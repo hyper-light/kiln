@@ -519,12 +519,47 @@ impl Owner {
                 self.changed = true;
             }
             Input::Moved { from, to } => {
-                for c in self.repos.iter_mut().flat_map(|r| r.copies.iter_mut()).filter(|c| c.machine == from) {
-                    c.machine = to.clone();
+                // The machine's copies of one repository in one folder are one copy (docs/machines.md,
+                // "One record a machine"): the one furthest along the log as last heard is kept; with
+                // none heard ahead, the one the machine's id had already; else the newest.
+                let mut dropped: Vec<(String, CopyRef)> = Vec::new();
+                for r in &mut self.repos {
+                    let theirs: Vec<u64> = r.copies.iter().filter(|c| c.machine == from).map(|c| c.member).collect();
+                    for c in r.copies.iter_mut().filter(|c| c.machine == from) {
+                        c.machine = to.clone();
+                    }
+                    let applied = |m: u64| self.statuses.get(&(r.id.clone(), m)).map_or(0, |st| st.applied);
+                    let mut keep: Vec<CopyRef> = Vec::new();
+                    for c in std::mem::take(&mut r.copies) {
+                        let same = keep.iter().position(|k| k.machine == c.machine && k.path == c.path);
+                        match same {
+                            None => keep.push(c),
+                            Some(i) => {
+                                let Some(k) = keep.get_mut(i) else { continue };
+                                let rank = |x: &CopyRef| (applied(x.member), !theirs.contains(&x.member), x.added);
+                                if rank(&c) > rank(k) {
+                                    dropped.push((r.id.clone(), std::mem::replace(k, c)));
+                                } else {
+                                    dropped.push((r.id.clone(), c));
+                                }
+                            }
+                        }
+                    }
+                    r.copies = keep;
+                }
+                for (repo, c) in &dropped {
+                    self.statuses.remove(&(repo.clone(), c.member));
+                    self.note(repo, Kind::Copy, &to, Tone::Info, format!("{}'s two copies in {} are one: the same machine's", self.shown(&to), c.path));
                 }
                 if self.up.remove(&from) {
-                    self.up.insert(to);
+                    self.up.insert(to.clone());
                 }
+                if !dropped.is_empty()
+                    && let Err(e) = self.save()
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "sync: a machine's copies made one weren't saved");
+                }
+                self.tell_copies(&to);
                 self.changed = true;
             }
             Input::Ask { ask, reply } => {
@@ -627,7 +662,7 @@ impl Owner {
 
     /// The name people see of `machine`: its label, else its name.
     fn shown(&self, machine: &str) -> String {
-        self.labels.lock().get(machine).cloned().unwrap_or_else(|| machine.to_owned())
+        self.labels.load().get(machine).cloned().unwrap_or_else(|| machine.to_owned())
     }
 
     /// The members of `repo` whose copies are on `machine`.
@@ -1295,6 +1330,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    /// docs/machines.md, "One record a machine": two records of one machine each had a copy of a
+    /// repository in the same folder; once one moves into the other, the machine has one copy
+    /// there, the one its id had. A copy in another folder of the same machine stays its own.
+    #[test]
+    fn machines_a_machines_copies_of_a_repo_in_one_folder_are_one_copy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents, crate::hub::Labels::default());
+        let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        let create = Ask::Create {
+            name: "dedup".into(),
+            copies: vec![("fedora".into(), "/src/kiln".into()), (id.into(), "/src/kiln".into()), ("fedora".into(), "/src/other".into()), ("box".into(), "/src/kiln".into())],
+            exclude: Vec::new(),
+            mode: super::super::Mode::Files,
+            transient: None,
+        };
+        let repo = futures::executor::block_on(sync.ask(create)).map_err(anyhow::Error::msg)?;
+        let theirs = |v: &View| -> Vec<(String, String, u64)> {
+            v.repos.iter().filter(|r| r.id == repo).flat_map(|r| r.copies.iter().map(|c| (c.machine.clone(), c.path.clone(), c.member))).collect()
+        };
+        let before = theirs(&sync.view());
+        let ours = before.iter().find(|(m, p, _)| m == id && p == "/src/kiln").map(|c| c.2);
+        sync.moved("fedora", id);
+        let one = eventually(|| {
+            let now = theirs(&sync.view());
+            now.len() == 3 && !now.iter().any(|(m, _, _)| m == "fedora")
+        });
+        let now = theirs(&sync.view());
+        anyhow::ensure!(one, "one copy a folder: {now:?}");
+        anyhow::ensure!(now.iter().filter(|(m, p, _)| m == id && p == "/src/kiln").map(|c| Some(c.2)).collect::<Vec<_>>() == [ours], "the id's own copy is kept: {now:?}");
+        anyhow::ensure!(now.iter().any(|(m, p, _)| m == id && p == "/src/other"), "its copy in another folder stays: {now:?}");
+        anyhow::ensure!(now.iter().any(|(m, _, _)| m == "box"), "another machine's stays: {now:?}");
+        Ok(())
     }
 
     #[test]

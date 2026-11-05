@@ -34,12 +34,15 @@
 //!   pointers to walk instead, and Windows has no signals at all: its equivalent suspends the thread and walks
 //!   it from outside. So a report names the task's spawn site instead, recorded at every spawn with
 //!   `#[track_caller]`: the code whose future held the shard.
-//! - **What moves**: a task already admitted to a shard lives there (docs/runtime.md §3): it waits for the
-//!   held shard until kiln can steal work (goal 7). Work not yet admitted can go elsewhere: spawns submitted as
-//!   movable ([`crate::runtime::submit_movable`], what kiln's spread placement and accepted connections use)
-//!   wait in a queue of their own on the shard's entry, and the watchdog hands those that wait for a held shard
-//!   to the runtime's next shard that is not held. Placement asks [`stalled`] and sends no new work to a held
-//!   shard. Spawns addressed to one shard ([`crate::runtime::submit_to_holder`], a shard's own spawns) stay.
+//! - **What moves**: a pinned task already admitted to a shard lives there (docs/runtime.md §3): it waits for
+//!   the held shard. Work not yet admitted can go elsewhere: spawns submitted as movable
+//!   ([`crate::runtime::submit_movable`], what kiln's spread placement and accepted connections use) wait in a
+//!   queue of their own on the shard's entry, and the watchdog hands those that wait for a held shard to the
+//!   runtime's next shard that is not held. Movable tasks (`crate::movable`, kiln's goal 7) queued on a held
+//!   shard go to the runtime's shared queues, and parked siblings are kicked to take them: the held shard's queue
+//!   detached from it, as Tokio hands a blocked worker's core to another thread. Placement asks [`stalled`] and
+//!   sends no new work to a held shard. Spawns addressed to one shard ([`crate::runtime::submit_to_holder`], a
+//!   shard's own spawns) stay.
 
 use std::panic::Location;
 #[cfg(loom)]
@@ -162,7 +165,8 @@ pub(crate) struct Board {
     episodes: AtomicU64,
     /// The time those polls held the shard, as the watchdog saw them end, nanoseconds.
     held_ns: AtomicU64,
-    /// Movable spawns that waited for the shard while it was held and went to another shard.
+    /// Movable spawns that waited for the shard while it was held and went to another shard, and movable tasks
+    /// queued on it that went to the shared queues (`crate::movable`).
     moved: AtomicU64,
     /// Episodes reported, and those past the reports' cap.
     reports: AtomicU64,
@@ -186,7 +190,8 @@ pub struct Stalls {
     pub episodes: u64,
     /// The time those that ended held the shard, nanoseconds (seen to within a look).
     pub held_ns: u64,
-    /// Movable spawns handed to another shard while this one was held.
+    /// Movable spawns handed to another shard while this one was held, and movable tasks handed to the shared
+    /// queues (`crate::movable`).
     pub moved: u64,
     /// Episodes reported ([`report`]), and those past the cap of [`REPORTS_PER_MINUTE`].
     pub reports: u64,
@@ -518,10 +523,12 @@ pub(crate) struct Watchdog {
 }
 
 impl Watchdog {
-    /// Starts watching `holders`, the shards of a runtime built from `config`; returns once its thread runs.
+    /// Starts watching `holders`, the shards of a runtime built from `config` whose movable queues are `movable`
+    /// (in the same order); returns once its thread runs.
     pub(crate) fn start(
         holders: Vec<SlotHolder>,
         config: &crate::runtime::RuntimeConfig,
+        movable: Option<std::sync::Arc<crate::movable::Pool>>,
     ) -> Result<Watchdog, RtError> {
         let limits = Limits::of(config);
         let now = crate::machine::clock::monotonic_ns();
@@ -541,7 +548,7 @@ impl Watchdog {
                 let _ = running.send(());
                 // Let go now, while the starting thread still holds its end: the channel is freed there.
                 drop(running);
-                watch(shards, limits, &stopped);
+                watch(shards, limits, &stopped, movable.as_deref());
             })
             .map_err(|error| RtError::DriverRefused {
                 call: "thread spawn",
@@ -580,7 +587,12 @@ impl Drop for Watchdog {
 }
 
 /// The watchdog's thread: looks at every shard each half limit until its runtime drops its end of `stopped`.
-fn watch(mut shards: Vec<Watched>, limits: Limits, stopped: &Receiver<()>) {
+fn watch(
+    mut shards: Vec<Watched>,
+    limits: Limits,
+    stopped: &Receiver<()>,
+    movable: Option<&crate::movable::Pool>,
+) {
     let mut held: Option<Box<SpawnRequest>> = None;
     let mut every_ns = limits.look_every_ns(limits.limit_ns(limits.fixed_quantum_ns));
     loop {
@@ -599,6 +611,9 @@ fn watch(mut shards: Vec<Watched>, limits: Limits, stopped: &Receiver<()>) {
             every_ns = limits.look_every_ns(shortest);
         }
         move_waiting(&shards, &mut held);
+        if let Some(pool) = movable {
+            hand_off(&shards, pool);
+        }
     }
     // A request held for want of a shard to take it is dropped, which answers its receipt `Terminated`.
     drop(held);
@@ -635,6 +650,23 @@ fn move_waiting(shards: &[Watched], held: &mut Option<Box<SpawnRequest>>) {
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Hands the movable tasks queued on each held shard to the runtime's shared queues, parked siblings kicked to take
+/// them (`crate::movable::Pool::hand_off`); counted as moved on the held shard's board. Not while every shard is
+/// held: none could take them.
+fn hand_off(shards: &[Watched], pool: &crate::movable::Pool) {
+    if shards.iter().all(Watched::stalled) {
+        return;
+    }
+    for (index, shard) in shards.iter().enumerate().filter(|(_, shard)| shard.stalled()) {
+        let moved = pool.hand_off(index);
+        if moved > 0 {
+            let _ = registry::with_holder(shard.holder, |entry| {
+                entry.board.moved.fetch_add(moved, Ordering::Relaxed);
+            });
         }
     }
 }

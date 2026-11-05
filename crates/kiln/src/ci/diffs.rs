@@ -1908,6 +1908,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["repos", repo, "ladder"]) => ok(super::ladder::switches(hub, repo, caller, None).await?),
         (&Method::PUT, ["repos", repo, "ladder"]) => ok(super::ladder::switches(hub, repo, caller, Some(body)).await?),
+        // W26-R07: code no agent made, asked about in Ship: a helper kiln starts for the person.
+        (&Method::POST, ["repos", repo, "about"]) => ok(super::about::start(hub, repo, caller, body).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
             let mut v = super::review::inbox(hub, caller).await?;

@@ -4,6 +4,7 @@
 //! with CPU hogs beside it when asked.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -147,6 +148,14 @@ pub struct Machine {
     pub mhz_before: Option<f64>,
     #[serde(default)]
     pub mhz_after: Option<f64>,
+    /// The server's CPUs, where they're its own (`--server-cpus`), and their mean clock before and
+    /// after the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cpus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_mhz_before: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_mhz_after: Option<f64>,
 }
 
 fn loadavg() -> Option<[f64; 3]> {
@@ -161,7 +170,7 @@ fn loadavg() -> Option<[f64; 3]> {
 }
 
 /// The CPUs `list` names (`0-3,8,10-11`, as Linux writes an affinity).
-fn cpus_in(list: &str) -> Vec<usize> {
+pub fn cpus_in(list: &str) -> Vec<usize> {
     list.split(',')
         .filter_map(|part| {
             let part = part.trim();
@@ -206,6 +215,70 @@ pub fn machine() -> Machine {
     Machine { host, os: std::env::consts::OS.to_owned(), cpus: std::thread::available_parallelism().map_or(1, std::num::NonZero::get), affinity, ..Machine::default() }
 }
 
+/// Where a round's server and its hogs run (goal 10, plan 01a1a87b2dae step 1). On CPUs of their own
+/// (`--server-cpus`, Linux's `taskset`), the lab's clients, runners and stand-ins keep the CPUs the lab
+/// was started on to themselves, so the lab times the server, not itself. In production's layout
+/// (`--layout production`, Linux with systemd's user manager) the server runs in a scope of its own at
+/// `CPUWeight=1000`, as kiln.slice gives it on bare metal, and the hogs in one at `CPUWeight=1`, as CI
+/// legs and agents run (docs/priority.md); `shared`, the hogs run beside everything in the lab's own
+/// cgroup, as before.
+#[derive(Clone, Debug, Default)]
+pub struct Place {
+    pub cpus: Option<String>,
+    pub layout: String,
+}
+
+/// The weights production's layout gives the server and the hogs (`systemd.resource-control`'s
+/// `CPUWeight`): kiln.slice's on bare metal, and CI legs' and agents' (docs/priority.md).
+const SERVER_WEIGHT: u32 = 1000;
+const HOG_WEIGHT: u32 = 1;
+
+impl Place {
+    pub fn of(cpus: Option<&str>, layout: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(matches!(layout, "shared" | "production"), "no layout {layout}: shared or production");
+        anyhow::ensure!(layout == "shared" || cfg!(target_os = "linux"), "--layout production needs Linux with systemd's user manager");
+        if let Some(c) = cpus {
+            anyhow::ensure!(cfg!(target_os = "linux"), "--server-cpus needs Linux (taskset)");
+            anyhow::ensure!(!cpus_in(c).is_empty(), "--server-cpus takes a CPU list (16-31, or 0-3,8), not {c:?}");
+        }
+        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned() })
+    }
+
+    fn production(&self) -> bool {
+        self.layout == "production"
+    }
+
+    /// `program`, placed: in production's layout in a scope `unit` of its own at `weight` (systemd-run
+    /// execs it in place, so its pid and process group stay the lab's to stop), on the server's CPUs
+    /// when it has its own.
+    pub fn command(&self, program: &Path, weight: u32, unit: &str) -> Command {
+        let mut wrap: Vec<OsString> = Vec::new();
+        if self.production() {
+            wrap.extend(["systemd-run", "--user", "--scope", "--quiet", "--collect"].map(OsString::from));
+            wrap.push(format!("--unit={unit}").into());
+            wrap.push(format!("--property=CPUWeight={weight}").into());
+            wrap.push("--".into());
+        }
+        if let Some(c) = &self.cpus {
+            wrap.extend(["taskset", "-c"].map(OsString::from));
+            wrap.push(c.into());
+        }
+        match wrap.split_first() {
+            Some((first, rest)) => {
+                let mut cmd = Command::new(first);
+                cmd.args(rest).arg(program);
+                cmd
+            }
+            None => Command::new(program),
+        }
+    }
+
+    /// The server's command (`program`), placed.
+    pub fn server(&self, program: &Path, unit: &str) -> Command {
+        self.command(program, SERVER_WEIGHT, unit)
+    }
+}
+
 /// A round's result: each number it reports, and what it saw by class.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Round {
@@ -218,6 +291,64 @@ pub struct Round {
     pub shards: usize,
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
+    /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
+    /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
+    /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locks: BTreeMap<String, LockSeen>,
+}
+
+/// One place a lock is taken, as a build that counts its locks says on `/metrics` (`kiln_lock_*`):
+/// what the window, and the fill, took there.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LockSeen {
+    /// `mutex`, `read`, `write` (parking_lot's), `std_mutex`, `std_read`, `std_write`.
+    pub kind: String,
+    /// Acquisitions in the window, those that found it held, and the seconds those waited.
+    pub taken: f64,
+    pub contended: f64,
+    pub wait_s: f64,
+    /// The same over the fill.
+    pub fill_taken: f64,
+    pub fill_contended: f64,
+    pub fill_wait_s: f64,
+    /// The longest any one acquisition there waited, by the window's end.
+    pub max_wait_s: f64,
+    /// The first addresses of the locks taken there, in hex: sites that take one lock share its.
+    pub addrs: String,
+}
+
+/// The lock census of a build that counts its locks, between the fill's scrapes and the window's.
+fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
+    let mut out: BTreeMap<String, LockSeen> = BTreeMap::new();
+    let label = |l: &[(String, String)], k: &str| l.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    for (name, labels, value) in &window.1.series {
+        let (site, kind) = (label(labels, "site"), label(labels, "kind"));
+        if !name.starts_with("kiln_lock_") || site.is_empty() {
+            continue;
+        }
+        let want = [("site", site.as_str()), ("kind", kind.as_str())];
+        let since = |s: &Scrape| s.get(name, &want).unwrap_or(0.0);
+        let e = out.entry(format!("{site} {kind}")).or_insert_with(|| LockSeen { kind: kind.clone(), ..LockSeen::default() });
+        match name.as_str() {
+            "kiln_lock_taken_total" => {
+                e.taken = value - since(window.0);
+                e.fill_taken = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_contended_total" => {
+                e.contended = value - since(window.0);
+                e.fill_contended = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_wait_seconds_total" => {
+                e.wait_s = value - since(window.0);
+                e.fill_wait_s = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_wait_max_seconds" => e.max_wait_s = *value,
+            "kiln_lock_addresses" => e.addrs = label(labels, "addrs"),
+            _ => {}
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------------------------- the load
@@ -260,11 +391,23 @@ fn pause(think: Duration, retry_after: Option<Duration>) -> Duration {
     retry_after.map_or(think, |r| r.max(think))
 }
 
-fn timed(class: Class, f: impl FnOnce() -> anyhow::Result<u16>) -> Sample {
+fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u16>) -> Sample {
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what }
+}
+
+/// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
+/// epoch), and each frame it read then, by its stamp, with how long that took to reach it. Set against
+/// the other viewers' attaches, they say whether a frame published while one viewer attaches reaches
+/// the others without waiting for it (goal 10, plan 01a1a87b2dae step 3).
+pub struct Watch {
+    pub viewer: usize,
+    pub session: String,
+    pub from_us: u64,
+    pub to_us: u64,
+    pub frames: Vec<(u64, u64)>,
 }
 
 /// The stamps (`@lab:<µs>`) in a frame.
@@ -286,8 +429,9 @@ fn stamps(text: &[u8]) -> impl Iterator<Item = u64> + '_ {
 
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
-fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
+fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
     let mut out = Vec::new();
+    let mut watches = Vec::new();
     let mut r = Lcg(0x9e37_79b9 ^ (i as u64));
     let dwell = s.dwell;
     while !s.stop.load(Ordering::Relaxed) {
@@ -304,7 +448,7 @@ fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "" });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -321,10 +465,11 @@ fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "" });
         if !opened {
             continue;
         }
+        let mut watch = Watch { viewer: i, session: id, from_us: at_us, to_us: now_us(), frames: Vec::new() };
         let until = Instant::now() + jitter(&mut r, dwell);
         let mut seen = HashSet::new();
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
@@ -333,7 +478,8 @@ fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
                     let now = now_us();
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true });
+                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "" });
+                            watch.frames.push((stamp, now.saturating_sub(stamp)));
                         }
                     }
                 }
@@ -343,8 +489,9 @@ fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
             }
         }
         sock.close();
+        watches.push(watch);
     }
-    out
+    (out, watches)
 }
 
 /// An agent at work on `id`: a message, its turn, a pause, again.
@@ -362,7 +509,7 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
         let n = s.next.fetch_add(1, Ordering::Relaxed);
         let body = json!({"type": "send", "id": format!("lab-{n}"), "text": format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms)}).to_string();
         let mut retry_after = None;
-        out.push(timed(Class::ApiWrite, || {
+        out.push(timed(Class::ApiWrite, "command", || {
             http.send("POST", &path, Some(body.as_bytes())).map(|a| {
                 retry_after = a.retry_after;
                 a.status
@@ -382,19 +529,20 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
     let mut http = Http::new(s.port, &s.admin);
     while !s.stop.load(Ordering::Relaxed) {
         let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
-        let path = match r.below(20) {
-            0..=5 => "/api/harness/sessions".to_owned(),
-            6..=9 => format!("/api/harness/sessions/{id}"),
-            10..=12 => format!("/api/harness/sessions/{id}/events?limit=50"),
-            13 | 14 => "/api/agents".to_owned(),
-            15 => "/api/me".to_owned(),
-            16 => "/api/overview".to_owned(),
-            17 => "/api/runs".to_owned(),
-            18 => format!("/api/plans?session={id}"),
-            _ => format!("/api/harness/sessions/{id}/goals"),
+        // Each read is told apart by its route, so a run says which of them its tail is.
+        let (what, path) = match r.below(20) {
+            0..=5 => ("sessions", "/api/harness/sessions".to_owned()),
+            6..=9 => ("session", format!("/api/harness/sessions/{id}")),
+            10..=12 => ("events", format!("/api/harness/sessions/{id}/events?limit=50")),
+            13 | 14 => ("agents", "/api/agents".to_owned()),
+            15 => ("me", "/api/me".to_owned()),
+            16 => ("overview", "/api/overview".to_owned()),
+            17 => ("runs", "/api/runs".to_owned()),
+            18 => ("plans", format!("/api/plans?session={id}")),
+            _ => ("goals", format!("/api/harness/sessions/{id}/goals")),
         };
         let mut retry_after = None;
-        out.push(timed(Class::ApiRead, || {
+        out.push(timed(Class::ApiRead, what, || {
             http.send("GET", &path, None).map(|a| {
                 retry_after = a.retry_after;
                 a.status
@@ -415,13 +563,19 @@ fn mcp(s: &Shared, p: &Profile, i: usize, tools: &[String]) -> Vec<Sample> {
     let mut n = 0u64;
     while !s.stop.load(Ordering::Relaxed) {
         n += 1;
-        let body = match tools.get(usize::try_from(r.below(tools.len().max(1) as u64)).unwrap_or(0)) {
+        let tool = tools.get(usize::try_from(r.below(tools.len().max(1) as u64)).unwrap_or(0));
+        let what = match tool.map(String::as_str) {
+            Some("agents_list") => "mcp.agents_list",
+            Some("runners") => "mcp.runners",
+            _ => "mcp.tools",
+        };
+        let body = match tool {
             Some(tool) => json!({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": tool, "arguments": {}}}),
             None => json!({"jsonrpc": "2.0", "id": n, "method": "tools/list", "params": {}}),
         }
         .to_string();
         let mut retry_after = None;
-        out.push(timed(Class::ApiWrite, || {
+        out.push(timed(Class::ApiWrite, what, || {
             http.send("POST", "/api/mcp", Some(body.as_bytes())).map(|a| {
                 retry_after = a.retry_after;
                 a.status
@@ -443,7 +597,7 @@ fn pages(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
     while !s.stop.load(Ordering::Relaxed) {
         let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
         let mut body = Vec::new();
-        out.push(timed(Class::Page, || {
+        out.push(timed(Class::Page, "page", || {
             let a = http.send("GET", &format!("/agents/{id}"), None)?;
             body = a.body;
             Ok(a.status)
@@ -453,7 +607,7 @@ fn pages(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             files = text.split('"').filter(|w| w.starts_with("/assets/") && !w.contains(' ')).map(str::to_owned).take(4).collect();
         }
         for f in &files {
-            out.push(timed(Class::Page, || http.send("GET", f, None).map(|a| a.status)));
+            out.push(timed(Class::Page, "file", || http.send("GET", f, None).map(|a| a.status)));
         }
         if !nap(s, jitter(&mut r, Duration::from_millis(p.page_think_ms))) {
             break;
@@ -465,15 +619,22 @@ fn pages(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
 // ------------------------------------------------------------------------------------- the round
 
 /// CPU hogs: `n` processes of the lab's own, each spinning until its stdin closes (the lab ends
-/// them, or its end does).
+/// them, or its end does), on the server's CPUs where it has its own. In production's layout, one
+/// process of `n` threads in a scope `unit` of its own at the least weight ([`Place`]).
 pub struct Hogs(Vec<Child>);
 
 impl Hogs {
-    pub fn start(n: usize) -> anyhow::Result<Self> {
+    pub fn start(n: usize, place: &Place, unit: &str) -> anyhow::Result<Self> {
         let me = std::env::current_exe()?;
         let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(Command::new(&me).arg("hog").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
+        let each = if place.production() { usize::from(n > 0) } else { n };
+        for _ in 0..each {
+            let mut cmd = place.command(&me, HOG_WEIGHT, unit);
+            cmd.arg("hog");
+            if place.production() {
+                cmd.arg("--threads").arg(n.to_string());
+            }
+            v.push(cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         }
         Ok(Self(v))
     }
@@ -488,8 +649,8 @@ impl Drop for Hogs {
     }
 }
 
-/// A hog: spins until its stdin closes.
-pub fn hog() {
+/// A hog: `threads` threads spinning until its stdin closes.
+pub fn hog(threads: usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&stop);
     std::thread::spawn(move || {
@@ -497,12 +658,20 @@ pub fn hog() {
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
         s.store(true, Ordering::Relaxed);
     });
-    let mut x = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        for _ in 0..100_000 {
-            x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+    let spin = |stop: &AtomicBool| {
+        let mut x = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..100_000 {
+                x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+            }
         }
-    }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads.max(1) {
+            scope.spawn(|| spin(&stop));
+        }
+        spin(&stop);
+    });
 }
 
 /// How much the machine's IO is held back now (Linux PSI, `full avg10`, percent), where the OS says.
@@ -563,9 +732,9 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
 }
 
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
-pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
+pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env)?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
@@ -645,13 +814,16 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
     };
 
     let mut m = machine();
-    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs)?) } else { None };
-    let (samples, before, after, window) = std::thread::scope(|scope| -> anyhow::Result<(Vec<Sample>, Scrape, Scrape, (u64, u64))> {
+    m.server_cpus.clone_from(&place.cpus);
+    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs, place, &format!("kiln-lab-hogs-{}-{index}", std::process::id()))?) } else { None };
+    type Window = (Vec<Sample>, Vec<Watch>, Scrape, Scrape, (u64, u64));
+    let (samples, watches, before, after, window) = std::thread::scope(|scope| -> anyhow::Result<Window> {
         let s = &shared;
-        let mut handles = Vec::new();
+        let mut views = Vec::new();
         for i in 0..p.viewers {
-            handles.push(scope.spawn(move || viewer(s, i)));
+            views.push(scope.spawn(move || viewer(s, i)));
         }
+        let mut handles = Vec::new();
         for (i, id) in active.iter().enumerate() {
             handles.push(scope.spawn(move || driver(s, id, p, i)));
         }
@@ -670,6 +842,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
         m.load_before = loadavg();
         m.cpu_pressure_before = cpu_pressure();
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
+        m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
         let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
         let start = now_us();
         std::thread::sleep(Duration::from_secs(p.window_s));
@@ -678,12 +851,18 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
         m.mhz_after = cpu_mhz(m.affinity.as_deref());
+        m.server_mhz_after = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
         s.stop.store(true, Ordering::Relaxed);
-        let mut samples = Vec::new();
+        let (mut samples, mut watches) = (Vec::new(), Vec::new());
+        for h in views {
+            let (seen, watched) = h.join().map_err(|_| anyhow::anyhow!("a viewer panicked"))?;
+            samples.extend(seen);
+            watches.extend(watched);
+        }
         for h in handles {
             samples.extend(h.join().map_err(|_| anyhow::anyhow!("a worker panicked"))?);
         }
-        Ok((samples, before, after, (start, end)))
+        Ok((samples, watches, before, after, (start, end)))
     })?;
     drop(hogs_run);
     let in_window: Vec<Sample> = samples.into_iter().filter(|s| s.at_us >= window.0 && s.at_us < window.1).collect();
@@ -693,8 +872,37 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen: seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect() })
+    let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
+    seen.extend(measure::seen_by_what(&in_window));
+    seen.extend(frames_against_attaches(&watches, window));
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, locks })
+}
+
+/// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
+/// them (goal 10, plan 01a1a87b2dae step 3): `websocket.own_attach`, those published before the viewer's
+/// own snapshot came, which waited for it; `websocket.while_another_attaches`, those published while
+/// another viewer of the same session attached (its snapshot not yet come), which shouldn't wait for
+/// that; and `websocket.live`, the rest.
+pub fn frames_against_attaches(watches: &[Watch], window: (u64, u64)) -> BTreeMap<String, measure::Seen> {
+    let mut by: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for w in watches {
+        for &(stamp, took) in &w.frames {
+            if stamp < window.0 || stamp >= window.1 {
+                continue;
+            }
+            let group = if stamp < w.to_us {
+                "websocket.own_attach"
+            } else if watches.iter().any(|o| o.viewer != w.viewer && o.session == w.session && o.from_us <= stamp && stamp < o.to_us) {
+                "websocket.while_another_attaches"
+            } else {
+                "websocket.live"
+            };
+            by.entry(group.to_owned()).or_default().push(took);
+        }
+    }
+    by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
 }
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
@@ -854,6 +1062,42 @@ mod tests {
         assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
         assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
         assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3: a frame is told apart by whether it waited for its own
+    /// viewer's attach, came while another viewer of its session attached, or neither.
+    #[test]
+    fn g10_s3_frames_are_told_apart_by_the_attaches_they_met() {
+        let w = |viewer: usize, session: &str, from_us: u64, to_us: u64, frames: Vec<(u64, u64)>| Watch { viewer, session: session.to_owned(), from_us, to_us, frames };
+        let watches = vec![
+            // Viewer 0 of a, attached 100 to 200: 150 waited for its snapshot; 250 and 320 after it.
+            w(0, "a", 100, 200, vec![(150, 60), (250, 1), (320, 2)]),
+            // Viewer 1 of a attaches 240 to 300: 250 came to viewer 0 while it did.
+            w(1, "a", 240, 300, vec![(310, 3)]),
+            // Viewer 2 of b, attaching 245 to 400: no bearing on a's frames.
+            w(2, "b", 245, 400, vec![(410, 4), (9_999, 5)]),
+        ];
+        let seen = frames_against_attaches(&watches, (0, 1_000));
+        let n = |k: &str| seen.get(k).map_or(0, |s| s.n);
+        assert_eq!((n("websocket.own_attach"), n("websocket.while_another_attaches"), n("websocket.live")), (1, 1, 3), "outside the window isn't counted");
+        assert_eq!(seen.get("websocket.own_attach").and_then(|s| s.p50_ms), Some(0.06));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 1: the server and its hogs are placed on their own CPUs, and in
+    /// production's layout in scopes of their own at their weights.
+    #[test]
+    fn g10_s1_the_server_and_hogs_are_placed_where_asked() {
+        let args = |c: &Command| std::iter::once(c.get_program()).chain(c.get_args()).map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let k = Path::new("/bin/kiln");
+        assert_eq!(args(&Place::default().server(k, "u")), "/bin/kiln");
+        if cfg!(target_os = "linux") {
+            let p = Place::of(Some("16-31"), "shared").unwrap_or_default();
+            assert_eq!(args(&p.server(k, "u")), "taskset -c 16-31 /bin/kiln");
+            let p = Place::of(Some("16-31"), "production").unwrap_or_default();
+            assert_eq!(args(&p.server(k, "u")), "systemd-run --user --scope --quiet --collect --unit=u --property=CPUWeight=1000 -- taskset -c 16-31 /bin/kiln");
+            assert_eq!(args(&p.command(k, HOG_WEIGHT, "h")), "systemd-run --user --scope --quiet --collect --unit=h --property=CPUWeight=1 -- taskset -c 16-31 /bin/kiln");
+        }
+        assert!(Place::of(None, "elsewhere").is_err() && Place::of(Some("x"), "shared").is_err());
     }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: the many-sessions profile is production's whole shape, every

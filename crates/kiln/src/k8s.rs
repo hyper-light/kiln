@@ -72,7 +72,8 @@ impl K8s {
         let name = format!("kiln-{}-{}", short, job.attempt);
         let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
-        hub.ephemeral_tokens.lock().insert(token.clone(), (job.id.clone(), Instant::now() + ttl));
+        let until = Instant::now() + ttl;
+        hub.ephemeral_tokens.update(|t| t.insert(token.clone(), (job.id.clone(), until)));
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
         let pod = job_pod(&self.cfg, job, spec, run, &name, &token, (&server_url, &server_quic));
@@ -89,7 +90,8 @@ impl K8s {
         let name = executor_pod(executor);
         let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
-        hub.executor_tokens.lock().insert(token.clone(), (executor.to_owned(), name.clone(), Instant::now() + ttl));
+        let until = Instant::now() + ttl;
+        hub.executor_tokens.update(|t| t.insert(token.clone(), (executor.to_owned(), name.clone(), until)));
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
         let mut made = pool_pod(&self.cfg, executor, &name, &token, (&server_url, &server_quic), pool, pod);
@@ -237,7 +239,7 @@ impl K8s {
                     if since.elapsed() > Duration::from_secs(120) {
                         tracing::warn!(pod = %name, %reason, "pod cannot start; failing job");
                         let _ = self.api.delete_pod(&name).await;
-                        hub.launching.lock().remove(&job_id);
+                        hub.launching.update(|l| l.remove(&job_id));
                         if let Ok(Some(j)) = hub.store.job(job_id.clone()).await
                             && j.status == Status::Queued {
                                 hub.store.claim_job(job_id.clone(), name.clone(), "k8s".into()).await?;

@@ -720,7 +720,7 @@ fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Plan>> 
 pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Plan>> {
     let all = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM plans p ORDER BY p.updated_at DESC, p.id"))?;
             let rows = st.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -738,7 +738,7 @@ pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Pl
 pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
     let id = id.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let Some(mut p) = get_in(c, &id)? else { return Ok(None) };
             p.reviewed = review::last_in(c, &id)?;
             Ok(Some(p))
@@ -751,7 +751,7 @@ pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
 pub async fn shared(hub: &Hub, token: &str) -> R<Plan> {
     let token = token.to_owned();
     hub.store
-        .call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.share = ?1"), params![token], row).optional()?))
+        .read(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.share = ?1"), params![token], row).optional()?))
         .await?
         .ok_or(Error::Missing)
 }
@@ -893,7 +893,7 @@ pub async fn versions(hub: &Hub, id: &str) -> R<Vec<Version>> {
     let id = id.to_owned();
     Ok(hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT version, title, body, at, by, items FROM plan_versions WHERE plan_id = ?1 ORDER BY version DESC")?;
             let rows = st
                 .query_map(params![id], |r| {
@@ -912,7 +912,7 @@ pub async fn runs(hub: &Hub, id: &str) -> R<Vec<Run>> {
     let id = id.to_owned();
     Ok(hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT id, version, session, mode, at, by, state FROM plan_runs WHERE plan_id = ?1 ORDER BY at DESC LIMIT 100")?;
             let rows = st.query_map(params![id], |r| Ok(Run { id: r.get(0)?, version: r.get(1)?, session: r.get(2)?, mode: r.get(3)?, at: r.get(4)?, by: r.get(5)?, state: r.get(6)? }))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)

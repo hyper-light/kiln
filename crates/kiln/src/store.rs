@@ -1,11 +1,15 @@
-//! Durable state in SQLite (WAL). Every call runs on the blocking pool so the async runtime is
-//! never stalled by disk I/O. Logs are *not* stored here (see `logs.rs`).
+//! Durable state in SQLite (WAL), with no lock between its callers (goal 5 of the API runtime
+//! program, plan 01a1a59c2aae): what may write goes as a message to the one connection that writes,
+//! owned by a thread of its own ([`Store::call`]), and a read takes a read-only connection of its own
+//! on the blocking pool ([`Store::read`]), so reads run side by side, with each other and with the
+//! writer, and never wait behind a write. The async runtime is never stalled by disk I/O. Logs are
+//! *not* stored here (see `logs.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context as _;
-use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -23,15 +27,17 @@ pub struct Store {
     /// ([`Store::in_memory_inline`]): what kiln-sim's models drive under their seeded scheduler, a
     /// crash able to come at each call's wait.
     #[cfg(test)]
-    inline: bool,
+    inline: Option<Arc<parking_lot::Mutex<Connection>>>,
 }
 
-/// The store's connection, and with the cluster group what its writes go through.
+/// The store's writer, its readers, and with the cluster group what its writes go through.
 struct Inner {
-    // Dropped in order: the connection before the watch its hook writes into.
-    conn: Mutex<Connection>,
-    watch: Option<capture::Watch>,
-    group: Option<group::Group>,
+    /// The one connection that writes, and the watch its hook writes into, owned by their thread.
+    writer: Writer,
+    /// Read-only connections to the database's file, for [`Store::read`]; `None` for a store in
+    /// memory, whose one connection is the writer's.
+    reads: Option<Reads>,
+    group: Option<Arc<group::Group>>,
     /// The database's file, with the cluster group (a learner's copy is made from it).
     path: Option<std::path::PathBuf>,
     /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
@@ -40,11 +46,140 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // The writer's thread ends with its connection, and the readers' close: then the group's
+        // thread and connections, then the folder.
+        self.writer.stop();
+        self.reads.take();
         if let Some(dir) = self.scratch.take() {
-            // The group's thread and connections go first: then the folder.
             self.group.take();
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// What the writer's thread runs: a call, with the connection and, with the cluster group, the
+/// watch on what it writes.
+type WriteCall = Box<dyn FnOnce(&mut Connection, Option<&capture::Watch>) + Send>;
+
+/// The one connection that writes, owned by a thread of its own (`kiln-store`): every call that may
+/// write comes to it as a message, in order, and runs in its turn, as SQLite takes one writer at a
+/// time. Its callers wait for their answer, not on a lock: a thread preempted while it holds the
+/// connection is this one, which no shard ever is.
+struct Writer {
+    tx: Option<std::sync::mpsc::Sender<(WriteCall, Instant)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Writer {
+    fn start(conn: Connection, watch: Option<capture::Watch>) -> anyhow::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<(WriteCall, Instant)>();
+        let thread = std::thread::Builder::new()
+            .name("kiln-store".to_owned())
+            .spawn(move || {
+                let mut conn = conn;
+                while let Ok((job, sent)) = rx.recv() {
+                    crate::pool_health::store_write_queued(-1);
+                    let began = Instant::now();
+                    job(&mut conn, watch.as_ref());
+                    crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
+                }
+                // The connection before the watch its hook writes into.
+                drop(conn);
+                drop(watch);
+            })
+            .context("start the store's writer")?;
+        Ok(Self { tx: Some(tx), thread: Some(thread) })
+    }
+
+    /// Sends `job` to the thread: counted as waiting until the thread starts it (what goal 6's detector
+    /// reads of the writer's backlog, `crate::pool_health::queues`).
+    fn send(&self, job: WriteCall) -> bool {
+        crate::pool_health::store_write_queued(1);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send((job, Instant::now())).is_ok());
+        if !sent {
+            crate::pool_health::store_write_queued(-1);
+        }
+        sent
+    }
+
+    /// Ends its thread once the calls sent are done (on the thread itself, as the last of a store
+    /// a call held goes: it ends as that call returns).
+    fn stop(&mut self) {
+        self.tx.take();
+        if let Some(t) = self.thread.take()
+            && t.thread().id() != std::thread::current().id()
+        {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Read-only connections to the database's file ([`Store::read`]), each taken by one read at a time
+/// and given back as it ends: a lock-free queue of those not in use, as many as the blocking pool's
+/// `store` share runs reads at once. One taken when none is free (a read past them) is opened then.
+struct Reads {
+    path: std::path::PathBuf,
+    idle: concurrent_queue::ConcurrentQueue<Connection>,
+}
+
+impl Reads {
+    fn new(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), idle: concurrent_queue::ConcurrentQueue::bounded(crate::rt::profile().pool.1.max(1)) }
+    }
+
+    fn take(&self) -> anyhow::Result<Connection> {
+        if let Ok(c) = self.idle.pop() {
+            return Ok(c);
+        }
+        let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
+        c.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+        Ok(c)
+    }
+
+    /// Back for the next read (closed, past as many as are kept).
+    fn give(&self, c: Connection) {
+        let _ = self.idle.push(c);
+    }
+}
+
+/// An inline store's call yields once first (the wait a crash can come at, [`Store::in_memory_inline`]).
+#[cfg(test)]
+async fn yield_once() {
+    let mut yielded = false;
+    futures::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+    .await;
+}
+
+/// A read on a connection that also writes (a store in memory's one): read-only while `f` runs, as a
+/// read connection is, so a read that would write is refused here as it is there.
+fn read_on<R>(c: &Connection, f: impl FnOnce(&Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    struct Writable<'c>(&'c Connection);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.execute_batch("PRAGMA query_only = OFF");
+        }
+    }
+    c.execute_batch("PRAGMA query_only = ON")?;
+    let _after = Writable(c);
+    in_snapshot(c, f)
+}
+
+/// Runs `f` in one read transaction: every statement it makes sees the database as one write left
+/// it, as when a call held the store's one connection (WAL: a write committed meanwhile isn't seen).
+fn in_snapshot<R>(c: &Connection, f: impl FnOnce(&Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    c.execute_batch("BEGIN")?;
+    let out = f(c);
+    let ended = c.execute_batch(if out.is_ok() { "COMMIT" } else { "ROLLBACK" });
+    match (out, ended) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Ok(_), Err(e)) => Err(e.into()),
+        (Err(e), _) => Err(e),
     }
 }
 
@@ -488,7 +623,7 @@ impl Store {
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
@@ -497,7 +632,7 @@ impl Store {
         let conn = Self::connect(path)?;
         let group = group::Group::open(path, cluster).context("the cluster group")?;
         let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), path: Some(path.to_path_buf()), scratch: None }), #[cfg(test)] inline: false })
+        Ok(Self::of(Inner { writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None }))
     }
 
     /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
@@ -506,7 +641,11 @@ impl Store {
     pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
+    }
+
+    fn of(inner: Inner) -> Self {
+        Self { inner: Arc::new(inner), #[cfg(test)] inline: None }
     }
 
     fn connect(path: &Path) -> anyhow::Result<Connection> {
@@ -535,25 +674,38 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), #[cfg(test)] inline: false })
+        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None }))
     }
 
     /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
     /// models drive it under their seeded scheduler, so a crash can come at each call (CP-T6.1).
-    /// Never the cluster group's, whatever `KILN_STORE_GROUP` says.
+    /// Never the cluster group's, whatever `KILN_STORE_GROUP` says. Its connection is the calling
+    /// task's while it runs a call, behind a lock only the simulation's one thread takes.
     #[cfg(test)]
     pub fn in_memory_inline() -> anyhow::Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, path: None, scratch: None }), inline: true })
+        let idle = Connection::open_in_memory()?;
+        let inner = Inner { writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None };
+        Ok(Self { inner: Arc::new(inner), inline: Some(Arc::new(parking_lot::Mutex::new(conn))) })
     }
 
-    /// Run `f` with the connection on this thread: for what's read once as the server starts,
-    /// before anything else runs (a constructor that can't wait). Only reads: a write here would
-    /// go past the cluster group.
-    pub fn now<R>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
-        f(&mut self.inner.conn.lock())
+    /// Run `f` with the connection, this thread waiting for it: for what's read once as the server
+    /// starts, before anything else runs (a constructor that can't wait). Only reads: a write here
+    /// would go past the cluster group.
+    pub fn now<R: Send + 'static>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static) -> anyhow::Result<R> {
+        #[cfg(test)]
+        if let Some(c) = &self.inline {
+            return f(&mut c.lock());
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let job: WriteCall = Box::new(move |conn, _| {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))).unwrap_or_else(|_| Err(anyhow::anyhow!("a read of the store panicked")));
+            let _ = tx.send(out);
+        });
+        anyhow::ensure!(self.inner.writer.send(job), "the store's writer has stopped");
+        rx.recv().map_err(|_| anyhow::anyhow!("the store's writer let a call go unanswered"))?
     }
 
     /// Whether this store's writes go through the cluster group.
@@ -563,7 +715,7 @@ impl Store {
 
     /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
     pub fn group_standing(&self) -> Option<(u64, u64)> {
-        self.inner.group.as_ref().map(group::Group::standing)
+        self.inner.group.as_deref().map(group::Group::standing)
     }
 
     /// The database's size on disk, with its write-ahead log (with the cluster group).
@@ -575,7 +727,7 @@ impl Store {
 
     /// The cluster group, with it: its messages to the runners' learners, and theirs to it.
     pub fn group(&self) -> Option<&group::Group> {
-        self.inner.group.as_ref()
+        self.inner.group.as_deref()
     }
 
     /// A copy of kiln.db for a runner's learner, written to `dest`: the database as it is now,
@@ -599,55 +751,90 @@ impl Store {
         }
     }
 
-    /// Runs `f` with the connection on the blocking pool. With the cluster group, what `f` writes
-    /// goes through it: `f` runs in a transaction while the rows it touches are noted, which
-    /// commits with the write's number and sends the rows' state (its change) to the group's log,
-    /// which a restart replays. A read is only a read.
+    /// Runs `f` with the connection that writes, on its own thread, in its turn after the calls sent
+    /// before it. With the cluster group, what `f` writes goes through it: `f` runs in a transaction
+    /// while the rows it touches are noted, which commits with the write's number and sends the
+    /// rows' state (its change) to the group's log, which a restart replays. What only reads is
+    /// [`Store::read`]'s, which never waits behind a write.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
         #[cfg(test)]
-        if self.inline {
-            let mut yielded = false;
-            futures::future::poll_fn(|cx| {
-                if std::mem::replace(&mut yielded, true) {
-                    return std::task::Poll::Ready(());
-                }
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            })
-            .await;
-            let mut g = self.inner.conn.lock();
-            return f(&mut g);
+        if let Some(c) = &self.inline {
+            yield_once().await;
+            return f(&mut c.lock());
         }
-        let inner = self.inner.clone();
-        // The pool's store share: the one connection takes a statement at a time, so its places
-        // are few, and a slow statement (a checkpoint on a busy disk, another caller's long write)
-        // holds them, not the file share's that snapshots and reads need.
-        crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
-            let mut g = inner.conn.lock();
-            match (&inner.watch, &inner.group) {
-                (Some(watch), Some(group)) => through_group(&mut g, watch, group, f),
-                _ => f(&mut g),
-            }
+        let group = self.inner.group.clone();
+        self.write(move |conn, watch| match (watch, &group) {
+            (Some(watch), Some(group)) => through_group(conn, watch, group, f),
+            _ => f(conn),
         })
-        .await?
+        .await
     }
 
-    /// Runs `f` with the connection, past the cluster group: for this node's own tables ([`LOCAL`]).
+    /// Runs `f` with the connection that writes, past the cluster group: for this node's own tables
+    /// ([`LOCAL`]).
     pub async fn call_local<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(test)]
+        if let Some(c) = &self.inline {
+            yield_once().await;
+            return f(&mut c.lock());
+        }
+        self.write(move |conn, _| f(conn)).await
+    }
+
+    /// Runs `f`, which only reads, with a read-only connection of its own on the blocking pool's
+    /// `store` share, in one read transaction (its statements see the database as one write left it).
+    /// Reads run side by side, with each other and with the writer, and none waits behind a write: a
+    /// write committed before it begins is in what it sees. A store in memory has one connection, the
+    /// writer's, which its reads take their turn at.
+    pub async fn read<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(test)]
+        if let Some(c) = &self.inline {
+            yield_once().await;
+            return read_on(&c.lock(), f);
+        }
+        if self.inner.reads.is_none() {
+            return self.write(move |conn, _| read_on(conn, f)).await;
+        }
         let inner = self.inner.clone();
         crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
-            let mut g = inner.conn.lock();
-            f(&mut g)
+            let reads = inner.reads.as_ref().ok_or_else(|| anyhow::anyhow!("the store has no read connections"))?;
+            let conn = reads.take()?;
+            let out = in_snapshot(&conn, f);
+            // One left inside a transaction (its end refused) is closed, not reused.
+            if conn.is_autocommit() {
+                reads.give(conn);
+            }
+            out
         })
         .await?
+    }
+
+    /// Sends `f` to the writer's thread and waits for its answer.
+    async fn write<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut Connection, Option<&capture::Watch>) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let job: WriteCall = Box::new(move |conn, watch| {
+            // A call that panics answers with an error; the writer goes on with the next.
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn, watch))).unwrap_or_else(|_| Err(anyhow::anyhow!("a store call panicked")));
+            let _ = tx.send(out);
+        });
+        anyhow::ensure!(self.inner.writer.send(job), "the store's writer has stopped");
+        rx.await.map_err(|_| anyhow::anyhow!("the store's writer let a call go unanswered"))?
     }
 
     /// Runners connected just before this server started: those still marked connected (a server
@@ -656,7 +843,7 @@ impl Store {
     /// return is a deploy's check (`/healthz/server`).
     pub async fn runners_before(&self, within_s: i64) -> anyhow::Result<u64> {
         let since = crate::util::now_unix() - within_s;
-        self.call(move |c| {
+        self.read(move |c| {
             let n: i64 = c.query_row("SELECT COUNT(*) FROM agents WHERE ephemeral = 0 AND (connected = 1 OR last_seen >= ?1)", [since], |r| r.get(0))?;
             Ok(u64::try_from(n).unwrap_or(0))
         })
@@ -742,12 +929,12 @@ impl Store {
 
     /// Whether a native repository is public: anyone may read it over git (W14-R01).
     pub async fn repo_public(&self, id: String) -> anyhow::Result<bool> {
-        self.call(move |c| Ok(c.query_row("SELECT public FROM repos WHERE id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await
+        self.read(move |c| Ok(c.query_row("SELECT public FROM repos WHERE id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await
     }
 
     /// The public repositories' ids.
     pub async fn public_repos(&self) -> anyhow::Result<std::collections::HashSet<String>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare("SELECT id FROM repos WHERE public = 1")?;
             let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
             Ok(ids)
@@ -766,7 +953,7 @@ impl Store {
     /// Whether repository `id` requires a push's commits to be signed where its policy doesn't say
     /// (docs/ci.md W27-R03): `required`, else it warns.
     pub async fn repo_requires_signatures(&self, id: String) -> anyhow::Result<bool> {
-        self.call(move |c| Ok(c.query_row("SELECT signatures FROM repos WHERE id = ?1", [&id], |r| r.get::<_, String>(0)).optional()?.is_some_and(|s| s == "required"))).await
+        self.read(move |c| Ok(c.query_row("SELECT signatures FROM repos WHERE id = ?1", [&id], |r| r.get::<_, String>(0)).optional()?.is_some_and(|s| s == "required"))).await
     }
 
     /// Says whether repository `id` requires a push's commits to be signed (`required`, else
@@ -788,7 +975,7 @@ impl Store {
     }
 
     pub async fn repos(&self) -> anyhow::Result<Vec<Repo>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare(
                 "SELECT id, name, clone_url, branches, poll_seconds, enabled, created_at,
                         last_polled_at, last_error, mode, default_branch, mirror FROM repos ORDER BY name",
@@ -826,7 +1013,7 @@ impl Store {
     }
 
     pub async fn repo_etag(&self, id: String) -> anyhow::Result<Option<String>> {
-        self.call(move |c| {
+        self.read(move |c| {
             Ok(c.query_row("SELECT etag FROM repos WHERE id = ?1", [id], |r| r.get(0))
                 .optional()?
                 .flatten())
@@ -843,7 +1030,7 @@ impl Store {
     }
 
     pub async fn refs(&self, repo_id: String) -> anyhow::Result<Vec<(String, String)>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare("SELECT name, sha FROM refs WHERE repo_id = ?1")?;
             let rows = st.query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -948,7 +1135,7 @@ impl Store {
     }
 
     pub async fn runs(&self, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(
                 "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
                         r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
@@ -967,7 +1154,7 @@ impl Store {
     /// [`Self::runs`], of the repositories named only.
     pub async fn runs_among(&self, names: Vec<String>, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
         let names = serde_json::to_string(&names)?;
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(
                 "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
                         r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
@@ -992,7 +1179,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
             let rows = st.query_map([serde_json::to_string(&ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
             let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
@@ -1021,7 +1208,7 @@ impl Store {
             _ => "r.created_at DESC, r.number DESC".to_owned(),
         };
         let names = among.map(|n| serde_json::to_string(&n).unwrap_or_default());
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(&format!(
                 "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
                         r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
@@ -1038,7 +1225,7 @@ impl Store {
     }
 
     pub async fn run(&self, id: String) -> anyhow::Result<Option<Run>> {
-        self.call(move |c| {
+        self.read(move |c| {
             Ok(c.query_row(
                 "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
                         r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
@@ -1058,13 +1245,13 @@ impl Store {
 
     /// The leg a CI rerun's kept leg keeps the result of (docs/ci.md W05-R17).
     pub async fn reused_from(&self, job: String) -> anyhow::Result<Option<String>> {
-        self.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&job], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+        self.read(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&job], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
     }
 
     /// A run's jobs; for a CI run, the legs of `attempt` (the current one when `None`, docs/ci.md
     /// W05-R17). v1's jobs have no job_id and no attempts.
     pub async fn jobs_at(&self, run_id: String, with_spec: bool, attempt: Option<i64>) -> anyhow::Result<Vec<Job>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1))) ORDER BY rowid"))?;
             let mut jobs: Vec<Job> =
                 st.query_map(params![run_id, attempt], row_job)?.collect::<Result<Vec<_>, _>>()?;
@@ -1080,7 +1267,7 @@ impl Store {
     }
 
     pub async fn job(&self, id: String) -> anyhow::Result<Option<Job>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let j = c.query_row(&format!("{JOB_SELECT} WHERE id = ?1"), [&id], row_job).optional()?;
             match j {
                 Some(mut j) => {
@@ -1097,7 +1284,7 @@ impl Store {
     /// dispatcher's, docs/ci.md §2.4). A run of a concurrency group waits while an older run of the
     /// group is active: one of a group runs at a time.
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(&format!(
                 "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND paused_at IS NULL AND NOT EXISTS (
                    SELECT 1 FROM runs r JOIN runs o ON o.concurrency_group = r.concurrency_group
@@ -1112,7 +1299,7 @@ impl Store {
 
     /// v1 jobs running (the CI engine's legs are its dispatcher's).
     pub async fn running_jobs(&self) -> anyhow::Result<Vec<Job>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare(&format!("{JOB_SELECT} WHERE status = 'running' AND job_id IS NULL"))?;
             Ok(st.query_map([], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1124,7 +1311,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare("SELECT 1 FROM jobs WHERE id = ?1 AND job_id IS NOT NULL")?;
             let mut out = std::collections::HashSet::new();
             for id in ids {
@@ -1357,13 +1544,13 @@ impl Store {
     /// Whether `run` is the CI engine's (it has a plan), finished or not: its jobs are legs, run
     /// again and stopped through the engine (docs/ci.md W26-R21).
     pub async fn is_engine_run(&self, run: String) -> anyhow::Result<bool> {
-        self.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plans WHERE run_id = ?1)", [&run], |r| r.get::<_, bool>(0))?)).await
+        self.read(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plans WHERE run_id = ?1)", [&run], |r| r.get::<_, bool>(0))?)).await
     }
 
     /// Jobs of run `run_id` as Pause and Resume see them (docs/ci.md W26-R22), either engine's: each
     /// named, and what it is, `None` for one that isn't the run's.
     pub async fn pause_targets(&self, run_id: String, jobs: Vec<String>) -> anyhow::Result<Vec<(String, Option<PauseTarget>)>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare_cached("SELECT key, status, agent, paused_at, job_id IS NOT NULL FROM jobs WHERE id = ?1 AND run_id = ?2")?;
             let mut out = Vec::with_capacity(jobs.len());
             for id in jobs {
@@ -1500,7 +1687,7 @@ impl Store {
     /// `cancel-in-progress`, every older run still active; without it, the older ones waiting, as the
     /// oldest active goes on and `new` waits for it ([`Store::queued_jobs`]).
     pub async fn superseded_in_group(&self, group: String, new: String, cancel_in_progress: bool) -> anyhow::Result<Vec<String>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM runs WHERE concurrency_group = ?1 AND id != ?2
                    AND status IN ('queued','running','pending') ORDER BY created_at, rowid",
@@ -1515,7 +1702,7 @@ impl Store {
     /// a person of some repositories, W10).
     pub async fn stats(&self, among: Option<Vec<String>>) -> anyhow::Result<serde_json::Value> {
         let among = among.map(|names| serde_json::to_string(&names).unwrap_or_default());
-        self.call(move |c| {
+        self.read(move |c| {
             let since = crate::util::now_unix() - 86_400;
             // `?2`: the repositories, or NULL for all of them.
             const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
@@ -1579,7 +1766,7 @@ impl Store {
     /// queue (W10), where the server's counts are everyone's.
     pub async fn queue_among(&self, names: Vec<String>) -> anyhow::Result<serde_json::Value> {
         let names = serde_json::to_string(&names)?;
-        self.call(move |c| {
+        self.read(move |c| {
             let (queued, running): (i64, i64) = c.query_row(
                 "SELECT COALESCE(SUM(j.status = 'queued'), 0), COALESCE(SUM(j.status = 'running'), 0) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
                  WHERE j.status IN ('queued', 'running') AND p.name IN (SELECT value FROM json_each(?1))",
@@ -1648,7 +1835,7 @@ impl Store {
     }
 
     pub async fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare(
                 "SELECT name, labels, slots, hostname, os, arch, version, ephemeral, connected,
                         last_seen, enrolled_at FROM agents ORDER BY connected DESC, COALESCE(label, name)",
@@ -1677,6 +1864,33 @@ impl Store {
         self.call(move |c| {
             c.execute("DELETE FROM agents WHERE name = ?1", [name])?;
             Ok(())
+        })
+        .await
+    }
+
+    /// The names machines' certificates carried before kiln knew them by their ids, each with its
+    /// machine id (docs/machines.md, "One record a machine").
+    pub async fn machine_names(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT name, machine_id FROM machine_names")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Machine `id` forgotten: the names its certificates carried go with it. Those names.
+    pub async fn forget_machine_names(&self, id: String) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            let names: Vec<String> = {
+                let mut st = t.prepare("SELECT name FROM machine_names WHERE machine_id = ?1 ORDER BY name")?;
+                let rows = st.query_map([&id], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            t.execute("DELETE FROM machine_names WHERE machine_id = ?1", [&id])?;
+            t.commit()?;
+            Ok(names)
         })
         .await
     }
@@ -1714,9 +1928,21 @@ impl Store {
     /// attempts, its insights, its preview removals, its reap policy, its grants, who enrolled it,
     /// and what kiln keeps for it under `prefixes` and its name (`front_door/`, …). What `to` has already wins over
     /// `from`'s; `to` ends with a row, one of its own (with `hostname`) when neither had one.
+    ///
+    /// `to` may have a row already: a second record of the same machine folding into its id
+    /// (docs/machines.md, "Duplicates fold into the machine's id"). Then the two merge: `to`'s row,
+    /// label, settings, policy and enrollment stay; the insights both kept for one hour add up
+    /// (kiln_ci's `Rollup::merge`, the runner's time summed); a grant both had is kept once.
     pub async fn move_runner(&self, from: String, to: String, label: String, hostname: String, prefixes: Vec<&'static str>) -> anyhow::Result<()> {
         self.call(move |c| {
             let t = tx(c)?;
+            merge_runner_insights(&t, &from, &to)?;
+            // A grant `to` has already isn't kept twice.
+            t.execute(
+                "DELETE FROM grants WHERE scope = 'runner:' || ?1 AND EXISTS (SELECT 1 FROM grants g WHERE g.scope = 'runner:' || ?2
+                   AND g.principal = grants.principal AND g.what = grants.what AND g.deny = grants.deny)",
+                params![from, to],
+            )?;
             t.execute("UPDATE OR IGNORE agents SET name = ?2 WHERE name = ?1", params![from, to])?;
             t.execute("DELETE FROM agents WHERE name = ?1", [&from])?;
             t.execute(
@@ -1725,6 +1951,15 @@ impl Store {
                  ON CONFLICT(name) DO UPDATE SET label = COALESCE(agents.label, excluded.label), machine_id = excluded.machine_id",
                 params![to, label, hostname, crate::util::now_unix()],
             )?;
+            // The name it went by is the machine's from now on: a runner whose certificate says it
+            // is keyed by the id as it connects (docs/machines.md, "One record a machine").
+            if crate::join::is_machine_key(&to) && !crate::join::is_machine_key(&from) {
+                t.execute(
+                    "INSERT INTO machine_names (name, machine_id, at) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET machine_id = excluded.machine_id",
+                    params![from, to, crate::util::now_unix()],
+                )?;
+            }
+            t.execute("UPDATE machine_names SET machine_id = ?2 WHERE machine_id = ?1", params![from, to])?;
             t.execute("UPDATE jobs SET agent = ?2 WHERE agent = ?1", params![from, to])?;
             for at in ["$.runner", "$.avoid"] {
                 t.execute(&format!("UPDATE jobs SET placement = json_set(placement, '{at}', ?2) WHERE json_extract(placement, '{at}') = ?1"), params![from, to])?;
@@ -1751,14 +1986,39 @@ impl Store {
         .await
     }
 
+    /// Job pods' records (ephemeral runners, `kiln agent --ephemeral`) kiln forgets: not
+    /// connected, not in `keep` (connected again, or still inside their reconnect grace), with no
+    /// job of theirs still pending, queued or running (docs/machines.md, "Finished job pods are
+    /// forgotten"). Their jobs, attempts and insights keep their names. The ones forgotten.
+    pub async fn forget_finished_pods(&self, keep: Vec<String>) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            let done: Vec<String> = {
+                let mut st = t.prepare(
+                    "SELECT name FROM agents WHERE ephemeral = 1 AND connected = 0
+                       AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.status IN ('pending', 'queued', 'running') AND jobs.agent = agents.name)
+                     ORDER BY name",
+                )?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?.into_iter().filter(|n| !keep.contains(n)).collect()
+            };
+            for name in &done {
+                t.execute("DELETE FROM agents WHERE name = ?1 AND ephemeral = 1 AND connected = 0", [name])?;
+            }
+            t.commit()?;
+            Ok(done)
+        })
+        .await
+    }
+
     /// The name people see for agent `name`, if it has one other than its name.
     pub async fn agent_label(&self, name: String) -> anyhow::Result<Option<String>> {
-        self.call(move |c| Ok(c.query_row("SELECT label FROM agents WHERE name = ?1", [name], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+        self.read(move |c| Ok(c.query_row("SELECT label FROM agents WHERE name = ?1", [name], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
     }
 
     /// Each agent's label, by name: those that have one.
     pub async fn agent_labels(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare("SELECT name, label FROM agents WHERE label IS NOT NULL")?;
             let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -1768,7 +2028,7 @@ impl Store {
 
     /// Each agent's machine, by name: those whose runner said it.
     pub async fn agent_machines(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        self.call(|c| {
+        self.read(|c| {
             let mut st = c.prepare("SELECT name, machine_id FROM agents WHERE machine_id IS NOT NULL")?;
             let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -1780,7 +2040,7 @@ impl Store {
 
     /// The value stored under `key`.
     pub async fn kv_get(&self, key: String) -> anyhow::Result<Option<String>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let v = c.query_row("SELECT v FROM kv WHERE k = ?1", [key], |r| r.get::<_, String>(0)).optional()?;
             Ok(v)
         })
@@ -1806,7 +2066,7 @@ impl Store {
 
     /// Every key starting with `prefix`, with its value, in key order.
     pub async fn kv_prefix(&self, prefix: String) -> anyhow::Result<Vec<(String, String)>> {
-        self.call(move |c| {
+        self.read(move |c| {
             // `prefix` matched literally: substr instead of LIKE, whose `%` and `_` are wildcards.
             let mut st = c.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
             let rows = st.query_map([prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -1852,6 +2112,41 @@ impl Store {
         })
         .await
     }
+}
+
+/// Runner `from`'s insights that `to` has for the same hour too, merged into `to`'s
+/// ([`Store::move_runner`] folding a second record of a machine into its id): its legs' rollups
+/// by kiln_ci's `Rollup::merge`, its connected, slot and busy seconds summed. What's left of
+/// `from`'s moves as before.
+fn merge_runner_insights(t: &Connection, from: &str, to: &str) -> anyhow::Result<()> {
+    let both: Vec<(i64, i64, String, String)> = {
+        let mut st = t.prepare(
+            "SELECT f.rowid, k.rowid, f.data, k.data FROM ci_rollups f JOIN ci_rollups k
+               ON k.grain = f.grain AND k.bucket = f.bucket AND k.repo_id = f.repo_id AND k.workflow = f.workflow
+              AND k.job = f.job AND k.step = f.step AND k.executor = f.executor AND k.runner = ?2
+             WHERE f.runner = ?1",
+        )?;
+        let rows = st.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (was, kept, theirs, ours) in both {
+        // One that doesn't read stays `to`'s as it is.
+        if let (Ok(theirs), Ok(mut ours)) = (serde_json::from_str::<kiln_ci::insights::Rollup>(&theirs), serde_json::from_str::<kiln_ci::insights::Rollup>(&ours)) {
+            ours.merge(&theirs);
+            t.execute("UPDATE ci_rollups SET data = ?2 WHERE rowid = ?1", params![kept, serde_json::to_string(&ours)?])?;
+        }
+        t.execute("DELETE FROM ci_rollups WHERE rowid = ?1", [was])?;
+    }
+    t.execute(
+        "UPDATE ci_runner_time SET
+           connected = connected + (SELECT f.connected FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket),
+           slot_seconds = slot_seconds + (SELECT f.slot_seconds FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket),
+           busy_seconds = busy_seconds + (SELECT f.busy_seconds FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket)
+         WHERE runner = ?2 AND bucket IN (SELECT bucket FROM ci_runner_time WHERE runner = ?1)",
+        params![from, to],
+    )?;
+    t.execute("DELETE FROM ci_runner_time WHERE runner = ?1 AND bucket IN (SELECT bucket FROM ci_runner_time WHERE runner = ?2)", params![from, to])?;
+    Ok(())
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
@@ -2086,6 +2381,50 @@ mod tests {
     use super::*;
     use crate::pipeline;
 
+    /// Goal 5, plan 01a1a59c2aae step 2: a store's reads take read-only connections of their own,
+    /// alongside its writer: a read sees each write committed before it, many run at once while a
+    /// write holds the writer, and one that would write is refused, in a file's store and in memory.
+    #[test]
+    fn g5_reads_run_beside_the_writer_and_never_write() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::rt::block_on(async move {
+            for s in [Store::open(&dir.path().join("kiln.db"))?, Store::in_memory()?] {
+                s.kv_set("k".into(), "one".into()).await?;
+                anyhow::ensure!(s.kv_get("k".into()).await?.as_deref() == Some("one"), "a read sees the write before it");
+                let refused = s.read(|c| Ok(c.execute("INSERT INTO kv (k, v) VALUES ('x', 'y')", [])?)).await;
+                anyhow::ensure!(refused.is_err(), "a read that writes is refused: {refused:?}");
+                s.call(|c| Ok(c.execute("INSERT INTO kv (k, v) VALUES ('x', 'y')", [])?)).await?;
+                anyhow::ensure!(s.kv_get("x".into()).await?.as_deref() == Some("y"), "the writer writes after a refused read");
+            }
+            // A file's: reads at once while the writer holds a transaction open, each seeing what was
+            // committed before it.
+            let s = Store::open(&dir.path().join("held.db"))?;
+            s.kv_set("k".into(), "before".into()).await?;
+            let (held_tx, held) = futures::channel::oneshot::channel::<()>();
+            let (go_tx, go) = std::sync::mpsc::channel::<()>();
+            let writer = s.call(move |c| {
+                let t = tx(c)?;
+                t.execute("UPDATE kv SET v = 'during' WHERE k = 'k'", [])?;
+                let _ = held_tx.send(());
+                let _ = go.recv_timeout(std::time::Duration::from_secs(30));
+                t.commit()?;
+                Ok(())
+            });
+            let readers = async {
+                let _ = held.await;
+                let reads: Vec<_> = (0..8).map(|_| s.kv_get("k".into())).collect();
+                let seen = futures::future::try_join_all(reads).await;
+                let _ = go_tx.send(());
+                seen
+            };
+            let (wrote, seen) = futures::join!(writer, readers);
+            wrote?;
+            anyhow::ensure!(seen?.iter().all(|v| v.as_deref() == Some("before")), "reads ran beside the open write, seeing what was committed");
+            anyhow::ensure!(s.kv_get("k".into()).await?.as_deref() == Some("during"), "and the write once committed");
+            anyhow::Ok(())
+        })
+    }
+
     #[test]
     fn a_repository_that_moves_adopts_its_new_remote() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -2279,6 +2618,124 @@ mod tests {
             s.set_agent_label(id.into(), "studio".into(), String::new()).await?;
             s.move_runner("adas-macbook-pro.local".into(), id.into(), "adas-macbook-pro.local".into(), String::new(), vec!["front_door/"]).await?;
             anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("studio"));
+            anyhow::Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Duplicates fold into the machine's id": a second record of a machine
+    /// moves into the id it already has a row under, and the two merge: the id's row, label,
+    /// settings and enrollment stay; the insights both kept for one hour add up; a grant both had
+    /// is kept once; the rest of the duplicate's moves; its row is gone.
+    #[test]
+    fn machines_a_second_record_merges_into_the_id_it_folds_into() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+            let row = |name: &str, slots: u32| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots,
+                hostname: "fedora.attlocal.net".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral: false,
+                connected: false,
+                last_seen: 5,
+                enrolled_at: 1,
+            };
+            s.upsert_agent(row(id, 32)).await?;
+            s.set_agent_label(id.into(), "kiln-a094a12d.attlocal.net".into(), String::new()).await?;
+            s.upsert_agent(row("fedora.attlocal.net", 4)).await?;
+            let rollup = |count: u64| serde_json::to_string(&kiln_ci::insights::Rollup { count, success: count, ..Default::default() });
+            let (two, three, five) = (rollup(2)?, rollup(3)?, rollup(5)?);
+            s.call(move |c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO ci_runner_time (bucket, runner, connected, slot_seconds, busy_seconds) VALUES (1, 'fedora.attlocal.net', 10, 40, 4), (1, '{id}', 20, 640, 8), (2, 'fedora.attlocal.net', 7, 28, 0);
+                     INSERT INTO ci_rollups (grain, bucket, repo_id, workflow, job, step, executor, runner, data) VALUES
+                       ('hour', 1, 'r', 'ci', 'build', '', 'baremetal', 'fedora.attlocal.net', '{two}'),
+                       ('hour', 1, 'r', 'ci', 'build', '', 'baremetal', '{id}', '{three}'),
+                       ('hour', 2, 'r', 'ci', 'build', '', 'baremetal', 'fedora.attlocal.net', '{five}');
+                     INSERT INTO grants (principal, what, scope, created_at, created_by) VALUES
+                       ('user:1', 'viewer', 'runner:fedora.attlocal.net', 1, 'ada'), ('user:1', 'viewer', 'runner:{id}', 1, 'ada'),
+                       ('user:2', 'viewer', 'runner:fedora.attlocal.net', 1, 'ada');
+                     INSERT INTO enrollments (machine, enrolled_by, at) VALUES ('fedora.attlocal.net', 'bob', 1), ('{id}', 'ada', 1);
+                     INSERT INTO kv (k, v) VALUES ('front_door/fedora.attlocal.net', 'theirs'), ('front_door/{id}', 'ours'), ('agent_limit/fedora.attlocal.net', '2');"
+                ))?;
+                Ok(())
+            })
+            .await?;
+            s.move_runner("fedora.attlocal.net".into(), id.into(), "fedora.attlocal.net".into(), String::new(), vec!["front_door/", "agent_limit/"]).await?;
+            let agents = s.agents().await?;
+            anyhow::ensure!(agents.len() == 1 && agents.iter().any(|a| a.name == id && a.slots == 32), "the id's row stays, the duplicate's is gone: {agents:?}");
+            anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("kiln-a094a12d.attlocal.net"), "the id's label stays");
+            let read = |sql: String| s.call(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, String>(0))?));
+            let count = |sql: String| s.call(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, i64>(0))?));
+            // The hour both had adds up; the hour only the duplicate had moves.
+            anyhow::ensure!(read(format!("SELECT connected || ',' || slot_seconds || ',' || busy_seconds FROM ci_runner_time WHERE runner = '{id}' AND bucket = 1")).await? == "30.0,680.0,12.0");
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM ci_runner_time WHERE runner = '{id}' AND bucket = 2")).await? == 1);
+            let merged: kiln_ci::insights::Rollup = serde_json::from_str(&read(format!("SELECT data FROM ci_rollups WHERE runner = '{id}' AND bucket = 1")).await?)?;
+            anyhow::ensure!(merged.count == 5 && merged.success == 5, "rolled up as one: {merged:?}");
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM ci_rollups WHERE runner = '{id}'")).await? == 2);
+            for table in ["ci_runner_time", "ci_rollups"] {
+                anyhow::ensure!(count(format!("SELECT COUNT(*) FROM {table} WHERE runner = 'fedora.attlocal.net'")).await? == 0, "{table}: none left");
+            }
+            // A grant both had is kept once; one only the duplicate had moves.
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}' AND principal = 'user:1'")).await? == 1);
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}' AND principal = 'user:2'")).await? == 1);
+            anyhow::ensure!(count("SELECT COUNT(*) FROM grants WHERE scope = 'runner:fedora.attlocal.net'".into()).await? == 0);
+            // The id's settings and enrollment win; what only the duplicate had set moves.
+            anyhow::ensure!(read(format!("SELECT enrolled_by FROM enrollments WHERE machine = '{id}'")).await? == "ada");
+            anyhow::ensure!(s.kv_get(format!("front_door/{id}")).await?.as_deref() == Some("ours"));
+            anyhow::ensure!(s.kv_get(format!("agent_limit/{id}")).await?.as_deref() == Some("2"));
+            anyhow::ensure!(s.kv_prefix("front_door/fedora".into()).await?.is_empty() && s.kv_get("agent_limit/fedora.attlocal.net".into()).await?.is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's not
+    /// connected and its jobs have ended; one whose job still runs, one connected, one the hub
+    /// keeps (inside its grace) and a machine's record stay. The pod's finished job keeps its name.
+    #[test]
+    fn machines_a_finished_job_pods_record_is_forgotten() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let row = |name: &str, ephemeral: bool, connected: bool| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 1,
+                hostname: name.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral,
+                connected,
+                last_seen: 5,
+                enrolled_at: 1,
+            };
+            for (name, ephemeral, connected) in [("kiln-done-1", true, false), ("kiln-busy-1", true, false), ("kiln-live-1", true, true), ("kiln-grace-1", true, false), ("box", false, false)] {
+                s.upsert_agent(row(name, ephemeral, connected)).await?;
+            }
+            s.call(|c| {
+                c.execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent) VALUES
+                       ('j1', 'r', 'build', 'build', 'succeeded', '[]', '[]', '{}', 'kiln-done-1'),
+                       ('j2', 'r', 'test', 'test', 'running', '[]', '[]', '{}', 'kiln-busy-1');
+                     PRAGMA foreign_keys = ON;",
+                )?;
+                Ok(())
+            })
+            .await?;
+            let gone = s.forget_finished_pods(vec!["kiln-grace-1".into()]).await?;
+            anyhow::ensure!(gone == ["kiln-done-1"], "{gone:?}");
+            let left: Vec<String> = s.agents().await?.into_iter().map(|a| a.name).collect();
+            for name in ["kiln-busy-1", "kiln-live-1", "kiln-grace-1", "box"] {
+                anyhow::ensure!(left.iter().any(|n| n == name), "{name} stays: {left:?}");
+            }
+            let agent = s.call(|c| Ok(c.query_row("SELECT agent FROM jobs WHERE id = 'j1'", [], |r| r.get::<_, String>(0))?)).await?;
+            anyhow::ensure!(agent == "kiln-done-1", "its job's history keeps its name");
+            anyhow::ensure!(s.forget_finished_pods(Vec::new()).await? == ["kiln-grace-1"], "once the hub keeps it no more");
             anyhow::Ok(())
         })
     }
