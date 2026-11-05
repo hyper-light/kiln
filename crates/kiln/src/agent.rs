@@ -394,7 +394,9 @@ enum Ev {
     Redial,
     Term(String, PtyOut),
     Up(Up),
-    Harness(String, crate::harness::core::Update),
+    /// A session's update, and when its session handed it on: when this runner took it in (goal 10, plan
+    /// 01a1a87b2dae step 5).
+    Harness(String, crate::harness::core::Update, Instant),
     /// The front door's status changed.
     FrontDoor,
     /// What headroom decides changed (docs/headroom.md).
@@ -1679,7 +1681,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
-    let (harness_tx, harness_rx) = crate::memory::queue::places::<(String, crate::harness::core::Update)>(&crate::memory::owners::CHANNELS, 8192);
+    // Each with when its session handed it on (`crate::harness::session::Taken`): its frame says how long this
+    // runner held it (`crate::wire::stamp`; goal 10, plan 01a1a87b2dae step 5).
+    let (harness_tx, harness_rx) = crate::memory::queue::places::<crate::harness::session::Taken>(&crate::memory::owners::CHANNELS, 8192);
     // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
     // the server has them, and sent again after a reconnect from where it has them, never whole.
     let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
@@ -1965,7 +1969,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = own_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
-            h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
+            h = harness_rx.recv().fuse() => match h { Ok(t) => Ev::Harness(t.session, t.update, t.at), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
             () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
             b = bg_rx.recv().fuse() => match b {
@@ -3689,10 +3693,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 updates_on = true;
                                 // Updates queued meanwhile go on their streams; those of sessions
                                 // whose stream starts now are in its snapshot.
-                                while let Ok((session, u)) = harness_rx.try_recv() {
+                                while let Ok(crate::harness::session::Taken { session, update: u, at }) = harness_rx.try_recv() {
                                     note_announced(&mut announced, &session, &u);
                                     if updates.started(&crate::wire::uplink::session_key(&session)) {
-                                        push_update(&mut updates, &session, &u, false, &mut sent_changes);
+                                        push_update(&mut updates, &session, &u, false, &mut sent_changes, Some(at));
                                     }
                                 }
                             } else {
@@ -4437,7 +4441,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Harness(session, u) => {
+            Ev::Harness(session, u, taken) => {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
@@ -4494,8 +4498,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         updates.start(&key);
                         opens = true;
                     }
-                    // A new session's Open is its stream's picture.
-                    push_update(&mut updates, &session, &u, opens, &mut sent_changes);
+                    // A new session's Open is its stream's picture. Its frames say how long this runner held it
+                    // (goal 10, plan 01a1a87b2dae step 5).
+                    push_update(&mut updates, &session, &u, opens, &mut sent_changes, Some(taken));
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
@@ -4837,8 +4842,10 @@ fn fit_changes(files: &[crate::harness::model::FileChange]) -> Option<String> {
 /// One agent-session update onto its session's channel stream, as the frames it needs: part of the
 /// picture its stream starts with (`picture`: its snapshot, a new session's Open), which goes
 /// whatever its size, or after it. A changeset goes as what changed in it where the server takes
-/// that (`sent`).
-fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges) -> usize {
+/// that (`sent`). `taken`: when this runner took it in (its session handed it on), for an update that
+/// came so: each of its frames says how long before it was made (`crate::wire::stamp`; goal 10, plan
+/// 01a1a87b2dae step 5). A stream's snapshot is the session as it stands, taken in before: it says none.
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges, taken: Option<Instant>) -> usize {
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
@@ -4850,7 +4857,17 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
         }
         _ => harness_frames(session, u),
     };
-    let bodies: Vec<Vec<u8>> = frames.into_iter().filter_map(|json| proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }).ok()).collect();
+    // Read once its frames are made: their making is this runner's time with it too.
+    let held = taken.map(|at| at.elapsed());
+    let bodies: Vec<Vec<u8>> = frames
+        .into_iter()
+        .filter_map(|mut json| {
+            if let Some(held) = held {
+                crate::wire::stamp::put(&mut json, held);
+            }
+            proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }).ok()
+        })
+        .collect();
     let bytes = bodies.iter().map(Vec::len).sum();
     if picture {
         for b in bodies {
@@ -4883,7 +4900,7 @@ fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &c
     // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
     let (mut bytes, mut newest, mut after) = (0, 0, 0);
     for u in &snapshot {
-        let n = push_update(updates, session, u, true, sent);
+        let n = push_update(updates, session, u, true, sent, None);
         bytes += n;
         match u {
             Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
@@ -5757,16 +5774,46 @@ mod tests {
         let key = crate::wire::uplink::session_key("s");
         let mut sent = SentChanges::default();
         updates.start(&key);
-        let bytes = push_update(&mut updates, "s", &history, true, &mut sent);
+        let bytes = push_update(&mut updates, "s", &history, true, &mut sent, None);
         assert!(bytes > crate::wire::uplink::ROOM, "{bytes} bytes");
-        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent);
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent, None);
         assert!(updates.take_stale().is_empty(), "its picture went whole");
         assert_eq!(updates.unanswered(), frames + 1, "the snapshot and what came after it");
         // As it was pushed before: held to the room, it goes stale part-way.
         let other = crate::wire::uplink::session_key("t");
         updates.start(&other);
-        push_update(&mut updates, "t", &history, false, &mut sent);
+        push_update(&mut updates, "t", &history, false, &mut sent, None);
         assert_eq!(updates.take_stale(), vec![other]);
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: an update this runner took in goes out saying how long it held it, in every
+    /// frame of it (a long one goes in parts), at least the time since its session handed it on, and each frame reads
+    /// as its part of the update once that's read off. A stream's snapshot, the session as it stands, says none.
+    #[test]
+    fn g10_s5_an_update_taken_in_says_how_long_the_runner_held_it() -> anyhow::Result<()> {
+        let mut updates = crate::wire::uplink::Updates::new("boot");
+        // The link up and the server's word in (it has nothing yet): what's pushed goes at the next poll.
+        updates.on_frame(crate::wire::channel::Frame::Have(Vec::new()));
+        let mut sent = SentChanges::default();
+        updates.start(&crate::wire::uplink::session_key("s"));
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(1, "as it stands".into())] }, true, &mut sent, None);
+        let long = Update::Events { events: (2..2000).map(|i| said(i, "x".repeat(2000))).collect() };
+        let parts = harness_frames("s", &long).len();
+        anyhow::ensure!(parts > 1, "{parts} part");
+        let held_for = Duration::from_millis(3);
+        let taken = Instant::now().checked_sub(held_for).ok_or_else(|| anyhow::anyhow!("no time 3 ms ago"))?;
+        push_update(&mut updates, "s", &long, false, &mut sent, Some(taken));
+        let mut said_held = Vec::new();
+        for f in updates.poll(Instant::now()) {
+            let crate::wire::channel::Frame::Item { body, .. } = f else { continue };
+            let Ok(AgentMsg::Harness { mut json, .. }) = proto::read_agent(&body) else { anyhow::bail!("not a session's update") };
+            said_held.push(crate::wire::stamp::take(&mut json));
+            anyhow::ensure!(matches!(serde_json::from_str::<Update>(&json), Ok(Update::Events { .. })), "its part of the update, once read off");
+        }
+        anyhow::ensure!(said_held.len() == 1 + parts, "{} frames", said_held.len());
+        anyhow::ensure!(said_held.first() == Some(&None), "the snapshot says none");
+        anyhow::ensure!(said_held.iter().skip(1).all(|h| h.is_some_and(|d| d >= held_for)), "each part at least {held_for:?}: {said_held:?}");
+        Ok(())
     }
 
     /// A file of a changeset with `lines` added lines, each about as long as a line of code.
@@ -5848,7 +5895,7 @@ mod tests {
             // The copy starts over (an Open on the stream): every file again.
             let mut updates = crate::wire::uplink::Updates::new("boot");
             updates.start(&crate::wire::uplink::session_key("s"));
-            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent);
+            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent, None);
             let again: Vec<crate::harness::model::FileChange> = sent.frames("s", &files, false).iter().filter_map(|f| match serde_json::from_str::<Update>(f) { Ok(Update::ChangesPatch { set, .. }) => Some(set), _ => None }).flatten().collect();
             anyhow::ensure!(again == files);
             Ok(())

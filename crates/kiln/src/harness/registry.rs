@@ -4937,7 +4937,7 @@ mod tests {
             for id in ids.clone() {
                 let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
                 crate::rt::spawn_spread(async move {
-                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None };
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None };
                     let mut n = 0u64;
                     while n < per {
                         let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
