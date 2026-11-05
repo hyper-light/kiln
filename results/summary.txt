@@ -1,0 +1,51 @@
+clippy exit 0
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+    |
+
+    |
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+    |
+
+     |
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+     |
+
+    |
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+    |
+
+   |
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+   |
+
+    Checking tracing-subscriber v0.3.23
+--
+    Checking tar v0.4.46
+    Checking postcard v1.1.3
+    Checking password-hash v0.6.1
+    Checking pbkdf2 v0.12.2
+    Checking icu_collator v2.3.1
+    Checking tungstenite v0.30.0
+    Checking vorpal-language v0.10.2 (/Users/runner/work/kiln/kiln/vendor/vorpal/crates/language)
+    Checking vorpal-kg v0.10.2 (/Users/runner/work/kiln/kiln/vendor/vorpal/crates/kg)
+    Checking flate2 v1.1.10
+    Checking icu_locale v2.3.1
+   Compiling rust-embed-impl v8.13.0
+    Checking rquickjs-core v0.14.0
