@@ -2228,8 +2228,9 @@ proptest! {
 }
 
 /// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
-/// after counts against it until the next sample, which then has it; a sample older than a minute
-/// leaves the runner's headroom unknown, placed as before samples were.
+/// after counts against it until the next sample, which then has it, or until it leaves; no clock
+/// ages a sample (SAMPLE_FRESH_MS's minute is gone from the engine, constants.md): it stands until
+/// the next, and a runner back on a new link is unknown until its first sample there.
 #[test]
 fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_next() {
     use super::state::{Headroom, Sample};
@@ -2249,8 +2250,21 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
     // The next sample has it in it: what's free is what the sample says.
     s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.65, 76) }, 11_000);
     assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
-    // A minute on with no sample, it's unknown again.
-    s.handle(Input::Tick, 11_000 + super::state::SAMPLE_FRESH_MS + 1);
+    // An hour on with no sample, it stands: nothing new was said.
+    s.handle(Input::Tick, 11_000 + 3_600_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // A leg placed after the sample counts until it ends, and no longer: nothing piles up while
+    // the runner says nothing new.
+    let more = LegIn { request: Resources { cpu: Cpus::whole(4), mem: 8 * GIB, ..Resources::default() }, ..leg("test", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(more)), 3_700_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "test")), "{c:?}");
+    assert!(near(s.headroom("adacachy"), 7.2, 40), "{:?}", s.headroom("adacachy"));
+    s.handle(Input::AttemptFinished { leg: "test".into(), attempt: 1, outcome: Outcome::Success }, 3_710_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // Its link lost and back: what it had in use was measured before it went; unknown until its
+    // first sample on the new link.
+    s.handle(Input::RunnerLost { runner: "adacachy".into() }, 3_720_000);
+    s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 3_730_000);
     assert_eq!(s.headroom("adacachy"), None);
     // A sample for a runner kiln doesn't know is nothing.
     s.handle(Input::RunnerSample { runner: "nowhere".into(), sample: sample(0.1, 1) }, 80_000);
@@ -2258,14 +2272,14 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
 }
 
 /// The scheduler's headroom, placement (W05): a leg goes to the runner its live sample leaves the
-/// most headroom after it, within the target use (85%); I/O pressure counts against a runner; a
-/// leg every runner with room would pass the target with waits, saying so, and goes once a sample
-/// shows room; once samples go stale, runners are placed as before them.
+/// most headroom after it, within the target use (a person's 85% here); I/O pressure counts
+/// against a runner; a leg every runner with room would pass the target with waits, saying so, and
+/// goes once a sample shows room; samples stand until the next (no clock ages them).
 #[test]
 fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
-    use super::state::{SAMPLE_FRESH_MS, Sample};
+    use super::state::{Sample, TargetUse};
     const GIB: u64 = 1 << 30;
-    let mut s = Scheduler::new(Config::default());
+    let mut s = Scheduler::new(Config { target_use: TargetUse::Set(0.85), ..Config::default() });
     for r in ["a", "b"] {
         s.handle(Input::RunnerUp(Box::new(linux(r, 8))), 0);
     }
@@ -2308,9 +2322,46 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
     let c = s.handle(Input::LegQueued(Box::new(asking("big", 1.0, 40))), 9_000);
     assert_eq!(to(&c, "big"), None, "{c:?}");
     assert!(matches!(s.reason("big"), Some(WaitReason::Headroom { target: 85, .. })), "{:?}", s.reason("big"));
-    // A minute on with no samples: placed as before them, by slots.
-    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + SAMPLE_FRESH_MS + 1);
-    assert!(to(&c, "fourth").is_some(), "{c:?}");
+    // An hour on with no samples, they stand: 30 CPUs more on 32 at 10% passes the target.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + 3_600_000);
+    assert_eq!(to(&c, "fourth"), None, "{c:?}");
+}
+
+/// The target use by default (constants.md, `TargetUse`): derived for each runner, not picked.
+/// CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
+/// Performance", 2010): 1/2 for one (M/M/1's R/ρ = S/(ρ(1-ρ)) is least at ρ = 1/2), rising with the
+/// CPUs as his table has it; memory to all the kernel says is available.
+#[test]
+fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
+    use super::state::{Headroom, Sample, TargetUse, knee};
+    const GIB: u64 = 1 << 30;
+    // Within √ε of it: R/ρ is flat at its least, so closer values of it compare equal.
+    assert!((knee(1) - 0.5).abs() < 1e-7, "{}", knee(1));
+    // M/M/2's in closed form: R/ρ = 1/(ρ(1-ρ²)) is least at ρ = 1/√3.
+    assert!((knee(2) - 1.0 / 3.0_f64.sqrt()).abs() < 1e-7, "{}", knee(2));
+    // The knees his Table 5 lists for these counts, here from Erlang's C, rounded to the percent.
+    for (m, pct) in [(4, 67), (8, 74), (16, 81), (32, 86), (64, 90), (128, 93)] {
+        assert_eq!((knee(m) * 100.0).round() as i64, pct, "{m} CPUs: {}", knee(m));
+    }
+    assert!((1..200).all(|m| knee(m) < knee(m + 1)), "more CPUs, a later knee");
+    let h = |cpus: u32, busy: f64, used: u64| Headroom::of(&Sample { cpus, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used * GIB, io_full: None });
+    let one = Resources { cpu: Cpus::whole(1), mem: GIB, ..Resources::default() };
+    // 32 CPUs at 84%: one more is 87%, past 32's knee (86%); at 82%, 85% is within it.
+    assert!(!h(32, 0.84, 8).within(&one, TargetUse::Derived));
+    assert!(h(32, 0.82, 8).within(&one, TargetUse::Derived));
+    // 4 CPUs at 50%: one more is 75%, past 4's knee (66%).
+    assert!(!h(4, 0.5, 8).within(&one, TargetUse::Derived));
+    // Memory to all that's available: 63 of 64 GiB in use, one more fits, two don't.
+    assert!(h(32, 0.1, 63).within(&one, TargetUse::Derived));
+    assert!(!h(32, 0.1, 64).within(&one, TargetUse::Derived));
+    // A person's setting is theirs, for both.
+    assert!(!h(32, 0.1, 63).within(&one, TargetUse::Set(0.85)));
+    // The wait says the strictest knee of the runners it would pass.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 8))), 0);
+    s.handle(Input::RunnerSample { runner: "a".into(), sample: Sample { cpus: 32, busy: 0.84, load1: 0.0, mem_total: 64 * GIB, mem_used: 8 * GIB, io_full: None } }, 1);
+    s.handle(Input::LegQueued(Box::new(LegIn { request: one, ..leg("x", "acme/x", 60) })), 2);
+    assert!(matches!(s.reason("x"), Some(WaitReason::Headroom { target: 86, .. })), "{:?}", s.reason("x"));
 }
 
 
@@ -2356,9 +2407,11 @@ fn a_declared_preference_comes_before_headroom_within_the_target() {
 /// the held leg starts there and its hold is done.
 #[test]
 fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
-    use super::state::Sample;
+    use super::state::{Sample, TargetUse};
     const GIB: u64 = 1 << 30;
-    let mut s = Scheduler::new(Config::default());
+    // A person's 85%, which its CPUs' arithmetic below is in (the hold works alike at a runner's
+    // derived target).
+    let mut s = Scheduler::new(Config { target_use: TargetUse::Set(0.85), ..Config::default() });
     for r in ["a", "b"] {
         s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
     }
@@ -2870,44 +2923,49 @@ fn w05_r31_interactive_goes_first_while_batch_holds_its_floor() {
 
 /// W05-AC15, docs/needs.md E2.3: a background leg under a steady stream of one-minute batch legs on
 /// 20 slots starts when a runner next frees, through its 5 % floor; with every floor at zero, at
-/// its 60-minute bound, promoted to batch, and a leg's time. Its standing names its class and the
-/// one it was promoted from.
+/// its bound, promoted to batch: the expected end of the batch work ahead of it when it came, by
+/// that work's history (its p90, a minute), else its declared timeout (5 minutes), where the
+/// picked 60 minutes stood (constants.md).
 #[test]
 fn w05_ac15_a_background_leg_under_a_batch_stream_starts_within_its_bound() {
-    use super::state::{Class, ClassConfig, default_classes};
+    use super::state::{ClassConfig, default_classes};
     for floors in [true, false] {
-        let classes = if floors { default_classes() } else { default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect() };
-        let mut sim = Sim::new(Config { classes, ..Config::default() });
-        for r in 0..4 {
-            sim.runner(0, linux(&format!("r{r}"), 5));
-        }
-        for i in 0..20 {
-            sim.leg(0, classed(&format!("batch0-{i}"), "acme/x", Class::Batch), MIN);
-        }
-        sim.leg(1, classed("bg", "acme/x", Class::Background), MIN);
-        for m in 1..90 {
-            for i in 0..20 {
-                sim.leg(m * MIN - 1, classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch), MIN);
-            }
-        }
-        sim.run(60 * MIN + MIN / 2);
-        if !floors {
-            let standing = sim.sched.standing("bg").map(|s| (s.class, s.promoted_from, s.tenant));
-            assert_eq!(standing, Some((Class::Batch, Some(Class::Background), vec!["acme/x".to_owned()])), "promoted at its bound");
-        }
-        sim.run(90 * MIN);
-        let waited = sim.started("bg").unwrap_or(i64::MAX) - 1;
+        let waited = background_under_batch(if floors { default_classes() } else { default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect() }, |l| LegIn { p90: Some(60_000), cost: Some(60_000), ..l });
         if floors {
             assert!(waited <= 2 * MIN, "with floors it waited {} s", waited / 1000);
         } else {
-            assert!((60 * MIN..=61 * MIN).contains(&waited), "without floors it waited {} s", waited / 1000);
+            assert_eq!(waited, MIN - 1, "without floors, as the batch work ahead was due done");
         }
     }
+    let cold = background_under_batch(default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect(), |l| LegIn { timeout: Some(300_000), ..l });
+    assert_eq!(cold, 5 * MIN - 1, "with no history, at the work ahead's declared timeout");
+}
+
+/// How long a background leg queued at 1 ms waits under a stream of one-minute batch legs filling
+/// 20 slots, each batch leg as `shape` makes it.
+fn background_under_batch(classes: std::collections::BTreeMap<super::state::Class, super::state::ClassConfig>, shape: impl Fn(LegIn) -> LegIn) -> i64 {
+    use super::state::Class;
+    let mut sim = Sim::new(Config { classes, ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..20 {
+        sim.leg(0, shape(classed(&format!("batch0-{i}"), "acme/x", Class::Batch)), MIN);
+    }
+    sim.leg(1, classed("bg", "acme/x", Class::Background), MIN);
+    for m in 1..90 {
+        for i in 0..20 {
+            sim.leg(m * MIN - 1, shape(classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch)), MIN);
+        }
+    }
+    sim.run(90 * MIN);
+    sim.started("bg").unwrap_or(i64::MAX) - 1
 }
 
 /// W05-R31: a class is promoted where it's passed over: batch legs starting all the while on CPU
-/// runners don't keep a batch leg waiting behind interactive GPU work from going up at its bound,
-/// where it takes the GPU runner at its tenant's turn.
+/// runners don't keep a batch leg waiting behind interactive GPU work from going up at its bound
+/// (the interactive leg running when it came, due done in a minute by its history), where it takes
+/// the GPU runner at its tenant's turn.
 #[test]
 fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
     use super::state::Class;
@@ -2920,7 +2978,7 @@ fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
     sim.runner(0, labelled("c0", "cpu", 2));
     sim.runner(0, labelled("g0", "gpu", 1));
     for m in 0..60 {
-        sim.leg((m * MIN - 1).max(0), on(classed(&format!("interactive{m}"), "acme/x", Class::Interactive), "gpu"), MIN);
+        sim.leg((m * MIN - 1).max(0), on(LegIn { p90: Some(60_000), ..classed(&format!("interactive{m}"), "acme/x", Class::Interactive) }, "gpu"), MIN);
         for i in 0..2 {
             sim.leg((m * MIN - 1).max(0), on(classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch), "cpu"), MIN);
         }
@@ -2928,7 +2986,56 @@ fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
     sim.leg(1, on(classed("gpu-batch", "acme/y", Class::Batch), "gpu"), MIN);
     sim.run(60 * MIN);
     let start = sim.started("gpu-batch").unwrap_or(i64::MAX);
-    assert!((30 * MIN..=31 * MIN).contains(&start), "the GPU batch leg started at {} s", start / 1000);
+    assert_eq!(start, MIN, "the GPU batch leg started at {} s", start / 1000);
+}
+
+/// W05-R31 (constants.md): a leg with nothing of the classes before its own ahead of it when it
+/// came has no bound yet (only its own class is ahead, which promotion isn't for), and isn't
+/// promoted; once such work comes its wait is from then, behind that work. A batch leg queued
+/// behind batch work alone, then a stream of land legs from 30 s (one a minute, a minute long, a
+/// minute's p90): with no floors it goes up as the land work ahead of it is due done, and starts
+/// within a few legs' time, where by class order alone it would wait out the stream.
+#[test]
+fn w05_r31_a_leg_with_nothing_ahead_waits_from_when_such_work_comes() {
+    use super::state::{Class, ClassConfig};
+    let classes = Class::ALL.into_iter().map(|c| (c, ClassConfig { floor: 0, bound: None })).collect();
+    let mut sim = Sim::new(Config { classes, ..Config::default() });
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, classed("busy", "acme/x", Class::Batch), MIN);
+    sim.leg(1, classed("b", "acme/y", Class::Batch), MIN);
+    for m in 0..60 {
+        sim.leg(m * MIN + 30_000, LegIn { p90: Some(60_000), ..classed(&format!("land{m}"), "acme/x", Class::Land) }, MIN);
+    }
+    sim.run(30_000);
+    assert_eq!(sim.sched.standing("b").map(|s| s.class), Some(Class::Batch), "nothing ahead of it yet: not promoted");
+    sim.run(70 * MIN);
+    let start = sim.started("b").unwrap_or(i64::MAX);
+    assert!((2 * MIN..=4 * MIN).contains(&start), "it started at {} s", start / 1000);
+}
+
+/// W05-R31: the measured bound promotes only a class passed over. Under the saturating land stream
+/// of the floor test above, with the land legs' history known (a minute's p90), batch, served by
+/// its floor all along, is never promoted: it keeps 15 % and no more (the classes don't merge).
+#[test]
+fn w05_r31_a_class_served_by_its_floor_is_not_promoted_by_its_measured_bound() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..400 {
+        sim.leg(0, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    for m in 0..70 {
+        for k in 0..25 {
+            sim.leg(m * MIN + 1, LegIn { p90: Some(60_000), cost: Some(60_000), ..classed(&format!("land{m}-{k}"), "acme/x", Class::Land) }, MIN);
+        }
+    }
+    sim.run(70 * MIN);
+    for w in (10..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!((0.13..=0.17).contains(&share), "window {w}–{}: batch got {share:.3}", w + 10);
+    }
 }
 
 /// W05-R30, R31, docs/needs.md E2.3: the routing explanation's standing names a leg's class, its

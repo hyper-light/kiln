@@ -19,14 +19,17 @@
 //!   passed, which that leg then sets to `now + its dominant share × its cost / (what was left of
 //!   the floor)`, rounded up, settled to the time it ran when it ends. Legs going to their best
 //!   runner go in class order.
-//! - Promotion (W05-R31): a queued leg is looked at a class's bound after it came to its class
-//!   (queued, or promoted): if a leg of its class started at its signature in the bound before,
-//!   it's looked at again a bound after that start; if none did, it goes up a class (background to
-//!   batch, batch to interactive), keeping its place in its tenant's order. Looks due by an
-//!   input's time are taken before the input. An `interactive` leg also goes up into `land` (with
-//!   its gang's queued `interactive` members) once none of the `land` and `critical` legs queued or
-//!   running when it came to its class waits any more, at the latest expected end of those still
-//!   running then, or then (an integration call on merging into main, for W28-R65's aging).
+//! - Promotion (W05-R31): a queued leg in a class with one above (background, batch, interactive)
+//!   has a bound: once none of the legs of the classes before its own queued or running when it
+//!   came to its class (queued, or promoted) waits any more, the latest expected end of those still
+//!   running then, or then, less when it came. With none of them queued or running when it came,
+//!   it has none until the first input after which one is: its wait starts at that input's time,
+//!   behind those. A person's bound for its class (`[sched.classes.<class>] bound`) is one too,
+//!   looked at a bound after it came to its class. At a look, if a leg of its class started at its
+//!   signature in the bound before, it's looked at again a bound after that start; if none did, it
+//!   goes up a class (background to batch, batch to interactive, interactive to land) with its
+//!   gang's queued members of its class, keeping its place in its tenant's order. Looks due by an
+//!   input's time are taken before the input.
 //! - Fair share's charge (docs/needs.md E2.1 to E2.4): a leg placed on a runner charges each node of
 //!   its tenant in its class's tree, in every set of dimensions, the largest over the set of its
 //!   share of each dimension of the fleet (what it holds there, one slot and its request or the
@@ -228,10 +231,22 @@ struct Queued {
     own: i128,
     arrival: u64,
     look: Option<i64>,
-    /// An `interactive` leg's: the `land` and `critical` legs queued or running when it came to
-    /// its class, those of them queued then that haven't started since, and, once none is left,
-    /// when it goes up into `land`.
-    ahead: Option<(BTreeSet<String>, BTreeSet<String>, Option<i64>)>,
+    /// In a class with one above: the legs of the classes before its own queued or running when
+    /// its wait began, those of them queued then that haven't started since, once none is left
+    /// when its bound is due, and when its wait began.
+    ahead: Option<Ahead>,
+}
+
+/// A queued leg's wait behind the classes before its own (W05-R31): those legs, those of them
+/// still to start, when its wait began; once none is left to start, when its bound was due, and
+/// when it's looked at next by that bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ahead {
+    legs: BTreeSet<String>,
+    waiting: BTreeSet<String>,
+    since: i64,
+    due: Option<i64>,
+    next: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +687,7 @@ impl Reference {
         self.unkept_fill(now);
         self.place(now);
         self.unkept_fill(now);
+        self.arm_ahead(now);
         self.ahead_due(now);
     }
 
@@ -731,72 +747,74 @@ impl Reference {
         Some(since + i64::try_from(bound).unwrap_or(i64::MAX / 2))
     }
 
-    /// Every look due by `now`, the earliest first: a leg whose class started a leg at its
-    /// signature in the bound before the look is looked at again a bound after that start; one
-    /// whose class started none there goes up a class.
+    /// Every look due by `now`, the earliest time first, every leg looked at then (by id) before
+    /// any of them takes its watch in its new class: a leg whose class started a leg at its
+    /// signature in its bound before the look is looked at again a bound after that start; one
+    /// whose class started none there goes up a class. Its bound: once the work ahead of it was
+    /// due done, the time from its wait's start to then; else its class's, if set.
     fn promote(&mut self, now: i64) {
+        let times = |q: &Queued| [q.look, q.ahead.as_ref().and_then(|a| a.next)];
         loop {
-            let due = self
-                .legs
-                .iter()
-                .filter_map(|(id, l)| if let At::Queued(q) = &l.at { [q.look, q.ahead.as_ref().and_then(|a| a.2)].into_iter().flatten().filter(|t| *t <= now).min().map(|t| (t, id.clone())) } else { None })
-                .min();
-            let Some((at, id)) = due else { return };
-            let Some(l) = self.legs.get(&id) else { return };
-            let At::Queued(q) = &l.at else { return };
-            let (class, sig) = (q.class, signature(&l.input));
-            // An `interactive` leg whose `land` work ahead is due done goes up into `land`, its
-            // gang's queued `interactive` members with it.
-            if q.ahead.as_ref().and_then(|a| a.2).is_some_and(|d| d <= at) {
+            let at = self.legs.values().filter_map(|l| if let At::Queued(q) = &l.at { times(q).into_iter().flatten().min() } else { None }).filter(|t| *t <= now).min();
+            let Some(at) = at else { return };
+            let ids: Vec<String> = self.legs.iter().filter(|(_, l)| matches!(&l.at, At::Queued(q) if times(q).contains(&Some(at)))).map(|(id, _)| id.clone()).collect();
+            let mut came: Vec<String> = Vec::new();
+            for id in ids {
+                let Some(l) = self.legs.get(&id) else { continue };
+                let At::Queued(q) = &l.at else { continue };
+                if !times(q).contains(&Some(at)) {
+                    continue;
+                }
+                let (class, sig) = (q.class, signature(&l.input));
+                let derived = q.ahead.as_ref().filter(|a| a.waiting.is_empty()).and_then(|a| a.due.filter(|d| *d <= at).map(|d| (d - a.since).max(0)));
+                let bound = derived.or_else(|| self.class_config(class).bound.map(|b| i64::try_from(b).unwrap_or(i64::MAX / 2)));
+                let (Some(bound), Some(up)) = (bound, class.up()) else {
+                    if let Some(At::Queued(q)) = self.legs.get_mut(&id).map(|l| &mut l.at) {
+                        q.look = q.look.filter(|t| *t != at);
+                        if let Some(a) = q.ahead.as_mut() {
+                            a.next = a.next.filter(|t| *t != at);
+                        }
+                    }
+                    continue;
+                };
+                if let Some(t) = self.served.get(&(sig, class)).copied().filter(|t| *t > at - bound) {
+                    // Served there: each look due now is taken again a bound after that start.
+                    if let Some(At::Queued(q)) = self.legs.get_mut(&id).map(|l| &mut l.at) {
+                        if q.look == Some(at) {
+                            q.look = Some(t + bound);
+                        }
+                        if let Some(a) = q.ahead.as_mut().filter(|a| a.next == Some(at)) {
+                            a.next = Some(t + bound);
+                        }
+                    }
+                    continue;
+                }
                 self.promoted += 1;
-                let look = self.look(Class::Land, at);
+                let look = self.look(up, at);
+                // A gang's members share a class (W05-R40): its queued members in that class go up
+                // with it.
                 for m in std::iter::once(id.clone()).chain(self.mates(&id)) {
                     if let Some(At::Queued(q)) = self.legs.get_mut(&m).map(|l| &mut l.at)
                         && q.class == class
                     {
-                        (q.class, q.look, q.ahead) = (Class::Land, look, None);
+                        (q.class, q.look, q.ahead) = (up, look, None);
+                        came.push(m);
                     }
                 }
-                continue;
             }
-            let bound = self.class_config(class).bound.map_or(0, |b| i64::try_from(b).unwrap_or(i64::MAX / 2));
-            let last = self.served.get(&(sig, class)).copied().filter(|t| *t > at - bound);
-            let up = class.up().unwrap_or(class);
-            let look = match last {
-                Some(t) => Some(t + bound),
-                None => self.look(up, at),
-            };
-            if last.is_none() {
-                self.promoted += 1;
-            }
-            let ahead = if last.is_none() { self.ahead_of(&id, up) } else { q.ahead.clone() };
-            if let Some(At::Queued(q)) = self.legs.get_mut(&id).map(|l| &mut l.at) {
-                if last.is_none() {
-                    q.class = up;
-                }
-                q.look = look;
-                q.ahead = ahead;
-            }
-            // A gang's members share a class (W05-R40): its queued members in that class go up with
-            // it.
-            if last.is_none() {
-                for m in self.mates(&id) {
-                    let ahead = self.ahead_of(&m, up);
-                    if let Some(At::Queued(q)) = self.legs.get_mut(&m).map(|l| &mut l.at)
-                        && q.class == class
-                    {
-                        q.class = up;
-                        q.look = look;
-                        q.ahead = ahead;
-                    }
-                }
-                // Come to `interactive` at the look: what of it is due already is due from then.
-                if up == Class::Interactive {
-                    self.ahead_due(at);
+            // Each come to its class at the look, all of them in it: what's ahead of it then, and
+            // what of that is due already is due from then.
+            for m in came {
+                let class = if let Some(At::Queued(q)) = self.legs.get(&m).map(|l| &l.at) { q.class } else { continue };
+                let ahead = self.ahead_of(&m, class, at);
+                if let Some(At::Queued(q)) = self.legs.get_mut(&m).map(|l| &mut l.at) {
+                    q.ahead = ahead;
                 }
             }
+            self.ahead_due(at);
         }
     }
+
 
     /// A gang's members other than `id`, if it's one's.
     fn mates(&self, id: &str) -> Vec<String> {
@@ -1037,49 +1055,63 @@ impl Reference {
         // A gang's members share a class (W05-R40): one queued while others wait joins theirs.
         let class = self.mates(id).into_iter().find_map(|m| if let Some(At::Queued(q)) = self.legs.get(&m).map(|x| &x.at) { Some(q.class) } else { None }).unwrap_or(class);
         let look = self.look(class, now);
-        let ahead = self.ahead_of(id, class);
+        let ahead = self.ahead_of(id, class, now);
         if let Some(l) = self.legs.get_mut(id) {
             l.at = At::Queued(Queued { class, own: own_order(l.input.priority, aging, now), arrival, look, ahead });
         }
     }
 
-    /// For a leg coming to `class`, if that's `interactive`: the other `land` and `critical` legs
-    /// queued or running now.
-    fn ahead_of(&self, id: &str, class: Class) -> Option<(BTreeSet<String>, BTreeSet<String>, Option<i64>)> {
-        (class == Class::Interactive).then(|| {
-            let legs: BTreeSet<String> = self
-                .legs
-                .iter()
-                .filter(|(other, l)| {
-                    other.as_str() != id
-                        && match &l.at {
-                            At::Queued(q) => q.class <= Class::Land,
-                            At::On { charged, .. } => charged.class <= Class::Land,
-                            At::Retrying { .. } | At::Off => false,
-                        }
-                })
-                .map(|(other, _)| other.clone())
-                .collect();
-            let waiting = legs.iter().filter(|a| matches!(self.legs.get(*a).map(|x| &x.at), Some(At::Queued(_)))).cloned().collect();
-            (legs, waiting, None)
-        })
+    /// For a leg coming to `class` at `since`, if a class is above it: the other legs of the
+    /// classes before it queued or running now (none: its wait hasn't begun).
+    fn ahead_of(&self, id: &str, class: Class, since: i64) -> Option<Ahead> {
+        class.up()?;
+        let legs: BTreeSet<String> = self
+            .legs
+            .iter()
+            .filter(|(other, l)| {
+                other.as_str() != id
+                    && match &l.at {
+                        At::Queued(q) => q.class < class,
+                        At::On { charged, .. } => charged.class < class,
+                        At::Retrying { .. } | At::Off => false,
+                    }
+            })
+            .map(|(other, _)| other.clone())
+            .collect();
+        let waiting = legs.iter().filter(|a| matches!(self.legs.get(*a).map(|x| &x.at), Some(At::Queued(_)))).cloned().collect();
+        Some(Ahead { legs, waiting, since, due: None, next: None })
+    }
+
+    /// Each queued leg with nothing of the classes before its own ahead of it yet, once some is
+    /// queued or running: its wait starts now, behind that.
+    fn arm_ahead(&mut self, now: i64) {
+        let unarmed: Vec<(String, Class)> = self.legs.iter().filter_map(|(id, l)| if let At::Queued(Queued { class, ahead: Some(a), .. }) = &l.at { a.legs.is_empty().then(|| (id.clone(), *class)) } else { None }).collect();
+        for (id, class) in unarmed {
+            let Some(ahead) = self.ahead_of(&id, class, now).filter(|a| !a.legs.is_empty()) else { continue };
+            if let Some(At::Queued(q)) = self.legs.get_mut(&id).map(|l| &mut l.at) {
+                q.ahead = Some(ahead);
+            }
+        }
     }
 
     /// A leg placed: no `interactive` leg's wait counts it as waiting any more.
     fn ahead_started(&mut self, leg: &str) {
         for l in self.legs.values_mut() {
-            if let At::Queued(Queued { ahead: Some((_, waiting, _)), .. }) = &mut l.at {
-                waiting.remove(leg);
+            if let At::Queued(Queued { ahead: Some(a), .. }) = &mut l.at {
+                a.waiting.remove(leg);
             }
         }
     }
 
-    /// Each queued `interactive` leg none of whose `land` work ahead waits any more, with no time
-    /// set yet: it goes up at `now` or the latest expected end of that work still running.
+    /// Each queued leg none of whose work ahead waits any more, with no time set yet: its bound is
+    /// due at `now` or the latest expected end of that work still running.
     fn ahead_due(&mut self, now: i64) {
         let mut set: Vec<(String, i64)> = Vec::new();
         for (id, l) in &self.legs {
-            let At::Queued(Queued { ahead: Some((legs, waiting, None)), .. }) = &l.at else { continue };
+            let At::Queued(Queued { ahead: Some(Ahead { legs, waiting, due: None, .. }), .. }) = &l.at else { continue };
+            if legs.is_empty() {
+                continue;
+            }
             // Each queued when it came has started since or left; and none is queued now (one lost
             // and queued again waits again).
             if !waiting.is_empty() && waiting.iter().any(|a| matches!(self.legs.get(a).map(|x| &x.at), Some(At::Queued(_)))) {
@@ -1092,9 +1124,9 @@ impl Reference {
             set.push((id.clone(), due));
         }
         for (id, due) in set {
-            if let Some(At::Queued(Queued { ahead: Some((_, waiting, d)), .. })) = self.legs.get_mut(&id).map(|l| &mut l.at) {
-                waiting.clear();
-                *d = Some(due);
+            if let Some(At::Queued(Queued { ahead: Some(a), .. })) = self.legs.get_mut(&id).map(|l| &mut l.at) {
+                a.waiting.clear();
+                (a.due, a.next) = (Some(due), Some(due));
             }
         }
     }

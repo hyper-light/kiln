@@ -274,7 +274,9 @@ pub struct ClassSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub floor: Option<f64>,
     /// How long one of its items waits, its class starting nothing where it would run, before it's
-    /// promoted a class (`90s`, `30m`, `6h`), or `never`.
+    /// promoted a class (`90s`, `30m`, `6h`), or `never`: a person's, none by default. Each item
+    /// has a measured bound besides, the expected end of the higher-class work ahead of it (docs/ci.md
+    /// W05-R31), which `never` doesn't turn off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound: Option<String>,
 }

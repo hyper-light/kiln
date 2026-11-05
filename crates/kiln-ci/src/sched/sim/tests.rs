@@ -4,7 +4,12 @@ use super::replay::rng::Rng;
 use super::{Machine, Sim};
 use crate::facts::RunnerFacts;
 use crate::sched::routing::{LegRoute, RunnerView};
-use crate::sched::state::{Config, Cpus, LegIn, Resources, RunnerIn, TARGET_USE};
+use crate::sched::state::{Config, Cpus, LegIn, Resources, RunnerIn, TargetUse};
+
+/// The target use these fleets are held to: main's 0.85, set as a person would, since the waits
+/// they're held to were measured through main's engine (861bbe60) at it. By default the target is
+/// derived for each runner (`TargetUse::Derived`, constants.md).
+const TARGET_USE: f64 = 0.85;
 use crate::sched::units;
 
 const GIB: u64 = 1 << 30;
@@ -68,7 +73,7 @@ fn legs(seed: u64, from: i64, until: i64) -> Vec<(i64, LegIn, i64)> {
 /// The fleet up, each runner sampling itself once it's up, the fleet's samples spread over the
 /// period: legs may come from [`SAMPLE_MS`] on.
 fn fleet() -> Sim {
-    let mut sim = Sim::new(Config::default());
+    let mut sim = Sim::new(Config { target_use: TargetUse::Set(TARGET_USE), ..Config::default() });
     for (i, &(name, cpus, gib, own_cpu, own_gib, io_full)) in FLEET.iter().enumerate() {
         sim.runner(0, runner(name, cpus, gib));
         let first = i as i64 * SAMPLE_MS / FLEET.len() as i64;

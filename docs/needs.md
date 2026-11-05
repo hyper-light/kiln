@@ -212,10 +212,13 @@ tenant's own order.
   item never preempts (§7). A class being served isn't: there the order stays fair share's and its
   tenants' own, never the longest wait's (promoting every item that waited lifted a saturated
   class's own backlog past other tenants). With the classes' floor shares, that bounds every
-  class's wait twice over. *Integration call (merging into main, to confirm with the person):* an
-  `interactive` item also goes up into `land`, never `critical`, once the `land` and `critical` work
-  queued or running when it came has started and is due done by its expected ends (p90 from history,
-  else median, else its timeout), so it has a bounded wait with no picked bound, history or none.
+  class's wait twice over. An item's bound is measured, not picked: once the work of the classes
+  before its own queued or running when it came has started, the latest of its expected ends (p90
+  from history, else median, else its timeout), so it has a bounded wait history or none; with none
+  such when it came, its wait counts from when such work first comes (promotion isn't for waiting
+  behind one's own class). `interactive` goes up into `land`, never `critical`. *Integration call
+  (merging into main, to confirm with the person)* for `interactive`; for every class (lb/constants),
+  in place of the picked 30 minutes for `batch` and 60 for `background`.
 - **Aging never orders tenants against each other.** There it would only measure who came first:
   today's key does that, which is why its fair share holds only within a minute.
 
@@ -286,13 +289,14 @@ sessions' from what runners measured them using. They give work that asks for no
 | `background` | schedules, simulations, prewarming, reclaimed room | no | always |
 
 Classes go strictly in order, except that each has a **floor share** of capacity it gets whenever it
-has work (by default 5 % for `background`, 15 % for `batch`), and a class passed over for its bound
-has its items promoted (§5), so no class starves another. A class short of its floor goes ahead
+has work (by default 5 % for `background`, 15 % for `batch`, E-D2), and an item whose class is passed
+over for its measured bound is promoted (§5), so no class starves another. A class short of its floor goes ahead
 with an item that keeps it within its floor, and with one that would take it over (a floor smaller
 than an item) as often as its floor of the fleet's time allows: on one slot, 15 % is the slot 15 %
 of the time. *Integration call (merging into main, to confirm with the person):* `interactive`,
-which has no floor or bound by default, is promoted into `land` once the `land` work ahead of it is
-due done (§5), in place of the aging between priorities (W28-R65) main had; it preempts nothing.
+which has no floor by default, is promoted into `land` once the `land` work ahead of it is due done
+(§5), in place of the aging between priorities (W28-R65) main had; it preempts nothing. Every class
+below it is promoted alike, by the work of the classes before it.
 W05-R09's default priorities map onto classes (a manual run `interactive`, a land `land`, pushes,
 pull requests and agents' runs `batch`, schedules `background`) and keep ordering, with their aging,
 a tenant's own work within its class.

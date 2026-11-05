@@ -4117,10 +4117,11 @@ fn work_slots(a: &crate::hub::AgentLive) -> u32 {
     if a.skew.takes_work() { a.slots } else { 0 }
 }
 
-/// `[ci.scheduler] target_use` as placement takes it (W05): within (0, 1], else the default; past
-/// 1 a runner would be filled past all it has.
-pub(crate) fn target_use(s: &crate::config::ci::Scheduler) -> f64 {
-    if s.target_use > 0.0 && s.target_use <= 1.0 { s.target_use } else { kiln_ci::sched::state::TARGET_USE }
+/// `[ci.scheduler] target_use` as placement takes it (W05): a person's share within (0, 1]; else,
+/// unset or past 1 (a runner would be filled past all it has), derived for each runner
+/// (`kiln_ci::sched::state::TargetUse`).
+pub(crate) fn target_use(s: &crate::config::ci::Scheduler) -> kiln_ci::sched::state::TargetUse {
+    s.target_use.filter(|t| *t > 0.0 && *t <= 1.0).into()
 }
 
 /// What the engine weighs of a runner's sample: its CPUs, the share of them busy, its load and
