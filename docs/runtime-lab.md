@@ -30,6 +30,7 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_scheduler_overrun_seconds{shard}` | How late the shard's steps ran after its waits, as the shard measured it: the host descheduling it, decaying as it recovers. |
 | `kiln_shard_held_polls_total{shard,site,label}`, `kiln_shard_held_seconds_total{...}`, `kiln_shard_held_longest_seconds{...}` | What held the shard: every poll past 100 µs (`hyper_rt::slow::SLOW_POLL_NS`, a tenth of goal 9's bar), counted against the spawn site of its task (`#[track_caller]`, `file:line:column`) and the label its code set (`label`: an HTTP request's route, as `read /api/harness/sessions`; `crate::route_latency::label_of`), with their holds added up and the longest. Each shard keeps its own table (`hyper_rt::slow`), which only it writes; `/metrics` reads it without a lock. |
 | `kiln_shard_held_host_polls_total{shard,site,label}`, `kiln_shard_held_host_seconds_total{...}` | Of those polls, the ones the host held, and their time: the shard's thread runnable and off the CPU (preempted), as hyper-rt attributes a poll past twice the step quantum (`hyper_rt::attribution`), so a shorter one is never among them. What no code held, and cores of its own would (goal 9, plan 01a1a87b2cec steps 3 and 4); the lab's report gives each site and label's share. |
+| `kiln_shard_held_cpu_polls_total{shard,site,label}`, `kiln_shard_held_cpu_held_seconds_total{...}`, `kiln_shard_held_cpu_seconds_total{...}`, `kiln_shard_held_longest_cpu_seconds{...}` | Of those polls, the ones whose shard's thread said its time on the CPU, their holds, that time, and the longest any ran on the CPU (goal 9's step 3): the shard thread's run time from a self-monitoring perf event's page, read with no system call as each poll starts (hyper-rt's `task_clock`; Linux on x86-64 and arm64, where the event can be opened). A hold less its time on the CPU was off it: the host's, or a call that blocked. |
 | `kiln_shard_steps_total{shard}`, `kiln_shard_parks_total{shard}`, `kiln_shard_parks_withdrawn_total{shard}` | What each request costs a shard beside its polls (goal 9, plan 01a1a87b2cec step 5; `crate::shard_health::Wakes`): its loop's steps; its parks that waited in its driver, each a system call and a sleep; and those withdrawn, an inbox already holding work, which cost neither. |
 | `kiln_shard_wakeups_total{shard,by}` | Its parks by what ended them: `kick` (another thread's wake or message: the driver's kick, one a park however many senders), `io` (a socket's readiness, a completion), `timer` (the deadline it waited for, or a signal). |
 | `kiln_shard_wakes_taken_total{shard}`, `kiln_shard_wakes_sent_total{shard,to}` | Wakes from other threads the shard took in (bits drained: a task's wakes before it runs are one), and the wakes its own thread made through tasks' wakers (a channel's send, a broadcast's subscribers, a cell's publisher): `to="own"` to its own tasks, `to="other"` to other shards'. |
@@ -1174,8 +1175,12 @@ tens of microseconds (`shard_health`), so that much of its hold was the host's, 
 the host may hold any poll as long (g9p6 on fedora, at a load of 23 to 45: the probes' polls held up to
 5.3 ms calm and 18.9 ms with hogs). Then a row a path, with where its longest poll was, the rounds past
 (and past the probe's), its polls past 100 µs a second and the share of their time the host was found to
-hold (preempted: step 4's, not the code's); then what else passed the quantum. Rounds of a build from
-before the gauge, or held to another quantum:
+hold (preempted: step 4's, not the code's); then what else passed the quantum. Where the shards say their
+time on the CPU (`kiln_shard_held_cpu_*`), the first line also says whether any listed path's poll ran
+past the quantum on the CPU, kiln's code alone with the host's time left out, and each row its longest on
+the CPU; and the tables of what held the shards say what share of their holds was on the CPU (kiln's) and
+what share off it (the host's, or a call that blocked). Rounds of a build from before the gauge, or held
+to another quantum:
 
 ```sh
 kiln-lab report --quantum-us 266.666 <run>/run.json
