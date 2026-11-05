@@ -71,6 +71,19 @@ macro_rules! bp_struct {
             }
         }
 
+        impl $crate::wire::Fields for $name {
+            fn fields(&self) -> ::std::vec::Vec<$crate::wire::Bytes> {
+                vec![ $( $crate::wire::Bytes($crate::wire::to_bytes(&self.$f)), )+ ]
+            }
+            fn from_fields(fields: &[$crate::wire::Bytes]) -> ::core::result::Result<Self, $crate::wire::Refusal> {
+                let mut it = fields.iter();
+                ::core::result::Result::Ok(Self { $( $f: match it.next() {
+                    ::core::option::Option::Some(b) if !b.0.is_empty() => $crate::wire::from_bytes::<$t>(&b.0)?,
+                    _ => ::core::default::Default::default(),
+                }, )+ })
+            }
+        }
+
         impl $crate::wire::Body for $name {
             fn put_body(&self, w: &mut $crate::wire::Writer, version: u32) {
                 $(

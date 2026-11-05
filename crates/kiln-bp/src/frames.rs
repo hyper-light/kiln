@@ -480,6 +480,7 @@ macro_rules! kinds {
         pub fn registry() -> Registry {
             let mut reg = Registry::default();
             $( <$body as Wire>::visit(&mut reg); )+
+            crate::records::visit(&mut reg);
             reg
         }
     };

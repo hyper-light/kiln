@@ -142,6 +142,22 @@ fn render_struct(out: &mut String, name: &str, fields: &[Field], body: bool) {
     }
     let _ = writeln!(out, "  return {{ {} }};", object(fields));
     let _ = writeln!(out, "}}");
+    if crate::records::RECORDS.contains(&name) {
+        // A record a topic carries field by field: each field its own encoding, empty for its default.
+        let _ = writeln!(out, "export function fromFields{name}(f: Uint8Array[]): {name} {{");
+        for (i, fd) in fields.iter().enumerate() {
+            let _ = writeln!(out, "  const {} = f[{i}] !== undefined && f[{i}]!.length > 0 ? ((r: Reader) => {})(new Reader(f[{i}]!)) : {};", fd.name, take(&fd.ty), default(&fd.ty));
+        }
+        let _ = writeln!(out, "  return {{ {} }};", object(fields));
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out, "export function toFields{name}(v: {name}): Uint8Array[] {{");
+        let _ = writeln!(out, "  const out: Uint8Array[] = [];");
+        for fd in fields {
+            let _ = writeln!(out, "  {{\n    const w = new Writer();\n    {};\n    out.push(w.bytesOut());\n  }}", put(&fd.ty, &format!("v.{}", fd.name), 0));
+        }
+        let _ = writeln!(out, "  return out;");
+        let _ = writeln!(out, "}}");
+    }
     if body {
         // As a frame's body: written for the peer's version, read tolerantly.
         let _ = writeln!(out, "export function put{name}Body(w: Writer, v: {name}, version: number): void {{");

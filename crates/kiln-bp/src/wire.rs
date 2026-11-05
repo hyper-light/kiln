@@ -261,6 +261,29 @@ pub trait Wire: Sized {
 /// byte UTF-8.
 pub const ALPHABET: [char; 13] = ['a', 'b', 'z', '0', '9', ' ', '"', '\\', '\n', '\u{1}', 'é', '中', '😀'];
 
+/// A record a topic carries field by field (docs/browser-protocol.md, "Changes"): each field its
+/// own encoding, so the generic core merges and keeps them without the type, and a delta carries
+/// only the fields that changed.
+pub trait Fields: Sized {
+    fn fields(&self) -> Vec<Bytes>;
+    /// The record from its fields; a missing or empty one is its type's default.
+    fn from_fields(fields: &[Bytes]) -> Result<Self, Refusal>;
+}
+
+/// What changed from `old` to `new`, field by field: the mask of the fields that differ and their
+/// new encodings (a `Patch`'s or `Set`'s).
+pub fn diff(old: &[Bytes], new: &[Bytes]) -> (Bits, Vec<Bytes>) {
+    let mut mask = 0u64;
+    let mut out = Vec::new();
+    for (i, f) in new.iter().enumerate().take(64) {
+        if old.get(i) != Some(f) {
+            mask |= 1u64 << i;
+            out.push(f.clone());
+        }
+    }
+    (Bits(mask), out)
+}
+
 /// A frame's body: read tolerantly (missing trailing fields default, newer ones are counted),
 /// written for the version the peer speaks (fields newer than it left off).
 pub trait Body: Wire + Default {

@@ -2267,6 +2267,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-bp",
  "kiln-cd",
  "kiln-ci",
  "kiln-http",

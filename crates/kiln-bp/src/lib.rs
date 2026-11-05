@@ -13,6 +13,7 @@
 //! | [`schema`] | every type as data: what the TypeScript codec is made from, and the schema hash |
 //! | [`frames`] | the frame kinds, their bodies, the envelope, reading a message |
 //! | [`join`] | fragments cut and joined |
+//! | [`records`] | the records kiln's live topics carry, field by field |
 //! | [`samples`] | one or more frames of every kind, for tests and the shared vectors |
 //! | [`fuzz`] | seeded inputs made the same way in Rust and TypeScript |
 //! | [`rng`] | SplitMix64, as kiln-sim draws it |
@@ -38,6 +39,7 @@ pub mod join;
 pub mod liveness;
 mod macros;
 pub mod rng;
+pub mod records;
 pub mod samples;
 pub mod schema;
 pub mod server;
