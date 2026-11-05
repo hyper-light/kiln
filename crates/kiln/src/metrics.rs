@@ -1218,6 +1218,7 @@ pub fn render() -> String {
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
+    crate::placement::render(&mut o);
 
     let samples = agent_samples().load();
     if !samples.is_empty() {

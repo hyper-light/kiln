@@ -592,6 +592,194 @@ Still on the hot path, listed so (`todo`): reach's relay (`reach`), each relayed
 loop; and a live job's files (`logs.rs`'s `files`), one per job, its writers' alone. Inside Quiver
 (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
+## Goal 7: placement
+
+Goal 7 of the API runtime program (plan `01a1a59c2aea73e487fb6fcfe90c5fcc`, research
+`01a1a59c2aeb70e9824606865d6762ca`) built three more ways for the server to place its work on kiln-rt's
+shards beside today's. `[server] placement` picks one, and `KILN_RT_PLACEMENT` overrides it, so each runs
+from the setting alone, with no rebuild (`crate::placement`):
+
+| placement | a new connection | a request on a connection | a held shard's queued work |
+| --- | --- | --- | --- |
+| `round-robin` (main before goal 7) | the next shard in turn, past one the watchdog sees held | in its connection's task | spawns not yet admitted go to another shard (goal 6) |
+| `steer` | the less delayed of two shards drawn at random, held ones passed over | on its connection's shard, unless one other drawn at random is less delayed by more than a step quantum (250 µs), or its own shard is held | as `round-robin` |
+| `steal` | as `round-robin` | a movable task (`hyper_rt::movable`) queued on its connection's shard, which an idle shard takes half of a busy one's queue of | the watchdog hands it to the shared queues and kicks a parked shard |
+| `both` | as `steer` | as `steal` | as `steal` |
+
+- **A shard's delay** is goal 1's probe's: how late its latest probe ran, or how overdue its next one is
+  (`crate::shard_health::delay_now`), so a shard held right now shows before its probe runs again.
+- **A request is weighed against its own shard** and one other drawn at random, not two drawn afresh: moving
+  it costs a hop each way between threads, worth paying only for a wait longer than the step quantum, the
+  least wait goal 6 takes as a queue (`crate::overload`). Drawing at random, rather than taking the least
+  delayed of all, keeps placers acting on the same stale reading from piling onto one shard (research f10).
+- **Movable tasks** (kiln-rt's `movable.rs`, ORIGIN.md) are reference-counted headers beside the arena's
+  pinned tasks, their waker the header itself. Each shard keeps a first-in, first-out queue of its own per
+  class (crossbeam-deque), bounded at its poll batch, the older half moving to a shared queue when full; an
+  idle shard takes from the shared queues and then half a sibling's queue, at most half the shards looking at
+  once; a push behind another task kicks a parked sibling while none looks (Tokio's layout, f14 to f16). A
+  carrier task per class polls a shard's movable tasks, each once a turn until its share is used, so a
+  movable task's yield is one turn of a round, as hyper-rt's is (f13). Sockets and timers stay on their
+  shard: a movable task's waits go through a helper task on the shard each began on (`crate::rt::Bridge`,
+  `crate::rt::native`).
+- **WebSockets** are placed with their upgrade request: a socket's task is spawned where that request's
+  handler ran. A viewer's heavy messages, its catch-ups, are made off the shards (the blocking pool, goal 3)
+  from state its session's owner keeps (goal 4), so none is heavy on the socket's shard.
+- `/metrics` says what was placed how (`kiln_placement_total{how}`: `steered`, `local`, `moved`, `movable`,
+  `refused`) and what the movable tasks did (`kiln_rt_movable_*`: spawned, polls, stolen, taken from the
+  shared queues, overflowed, handed off by the watchdog, parked shards kicked).
+
+### The rule, written before the runs (2026-11-04)
+
+The default is the placement that gives people's requests the best p99 under CPU hogs in the production-like
+layout, without losing throughput or CPU per request beyond noise:
+
+1. **The deciding run** is the production-like layout with hogs: the server alone in a cgroup of its own at
+   `cpu.weight` 1000 (`kiln.slice`'s, docs/priority.md), as many busy loops as the lab's CPUs in another at
+   `cpu.weight` 1, the lab and its runners in a third at the default weight, all on the lab's CPUs.
+2. **People's requests** are the lab's `page` (a person's pages: kiln's Critical class) and `api_write`
+   (messages to agents and agents' MCP calls: what stands in for a person's actions; the lab sends them with
+   a token, so kiln serves them as Normal).
+3. **A placement qualifies** when, against `round-robin` in the deciding run (`kiln-lab compare` of the two
+   placements' rounds, every number held together at 95%, Bonferroni):
+   - `page.p99_ms` or `api_write.p99_ms` is better beyond noise, and neither is worse beyond noise;
+   - no throughput (`page`, `api_read`, `api_write`, `websocket` and `attach` `.per_s`) and not
+     `server.cpu_ms_per_request` is worse beyond noise.
+4. **The winner** is the qualifying placement whose two p99s improved most against `round-robin`, by the
+   mean of their relative changes. When none qualifies, `round-robin` stays the default.
+5. The shared layout and calm are run and reported beside it; a placement worse beyond noise there in
+   people's p99s is named, but they don't change the pick: production runs the production-like layout.
+
+### Running it
+
+On a Linux machine with systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
+
+```sh
+mkdir -p ~/.cache/g7-lab/bin && cp scripts/placement_lab/*.sh scripts/placement_lab/merge.py ~/.cache/g7-lab/
+cp target/release/kiln target/release/kiln-lab ~/.cache/g7-lab/bin/
+systemd-run --user --unit=g7-lab --collect -E HOME="$HOME" -E PATH="$PATH" \
+  env ROUNDS=6 N=16 CPUS=16-31 ~/.cache/g7-lab/driver.sh
+~/.cache/g7-lab/report.sh      # once runs/DONE is there: the tables and the comparisons
+```
+
+`driver.sh` runs every condition (`prod`, `shared`, `calm`) and placement in turn, one `kiln-lab run` round
+each, each round starting the turn one further on, so a machine's drift falls on every placement alike.
+Run again, it measures only the rounds not measured yet; with `HOLD_FILE` set, each round waits while another
+lab keeps that file fresh, so two labs never measure at once.
+
+### The A/B (2026-11-04)
+
+On fedora (an Intel Core i9-14900HX, 32 threads; Fedora's Linux 6.19 with lazy preemption), the lab and
+everything it started held to the 16 efficient cores (`taskset -c 16-31`), where the server sized itself to 4
+shards. One build, this goal at `8cbb752a586` (main at `b3a00b70cff` with goal 7), in release with the UI's
+client built in; each placement set by `KILN_RT_PLACEMENT` alone. The `realistic` profile, six rounds of each
+placement, the placements taking turns round by round (`scripts/placement_lab/driver.sh`). Other agents'
+builds loaded the machine throughout (a load of 42 to 48 before each window, its CPU pressure 18% to 23%), so
+the noise is wide; the turns spread it over every placement alike. The rounds, as `kiln-lab` wrote them:
+`docs/runtime-lab/2026-11-04/goal7-prod-<placement>.json`.
+
+**The deciding run: the production-like layout, 16 hogs at `cpu.weight` 1** (21:28 to 22:09 UTC). Each cell
+is the median of the six rounds and its noise (the 95% interval of that median):
+
+| number | round-robin | steer | steal | both |
+| --- | --- | --- | --- | --- |
+| page p50 ms | 0.217 (0.189 to 0.303) | 0.211 (0.156 to 0.349) | 0.224 (0.191 to 0.285) | 0.231 (0.200 to 0.396) |
+| page p99 ms | 3.42 (2.75 to 7.15) | 2.75 (2.16 to 8.64) | 2.65 (1.95 to 4.14) | 2.27 (1.97 to 11.5) |
+| page p99.9 ms | 32.2 (7.79 to 57.8) | 13.1 (3.47 to 42.2) | 19.7 (4.37 to 49.8) | 14.0 (3.15 to 53.9) |
+| api_read p50 ms | 1.94 (1.79 to 2.02) | 2.14 (1.79 to 2.23) | 2.05 (1.97 to 2.33) | 2.16 (2.04 to 2.27) |
+| api_read p99 ms | 165 (119 to 194) | 168 (160 to 195) | 179 (148 to 207) | 188 (186 to 196) |
+| api_read p99.9 ms | 823 (723 to 1147) | 750 (623 to 1398) | 984 (748 to 1498) | 1112 (839 to 1365) |
+| api_write p50 ms | 1.66 (1.50 to 1.89) | 1.56 (1.38 to 1.95) | 1.57 (1.31 to 1.74) | 1.58 (1.20 to 1.72) |
+| api_write p99 ms | 593 (529 to 890) | 618 (526 to 925) | 626 (479 to 825) | 631 (550 to 878) |
+| api_write p99.9 ms | 1025 (917 to 1463) | 800 (755 to 1387) | 1040 (774 to 1963) | 1359 (917 to 1695) |
+| websocket p50 ms | 2.71 (2.58 to 2.77) | 2.59 (2.50 to 2.69) | 2.62 (2.58 to 2.75) | 2.63 (2.57 to 2.73) |
+| websocket p99 ms | 1118 (1068 to 1300) | 1068 (952 to 1181) | 1080 (1035 to 1202) | 1021 (921 to 1140) |
+| websocket p99.9 ms | 1442 (1331 to 1639) | 1304 (1205 to 1463) | 1352 (1288 to 1672) | 1314 (1235 to 1502) |
+| attach p50 ms | 1334 (1250 to 1384) | 1254 (1156 to 1296) | 1281 (1203 to 1354) | 1312 (1235 to 1336) |
+| attach p99 ms | 1940 (1465 to 2224) | 1841 (1416 to 2355) | 1543 (1466 to 2196) | 1743 (1677 to 1917) |
+| throughput: API reads a second | 65.2 (64.2 to 66.5) | 65.7 (63.1 to 67.5) | 65.3 (64.6 to 67.2) | 65.7 (64.7 to 66.9) |
+| throughput: live deliveries a second | 86.8 (85.7 to 87.5) | 87.1 (86.1 to 88.4) | 86.8 (85.4 to 87.7) | 86.3 (85.4 to 87.7) |
+| server CPU ms a request | 13.1 (12.1 to 14.6) | 12.7 (11.2 to 13.5) | 13.0 (12.3 to 14.1) | 13.1 (12.2 to 13.4) |
+| shards' delay p99 ms | 2.37 (2.08 to 2.57) | 2.23 (1.49 to 2.48) | 2.17 (1.89 to 2.74) | 2.18 (1.86 to 2.22) |
+| server: page waited p99 ms | 0.058 (0.050 to 0.091) | 0.795 (0.504 to 1.28) | 0.166 (0.111 to 0.587) | 0.166 (0.114 to 0.959) |
+| server: api_read waited p99 ms | 0.055 (0.050 to 0.091) | 0.823 (0.482 to 0.890) | 0.779 (0.512 to 0.838) | 0.517 (0.230 to 1.04) |
+| server: api_write waited p99 ms | 0.060 (0.050 to 0.091) | 0.921 (0.761 to 0.995) | 0.717 (0.269 to 1.19) | 0.660 (0.220 to 0.986) |
+| server: websocket waited p99 ms | 1514 (1342 to 1752) | 1297 (927 to 1738) | 1361 (1111 to 1562) | 1093 (875 to 1554) |
+| server: runner waited p99 ms | 159 (84.0 to 214) | 97.6 (53.3 to 141) | 131 (69.4 to 163) | 128 (70.9 to 151) |
+
+Pages (10 a second) and API writes (10.4 a second) ran at the same rate under every placement. Against
+`round-robin` (`kiln-lab compare`, 101 numbers held together at 95%), each placement differs beyond noise in 3
+numbers, the same three: the server's wait from a request's head to its handler's start at p99, for pages,
+API reads and writes, worse, from 0.06 ms to between 0.17 and 0.92 ms: the hop each placement adds (a task on
+another shard, or a movable task and its carrier). Nothing the lab's clients timed, no throughput and no CPU
+per request differs beyond noise.
+
+**By the rule, `round-robin` stays the default.** No placement's people's p99 is better beyond noise: `page`
+p99 and `api_write` p99 went -19.7% and +4.2% under `steer`, -22.3% and +5.6% under `steal`, -33.7% and
++6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stay behind the setting for
+later A/B tests.
+
+**The shared layout and calm, partial** (22:10 to 23:50 UTC; the same build, CPUs and profile). In `shared`
+the server, its runners, the lab and 16 of kiln-lab's own hogs share the lab's cgroup at one weight; in `calm`
+the server has its scope at `cpu.weight` 1000 and there are no hogs. The block waited from 22:28 to 23:11 while
+another lab held the machine, and was stopped at 23:50, short of its six rounds, to give the machine back;
+another agent's A/B of runner restarts ran beside it, unpinned, from 22:49. Fedora thrashed from 23:04 to 23:23
+(a kiln CI job's unbounded release build: a load of 330 to 400, swap full), so the six rounds measured in it are
+dropped, not run again: round 2 of calm under `round-robin` and of shared under every placement, and round 3 of
+shared under `steal`. What's left: in shared, four rounds of `round-robin` and `steer` and three of `steal` and
+`both`; in calm, three of `round-robin` and four of the others. Their rounds:
+`docs/runtime-lab/2026-11-04/goal7-shared-<placement>.json` and `goal7-calm-<placement>.json`. Medians and
+their noise, as above:
+
+| number | round-robin | steer | steal | both |
+| --- | --- | --- | --- | --- |
+| shared: page p99 ms | 2.42 (1.90 to 3.34) | 2.48 (1.96 to 5.42) | 2.02 (1.96 to 10.2) | 1.94 (1.93 to 7.94) |
+| shared: api_write p99 ms | 193 (65.1 to 348) | 366 (194 to 530) | 413 (364 to 3411) | 338 (188 to 543) |
+| shared: api_read p99 ms | 63.6 (39.0 to 74.7) | 111 (93.4 to 147) | 74.0 (68.8 to 1279) | 85.6 (82.1 to 138) |
+| shared: API reads a second | 72.1 (71.6 to 74.6) | 69.8 (67.7 to 70.5) | 69.9 (40.9 to 70.5) | 67.7 (67.0 to 71.2) |
+| shared: live deliveries a second | 88.8 (88.0 to 90.4) | 88.6 (87.1 to 89.1) | 87.8 (75.6 to 88.4) | 87.3 (87.3 to 88.3) |
+| shared: server CPU ms a request | 9.55 (9.10 to 12.0) | 9.49 (9.15 to 10.1) | 9.81 (9.27 to 10.6) | 9.60 (8.99 to 9.99) |
+| shared: shards' delay p99 ms | 2.27 (1.77 to 7.15) | 2.29 (1.94 to 8.10) | 2.19 (2.18 to 6.33) | 2.26 (2.19 to 8.50) |
+| calm: page p99 ms | 0.448 (0.354 to 1.30) | 0.413 (0.354 to 1.17) | 0.384 (0.350 to 8.37) | 1.09 (0.334 to 2.18) |
+| calm: api_write p99 ms | 496 (492 to 574) | 600 (376 to 754) | 638 (334 to 1184) | 369 (335 to 2228) |
+| calm: api_read p99 ms | 82.3 (80.7 to 176) | 85.5 (83.2 to 161) | 105 (82.1 to 135) | 85.3 (60.9 to 114) |
+| calm: API reads a second | 68.4 (66.2 to 70.3) | 68.3 (66.9 to 69.1) | 67.4 (67.0 to 71.7) | 69.6 (64.2 to 71.8) |
+| calm: live deliveries a second | 86.2 (86.1 to 86.6) | 86.2 (85.5 to 87.0) | 86.6 (83.7 to 88.0) | 86.5 (83.0 to 87.9) |
+| calm: server CPU ms a request | 14.9 (12.0 to 15.3) | 12.4 (9.54 to 15.5) | 10.8 (9.54 to 14.0) | 11.7 (10.7 to 14.8) |
+| calm: shards' delay p99 ms | 0.992 (0.646 to 1.41) | 0.721 (0.490 to 1.01) | 0.561 (0.491 to 2.30) | 0.671 (0.569 to 1.11) |
+
+Against `round-robin` (`kiln-lab compare`, as above):
+
+- **Shared:** no people's p99 is better beyond noise under any placement, and `steal`'s API writes' p99 is
+  worse beyond it (413 ms against 193, +114%). The API reads' throughput is worse beyond noise under all three
+  (-3.1% under `steer` and `steal`, -6.1% under `both`), and so is their p99 under `steer` (+75%) and `both`
+  (+35%); with the server's wait before handlers, 5, 13 and 8 numbers differ in all. `both`'s rounds began at
+  a load of 63 before each window against `round-robin`'s 27 (one as the thrash ended), so its differences are
+  the least sure.
+- **Calm:** no people's p99, no throughput and no CPU per request differs beyond noise under any placement.
+  What does is the server's wait before handlers (`steal` one number, `both` three) and numbers of the fill
+  (six under `steer`, one under `both`).
+
+**The pick holds in both.** No placement qualifies by rule 3 in either, and in the shared layout `round-robin`
+leads; rule 5 names `steal` there, worse beyond noise in API writes' p99. With fewer than six rounds, these say
+less than the deciding run.
+
+What it says:
+
+- **On this load no placement beat today's.** The tails people see (pages' p99 of 2 to 3 ms, API writes'
+  p99 of about 0.6 s) are not a shard's queue that placement can shorten: the shards ran their ready work
+  2.2 to 2.4 ms late at p99 under every placement, and an API write's p99 is its handler's own time at the
+  server (0.67 to 0.72 s), which waits on kiln.db's one connection (goal 3's `store` share, 0.5 s at p99
+  here). The live feed's and runners' waits moved the most (a viewer's frames 1.51 s at p99 under
+  `round-robin` against 1.09 to 1.36 s, runners' messages 159 ms against 98 to 131 ms), within noise.
+- **What placing costs is a sub-millisecond hop** before each handler, the one difference beyond noise; it
+  bought nothing measurable here.
+- **Production's load may differ.** These rounds, as goal 8's, ran with the machine shared with other agents'
+  builds; a quieter machine narrows the noise, and the setting lets the A/B be run again on one build
+  (`scripts/placement_lab/driver.sh`).
+- **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
+  queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
+  shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;

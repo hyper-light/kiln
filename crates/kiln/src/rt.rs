@@ -3,11 +3,13 @@
 //! of primitives the rest of kiln uses.
 //!
 //! * One process-wide [`hyper_rt::Runtime`], started on first use with the sizing chosen by
-//!   [`configure`] (server, agent or CLI). Shards never steal work and there is no preemption, so
-//!   CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and below
-//!   them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
+//!   [`configure`] (server, agent or CLI). There is no preemption, and shards take each other's work
+//!   only where the server's placement makes its requests movable tasks (goal 7, `crate::placement`),
+//!   so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and
+//!   below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
-//!   registered); spawns from outside the runtime are spread round-robin over the shards.
+//!   registered); spawns from outside the runtime are spread round-robin over the shards. Accepted
+//!   connections go where the placement says ([`spawn_connection`]).
 //! * A task gives up its shard on time with no hand-placed yields: hyper-rt charges its leaf futures
 //!   (sockets, timers, its channels) to the polling task, and the cross-task primitives here charge
 //!   the same budget (`hyper_rt::coop`, kiln's goal 6), so a loop whose waits are always ready yields
@@ -166,6 +168,9 @@ fn shard_cores(cores: &[u32], shards: u16) -> Vec<u32> {
     (0..usize::from(shards)).filter_map(|i| rest.get(i.checked_rem(rest.len())?).copied()).collect()
 }
 
+/// The shards' step budget, nanoseconds: 250 µs, so sockets stay responsive on a busy shard ([`runtime_config`]).
+pub const STEP_BUDGET_NS: u64 = 250_000;
+
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
 /// wheel never runs dry, a 250 µs step budget so sockets stay responsive on a busy shard, no spin.
 pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
@@ -175,7 +180,7 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
         timers_per_shard: tasks.saturating_mul(2),
         interests_per_shard: hyper_rt::runtime::interests_for(tasks),
         ring_entries: 1024,
-        step_budget_ns: 250_000,
+        step_budget_ns: STEP_BUDGET_NS,
         timer_tick_ns: 100_000,
         batch: 64,
         pin: false,
@@ -193,7 +198,7 @@ pub const SHARE_STORE: &str = "store";
 
 struct Rt {
     /// Held for the life of the process: dropping it would stop the shards.
-    _runtime: Runtime,
+    runtime: Runtime,
     holders: Vec<SlotHolder>,
     next: AtomicUsize,
 }
@@ -240,7 +245,7 @@ fn start() -> Result<Rt, String> {
         });
     }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
-    Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
+    Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
 }
 
 /// The compute pool (goal 3 of the API runtime program, plan 01a1a59c2a8e step 1; `hyper_rt::compute`): as
@@ -287,6 +292,16 @@ pub fn shard_holders() -> Vec<SlotHolder> {
     rt().map_or_else(|_| Vec::new(), |rt| rt.holders.clone())
 }
 
+/// [`shard_holders`], borrowed: empty when the runtime couldn't start.
+pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
+    rt().map_or(&[], |rt| rt.holders.as_slice())
+}
+
+/// What the runtime's movable tasks did so far (goal 7, `crate::placement`); `None` when it couldn't start.
+pub fn movable_stats() -> Option<hyper_rt::movable::Stats> {
+    rt().ok().map(|rt| rt.runtime.movable_stats())
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -294,15 +309,15 @@ pub fn on_shard() -> bool {
 
 // ------------------------------------------------------------------------------------ spawning
 
-type Boxed = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type Boxed = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// A future handed to the runtime through a slot, so a refused submission (full control queue,
 /// full arena) leaves it in place for the next attempt instead of dropping it.
-fn handoff(fut: Boxed) -> Arc<Mutex<Option<Boxed>>> {
+pub(crate) fn handoff(fut: Boxed) -> Arc<Mutex<Option<Boxed>>> {
     Arc::new(Mutex::new(Some(fut)))
 }
 
-fn bootstrap(slot: &Arc<Mutex<Option<Boxed>>>) -> impl Future<Output = ()> + Send + 'static {
+pub(crate) fn bootstrap(slot: &Arc<Mutex<Option<Boxed>>>) -> impl Future<Output = ()> + Send + 'static {
     let slot = Arc::clone(slot);
     async move {
         let fut = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -437,13 +452,17 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
-/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, its task starting
-/// Critical: its first request's head must be read before the request's class is known, and reading a
-/// head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
+/// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
+/// task starting Critical: its first request's head must be read before the request's class is known, and
+/// reading a head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
 #[track_caller]
 pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
-    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
+    let critical = hyper_rt::coop::Class::Critical;
+    let steered = crate::placement::get().steers()
+        && crate::placement::connection_shard().is_some_and(|holder| hyper_rt::runtime::submit_movable_as(holder, critical, bootstrap(&slot)).is_ok());
+    if steered || submit_spread_as(&slot, critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -848,8 +867,64 @@ impl<T: Send + 'static> Bridge<T> {
 
 impl<T: Send + 'static> Drop for Bridge<T> {
     fn drop(&mut self) {
-        // A helper that already finished is a stale id: refused, harmlessly.
-        let _ = hyper_rt::futures::cancel(self.task);
+        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another shard than its
+        // helper's (a movable task's bridge, the task moved since: goal 7, `hyper_rt::movable`), it is cancelled
+        // there by a message, so its wait doesn't outlive what it waited for.
+        if hyper_rt::futures::shard_id().is_some_and(|here| here.0 == self.task.0.shard()) {
+            let _ = hyper_rt::futures::cancel(self.task);
+        } else {
+            let _ = hyper_rt::runtime::cancel_task(self.task);
+        }
+    }
+}
+
+/// `fut` polled under its own task's waker, which hyper-rt's leaves need (a connect, a socket's readiness wait):
+/// as it is where its caller's poll is native, else in a helper task on this shard ([`Bridge`]) that wakes the
+/// caller when it ends: a movable task's poll (goal 7, `hyper_rt::movable`), or one through a combinator's own
+/// waker. Refused (`NotOnShardThread`) off the runtime's shards.
+pub async fn native<F>(fut: F) -> Result<F::Output, RtError>
+where
+    F: Future + 'static,
+    F::Output: Send + 'static,
+{
+    Native { fut: Some(Box::pin(fut)), bridged: None }.await
+}
+
+/// The future of [`native`].
+struct Native<F: Future>
+where
+    F::Output: Send + 'static,
+{
+    fut: Option<Pin<Box<F>>>,
+    bridged: Option<Bridge<F::Output>>,
+}
+
+impl<F: Future + 'static> Future for Native<F>
+where
+    F::Output: Send + 'static,
+{
+    type Output = Result<F::Output, RtError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(bridge) = &this.bridged {
+            return bridge.poll(cx).map(Ok);
+        }
+        if is_native(cx) {
+            return match this.fut.as_mut() {
+                Some(fut) => fut.as_mut().poll(cx).map(Ok),
+                None => Poll::Ready(Err(RtError::NotOnShardThread)),
+            };
+        }
+        let Some(fut) = this.fut.take() else { return Poll::Ready(Err(RtError::NotOnShardThread)) };
+        match Bridge::spawn(fut, cx.waker()) {
+            Ok(bridge) => {
+                let polled = bridge.poll(cx);
+                this.bridged = Some(bridge);
+                polled.map(Ok)
+            }
+            Err(refused) => Poll::Ready(Err(refused)),
+        }
     }
 }
 
