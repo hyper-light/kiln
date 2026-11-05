@@ -1,0 +1,9 @@
+clippy exit 101
+clippy past main's unused import exit 0
+clippy kiln-lab exit 0
+clippy mimalloc exit 0
+build mimalloc exit 0
+run mimalloc exit 0
+kiln 0.2.0
+D:\a\_temp/win/clippy.txt:error: unused import: `super::*`
+D:\a\_temp/win/clippy.txt:error: could not compile `kiln` (lib test) due to 1 previous error
