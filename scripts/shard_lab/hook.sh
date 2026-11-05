@@ -8,11 +8,19 @@
 # PERF_CALL_GRAPH (DWARF by default: a release build keeps .eh_frame; `fp` for a build with frame pointers), user space only (perf_event_paranoid 2 lets a user profile their own
 # processes). The lab waits for the hook, so perf runs in the background from window-start until window-end stops it.
 #   hook.sh <event> <server pid> <dir>     (PERF_ON; PERF: the perf binary; PERF_LIBS: a folder of its libraries;
-#                                          PERF_CALL_GRAPH: perf record's --call-graph)
+#                                          PERF_CALL_GRAPH: perf record's --call-graph; PERF_FROM: below)
+# PERF_FROM says where perf starts (goal 9, plan 01a1a87b2cec step 3), and it stops as the window ends: `window`, the
+# default, the measured window alone; `fill`, from the fill's start, for what only the fill does (sessions' Open, the
+# owners' first events); `server`, from the server's start, before its runners connect (their Build and ReachHello).
 event=$1 pid=$2 dir=$3
+case "${PERF_FROM:-window}" in
+  server) perf_from=server-up ;;
+  fill) perf_from=fill-start ;;
+  *) perf_from=window-start ;;
+esac
 case "$event" in
-  window-start)
-    if [ "${PERF_ON:-0}" = 1 ]; then
+  server-up | fill-start | window-start)
+    if [ "${PERF_ON:-0}" = 1 ] && [ "$event" = "$perf_from" ]; then
       LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} nohup "${PERF:-perf}" record -F 499 --call-graph "${PERF_CALL_GRAPH:-dwarf,16384}" -p "$pid" -o "$dir/perf.data" > "$dir/perf.log" 2>&1 &
       echo $! > "$dir/perf.pid"
     fi

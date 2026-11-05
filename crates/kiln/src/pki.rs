@@ -40,6 +40,10 @@ pub struct Pki {
     pub ca_der: Vec<u8>,
     /// How its files are written: synced to disk (`write_secret`), or not (a test's scratch PKI).
     write: fn(&Path, &[u8], u32) -> std::io::Result<()>,
+    /// The organization its CA certifies for ([`Pki::organization`]), read from the certificate once: every custody
+    /// record kiln took parsed the certificate again for it, on a shard (goal 9, plan 01a1a87b2cec step 3: 1.5% of the
+    /// shards' cycles in g9p6's calm profile).
+    organization: String,
 }
 
 /// A certificate + private key, both PEM.
@@ -245,6 +249,14 @@ pub fn cert_matches_key(cert_pem: &str, key_pem: &str) -> bool {
 }
 
 /// Whether the CA certificate `ca_der` signed the certificate `der`.
+/// The organization the CA certificate `ca_der` certifies for (its O); `kiln` when it names none.
+fn organization_of(ca_der: &[u8]) -> String {
+    x509_parser::parse_x509_certificate(ca_der)
+        .ok()
+        .and_then(|(_, c)| c.subject().iter_organization().next().and_then(|o| o.as_str().ok()).map(str::to_owned))
+        .unwrap_or_else(|| "kiln".to_owned())
+}
+
 pub fn verify_issued(ca_der: &[u8], der: &[u8]) -> bool {
     let (Ok((_, cert)), Ok((_, ca))) = (x509_parser::parse_x509_certificate(der), x509_parser::parse_x509_certificate(ca_der)) else {
         return false;
@@ -347,7 +359,8 @@ impl Pki {
         };
         let issuer = Issuer::from_ca_cert_pem(&ca_pem, key).context("load CA")?;
         let ca_der = pem_to_der(&ca_pem)?;
-        Ok(Self { dir: dir.to_path_buf(), issuer, ca_pem, ca_der, write })
+        let organization = organization_of(&ca_der);
+        Ok(Self { dir: dir.to_path_buf(), issuer, ca_pem, ca_der, write, organization })
     }
 
     /// The server's leaf, (re)issued when missing, expiring, or when its names changed.
@@ -517,12 +530,9 @@ impl Pki {
     }
 
     /// The organization kiln's CA certifies for (its certificate's O), the root of every
-    /// identity's chain (W27-R01); `kiln` when it names none.
+    /// identity's chain (W27-R01); `kiln` when it names none. Read as the CA was opened.
     pub fn organization(&self) -> String {
-        x509_parser::parse_x509_certificate(&self.ca_der)
-            .ok()
-            .and_then(|(_, c)| c.subject().iter_organization().next().and_then(|o| o.as_str().ok()).map(str::to_owned))
-            .unwrap_or_else(|| "kiln".to_owned())
+        self.organization.clone()
     }
 
     /// Whether this CA issued (signed) the DER certificate `der`.
@@ -568,6 +578,18 @@ pub fn needs_renewal(cert_pem: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the organization is the CA certificate's, read once as the CA opens, and
+    /// `kiln` for a certificate that names none.
+    #[test]
+    fn g9_s3_the_organization_is_read_once_from_the_ca() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(dir.path())?;
+        assert_eq!(pki.organization(), "hyper-light");
+        assert_eq!(pki.organization(), organization_of(&pki.ca_der));
+        assert_eq!(organization_of(b"not a certificate"), "kiln");
+        Ok(())
+    }
 
     #[test]
     fn ca_signs_csr_and_persists() -> anyhow::Result<()> {
