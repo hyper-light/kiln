@@ -149,8 +149,25 @@ pub static PULL_LISTS: Owner = Owner::new("pull_lists");
 /// may keep that again. Let go with their pipeline.
 pub static GROK_DFA: Owner = Owner::new("grok_dfa");
 
+/// What the deployments engine is told and hasn't taken yet (`crate::cd::Cd::input`): its clusters'
+/// objects (a kind's list, each change a watch sees, each apply's answer), its renders, and people's and
+/// the source poll's word, each counted by what it takes in memory (an object as serde_json keeps it). At
+/// most [`crate::cd::INPUTS_BYTES`], as much as kiln reads of one answer of a cluster's API server
+/// (`crate::cd::kube::BODY_LIMIT`, 256 MiB). At the bound whoever sends waits for room, as a task: a
+/// watch stops reading its stream (the API server holds what follows), a render or an answer waits to be
+/// handed in, a person's request waits its turn. None sends past it: the poll's and a rollback's inputs,
+/// sent under the gate that keeps them in order, wait for their room before they take it.
+pub static CD_INPUTS: Owner = Owner::new("cd_inputs");
+
+/// What the deployments engine asked for and its dispatcher hasn't taken yet (`crate::cd`'s `dispatch`):
+/// applies (each its object), deletes, renders, watches, apps' statuses and syncs' records. At most
+/// [`crate::cd::ACTIONS_BYTES`], as much as its inputs, which what it asks for is made of (an apply's
+/// object is a render's). At the bound the engine's thread waits (its own, not the runtime's), and its
+/// inputs behind it.
+pub static CD_ACTIONS: Owner = Owner::new("cd_actions");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 23] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA];
+pub(super) const ALL: [&Owner; 25] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS];
 
 #[cfg(test)]
 mod tests {
