@@ -161,7 +161,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
@@ -190,7 +190,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
     });
     let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
@@ -205,9 +205,10 @@ where
 
 /// A request's handler run where the server's placement puts it (goal 7, `crate::placement`): in this task,
 /// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
-/// answered.
-async fn placed(class: crate::overload::Class, handling: impl Future<Output = Response> + Send + 'static) -> Response {
-    match crate::placement::request(class, handling).await {
+/// answered. A `demoted` request (its head read in a more urgent class's turn) takes its own class's turn
+/// first where it stays in this task (goal 6, plan 01a1a59c2abe step 3).
+async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Future<Output = Response> + Send + 'static) -> Response {
+    match crate::placement::request(class, demoted, handling).await {
         Some(resp) => resp,
         None => text(StatusCode::SERVICE_UNAVAILABLE, "the server is stopping"),
     }

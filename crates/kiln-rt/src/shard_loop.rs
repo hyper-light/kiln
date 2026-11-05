@@ -1331,9 +1331,13 @@ impl Shard {
     }
 
     /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
-    /// first after the inputs are read again, which lists them behind what those made ready.
+    /// first after the inputs are read again, which lists them behind what those made ready. With classes
+    /// kept, a class goes ahead of less urgent ones while it has run no more than the quantum past the least
+    /// run of them (`crate::queue::LocalQueue::pop_within`, kiln's goal 6): a task's turn, which every other
+    /// task waits for anyway.
     fn next_in_batch(&mut self, at: &mut BatchMark) -> Option<u32> {
-        if let Some(slot) = self.desk.local.pop() {
+        let lead_ns = self.desk.quantum_ns.get();
+        if let Some(slot) = self.desk.local.pop_within(lead_ns) {
             return Some(slot);
         }
         if !self.desk.local.has_yielded() {
@@ -1344,7 +1348,7 @@ impl Shard {
             None => self.carried_now_ns(),
         };
         self.read_inputs_within(at, now);
-        self.desk.local.pop()
+        self.desk.local.pop_within(lead_ns)
     }
 
     /// The inputs read again within the batch at `now_ns`, the step's time from here; where they did work,
