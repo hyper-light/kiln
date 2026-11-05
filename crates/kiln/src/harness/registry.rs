@@ -582,11 +582,11 @@ impl Snapshot {
     }
 
     /// A compact chunk's texts joined: its segment's, or a spilled one's its file doesn't give back, its
-    /// events as the conversation store keeps them ([`Snapshot::from_store`]).
+    /// events as the conversation store keeps them ([`Snapshot::read_from_store`]).
     fn joined(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
         match c.joined() {
             Ok(joined) => Ok(joined.into_owned()),
-            Err(e) if c.is_spilled() => self.from_store(c).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}"))),
+            Err(e) if c.is_spilled() => self.read_from_store(c).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}"))),
             Err(e) => Err(e),
         }
     }
@@ -595,7 +595,7 @@ impl Snapshot {
     /// written), its events' texts as the conversation store keeps them, by their numbers, joined as an
     /// `events` frame joins them: the session's events are never lost to a viewer while the store has them
     /// (goal 11, plan 01a1a87b2e56 step 5). Read where the snapshot is made, on the blocking pool.
-    fn from_store(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
+    fn read_from_store(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
         let (store, id) = self.store.as_ref().ok_or_else(|| std::io::Error::other("no conversation store to read it from"))?;
         let (Some(first), Some(last)) = (c.metas().first().and_then(|m| m.seq), c.metas().last().and_then(|m| m.seq)) else {
             return Err(std::io::Error::other("its events have no numbers to read them by"));
@@ -647,7 +647,7 @@ impl Snapshot {
                             Ok(packed) => packed,
                             // A spilled one its file doesn't give back: its events as the store keeps them.
                             Err(e) if chunk.is_spilled() => {
-                                let joined = self.from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
+                                let joined = self.read_from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
                                 Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
                             }
                             Err(e) => return Err(e),
