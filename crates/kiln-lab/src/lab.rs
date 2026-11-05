@@ -338,39 +338,87 @@ pub struct LockSeen {
     pub max_wait_s: f64,
     /// The first addresses of the locks taken there, in hex: sites that take one lock share its.
     pub addrs: String,
+    /// The copies of the site's location the build counted it under, summed in each figure above (goal 5, plan
+    /// 01a1a59c2aae step 1; `lock_sums`). 0 from a kiln-lab from before it summed them, whose figures for a site
+    /// of two or more took one copy's count at the start and another's at the end (`scripts/locks.py rank`
+    /// refuses those runs).
+    #[serde(default)]
+    pub copies: usize,
 }
 
-/// The lock census of a build that counts its locks, between the fill's scrapes and the window's.
-fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
-    let mut out: BTreeMap<String, LockSeen> = BTreeMap::new();
+/// One scrape's `kiln_lock_*` figures for a site and kind, over every series with its labels.
+#[derive(Default)]
+struct LockSums {
+    taken: f64,
+    contended: f64,
+    wait_s: f64,
+    max_wait_s: f64,
+    addrs: Vec<String>,
+    copies: usize,
+}
+
+/// Each site's and kind's figures in one scrape, summed over its copies (goal 5, plan 01a1a59c2aae step 1). The
+/// census keys its counters by the address of the site's `Location` (scripts/locks/census.rs), and the compiler
+/// makes one of those for each instance of a generic caller and each codegen unit an inlined caller lands in, so
+/// one site can have several counters, each its own series under the same labels: census-B's build has 53 such
+/// sites of 280, event-listener's 2 or 3 copies each. Taking a site's start from its first series and its end
+/// from its last paired two counters, which put event-listener's window below zero.
+fn lock_sums(s: &Scrape) -> BTreeMap<(String, String), LockSums> {
     let label = |l: &[(String, String)], k: &str| l.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    for (name, labels, value) in &window.1.series {
-        let (site, kind) = (label(labels, "site"), label(labels, "kind"));
-        if !name.starts_with("kiln_lock_") || site.is_empty() {
+    let mut out: BTreeMap<(String, String), LockSums> = BTreeMap::new();
+    for (name, labels, value) in &s.series {
+        let Some(figure) = name.strip_prefix("kiln_lock_") else { continue };
+        let site = label(labels, "site");
+        if site.is_empty() {
             continue;
         }
-        let want = [("site", site.as_str()), ("kind", kind.as_str())];
-        let since = |s: &Scrape| s.get(name, &want).unwrap_or(0.0);
-        let e = out.entry(format!("{site} {kind}")).or_insert_with(|| LockSeen { kind: kind.clone(), ..LockSeen::default() });
-        match name.as_str() {
-            "kiln_lock_taken_total" => {
-                e.taken = value - since(window.0);
-                e.fill_taken = since(fill.1) - since(fill.0);
+        let e = out.entry((site, label(labels, "kind"))).or_default();
+        match figure {
+            "taken_total" => {
+                e.taken += value;
+                e.copies += 1;
             }
-            "kiln_lock_contended_total" => {
-                e.contended = value - since(window.0);
-                e.fill_contended = since(fill.1) - since(fill.0);
+            "contended_total" => e.contended += value,
+            "wait_seconds_total" => e.wait_s += value,
+            "wait_max_seconds" => e.max_wait_s = e.max_wait_s.max(*value),
+            "addresses" => {
+                for a in label(labels, "addrs").split_whitespace() {
+                    if !e.addrs.iter().any(|x| x == a) {
+                        e.addrs.push(a.to_owned());
+                    }
+                }
             }
-            "kiln_lock_wait_seconds_total" => {
-                e.wait_s = value - since(window.0);
-                e.fill_wait_s = since(fill.1) - since(fill.0);
-            }
-            "kiln_lock_wait_max_seconds" => e.max_wait_s = *value,
-            "kiln_lock_addresses" => e.addrs = label(labels, "addrs"),
             _ => {}
         }
     }
     out
+}
+
+/// The lock census of a build that counts its locks, between the fill's scrapes and the window's: each site's
+/// growth over each, its copies summed in every scrape first (`lock_sums`). A copy first taken between two
+/// scrapes is in the second alone, and its counters began at zero, so no figure can come out below zero.
+fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
+    let (fill_start, fill_end, start) = (lock_sums(fill.0), lock_sums(fill.1), lock_sums(window.0));
+    let none = LockSums::default();
+    lock_sums(window.1)
+        .into_iter()
+        .map(|(key, end)| {
+            let (f0, f1, s) = (fill_start.get(&key).unwrap_or(&none), fill_end.get(&key).unwrap_or(&none), start.get(&key).unwrap_or(&none));
+            let seen = LockSeen {
+                kind: key.1.clone(),
+                taken: end.taken - s.taken,
+                contended: end.contended - s.contended,
+                wait_s: end.wait_s - s.wait_s,
+                fill_taken: f1.taken - f0.taken,
+                fill_contended: f1.contended - f0.contended,
+                fill_wait_s: f1.wait_s - f0.wait_s,
+                max_wait_s: end.max_wait_s,
+                addrs: end.addrs.join(" "),
+                copies: end.copies,
+            };
+            (format!("{} {}", key.0, key.1), seen)
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------------------------- the load
@@ -1594,5 +1642,37 @@ mod tests {
         let f = br#"{"t":"events","events":[{"text":"@lab:1730000000123456 the retry"},{"text":"no stamp"},{"output":"@lab:42 x @lab:"}]}"#;
         assert_eq!(stamps(f).collect::<Vec<_>>(), vec![1_730_000_000_123_456, 42]);
         assert_eq!(stamps(b"nothing").count(), 0);
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 1 (census-B's event-listener rates below zero): a site the build counts under
+    /// several copies of its location has a series of each under the same labels, in the census table's order.
+    /// Each scrape's copies are summed before the growth is taken, so a big copy at the window's start isn't
+    /// paired against a small one at its end, and a copy first taken in the window, ahead of the others in the
+    /// table, adds what it took.
+    #[test]
+    fn g5_s1_a_sites_copies_are_summed_before_its_growth() {
+        let site = "event-listener@5.4.2:src/intrusive.rs:220:14";
+        // Each copy as the census renders it: taken, held when asked, seconds waited, longest wait, addresses.
+        let scrape = |copies: &[(u64, u64, f64, f64, &str)]| {
+            let mut t = String::from("# TYPE kiln_lock_taken_total counter\n");
+            for (taken, contended, wait, max, addrs) in copies {
+                let labels = format!("site=\"{site}\",kind=\"std_mutex\"");
+                t.push_str(&format!("kiln_lock_taken_total{{{labels}}} {taken}\nkiln_lock_contended_total{{{labels}}} {contended}\n"));
+                t.push_str(&format!("kiln_lock_wait_seconds_total{{{labels}}} {wait}\nkiln_lock_wait_max_seconds{{{labels}}} {max}\n"));
+                t.push_str(&format!("kiln_lock_addresses{{{labels},addrs=\"{addrs}\"}} 1\n"));
+            }
+            t.push_str("kiln_lock_sites_full_total 0\n");
+            measure::Scrape::parse(&t)
+        };
+        let (big, small) = ((20_000, 1_000, 0.5, 0.25, "7f01 7f02"), (1_000, 50, 0.125, 0.0625, "7f03"));
+        let fill = (scrape(&[]), scrape(&[(18_000, 900, 0.25, 0.25, "7f01 7f02"), (900, 40, 0.125, 0.0625, "7f03")]));
+        let start = scrape(&[big, small]);
+        // In the window the big copy took 6,000 and the small one 500, and a third, first taken in it, 300.
+        let end = scrape(&[(300, 2, 0.0625, 0.03125, "7f04 7f01"), (26_000, 1_400, 0.75, 0.25, "7f01 7f02"), (1_500, 60, 0.125, 0.0625, "7f03")]);
+        let locks = lock_census((&fill.0, &fill.1), (&start, &end));
+        let seen = locks.get(&format!("{site} std_mutex"));
+        let got = seen.map(|s| (s.taken, s.contended, s.wait_s, s.fill_taken, s.fill_contended, s.fill_wait_s, s.max_wait_s, s.addrs.as_str(), s.copies));
+        assert_eq!(got, Some((6_800.0, 412.0, 0.3125, 18_900.0, 940.0, 0.375, 0.25, "7f04 7f01 7f02 7f03", 3)), "{locks:?}");
+        assert_eq!(locks.len(), 1, "one entry a site and kind, whatever its copies: {locks:?}");
     }
 }
