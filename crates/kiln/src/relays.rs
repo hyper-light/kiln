@@ -49,7 +49,7 @@ const UNANSWERED: &str = " (unanswered: a runner from before)";
 /// Whether runner process `peer` checks what relays pass on to it, and signs its receipts
 /// (`CAP_RELAYS`).
 fn answers(hub: &Hub, peer: PeerId) -> bool {
-    hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_RELAYS != 0)
+    hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_RELAYS != 0)
 }
 
 /// kiln's own state of the relays it takes from and is.
@@ -322,7 +322,7 @@ fn named(u: Unrelayed, relay: &str) -> Unrelayed {
 pub async fn words(hub: &Hub, to: &str, carried: Carried) -> Option<(Value, u64, String)> {
     let Some(crate::harness::registry::Location::Machine(machine)) = hub.harness.location(to) else { return None };
     let held = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.reaches(&machine, &crate::instances::Owned::Agent(to.to_owned())).and_then(|p| inst.get(p).map(|i| (i.label(), p)))
     };
     let (instance, peer) = held?;
@@ -378,7 +378,7 @@ pub async fn frames(hub: &Hub, runs: Vec<crate::reach::relay::Passed>) {
     let org = hub.pki.organization();
     let server = crate::custody::server_uri(&org);
     for p in runs {
-        let of = |peer: PeerId| hub.instances.lock().get(peer).map(|i| i.label());
+        let of = |peer: PeerId| hub.instances.load().get(peer).map(|i| i.label());
         let (Some(from_instance), Some(to_instance)) = (of(p.from_peer), of(p.to_peer)) else { continue };
         let answers = answers(hub, p.to_peer);
         let run = || async {

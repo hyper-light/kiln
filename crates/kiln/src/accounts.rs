@@ -555,7 +555,7 @@ fn reachable(hub: &Hub, target: &str) -> anyhow::Result<()> {
         cfg!(windows)
     } else {
         let machine = target.strip_prefix("agent:").unwrap_or(target);
-        let g = hub.agents.lock();
+        let g = hub.agents.load();
         let a = g.get(machine).ok_or_else(|| anyhow::anyhow!("there is no machine called {machine}"))?;
         anyhow::ensure!(a.connected, "{} is not connected", a.shown());
         anyhow::ensure!(a.terminal && !a.ephemeral, "{} has terminals (and so agents) turned off", a.shown());

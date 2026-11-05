@@ -1296,7 +1296,7 @@ static OFFLINE: parking_lot::Mutex<Option<std::collections::HashSet<String>>> = 
 pub fn runners_gone(hub: &Arc<Hub>) {
     let gone: Vec<(String, u64)> = hub
         .agents
-        .lock()
+        .load()
         .values()
         .filter(|a| !a.connected && !a.ephemeral && !a.outpost && a.lost_at.is_some_and(|t| t.elapsed() > OFFLINE_AFTER))
         .map(|a| (a.name.clone(), a.lost_at.map_or(0, |t| t.elapsed().as_secs())))
@@ -1316,7 +1316,7 @@ pub fn runners_gone(hub: &Arc<Hub>) {
 /// rules that take it (`where` reads `runner`: its `name`, `labels` and `gone_for` seconds), and
 /// to the server's webhook subscribers.
 pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
-    let live = hub.agents.lock().get(&name).map(|a| a.labels.clone());
+    let live = hub.agents.load().get(&name).map(|a| a.labels.clone());
     let labels = match live {
         Some(l) => l,
         // Gone from the live runners: the labels it has on record.

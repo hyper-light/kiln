@@ -74,7 +74,7 @@ impl Headrooms {
 
 /// The machine's processes that run headroom: its newest (it paces), and the rest (they stand by).
 fn peers(hub: &Hub, machine: &str) -> (Option<PeerId>, Vec<PeerId>) {
-    let inst = hub.instances.lock();
+    let inst = hub.instances.load();
     let newest = inst.newest(machine);
     let capable = |p: PeerId| inst.get(p).is_some_and(|i| i.wide & CAP_HEADROOM != 0);
     let others = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && capable(*p)).collect();
@@ -130,14 +130,14 @@ pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, status: serde_json::Val
 // ------------------------------------------------------------------------------ the API
 
 async fn known(hub: &Hub, name: &str) -> bool {
-    hub.agents.lock().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
+    hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
 /// `GET /api/runners/:name/headroom` (and what the others answer with).
 pub fn view(hub: &Hub, name: &str) -> serde_json::Value {
     let (set, status, status_at) = hub.headrooms.inner.lock().get(name).map(|e| (e.settings.is_some(), e.status.clone(), e.status_at)).unwrap_or_default();
     let settings = hub.headrooms.settings(name);
-    let connected = hub.agents.lock().get(name).is_some_and(|a| a.connected);
+    let connected = hub.agents.load().get(name).is_some_and(|a| a.connected);
     let supported = connected.then(|| peers(hub, name).0.is_some());
     let applied = status.as_ref().and_then(|s| s.get("settings")).and_then(|f| f.as_str()).map(|f| f == settings.fingerprint());
     json!({
@@ -162,7 +162,7 @@ pub async fn get(hub: &Hub, name: &str) -> Answer {
 /// `GET /api/headroom`: every runner that runs headroom or has settings for it.
 pub async fn list(hub: &Hub) -> Answer {
     let mut names = hub.headrooms.runners();
-    for (name, a) in hub.agents.lock().iter() {
+    for (name, a) in hub.agents.load().iter() {
         if a.connected && !names.contains(name) {
             names.push(name.clone());
         }

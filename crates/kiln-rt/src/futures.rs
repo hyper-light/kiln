@@ -64,6 +64,13 @@ pub fn wake_cost_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.wake_cost_ns())
 }
 
+/// Says what the task being polled is doing, for the rest of this poll: should the poll hold its shard past
+/// [`crate::slow::SLOW_POLL_NS`], the shard counts it against `label` as well as the task's spawn site
+/// ([`crate::slow`], kiln's goal 9). The last label set in a poll is the one counted. Nothing off a shard.
+pub fn label(label: &'static crate::slow::Label) {
+    let _ = registry::with_current(|ctx| ctx.label.set(Some(label)));
+}
+
 /// The task being polled on this thread, if any.
 pub fn current_task() -> Option<TaskId> {
     registry::with_current(|ctx| ctx.current_task()).flatten()

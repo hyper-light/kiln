@@ -82,8 +82,10 @@ pub mod runtime;
 pub mod shard;
 pub mod shard_loop;
 pub mod signal;
+mod slab;
 #[cfg(unix)]
 mod signal_protocol;
+pub mod slow;
 pub mod sim;
 pub mod stdio;
 pub mod sync;

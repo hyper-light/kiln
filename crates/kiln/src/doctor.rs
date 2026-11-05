@@ -505,7 +505,7 @@ pub struct Live {
 }
 
 fn live_of(hub: &Hub, name: &str) -> Option<Live> {
-    let agents = hub.agents.lock();
+    let agents = hub.agents.load();
     let a = agents.get(name)?;
     Some(Live { connected: a.connected, last_seen: a.last_seen, sample: a.sample.clone(), tools: a.facts.as_ref().map(|f| f.tools.clone()).unwrap_or_default() })
 }

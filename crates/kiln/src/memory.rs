@@ -87,8 +87,48 @@ pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 /// events, its newest chunk alone kept as text), for as many copies as there are sessions.
 pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
 
+/// The rows the conversation store's writer hasn't committed yet (`crate::convo::store::Queue`): its bound
+/// is what the writer commits in the most a row waits to share a commit (`COMMIT_MS`), at the rate it has
+/// committed.
+pub static CONVO_QUEUE: Owner = Owner::new("convo_queue");
+
+/// Viewers' snapshots made and not yet handed to their sockets (`crate::api`'s `send_snapshot`): a long
+/// session's is megabytes, packed or as frames, and each viewer that opens one holds its own until the last
+/// of it is written. No bound of its own yet: as many as viewers open sessions at once.
+pub static SNAPSHOTS: Owner = Owner::new("snapshots");
+
 /// The owners counted here, in the order the exposition says them.
-const OWNERS: [&Owner; 2] = [&UI_ASSETS, &SESSION_ENTRIES];
+const OWNERS: [&Owner; 4] = [&UI_ASSETS, &SESSION_ENTRIES, &CONVO_QUEUE, &SNAPSHOTS];
+
+/// Bytes an owner holds for as long as this lives: what's left of them is let go with it, whether they
+/// were written or dropped on the way (an error, a socket gone).
+pub struct Held {
+    owner: &'static Owner,
+    bytes: usize,
+}
+
+impl Owner {
+    /// `bytes` held until what's returned lets them go.
+    pub fn hold(&'static self, bytes: usize) -> Held {
+        self.add(bytes);
+        Held { owner: self, bytes }
+    }
+}
+
+impl Held {
+    /// `n` of its bytes gone now (a frame written), never more than it holds.
+    pub fn release(&mut self, n: usize) {
+        let n = n.min(self.bytes);
+        self.owner.sub(n);
+        self.bytes = self.bytes.saturating_sub(n);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.owner.sub(self.bytes);
+    }
+}
 
 /// The process's resident memory by kind, in bytes: `anon`, `file` and `shmem` (Linux; elsewhere none).
 pub fn resident() -> Option<[(&'static str, u64); 3]> {
@@ -160,5 +200,25 @@ mod tests {
         assert!(o.contains("kiln_memory_bytes{owner=\"test_open\"} 7\n"), "{o}");
         assert!(!o.contains("kiln_memory_bound_bytes{owner=\"test_open\"}"), "{o}");
         assert!(o.contains("kiln_memory_bytes{owner=\"ui_assets\"}"), "{o}");
+        assert!(o.contains("kiln_memory_bytes{owner=\"snapshots\"}"), "{o}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: what's held shows while it's held, goes as it's let go, and what's
+    /// left of it goes with its holder however that ends.
+    #[test]
+    fn g11_s3_held_bytes_go_with_their_holder() {
+        static FRAMES: Owner = Owner::new("test_frames");
+        let mut held = FRAMES.hold(1000);
+        assert_eq!(FRAMES.bytes(), 1000);
+        held.release(300);
+        assert_eq!(FRAMES.bytes(), 700);
+        held.release(5000);
+        assert_eq!(FRAMES.bytes(), 0, "never more than it holds");
+        let other = FRAMES.hold(250);
+        let _again = FRAMES.hold(50);
+        drop(other);
+        assert_eq!(FRAMES.bytes(), 50, "the rest goes with its holder");
+        drop(held);
+        assert_eq!(FRAMES.bytes(), 50);
     }
 }

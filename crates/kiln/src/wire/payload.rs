@@ -274,6 +274,90 @@ pub fn payload_of<M: Carries>(msg: M) -> Result<Carried<M, M::Read>, Box<Unreada
     msg.read()
 }
 
+/// A runner's frame, as [`read_frame`] read it.
+pub enum Frame {
+    /// It isn't a runner's message this build reads.
+    Unreadable(crate::proto::Unreadable),
+    /// A message that may not come before its runner's Hello, from a runner whose Hello hasn't come: its
+    /// kind (`crate::wire::agent_name`), and nothing it carries read.
+    BeforeHello { what: String },
+    /// A runner's message, what it carries read ([`payload_of`]).
+    Read(Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>>),
+}
+
+/// What reading a runner frame is expected to take, by its length ([`read_frame`]): moving averages of
+/// each frame's bytes and of how long its read took where it ran, nanoseconds (the weight of a new
+/// sample 1/8, as RFC 6298 smooths a round trip). One writer, the hub's loop.
+#[derive(Default)]
+struct Expect {
+    bytes: std::sync::atomic::AtomicU64,
+    ns: std::sync::atomic::AtomicU64,
+}
+
+impl Expect {
+    /// Nanoseconds a frame of `len` bytes is expected to take to read: it grows with its length at the
+    /// rate the frames so far were read, not a short one's fixed cost; none expected until one was read.
+    fn expected(&self, len: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        len.saturating_mul(self.ns.load(Relaxed)).checked_div(self.bytes.load(Relaxed)).unwrap_or(0)
+    }
+
+    /// A frame of `len` bytes took `took` nanoseconds to read, on a shard or off one.
+    fn learn(&self, len: u64, took: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
+        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
+        self.bytes.store(smooth(self.bytes.load(Relaxed), len), Relaxed);
+        self.ns.store(smooth(self.ns.load(Relaxed), took), Relaxed);
+    }
+}
+
+/// The runner frames the hub's loop reads ([`read_frame`]).
+static FRAMES: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
+
+/// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
+/// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
+/// (`Hello`, `Instance`, `Machine`). On the shard while that's expected ([`Expect`]) to take less than a
+/// slow poll (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, the caller waiting either way, so
+/// its messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read
+/// runners' frames on its shard, holding it up to 76 ms).
+pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
+    read_frame_by(&FRAMES, data, hello).await
+}
+
+/// [`read_frame`] by what `expect` learned. A read is timed where it runs, so one off the shard teaches
+/// it too: else one slow sample (a preempted read) could send every frame of a runner sending only long
+/// ones off the shard for good, none read on it to bring the expectation back down.
+async fn read_frame_by(expect: &Expect, data: Vec<u8>, hello: bool) -> Frame {
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    let (frame, took) = if expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS {
+        match crate::rt::compute(move || timed(|| read_now(&data, hello))).await {
+            Ok(read) => read,
+            Err(e) => return Frame::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("it couldn't be read off the shard: {e:#}") }),
+        }
+    } else {
+        timed(|| read_now(&data, hello))
+    };
+    expect.learn(len, took);
+    frame
+}
+
+/// `read()`'s frame, and how long it took, nanoseconds.
+fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
+    let began = Instant::now();
+    let frame = read();
+    (frame, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// [`read_frame`]'s work, where it runs.
+fn read_now(data: &[u8], hello: bool) -> Frame {
+    match crate::proto::read_agent(data) {
+        Err(e) => Frame::Unreadable(e),
+        Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
+        Ok(msg) => Frame::Read(payload_of(msg)),
+    }
+}
+
 /// An answer by `req` to something the server asked a runner ([`AgentMsg::Answer`],
 /// `AiTranscript`, `AiView`, `HarnessTaskOutput`, `HarnessHistory`, `DirList`). It's of the type
 /// its question asks for, so it's read once it's matched to its question (`crate::hub`'s asks), by
@@ -966,6 +1050,31 @@ mod tests {
             anyhow::ensure!(told, "the runner is told: {:?}", hub.sent.lock());
             let kept = hub.refusals.load().kept(&Page::Runner("fedora".into())).map(crate::wire::unread::Kept::total);
             anyhow::ensure!(kept == Some(1), "kept for the runner's page: {kept:?}");
+            Ok(())
+        })
+    }
+
+    /// A runner's frame read off the shard teaches what reading one is expected to take, as one read on
+    /// it does: one slow read can't keep a runner's long frames off the shard for good (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_frames_read_off_the_shard_teach_the_expectation() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let data = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![7; 4096] })?;
+            let len = u64::try_from(data.len())?;
+            // As if one read of a frame this long had taken a second: each like it is expected slow, so
+            // read off the shard.
+            let expect = Expect::default();
+            expect.learn(len, 1_000_000_000);
+            anyhow::ensure!(expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS, "expected slow");
+            for _ in 0..64 {
+                let frame = read_frame_by(&expect, data.clone(), true).await;
+                anyhow::ensure!(matches!(frame, Frame::Read(Ok(_))), "the frame is read");
+            }
+            // Each read off the shard took its eighth of the averages: (7/8)^64 of the second is 0.19 ms,
+            // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
+            let left = expect.expected(len);
+            anyhow::ensure!(left < 100_000_000, "still expected to take {left} ns");
             Ok(())
         })
     }

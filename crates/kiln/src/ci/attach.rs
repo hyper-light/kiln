@@ -950,7 +950,7 @@ async fn upgrades_failed(hub: &Hub) -> Vec<Trigger> {
         if !seen.insert(j.id.clone()) || first {
             continue;
         }
-        let labels = hub.agents.lock().get(&j.target).map(|a| a.labels.clone()).unwrap_or_default();
+        let labels = hub.agents.load().get(&j.target).map(|a| a.labels.clone()).unwrap_or_default();
         let error = j.error.clone().unwrap_or_else(|| "it gave no reason".to_owned());
         let tail: Vec<&str> = j.log.iter().rev().take(30).rev().map(String::as_str).collect();
         out.push(Trigger {
@@ -1376,7 +1376,7 @@ async fn ticks(hub: Arc<Hub>) {
         for a in attached.iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "check")) {
             let names: Vec<String> = hub
                 .agents
-                .lock()
+                .load()
                 .values()
                 .filter(|r| !r.ephemeral && !r.outpost && looks_after(a, &About { runner: Some(r.name.clone()), labels: r.labels.clone(), ..About::default() }))
                 .map(|r| r.name.clone())
@@ -1395,7 +1395,7 @@ async fn ticks(hub: Arc<Hub>) {
                 for f in v.get("findings").and_then(Value::as_array).into_iter().flatten().filter(|f| f.get("level").and_then(Value::as_str) == Some("fail")) {
                     let id = f.get("id").and_then(Value::as_str).unwrap_or("?");
                     let title = f.get("title").and_then(Value::as_str).unwrap_or_default();
-                    let labels = hub.agents.lock().get(&r).map(|x| x.labels.clone()).unwrap_or_default();
+                    let labels = hub.agents.load().get(&r).map(|x| x.labels.clone()).unwrap_or_default();
                     let shown = hub.shown(&r);
                     let t = Trigger {
                         wake: "check",

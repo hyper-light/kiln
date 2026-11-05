@@ -173,7 +173,7 @@ pub async fn give_inputs(hub: &Hub, peer: crate::instances::PeerId, job: &str, a
         Ok(b) => b,
         Err(e) => return tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "a leg's inputs weren't handed on signed"),
     };
-    let signs = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+    let signs = hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
     if signs && !bundles.is_empty() {
         hub.send_peer(peer, &crate::proto::ServerMsg::Custody { json: json!({ "leg": job, "hand_on": bundles }).to_string() }).await;
     }

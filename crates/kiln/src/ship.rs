@@ -2100,7 +2100,7 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
                 .find(|j| j.kind == "runner" && j.target == r.name)
                 .filter(|j| matches!(j.state, crate::updates::JobState::Failed))
                 .map(|j| j.error.clone().unwrap_or_else(|| "the upgrade failed".to_string()));
-            let freeze = hub.instances.lock().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
+            let freeze = hub.instances.load().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
             RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed, freeze }
         })
         .collect()
