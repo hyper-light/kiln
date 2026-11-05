@@ -61,6 +61,8 @@ use crate::sched::routing::Constraint;
 use crate::sched::state::{self as engine, Class, ClassConfig, Due, FairBy, Fence, LEVELS, PerMille, Resources};
 use crate::sched::units::Ms;
 
+
+
 /// Fair share's dimensions, as the engine counts them (W05-R33): slots, milli-CPUs, memory bytes
 /// and GPUs.
 const FAIR: usize = engine::DIMS;
@@ -384,8 +386,9 @@ pub struct Admission {
     /// offered at once is told only the offer (an owner choosing between offers takes a word that
     /// it waits for its answer, docs/needs.md §11, AUDIT P6), and a message is saved.
     hush: Option<u32>,
-    /// A buffer of replies, reused by the wire's inputs.
+    /// A buffer of replies, reused by the wire's inputs; and one of the line's slots in order.
     replies: Vec<Reply>,
+    order: Vec<u32>,
 }
 
 fn ix(s: u32) -> usize {
@@ -474,6 +477,7 @@ impl Admission {
             watchers: BTreeSet::new(),
             hush: None,
             replies: Vec::new(),
+            order: Vec::new(),
         };
         a.nodes.intern("");
         a.remeasure();
@@ -712,10 +716,20 @@ impl Admission {
         }
     }
 
+    /// A waiting probe's key in the line: its own order and arrival as it came, its standing its
+    /// tenant's, as the class's leaves record it (every waiting run of a tenant stands where its
+    /// tenant does: a tenant moved as one block isn't written run by run).
+    fn key_of(&self, s: u32) -> Option<Key> {
+        let p = self.get(s)?;
+        let k = p.key?;
+        let standing = self.fair_of(p.class).and_then(|f| f.leaves.get(&leaf_of(p))).map_or(k.standing, |(st, _)| *st);
+        Some(Key { standing, ..k })
+    }
+
     /// Takes a probe out of the line, if it's in it.
     fn leave(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
-        if let (State::Waiting, Some(k)) = (p.state, p.key) {
+        if let (State::Waiting, Some(k)) = (p.state, self.key_of(s)) {
             let (came, class) = (p.came, p.class);
             self.line.remove(&k);
             if self.kept.is_some_and(|(k, _)| k == s) {
@@ -755,9 +769,22 @@ impl Admission {
 
     /// A leaf's standing in `class`'s tree (the engine's `standing_of`, for this runner's set of
     /// dimensions): at each node from its repository down, `max(V[parent], finish[node])`.
+    ///
+    /// As the line keys it: with one level (the default, fair share between repositories), a
+    /// repository at the floor (its finish tag at or under the root's virtual time, so its standing
+    /// the root's) is keyed 0, one above it by its finish tag. The order is the same (every one at
+    /// the floor ties at V, every one above it is above V), but V rising moves no one at the floor:
+    /// only the tenant charged, and one V passes, is put in again (docs/needs.md §11, AUDIT P6).
     fn standing_of(&self, class: Class, path: &[u32]) -> [u128; LEVELS] {
         let mut out = [0; LEVELS];
         let Some(f) = self.fair_of(class) else { return out };
+        if let [leaf] = path {
+            let fin = f.finish_of(*leaf).unwrap_or(0);
+            if let Some(slot) = out.first_mut() {
+                *slot = if fin > f.vtime(0) { fin } else { 0 };
+            }
+            return out;
+        }
         let mut parent = 0;
         for (slot, node) in out.iter_mut().zip(path) {
             *slot = f.vtime(parent).max(f.finish_of(*node).unwrap_or(0));
@@ -771,15 +798,19 @@ impl Admission {
     fn enter(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
         let (class, came, land_due) = (p.class, p.came, p.land_due);
-        let standing = self.standing_of(class, path_of(p));
+        // At its tenant's standing as its other runs here hold it, so they all stand alike; if
+        // that's moved, restand moves them all.
+        let now_standing = self.standing_of(class, path_of(p));
+        let had = self.fair_of(class).and_then(|f| f.leaves.get(&leaf_of(p))).map(|(st, _)| *st);
+        let standing = had.unwrap_or(now_standing);
         let key = Key { class: class_ix(class), standing, own: p.own, seq: p.seq };
         let item = Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout };
         self.line.insert(key, item);
         if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) {
             match f.leaves.get_mut(&leaf_of(p)) {
-                Some((had, set)) => {
+                Some((_, set)) => {
                     set.insert(s);
-                    if *had != standing {
+                    if standing != now_standing {
                         f.moved = true;
                     }
                 }
@@ -812,30 +843,52 @@ impl Admission {
             if let Some(f) = self.fair.get_mut(c.index()) {
                 f.moved = false;
             }
-            let mut moves: Vec<(u32, [u128; LEVELS])> = Vec::new();
+            let mut moves: Vec<(u32, [u128; LEVELS], [u128; LEVELS])> = Vec::new();
+            // Standings still held in the line by tenants whose runs are put in again one by one,
+            // after this loop: no block is taken from or put at them.
+            let mut held: Vec<[u128; LEVELS]> = Vec::new();
+            let mut blocks = 0u32;
+            // A block's places before and after it moved, and its length.
+            let mut block: Option<(u32, u32, u32)> = None;
             for (leaf, had) in leaves {
                 let (path, depth) = self.paths.get(&leaf).copied().unwrap_or(([0; LEVELS], 0));
                 let standing = self.standing_of(c, path.get(..usize::from(depth)).unwrap_or(&[]));
                 if standing == had {
                     continue;
                 }
-                if let Some((st, set)) = self.fair.get_mut(c.index()).and_then(|f| f.leaves.get_mut(&leaf)) {
-                    *st = standing;
-                    moves.extend(set.iter().map(|s| (*s, standing)));
+                let Some(f) = self.fair.get_mut(c.index()) else { continue };
+                // Alone where it stood and where it goes: its runs are one run of the order, moved
+                // as a block, O(log n). Else each is put in again, ties interleaving by arrival.
+                let alone = !f.leaves.iter().any(|(l, (st, _))| *l != leaf && (*st == had || *st == standing)) && !held.iter().any(|h| *h == had || *h == standing);
+                let Some((st, set)) = f.leaves.get_mut(&leaf) else { continue };
+                *st = standing;
+                if alone {
+                    let cx = class_ix(c);
+                    let (lo, hi) = (Key { class: cx, standing: had, own: i128::MIN, seq: 0 }, Key { class: cx, standing: had, own: i128::MAX, seq: u64::MAX });
+                    let (p, k) = (self.line.rank(&lo), self.line.rank(&hi).saturating_sub(self.line.rank(&lo)));
+                    self.line.restand_block(cx, had, standing);
+                    let q = self.line.rank(&Key { class: cx, standing, own: i128::MIN, seq: 0 });
+                    block = Some((p, q, k));
+                    blocks += 1;
+                } else {
+                    held.push(had);
+                    moves.extend(set.iter().map(|s| (*s, had, standing)));
                 }
             }
             // Each move looked at alone costs the boundaries before and after it, two runs at each
             // power of two, and the run itself: 4·⌈log2 n⌉ + 1 tells to look at. Looking at every
             // waiting run once costs n. Many moves at once (a tenant with many runs waiting, its
             // standing moved by a charge) are made together, then every run looked at once
-            // (docs/needs.md §11, AUDIT P6: restand was O(k log² n) for k runs moved).
+            // (docs/needs.md §11, AUDIT P6: restand was O(k log² n) for k runs moved); so is a
+            // tenant moved as a block.
             let n = u64::from(self.line.len());
             let per_move = 4 * u64::from(n.max(1).ilog2() + 1) + 1;
-            let together = (moves.len() as u64).saturating_mul(per_move) > n;
-            for (s, standing) in moves {
+            let together = blocks > 0 || (moves.len() as u64).saturating_mul(per_move) > n;
+            let one_block = blocks == 1 && moves.is_empty();
+            for (s, had, standing) in moves {
                 let Some(p) = self.get(s) else { continue };
-                let (Some(old), item) = (p.key, Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout }) else { continue };
-                let key = Key { standing, ..old };
+                let (Some(stored), item) = (p.key, Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout }) else { continue };
+                let (old, key) = (Key { standing: had, ..stored }, Key { standing, ..stored });
                 self.line.remove(&old);
                 if !together {
                     self.boundaries(now, out);
@@ -851,8 +904,49 @@ impl Admission {
                     self.tell_if_changed(s, now, out);
                 }
             }
-            if together {
-                self.tell_all(now, out);
+            match block {
+                Some((p, q, k)) if one_block => self.tell_moved(p, q, k, now, out),
+                _ if together => self.tell_all(now, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// After one block of `k` runs moved from place `p` to `q` in line (the first 0), each run
+    /// whose place to within a power of two changed is told: the block's own runs, and of those it
+    /// passed (each moved by `k` the other way) only those within `k` of a power of two, the only
+    /// ones whose range a move of `k` can change. O(k log n) runs looked at, the full line only
+    /// when that's fewer (docs/needs.md §11, AUDIT P6).
+    fn tell_moved(&mut self, p: u32, q: u32, k: u32, now: i64, out: &mut Vec<Reply>) {
+        let n = self.line.len();
+        let bits = u64::from(n.max(1).ilog2() + 1);
+        if u64::from(k).saturating_mul(bits.saturating_add(1)) >= u64::from(n) {
+            self.tell_all(now, out);
+            return;
+        }
+        let mut ranks: Vec<u32> = (q..q.saturating_add(k)).collect();
+        // Those passed: back (q > p) they came forward by k, to [p, q); forward (q < p) they went
+        // back by k, to [q + k, p + k). A run at place y (from 1) changed range iff a power of two
+        // b lies in (y, y + k] (it came forward) or (y − k, y] (it went back).
+        let (from, to, forward) = if q > p { (p, q, true) } else { (q.saturating_add(k), p.saturating_add(k), false) };
+        let mut b: u32 = 1;
+        while b <= n {
+            // Places y (from 1) with the boundary b in range, as ranks y − 1.
+            let (lo, hi) = if forward { (b.saturating_sub(k).max(1), b.saturating_sub(1)) } else { (b, b.saturating_add(k).saturating_sub(1)) };
+            for y in lo..=hi {
+                let r = y.saturating_sub(1);
+                if (from..to).contains(&r) && y >= 1 {
+                    ranks.push(r);
+                }
+            }
+            let Some(next) = b.checked_mul(2) else { break };
+            b = next;
+        }
+        ranks.sort_unstable();
+        ranks.dedup();
+        for r in ranks {
+            if let Some((_, s)) = self.line.select(r) {
+                self.tell_at(s, r, now, out);
             }
         }
     }
@@ -1135,19 +1229,23 @@ impl Admission {
         }
     }
 
-    /// Whether room kept for the first in line (`kept`) lets run `s` start ahead of it (W05-R39):
-    /// it's that run, or it fits beside the room kept (nothing beside a run that takes it whole), or
-    /// it's predicted to end by the room's time.
-    fn respects(&self, s: u32, kept: Option<(u32, Option<i64>)>, now: i64) -> bool {
-        let Some((k, at)) = kept else { return true };
-        if s == k {
-            return true;
+
+    /// The first of `class` in order that can start and that room kept for the first in line lets
+    /// start ahead of it (W05-R39: it fits beside the room kept, nothing beside a run that takes the
+    /// runner whole, or it's predicted to end by the room's time): with room kept, the earlier of
+    /// the first that fits beside it and the first predicted to end by its time, each found by the line's own search, so that what it passes over is passed by
+    /// what each subtree asks at the least and runs at the shortest, not looked at one by one
+    /// (docs/needs.md §11, AUDIT P6: the test inside the search saw every run waiting).
+    fn first_that_starts(&self, class: u8, free: &Amounts, kept: Option<(u32, Option<i64>)>, now: i64) -> Option<u32> {
+        let find = |free: &Amounts, within: u64| self.line.find(&Query { class: Some(class), after: None, free, within }, &mut |s| self.can_start(s));
+        let Some((k, at)) = kept else { return find(free, u64::MAX).map(|(_, s)| s) };
+        let h = self.get(k)?;
+        let beside = (kind_of(&h.ask) != Kind::Whole).then(|| ask::less(free, &h.amounts)).and_then(|b| find(&b, u64::MAX));
+        let by = at.and_then(|at| u64::try_from(at.saturating_sub(now)).ok()).and_then(|within| find(free, within));
+        match (beside, by) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a.1 } else { b.1 }),
+            (a, b) => a.or(b).map(|(_, s)| s),
         }
-        let (Some(h), Some(p)) = (self.get(k), self.get(s)) else { return true };
-        let beside = ask::less(&self.free_now(), &h.amounts);
-        let fits_beside = kind_of(&h.ask) != Kind::Whole && ask::fits(&p.amounts, &beside);
-        let ends_by = at.is_some_and(|at| p.predicted.is_some_and(|ms| later(now, ms) <= at));
-        fits_beside || ends_by
     }
 
     /// Offers what can start, as the engine's pick takes it (W05-R04, R30, R31): of each class, the
@@ -1186,7 +1284,7 @@ impl Admission {
                 let c = mask.trailing_zeros();
                 mask &= mask.wrapping_sub(1);
                 let (Some(best), Ok(class)) = (bests.get_mut(c as usize), u8::try_from(c)) else { continue };
-                *best = self.line.find(&Query { class: Some(class), after: None, free: &free, within: u64::MAX }, &mut |s| self.can_start(s) && self.respects(s, kept, now)).map(|(_, s)| s);
+                *best = self.first_that_starts(class, &free, kept, now);
             }
             let mut found = Class::ALL.into_iter().zip(bests).filter_map(|(c, b)| b.map(|s| (c, s)));
             let Some((_, first)) = found.next() else { return };
@@ -1282,9 +1380,12 @@ impl Admission {
     /// Tells every waiting probe whose place or reason changed (a drain, an owner back): O(n).
     fn tell_all(&mut self, now: i64, out: &mut Vec<Reply>) {
         // In order: each one's place is where it comes, no search for it.
-        for (rank, (_, s)) in self.line.entries().into_iter().enumerate() {
-            self.tell_at(s, u32::try_from(rank).unwrap_or(u32::MAX), now, out);
+        let mut slots = std::mem::take(&mut self.order);
+        self.line.slots_into(&mut slots);
+        for (rank, s) in slots.iter().enumerate() {
+            self.tell_at(*s, u32::try_from(rank).unwrap_or(u32::MAX), now, out);
         }
+        self.order = slots;
     }
 
     fn tell_if_changed(&mut self, s: u32, now: i64, out: &mut Vec<Reply>) {
@@ -1319,7 +1420,7 @@ impl Admission {
     /// A waiting probe's place in line, the first 0.
     fn rank_of(&self, s: u32) -> Option<u32> {
         let p = self.get(s)?;
-        match (p.state, p.key) {
+        match (p.state, self.key_of(s)) {
             (State::Waiting, Some(k)) => Some(self.line.rank(&k)),
             _ => None,
         }
@@ -1358,7 +1459,7 @@ impl Admission {
     /// What a waiting probe's owner is told of where it stands.
     fn waiting_msg(&self, s: u32, rank: u32, now: i64) -> Option<Up> {
         let p = self.get(s)?;
-        let k = p.key?;
+        let k = self.key_of(s)?;
         Some(Up::Waiting {
             reason: self.reason(s, rank),
             place: Place::of(rank.saturating_add(1)),
@@ -2068,7 +2169,8 @@ impl Admission {
         let Some(s) = self.find(from, run) else { return };
         let Some(p) = self.get_mut(s) else { return };
         p.predicted = predicted;
-        let (state, key, item) = (p.state, p.key, Item { slot: s, ask: p.amounts, predicted, timeout: p.ask.timeout });
+        let (state, item) = (p.state, Item { slot: s, ask: p.amounts, predicted, timeout: p.ask.timeout });
+        let key = self.key_of(s);
         match (state, key) {
             (State::Waiting, Some(k)) => {
                 self.line.remove(&k);
@@ -2196,8 +2298,9 @@ impl Admission {
                 State::Waiting => {
                     waiting = waiting.saturating_add(1);
                     let standing = self.standing_of(p.class, path_of(p));
-                    if p.key.is_none_or(|k| k.standing != standing || k.class != class_ix(p.class)) && !self.fair_of(p.class).is_some_and(|f| f.moved) {
-                        return Err(format!("{}: {} (slot {s}) waits at {:?}, its tenant standing at {standing:?} in {}", self.me, p.run, p.key, p.class.as_str()));
+                    let key = self.key_of(u32::try_from(s).unwrap_or(u32::MAX));
+                    if key.is_none_or(|k| k.standing != standing || k.class != class_ix(p.class) || !self.line.contains(&k)) && !self.fair_of(p.class).is_some_and(|f| f.moved) {
+                        return Err(format!("{}: {} (slot {s}) waits at {:?}, its tenant standing at {standing:?} in {}", self.me, p.run, key, p.class.as_str()));
                     }
                 }
                 State::Aside => {}

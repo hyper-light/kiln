@@ -124,6 +124,17 @@ struct Node {
     right: u32,
     own: Sums,
     all: Sums,
+    /// A standing given every key of this subtree since it was last walked down by a change
+    /// ([`Line::restand_block`]): read on the way down, pushed to the children by the next change
+    /// that passes.
+    tag: Option<[u128; LEVELS]>,
+}
+
+/// A node's key as it stands under the standing given above it (`over`), and what its children
+/// stand under.
+fn eff(n: &Node, over: Option<[u128; LEVELS]>) -> (Key, Option<[u128; LEVELS]>) {
+    let over = over.or(n.tag);
+    (over.map_or(n.key, |standing| Key { standing, ..n.key }), over)
 }
 
 /// What [`Line::find`] looks for.
@@ -203,8 +214,22 @@ impl Line {
         }
     }
 
+    /// A standing given `t`'s subtree, its own key given it and its children given it in turn.
+    fn push(&mut self, t: u32) {
+        let Some(n) = self.nodes.get_mut(ix(t)) else { return };
+        let Some(tag) = n.tag.take() else { return };
+        n.key.standing = tag;
+        let (l, r) = (n.left, n.right);
+        for c in [l, r] {
+            if let Some(cn) = self.nodes.get_mut(ix(c)) {
+                cn.tag = Some(tag);
+            }
+        }
+    }
+
     /// Splits `t` into the entries before `key` and the rest.
     fn split(&mut self, t: u32, key: &Key) -> (u32, u32) {
+        self.push(t);
         let Some(n) = self.node(t) else { return (NIL, NIL) };
         if n.key < *key {
             let (a, b) = self.split(n.right, key);
@@ -219,6 +244,8 @@ impl Line {
 
     /// Joins `a` and `b`, every key of `a` before every key of `b`.
     fn merge(&mut self, a: u32, b: u32) -> u32 {
+        self.push(a);
+        self.push(b);
         let (Some(na), Some(nb)) = (self.node(a), self.node(b)) else { return if a == NIL { b } else { a } };
         if na.prio >= nb.prio {
             let m = self.merge(na.right, b);
@@ -237,7 +264,7 @@ impl Line {
             return;
         }
         let own = Sums::of(&item);
-        let n = Node { key, slot: item.slot, prio: mix(key.seq), left: NIL, right: NIL, own, all: own };
+        let n = Node { key, slot: item.slot, prio: mix(key.seq), left: NIL, right: NIL, own, all: own, tag: None };
         let t = match self.spare.pop() {
             Some(t) => {
                 if let Some(slot) = self.nodes.get_mut(ix(t)) {
@@ -282,9 +309,11 @@ impl Line {
 
     /// Whether `key` is in it.
     pub fn contains(&self, key: &Key) -> bool {
-        let mut t = self.root;
+        let (mut t, mut over) = (self.root, None);
         while let Some(n) = self.nodes.get(ix(t)) {
-            match key.cmp(&n.key) {
+            let (k, o) = eff(n, over);
+            over = o;
+            match key.cmp(&k) {
                 std::cmp::Ordering::Less => t = n.left,
                 std::cmp::Ordering::Greater => t = n.right,
                 std::cmp::Ordering::Equal => return true,
@@ -294,6 +323,7 @@ impl Line {
     }
 
     fn erase(&mut self, t: u32, key: &Key, found: &mut bool) -> u32 {
+        self.push(t);
         let Some(n) = self.node(t) else { return NIL };
         match key.cmp(&n.key) {
             std::cmp::Ordering::Less => {
@@ -345,11 +375,13 @@ impl Line {
             }
             d
         };
-        let (mut acc, mut best, mut t) = (Sums::NONE, None, self.root);
+        let (mut acc, mut best, mut t, mut over) = (Sums::NONE, None, self.root, None);
         while let Some(n) = self.nodes.get(ix(t)) {
+            let (k, o) = eff(n, over);
+            over = o;
             let through = acc.with(&self.sums(n.left)).with(&n.own);
-            if n.key >= *from && ok(&less(&through)) {
-                best = Some(n.key);
+            if k >= *from && ok(&less(&through)) {
+                best = Some(k);
                 t = n.left;
             } else {
                 acc = through;
@@ -366,10 +398,11 @@ impl Line {
 
     /// The sums over what comes before `key`.
     pub fn ahead(&self, key: &Key) -> Sums {
-        let mut acc = Sums::NONE;
-        let mut t = self.root;
+        let (mut acc, mut t, mut over) = (Sums::NONE, self.root, None);
         while let Some(n) = self.nodes.get(ix(t)) {
-            if n.key < *key {
+            let (k, o) = eff(n, over);
+            over = o;
+            if k < *key {
                 acc = acc.with(&self.sums(n.left)).with(&n.own);
                 t = n.right;
             } else {
@@ -381,12 +414,14 @@ impl Line {
 
     /// The entry at place `k`, the first 0: its key and slot.
     pub fn select(&self, k: u32) -> Option<(Key, u32)> {
-        let (mut t, mut k) = (self.root, k);
+        let (mut t, mut k, mut over) = (self.root, k, None);
         while let Some(n) = self.nodes.get(ix(t)) {
+            let (key, o) = eff(n, over);
+            over = o;
             let before = self.sums(n.left).count;
             match k.cmp(&before) {
                 std::cmp::Ordering::Less => t = n.left,
-                std::cmp::Ordering::Equal => return Some((n.key, n.slot)),
+                std::cmp::Ordering::Equal => return Some((key, n.slot)),
                 std::cmp::Ordering::Greater => {
                     k = k.saturating_sub(before.saturating_add(1));
                     t = n.right;
@@ -403,30 +438,30 @@ impl Line {
 
     /// The first entry in order that `q` describes and `ok` accepts: its key and slot.
     pub fn find(&self, q: &Query<'_>, ok: &mut dyn FnMut(u32) -> bool) -> Option<(Key, u32)> {
-        let t = self.find_in(self.root, q, ok)?;
-        self.node(t).map(|n| (n.key, n.slot))
+        self.find_in(self.root, q, ok, None)
     }
 
-    fn find_in(&self, t: u32, q: &Query<'_>, ok: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
+    fn find_in(&self, t: u32, q: &Query<'_>, ok: &mut dyn FnMut(u32) -> bool, over: Option<[u128; LEVELS]>) -> Option<(Key, u32)> {
         let n = self.nodes.get(ix(t))?;
+        let (key, over) = eff(n, over);
         // One class: its entries are a run of the order, found as a key is.
         match q.class.map(|c| n.key.class.cmp(&c)) {
-            Some(std::cmp::Ordering::Less) => return self.find_in(n.right, q, ok),
-            Some(std::cmp::Ordering::Greater) => return self.find_in(n.left, q, ok),
+            Some(std::cmp::Ordering::Less) => return self.find_in(n.right, q, ok, over),
+            Some(std::cmp::Ordering::Greater) => return self.find_in(n.left, q, ok, over),
             _ => {}
         }
         if !fits(&n.all.least, q.free) || n.all.shortest > q.within {
             return None;
         }
-        if q.after.is_none_or(|a| n.key > *a) && q.class.is_none_or(|c| n.key.class == c) {
-            if let Some(found) = self.find_in(n.left, q, ok) {
+        if q.after.is_none_or(|a| key > *a) && q.class.is_none_or(|c| n.key.class == c) {
+            if let Some(found) = self.find_in(n.left, q, ok, over) {
                 return Some(found);
             }
             if fits(&n.own.least, q.free) && n.own.shortest <= q.within && ok(n.slot) {
-                return Some(t);
+                return Some((key, n.slot));
             }
         }
-        self.find_in(n.right, q, ok)
+        self.find_in(n.right, q, ok, over)
     }
 
     /// How many of class `class` wait in it: O(log n), from the places where its run of the order
@@ -438,18 +473,58 @@ impl Line {
         end.saturating_sub(self.rank(&from))
     }
 
+    /// Every entry's slot, in order, into `out` (cleared first): O(n), no key copied.
+    pub fn slots_into(&self, out: &mut Vec<u32>) {
+        out.clear();
+        let mut stack: Vec<u32> = Vec::new();
+        let mut t = self.root;
+        loop {
+            while let Some(n) = self.nodes.get(ix(t)) {
+                stack.push(t);
+                t = n.left;
+            }
+            let Some(top) = stack.pop() else { return };
+            let Some(n) = self.nodes.get(ix(top)) else { return };
+            out.push(n.slot);
+            t = n.right;
+        }
+    }
+
     /// Every entry in order: its key and slot (for views and tests; O(n)).
     pub fn entries(&self) -> Vec<(Key, u32)> {
         let mut out = Vec::new();
-        self.walk(self.root, &mut out);
+        self.walk(self.root, &mut out, None);
         out
     }
 
-    fn walk(&self, t: u32, out: &mut Vec<(Key, u32)>) {
+    fn walk(&self, t: u32, out: &mut Vec<(Key, u32)>, over: Option<[u128; LEVELS]>) {
         let Some(n) = self.nodes.get(ix(t)) else { return };
-        self.walk(n.left, out);
-        out.push((n.key, n.slot));
-        self.walk(n.right, out);
+        let (key, over) = eff(n, over);
+        self.walk(n.left, out, over);
+        out.push((key, n.slot));
+        self.walk(n.right, out, over);
+    }
+
+    /// Every entry of `class` standing at `from` given standing `to` instead, in O(log n): split
+    /// out as one block (they're the keys from `(class, from, own MIN)` to `(class, from, own MAX)`),
+    /// the block given `to` at its root, and joined again where `(class, to)` comes. Their order
+    /// among themselves is unchanged. For a tenant that alone stands at `from` in its class, so its
+    /// runs are a run of the order, when nothing in the class stands at `to`: so they're one again
+    /// there (docs/needs.md §11, AUDIT P6: a tenant's standing moved its runs one at a time).
+    pub fn restand_block(&mut self, class: u8, from: [u128; LEVELS], to: [u128; LEVELS]) {
+        let lo = Key { class, standing: from, own: i128::MIN, seq: 0 };
+        let hi = Key { class, standing: from, own: i128::MAX, seq: u64::MAX };
+        let root = self.root;
+        let (a, rest) = self.split(root, &lo);
+        let (block, c) = self.split(rest, &hi);
+        let main = self.merge(a, c);
+        if let Some(n) = self.nodes.get_mut(ix(block)) {
+            n.tag = Some(to);
+        }
+        let at = Key { class, standing: to, own: i128::MIN, seq: 0 };
+        let (x, y) = self.split(main, &at);
+        let left = self.merge(x, block);
+        self.root = self.merge(left, y);
     }
 }
 
@@ -504,6 +579,9 @@ mod tests {
         Insert { class: u8, tag: u8, cpu: u8, predicted: Option<u8> },
         Remove { pick: u8 },
         Find { cpu: u8, within: Option<u8>, after: Option<u8>, class: Option<u8> },
+        /// Every entry of `class` standing at `from` stands at `to` instead (when none stands at
+        /// `to`).
+        Restand { class: u8, from: u8, to: u8 },
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -511,6 +589,7 @@ mod tests {
             (0..3u8, 0..6u8, 0..8u8, proptest::option::of(0..9u8)).prop_map(|(class, tag, cpu, predicted)| Op::Insert { class, tag, cpu, predicted }),
             any::<u8>().prop_map(|pick| Op::Remove { pick }),
             (0..9u8, proptest::option::of(0..9u8), proptest::option::of(any::<u8>()), proptest::option::of(0..3u8)).prop_map(|(cpu, within, after, class)| Op::Find { cpu, within, after, class }),
+            (0..3u8, 0..6u8, 0..12u8).prop_map(|(class, from, to)| Op::Restand { class, from, to }),
         ]
     }
 
@@ -540,6 +619,17 @@ mod tests {
                             prop_assert!(l.remove(&k));
                         }
                     }
+                    Op::Restand { class, from, to } => {
+                        let (from, to) = (u128::from(from), u128::from(to));
+                        if from != to && !m.keys().any(|k| k.class == class && k.standing[0] == to) {
+                            let moved: Vec<(Key, Item)> = m.iter().filter(|(k, _)| k.class == class && k.standing[0] == from).map(|(k, i)| (*k, *i)).collect();
+                            for (k, i) in moved {
+                                m.remove(&k);
+                                m.insert(Key { standing: [to, 0, 0], ..k }, i);
+                            }
+                            l.restand_block(class, [from, 0, 0], [to, 0, 0]);
+                        }
+                    }
                     Op::Find { cpu, within, after, class } => {
                         let free = [u64::from(cpu), 0, 0, 0];
                         let within = within.map_or(u64::MAX, u64::from);
@@ -552,6 +642,9 @@ mod tests {
                 prop_assert_eq!(l.len(), u32::try_from(m.len()).unwrap_or(0));
                 let entries: Vec<(Key, u32)> = m.iter().map(|(k, i)| (*k, i.slot)).collect();
                 prop_assert_eq!(l.entries(), entries.clone());
+                let mut slots = Vec::new();
+                l.slots_into(&mut slots);
+                prop_assert_eq!(slots, entries.iter().map(|(_, s)| *s).collect::<Vec<_>>());
                 for c in 0..3u8 {
                     prop_assert_eq!(l.count_of(c), u32::try_from(m.keys().filter(|k| k.class == c).count()).unwrap_or(0));
                 }
