@@ -71,9 +71,6 @@ const NATIVE_TOOLS: [&str; 2] = ["cargo", "node"];
 /// The tools a Linux machine cross-builds kiln for a Mac with: `ci/release/build.sh` fetches its
 /// own zig with python3.
 const CROSS_TOOLS: [&str; 3] = ["cargo", "node", "python3"];
-/// What building natively counts for when a machine is picked to build for another: more than any
-/// room a machine has, less than its being overloaded (`crate::reach::directory::OVERLOADED`).
-const NATIVE: f32 = 1.0e3;
 
 /// The usual homes of a checkout of kiln, which a runner reports where it has one
 /// (`crate::updates::kiln_checkout`). Nothing needs one to build kiln.
@@ -608,28 +605,34 @@ struct Candidate {
     /// The platform its own builds are for.
     target: Option<String>,
     tools: BTreeMap<String, String>,
-    /// Its room for more work (`crate::reach::directory::room`).
-    room: f32,
+    /// How full it is by its last sample (`crate::reach::directory::fullness`, the engine's
+    /// measure); `None` before it has sampled.
+    full: Option<f64>,
 }
 
 /// Of `candidates`, the one to build kiln for `target`, and whether it cross-builds: a machine of
 /// that platform with the tools builds natively; a Linux machine with the tools cross-builds a
-/// Mac's (`ci/release/build.sh`). Natively first, unless that machine is overloaded; then the one
-/// with the most room.
-fn pick(target: &str, candidates: &[Candidate]) -> Option<(String, bool)> {
+/// Mac's (`ci/release/build.sh`). One within `limit` first (`[ci.scheduler] target_use`, how full
+/// placement fills a machine; one that hasn't sampled counts as within it), then natively before
+/// cross-built, then the emptiest, then by name: a Mac past the limit gives way to a Linux machine
+/// within it.
+fn pick(target: &str, candidates: &[Candidate], limit: f64) -> Option<(String, bool)> {
     candidates
         .iter()
         .filter_map(|c| {
             if c.target.as_deref() == Some(target) && lacks(&c.tools, &NATIVE_TOOLS).is_empty() {
-                Some((c, false, c.room + NATIVE))
+                Some((c, false))
             } else if shared(target) && c.os == "linux" && lacks(&c.tools, &CROSS_TOOLS).is_empty() {
-                Some((c, true, c.room))
+                Some((c, true))
             } else {
                 None
             }
         })
-        .max_by(|a, b| a.2.total_cmp(&b.2))
-        .map(|(c, cross, _)| (c.name.clone(), cross))
+        .min_by(|(a, a_cross), (b, b_cross)| {
+            let within = |c: &Candidate| c.full.is_none_or(|f| f <= limit);
+            within(b).cmp(&within(a)).then(a_cross.cmp(b_cross)).then(crate::reach::directory::emptier(a.full, b.full)).then_with(|| a.name.cmp(&b.name))
+        })
+        .map(|(c, cross)| (c.name.clone(), cross))
 }
 
 /// Who builds the newest kiln for `r` (whose platform is `target`): `r` itself when it can; else,
@@ -650,18 +653,12 @@ pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder
         .values()
         .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
         .filter_map(|a| {
-            let strain = a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default();
-            Some(Candidate {
-                name: a.name.clone(),
-                os: a.os.clone(),
-                target: crate::updates::target_for(&a.os, &a.arch),
-                tools: a.facts.as_ref()?.tools.clone(),
-                room: crate::reach::directory::room(strain, a.busy, a.slots),
-            })
+            let full = a.sample.as_ref().and_then(|s| crate::reach::directory::fullness(&crate::ci::dispatch::sample_of(s, a.facts.as_deref()), &kiln_ci::sched::state::Resources::default()));
+            Some(Candidate { name: a.name.clone(), os: a.os.clone(), target: crate::updates::target_for(&a.os, &a.arch), tools: a.facts.as_ref()?.tools.clone(), full })
         })
         .collect();
     let candidates: Vec<Candidate> = candidates.into_iter().filter(|c| cant_build(hub, &c.name).is_none()).collect();
-    match pick(target, &candidates) {
+    match pick(target, &candidates, crate::ci::dispatch::target_use(&hub.cfg.ci.scheduler)) {
         Some((machine, cross)) => Ok(Builder { machine, itself: false, cross, why }),
         None => Err(format!("{why}, and no connected machine can build kiln for {target}")),
     }
@@ -1408,28 +1405,33 @@ mod tests {
         Ok(())
     }
 
-    fn candidate(name: &str, os: &str, target: &str, tools: &[&str], room: f32) -> Candidate {
-        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), room }
+    fn candidate(name: &str, os: &str, target: &str, tools: &[&str], full: f64) -> Candidate {
+        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), full: Some(full) }
     }
 
     /// A Mac with no developer tools gets its build from a Mac that has them, natively, before a
-    /// Linux machine that cross-builds it; from Linux when that Mac is overloaded or there is none;
-    /// from nowhere when nothing has the tools.
+    /// Linux machine that cross-builds it; from Linux when that Mac is past the target use or there
+    /// is none; from nowhere when nothing has the tools. No constant weighs one against another:
+    /// within the target first, then natively, then the emptiest.
     #[test]
     fn a_mac_s_build_is_made_where_the_tools_are() {
-        let mac = "aarch64-apple-darwin";
-        let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 10.0);
-        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 60.0);
-        let studio = candidate("studio", "macos", mac, &["git", "docker"], 80.0);
-        assert_eq!(pick(mac, &[studio.clone(), linux.clone(), laptop.clone()]), Some(("laptop".to_owned(), false)), "natively, on the Mac with the tools");
-        let pressed = Candidate { room: 10.0 - crate::reach::directory::OVERLOADED, ..laptop.clone() };
-        assert_eq!(pick(mac, &[pressed, linux.clone()]), Some(("linux".to_owned(), true)), "an overloaded Mac gives way to a Linux machine");
-        assert_eq!(pick(mac, &[studio.clone(), linux.clone()]), Some(("linux".to_owned(), true)), "cross-built when no Mac can");
-        let roomier = Candidate { name: "linux-2".into(), room: 90.0, ..linux.clone() };
-        assert_eq!(pick(mac, &[linux.clone(), roomier]), Some(("linux-2".to_owned(), true)), "the Linux machine with the most room");
-        let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 60.0);
-        assert_eq!(pick(mac, &[studio.clone(), no_python]), None, "cross-building needs python3 for zig");
-        assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio]), None, "only a Mac's build is cross-built for it");
+        let (mac, limit) = ("aarch64-apple-darwin", 0.85);
+        let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 0.8);
+        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 0.3);
+        let studio = candidate("studio", "macos", mac, &["git", "docker"], 0.1);
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone(), laptop.clone()], limit), Some(("laptop".to_owned(), false)), "natively, on the Mac with the tools, though it's fuller");
+        let pressed = Candidate { full: Some(0.97), ..laptop.clone() };
+        assert_eq!(pick(mac, &[pressed.clone(), linux.clone()], limit), Some(("linux".to_owned(), true)), "a Mac past the target gives way to a Linux machine within it");
+        let crowded = Candidate { full: Some(0.99), ..linux.clone() };
+        assert_eq!(pick(mac, &[pressed, crowded], limit), Some(("laptop".to_owned(), false)), "both past it: natively");
+        let unsampled = Candidate { full: None, ..laptop.clone() };
+        assert_eq!(pick(mac, &[unsampled, linux.clone()], limit), Some(("laptop".to_owned(), false)), "one that hasn't sampled isn't held past the target");
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone()], limit), Some(("linux".to_owned(), true)), "cross-built when no Mac can");
+        let roomier = Candidate { name: "linux-2".into(), full: Some(0.1), ..linux.clone() };
+        assert_eq!(pick(mac, &[linux.clone(), roomier], limit), Some(("linux-2".to_owned(), true)), "the emptiest Linux machine");
+        let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 0.3);
+        assert_eq!(pick(mac, &[studio.clone(), no_python], limit), None, "cross-building needs python3 for zig");
+        assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio], limit), None, "only a Mac's build is cross-built for it");
     }
 
     fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
@@ -1451,6 +1453,7 @@ mod tests {
             busy: 0,
             draining: false,
             sample: None,
+            sampled_at: None,
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),

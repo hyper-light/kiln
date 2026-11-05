@@ -749,25 +749,31 @@ pub enum Input {
 pub struct Sample {
     /// Its CPUs (hardware threads).
     pub cpus: u32,
-    /// The share of them busy, 0 to 1.
+    /// The share of their time they were busy, 0 to 1. Time waiting on I/O is idle time here.
     pub busy: f64,
-    /// Its load average over the last minute.
+    /// Its load average over the last minute, as it reported it. Placement doesn't weigh it
+    /// ([`Headroom::of`]): Linux counts tasks waiting on disk in it, and Windows has none.
     pub load1: f64,
     /// Its memory, and how much of it is in use, in bytes.
     pub mem_total: u64,
     pub mem_used: u64,
-    /// The share of time all its tasks stalled on I/O at once, in percent (Linux's PSI, `full`
-    /// avg10), where it says.
+    /// The share of time all its tasks stalled on I/O at once, in percent (Linux's PSI, `io`'s
+    /// `full`), where it says.
     pub io_full: Option<f64>,
+    /// The share of time all its tasks stalled on memory at once, in percent (Linux's PSI,
+    /// `memory`'s `full`), where it says.
+    pub mem_full: Option<f64>,
 }
 
 /// A runner's headroom by its latest sample: the CPUs and memory it has free, what kiln placed
-/// there since counted in use until the next sample shows it, and its I/O pressure.
+/// there since counted in use until the next sample shows it, and its pressure: the shares of
+/// time its tasks all stalled on I/O, and on memory.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Headroom {
     pub cpus: f64,
     pub mem: u64,
     pub io_full: Option<f64>,
+    pub mem_full: Option<f64>,
     /// What it has in all: its CPUs and memory.
     pub of: Resources,
 }
@@ -779,14 +785,13 @@ pub struct Headroom {
 #[allow(clippy::float_arithmetic, clippy::cast_precision_loss)]
 impl Headroom {
     /// A runner's headroom by its sample as it is, nothing placed since: what the v1 dispatcher
-    /// and reach weigh, from the samples the server holds. Its free CPUs are those neither its
-    /// busy share nor its load average takes, whichever leaves fewer (work waiting on disk or
-    /// memory shows in its load, not its busy share).
+    /// and reach weigh, from the samples the server holds. Its free CPUs are its CPUs times the
+    /// share of their time they were idle. Its load average plays no part: Linux counts tasks
+    /// waiting on disk in it, which its I/O pressure counts on its own, and Windows has none.
     pub fn of(s: &Sample) -> Headroom {
         let all = f64::from(s.cpus);
-        let by_busy = all * (1.0 - s.busy.clamp(0.0, 1.0));
-        let by_load = (all - s.load1.max(0.0)).max(0.0);
-        Headroom { cpus: by_busy.min(by_load), mem: s.mem_total.saturating_sub(s.mem_used), io_full: s.io_full, of: Resources { cpu: Cpus::whole(u64::from(s.cpus)), mem: s.mem_total, ..Resources::default() } }
+        let free = all * (1.0 - s.busy.clamp(0.0, 1.0));
+        Headroom { cpus: free, mem: s.mem_total.saturating_sub(s.mem_used), io_full: s.io_full, mem_full: s.mem_full, of: Resources { cpu: Cpus::whole(u64::from(s.cpus)), mem: s.mem_total, ..Resources::default() } }
     }
 
     /// Its CPUs' and its memory's share in use with `request` on it.
@@ -803,12 +808,16 @@ impl Headroom {
         cpu <= target + 1e-9 && mem <= target + 1e-9
     }
 
-    /// How full `request` leaves it: the larger of its CPUs' and its memory's share in use, its
-    /// I/O pressure (the share of time its tasks all stalled) on top. Lower is the more headroom:
-    /// placement's order for the engine, the v1 dispatcher and reach alike.
+    /// How full `request` leaves it: the larger of its CPUs' and its memory's share in use, and on
+    /// top the shares of time its tasks all stalled on memory and on I/O (PSI's `full`: nothing
+    /// advanced and the CPU went idle, so that time was lost, not used; idle CPUs don't show it).
+    /// Lower is the more headroom: placement's order for the engine, the v1 dispatcher and reach
+    /// alike. The two stalls overlap only while a task waits on I/O to bring its memory back with
+    /// nothing running (thrashing), which counts twice; delays (PSI's `some`) don't count.
     pub fn fullness(&self, request: &Resources) -> f64 {
         let (cpu, mem) = self.use_with(request);
-        cpu.max(mem) + self.io_full.unwrap_or(0.0) / 100.0
+        let stalled = self.mem_full.unwrap_or(0.0) + self.io_full.unwrap_or(0.0);
+        cpu.max(mem) + stalled / 100.0
     }
 }
 

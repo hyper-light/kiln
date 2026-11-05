@@ -1631,6 +1631,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     // Agent sessions handed to this machine's newer runner process go by way of the server.
     crate::harness::handing::install(uplink.0.clone());
+    // What each run here does goes to the server as it ends (docs/needs.md).
+    if !o.ephemeral && !o.outpost {
+        crate::sense::run::install(uplink.clone());
+    }
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
     let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if !o.ephemeral && !o.outpost {

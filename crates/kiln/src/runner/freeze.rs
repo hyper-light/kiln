@@ -103,6 +103,23 @@ pub fn begin(job: &str) -> Started {
     Started(job.to_owned())
 }
 
+/// What job `job`'s processes have used so far, as its OS counts them for it (docs/needs.md): its
+/// cgroup's (Linux), its steps' job objects' (Windows); nothing elsewhere.
+pub fn usage(job: &str) -> crate::sense::run::Usage {
+    let Some(j) = JOBS.lock().get(job).cloned() else { return crate::sense::run::Usage::default() };
+    let st = j.0.lock();
+    #[cfg(target_os = "linux")]
+    if let Some(cg) = &st.cgroup {
+        return cg.usage();
+    }
+    #[cfg(windows)]
+    if !st.trees.is_empty() {
+        return st.trees.iter().map(crate::os::contain::Tree::usage).fold(crate::sense::run::Usage::default(), crate::sense::run::Usage::plus);
+    }
+    drop(st);
+    crate::sense::run::Usage::default()
+}
+
 /// A running job's place in the registry, given up when it ends, and its cgroup with it.
 pub struct Started(String);
 

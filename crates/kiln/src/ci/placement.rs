@@ -47,7 +47,7 @@ impl Placement for Headroomed {
                 .map(|n| {
                     let u = used(&placed, &n.name);
                     let free = Resources { cpu_milli: n.capacity.cpu_milli.saturating_sub(u.cpu_milli), memory_bytes: n.capacity.memory_bytes.saturating_sub(u.memory_bytes) };
-                    let headroom = Headroom { cpus: engine(free).cpu.as_f64(), mem: free.memory_bytes, io_full: None, of: engine(n.capacity) };
+                    let headroom = Headroom { cpus: engine(free).cpu.as_f64(), mem: free.memory_bytes, io_full: None, mem_full: None, of: engine(n.capacity) };
                     kiln_ci::sched::place::Node { name: &n.name, headroom: Some(headroom) }
                 })
                 .collect();

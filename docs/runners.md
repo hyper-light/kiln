@@ -153,10 +153,10 @@ share) takes its place behind that shape: which node, what's held for whom, and 
 **A command** (`kiln run`, MCP's `run`, code_run's `kiln.machines.run`) goes to a connected runner
 that takes reach links, meets the constraints (its reported facts, with its latest sample's
 platform, cores and memory over them) and has the room asked for idle and free (docs/reach.md §2).
-The asking machine comes first while it suits and has 4 GiB free beyond what's asked; else the
-one the command leaves the most headroom by the engine's measure (the larger of its CPUs' and its
-memory's share in use with what's asked, its I/O pressure on top), a tunnelled path and being
-overloaded counting against it. It says which and why:
+Every one that suits is weighed by the engine's measure, the asking machine like any other: the
+one the command leaves the most headroom (the larger of its CPUs' and its memory's share in use with
+what's asked, its memory and I/O stalls on top) goes first, the asking machine only on a tie. Idle cores are
+CPUs times their idle share; a load average plays no part. It says which and why:
 
 ```text
 [kiln] on big · linux/x86_64 · 32 of 32 cores idle · 60 GB free · room for 8 CPUs, 32 GiB of memory

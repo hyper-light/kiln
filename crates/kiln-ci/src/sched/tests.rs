@@ -2237,7 +2237,7 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 0);
     assert_eq!(s.headroom("adacachy"), None, "no sample yet");
-    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1) };
+    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1), mem_full: None };
     let near = |h: Option<Headroom>, cpus: f64, mem_gib: u64| h.is_some_and(|h| (h.cpus - cpus).abs() < 1e-9 && h.mem == mem_gib * GIB && h.io_full == Some(2.1) && h.of.cpu == Cpus::whole(32));
     s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.4, 60) }, 1_000);
     assert!(near(s.headroom("adacachy"), 19.2, 64), "{:?}", s.headroom("adacachy"));
@@ -2270,7 +2270,7 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
         s.handle(Input::RunnerUp(Box::new(linux(r, 8))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy: f64, io: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io), mem_full: None } }, at)
     };
     let asking = |id: &str, cpu: f64, mem_gib: u64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: mem_gib * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let to = |c: &[Command], id: &str| {
@@ -2328,7 +2328,7 @@ fn a_declared_preference_comes_before_headroom_within_the_target() {
         s.handle(Input::RunnerUp(Box::new(r)), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0), mem_full: None } }, at)
     };
     let fast = |id: &str| LegIn { prefer: vec![Preference { label: Some("fast".into()), ..Preference::default() }], request: Resources { cpu: Cpus::whole(4), mem: 2 * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let to = |c: &[Command], id: &str| {
@@ -2363,7 +2363,7 @@ fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
         s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0), mem_full: None } }, at)
     };
     let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: GIB, ..Resources::default() }, cost: super::units::ms_of_secs(cost_s), ..leg(id, "acme/x", 50) };
     let to = |c: &[Command], id: &str| {
@@ -2422,7 +2422,7 @@ fn a_hold_ends_with_its_runner_or_its_leg() {
         s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0), mem_full: None } }, at)
     };
     let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: GIB, ..Resources::default() }, cost: super::units::ms_of_secs(cost_s), ..leg(id, "acme/x", 50) };
     say(&mut s, "a", 0.0, 0);

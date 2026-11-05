@@ -176,9 +176,10 @@ fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
     v
 }
 
-/// How hard a runner is pressed, by its last sample (none yet: unknown, not overloaded).
-fn strain_of(a: &AgentLive) -> crate::reach::directory::Strain {
-    a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default()
+/// How full `asked` would leave a runner by its last sample, fresh or not
+/// (`crate::reach::directory::fullness`, the engine's measure); `None` before it has sampled.
+fn fullness_of(a: &AgentLive, asked: &kiln_ci::sched::state::Resources) -> Option<f64> {
+    a.sample.as_ref().and_then(|s| crate::reach::directory::fullness(&crate::ci::dispatch::sample_of(s, a.facts.as_deref()), asked))
 }
 
 /// An outpost (`kiln outpost`) says so with its label and no slots; a runner given the label by
@@ -343,6 +344,12 @@ pub struct AgentLive {
     pub busy: u32,
     pub draining: bool,
     pub sample: Option<HostSample>,
+    /// When the server received `sample`, by the server's clock (ms): what its age is told by,
+    /// never the runner's own clock (`HostSample::ts_ms`); and, to reach's directory, which sample
+    /// work placed since is counted against (`crate::reach::directory::RunnerInfo::sampled_at`).
+    #[serde(skip)]
+    #[cfg_attr(test, ts(skip))]
+    pub sampled_at: Option<i64>,
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -1120,6 +1127,7 @@ impl Hub {
                     busy: 0,
                     draining: false,
                     sample: None,
+                    sampled_at: None,
                     battery: None,
                     dropped: Vec::new(),
                     dropped_toward: Vec::new(),
@@ -1705,6 +1713,7 @@ impl Hub {
                     harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
                     via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
                     facts: a.facts.clone(),
+                    sampled_at: a.sampled_at,
                 }
             })
             .collect();
@@ -2179,6 +2188,7 @@ impl Hub {
             AgentMsg::Sample(s) => {
                 if let Some(a) = self.agents.lock().get_mut(&agent) {
                     a.sample = Some(s.clone());
+                    a.sampled_at = Some(crate::util::now_ms());
                 }
                 self.record_sample(&agent, s);
                 // The CI engine weighs its headroom by it: once a sample, as it comes.
@@ -2540,7 +2550,15 @@ impl Hub {
                 }
             }
             // The kiln it runs (`crate::fleet`); the rest is W13's.
-            FromRunner::Facts(f) => {
+            FromRunner::Facts(mut f) => {
+                // Runs that finished on it, for the learned run-time model (docs/needs.md): kept
+                // apart, never with its facts.
+                let runs = std::mem::take(&mut f.runs);
+                if !runs.is_empty()
+                    && let Err(e) = self.store.record_runs(agent.to_owned(), runs).await
+                {
+                    tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs");
+                }
                 if let Some(k) = f.kiln.clone() {
                     // How far behind the server's kiln it is: to be upgraded, it takes no new work.
                     self.skew_check(agent, peer, Some(k.commit.clone()));
@@ -2548,6 +2566,14 @@ impl Hub {
                     self.instances.lock().set_kiln(peer, k);
                     self.updates.late_by_commit(self, agent);
                     self.updates.fleet.wake();
+                }
+                // Its pressure, said again as a run on it ended (docs/needs.md): kept with the
+                // facts it has, which placement weighs it by until it next says.
+                if f.cpu.threads == 0
+                    && let Some(work) = f.work.clone()
+                    && let Some(kept) = self.agents.lock().get_mut(agent).and_then(|a| a.facts.as_mut())
+                {
+                    kept.work = Some(work);
                 }
                 // A probe's whole report (a runner that only said its kiln has no CPU count):
                 // routing decides over it from now on (docs/ci.md W13-R01).
@@ -2884,6 +2910,7 @@ impl Hub {
             running: keep,
             draining: false,
             sample: None,
+            sampled_at: None,
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
@@ -3618,7 +3645,7 @@ impl Hub {
         let g = self.agents.lock();
         let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
         let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
-        let (target, now) = (crate::ci::dispatch::target_use(&self.cfg.ci.scheduler), crate::util::now_ms());
+        let target = crate::ci::dispatch::target_use(&self.cfg.ci.scheduler);
         let found = g
             .values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
@@ -3638,11 +3665,11 @@ impl Hub {
             // Where a person's retry asked it to run (docs/ci.md W05-R28).
             .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
             .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
-            // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
-            // job goes to another, or waits for one (a pod made for it is its own).
-            .filter(|a| a.ephemeral || !strain_of(a).overloaded)
-            // By the engine's own rule (W05): within the target use, the most headroom left.
-            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
+            // By the engine's own rule (W05): within the target use by its last sample, however old
+            // (a runner whose sample is stale is as full as it last said, never taken to fit), the
+            // most headroom left. No load or memory threshold sets a runner aside: one past the
+            // target waits for room like any other (a pod made for the job is its own).
+            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { known_headroom(a) }, full: fullness_of(a, &asked) });
         v1_best(found, &asked, target).map(str::to_owned)
     }
 
@@ -3825,26 +3852,30 @@ fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Re
 pub(crate) struct V1Candidate<'a> {
     pub name: &'a str,
     pub slots: u32,
-    /// Its headroom by a fresh sample; none for a pod made for the job, or a runner without one.
+    /// Its headroom by its last sample, however old; none for a pod made for the job, or a
+    /// runner that hasn't sampled.
     pub headroom: Option<kiln_ci::sched::state::Headroom>,
-    /// Its room as reach measures it, for runners without a fresh sample.
-    pub room: f32,
+    /// How full the job would leave it by its last sample (the engine's measure), which orders
+    /// runners; `None` before it has sampled.
+    pub full: Option<f64>,
 }
 
 /// Where a v1 job goes of the runners that could take it, by the engine's own rule (W05, the
-/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its live
-/// sample, the one with the most headroom left after it; ties, and runners without a fresh
-/// sample after those, by reach's room, then the most slots, then the name.
+/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its last
+/// sample, the one with the most headroom left after it; ties by how full the job would leave
+/// each, runners that haven't sampled after those, then the most slots, then the name.
 pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
     let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
-    found.sort_by(|a, b| b.room.total_cmp(&a.room).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
+    found.sort_by(|a, b| crate::reach::directory::emptier(a.full, b.full).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
     let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();
     kiln_ci::sched::place::place(asked, &nodes, target).ok()
 }
 
-/// A runner's headroom by its sample when it's fresh ([`kiln_ci::sched::state::SAMPLE_FRESH_MS`]).
-fn fresh_headroom(a: &AgentLive, now_ms: i64) -> Option<kiln_ci::sched::state::Headroom> {
-    let s = a.sample.as_ref().filter(|s| now_ms.saturating_sub(s.ts_ms) <= kiln_ci::sched::state::SAMPLE_FRESH_MS)?;
+/// A runner's headroom by its last sample, however old, as the engine weighs it (W05): a
+/// runner whose sample is stale is as full as it last said, never taken to fit for want of a
+/// sample. None before it has sampled.
+fn known_headroom(a: &AgentLive) -> Option<kiln_ci::sched::state::Headroom> {
+    let s = a.sample.as_ref()?;
     Some(kiln_ci::sched::state::Headroom::of(&crate::ci::dispatch::sample_of(s, a.facts.as_deref())))
 }
 
@@ -4294,6 +4325,7 @@ pub(crate) mod tests {
             held: Vec::new(),
             draining: false,
             sample: None,
+            sampled_at: None,
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
@@ -4451,6 +4483,33 @@ pub(crate) mod tests {
         })
     }
 
+    /// W05: v1 dispatch weighs a runner whose sample is stale as full as it last said, never as
+    /// fitting for want of a fresh one; and no load or memory threshold sets a runner aside. A
+    /// sample's age is the server's reckoning (`sampled_at`), its runner's clock (`ts_ms`, here an
+    /// hour behind) plays no part.
+    #[test]
+    fn w05_a_stale_runner_is_as_full_as_it_last_said() {
+        use kiln_ci::sched::state::{Cpus, Resources};
+        const GIB: u64 = 1 << 30;
+        let asked = Resources { cpu: Cpus::whole(4), mem: 2 * GIB, ..Resources::default() };
+        let at = |name: &str, cpu_pct: f32| {
+            let mut a = live_runner(name, "linux", "x86_64");
+            a.sample = Some(HostSample { ts_ms: crate::util::now_ms() - 3_600_000, cpus: 32, cpu_pct, mem_total: 64 * GIB, mem_used: 8 * GIB, ..HostSample::default() });
+            a.sampled_at = Some(0);
+            a
+        };
+        let (busy, calm) = (at("busy", 95.0), at("calm", 20.0));
+        assert!(known_headroom(&busy).is_some_and(|h| h.cpus < 2.0), "{:?}", known_headroom(&busy));
+        let cand = |a: &AgentLive| V1Candidate { name: "", slots: 4, headroom: known_headroom(a), full: fullness_of(a, &asked) };
+        let only_busy = v1_best([V1Candidate { name: "busy", ..cand(&busy) }], &asked, 0.85);
+        assert_eq!(only_busy, None, "past the target by its last sample, however old: the job waits");
+        let both = v1_best([V1Candidate { name: "busy", ..cand(&busy) }, V1Candidate { name: "calm", ..cand(&calm) }], &asked, 0.85);
+        assert_eq!(both, Some("calm"));
+        // Never sampled: as before samples were, within the target, after every runner that has.
+        let quiet = live_runner("quiet", "linux", "x86_64");
+        assert_eq!(v1_best([V1Candidate { name: "quiet", ..cand(&quiet) }], &asked, 0.85), Some("quiet"));
+    }
+
     /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
     /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
     /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
@@ -4461,7 +4520,7 @@ pub(crate) mod tests {
         use kiln_ci::sched::state::{Command, Config, Headroom, Input, LegIn, Resources, RunnerIn, Sample, Scheduler};
         const GIB: u64 = 1 << 30;
         let fleet = [("a", 0.8, 0.0), ("b", 0.3, 0.0), ("c", 0.1, 60.0)];
-        let sample = |busy: f64, io: f64| Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) };
+        let sample = |busy: f64, io: f64| Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io), mem_full: None };
         let asked = Resources { cpu: kiln_ci::sched::state::Cpus::whole(4), mem: 2 * GIB, ..Resources::default() };
         // The engine.
         let mut engine = Scheduler::new(Config::default());
@@ -4477,7 +4536,7 @@ pub(crate) mod tests {
             _ => None,
         });
         // The v1 dispatcher.
-        let by_v1 = v1_best(fleet.iter().map(|(name, busy, io)| V1Candidate { name, slots: 4, headroom: Some(Headroom::of(&sample(*busy, *io))), room: 0.0 }), &asked, 0.85);
+        let by_v1 = v1_best(fleet.iter().map(|(name, busy, io)| V1Candidate { name, slots: 4, headroom: Some(Headroom::of(&sample(*busy, *io))), full: None }), &asked, 0.85);
         // kiln run.
         let info: Vec<crate::reach::directory::RunnerInfo> = fleet
             .iter()
@@ -4491,7 +4550,7 @@ pub(crate) mod tests {
                 cpu_pct: (*busy * 100.0) as f32,
                 mem_total: 64 * GIB,
                 mem_used: 16 * GIB,
-                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(*io) }), ..kiln_ci::facts::RunnerFacts::default() })),
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(*io), ..kiln_ci::facts::WorkFacts::default() }), ..kiln_ci::facts::RunnerFacts::default() })),
                 ..crate::reach::directory::RunnerInfo::default()
             })
             .collect();

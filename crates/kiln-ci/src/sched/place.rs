@@ -73,7 +73,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn node(name: &str, busy: f64, used_gib: u64, io: f64) -> Node<'_> {
-        Node { name, headroom: Some(Headroom::of(&Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used_gib * GIB, io_full: Some(io) })) }
+        Node { name, headroom: Some(Headroom::of(&Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used_gib * GIB, io_full: Some(io), mem_full: None })) }
     }
 
     /// W05 step 5: placement's shape, kiln-seams' `Placement`'s: needs and nodes in, a node or why

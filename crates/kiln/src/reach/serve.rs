@@ -414,7 +414,15 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
             }
         };
         // (Windows' has more: its job object.)
-        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, .. } = duplex;
+        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, usage, .. } = duplex;
+        // What it does, from here to its end, for the learned run-time model (docs/needs.md).
+        let recorder = {
+            let (key, label, dir, so_far) = (crate::sense::run::command_key(&spec.command, &cwd), crate::sense::run::command_label(&spec.command), cwd.clone(), group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default());
+            crate::rt::blocking(move || crate::sense::run::Recorder::start(key, "command", Some(label), &dir, so_far, None)).await.ok()
+        };
+        // Its output looked over, each stream's lines apart, for what the machine ended it of
+        // (no space, a tool not found: S6).
+        let (mut out_scan, mut err_scan) = (crate::sense::health::Scan::default(), crate::sense::health::Scan::default());
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
             end_now(pid, group);
             return;
@@ -445,6 +453,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     // Only stderr is left: wait on it alone.
                     if err_open {
                         while let Ok(data) = stderr.recv().await {
+                            err_scan.feed(&data);
                             if events.send(Event::Output { stream: Stream::Err, data }).await.is_err() {
                                 end_now(pid, group);
                                 return;
@@ -457,6 +466,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     err_open = false;
                     if out_open {
                         while let Ok(data) = stdout.recv().await {
+                            out_scan.feed(&data);
                             if events.send(Event::Output { stream: Stream::Out, data }).await.is_err() {
                                 end_now(pid, group);
                                 return;
@@ -466,6 +476,10 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     }
                 }
                 (stream, Some(data)) => {
+                    match stream {
+                        Stream::Out => out_scan.feed(&data),
+                        Stream::Err => err_scan.feed(&data),
+                    }
                     if events.send(Event::Output { stream, data }).await.is_err() {
                         end_now(pid, group);
                         return;
@@ -474,6 +488,20 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
             }
         }
         let code = exit.await.ok().flatten();
+        if let Some(recorder) = recorder {
+            // Its group's count (everything it started) before its own tree's as `wait4` gave it.
+            let tree = match usage {
+                Some(u) => u.await.unwrap_or_default(),
+                None => crate::sense::run::Usage::default(),
+            };
+            let all = group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default();
+            out_scan.end();
+            err_scan.end();
+            let scan = out_scan.with(err_scan);
+            if let Ok(o) = crate::rt::blocking(move || recorder.finish(code, all.or(tree), Some(&scan))).await {
+                crate::sense::run::report(o);
+            }
+        }
         // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
         let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
         let _ = events.send(Event::Exit { code, error: None }).await;

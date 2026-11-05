@@ -3,12 +3,23 @@
 
 /**
  * The machine as W24's work sees it: its load now (admission, W24-R19). The work volume's free
- * disk is [`RunnerFacts::disk`]'s.
+ * disk is [`RunnerFacts::disk`]'s. Probed with the other facts, and said again as each run on
+ * the runner ends (with [`RunnerFacts::runs`]): on change, never on a timer (docs/needs.md).
  */
 export type WorkFacts = { 
 /**
- * The share of the last 10 seconds in which all the machine's non-idle tasks were stalled on
- * I/O at once, in percent: Linux's pressure stall information, `/proc/pressure/io`'s `full
- * avg10`. `None` where the system doesn't report it.
+ * The share of time in which all the machine's non-idle tasks were stalled on I/O at once, in
+ * percent: Linux's pressure stall information, `/proc/pressure/io`'s `full`. Probed, its
+ * 10-second average; said as a run ends, the exact share over the interval since the run event
+ * before. `None` where the system doesn't report it.
  */
-io_full: number | null, };
+io_full: number | null, 
+/**
+ * The same of memory: the share in which all of them were stalled on memory at once
+ * (`/proc/pressure/memory`'s `full`), in percent.
+ */
+mem_full: number | null, 
+/**
+ * macOS's memory pressure level (`normal`, `warn`, `critical`); it keeps no stall times.
+ */
+memory_level: string | null, };

@@ -1496,6 +1496,13 @@ impl Leg {
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         // It can be frozen where it runs while it runs here (W26-R22); its time limit stops then.
         let _freezing = super::freeze::begin(&a.job_id);
+        // What it does, for the learned run-time model (docs/needs.md): observed as this returns,
+        // before its cgroup goes with `_freezing`.
+        let _observed = {
+            let workflow = a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str());
+            let key = crate::sense::run::leg_key(&a.repo, workflow, &a.leg.job_id, &a.leg.matrix.to_string());
+            crate::sense::run::Leg::start(&a.job_id, key, Some(format!("{} {}", a.repo, a.leg.name)), &self.work_dir)
+        };
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
         if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {

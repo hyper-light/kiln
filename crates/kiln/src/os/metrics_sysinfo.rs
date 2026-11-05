@@ -1,40 +1,33 @@
-//! Host and process statistics where there is no procfs (macOS, Windows), through `sysinfo`.
-//! A job's footprint is its process tree (the step's shell and every descendant), the closest
-//! portable equivalent of a Unix process group.
+//! Host and process statistics where there is no procfs (macOS, Windows): the machine's figures
+//! from the runner's sensor ([`crate::sense`]), network totals through `sysinfo`. A job's footprint
+//! is its process group on macOS (libproc), its process tree on Windows (the step's shell and every
+//! descendant), the closest portable equivalent of a Unix process group.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::host::ProcStats;
 use crate::metrics::HostSample;
 
-/// Stateful sampler: CPU% is a delta between calls; network totals are cumulative.
+/// Stateful sampler: CPU and memory from the runner's sensor ([`crate::sense::Sensor`]: Mach's
+/// and Win32's own counters, each figure the exact average since the previous sample), the work
+/// directory's volume from it too, network totals (cumulative) from `sysinfo`, and the number of
+/// processes by one call that lists none of them (AUDIT P3: no process table is walked per sample).
 pub struct Sampler {
-    sys: System,
+    sensor: crate::sense::Sensor,
     nets: Networks,
-    disks: Disks,
-    work_dir: Option<PathBuf>,
 }
 
 impl Sampler {
     pub fn new(work_dir: Option<&Path>) -> Self {
-        let mut sys = System::new();
-        sys.refresh_cpu_usage();
-        Self {
-            sys,
-            nets: Networks::new_with_refreshed_list(),
-            disks: Disks::new_with_refreshed_list(),
-            work_dir: work_dir.map(Path::to_path_buf),
-        }
+        let dir = work_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        Self { sensor: crate::sense::Sensor::new(&dir), nets: Networks::new_with_refreshed_list() }
     }
 
     pub fn sample(&mut self) -> HostSample {
-        self.sys.refresh_cpu_usage();
-        self.sys.refresh_memory();
-        let mem_total = self.sys.total_memory();
-        let mem_used = mem_total.saturating_sub(self.sys.available_memory());
+        let m = self.sensor.measure();
+        let b = m.budget();
         #[allow(clippy::cast_possible_truncation)]
         let load1 = System::load_average().one as f32;
 
@@ -48,39 +41,82 @@ impl Sampler {
             net_rx = net_rx.saturating_add(data.total_received());
             net_tx = net_tx.saturating_add(data.total_transmitted());
         }
-
-        let (disk_total, disk_used) = self.work_dir_disk();
-
-        self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
-        HostSample {
-            ts_ms: crate::util::now_ms(),
-            cpu_pct: self.sys.global_cpu_usage(),
-            cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
-            load1,
-            mem_total,
-            mem_used,
-            disk_total,
-            disk_used,
-            net_rx,
-            net_tx,
-            procs: u32::try_from(self.sys.processes().len()).unwrap_or(u32::MAX),
-        }
+        let (disk_total, disk_used) = m.space.map_or((0, 0), |s| (s.total, s.total.saturating_sub(s.free)));
+        #[allow(clippy::cast_possible_truncation)]
+        let cpu_pct = (b.busy * 100.0) as f32;
+        HostSample { ts_ms: crate::util::now_ms(), cpu_pct, cpus: b.cpus, load1, mem_total: b.mem_total, mem_used: b.mem_used, disk_total, disk_used, net_rx, net_tx, procs: process_count() }
     }
+}
 
-    /// Size and use of the volume holding the work dir: the disk with the longest mount point
-    /// that is a prefix of it.
-    fn work_dir_disk(&mut self) -> (u64, u64) {
-        let Some(dir) = self.work_dir.as_deref() else { return (0, 0) };
-        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        self.disks.refresh(true);
-        self.disks
-            .list()
-            .iter()
-            .filter(|d| dir.starts_with(d.mount_point()))
-            .max_by_key(|d| d.mount_point().as_os_str().len())
-            .map(|d| (d.total_space(), d.total_space().saturating_sub(d.available_space())))
-            .unwrap_or((0, 0))
+/// How many processes run: macOS's `proc_listallpids` asked for none (it returns the count),
+/// Windows' `GetPerformanceInfo`'s `ProcessCount`.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn process_count() -> u32 {
+    // SAFETY: no buffer: the call returns how many pids there are.
+    let n = unsafe { nix::libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    u32::try_from(n).unwrap_or(0)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn process_count() -> u32 {
+    /// `PERFORMANCE_INFORMATION`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct PerformanceInformation {
+        cb: u32,
+        sizes: [usize; 10],
+        handle_count: u32,
+        process_count: u32,
+        thread_count: u32,
     }
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(std::mem::size_of::<PerformanceInformation>() == 104 && std::mem::offset_of!(PerformanceInformation, process_count) == 92);
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn K32GetPerformanceInfo(info: *mut PerformanceInformation, cb: u32) -> i32;
+    }
+    let mut info = PerformanceInformation { cb: u32::try_from(std::mem::size_of::<PerformanceInformation>()).unwrap_or(0), ..PerformanceInformation::default() };
+    let cb = info.cb;
+    // SAFETY: a whole PERFORMANCE_INFORMATION, its size given.
+    if unsafe { K32GetPerformanceInfo(&raw mut info, cb) } == 0 {
+        return 0;
+    }
+    info.process_count
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn process_count() -> u32 {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+    u32::try_from(sys.processes().len()).unwrap_or(u32::MAX)
+}
+
+/// This machine's pressure (docs/reach.md §2): on macOS its memory pressure level, which any
+/// process may read; it has no stall times. Windows says none.
+pub fn pressure() -> crate::metrics::Pressure {
+    crate::metrics::Pressure { memory: memory_level(), ..crate::metrics::Pressure::default() }
+}
+
+/// macOS's memory pressure level, `kern.memorystatus_vm_pressure_level` (XNU checks no privilege
+/// for it on macOS), read without a process to start.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn memory_level() -> Option<crate::metrics::MemoryLevel> {
+    use nix::libc;
+    let mut level: libc::c_uint = 0;
+    let mut len = std::mem::size_of::<libc::c_uint>();
+    // SAFETY: the name is NUL-terminated; the out pointer and its length name one live local
+    // `c_uint`, the sysctl's type (`CTLTYPE_INT`); no new value is written.
+    let outcome = unsafe { libc::sysctlbyname(c"kern.memorystatus_vm_pressure_level".as_ptr(), (&raw mut level).cast::<libc::c_void>(), &raw mut len, std::ptr::null_mut(), 0) };
+    (outcome == 0 && len == std::mem::size_of::<libc::c_uint>()).then_some(level).and_then(crate::metrics::MemoryLevel::of_dispatch)
+}
+
+/// No memory pressure level where there's no macOS kernel to say it.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn memory_level() -> Option<crate::metrics::MemoryLevel> {
+    None
 }
 
 fn stats_of(p: &sysinfo::Process) -> ProcStats {
@@ -101,19 +137,65 @@ pub fn process_self() -> ProcStats {
     sys.process(me).map(stats_of).unwrap_or_default()
 }
 
+/// Aggregate CPU time and RSS of process group `pgid`: the footprint of one job, as Linux's
+/// procfs one counts it. macOS lists the group's members alone (`proc_listpids(PROC_PGRP_ONLY)`)
+/// and asks each for its task info, never walking the process table (AUDIT P3).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn process_group(pgid: i32) -> ProcStats {
+    use nix::libc;
+    /// `PROC_PGRP_ONLY` (`<libproc.h>`).
+    const PROC_PGRP_ONLY: u32 = 2;
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+    }
+    let mut acc = ProcStats::default();
+    let Ok(group) = u32::try_from(pgid) else { return acc };
+    // SAFETY: no buffer: the call returns the bytes the list needs.
+    let need = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, std::ptr::null_mut(), 0) };
+    let Ok(need) = usize::try_from(need) else { return acc };
+    // Room for what joins between the two calls: as many again.
+    let mut pids = vec![0 as libc::pid_t; need / std::mem::size_of::<libc::pid_t>() * 2 + 1];
+    let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
+    // SAFETY: a buffer of `bytes` bytes of pids.
+    let got = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(got).unwrap_or(0) / std::mem::size_of::<libc::pid_t>();
+    let mut tb = [0u32; 2];
+    // SAFETY: a mach_timebase_info_data_t (numer, denom).
+    let ticks_to_ns = if unsafe { mach_timebase_info(&raw mut tb) } == 0 && tb[1] > 0 { f64::from(tb[0]) / f64::from(tb[1]) } else { 1.0 };
+    for pid in pids.iter().take(n).copied().filter(|p| *p > 0) {
+        // SAFETY: plain integers, for which zero is a value.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+        // SAFETY: a whole proc_taskinfo, its size given.
+        let r = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+        if r != size {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            acc.cpu_seconds += (info.pti_total_user.saturating_add(info.pti_total_system)) as f64 * ticks_to_ns / 1e9;
+        }
+        acc.rss_bytes = acc.rss_bytes.saturating_add(info.pti_resident_size);
+        acc.threads = acc.threads.saturating_add(u64::try_from(info.pti_threadnum).unwrap_or(0));
+    }
+    acc
+}
+
 /// Aggregate CPU time and RSS of the process tree rooted at `root`: the footprint of one job.
+#[cfg(not(target_os = "macos"))]
 pub fn process_group(root: i32) -> ProcStats {
     let mut acc = ProcStats::default();
     let Ok(root) = u32::try_from(root) else { return acc };
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_memory().with_cpu().without_tasks());
-    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    let mut children: std::collections::HashMap<Pid, Vec<Pid>> = std::collections::HashMap::new();
     for (pid, p) in sys.processes() {
         if let Some(parent) = p.parent() {
             children.entry(parent).or_default().push(*pid);
         }
     }
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut todo = vec![Pid::from_u32(root)];
     while let Some(pid) = todo.pop() {
         if !seen.insert(pid) {

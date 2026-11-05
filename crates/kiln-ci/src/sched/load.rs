@@ -135,7 +135,7 @@ mod tests {
     }
 
     fn facts(pressure: Option<f64>, free: u64) -> RunnerFacts {
-        RunnerFacts { os: "linux".into(), arch: "x86_64".into(), disk: Disk { total: 1_000 * GIB, free }, work: Some(WorkFacts { io_full: pressure }), ..RunnerFacts::default() }
+        RunnerFacts { os: "linux".into(), arch: "x86_64".into(), disk: Disk { total: 1_000 * GIB, free }, work: Some(WorkFacts { io_full: pressure, ..WorkFacts::default() }), ..RunnerFacts::default() }
     }
 
     fn runner(name: &str, pressure: Option<f64>, free: u64) -> RunnerIn {

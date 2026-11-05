@@ -4124,15 +4124,20 @@ pub(crate) fn target_use(s: &crate::config::ci::Scheduler) -> f64 {
 }
 
 /// What the engine weighs of a runner's sample: its CPUs, the share of them busy, its load and
-/// memory, and the I/O pressure its facts last said (`work.io_full`).
+/// memory, and the pressure its facts last said (docs/reach.md §2): Linux's memory and I/O stalls
+/// (PSI's `full`) as they are, and memory macOS calls critical counted all in use (even
+/// compressed, its working set no longer fits, and it swaps).
 pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::facts::RunnerFacts>) -> kiln_ci::sched::state::Sample {
+    let work = facts.and_then(|f| f.work.as_ref());
+    let depleted = work.and_then(|w| w.memory_level.as_deref()) == Some("critical");
     kiln_ci::sched::state::Sample {
         cpus: s.cpus,
         busy: f64::from(s.cpu_pct.clamp(0.0, 100.0)) / 100.0,
         load1: f64::from(s.load1),
         mem_total: s.mem_total,
-        mem_used: s.mem_used,
-        io_full: facts.and_then(|f| f.work.as_ref()).and_then(|w| w.io_full),
+        mem_used: if depleted { s.mem_total } else { s.mem_used },
+        io_full: work.and_then(|w| w.io_full),
+        mem_full: work.and_then(|w| w.mem_full),
     }
 }
 
@@ -4736,7 +4741,7 @@ mod tests {
         use kiln_ci::sched::state::{Config, Input, RunnerIn, Scheduler};
         const GIB: u64 = 1 << 30;
         let host = crate::metrics::HostSample { cpus: 32, cpu_pct: 40.0, load1: 12.5, mem_total: 124 * GIB, mem_used: 60 * GIB, ..crate::metrics::HostSample::default() };
-        let facts = kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(2.1) }), ..kiln_ci::facts::RunnerFacts::default() };
+        let facts = kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(2.1), ..kiln_ci::facts::WorkFacts::default() }), ..kiln_ci::facts::RunnerFacts::default() };
         let s = super::sample_of(&host, Some(&facts));
         assert_eq!((s.cpus, s.busy, s.load1, s.mem_total, s.mem_used, s.io_full), (32, 0.4, 12.5, 124 * GIB, 60 * GIB, Some(2.1)));
         assert_eq!(super::sample_of(&host, None).io_full, None, "no facts yet, no pressure said");

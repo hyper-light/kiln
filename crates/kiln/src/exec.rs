@@ -243,6 +243,9 @@ impl Exec {
         // It can be frozen where it runs while it runs here (docs/ci.md W26-R22); its time limit
         // stops then.
         let _freezing = crate::runner::freeze::begin(&job);
+        // What it does, for the learned run-time model (docs/needs.md): observed as this returns,
+        // before its cgroup goes with `_freezing`.
+        let _observed = crate::sense::run::Leg::start(&job, crate::sense::run::leg_key(&a.repo, "", &a.spec.key, ""), Some(format!("{} {}", a.repo, a.spec.key)), &self.work_dir);
         let mut usage = Usage::default();
         let mut failed: Option<(Status, Option<i32>, String)> = None;
         for (i, step) in a.spec.steps.iter().enumerate() {

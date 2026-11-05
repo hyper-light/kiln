@@ -67,6 +67,7 @@ pub mod runner;
 pub mod rt;
 pub mod ship;
 pub mod secrets;
+pub mod sense;
 pub mod server;
 pub mod setup;
 #[cfg(test)]
