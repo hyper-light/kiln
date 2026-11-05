@@ -1,0 +1,60 @@
+   Compiling vte v0.15.0
+   Compiling combine v4.6.9
+   Compiling polling v3.11.0
+   Compiling concurrent-queue v2.5.0
+   Compiling rtoolbox v0.0.6
+   Compiling serial2 v0.2.38
+   Compiling libloading v0.8.9
+   Compiling base64 v0.22.1
+   Compiling pastey v0.2.3
+   Compiling unicode-width v0.2.2
+   Compiling atomic-waker v1.1.2
+   Compiling simdutf8 v0.1.5
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling downcast-rs v1.2.1
+   Compiling cfg_block v0.1.1
+   Compiling allocator-api2 v0.4.0
+   Compiling shell-words v1.1.1
+   Compiling glob v0.3.4
+   Compiling kiln v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln)
+   Compiling typed-path v0.12.3
+   Compiling zip v9.0.5
+   Compiling str0m v0.24.1
+   Compiling portable-pty v0.9.0
+   Compiling vt100 v0.16.2
+   Compiling async-tungstenite v0.35.0
+   Compiling rpassword v7.5.4
+   Compiling async-channel v2.5.0
+   Compiling scrypt v0.11.0
+   Compiling argon2 v0.6.0
+   Compiling kiln-ci v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-ci)
+   Compiling rusqlite v0.40.2
+   Compiling clap v4.6.7
+   Compiling quiver v0.1.0 (/home/runner/work/kiln/kiln/vendor/quiver/crates/quiver)
+   Compiling rust-embed v8.13.0
+   Compiling crypto_secretbox v0.1.1
+   Compiling kiln-search v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-search)
+   Compiling mantle-client v0.1.0 (/home/runner/work/kiln/kiln/vendor/mantle/crates/client)
+   Compiling rquickjs v0.14.0
+   Compiling http-body-util v0.1.5
+   Compiling kiln-http v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-http)
+   Compiling async-broadcast v0.7.2
+   Compiling async-lock v3.4.2
+   Compiling kiln-obs v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-obs)
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling hmac v0.13.0
+   Compiling webpki-roots v1.0.9
+   Compiling serde_path_to_error v0.1.20
+   Compiling sysinfo v0.39.6
+   Compiling socket2 v0.6.5
+   Compiling kiln-sim v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-sim)
+   Compiling hyper-measure v0.1.0 (/home/runner/work/kiln/kiln/vendor/hyper-raft/crates/hyper-measure)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 03s
+     Running tests/session_resident.rs (/mnt/target/debug/deps/session_resident-d10b6205b5879d70)
+
+running 1 test
+g11 resident (conversation store on): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 107.91 MB more (23255 bytes an event kept), 35.14 MB of it let go at its end (process 0.11 MB before, 108.01 MB with it, 72.87 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+test g11_s2_a_20000_event_sessions_resident_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.80s
+
