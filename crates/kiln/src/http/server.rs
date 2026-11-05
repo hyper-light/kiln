@@ -162,8 +162,7 @@ where
     let service = service_fn(move |mut req: Request| {
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
-        let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
+        answer(handler.clone(), req, request)
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
@@ -191,8 +190,7 @@ where
         as_http1(&mut req);
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
-        let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
+        answer(handler.clone(), req, request)
     });
     let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
@@ -209,6 +207,16 @@ where
 /// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
 /// answered. A `demoted` request (its head read in a more urgent class's turn) takes its own class's turn
 /// first where it stays in this task (goal 6, plan 01a1a59c2abe step 3).
+/// A request's future as its connection keeps and polls it (both HTTP/1.1's and HTTP/2's; goal 9, plan 01a1a87b2cec
+/// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, its placement,
+/// the connection's slot for it) moves a pointer. Each moved the handler's whole future as it was first polled:
+/// 36 KB a layer at rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's
+/// step 5 (the router boxed apart). Boxed, it's copied once, into its box.
+fn answer<H: Handler>(handler: Arc<H>, req: Request, serving: crate::overload::Serving) -> impl Future<Output = Response> + Send + 'static {
+    let handling = Box::pin(handler.handle(req));
+    async move { crate::overload::while_sent(placed(serving.class(), serving.demoted(), handling).await, serving) }
+}
+
 async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Future<Output = Response> + Send + 'static) -> Response {
     match crate::placement::request(class, demoted, handling).await {
         Some(resp) => resp,
@@ -599,6 +607,48 @@ mod tests {
             assert_eq!(kinds, ["full", "resumed"]);
             assert!(counted("resumed") > resumed_before, "counted on /metrics");
             assert!(crate::metrics::render().contains("kiln_tls_handshakes_total{door=\"server\",kind=\"resumed\"}"));
+            Ok(())
+        })
+    }
+
+    /// A handler whose future is large: it holds a buffer across an await, as a router with every route inline did
+    /// (goal 9, plan 01a1a87b2cec step 5).
+    struct Big;
+
+    impl Handler for Big {
+        async fn handle(self: Arc<Self>, _req: Request) -> Response {
+            let held = [7u8; 64 << 10];
+            hyper_rt::futures::yield_now().await;
+            text(StatusCode::OK, if held.iter().all(|b| *b == 7) { "held" } else { "lost" })
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a request's future, as its connection keeps it, is under a kilobyte however
+    /// big its handler's future is (64 KiB here; kiln's API's 2 KB since goal 10's step 5): the handler's future is
+    /// boxed where it's made, so no layer that carries it copies it whole; and it still answers.
+    #[test]
+    fn g9_s5_a_requests_future_is_under_a_kilobyte_whatever_its_handlers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let request = || http::Request::builder().uri("/api/me").header(header::AUTHORIZATION, "Bearer test-admin-token").body(Incoming::empty());
+            let conn = crate::overload::Connection::new();
+            let handling = Arc::new(Big).handle(request()?);
+            let whole = size_of_val(&handling);
+            drop(handling);
+            let mut req = request()?;
+            let serving = conn.begin(&mut req);
+            let fut = answer(Arc::new(Big), req, serving);
+            let kept = size_of_val(&fut);
+            anyhow::ensure!(whole >= 64 << 10 && kept < 1024, "the handler's future {whole} bytes, the request's as kept {kept}");
+            let resp = fut.await;
+            anyhow::ensure!(resp.status() == StatusCode::OK, "it answers: {}", resp.status());
+            // kiln's API's own, on a hub of its own.
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(crate::api::Api { hub });
+            let handled = size_of_val(&Handler::handle(Arc::clone(&api), request()?));
+            let mut req = request()?;
+            let serving = conn.begin(&mut req);
+            let kept = size_of_val(&answer(api, req, serving));
+            anyhow::ensure!(kept < 1024, "the API's handler future {handled} bytes, the request's as kept {kept}");
             Ok(())
         })
     }

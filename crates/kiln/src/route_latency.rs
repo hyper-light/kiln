@@ -82,6 +82,25 @@ impl Routes {
         }
     }
 
+    /// [`Routes::observe`]'s wait alone, for work whose time taken is told once it and others are done
+    /// ([`Routes::observe_took`]): a live frame fed to a viewer's socket with the rest of its batch, all
+    /// written at once (goal 9, plan 01a1a87b2cec step 5).
+    pub fn observe_wait(&self, class: Class, wait: Duration) {
+        if let Some(h) = self.wait.get(class.index()) {
+            h.observe(wait.as_secs_f64());
+        }
+    }
+
+    /// [`Routes::observe`]'s time taken alone, for `n` pieces of `class`'s work done at once, each taking
+    /// `took`: a batch of frames written with one write.
+    pub fn observe_took(&self, class: Class, took: Duration, n: u64) {
+        if let Some(h) = self.took.get(class.index()) {
+            for _ in 0..n {
+                h.observe(took.as_secs_f64());
+            }
+        }
+    }
+
     /// `class`'s histograms: how long its work waited, and took.
     pub fn of(&self, class: Class) -> Option<(&Histogram, &Histogram)> {
         Some((self.wait.get(class.index())?, self.took.get(class.index())?))
@@ -165,6 +184,16 @@ pub fn observe_leg(leg: RunnerLeg, took: Duration) {
 /// Work of `class` that waited `wait` and took `took`, on the server's histograms.
 pub fn observe(class: Class, wait: Option<Duration>, took: Duration) {
     routes().observe(class, wait, took);
+}
+
+/// Work of `class` that waited `wait`, its time taken told once it and others are done ([`observe_took`]).
+pub fn observe_wait(class: Class, wait: Duration) {
+    routes().observe_wait(class, wait);
+}
+
+/// `n` pieces of `class`'s work done at once, each having taken `took`, on the server's histograms.
+pub fn observe_took(class: Class, took: Duration, n: u64) {
+    routes().observe_took(class, took, n);
 }
 
 /// A request's class, by its method and path; `None` for a WebSocket's opening (`upgrade`), whose

@@ -6394,6 +6394,76 @@ enum Live {
     Quiet,
 }
 
+/// What a batch of a session's feed came to for its viewer ([`write_live_batch`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Fed {
+    /// Its frames went out: the next read goes on from the batch's end.
+    Written,
+    /// A frame the feed didn't make, its resync marker, or a frame the viewer can't take: the viewer starts
+    /// over, the batch's frames before it gone out.
+    StartOver,
+    /// The session's last frame went out: the viewer ends with it.
+    Closed,
+}
+
+/// Writes a batch of a session's feed to its viewer's socket `tx` (goal 9, plan 01a1a87b2cec step 5): each frame
+/// the viewer takes is fed to the socket and the batch flushed once, one write for the batch where each frame
+/// was a write of its own (a system call on the shard each). Each frame goes as its payload's own bytes, read
+/// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
+/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
+/// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
+/// written (goal 1, plan 01a1a59c2a68 step 2).
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant) -> Result<Fed, S::Error>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+{
+    use futures::SinkExt as _;
+    let mut fed = 0u64;
+    let mut came_to = Fed::Written;
+    for m in messages {
+        let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
+            tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
+            came_to = Fed::StartOver;
+            break;
+        };
+        if frame.text == crate::harness::live::RESYNC {
+            came_to = Fed::StartOver;
+            break;
+        }
+        // The session's last frame: the viewer ends with it, and its place, given back, lets the topic go.
+        if frame.text == crate::harness::live::closed() {
+            tx.feed(ws::text(frame.for_viewer(patches))).await?;
+            came_to = Fed::Closed;
+            break;
+        }
+        // One its catch-up already held.
+        if frame.rev != 0 && frame.rev <= *have {
+            continue;
+        }
+        let (rev, range) = (frame.rev, frame.range_for_viewer(patches));
+        let published = crate::harness::live::published_us(&m.payload);
+        let said = crate::harness::live::into_text(m.payload, range);
+        // A state or changeset that went as its patch alone, to a viewer that takes it whole (none did as it
+        // went: `live::Feed::wants_whole`): it starts over rather than take nothing.
+        if said.is_empty() {
+            came_to = Fed::StartOver;
+            break;
+        }
+        if let Some(waited) = published.map(|at| Duration::from_micros(now_us.saturating_sub(at))) {
+            crate::metrics::bus().delivery_seconds.observe(waited.as_secs_f64());
+            crate::route_latency::observe_wait(crate::route_latency::Class::Websocket, waited);
+        }
+        *have = (*have).max(rev);
+        tx.feed(ws::text(said)).await?;
+        fed = fed.saturating_add(1);
+    }
+    if fed > 0 || came_to == Fed::Closed {
+        tx.flush().await?;
+    }
+    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, read_at.elapsed(), fed);
+    Ok(came_to)
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
@@ -6407,7 +6477,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
-    let (mut tx, mut rx) = socket.split();
+    let (mut tx, rx) = socket.split();
+    // What its person sends, read only once its socket has some (goal 9, plan 01a1a87b2cec step 5): every frame
+    // and answer wakes this loop, and an ask with nothing come zero-fills the reader's 16 KiB and reads nothing.
+    let mut rx = ws::Gated::new(rx);
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
@@ -6476,50 +6549,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     Ok(batch) => {
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
-                        let now = crate::harness::live::now_us();
-                        let read_at = Instant::now();
-                        let next = batch.next;
-                        // Each frame read where it is in its payload, and sent as the payload's own
-                        // bytes (this viewer's copy of it, moved): no other copy of it is made.
-                        for m in batch.messages {
-                            let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
-                                tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
-                                start_over = true;
-                                break;
-                            };
-                            if frame.text == crate::harness::live::RESYNC {
-                                start_over = true;
-                                break;
-                            }
-                            // The session's last frame: the viewer ends with it, and its place,
-                            // given back, lets the topic go.
-                            if frame.text == crate::harness::live::closed() {
-                                tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
-                                return Ok(());
-                            }
-                            // One its catch-up already held.
-                            if frame.rev != 0 && frame.rev <= have {
-                                continue;
-                            }
-                            let (rev, range) = (frame.rev, frame.range_for_viewer(takes.patches));
-                            let published = crate::harness::live::published_us(&m.payload);
-                            let said = crate::harness::live::into_text(m.payload, range);
-                            // A state or changeset that went as its patch alone, to a viewer that
-                            // takes it whole (none did as it went: `live::Feed::wants_whole`):
-                            // it starts over rather than take nothing.
-                            if said.is_empty() {
-                                start_over = true;
-                                break;
-                            }
-                            let waited = published.map(|at| Duration::from_micros(now.saturating_sub(at)));
-                            if let Some(w) = waited {
-                                crate::metrics::bus().delivery_seconds.observe(w.as_secs_f64());
-                            }
-                            have = have.max(rev);
-                            tx.send(ws::text(said)).await?;
-                            // From its publish to this viewer's read, then to its write on the socket
-                            // (goal 1, plan 01a1a59c2a68 step 2).
-                            crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
+                        let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
+                        match write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at).await? {
+                            Fed::Written => {}
+                            Fed::StartOver => start_over = true,
+                            Fed::Closed => return Ok(()),
                         }
                         at = Some(next);
                         // A viewer behind its feed reads batch after batch, each ready at once: past its
@@ -7630,6 +7664,92 @@ mod tests {
         }
         assert!(policy.starts_with("sandbox allow-scripts ") && policy.ends_with("; frame-ancestors 'self'"), "{policy}");
         assert_eq!(page_policy("", "frame-ancestors 'self'"), format!("{PAGE_POLICY}; frame-ancestors 'self'"), "none named: the policy as it was");
+    }
+
+    /// A connection that takes each write whole and says it on its channel: what a socket's writes were, as
+    /// many as its system calls would be.
+    struct Writes(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl futures::io::AsyncRead for Writes {
+        fn poll_read(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &mut [u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures::io::AsyncWrite for Writes {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            let _ = self.0.send(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A session's frame of revision `rev` saying `text`, as its feed puts it on the bus.
+    fn fed_frame(offset: u64, text: &str, rev: u64) -> kiln_seams::bus::Message {
+        let frame = crate::harness::registry::Frame { text: Arc::from(text), patch: None, patch_of: crate::harness::registry::PatchOf::State, rev };
+        kiln_seams::bus::Message { offset, key: None, payload: crate::harness::live::encode(&frame), at_ms: 0 }
+    }
+
+    /// The text messages a client reads from `wire`, a server's writes, in order.
+    fn texts_read(wire: Vec<u8>) -> anyhow::Result<Vec<String>> {
+        let mut client = tungstenite::protocol::WebSocket::from_raw_socket(std::io::Cursor::new(wire), tungstenite::protocol::Role::Client, None);
+        let mut texts = Vec::new();
+        loop {
+            match client.read() {
+                Ok(ws::Message::Text(t)) => texts.push(t.as_str().to_owned()),
+                Ok(other) => anyhow::bail!("not text: {other:?}"),
+                // The writes' end, at a frame's: tungstenite says the stream ended with no close.
+                Err(tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => return Ok(texts),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a batch of a session's feed goes to its viewer's socket in one write:
+    /// each live frame fed, the batch flushed once, where sending each frame wrote each (a system call on the
+    /// shard a frame). A frame the viewer's catch-up held is skipped, the rest arrive whole and in order, the
+    /// viewer's revision moves to the newest sent; a batch ending with the session's last frame is one write too,
+    /// and says the viewer ends.
+    #[test]
+    fn g9_s5_a_feeds_batch_goes_to_its_viewer_in_one_write() -> anyhow::Result<()> {
+        /// Shape: the live frames of the batch: more than one, so one write for them all is seen.
+        const FRAMES: u64 = 5;
+        crate::rt::block_on(async {
+            let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
+            let (mut tx, _rx) = socket.split();
+            let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
+            // The viewer's catch-up held revision 1: that frame isn't sent again.
+            let mut have = 1;
+            let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
+            anyhow::ensure!(have == FRAMES, "the viewer has the newest sent: {have}");
+            let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
+            anyhow::ensure!(wrote.len() == 1, "{} frames of one batch went in {} writes", FRAMES - 1, wrote.len());
+            anyhow::ensure!(texts_read(wrote.concat())? == texts.get(1..).unwrap_or_default(), "the frames, whole and in order, the held one skipped");
+            // As they went before: a write a frame.
+            for text in &texts {
+                tx.send(ws::text(text.as_str())).await?;
+            }
+            anyhow::ensure!(writes.try_iter().count() == texts.len(), "sending each frame writes each");
+            // A batch the session's last frame ends: one write, and the viewer ends with it.
+            let closed = crate::harness::registry::Frame::of(SessionDown::from(SessionFrame::Closed));
+            let last = vec![fed_frame(9, r#"{"t":"events","rev":9}"#, 9), kiln_seams::bus::Message { offset: 10, key: None, payload: crate::harness::live::encode(&closed), at_ms: 0 }];
+            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            anyhow::ensure!(came_to == Fed::Closed, "{came_to:?}");
+            let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
+            anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
+            anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            Ok(())
+        })
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a request's future holds its router's state by a pointer, not a copy
