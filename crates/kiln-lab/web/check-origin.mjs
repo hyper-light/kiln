@@ -155,19 +155,18 @@ export async function served(originUrl, ctl, payloads) {
       const texts = { sse: "", "fetch-stream": "" };
       const encodings = {};
       const streams = [];
+      // A server may hold a compressed stream's headers until it has bytes enough to compress
+      // (Caddy's encoder does), so nothing waits for them: each is read when it comes.
       for (const [carrier, path] of [["sse", `/stream/${kind}`], ["fetch-stream", `/fetch-stream/${kind}`]]) {
         const st = session.request({ ":path": path, "accept-encoding": "gzip" });
         streams.push(st);
-        await new Promise((ok, bad) => {
-          st.on("response", (h) => {
-            encodings[carrier] = h["content-encoding"] || "identity";
-            const body = h["content-encoding"] === "gzip" ? st.pipe(createGunzip({ flush: 2 })) : st;
-            body.setEncoding("utf8");
-            body.on("data", (d) => (texts[carrier] += d));
-            body.on("error", () => {});
-            ok();
-          });
-          st.on("error", bad);
+        st.on("error", () => {});
+        st.on("response", (h) => {
+          encodings[carrier] = h["content-encoding"] || "identity";
+          const body = h["content-encoding"] === "gzip" ? st.pipe(createGunzip({ flush: 2 })) : st;
+          body.setEncoding("utf8");
+          body.on("data", (d) => (texts[carrier] += d));
+          body.on("error", () => {});
         });
       }
       // Both streams open at the origin before it replays (each server opens its upstream when
