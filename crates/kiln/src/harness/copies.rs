@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use flate2::Compression;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
@@ -400,7 +400,7 @@ impl View {
     /// Its frames are written off the runtime's threads (`super::registry::Snapshot`).
     pub fn parts(&self) -> Parts {
         Parts {
-            info: json!(*self.info),
+            info: Arc::clone(&self.info),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
             changes: self.changes.clone(),
@@ -1152,6 +1152,8 @@ async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLo
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// What a source file's code says outside its tests, its comments left out.

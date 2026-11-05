@@ -288,7 +288,9 @@ pub(super) fn null() -> Arc<Value> {
 /// A snapshot of a copy, or what a viewer lacks of it since a revision, not yet made into frames
 /// (`super::copies::View::parts`, `View::parts_since`): references to what an immutable view holds.
 pub struct Parts {
-    pub(super) info: Value,
+    /// Its info, made into the head's JSON where the snapshot is written (off the shard that takes
+    /// it: goal 10, plan 01a1a87b2dae step 3).
+    pub(super) info: Arc<Info>,
     pub(super) meta: Arc<Value>,
     pub(super) state: Arc<Value>,
     pub(super) changes: Option<Files>,
@@ -406,7 +408,7 @@ impl Snapshot {
         let p = &self.parts;
         match part {
             Part::Head => {
-                let (info, born) = (p.info.clone(), Some(born()));
+                let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
                 let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
             }
