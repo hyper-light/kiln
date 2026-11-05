@@ -688,8 +688,12 @@ a lock in a copy of the hub and holds the check to failing on it.
 
 Reach's relay between runners has one owner, a task of its own (`Hub::relay_loop`): the hub's loop
 hands it each relayed frame without waiting, it forwards them in order, and the reach directory reads
-each runner's announcement from a copy. Still on the hot path, listed so (`todo`): a live job's files
-(`logs.rs`'s `files`), one per job, its writers' alone. Inside Quiver
+each runner's announcement from a copy. A live job's files have one writer each, a task of its own that
+writes what it's sent (its runner's chunks, which the hub's loop waits for as it waited for the write; its
+steps; its end) in order, a batch at a time on the blocking pool; a read of the job, and a retry's mark,
+wait for what was sent before, and a retried job's next writer for the last one. Still on the hot path,
+listed so (`todo`): a runner's front door answering reads from its replica (`frontdoor/replica.rs`,
+`store/learner.rs`), the peer-to-peer unification's. Inside Quiver
 (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
 ## Goal 7: placement
