@@ -1013,6 +1013,18 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             }
         }
     }
+    // A runner's message's wait by its legs, to the microsecond, where the build has them
+    // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
+    // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
+    // copy, and that owner taking it.
+    for leg in ["to_loop", "in_loop", "to_owner"] {
+        let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
+        for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            if let Some(v) = measure::histogram_quantile(at, &d) {
+                n.insert(format!("server.runner.{leg}_{q}_us"), v * 1e6);
+            }
+        }
+    }
     // The requests the server shed, by class (`kiln_shed_total`, goal 6), where the build counts them.
     for class in ["background", "normal"] {
         if let Some(v) = diff("kiln_shed_total", &[("class", class)]) {
@@ -1161,6 +1173,32 @@ mod tests {
         assert!(flood.readers >= 16 * overload.readers && flood.mcp > overload.mcp, "{flood:?}");
         assert_eq!((flood.read_think_ms, flood.mcp_think_ms, flood.dwell_s), (0, 0, 0));
         assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
+    /// the server's histogram of it between the window's two scrapes.
+    #[test]
+    fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
+        let legs = ["to_loop", "in_loop", "to_owner"];
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for leg in legs {
+                // Half the leg's observations at or under 0.5 ms, all of them at or under 1 ms.
+                for (le, c) in [("0.0005", n / 2.0), ("0.001", n), ("+Inf", n)] {
+                    t.push_str(&format!("kiln_runner_wait_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for leg in legs {
+            let p50 = n.get(&format!("server.runner.{leg}_p50_us")).copied();
+            let p99 = n.get(&format!("server.runner.{leg}_p99_us")).copied();
+            assert!(p50.is_some_and(|v| (v - 500.0).abs() < 1.0), "{leg}: p50 {p50:?}");
+            assert!(p99.is_some_and(|v| (v - 990.0).abs() < 1.0), "{leg}: p99 {p99:?}");
+        }
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
+        assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
     }
 
     #[test]
