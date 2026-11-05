@@ -131,6 +131,9 @@ fn only_agents_at_work_count_toward_a_runners_limit_set_on_the_server_over_its_c
     let env = [("KILN_CONFIG", config_path.as_str()), ("FAKE_CLAUDE_GO", go_path.as_str()), ("FAKE_CLAUDE_FIRST_LINES", "1")];
     let (runner, log) = agents::runner_with(dir.path(), s.port, "box", None, TALK, &env)?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    // Its headroom off: on a busy machine it held a new session's first turn (run #1858, the
+    // limit then taken away: its turn waited for room, not at work), which isn't this test's.
+    agents::headroom_off(s.port, &s.admin, "box", Duration::from_secs(60))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let kept = dir.path().join("box-state/agent-limit.json");
