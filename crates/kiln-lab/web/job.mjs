@@ -62,6 +62,17 @@ export async function runJob(path) {
     await page.waitForFunction(() => !!window.__lab);
     await page.unrouteAll({ behavior: "wait" });
     result.isolated = await page.evaluate(() => window.crossOriginIsolated);
+    // The page's timer grain: the smallest step performance.now() takes, over 200,000 reads.
+    result.timer_grain_us = await page.evaluate(() => {
+      let last = performance.now();
+      let grain = Infinity;
+      for (let i = 0; i < 200000; i++) {
+        const t = performance.now();
+        if (t > last) grain = Math.min(grain, t - last);
+        last = t;
+      }
+      return grain * 1000;
+    });
     // One request to the origin, so the page says which protocol its operations came over (a
     // socket has no timing entry of its own).
     if (job.protocol_path) await page.evaluate((p) => fetch(p, { cache: "no-store" }).then((r) => r.arrayBuffer()), job.protocol_path).catch((e) => result.errors.push({ where: "protocol", error: String(e) }));
