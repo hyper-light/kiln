@@ -46,6 +46,9 @@ struct Inner {
     path: Option<std::path::PathBuf>,
     /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
     scratch: Option<std::path::PathBuf>,
+    /// Its revocations as last read, with their stamp (`crate::identities::revoked`; goal 9, plan 01a1a87b2cec
+    /// step 5): none until a check of a custody record first reads them.
+    revoked: arc_swap::ArcSwapOption<crate::identities::Revoked>,
 }
 
 impl Drop for Inner {
@@ -757,7 +760,7 @@ impl Store {
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
@@ -766,7 +769,7 @@ impl Store {
         let conn = Self::connect(path)?;
         let group = group::Group::open(path, cluster).context("the cluster group")?;
         let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
@@ -775,7 +778,7 @@ impl Store {
     pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     fn of(inner: Inner) -> Self {
@@ -808,7 +811,7 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
@@ -821,7 +824,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
         let idle = Connection::open_in_memory()?;
-        let inner = Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None };
+        let inner = Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() };
         Ok(Self { inner: Arc::new(inner), inline: Some(Arc::new(parking_lot::Mutex::new(conn))) })
     }
 
@@ -913,6 +916,16 @@ impl Store {
     /// What its committed writes have changed, a table at a time (goal 10, plan 01a1a87b2dae step 2).
     pub fn changes(&self) -> &Changes {
         &self.inner.changes
+    }
+
+    /// Its revocations as last read, with their stamp (`crate::identities::revoked`), if they were.
+    pub(crate) fn revoked_kept(&self) -> Option<Arc<crate::identities::Revoked>> {
+        self.inner.revoked.load_full()
+    }
+
+    /// Keeps `revoked`, read just now, for the reads after it (`crate::identities::revoked_now`).
+    pub(crate) fn keep_revoked(&self, revoked: Arc<crate::identities::Revoked>) {
+        self.inner.revoked.store(Some(revoked));
     }
 
     /// How many calls and reads it's been asked for, ever: what shows a read answered without it
