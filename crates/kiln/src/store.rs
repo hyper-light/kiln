@@ -222,6 +222,12 @@ impl Writer {
         sent
     }
 
+    /// Whether its thread runs, taking calls: what `/readyz` reads of the store without sending it one (goal 6, plan
+    /// 01a1a59c2abe step 3).
+    fn running(&self) -> bool {
+        self.tx.is_some() && self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
     /// Ends its thread once the calls sent are done (on the thread itself, as the last of a store
     /// a call held goes: it ends as that call's group is committed).
     fn stop(&mut self) {
@@ -1505,6 +1511,12 @@ impl Store {
             return counted(&mut c.lock(), &self.inner.changes, f);
         }
         self.write(false, f).await
+    }
+
+    /// Whether its writer's thread runs, taking calls (goal 6, plan 01a1a59c2abe step 3: `/readyz`, answered from
+    /// what the server knows rather than a call sent through the writer, which waited behind every write before it).
+    pub fn writer_running(&self) -> bool {
+        self.inner.writer.running()
     }
 
     /// What its committed writes have changed, a table at a time (goal 10, plan 01a1a87b2dae step 2).

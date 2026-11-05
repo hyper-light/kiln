@@ -195,14 +195,16 @@ fn held_of(sent: &Value, answer: &Value, manager: &str) -> (Value, Option<String
 
 /// `s` signed by kiln's CD, taken: its digest, and the break its hop recorded, if any. An error if
 /// kiln doesn't take its own.
-async fn as_cd(hub: &Hub, s: &Statement, came_from: &str) -> anyhow::Result<(String, Option<String>)> {
-    let bundle = crate::custody::cd_signed(&hub.pki, s)?;
+async fn as_cd(hub: &Hub, s: Statement, came_from: &str) -> anyhow::Result<(String, Option<String>)> {
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = crate::custody::cd_signed_off(&hub.pki, s).await?;
     taken(hub, &bundle, came_from).await
 }
 
 /// `s` signed by kiln's server, taken: its digest, and the break its hop recorded, if any.
-async fn as_server(hub: &Hub, s: &Statement, came_from: &str) -> anyhow::Result<(String, Option<String>)> {
-    let bundle = crate::custody::server_signed(&hub.pki, s)?;
+async fn as_server(hub: &Hub, s: Statement, came_from: &str) -> anyhow::Result<(String, Option<String>)> {
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = crate::custody::server_signed_off(&hub.pki, s).await?;
     taken(hub, &bundle, came_from).await
 }
 
@@ -223,12 +225,12 @@ async fn holding(hub: &Hub, app: &str, name: &str, hex: &str) -> anyhow::Result<
     let came_from = format!("KilnCD's deploys of {app}");
     let receipt = match crate::custody::held_with(&hub.store, &org, &server, &thing).await? {
         Some(held) => {
-            let (to_cd, _) = as_server(hub, &deployed::registry_hand_on(&server, &cd_uri, thing.clone(), &held, app), &came_from).await?;
+            let (to_cd, _) = as_server(hub, deployed::registry_hand_on(&server, &cd_uri, thing.clone(), &held, app), &came_from).await?;
             deployed::cd_receipt(&cd_uri, &server, thing, Some(&to_cd), app)
         }
         None => deployed::cd_receipt(&cd_uri, &format!("docker://{name}@sha256:{hex}"), thing, None, app),
     };
-    Ok(as_cd(hub, &receipt, &came_from).await?.0)
+    Ok(as_cd(hub, receipt, &came_from).await?.0)
 }
 
 /// A sync's records, kept: CD's hand-on and kiln's receipt for the cluster, the SHA-256 of what CD
@@ -284,7 +286,7 @@ async fn record_sync(hub: &Hub, cluster: &str, app: &str, op: u64, revision: &st
     let mut things = vec![deployed::manifests(app, revision, &sent_hex, n)];
     things.extend(images.iter().map(|(name, hex)| deployed::image(name, hex)));
     let why = format!("sync {op} of {app}{}: the {n} objects it applied, to cluster {cluster}", if revision.is_empty() { String::new() } else { format!(" at {revision}") });
-    let (hand_on, _) = as_cd(hub, &deployed::hand_on(&cd_uri, cluster, things.clone(), holdings, &why, at), &came_from).await?;
+    let (hand_on, _) = as_cd(hub, deployed::hand_on(&cd_uri, cluster, things.clone(), holdings, &why, at), &came_from).await?;
     let mut answer = deployed::manifests(app, revision, &held_hex, n);
     answer.annotations.insert("applied".into(), json!(format!("sha256:{}", deployed::digest_of_objects(&answered))));
     let mut got = vec![answer];
@@ -293,7 +295,7 @@ async fn record_sync(hub: &Hub, cluster: &str, app: &str, op: u64, revision: &st
         Some(d) => format!("as its API server answered each of the {n} applies: {d}"),
         None => format!("as its API server answered each of the {n} applies"),
     };
-    let (receipt, broke) = as_server(hub, &deployed::cluster_receipt(&server, cluster, &cd_uri, got, &hand_on, &said), &came_from).await?;
+    let (receipt, broke) = as_server(hub, deployed::cluster_receipt(&server, cluster, &cd_uri, got, &hand_on, &said), &came_from).await?;
     if let Some(b) = &broke {
         tracing::warn!(target: "kiln.custody", %app, op, %cluster, broke = %b, "the cluster holds other manifests than CD handed on");
     }
@@ -657,15 +659,15 @@ async fn record_pod(cd: &Cd, app: &str, sync: &Sync, node: &str, ns: &str, pod: 
     let came_from = format!("KilnCD's look at {app}'s pods");
     let image = deployed::image(name, &r.image);
     let scheduled = format!("the pods of {app} it scheduled there run {name}@sha256:{}", r.image);
-    let (given, _) = as_server(&cd.hub, &deployed::to_node(&server, &sync.cluster, node, vec![image.clone()], &sync.receipt, &scheduled), &came_from).await?;
+    let (given, _) = as_server(&cd.hub, deployed::to_node(&server, &sync.cluster, node, vec![image.clone()], &sync.receipt, &scheduled), &came_from).await?;
     // What the node pulls for its platform, said on its receipt: the index's resolution follows it.
     let mut pulled = image;
     pulled.annotations.insert("pulls".into(), json!(format!("sha256:{}", r.manifest)));
     pulled.annotations.insert("platform".into(), json!(r.platform));
-    let (got, _) = as_server(&cd.hub, &deployed::node_receipt(&server, &sync.cluster, node, vec![pulled], &given, &format!("{name}@sha256:{}, as its pods' spec names it", r.image)), &came_from).await?;
+    let (got, _) = as_server(&cd.hub, deployed::node_receipt(&server, &sync.cluster, node, vec![pulled], &given, &format!("{name}@sha256:{}, as its pods' spec names it", r.image)), &came_from).await?;
     let pod_uri = deployed::pod_uri(&sync.cluster, ns, pod);
     let container = format!("pod {ns}/{pod} (uid {uid})'s container {} on node {node}", c.container);
-    let (to_pod, _) = as_server(&cd.hub, &deployed::to_pod(&server, &sync.cluster, node, &pod_uri, name, r, &got, &container), &came_from).await?;
+    let (to_pod, _) = as_server(&cd.hub, deployed::to_pod(&server, &sync.cluster, node, &pod_uri, name, r, &got, &container), &came_from).await?;
     let (runs, follows, why) = match deployed::runs(r, reported) {
         Runs::Follows => (r.manifest.clone(), true, String::new()),
         Runs::Other(hex) => {
@@ -674,7 +676,7 @@ async fn record_pod(cd: &Cd, app: &str, sync: &Sync, node: &str, ns: &str, pod: 
         }
         Runs::Unknown => anyhow::bail!("{container} reports no image yet"),
     };
-    let (record, broke) = as_server(&cd.hub, &deployed::pod_receipt(&server, &sync.cluster, node, &pod_uri, name, r, &runs, reported, &to_pod, &container), &came_from).await?;
+    let (record, broke) = as_server(&cd.hub, deployed::pod_receipt(&server, &sync.cluster, node, &pod_uri, name, r, &runs, reported, &to_pod, &container), &came_from).await?;
     if follows && broke.is_some() {
         tracing::warn!(target: "kiln.custody", %app, %pod, broke = broke.as_deref().unwrap_or_default(), "a pod's receipt breaks its chain");
     }

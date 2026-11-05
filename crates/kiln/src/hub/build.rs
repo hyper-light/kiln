@@ -271,4 +271,35 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a machine's agent sessions, as its runner processes are counted and an older one's
+    /// retirement checked, are found by id without a copy of every session's whole info (`Registry::ids_on`): the same
+    /// sessions the list's filter found.
+    #[test]
+    fn g9_s3_a_machines_sessions_are_found_without_copying_every_sessions_info() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        use crate::harness::session::Info;
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let (here, there) = (Location::Machine("g9s3-box".into()), Location::Machine("g9s3-other".into()));
+            for (id, from) in [("g9s3-a", &here), ("g9s3-b", &there), ("g9s3-c", &here), ("g9s3-d", &Location::Local)] {
+                let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), ..Info::default() };
+                hub.harness.ingest(&hub, from, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            for target in ["agent:g9s3-box", "agent:g9s3-other", "local", "agent:g9s3-none"] {
+                let mut found = hub.harness.ids_on(target);
+                found.sort();
+                let listed: Vec<String> = hub.harness.list().into_iter().filter(|i| i.target == target).map(|i| i.id).collect();
+                anyhow::ensure!(found == listed, "{target}: {found:?} != {listed:?}");
+            }
+            anyhow::ensure!(hub.harness.ids_on("agent:g9s3-box").len() == 2, "the machine's two");
+            let code: String = include_str!("../hub.rs").split("\n#[cfg(test)]\npub(crate) mod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            for f in ["pub fn runner_processes(&self", "pub(crate) async fn check_retire(&self)"] {
+                let body = code.split(f).nth(1).and_then(|rest| rest.split("\n    }\n").next()).unwrap_or_default();
+                anyhow::ensure!(!body.is_empty() && !body.contains("harness.list()") && body.contains("harness.ids_on("), "{f} finds a machine's sessions without copying them: {body}");
+            }
+            Ok(())
+        })
+    }
 }
