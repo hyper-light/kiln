@@ -232,7 +232,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     // The machines' batteries on the hub's events, agent sessions' on their owners' lanes
     // (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds
     // as many as the hub's ring held in all: what an agent's notes are made of it misses none it can help.
-    let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe(crate::hub::EVENTS)?);
+    let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
     if hub.cfg.push.enabled {
         let _ = Service::keys(&hub).await;
     }

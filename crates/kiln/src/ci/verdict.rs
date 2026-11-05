@@ -292,7 +292,7 @@ pub async fn wait(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String, Stri
     let any = q.get("until").map(String::as_str) == Some("any");
     let secs = q.get("timeout_s").and_then(|t| t.parse::<u64>().ok()).unwrap_or(WAIT_MAX_SECS).clamp(1, WAIT_MAX_SECS);
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events().map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("kiln's events can't be followed now: {e}")))?;
     let first = of_commit(hub, repo_key, sha, q).await?;
     let full = first.get("sha").and_then(Value::as_str).unwrap_or(sha).to_owned();
     let answer = |v: Value, timed_out: bool| json!({ "final": is_final(&v), "timed_out": timed_out, "verdict": v });
@@ -351,7 +351,7 @@ fn ended(v: &Value) -> bool {
 /// are worked out again (W28-R59).
 pub async fn verdict_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),

@@ -522,11 +522,15 @@ pub struct Hub {
     pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
-    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text, but
-    /// agent sessions' own ([`Hub::harness_events`]): kept for their slowest at most [`EVENTS`] of them
-    /// and one receive window of their bytes (goal 11, plan 01a1a87b2e56 step 3:
-    /// `crate::memory::owners::UI_EVENTS`).
-    pub events: crate::memory::ring::Ring<Arc<str>>,
+    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text, but agent
+    /// sessions' own ([`Hub::harness_events`]): runs, jobs, runners, samples, the queue and the rest, sent from
+    /// the hub's loop, CI and the API's handlers, on every shard. One lane, to each listener's own channel
+    /// (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5, and goal 5's rule): no send or receive takes
+    /// a lock two shards share, as a ring's did (async-broadcast's `Mutex`), and every listener has the events
+    /// in the order they were sent, as that lock made it. Each listener holds at most [`EVENTS`] of them
+    /// ([`Hub::subscribe_events`]), their texts one receive window of bytes, each counted once (goal 11, plan
+    /// 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
+    pub events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Agent sessions' own events (`harness`: an info changed, `harness_closed`: a session gone), apart from
     /// [`Hub::events`] (goal 4, plan 01a1a59c2a9c step 5). Every change of a session's info is one, sent from
     /// the session's owner shard: about 1,700 a second in the lab's many-sessions profile. Only `GET
@@ -734,7 +738,7 @@ impl Hub {
             peers: Default::default(),
             pending_peers: Default::default(),
             tunnels: Arc::default(),
-            events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
+            events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             harness_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
@@ -1002,10 +1006,17 @@ impl Hub {
             ServerEvent::HarnessClosed { id } => self.emit_session(id, || Arc::from(e.text())),
             _ => {
                 if self.events.receiver_count() > 0 {
-                    self.events.send(Arc::from(e.text()));
+                    self.events.send(0, Arc::from(e.text()));
                 }
             }
         }
+    }
+
+    /// A listener of the hub's events ([`Hub::events`]) from now, holding as many as the hub's ring held for
+    /// its slowest ([`EVENTS`]): past them it's told how many it lost. Refused when the runtime has no channel
+    /// to give it (its cells all in use).
+    pub fn subscribe_events(&self) -> Result<crate::memory::lanes::Reader<Arc<str>>, hyper_rt::RtError> {
+        self.events.subscribe(EVENTS.div_ceil(self.events.lanes()))
     }
 
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
@@ -4541,7 +4552,7 @@ pub(crate) mod tests {
         crate::rt::block_on(async {
             let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
             hub.put_agent(live_runner("fedora", "linux", "x86_64"));
-            let mut events = hub.events.subscribe();
+            let mut events = hub.subscribe_events()?;
             let fedora = crate::wire::unread::Sender::Runner { name: "fedora".into(), instance: "main".into() };
             anyhow::ensure!(hub.note_unread_told(unread(crate::wire::unread::Wire::Runner, fedora), None).await == Some(0), "its sender may be told");
             let row: (String, Option<String>, String, String) = hub
@@ -4569,7 +4580,7 @@ pub(crate) mod tests {
     fn g4_s5_a_sessions_events_go_on_its_owners_lane() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            let (mut all, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe(16)?);
+            let (mut all, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(16)?);
             let ids = ["s1", "s2", "s3", "s4", "s5"];
             for id in ids {
                 let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() };
@@ -4600,6 +4611,70 @@ pub(crate) mod tests {
             let ours: Vec<&String> = on_all.iter().filter(|k| *k == "updates" || *k == "terminals").collect();
             anyhow::ensure!(ours == ["updates", "terminals"], "the hub's events: {on_all:?}");
             anyhow::ensure!(hub.harness_events.lanes() == crate::rt::shard_count().max(1), "a lane for each owner shard");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5 (goal 5's rule: no lock two shards share): the hub's events, sent from
+    /// tasks on every shard at once, reach every listener once each, each sender's in the order it sent them;
+    /// and a listener that joins after some were sent has those that came after, in order.
+    #[test]
+    fn g4_s5_the_hubs_events_reach_every_listener_in_the_order_sent() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let (senders, per) = (6usize, 150usize);
+            // Ours alone, among whatever else the hub sends: `ai_sessions` frames naming their sender and number.
+            fn ours(text: &str) -> anyhow::Result<Option<(usize, usize)>> {
+                let v: serde_json::Value = serde_json::from_str(text)?;
+                let Some(m) = v.get("machine").and_then(serde_json::Value::as_str).and_then(|m| m.strip_prefix("lab-")) else { return Ok(None) };
+                let (s, n) = m.split_once('-').ok_or_else(|| anyhow::anyhow!("{m}"))?;
+                Ok(Some((s.parse()?, n.parse()?)))
+            }
+            let mut listeners = Vec::new();
+            for _ in 0..3 {
+                let mut rx = hub.subscribe_events()?;
+                let want = senders * per;
+                listeners.push(crate::rt::spawn_spread_joined(async move {
+                    let mut got: Vec<(usize, usize)> = Vec::with_capacity(want);
+                    while got.len() < want {
+                        let text = rx.recv().await.map_err(|e| anyhow::anyhow!("a listener was told {e:?} after {}", got.len()))?;
+                        got.extend(ours(&text)?);
+                    }
+                    Ok::<_, anyhow::Error>(got)
+                }));
+            }
+            let mut sent = Vec::new();
+            for s in 0..senders {
+                let hub = Arc::clone(&hub);
+                sent.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        hub.emit(&ServerEvent::AiSessions { machine: format!("lab-{s}-{n}") });
+                        if n % 25 == 0 {
+                            crate::rt::maybe_yield().await;
+                        }
+                    }
+                }));
+            }
+            for s in sent {
+                s.await.map_err(|_| anyhow::anyhow!("a sender ended early"))?;
+            }
+            for l in listeners {
+                let got = crate::rt::timeout(Duration::from_secs(30), l).await.map_err(|_| anyhow::anyhow!("a listener never had them all"))?.map_err(|_| anyhow::anyhow!("a listener ended"))??;
+                for s in 0..senders {
+                    let theirs: Vec<usize> = got.iter().filter(|(g, _)| *g == s).map(|(_, n)| *n).collect();
+                    anyhow::ensure!(theirs == (0..per).collect::<Vec<_>>(), "sender {s}'s events: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+                }
+            }
+            // One joining now has what comes after it, in order, and nothing from before.
+            let mut late = hub.subscribe_events()?;
+            for n in 0..3 {
+                hub.emit(&ServerEvent::AiSessions { machine: format!("lab-9-{n}") });
+            }
+            let mut after = Vec::new();
+            while let Ok(text) = late.try_recv() {
+                after.extend(ours(&text)?);
+            }
+            anyhow::ensure!(after == [(9, 0), (9, 1), (9, 2)], "the late listener's: {after:?}");
             Ok(())
         })
     }

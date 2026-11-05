@@ -45,7 +45,7 @@ const FOLLOWS: [&str; 5] = ["comment", "review", "diff_run", "queue", "landed"];
 /// the server runs.
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
