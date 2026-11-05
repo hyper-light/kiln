@@ -1573,3 +1573,23 @@ fn m4_g1_sessions_legs_and_commands_never_pass_a_runners_budget_together() -> an
         anyhow::Ok(())
     })
 }
+
+/// docs/needs.md E5, AUDIT O1: a runner's hint quotes its admission's answer for each size waiting
+/// or held there (here: a run of 4 CPUs holding room, so 4 CPUs would wait for it, or start where
+/// room is), and says when it's draining (an upgrade pending): a change decided by, so it's said.
+#[test]
+fn o1_a_runners_hint_quotes_its_sizes_and_says_when_it_drains() -> anyhow::Result<()> {
+    use super::place::{Placer, sample_of};
+    use crate::offers::hint::{Hint, Taking};
+    let mut p = Placer::new("r", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample_of(&reading(0.0)), kiln_ci::place::runner::Settings::default(), 0);
+    let needs = kiln_ci::sched::needs::parse("cpus=4").map_err(anyhow::Error::msg)?;
+    let _ = p.directory(&[], 0);
+    let _ = p.ask(kiln_ci::place::Ask { run: "r1".into(), needs, ..kiln_ci::place::Ask::default() }, 0);
+    let h: Hint = serde_json::from_str(&p.hint_due(1, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?)?;
+    anyhow::ensure!(h.quotes.iter().any(|q| q.ask.first() == Some(&4_000)), "a quote for the size held here: {h:?}");
+    let _ = p.drain(true, 2);
+    let h: Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("draining is news"))?)?;
+    anyhow::ensure!(h.state == Taking::Draining, "{h:?}");
+    anyhow::ensure!(h.quotes.iter().all(|q| !matches!(q.answer, crate::offers::hint::Quoted::Now)), "nothing starts now while it drains: {h:?}");
+    Ok(())
+}

@@ -182,6 +182,8 @@ pub enum In {
     /// [`crate::proto::ServerMsg::Place`], JSON `super::place::SessionAsk`): what placement says
     /// of it goes back as [`AgentMsg::Placed`] under `req`.
     SessionPlace { req: u64, json: String },
+    /// This runner takes nothing new (draining: an upgrade pending, or retiring), or does again.
+    Drain(bool),
 }
 
 /// What local tools ask of the node.
@@ -931,6 +933,10 @@ impl Node {
             }
             In::Hint(json) => self.place.hinted(&json),
             In::SessionPlace { req, json } => self.session_place(req, &json).await,
+            In::Drain(draining) => {
+                let outs = self.place.drain(draining, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
         }
         while !self.place_later.is_empty() {
             let outs = std::mem::take(&mut self.place_later);

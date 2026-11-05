@@ -301,6 +301,14 @@ fn marks(p: &Probe) -> [Option<u64>; 5] {
     Class::ALL.map(|c| below(p, c).filter(|_| watched(c)))
 }
 
+/// What a probe of a size would be answered here now ([`Admission::quote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Quote {
+    Now,
+    Waits { reason: Reason, start: Estimate },
+    Never { why: String },
+}
+
 /// An owner's process, as this runner hears it.
 #[derive(Debug, Clone)]
 struct OwnerAt {
@@ -2440,6 +2448,49 @@ impl Admission {
             return Resources::default();
         }
         ask::resources(&self.free_now())
+    }
+
+    /// What a probe of `ask` (in its class) would be answered here now, without probing it (the
+    /// `offers` hint's quotes, docs/needs.md E5): never and why, as a probe of it would be; now, by
+    /// the same room rule a probe is admitted by ([`Self::can_start`]'s), unless the runner takes
+    /// nothing new (draining, strained) or keeps room for the first in line; else it would wait,
+    /// with its one reason and when it would start, estimated as a waiting probe's is from the
+    /// work ahead of the end of its class's line. O(log n); changes nothing.
+    pub fn quote(&self, ask: &Ask, now: i64) -> Quote {
+        if let Some(why) = self.never(ask) {
+            return Quote::Never { why };
+        }
+        let amounts = ask::amounts(&ask.needs.request);
+        let free = self.free_now();
+        let fits = match kind_of(ask) {
+            Kind::Whole => self.claims == 0 && self.sample.ci_jobs == 0 && ask::fits(&amounts, &free),
+            Kind::Share => ask::fits(&ask::plus(&self.held, &amounts), &self.base),
+            Kind::Ordinary => ask::fits(&amounts, &free),
+        } && self.whole_claims == 0;
+        let reason = if self.draining {
+            Reason::Draining
+        } else if let Some(why) = &self.strained {
+            Reason::Strained { why: why.clone() }
+        } else if let Some((_, at)) = self.kept {
+            Reason::Kept { at }
+        } else if fits {
+            return Quote::Now;
+        } else if ask::fits(&amounts, &free) {
+            Reason::Whole { jobs: self.claims.saturating_add(self.sample.ci_jobs) }
+        } else {
+            Reason::Room { short: shortfall(&ask.needs.request, &ask::resources(&free)) }
+        };
+        let end = Key { class: class_ix(ask.class), standing: [u128::MAX; LEVELS], own: i128::MAX, seq: u64::MAX };
+        Quote::Waits { reason, start: self.estimate(&end, now) }
+    }
+
+    /// Whether it takes nothing new: draining (an upgrade pending), or its machine under strain.
+    pub fn taking(&self) -> Result<(), Reason> {
+        match (&self.strained, self.draining) {
+            (_, true) => Err(Reason::Draining),
+            (Some(why), false) => Err(Reason::Strained { why: why.clone() }),
+            (None, false) => Ok(()),
+        }
     }
 
     /// The room it admits against now, and what its claims hold of it.

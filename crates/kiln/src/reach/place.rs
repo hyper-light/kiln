@@ -67,6 +67,21 @@ pub enum SessionWord {
     Fallback { runners: Vec<String> },
 }
 
+/// A waiting reason's kind as `kiln_ci::place::msg::Reason` names it (the hint's quotes).
+fn reason_kind(r: &kiln_ci::place::msg::Reason) -> &'static str {
+    use kiln_ci::place::msg::Reason;
+    match r {
+        Reason::Room { .. } => "room",
+        Reason::Kept { .. } => "kept",
+        Reason::Line => "line",
+        Reason::Whole { .. } => "whole",
+        Reason::Draining => "draining",
+        Reason::Away => "away",
+        Reason::Strained { .. } => "strained",
+        Reason::Barred { .. } => "barred",
+    }
+}
+
 /// A waiting reason in words, as a refused leg says why.
 fn reason_words(r: &kiln_ci::place::msg::Reason) -> String {
     use kiln_ci::place::msg::Reason;
@@ -728,6 +743,14 @@ impl Placer {
         self.said(said, now)
     }
 
+    /// This runner takes nothing new while `draining` (an upgrade pending, or retiring), or does
+    /// again: its runs wait saying so, and its hint says it (AUDIT O1).
+    pub fn drain(&mut self, draining: bool, now: i64) -> Vec<Out> {
+        let mut said = Vec::new();
+        self.admission.drain(draining, now, &mut said);
+        self.said(said, now)
+    }
+
     /// Whether it measures its machine itself.
     pub fn senses(&self) -> bool {
         self.sensor.is_some()
@@ -817,14 +840,33 @@ impl Placer {
     /// runs that wait. Never per sample. `strained`: why its machine is, if it is (sense's
     /// health, as the gate's guard sees it).
     pub fn hint_due(&mut self, now: i64, strained: Option<String>) -> Option<String> {
-        use crate::offers::hint::{Hint, Taking};
+        use crate::offers::hint::{Hint, Quote, Quoted, Taking};
         use crate::offers::relevant::{Said, relevant};
-        let state = match strained {
-            Some(why) => Taking::Strained { why },
-            None => Taking::Taking,
+        let state = match (self.admission.taking(), strained) {
+            (Err(kiln_ci::place::msg::Reason::Draining), _) => Taking::Draining,
+            (_, Some(why)) => Taking::Strained { why },
+            _ => Taking::Taking,
         };
         let room = kiln_ci::place::ask::amounts(&self.admission.hint());
-        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes: Vec::new(), waits: Vec::new(), gone: Vec::new(), whole: self.whole };
+        // Its admission's answer for each size waiting or held here, as a probe of it would get it.
+        let mut sizes: BTreeMap<[u64; 4], kiln_ci::sched::state::Class> = BTreeMap::new();
+        for p in self.admission.probes() {
+            sizes.entry(p.ask).or_insert(p.class);
+        }
+        let quotes = sizes
+            .into_iter()
+            .map(|(a, class)| {
+                let ask = Ask { needs: kiln_ci::sched::needs::Needs { request: kiln_ci::place::ask::resources(&a), ..kiln_ci::sched::needs::Needs::default() }, class, ..Ask::default() };
+                let since = |t: Option<i64>| t.map(|t| u64::try_from(t.saturating_sub(now)).unwrap_or(0));
+                let answer = match self.admission.quote(&ask, now) {
+                    kiln_ci::place::runner::Quote::Now => Quoted::Now,
+                    kiln_ci::place::runner::Quote::Never { why } => Quoted::Never { why },
+                    kiln_ci::place::runner::Quote::Waits { reason, start } => Quoted::Waits { reason: reason_kind(&reason).to_owned(), soonest_in: since(start.soonest), latest_in: since(start.latest) },
+                };
+                Quote { ask: a, answer }
+            })
+            .collect();
+        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole };
         let changed = match &self.hinted {
             None => true,
             Some(last) => {

@@ -1972,7 +1972,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // what the network says (a job's end waits behind what its job sent before it, `Ev::Done`).
     let mut taken: VecDeque<Ev> = VecDeque::new();
 
+    // What this runner's placement was last told of its draining (AUDIT O1: its runs wait, and its
+    // hint says it).
+    let mut drain_said = false;
     'events: loop {
+        // Draining, an upgrade pending or retiring, as the last event left it: its admission told
+        // once it changes (an event, not a timer).
+        let drain_now = draining || upgrade_pending || retiring;
+        if drain_now != drain_said
+            && let Some(r) = &reach
+        {
+            r.feed(crate::reach::node::In::Drain(drain_now)).await;
+            drain_said = drain_now;
+        }
         if let Some((stream, seq, refusal)) = answer_after.take() {
             let a = match refusal {
                 Some((code, why)) => wire_in.refused(&stream, seq, code, why),

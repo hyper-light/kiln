@@ -87,6 +87,32 @@ fn ended(a: &mut Admission, from: Peer<'_>, run: &str, now: i64) -> Vec<Said> {
     out
 }
 
+/// docs/needs.md E5, the `offers` hint's quotes: what a probe of a size would be answered here
+/// now, without probing it, and as a probe of it is: now within the room; never past what the
+/// runner could ever run; waiting short of room, with when it would start once the claims holding
+/// room end; waiting while draining. A quote changes nothing.
+#[test]
+fn e5_a_quote_is_the_answer_a_probe_of_that_size_would_get_and_changes_nothing() -> Result<(), String> {
+    use super::runner::Quote;
+    let mut a = runner(machine(8, 16, 0, 0), false);
+    assert_eq!(a.quote(&ask("q", "cpus=2")?, 0), Quote::Now);
+    assert!(matches!(a.quote(&ask("q", "mem=128g")?, 0), Quote::Never { why } if why.contains("memory")));
+    let said = probe(&mut a, O1, ask("r1", "cpus=6")?, Some(60_000), 0);
+    let f = offer(&said, "o1", "r1").ok_or(format!("{said:?}"))?;
+    run_it(&mut a, O1, "r1", f, 0)?;
+    let before = (a.room(), a.queued(), a.timer());
+    match a.quote(&ask("q", "cpus=4")?, 1_000) {
+        Quote::Waits { reason: Reason::Room { .. }, start } => assert!(start.soonest.is_some_and(|t| t > 1_000 && t <= 60_000), "by r1's predicted end at the latest: {start:?}"),
+        other => return Err(format!("{other:?}")),
+    }
+    assert_eq!((a.room(), a.queued(), a.timer()), before, "a quote changes nothing");
+    let mut out = Vec::new();
+    a.drain(true, 2_000, &mut out);
+    assert!(matches!(a.quote(&ask("q", "cpus=1")?, 2_000), Quote::Waits { reason: Reason::Draining, .. }));
+    assert_eq!(a.taking(), Err(Reason::Draining));
+    a.check()
+}
+
 /// AUDIT L1: a runner whose machine is under strain (the gate guard's predicate, as its shell
 /// measured it when it decided) offers nothing new: a probe waits there saying why, its room is
 /// hinted as none, and once a measure shows the strain gone what fits is offered in that same
