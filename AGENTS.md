@@ -62,14 +62,17 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **Never print or commit a secret,** kiln's admin token included.
 - **The person's word** is needed for every merge to main, every push and every deploy, and to
   create a repository. Deploys go through KilnCD, in merge trains (`docs/trains`).
-- **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; gate every push on
-  every check's exit code.
+- **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; every push waits on
+  the exit codes of the tests relevant to its change.
 
 ## Checks before handing over
 
+The tests relevant to a change must pass before it's pushed. Full CI/CD runs (the gate, the whole
+workspace's tests, the pipelines started by hand) wait for the person's explicit word.
+
 | You changed | Run |
 |---|---|
-| Rust | what you touched first (its tests, clippy on its crate), then the gate: `ci/gate.sh` through `kiln run --needs` (clippy for Linux, Windows and macOS, `cargo test --workspace`) |
+| Rust | what you touched: its tests and clippy on its crate. When the person asks for the full run, the gate: `ci/gate.sh` through `kiln run --needs` (clippy for Linux, Windows and macOS, `cargo test --workspace`) |
 | The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
 | A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
 | Vendored code | `python3 scripts/vendor.py check` |
