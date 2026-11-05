@@ -33,6 +33,8 @@ part() { # one line: name [after=part] run's arguments
   local name=$1; shift
   local out=$OUT/$name
   if [ -f $out/done ]; then echo "$(date -u +%FT%TZ) $name: done before"; return 0; fi
+  # A part another machine took (`<part>.skip` beside the parts' folders) isn't run here.
+  if [ -f $OUT/$name.skip ]; then echo "$(date -u +%FT%TZ) $name: taken by another machine"; return 0; fi
   if [[ ${1:-} == after=* ]]; then
     local deps=${1#after=}; shift
     for dep in ${deps//,/ }; do until [ -f $OUT/$dep/done ]; do sleep 60; done; done

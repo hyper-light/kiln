@@ -507,24 +507,48 @@ of the lab's, which a job now records as a named failure ("the driver left no re
 cell with nothing in it; requests a page scheduled and had no answer to by the job's end are now
 counted as misses with their wait (`missed`, open loop), so a starved link shows as misses.
 
-**Pass 1** runs the pilot and the matrix in one systemd user unit on the lab machine, from a
-snapshot of the lab (`~/.cache/kiln-bp/g1/lab-snap1`: the `kiln-lab` binary, the web driver and
-`run-all.sh`) that nothing edits while it runs:
+**Pass 1** runs the pilot and the matrix on two lab machines at once, kiln-a094a12d (Fedora, WebKit
+in Playwright's image) and adacachy (CachyOS, WebKit 27.2 on the machine itself; production's
+host, on Ada's word), each machine three parts at a time, each part a lab of its own (its own
+namespaces, servers and browsers: the labs share nothing but the CPU), from a snapshot of the lab
+(`~/.cache/kiln-bp/g1/lab-snap1`: `kiln-lab`, the lab kiln, the web driver, `run-pass.sh` and the
+machine's parts) that nothing edits while it runs:
 
 ```sh
 systemd-run --user --unit=kiln-bp-g1-lab -E PATH=$PATH -E HOME=$HOME -p Delegate=yes \
-  -p StandardOutput=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
-  -p StandardError=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
-  --collect bash $HOME/.cache/kiln-bp/g1/lab-snap1/run-all.sh
+  -p Nice=19 -p CPUWeight=10 -p IOWeight=10 \
+  -p StandardOutput=append:$HOME/.cache/kiln-bp/g1/lab-run.log \
+  -p StandardError=append:$HOME/.cache/kiln-bp/g1/lab-run.log \
+  --collect bash $HOME/.cache/kiln-bp/g1/lab-snap1/run-pass.sh $HOME/.cache/kiln-bp/g1/lab-snap1/parts 3
 ```
 
-Its parts (the pilot's three, then the matrix's 21: each condition and case with the rounds the run
-plan gives it) each write `~/.cache/kiln-bp/g1/lab/<part>/run.json` as their jobs end, and `done`
-when they end well (`failed` otherwise). Started again the same way, it skips what is done and
-runs the rest: that is how it resumes after a stop or a reset. `systemctl --user stop
-kiln-bp-g1-lab` stops it (the lab's PID namespace takes every process it started with it). The
-pilot picks h2o's QUIC controller for the matrix (the lower median p99 at 50k/1 of `h2o-h3`, Cubic,
-and `h2o-h3-reno`, Reno).
+The parts (`crates/kiln-lab/web/servers/pass1/{fedora,adacachy}.parts`, made by `genparts.py`)
+split the run plan's cells between the machines by their hours (38.5 and 38.3 job-hours: about
+13 hours of wall time with three parts at once), each condition's rounds as the plan gives them at
+a 70 h budget: the step-6 rule's budget clause puts the slow links' requests (11 rounds at 50k, 6 at
+100k) and 50k/5's bursts at the 3,688 floor, and every other cell at the 5-round minimum, which, with
+each job's fixed length (60 s on the good link, 180 s on the slow ones), is what the hours come
+from. Each part writes `~/.cache/kiln-bp/g1/lab/<part>/run.json` and `done` when it ends well
+(`failed` otherwise); started again the same way, it skips what is done. `kiln-lab browser merge`
+puts the parts' run files together (each job keeps its machine's name), for the report and the
+comparisons.
+
+- **The pilot** comes first on each machine: adacachy runs 50k/1 (stream, burst and request, each a
+  part) and fedora good/0, each for kiln today twice (the A/A, interleaved on the same seeds), h2o
+  over HTTP/2, and h2o over HTTP/3 with Cubic and with Reno, in both browsers where each runs. Its
+  cells stand for the matrix's good/0 and 50k/1 cells (except 50k/1's requests, which the plan gives
+  11 rounds). Each machine also runs kiln today's 50k/1 stream and good/0 request cells with one link
+  (the K-links-against-one check, on each machine, against its own K = 8 cell), and the two machines
+  share two cells for kiln today and h2o over HTTP/2 (50k/1 stream on fedora, good/0 request on
+  adacachy, each against the other's pilot): a cross-machine A/A. The h2o builds differ by machine
+  (the same commit, `1b5ef77eb`, against each machine's OpenSSL: fedora's 3.5 `8b2d8a23…`,
+  adacachy's 3.6.5 `8b1ecfc5…`), so h2o's cross-machine cells show whether the baselines agree.
+- **h2o's QUIC controller**: h2o-h3's matrix rows run on adacachy after its pilot (`$H3` in a part:
+  the lower median p99 at 50k/1 of Cubic and Reno).
+- **Production's guard** (`pass1/guard-prod.sh`): on adacachy, production's `/readyz` every minute;
+  slower than 1 s or failing, the lab's unit is frozen and that is logged, and thawed after five
+  good minutes. The jobs a freeze overlapped are left out of the report; the freezes' count and
+  minutes are in the run's notes. If adacachy's share falls far behind, its parts move to fedora.
 
 ## What the lab leaves out
 
