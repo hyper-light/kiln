@@ -188,7 +188,7 @@ impl AgentLimits {
 
 /// Whether `machine` is the server's own runner (`[local_agent]`, in its process): it runs no
 /// agents, and the server's own agents are held to what's set for it.
-fn own(hub: &Hub, machine: &str) -> bool {
+pub(crate) fn own(hub: &Hub, machine: &str) -> bool {
     hub.cfg.local_agent.enabled && machine == hub.cfg.local_agent_key()
 }
 

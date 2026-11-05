@@ -50,8 +50,7 @@ impl Sampler {
         }
 
         let (disk_total, disk_used) = self.work_dir_disk();
-
-        self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+        let procs = self.process_count();
         HostSample {
             ts_ms: crate::util::now_ms(),
             cpu_pct: self.sys.global_cpu_usage(),
@@ -63,8 +62,34 @@ impl Sampler {
             disk_used,
             net_rx,
             net_tx,
-            procs: u32::try_from(self.sys.processes().len()).unwrap_or(u32::MAX),
+            procs,
         }
+    }
+
+    /// How many processes the machine runs. On macOS it's asked of the kernel as a count: a
+    /// `sysinfo` refresh reads every process (`sysctl` and `proc_pidinfo` for each), and a runner
+    /// samples inline on its event loop. With 9,145 processes (8,009 of them leaked ssh-agents) that
+    /// read took as long as the 5 s between samples, so the loop never caught up, its server's
+    /// commands went unanswered and its agent sessions read offline (2026-11-04).
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    fn process_count(&mut self) -> u32 {
+        // SAFETY: a null buffer of size 0 asks only how much room the list needs (with slack);
+        // nothing is written.
+        let room = unsafe { nix::libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let Ok(room) = usize::try_from(room) else { return 0 };
+        let mut pids = vec![0i32; room.saturating_add(64)];
+        let bytes = i32::try_from(pids.len().saturating_mul(std::mem::size_of::<i32>())).unwrap_or(i32::MAX);
+        // SAFETY: `pids` has room for `bytes` bytes; the kernel writes at most that many and
+        // returns how many pids it wrote.
+        let n = unsafe { nix::libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        u32::try_from(n).unwrap_or(0)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn process_count(&mut self) -> u32 {
+        self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+        u32::try_from(self.sys.processes().len()).unwrap_or(u32::MAX)
     }
 
     /// Size and use of the volume holding the work dir: the disk with the longest mount point
@@ -135,4 +160,24 @@ pub fn process_has_env(pid: u32, marker: &str) -> bool {
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_environ(UpdateKind::Always));
     sys.process(pid).is_some_and(|p| p.environ().iter().any(|kv| kv.as_os_str() == std::ffi::OsStr::new(marker)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Mac's process count comes from the kernel's pid list, not a read of every process (which,
+    /// inline on a runner's loop, stalled it on a machine with 9,145 processes): it's the count
+    /// `sysinfo` gets the long way, give or take what started or ended between the two.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macs_process_count_is_the_kernels_without_reading_each_process() {
+        let mut sampler = Sampler::new(None);
+        let quick = sampler.process_count();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+        let slow = u32::try_from(sys.processes().len()).unwrap_or(u32::MAX);
+        assert!(quick > 0, "no processes counted");
+        assert!(quick.abs_diff(slow) <= slow / 20 + 5, "the kernel's count {quick} is far from sysinfo's {slow}");
+    }
 }

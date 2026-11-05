@@ -270,7 +270,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
 async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
     use crate::reach::Question;
     let (session, terminal) = match ask {
-        Question::Directory => return json!({ "runners": hub.reach_directory() }),
+        Question::Directory => return json!({ "runners": hub.directory().await }),
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
@@ -411,7 +411,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         // An act its runner asks kiln to take before it does it (a run on another machine):
         // taken above, as the session's holder's now (W27-R08).
         Question::Act { .. } => json!({"ok": {}}),
-        Question::Directory => json!({ "runners": hub.reach_directory() }),
+        Question::Directory => json!({ "runners": hub.directory().await }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
     };

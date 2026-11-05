@@ -269,7 +269,10 @@ impl Hub {
             Ok(Some(e)) => e,
             _ => self.harness.epoch_of(session),
         };
-        match crate::custody::word(&self.pki, session, &json, agent, &instance, epoch) {
+        // Addressed as the process knows itself: by the name its certificate carries, for one from
+        // before its certificate for the machine's id (docs/machines.md).
+        let addressee = self.peer_certs.load().get(&peer).cloned().unwrap_or_else(|| agent.to_owned());
+        match crate::custody::word(&self.pki, session, &json, &addressee, &instance, epoch) {
             Ok(worded) => {
                 // Kept, so a walk through a relay that passes it on (blue/green's old build) reaches
                 // it (docs/ci.md W27-R08's relays).
