@@ -718,6 +718,11 @@ pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 fn run_of_event(text: &str) -> Option<String> {
+    // A run's events alone are parsed: the rest, every agent session's change of its info among them,
+    // are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+    if !crate::wire::events::is_one_of(text, &["run"]) {
+        return None;
+    }
     let v: Value = serde_json::from_str(text).ok()?;
     (v.get("type").and_then(Value::as_str) == Some("run")).then(|| v.pointer("/run/id").and_then(Value::as_str).map(str::to_owned)).flatten()
 }
@@ -747,6 +752,16 @@ async fn reconcile(hub: &Hub) {
 mod tests {
     use super::*;
     use aws_lc_rs::signature::KeyPair as _;
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a run's event says its run; any other, an agent session's info
+    /// change among them, is passed over by its front.
+    #[test]
+    fn g4_s5_only_a_runs_event_is_read_for_its_run() -> anyhow::Result<()> {
+        anyhow::ensure!(run_of_event(r#"{"type":"run","run":{"id":"r1","status":"running"}}"#).as_deref() == Some("r1"));
+        anyhow::ensure!(run_of_event(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string()).is_none() && run_of_event(r#"{"type":"run.failed","run":{"id":"r1"}}"#).is_none());
+        anyhow::ensure!(run_of_event(r#"{ "type": "run", "run": {"id": "r2"} }"#).as_deref() == Some("r2"), "a frame whose kind isn't at its front, read whole");
+        Ok(())
+    }
 
     #[test]
     fn w14_r10_jwt_and_permissions() -> anyhow::Result<()> {

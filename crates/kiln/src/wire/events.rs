@@ -153,6 +153,25 @@ pub fn harness_frame(info_json: &[u8]) -> std::sync::Arc<str> {
     std::sync::Arc::from(frame)
 }
 
+/// What kind of frame `text` is (its `type`), read off its front without parsing it. Every frame
+/// [`ServerEvent::text`] and [`harness_frame`] write begins `{"type":"<kind>"`: serde writes an internally
+/// tagged enum's tag first, and each untagged notice's `type` is its struct's first field. So kiln's own
+/// listeners pass over the kinds they don't handle unread (goal 4, plan 01a1a59c2a9c step 5: every change
+/// of an agent session's info is a `harness` frame, about 1,700 a second in the lab's many-sessions
+/// profile, and six listeners parsed each one whole to read its `type`). None when `text` doesn't begin
+/// so, or its kind holds an escape (no kind of [`ServerEvent`]'s does): such a frame is read whole.
+pub fn kind_of(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(r#"{"type":""#)?;
+    let kind = rest.get(..rest.find('"')?)?;
+    (!kind.contains('\\')).then_some(kind)
+}
+
+/// Whether a listener that handles the frames of `kinds` reads `text`: one of those, or one whose kind
+/// can't be read off its front ([`kind_of`]), which it parses to find out.
+pub fn is_one_of(text: &str, kinds: &[&str]) -> bool {
+    kind_of(text).is_none_or(|k| kinds.contains(&k))
+}
+
 impl ServerEvent {
     /// The frame as its socket sends it.
     pub fn text(&self) -> String {
@@ -830,6 +849,67 @@ mod tests {
             })),
             json!({ "type": "ci_verdict", "repo": "acme/app", "workflow": ".kiln/ci.yaml", "branch": "main", "sha": "abc", "kind": "covered", "why": "covered by def's pass", "verdict": verdict }),
         )?;
+        Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a frame's kind read off its front is the `type` its JSON says, for
+    /// every kind ServerEvent writes (each tag its TypeScript names, and each notice's kind), whatever the
+    /// frame's fields hold (quotes, escapes, a `"type"` of their own); real frames of every shape (unit,
+    /// struct, newtype, untagged notices, a harness frame of an encoded info) begin with theirs; and a text
+    /// that doesn't begin so, or whose kind holds an escape, is read whole.
+    #[test]
+    fn g4_s5_a_frames_kind_is_read_off_its_front() -> anyhow::Result<()> {
+        use ts_rs::TS as _;
+        let cfg = ts_rs::Config::new();
+        // Every tag of ServerEvent's own (`{ "type": "resync" } | ...`), and every kind an untagged notice says.
+        let decl = ServerEvent::decl(&cfg);
+        let mut kinds: Vec<String> = decl.split(r#""type": ""#).skip(1).filter_map(|s| s.split('"').next()).map(str::to_owned).collect();
+        for notice in [NoticeKind::decl(&cfg), SelfDeployKind::decl(&cfg), AgentNoticeKind::decl(&cfg)] {
+            kinds.extend(notice.split('"').skip(1).step_by(2).map(str::to_owned));
+        }
+        anyhow::ensure!(kinds.iter().any(|k| k == "harness") && kinds.iter().any(|k| k == "run.failed") && kinds.iter().any(|k| k == "agent.needs_you"), "{kinds:?}");
+        // Each kind as serde writes its frame, its fields holding what a reader could take for a tag.
+        let odd = "a \"quoted\" word, a \\ backslash, \"type\":\"comment\", a tab\t and ünïcode";
+        for k in &kinds {
+            let text = format!(r#"{{"type":{},"note":{},"type2":{{"type":"run"}}}}"#, serde_json::to_string(k)?, serde_json::to_string(odd)?);
+            let said: Value = serde_json::from_str(&text)?;
+            anyhow::ensure!(kind_of(&text) == Some(k.as_str()) && said.get("type").and_then(Value::as_str) == Some(k.as_str()), "{text}");
+            anyhow::ensure!(is_one_of(&text, &[k.as_str()]) && !is_one_of(&text, &["no such kind"]), "{text}");
+        }
+        // Real frames, of every shape ServerEvent has: each begins with its kind, one of those above.
+        let mut info = crate::harness::session::Info { id: "s\"1".into(), kind: "claude".into(), ..Default::default() };
+        info.summary = odd.into();
+        let agent = NoticeAgent { id: "a".into(), name: "n".into(), harness: "claude".into(), harness_name: "Claude".into(), machine: "server".into(), cwd: "/w".into(), opener: "owner".into() };
+        let run = NoticeRun { conclusion: "failure".into(), ..NoticeRun::default() };
+        let frames: Vec<String> = vec![
+            ServerEvent::Resync.text(),
+            ServerEvent::Updates.text(),
+            ServerEvent::Queue(Queue::Counts { queued: 3, running: 1 }).text(),
+            ServerEvent::MachineBatteryLow { machine: odd.into(), battery: crate::os::battery::Battery { percent: 12, ac: false, charging: false, minutes: None }, text: odd.into() }.text(),
+            ServerEvent::AiSessions { machine: odd.into() }.text(),
+            ServerEvent::Comment(Box::new(Comment { body: odd.into(), ..Comment::default() })).text(),
+            ServerEvent::Attachment(AttachmentChange::Removed { removed: odd.into() }).text(),
+            ServerEvent::DeployRegistration(RegistrationChange::Removed { removed: RegistrationRemoved { app: odd.into(), environment: "prod".into() } }).text(),
+            ServerEvent::PreviewRemoved { repo: odd.into(), environment: "e".into(), why: odd.into() }.text(),
+            ServerEvent::Harness { info: Box::new(info.clone()) }.text(),
+            harness_frame(&serde_json::to_vec(&info)?).to_string(),
+            ServerEvent::HarnessClosed { id: odd.into() }.text(),
+            ServerEvent::Notices(Notices { principal: odd.into(), keys: vec![], how: "seen".into(), at: 5, tags: vec![] }).text(),
+            ServerEvent::CdApps { apps: vec![] }.text(),
+            ServerEvent::RunnerOffline { runner: OfflineRunner { name: odd.into(), labels: vec![], gone_for: 1 } }.text(),
+            ServerEvent::RunNotice(Box::new(RunNotice { kind: NoticeKind::RunFailed, repo: RepoRef::default(), run, environments: vec![] })).text(),
+            ServerEvent::SelfDeploy(SelfDeployNotice { kind: SelfDeployKind::Held, deploy: SelfDeploy { app: "kiln".into(), from: "a".into(), to: "b".into(), revision: None }, message: odd.into() }).text(),
+            ServerEvent::AgentNotice(Box::new(AgentNotice { kind: AgentNoticeKind::NeedsYou, agent, title: odd.into(), text: odd.into(), url: "u".into() })).text(),
+        ];
+        for text in &frames {
+            let said: Value = serde_json::from_str(text)?;
+            let kind = said.get("type").and_then(Value::as_str);
+            anyhow::ensure!(kind.is_some() && kind_of(text) == kind && kinds.iter().any(|k| Some(k.as_str()) == kind), "{text}");
+        }
+        // What isn't a frame's front, and a kind with an escape in it, are read whole.
+        for text in ["", "{}", r#"{"kind":"run"}"#, r#"{ "type":"run"}"#, r#"{"type":run}"#, r#"{"type":"run"#, r#"{"type":"a\"b"}"#, r#"{"type":"a\\b"}"#, r#"{"type":"\u0072un"}"#] {
+            anyhow::ensure!(kind_of(text).is_none() && is_one_of(text, &["run"]), "{text}");
+        }
         Ok(())
     }
 

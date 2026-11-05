@@ -85,6 +85,82 @@ pub struct Shard {
     most_tasks: AtomicU64,
     /// The shard's step quantum, nanoseconds, as its probe last read it (0: not yet).
     quantum_ns: AtomicU64,
+    /// What its parks and wakes cost it ([`Wakes`]), as the probe last copied them.
+    wakes: WakeCells,
+}
+
+/// What a shard's parks and wakes cost it, as hyper-rt counts them on the shard (goal 9, plan 01a1a87b2cec step
+/// 5: the CPU a request costs the shards, per request in the lab's report). Each park that waits is a system call
+/// and a sleep, and each kick a system call on the thread that sends it; a park withdrawn costs neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakes {
+    /// Loop steps.
+    pub steps: u64,
+    /// Parks that waited in the driver.
+    pub parks: u64,
+    /// Of those, the ones a kick ended (another thread's wake or message), I/O ended (a socket's readiness), and
+    /// their deadline ended (a timer's).
+    pub by_kick: u64,
+    pub by_io: u64,
+    pub by_timer: u64,
+    /// Parks withdrawn, work already waiting.
+    pub withdrawn: u64,
+    /// Wakes from other threads the shard took in.
+    pub taken: u64,
+    /// Wakes its thread made through tasks' wakers: to its own tasks, and to other shards'.
+    pub sent_own: u64,
+    pub sent_other: u64,
+    /// Kicks its thread made to parked shards, and kicks the shard's senders were saved (it was running).
+    pub kicks_sent: u64,
+    pub kicks_saved: u64,
+    /// Threads its thread unparked: compute pool workers woken for its jobs, threads waiting on what it published.
+    pub threads_woken: u64,
+}
+
+impl Wakes {
+    fn of(c: &hyper_rt::shard_loop::Counters) -> Self {
+        Self {
+            steps: c.steps,
+            parks: c.waits,
+            by_kick: c.woken_by_kick,
+            by_io: c.woken_by_io,
+            by_timer: c.woken_by_timer,
+            withdrawn: c.parks_withdrawn,
+            taken: c.wakes_foreign,
+            sent_own: c.wakes_sent_local,
+            sent_other: c.wakes_sent_foreign,
+            kicks_sent: c.kicks_sent,
+            kicks_saved: c.kicks_saved,
+            threads_woken: c.threads_woken,
+        }
+    }
+
+    /// Its counts in a row, in [`WakeCells`]' order.
+    fn row(&self) -> [u64; 12] {
+        [self.steps, self.parks, self.by_kick, self.by_io, self.by_timer, self.withdrawn, self.taken, self.sent_own, self.sent_other, self.kicks_sent, self.kicks_saved, self.threads_woken]
+    }
+
+    /// [`Wakes::row`]'s inverse.
+    fn of_row(row: [u64; 12]) -> Self {
+        let [steps, parks, by_kick, by_io, by_timer, withdrawn, taken, sent_own, sent_other, kicks_sent, kicks_saved, threads_woken] = row;
+        Self { steps, parks, by_kick, by_io, by_timer, withdrawn, taken, sent_own, sent_other, kicks_sent, kicks_saved, threads_woken }
+    }
+}
+
+/// [`Wakes`] as the probe stores them: an atomic each, in [`Wakes::row`]'s order.
+#[derive(Default)]
+struct WakeCells([AtomicU64; 12]);
+
+impl WakeCells {
+    fn store(&self, wakes: &Wakes) {
+        for (cell, n) in self.0.iter().zip(wakes.row()) {
+            cell.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> Wakes {
+        Wakes::of_row(self.0.each_ref().map(|cell| cell.load(Ordering::Relaxed)))
+    }
 }
 
 impl Shard {
@@ -105,6 +181,7 @@ impl Shard {
             tasks: AtomicU64::new(0),
             most_tasks: AtomicU64::new(0),
             quantum_ns: AtomicU64::new(0),
+            wakes: WakeCells::default(),
         }
     }
 
@@ -127,6 +204,7 @@ impl Shard {
             let tasks = held_tasks(&c);
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
+            self.wakes.store(&Wakes::of(&c));
         }
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
             self.quantum_ns.store(q, Ordering::Relaxed);
@@ -141,6 +219,11 @@ impl Shard {
     /// How late its probes ran, each noted.
     pub fn delay(&self) -> &Histogram {
         &self.delay
+    }
+
+    /// What its parks and wakes have cost it, as its probe last copied them (goal 9, plan 01a1a87b2cec step 5).
+    pub fn wakes(&self) -> Wakes {
+        self.wakes.load()
     }
 
     /// What the shard's probe has noted, as it stands.
@@ -374,6 +457,7 @@ pub fn render(o: &mut String) {
     }
     help(o, "kiln_shard_quantum_seconds", "gauge", "The step quantum each shard runs with: the longest a poll is to hold it, and half the hold its slow polls are counted past.");
     render_quantum(o, all);
+    render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
     render_held(o, &help);
 }
 
@@ -384,6 +468,39 @@ fn render_quantum(o: &mut String, all: &[Shard]) {
         let q = s.quantum_ns.load(Ordering::Relaxed);
         if q > 0 {
             let _ = writeln!(o, "kiln_shard_quantum_seconds{{shard=\"{i}\"}} {}", secs(Duration::from_nanos(q)));
+        }
+    }
+}
+
+/// The families of what each shard's parks and wakes cost it ([`Wakes`]; goal 9, plan 01a1a87b2cec step 5), from
+/// `all`, each shard's in the runtime's order.
+fn render_wakes(o: &mut String, all: &[Wakes], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    type Count = fn(&Wakes) -> u64;
+    let families: [(&str, &str, &[(&str, Count)]); 9] = [
+        ("kiln_shard_steps_total", "Loop steps each shard ran.", &[("", |w: &Wakes| w.steps)]),
+        ("kiln_shard_parks_total", "Parks each shard waited in its driver: each a system call and a sleep.", &[("", |w: &Wakes| w.parks)]),
+        (
+            "kiln_shard_wakeups_total",
+            "Each shard's parks by what ended them: kick (another thread's wake or message), io (a socket's readiness), timer (their deadline).",
+            &[(",by=\"kick\"", |w: &Wakes| w.by_kick), (",by=\"io\"", |w: &Wakes| w.by_io), (",by=\"timer\"", |w: &Wakes| w.by_timer)],
+        ),
+        ("kiln_shard_parks_withdrawn_total", "Parks each shard withdrew with work already waiting: no system call.", &[("", |w: &Wakes| w.withdrawn)]),
+        ("kiln_shard_wakes_taken_total", "Wakes from other threads each shard took in.", &[("", |w: &Wakes| w.taken)]),
+        (
+            "kiln_shard_wakes_sent_total",
+            "Wakes each shard's thread made through tasks' wakers (a channel's send, a broadcast's subscribers): to its own tasks, and to other shards'.",
+            &[(",to=\"own\"", |w: &Wakes| w.sent_own), (",to=\"other\"", |w: &Wakes| w.sent_other)],
+        ),
+        ("kiln_shard_kicks_sent_total", "Kicks each shard's thread made to parked shards: each a system call on it.", &[("", |w: &Wakes| w.kicks_sent)]),
+        ("kiln_shard_kicks_saved_total", "Wakes and messages sent to each shard that found it running or its park's kick claimed: kicks saved.", &[("", |w: &Wakes| w.kicks_saved)]),
+        ("kiln_shard_threads_woken_total", "Threads each shard's thread unparked (compute pool workers for its jobs, threads waiting on what it published): each a system call on it.", &[("", |w: &Wakes| w.threads_woken)]),
+    ];
+    for (name, h, labels) in families {
+        help(o, name, "counter", h);
+        for (i, w) in all.iter().enumerate() {
+            for (label, n) in labels {
+                let _ = writeln!(o, "{name}{{shard=\"{i}\"{label}}} {}", n(w));
+            }
         }
     }
 }
@@ -445,5 +562,61 @@ mod tests {
         let mut o = String::new();
         render_quantum(&mut o, &all);
         assert_eq!(o, "kiln_shard_quantum_seconds{shard=\"0\"} 0.000266666\n");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's parks and wakes becomes its [`Wakes`],
+    /// each count in its place, and survives the probe's atomics as it was.
+    #[test]
+    fn g9_s5_a_shards_counts_become_its_wakes() {
+        let c = hyper_rt::shard_loop::Counters {
+            steps: 1,
+            waits: 2,
+            woken_by_kick: 3,
+            woken_by_io: 4,
+            woken_by_timer: 5,
+            parks_withdrawn: 6,
+            wakes_foreign: 7,
+            wakes_sent_local: 8,
+            wakes_sent_foreign: 9,
+            kicks_sent: 10,
+            kicks_saved: 11,
+            threads_woken: 12,
+            ..Default::default()
+        };
+        let w = Wakes::of(&c);
+        assert_eq!(w, Wakes { steps: 1, parks: 2, by_kick: 3, by_io: 4, by_timer: 5, withdrawn: 6, taken: 7, sent_own: 8, sent_other: 9, kicks_sent: 10, kicks_saved: 11, threads_woken: 12 });
+        let cells = WakeCells::default();
+        cells.store(&w);
+        assert_eq!(cells.load(), w);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: each shard's parks and wakes are on `/metrics`, a series each, a park by
+    /// what ended it and a wake by whom it went to, as the lab reads them per request.
+    #[test]
+    fn g9_s5_each_shards_parks_and_wakes_are_on_metrics() {
+        let w = Wakes { steps: 1, parks: 2, by_kick: 3, by_io: 4, by_timer: 5, withdrawn: 6, taken: 7, sent_own: 8, sent_other: 9, kicks_sent: 10, kicks_saved: 11, threads_woken: 12 };
+        let mut o = String::new();
+        render_wakes(&mut o, &[Wakes::default(), w], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "kiln_shard_steps_total{shard=\"1\"} 1",
+            "kiln_shard_parks_total{shard=\"1\"} 2",
+            "kiln_shard_wakeups_total{shard=\"1\",by=\"kick\"} 3",
+            "kiln_shard_wakeups_total{shard=\"1\",by=\"io\"} 4",
+            "kiln_shard_wakeups_total{shard=\"1\",by=\"timer\"} 5",
+            "kiln_shard_parks_withdrawn_total{shard=\"1\"} 6",
+            "kiln_shard_wakes_taken_total{shard=\"1\"} 7",
+            "kiln_shard_wakes_sent_total{shard=\"1\",to=\"own\"} 8",
+            "kiln_shard_wakes_sent_total{shard=\"1\",to=\"other\"} 9",
+            "kiln_shard_kicks_sent_total{shard=\"1\"} 10",
+            "kiln_shard_kicks_saved_total{shard=\"1\"} 11",
+            "kiln_shard_threads_woken_total{shard=\"1\"} 12",
+            "kiln_shard_parks_total{shard=\"0\"} 0",
+            "# TYPE kiln_shard_wakeups_total counter",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
+        assert_eq!(o.lines().filter(|l| l.starts_with("# TYPE")).count(), 9, "nine families:\n{o}");
     }
 }
