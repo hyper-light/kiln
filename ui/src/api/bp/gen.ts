@@ -6,7 +6,7 @@ import { BpError, Gen, Reader, Why, Writer } from "./runtime";
 export const VERSION = 1;
 export const OLDEST = 1;
 /** The schema's hash, said in `Open`: two builds that disagree on a layout find out at once. */
-export const SCHEMA_HASH = 17836181741169541297n;
+export const SCHEMA_HASH = 366989358415689829n;
 
 export interface Accepted { version: number; caps: bigint; idle_ms: number; born: number; fragment: number; build: string }
 export function putAccepted(w: Writer, v: Accepted): void {
@@ -230,6 +230,35 @@ export function takeChangeBody(r: Reader): Change {
   if (r.done()) return v;
   v.delta = takeDelta(r);
   return v;
+}
+
+export interface Changed { times: number }
+export function putChanged(w: Writer, v: Changed): void {
+  w.u53(v.times);
+}
+export function takeChanged(r: Reader): Changed {
+  const times = r.u53();
+  return { times };
+}
+export function defaultChanged(): Changed {
+  return { times: 0 };
+}
+export function arbChanged(g: Gen): Changed {
+  const times = g.u53();
+  return { times };
+}
+export function fromFieldsChanged(f: Uint8Array[]): Changed {
+  const times = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[0]!)) : 0;
+  return { times };
+}
+export function toFieldsChanged(v: Changed): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.u53(v.times);
+    out.push(w.bytesOut());
+  }
+  return out;
 }
 
 export interface Close { code: CloseCode; why: string; build: string }
@@ -633,6 +662,44 @@ export function arbEndCode(g: Gen): EndCode {
   }
 }
 
+export interface Event { tag: string; json: Uint8Array }
+export function putEvent(w: Writer, v: Event): void {
+  w.str(v.tag);
+  w.bytes(v.json);
+}
+export function takeEvent(r: Reader): Event {
+  const tag = r.str();
+  const json = r.bytes();
+  return { tag, json };
+}
+export function defaultEvent(): Event {
+  return { tag: "", json: new Uint8Array(0) };
+}
+export function arbEvent(g: Gen): Event {
+  const tag = g.str();
+  const json = g.bytes();
+  return { tag, json };
+}
+export function fromFieldsEvent(f: Uint8Array[]): Event {
+  const tag = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[0]!)) : "";
+  const json = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.bytes())(new Reader(f[1]!)) : new Uint8Array(0);
+  return { tag, json };
+}
+export function toFieldsEvent(v: Event): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.str(v.tag);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.bytes(v.json);
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
 export interface Fragment { lane: number; last: boolean; data: Uint8Array }
 export function putFragment(w: Writer, v: Fragment): void {
   w.u32(v.lane);
@@ -784,6 +851,143 @@ export function arbKey(g: Gen): Key {
     default:
       return defaultKey();
   }
+}
+
+export interface Leg { run: string; key: string; display: string; status: Status; labels: string[]; agent: string | null; executor: string | null; attempt: number; queued_at: number | null; started_at: number | null; finished_at: number | null; exit_code: number | null; error: string | null }
+export function putLeg(w: Writer, v: Leg): void {
+  w.str(v.run);
+  w.str(v.key);
+  w.str(v.display);
+  putStatus(w, v.status);
+  w.vec(v.labels, (x0) => w.str(x0));
+  w.opt(v.agent, (x0) => w.str(x0));
+  w.opt(v.executor, (x0) => w.str(x0));
+  w.u32(v.attempt);
+  w.opt(v.queued_at, (x0) => w.i53(x0));
+  w.opt(v.started_at, (x0) => w.i53(x0));
+  w.opt(v.finished_at, (x0) => w.i53(x0));
+  w.opt(v.exit_code, (x0) => w.i53(x0));
+  w.opt(v.error, (x0) => w.str(x0));
+}
+export function takeLeg(r: Reader): Leg {
+  const run = r.str();
+  const key = r.str();
+  const display = r.str();
+  const status = takeStatus(r);
+  const labels = r.vec(() => r.str());
+  const agent = r.opt(() => r.str());
+  const executor = r.opt(() => r.str());
+  const attempt = r.u32();
+  const queued_at = r.opt(() => r.i53());
+  const started_at = r.opt(() => r.i53());
+  const finished_at = r.opt(() => r.i53());
+  const exit_code = r.opt(() => r.i53());
+  const error = r.opt(() => r.str());
+  return { run, key, display, status, labels, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error };
+}
+export function defaultLeg(): Leg {
+  return { run: "", key: "", display: "", status: defaultStatus(), labels: [], agent: null, executor: null, attempt: 0, queued_at: null, started_at: null, finished_at: null, exit_code: null, error: null };
+}
+export function arbLeg(g: Gen): Leg {
+  const run = g.str();
+  const key = g.str();
+  const display = g.str();
+  const status = arbStatus(g);
+  const labels = g.vec(() => g.str());
+  const agent = g.opt(() => g.str());
+  const executor = g.opt(() => g.str());
+  const attempt = g.u32();
+  const queued_at = g.opt(() => g.i53());
+  const started_at = g.opt(() => g.i53());
+  const finished_at = g.opt(() => g.i53());
+  const exit_code = g.opt(() => g.i53());
+  const error = g.opt(() => g.str());
+  return { run, key, display, status, labels, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error };
+}
+export function fromFieldsLeg(f: Uint8Array[]): Leg {
+  const run = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[0]!)) : "";
+  const key = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[1]!)) : "";
+  const display = f[2] !== undefined && f[2]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[2]!)) : "";
+  const status = f[3] !== undefined && f[3]!.length > 0 ? ((r: Reader) => takeStatus(r))(new Reader(f[3]!)) : defaultStatus();
+  const labels = f[4] !== undefined && f[4]!.length > 0 ? ((r: Reader) => r.vec(() => r.str()))(new Reader(f[4]!)) : [];
+  const agent = f[5] !== undefined && f[5]!.length > 0 ? ((r: Reader) => r.opt(() => r.str()))(new Reader(f[5]!)) : null;
+  const executor = f[6] !== undefined && f[6]!.length > 0 ? ((r: Reader) => r.opt(() => r.str()))(new Reader(f[6]!)) : null;
+  const attempt = f[7] !== undefined && f[7]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[7]!)) : 0;
+  const queued_at = f[8] !== undefined && f[8]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[8]!)) : null;
+  const started_at = f[9] !== undefined && f[9]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[9]!)) : null;
+  const finished_at = f[10] !== undefined && f[10]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[10]!)) : null;
+  const exit_code = f[11] !== undefined && f[11]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[11]!)) : null;
+  const error = f[12] !== undefined && f[12]!.length > 0 ? ((r: Reader) => r.opt(() => r.str()))(new Reader(f[12]!)) : null;
+  return { run, key, display, status, labels, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error };
+}
+export function toFieldsLeg(v: Leg): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.str(v.run);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.key);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.display);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    putStatus(w, v.status);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.vec(v.labels, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.agent, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.executor, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.attempt);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.queued_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.started_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.finished_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.exit_code, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.error, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  return out;
 }
 
 export interface Mark { topic: Topic; cursor: Cursor }
@@ -1167,6 +1371,44 @@ export function takeProbeAckBody(r: Reader): ProbeAck {
   return v;
 }
 
+export interface QueueCounts { queued: number; running: number }
+export function putQueueCounts(w: Writer, v: QueueCounts): void {
+  w.i53(v.queued);
+  w.i53(v.running);
+}
+export function takeQueueCounts(r: Reader): QueueCounts {
+  const queued = r.i53();
+  const running = r.i53();
+  return { queued, running };
+}
+export function defaultQueueCounts(): QueueCounts {
+  return { queued: 0, running: 0 };
+}
+export function arbQueueCounts(g: Gen): QueueCounts {
+  const queued = g.i53();
+  const running = g.i53();
+  return { queued, running };
+}
+export function fromFieldsQueueCounts(f: Uint8Array[]): QueueCounts {
+  const queued = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[0]!)) : 0;
+  const running = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[1]!)) : 0;
+  return { queued, running };
+}
+export function toFieldsQueueCounts(v: QueueCounts): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.i53(v.queued);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.i53(v.running);
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
 export interface Refused { code: OpenRefusal; why: string; build: string }
 export function putRefused(w: Writer, v: Refused): void {
   putOpenRefusal(w, v.code);
@@ -1273,6 +1515,615 @@ export function takeResizeBody(r: Reader): Resize {
   if (r.done()) return v;
   v.rows = r.u16();
   return v;
+}
+
+export interface Run { repo: string; repo_name: string; number: number; pipeline: string; event: string; branch: string; sha: string; message: string; author: string; status: Status; created_at: number; started_at: number | null; finished_at: number | null; error: string | null }
+export function putRun(w: Writer, v: Run): void {
+  w.str(v.repo);
+  w.str(v.repo_name);
+  w.i53(v.number);
+  w.str(v.pipeline);
+  w.str(v.event);
+  w.str(v.branch);
+  w.str(v.sha);
+  w.str(v.message);
+  w.str(v.author);
+  putStatus(w, v.status);
+  w.i53(v.created_at);
+  w.opt(v.started_at, (x0) => w.i53(x0));
+  w.opt(v.finished_at, (x0) => w.i53(x0));
+  w.opt(v.error, (x0) => w.str(x0));
+}
+export function takeRun(r: Reader): Run {
+  const repo = r.str();
+  const repo_name = r.str();
+  const number = r.i53();
+  const pipeline = r.str();
+  const event = r.str();
+  const branch = r.str();
+  const sha = r.str();
+  const message = r.str();
+  const author = r.str();
+  const status = takeStatus(r);
+  const created_at = r.i53();
+  const started_at = r.opt(() => r.i53());
+  const finished_at = r.opt(() => r.i53());
+  const error = r.opt(() => r.str());
+  return { repo, repo_name, number, pipeline, event, branch, sha, message, author, status, created_at, started_at, finished_at, error };
+}
+export function defaultRun(): Run {
+  return { repo: "", repo_name: "", number: 0, pipeline: "", event: "", branch: "", sha: "", message: "", author: "", status: defaultStatus(), created_at: 0, started_at: null, finished_at: null, error: null };
+}
+export function arbRun(g: Gen): Run {
+  const repo = g.str();
+  const repo_name = g.str();
+  const number = g.i53();
+  const pipeline = g.str();
+  const event = g.str();
+  const branch = g.str();
+  const sha = g.str();
+  const message = g.str();
+  const author = g.str();
+  const status = arbStatus(g);
+  const created_at = g.i53();
+  const started_at = g.opt(() => g.i53());
+  const finished_at = g.opt(() => g.i53());
+  const error = g.opt(() => g.str());
+  return { repo, repo_name, number, pipeline, event, branch, sha, message, author, status, created_at, started_at, finished_at, error };
+}
+export function fromFieldsRun(f: Uint8Array[]): Run {
+  const repo = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[0]!)) : "";
+  const repo_name = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[1]!)) : "";
+  const number = f[2] !== undefined && f[2]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[2]!)) : 0;
+  const pipeline = f[3] !== undefined && f[3]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[3]!)) : "";
+  const event = f[4] !== undefined && f[4]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[4]!)) : "";
+  const branch = f[5] !== undefined && f[5]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[5]!)) : "";
+  const sha = f[6] !== undefined && f[6]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[6]!)) : "";
+  const message = f[7] !== undefined && f[7]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[7]!)) : "";
+  const author = f[8] !== undefined && f[8]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[8]!)) : "";
+  const status = f[9] !== undefined && f[9]!.length > 0 ? ((r: Reader) => takeStatus(r))(new Reader(f[9]!)) : defaultStatus();
+  const created_at = f[10] !== undefined && f[10]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[10]!)) : 0;
+  const started_at = f[11] !== undefined && f[11]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[11]!)) : null;
+  const finished_at = f[12] !== undefined && f[12]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[12]!)) : null;
+  const error = f[13] !== undefined && f[13]!.length > 0 ? ((r: Reader) => r.opt(() => r.str()))(new Reader(f[13]!)) : null;
+  return { repo, repo_name, number, pipeline, event, branch, sha, message, author, status, created_at, started_at, finished_at, error };
+}
+export function toFieldsRun(v: Run): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.str(v.repo);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.repo_name);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.i53(v.number);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.pipeline);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.event);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.branch);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.sha);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.message);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.author);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    putStatus(w, v.status);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.i53(v.created_at);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.started_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.finished_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.error, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
+export interface Runner { label: string | null; hostname: string; os: string; arch: string; version: string; labels: string[]; slots: number; busy: number; connected: boolean; draining: boolean; ephemeral: boolean; terminal: boolean; last_seen: number; enrolled_at: number; running: string[] }
+export function putRunner(w: Writer, v: Runner): void {
+  w.opt(v.label, (x0) => w.str(x0));
+  w.str(v.hostname);
+  w.str(v.os);
+  w.str(v.arch);
+  w.str(v.version);
+  w.vec(v.labels, (x0) => w.str(x0));
+  w.u32(v.slots);
+  w.u32(v.busy);
+  w.bool(v.connected);
+  w.bool(v.draining);
+  w.bool(v.ephemeral);
+  w.bool(v.terminal);
+  w.i53(v.last_seen);
+  w.i53(v.enrolled_at);
+  w.vec(v.running, (x0) => w.str(x0));
+}
+export function takeRunner(r: Reader): Runner {
+  const label = r.opt(() => r.str());
+  const hostname = r.str();
+  const os = r.str();
+  const arch = r.str();
+  const version = r.str();
+  const labels = r.vec(() => r.str());
+  const slots = r.u32();
+  const busy = r.u32();
+  const connected = r.bool();
+  const draining = r.bool();
+  const ephemeral = r.bool();
+  const terminal = r.bool();
+  const last_seen = r.i53();
+  const enrolled_at = r.i53();
+  const running = r.vec(() => r.str());
+  return { label, hostname, os, arch, version, labels, slots, busy, connected, draining, ephemeral, terminal, last_seen, enrolled_at, running };
+}
+export function defaultRunner(): Runner {
+  return { label: null, hostname: "", os: "", arch: "", version: "", labels: [], slots: 0, busy: 0, connected: false, draining: false, ephemeral: false, terminal: false, last_seen: 0, enrolled_at: 0, running: [] };
+}
+export function arbRunner(g: Gen): Runner {
+  const label = g.opt(() => g.str());
+  const hostname = g.str();
+  const os = g.str();
+  const arch = g.str();
+  const version = g.str();
+  const labels = g.vec(() => g.str());
+  const slots = g.u32();
+  const busy = g.u32();
+  const connected = g.bool();
+  const draining = g.bool();
+  const ephemeral = g.bool();
+  const terminal = g.bool();
+  const last_seen = g.i53();
+  const enrolled_at = g.i53();
+  const running = g.vec(() => g.str());
+  return { label, hostname, os, arch, version, labels, slots, busy, connected, draining, ephemeral, terminal, last_seen, enrolled_at, running };
+}
+export function fromFieldsRunner(f: Uint8Array[]): Runner {
+  const label = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.opt(() => r.str()))(new Reader(f[0]!)) : null;
+  const hostname = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[1]!)) : "";
+  const os = f[2] !== undefined && f[2]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[2]!)) : "";
+  const arch = f[3] !== undefined && f[3]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[3]!)) : "";
+  const version = f[4] !== undefined && f[4]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[4]!)) : "";
+  const labels = f[5] !== undefined && f[5]!.length > 0 ? ((r: Reader) => r.vec(() => r.str()))(new Reader(f[5]!)) : [];
+  const slots = f[6] !== undefined && f[6]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[6]!)) : 0;
+  const busy = f[7] !== undefined && f[7]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[7]!)) : 0;
+  const connected = f[8] !== undefined && f[8]!.length > 0 ? ((r: Reader) => r.bool())(new Reader(f[8]!)) : false;
+  const draining = f[9] !== undefined && f[9]!.length > 0 ? ((r: Reader) => r.bool())(new Reader(f[9]!)) : false;
+  const ephemeral = f[10] !== undefined && f[10]!.length > 0 ? ((r: Reader) => r.bool())(new Reader(f[10]!)) : false;
+  const terminal = f[11] !== undefined && f[11]!.length > 0 ? ((r: Reader) => r.bool())(new Reader(f[11]!)) : false;
+  const last_seen = f[12] !== undefined && f[12]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[12]!)) : 0;
+  const enrolled_at = f[13] !== undefined && f[13]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[13]!)) : 0;
+  const running = f[14] !== undefined && f[14]!.length > 0 ? ((r: Reader) => r.vec(() => r.str()))(new Reader(f[14]!)) : [];
+  return { label, hostname, os, arch, version, labels, slots, busy, connected, draining, ephemeral, terminal, last_seen, enrolled_at, running };
+}
+export function toFieldsRunner(v: Runner): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.opt(v.label, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.hostname);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.os);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.arch);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.version);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.vec(v.labels, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.slots);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.busy);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.bool(v.connected);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.bool(v.draining);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.bool(v.ephemeral);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.bool(v.terminal);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.i53(v.last_seen);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.i53(v.enrolled_at);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.vec(v.running, (x0) => w.str(x0));
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
+export interface Sample { ts_ms: number; cpu_pm: number; cpus: number; load1_c: number; mem_total: number; mem_used: number; disk_total: number; disk_used: number; net_rx: number; net_tx: number; procs: number }
+export function putSample(w: Writer, v: Sample): void {
+  w.i53(v.ts_ms);
+  w.u32(v.cpu_pm);
+  w.u32(v.cpus);
+  w.u32(v.load1_c);
+  w.u53(v.mem_total);
+  w.u53(v.mem_used);
+  w.u53(v.disk_total);
+  w.u53(v.disk_used);
+  w.u53(v.net_rx);
+  w.u53(v.net_tx);
+  w.u32(v.procs);
+}
+export function takeSample(r: Reader): Sample {
+  const ts_ms = r.i53();
+  const cpu_pm = r.u32();
+  const cpus = r.u32();
+  const load1_c = r.u32();
+  const mem_total = r.u53();
+  const mem_used = r.u53();
+  const disk_total = r.u53();
+  const disk_used = r.u53();
+  const net_rx = r.u53();
+  const net_tx = r.u53();
+  const procs = r.u32();
+  return { ts_ms, cpu_pm, cpus, load1_c, mem_total, mem_used, disk_total, disk_used, net_rx, net_tx, procs };
+}
+export function defaultSample(): Sample {
+  return { ts_ms: 0, cpu_pm: 0, cpus: 0, load1_c: 0, mem_total: 0, mem_used: 0, disk_total: 0, disk_used: 0, net_rx: 0, net_tx: 0, procs: 0 };
+}
+export function arbSample(g: Gen): Sample {
+  const ts_ms = g.i53();
+  const cpu_pm = g.u32();
+  const cpus = g.u32();
+  const load1_c = g.u32();
+  const mem_total = g.u53();
+  const mem_used = g.u53();
+  const disk_total = g.u53();
+  const disk_used = g.u53();
+  const net_rx = g.u53();
+  const net_tx = g.u53();
+  const procs = g.u32();
+  return { ts_ms, cpu_pm, cpus, load1_c, mem_total, mem_used, disk_total, disk_used, net_rx, net_tx, procs };
+}
+export function fromFieldsSample(f: Uint8Array[]): Sample {
+  const ts_ms = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.i53())(new Reader(f[0]!)) : 0;
+  const cpu_pm = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[1]!)) : 0;
+  const cpus = f[2] !== undefined && f[2]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[2]!)) : 0;
+  const load1_c = f[3] !== undefined && f[3]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[3]!)) : 0;
+  const mem_total = f[4] !== undefined && f[4]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[4]!)) : 0;
+  const mem_used = f[5] !== undefined && f[5]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[5]!)) : 0;
+  const disk_total = f[6] !== undefined && f[6]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[6]!)) : 0;
+  const disk_used = f[7] !== undefined && f[7]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[7]!)) : 0;
+  const net_rx = f[8] !== undefined && f[8]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[8]!)) : 0;
+  const net_tx = f[9] !== undefined && f[9]!.length > 0 ? ((r: Reader) => r.u53())(new Reader(f[9]!)) : 0;
+  const procs = f[10] !== undefined && f[10]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[10]!)) : 0;
+  return { ts_ms, cpu_pm, cpus, load1_c, mem_total, mem_used, disk_total, disk_used, net_rx, net_tx, procs };
+}
+export function toFieldsSample(v: Sample): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.i53(v.ts_ms);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.cpu_pm);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.cpus);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.load1_c);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.mem_total);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.mem_used);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.disk_total);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.disk_used);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.net_rx);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u53(v.net_tx);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.u32(v.procs);
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
+export interface SessionItem { json: Uint8Array; streamed: string }
+export function putSessionItem(w: Writer, v: SessionItem): void {
+  w.bytes(v.json);
+  w.str(v.streamed);
+}
+export function takeSessionItem(r: Reader): SessionItem {
+  const json = r.bytes();
+  const streamed = r.str();
+  return { json, streamed };
+}
+export function defaultSessionItem(): SessionItem {
+  return { json: new Uint8Array(0), streamed: "" };
+}
+export function arbSessionItem(g: Gen): SessionItem {
+  const json = g.bytes();
+  const streamed = g.str();
+  return { json, streamed };
+}
+export function fromFieldsSessionItem(f: Uint8Array[]): SessionItem {
+  const json = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.bytes())(new Reader(f[0]!)) : new Uint8Array(0);
+  const streamed = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[1]!)) : "";
+  return { json, streamed };
+}
+export function toFieldsSessionItem(v: SessionItem): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.bytes(v.json);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.streamed);
+    out.push(w.bytesOut());
+  }
+  return out;
+}
+
+export type Status = { t: "Pending" } | { t: "Queued" } | { t: "Running" } | { t: "Succeeded" } | { t: "Failed" } | { t: "Cancelled" } | { t: "Skipped" } | { t: "TimedOut" };
+export function putStatus(w: Writer, v: Status): void {
+  switch (v.t) {
+    case "Pending":
+      w.u32(0);
+      return;
+    case "Queued":
+      w.u32(1);
+      return;
+    case "Running":
+      w.u32(2);
+      return;
+    case "Succeeded":
+      w.u32(3);
+      return;
+    case "Failed":
+      w.u32(4);
+      return;
+    case "Cancelled":
+      w.u32(5);
+      return;
+    case "Skipped":
+      w.u32(6);
+      return;
+    case "TimedOut":
+      w.u32(7);
+      return;
+  }
+}
+export function takeStatus(r: Reader): Status {
+  switch (r.variant()) {
+    case 0:
+      return { t: "Pending" };
+    case 1:
+      return { t: "Queued" };
+    case 2:
+      return { t: "Running" };
+    case 3:
+      return { t: "Succeeded" };
+    case 4:
+      return { t: "Failed" };
+    case 5:
+      return { t: "Cancelled" };
+    case 6:
+      return { t: "Skipped" };
+    case 7:
+      return { t: "TimedOut" };
+    default:
+      throw new BpError(Why.UnknownVariant);
+  }
+}
+export function defaultStatus(): Status {
+  return { t: "Pending" };
+}
+export function arbStatus(g: Gen): Status {
+  switch (g.index(8)) {
+    case 0:
+      return { t: "Pending" };
+    case 1:
+      return { t: "Queued" };
+    case 2:
+      return { t: "Running" };
+    case 3:
+      return { t: "Succeeded" };
+    case 4:
+      return { t: "Failed" };
+    case 5:
+      return { t: "Cancelled" };
+    case 6:
+      return { t: "Skipped" };
+    case 7:
+      return { t: "TimedOut" };
+    default:
+      return defaultStatus();
+  }
+}
+
+export interface Step { idx: number; name: string; status: Status; started_at: number | null; finished_at: number | null; exit_code: number | null }
+export function putStep(w: Writer, v: Step): void {
+  w.u32(v.idx);
+  w.str(v.name);
+  putStatus(w, v.status);
+  w.opt(v.started_at, (x0) => w.i53(x0));
+  w.opt(v.finished_at, (x0) => w.i53(x0));
+  w.opt(v.exit_code, (x0) => w.i53(x0));
+}
+export function takeStep(r: Reader): Step {
+  const idx = r.u32();
+  const name = r.str();
+  const status = takeStatus(r);
+  const started_at = r.opt(() => r.i53());
+  const finished_at = r.opt(() => r.i53());
+  const exit_code = r.opt(() => r.i53());
+  return { idx, name, status, started_at, finished_at, exit_code };
+}
+export function defaultStep(): Step {
+  return { idx: 0, name: "", status: defaultStatus(), started_at: null, finished_at: null, exit_code: null };
+}
+export function arbStep(g: Gen): Step {
+  const idx = g.u32();
+  const name = g.str();
+  const status = arbStatus(g);
+  const started_at = g.opt(() => g.i53());
+  const finished_at = g.opt(() => g.i53());
+  const exit_code = g.opt(() => g.i53());
+  return { idx, name, status, started_at, finished_at, exit_code };
+}
+export function fromFieldsStep(f: Uint8Array[]): Step {
+  const idx = f[0] !== undefined && f[0]!.length > 0 ? ((r: Reader) => r.u32())(new Reader(f[0]!)) : 0;
+  const name = f[1] !== undefined && f[1]!.length > 0 ? ((r: Reader) => r.str())(new Reader(f[1]!)) : "";
+  const status = f[2] !== undefined && f[2]!.length > 0 ? ((r: Reader) => takeStatus(r))(new Reader(f[2]!)) : defaultStatus();
+  const started_at = f[3] !== undefined && f[3]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[3]!)) : null;
+  const finished_at = f[4] !== undefined && f[4]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[4]!)) : null;
+  const exit_code = f[5] !== undefined && f[5]!.length > 0 ? ((r: Reader) => r.opt(() => r.i53()))(new Reader(f[5]!)) : null;
+  return { idx, name, status, started_at, finished_at, exit_code };
+}
+export function toFieldsStep(v: Step): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  {
+    const w = new Writer();
+    w.u32(v.idx);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.str(v.name);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    putStatus(w, v.status);
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.started_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.finished_at, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  {
+    const w = new Writer();
+    w.opt(v.exit_code, (x0) => w.i53(x0));
+    out.push(w.bytesOut());
+  }
+  return out;
 }
 
 export interface Subscribe { sub: number; topic: Topic; cursor: Cursor | null; credit: number }

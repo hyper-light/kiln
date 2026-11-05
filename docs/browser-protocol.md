@@ -118,7 +118,7 @@ merged or dropped.
 | `Idle` | 15 | both | `got: u53` | telemetry | control | newest | never | no | datagram |
 | `Probe` | 16 | both | `nonce: u32` | ask | control, ahead of all | never | never | yes | datagram |
 | `ProbeAck` | 17 | both | `nonce: u32, got: u53` | answer | control | never | never | yes | datagram |
-| `Unread` | 18 | both | `kind: u32, code: Code, why: Why` | ack | control | never | never | no | control |
+| `Unread` | 18 | both | `kind: u32, code: UnreadCode, why: UnreadWhy` | ack | control | never | never | no | control |
 | `Compressed` | 19 | down | `ctx: u8, len: u32, data: bytes` | carried | its frames' | never | (is compression) | no | its frames' |
 | `Close` | 20 | both | `code: CloseCode, why: str, build: str` | handshake | control | never | never | yes | control |
 | `Input` | 21 | up | `sub: u32, data: bytes` | command, refused while away | interactive | never | never | yes | control |
@@ -141,8 +141,8 @@ The types inside them:
 | `OpenRefusal` | `0 BadTicket`, `1 Expired`, `2 Reused`, `3 TooOld`, `4 TooNew`, `5 Schema`, `6 Busy`, `7 Malformed` |
 | `EndCode` | `0 Done`, `1 Gone`, `2 Denied`, `3 Unknown`, `4 Limit` |
 | `CloseCode` | `0 Bye`, `1 Expired`, `2 SwitchBuild`, `3 Revoked`, `4 Shutdown`, `5 Protocol` |
-| `Code` | `0 Unknown`, `1 Malformed` |
-| `Why` | the refusals above, by index |
+| `UnreadCode` | `0 Unknown`, `1 Malformed` |
+| `UnreadWhy` | the refusals above, by index (`0 CutShort` to `8 OutOfOrder`) |
 
 A delta that carries a record's fields (`Set`, `Put`, `Patch`) holds each field as its own
 `bytes`, encoded as the topic's record type says, so the generic core moves, merges and keeps them

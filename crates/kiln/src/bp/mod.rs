@@ -408,10 +408,39 @@ impl Streams {
     }
 }
 
+/// What a connection's refusal is, for the one place refusals are noted
+/// (`crate::wire::unread`: `kiln_wire_refused_total{wire,code}`, the audit log, the person's
+/// page): a frame a page sent that couldn't be read (`bp_up`), one it says it couldn't read of
+/// the server's (`bp_down`), or an open refused. Other events aren't refusals.
+pub fn unread(e: &kiln_bp::server::Event, from: crate::wire::unread::Sender) -> Option<crate::wire::unread::Unread> {
+    use crate::wire::unread::{Code, Unread, Wire};
+    use kiln_bp::server::Event as E;
+    let code = |c: kiln_bp::wire::Code| match c {
+        kiln_bp::wire::Code::Unknown => Code::Unknown,
+        kiln_bp::wire::Code::Malformed => Code::Malformed,
+    };
+    match e {
+        E::Unreadable { kind, why } => Some(Unread { wire: Wire::BpUp, from, what: kind.map_or_else(|| "frame".to_owned(), |k| format!("kind {k}")), code: code(why.code()), why: why.name().to_owned() }),
+        E::Unread { kind, code: c, why } => {
+            let c = match c {
+                kiln_bp::frames::UnreadCode::Unknown => Code::Unknown,
+                kiln_bp::frames::UnreadCode::Malformed => Code::Malformed,
+            };
+            Some(Unread { wire: Wire::BpDown, from, what: format!("kind {kind}"), code: c, why: kiln_bp::frames::UnreadWhy::VARIANTS.get(why.variant() as usize).copied().unwrap_or("").to_owned() })
+        }
+        E::OpenRefused { code: c, why } => Some(Unread { wire: Wire::BpUp, from, what: format!("open: {}", kiln_bp::frames::OpenRefusal::VARIANTS.get(c.variant() as usize).copied().unwrap_or("")), code: Code::Malformed, why: why.clone() }),
+        _ => None,
+    }
+}
+
 /// The mask of every field of a record of `n` fields.
 pub fn all(n: usize) -> Bits {
     Bits(if n >= 64 { u64::MAX } else { (1u64 << n) - 1 })
 }
 
 #[cfg(test)]
+mod measure;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_support;
