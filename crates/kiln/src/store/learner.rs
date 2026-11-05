@@ -95,11 +95,28 @@ const COPY_TRIES: u32 = 3;
 
 /// A raft message's frames: one, or the parts of a bigger one, numbered `id`.
 pub fn frames(id: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
-    if bytes.len() <= PART {
-        return vec![(Msg::Raft { id: 0, part: 0, parts: 0 }, bytes)];
-    }
-    let parts = u32::try_from(bytes.chunks(PART).count()).unwrap_or(u32::MAX);
-    bytes.chunks(PART).zip(0..).map(|(chunk, part)| (Msg::Raft { id, part, parts }, chunk.to_vec())).collect()
+    parts(id, bytes).collect()
+}
+
+/// [`frames`], each made as it's asked for: a long message's parts copied one at a time, so whoever sends
+/// them can give its shard up between them (goal 9, plan 01a1a87b2cec step 3: the hub's cluster loop copied
+/// every part of a learner's catch-up, then sent them, in one poll, up to 5.7 ms in the lab's g6c2). One that
+/// fits a frame goes whole, uncopied.
+pub fn parts(id: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + Send {
+    let whole = bytes.len() <= PART;
+    let parts = u32::try_from(bytes.len().div_ceil(PART)).unwrap_or(u32::MAX);
+    let (mut left, mut part) = (Some(bytes), 0u32);
+    std::iter::from_fn(move || {
+        if whole {
+            return left.take().map(|b| (Msg::Raft { id: 0, part: 0, parts: 0 }, b));
+        }
+        let start = usize::try_from(part).ok()?.checked_mul(PART)?;
+        let rest = left.as_ref()?.get(start..).filter(|r| !r.is_empty())?;
+        let chunk = rest.get(..PART.min(rest.len()))?.to_vec();
+        let this = part;
+        part = part.saturating_add(1);
+        Some((Msg::Raft { id, part: this, parts }, chunk))
+    })
 }
 
 /// The token a runner fetches copies of kiln.db with: signed by the server's key, for it.
@@ -500,14 +517,14 @@ impl Learners {
         }
     }
 
-    /// A message to learner `member`, in its frames.
-    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
+    /// A message to learner `member`, in its frames, each made as it's asked for ([`parts`]).
+    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + Send + use<> {
         let after = if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) { self.changes_after.lock().get(&member).copied() } else { None };
         let bytes = match after {
             Some(after) => changed_in_transit(bytes, after),
             None => bytes,
         };
-        frames(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
+        parts(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
     }
 
     /// `machine`'s learner, held by runner process `peer`, checks the log's checkpoints, holding the
@@ -683,6 +700,23 @@ mod tests {
         }
         assert_eq!(got, Some(bytes));
         assert_eq!(decode(&encode(&Msg::Join { member: 7, token: "t".into() })), Some(Msg::Join { member: 7, token: "t".into() }));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a message's parts made one at a time are its frames: a small one whole and
+    /// uncopied; a long one in parts of `PART`, the last what's left, numbered in order, together the message.
+    #[test]
+    fn g9_s3_parts_made_one_at_a_time_are_the_frames() {
+        let small = vec![1u8, 2, 3];
+        let at = small.as_ptr();
+        let mut one = parts(5, small);
+        let first = one.next();
+        assert!(matches!(&first, Some((Msg::Raft { id: 0, part: 0, parts: 0 }, b)) if b.as_ptr() == at), "whole, uncopied: {first:?}");
+        assert!(one.next().is_none());
+        let bytes: Vec<u8> = (0..(PART * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        let made: Vec<(Msg, Vec<u8>)> = parts(9, bytes.clone()).collect();
+        assert_eq!(made.iter().map(|(_, b)| b.len()).collect::<Vec<_>>(), vec![PART, PART, 17]);
+        assert!(made.iter().zip(0u32..).all(|((m, _), n)| matches!(m, Msg::Raft { id: 9, part, parts: 3 } if *part == n)));
+        assert_eq!(made.into_iter().flat_map(|(_, b)| b).collect::<Vec<u8>>(), bytes);
     }
 
     /// W27-R08: a learner from before asks with no `checks`, and is read as one that checks
