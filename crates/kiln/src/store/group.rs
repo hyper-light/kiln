@@ -2,12 +2,14 @@
 //! store as its state machine. On the server alone it's a group of one voter, which commits alone;
 //! runners join it as learners, then voters, in the phases after.
 //!
-//! A write runs as it always has, in a transaction of the store's connection, while the rows it
-//! touches are noted ([`super::capture`]). When it's done, its net change is read and committed with
-//! the write's number (`seq`, in [`STATE`]), and then proposed to the group as an entry: the log
-//! takes the change right after, written alongside what other writes sent meanwhile, one flush for
-//! all of them. So a write's caller gets its answer as fast as before the group, and is as durable
-//! (kiln.db commits without waiting for the disk, as it always has).
+//! A write runs in its turn on the store's connection, in a savepoint of its own inside the
+//! transaction of the group of writes committed with it (goal 5, plan 01a1a59c2aae), while the rows
+//! it touches are noted ([`super::capture`]). When it's done, its net change is read and numbered
+//! (`seq`, in [`STATE`]); the group commits with its last write's number, and then each change is
+//! proposed to the group as an entry, in turn: the log takes them right after, written alongside
+//! what other writes sent meanwhile, one flush for all of them. So a write's caller gets its answer
+//! once its group commits, and is as durable as before the group (kiln.db commits without waiting
+//! for the disk, as it always has).
 //!
 //! - **A restart replays** the log's entries kiln.db doesn't hold (a write whose commit the disk
 //!   lost while the log's flush kept it): an entry applies when its `seq` is past kiln.db's, and is
@@ -90,7 +92,7 @@ const DISK: u64 = 4 << 30;
 /// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
 const KEEP: u64 = if cfg!(test) { 8 } else { 256 };
 /// Changes waiting for the log, at most: past them a write waits its turn.
-const QUEUED: usize = 1024;
+pub(super) const QUEUED: usize = 1024;
 /// Entries, and log bytes, between compactions.
 const COMPACT_ENTRIES: u64 = if cfg!(test) { 64 } else { 8192 };
 const COMPACT_BYTES: u64 = 128 << 20;
