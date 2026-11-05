@@ -27,6 +27,8 @@ use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
 
+mod build;
+
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
@@ -542,8 +544,9 @@ pub struct Hub {
     /// texts at the most, counted as the hub's events' are (`UI_EVENTS`).
     pub harness_events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
-    /// written as one opens and closes (`crate::rcu`).
-    pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
+    /// written as one opens and closes (`crate::rcu`). Each relay's queue is lock-free (goal 4, plan
+    /// 01a1a59c2a9c step 5: `crate::termsess`'s `relay`).
+    pub terms: crate::rcu::Rcu<HashMap<String, crate::memory::queue::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
     pub terminals: crate::termsess::Sessions,
     /// Every kiln-native agent session, local and on machines.
@@ -2794,38 +2797,9 @@ impl Hub {
             AgentMsg::PortData { conn, data } => self.harness.ports.data(&agent, conn, data),
             AgentMsg::PortAck { conn, bytes } => self.harness.ports.ack(&agent, conn, bytes),
             AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
-            AgentMsg::Build { build, caps } => {
-                self.instances.update(|i| i.set_build(peer, build.clone(), caps));
-                // It may send its legs' events and results again after a reconnect: they're taken
-                // once (a receipt without a job says so).
-                if caps & proto::CAP_RECEIVED != 0 {
-                    self.send_peer(peer, &ServerMsg::Received { job: String::new() }).await;
-                }
-                self.updates.on_build(self, &agent, &build);
-                self.updates.fleet.wake();
-                self.emit(&ServerEvent::Updates);
-                crate::frontdoor::control::on_build(self, &agent, caps).await;
-                if caps & proto::CAP_SYNC != 0 {
-                    self.sync_announced(&agent).await;
-                }
-                if caps & proto::CAP_OBSERVE != 0 {
-                    crate::observe::hub::announced(self, &agent).await;
-                }
-                if caps & proto::CAP_CLUSTER != 0 {
-                    self.cluster_announced(&agent).await;
-                }
-                if caps & proto::CAP_CONVO != 0 {
-                    self.mirrors_seen();
-                    self.harness.restore_due(self, &agent);
-                }
-                // What it can do decides which legs it may take.
-                self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() }).await;
-                // Previews' deployments it's left to take down (docs/ci.md W15-R07).
-                if caps & proto::CAP_UNDEPLOY != 0 {
-                    let (hub, agent) = (Arc::clone(self), agent.clone());
-                    crate::rt::spawn(async move { crate::ci::previews::runner_up(&hub, &agent).await });
-                }
-            }
+            // In pieces, in their order, its shard given up between them (`build`; goal 9, plan 01a1a87b2cec
+            // step 3).
+            AgentMsg::Build { build, caps } => Box::pin(self.on_build(peer, &agent, build, caps)).await,
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
                 self.updates.fleet.wake();
@@ -3865,9 +3839,10 @@ impl Hub {
     pub async fn cancel_jobs(&self, run_id: &str, jobs: Vec<String>, reason: &str) -> anyhow::Result<Vec<(String, crate::store::JobCancel)>> {
         use crate::store::JobCancel;
         if self.ci.is_run(run_id) || self.store.is_engine_run(run_id.to_owned()).await? {
-            let (tx, rx) = async_channel::bounded(1);
+            // Its answer on a one-shot, lock-free (goal 4, plan 01a1a59c2a9c step 5).
+            let (tx, rx) = hyper_rt::sync::oneshot().map_err(|e| anyhow::anyhow!("the CI dispatcher's answer can't be waited for: {e}"))?;
             self.ci.send(crate::ci::dispatch::Msg::CancelLegs { run: run_id.to_owned(), legs: jobs, reason: reason.to_owned(), reply: tx });
-            let each = crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("the CI dispatcher didn't answer"))??;
+            let each = crate::rt::timeout(std::time::Duration::from_secs(60), rx).await.ok().and_then(Result::ok).ok_or_else(|| anyhow::anyhow!("the CI dispatcher didn't answer"))?;
             return Ok(each.into_iter().map(|(leg, r)| (leg, r.map_or_else(JobCancel::Refused, |()| JobCancel::Cancelled))).collect());
         }
         let done = self.store.cancel_jobs(run_id.to_owned(), jobs, reason.to_owned()).await?;
@@ -5079,7 +5054,7 @@ pub(crate) mod tests {
             let session = crate::termsess::Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
             hub.terminals.insert(&session);
             // Its relay's queue full, nobody taking from it.
-            let (tx, rx) = async_channel::bounded::<TermOut>(1);
+            let (tx, rx) = crate::memory::queue::places::<TermOut>(&crate::memory::owners::CHANNELS, 1);
             tx.try_send(TermOut::Data(b"first".to_vec())).map_err(|_| anyhow::anyhow!("the relay's queue had no room for its first"))?;
             hub.terms.update(|m| m.insert("box/t1".into(), tx.clone()));
             let heard = crate::rt::timeout(Duration::from_secs(5), hub.on_runner_msg(1, AgentMsg::TermOutput { session: "t1".into(), data: b"second".to_vec() })).await;

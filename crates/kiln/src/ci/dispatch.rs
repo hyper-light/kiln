@@ -136,12 +136,13 @@ pub enum Msg {
         reason: String,
     },
     /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
-    /// leg and whether it was, or why not.
+    /// leg and whether it was, or why not. Answered once, on a one-shot (goal 4, plan 01a1a59c2a9c step
+    /// 5: an async-channel's wait took event-listener's `Mutex`, the dispatcher's shard and its caller's).
     CancelLegs {
         run: String,
         legs: Vec<String>,
         reason: String,
-        reply: async_channel::Sender<Vec<(String, Result<(), String>)>>,
+        reply: hyper_rt::sync::OneshotSender<Vec<(String, Result<(), String>)>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
@@ -1277,11 +1278,11 @@ impl Dispatch {
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
             Msg::CancelLegs { run, legs, reason, reply } => match self.cancel_legs(&run, &legs, &reason).await {
                 Ok(each) => {
-                    let _ = reply.try_send(each);
+                    let _ = reply.send(each);
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = reply.try_send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
+                    let _ = reply.send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
                     Err(e)
                 }
             },
@@ -3752,6 +3753,24 @@ mod tests {
         let ask: crate::ci::uploads::Ask = serde_json::from_value(serde_json::json!({ "sha": "a", "culprit": { "gate": true }, "vars": { "KILN_TRY_PRIORITY": "90" } }))?;
         assert_eq!(ask.culprit, None);
         Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5 (W26-R21): a cancel of some of a run's legs is answered once, on a
+    /// one-shot (hyper-rt's, lock-free), from the dispatcher's shard to its caller's: each leg asked, in the
+    /// order asked, and why it wasn't cancelled (none of these is a leg of the run).
+    #[test]
+    fn g4_s5_a_cancel_of_legs_is_answered_once_on_a_one_shot() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.ci.enabled = true).await?;
+            super::spawn(std::sync::Arc::clone(&hub));
+            let legs: Vec<String> = vec!["l3".into(), "l1".into(), "l2".into()];
+            let (reply, answer) = hyper_rt::sync::oneshot().map_err(|e| anyhow::anyhow!("{e}"))?;
+            hub.ci.send(super::Msg::CancelLegs { run: "no-such-run".into(), legs: legs.clone(), reason: "cancelled by a test".into(), reply });
+            let each = crate::rt::timeout(std::time::Duration::from_secs(30), answer).await.map_err(|_| anyhow::anyhow!("the dispatcher never answered"))?.map_err(|_| anyhow::anyhow!("the dispatcher let go of the answer"))?;
+            anyhow::ensure!(each.iter().map(|(l, _)| l).eq(legs.iter()), "each leg once, in the order asked: {each:?}");
+            anyhow::ensure!(each.iter().all(|(_, r)| r.as_ref().is_err_and(|why| why == "not a leg of this run")), "{each:?}");
+            Ok(())
+        })
     }
 
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
