@@ -6191,11 +6191,16 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
     // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
     // buffer), frames as each goes.
+    // Between its pieces the shard goes to its other tasks once this one has had its share of it
+    // (`crate::rt::consume_budget`): a socket that takes each piece at once never made it wait, and a long
+    // session's megabytes went out in one poll, holding its shard's other viewers, owners and requests
+    // 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
         let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
+            crate::rt::consume_budget().await;
         }
         return Ok(());
     }
@@ -6205,6 +6210,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         let n = f.capacity();
         tx.send(ws::text(f)).await?;
         held.release(n);
+        crate::rt::consume_budget().await;
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
@@ -6422,6 +6428,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                             crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
                         }
                         at = Some(next);
+                        // A viewer behind its feed reads batch after batch, each ready at once: past its
+                        // share of its shard, the shard's other tasks go between (as a snapshot's pieces do).
+                        crate::rt::consume_budget().await;
                     }
                     Err(Refusal::Behind { .. }) => {
                         crate::metrics::bus().lag_notices.inc();
