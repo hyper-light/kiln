@@ -608,6 +608,43 @@ python3 scripts/locks.py rank census/run.json
 - **Ship's Deploys** (`ship::deploys::Model`): the facts as last gathered, which every list reads, are a
   copy a new gathering replaces whole, and so are each source's newest commits.
 
+### What's left in the bus, Ship and CI, and why it's off the hot path
+
+The census (`python3 scripts/locks.py list`; every Mutex and RwLock outside a test build's code in
+`bus.rs`, `ship.rs`, `ship/`, `ci/` and `store.rs`, and kiln-seams' `bus.rs`) found none on the bus's
+side in kiln: its node is Quiver's (vendored; its locks are its own change), and `SimBus`'s is the
+simulator's, built for tests only. In Ship, only Deploys' (above). In CI, besides those above, these,
+none taken on a runner's message, a page's read or a websocket's frame:
+
+- **Async locks**, which park the task that waits and never a shard (a holder whose shard the OS
+  preempts holds up only that lock's waiters): the table of steps in flight (`services/memo.rs`, its
+  leases changed in order, each kept in SQLite before the next); a digest's put against its collection
+  (`services/cas.rs`'s stripes); one artifact finishing at a time (`services/pipelines.rs`); the OIDC
+  keys' rotation (`oidc.rs` `ROTATE`, so two requests never both make a key); a push to a repository kiln
+  hosts (`hosting.rs`, one at a time a repository, its `refs/for/*` the way in); the search's meta file and
+  a tree's index while it's built (`search.rs`); an incident's bookkeeping (`attach.rs` `WAKING`).
+- **One loop's own, or taken as something rare happens:** the scheduler's sweep every 5 s (`notify.rs`
+  `OFFLINE`, `QUARANTINED`, `UNUSED_LOOKED`), a release's move (`MOVING`), a cache's eviction
+  (`NEAR_QUOTA`); a push (`QUARANTINED`, and `fresh.rs`'s queues of trunk moves and of changes with a new
+  revision, which its replayer's loop takes); kiln's events, by the attachments' listener (`attach.rs`
+  `FROM_REPOS`, read again at most once a minute, `UPGRADES_SEEN`, `UPGRADES_THROUGH`) and by review's
+  (`cd_events.rs`, CD's apps moving); the replies mailbox's loop (`replies.rs`); the land queue's and the conflict
+  ladder's loops, and a review or landing as it's given (`land.rs`, `ladder.rs`); a preview's leg ending,
+  or a runner that takes previews down connecting or saying it did (`previews.rs`); an attest step's
+  signature (`attest.rs`); a credential minted for a brokered secret, a deployment or a tracker, each
+  around a token exchange over the network (`integrations/aws.rs`, `azure.rs`, `gcp.rs`, `oci.rs`,
+  `trackers.rs`), a cloud service's endpoint, read as each call to it is made (`integrations/mod.rs`,
+  where a test puts its fakes), and the KMS key's public half, fetched once (`signing.rs`); a person's
+  search of a change (`search.rs` `TREES`, `CHANGED`, `BUILDING`, around git and an index's build); a push
+  to a repository kiln hosts (`hosting.rs`'s map of its locks); an artifact kept in CAS, and the collector
+  (`services/cas.rs` `uploading`); the issuer's own listener (`[ci.oidc] listen`), whose documents' rate
+  limit by client (`oidc.rs` `asked`) clouds meet as they fetch kiln's keys, never the API's listener.
+- **One request's own:** GraphQL's errors and missing fields (`rest/graphql.rs`), made and dropped with
+  its request, so no other request, and no other shard, takes them.
+
+`scripts/locks/hot.toml` names the files above that became lock-free, and the CI modules the API's runs,
+legs, pools and insights are read through, so a lock there fails the check.
+
 ### Keeping them out
 
 `python3 scripts/locks.py check` fails when a Mutex, RwLock or Condvar appears in the modules
