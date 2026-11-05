@@ -1,0 +1,110 @@
+lib tests exit 0
+resident (store on) exit 0
+resident (store off) exit 0
+clippy exit 0
+test result: ok. 654 passed; 0 failed; 6 ignored; 0 measured; 2211 filtered out; finished in 128.69s
+g11 resident (conversation store on): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 74.19 MB more (15990 bytes an event kept), 4.78 MB of it let go at its end (process 0.11 MB before, 74.30 MB with it, 69.52 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.22s
+g11 resident (conversation store off): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 19.04 MB more (4102 bytes an event kept), 9.23 MB of it let go at its end (process 0.10 MB before, 19.14 MB with it, 9.91 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.10s
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |                  ^^^^^^^^^^^^
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    = note: `#[warn(deprecated)]` on by default
+/home/runner/work/_temp/c/lib-tests.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |              ^^^^^^^^^^^^
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-
+/home/runner/work/_temp/c/lib-tests.txt-     |
+/home/runner/work/_temp/c/lib-tests.txt-     |          ^^^^^^^^^^^^
+/home/runner/work/_temp/c/lib-tests.txt-     |
+/home/runner/work/_temp/c/lib-tests.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/lib-tests.txt-     |
+/home/runner/work/_temp/c/lib-tests.txt-     |
+/home/runner/work/_temp/c/lib-tests.txt-
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |                  ^^^^^^^^^^^^
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-    |
+/home/runner/work/_temp/c/lib-tests.txt-
+/home/runner/work/_temp/c/lib-tests.txt-   |
+/home/runner/work/_temp/c/lib-tests.txt-   |          ^^^^^^^^^^^^
+/home/runner/work/_temp/c/lib-tests.txt-   |
+/home/runner/work/_temp/c/lib-tests.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/lib-tests.txt-   |
+/home/runner/work/_temp/c/lib-tests.txt-   |
+/home/runner/work/_temp/c/lib-tests.txt-
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling yaml-rust2 v0.13.0
+--
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling uuid v1.28.0
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling clap_builder v4.6.7
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling rquickjs-core v0.14.0
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling tar v0.4.46
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling postcard v1.1.3
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling aristo v0.4.1
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling password-hash v0.6.1
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling tungstenite v0.30.0
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling pbkdf2 v0.12.2
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling vorpal-language v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/language)
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling icu_collator v2.3.1
+/home/runner/work/_temp/c/lib-tests.txt-   Compiling vorpal-kg v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/kg)
+--
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |                  ^^^^^^^^^^^^
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    = note: `#[warn(deprecated)]` on by default
+/home/runner/work/_temp/c/clippy.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |              ^^^^^^^^^^^^
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-
+/home/runner/work/_temp/c/clippy.txt-     |
+/home/runner/work/_temp/c/clippy.txt-     |          ^^^^^^^^^^^^
+/home/runner/work/_temp/c/clippy.txt-     |
+/home/runner/work/_temp/c/clippy.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/clippy.txt-     |
+/home/runner/work/_temp/c/clippy.txt-     |
+/home/runner/work/_temp/c/clippy.txt-
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |                  ^^^^^^^^^^^^
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-    |
+/home/runner/work/_temp/c/clippy.txt-
+/home/runner/work/_temp/c/clippy.txt-   |
+/home/runner/work/_temp/c/clippy.txt-   |          ^^^^^^^^^^^^
+/home/runner/work/_temp/c/clippy.txt-   |
+/home/runner/work/_temp/c/clippy.txt-help: replace the use of the deprecated method
+/home/runner/work/_temp/c/clippy.txt-   |
+/home/runner/work/_temp/c/clippy.txt-   |
+/home/runner/work/_temp/c/clippy.txt-
+/home/runner/work/_temp/c/clippy.txt-    Checking yaml-rust2 v0.13.0
+--
+/home/runner/work/_temp/c/clippy.txt-    Checking focal-bus v0.1.0 (/home/runner/work/kiln/kiln/vendor/focal-bus/crates/focal-bus)
+/home/runner/work/_temp/c/clippy.txt-    Checking postcard v1.1.3
+/home/runner/work/_temp/c/clippy.txt-    Checking aristo v0.4.1
+/home/runner/work/_temp/c/clippy.txt-    Checking tar v0.4.46
+/home/runner/work/_temp/c/clippy.txt-    Checking tungstenite v0.30.0
+/home/runner/work/_temp/c/clippy.txt-    Checking password-hash v0.6.1
+/home/runner/work/_temp/c/clippy.txt-    Checking icu_collator v2.3.1
+/home/runner/work/_temp/c/clippy.txt-    Checking pbkdf2 v0.12.2
+/home/runner/work/_temp/c/clippy.txt-    Checking vorpal-language v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/language)
+/home/runner/work/_temp/c/clippy.txt-    Checking vorpal-kg v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/kg)
+/home/runner/work/_temp/c/clippy.txt-    Checking icu_locale v2.3.1
+/home/runner/work/_temp/c/clippy.txt-    Checking flate2 v1.1.10

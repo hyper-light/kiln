@@ -1,0 +1,72 @@
+    Updating crates.io index
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 07s
+     Running tests/session_resident.rs (/mnt/target/debug/deps/session_resident-1c7ce3de406f9539)
+
+running 1 test
+g11 resident (conversation store off): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 19.04 MB more (4102 bytes an event kept), 9.23 MB of it let go at its end (process 0.10 MB before, 19.14 MB with it, 9.91 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+test g11_s2_a_20000_event_sessions_resident_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.10s
+
