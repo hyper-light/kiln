@@ -10,7 +10,7 @@
 //! kiln-lab ab --a main/kiln --b branch/kiln --rounds 8 [--hogs 2x]
 //! kiln-lab run --kiln kiln --server-cpus 16-31 --layout production --hogs 1x   # the lab on its own CPUs
 //! kiln-lab compare first/run.json second/run.json
-//! kiln-lab report DIR/run.json
+//! kiln-lab report DIR/run.json [--quantum-us 266.666]
 //! ```
 
 mod client;
@@ -121,7 +121,13 @@ enum Cmd {
         build: Option<String>,
     },
     /// A run's report, in Markdown.
-    Report { run: PathBuf },
+    Report {
+        run: PathBuf,
+        /// The step quantum to hold what held the shards to, µs, in place of the one each round's build said
+        /// (goal 9, plan 01a1a87b2cec step 3: a build from before it said, or a quantum it didn't run with).
+        #[arg(long)]
+        quantum_us: Option<f64>,
+    },
     /// Runs side by side: each number's median and noise in each (a baseline's table).
     Table {
         /// `label=path/run.json`, or a path (labelled by its folder).
@@ -277,7 +283,15 @@ fn main() -> anyhow::Result<()> {
                 .on(report::machine_line(one.rounds.iter().filter(|r| r.build == a)), report::machine_line(two.rounds.iter().filter(|r| r.build == b)));
             print!("{}", report::comparison_markdown(&c));
         }
-        Cmd::Report { run } => print!("{}", report::markdown(&load(&run)?)),
+        Cmd::Report { run, quantum_us } => {
+            let mut run = load(&run)?;
+            if let Some(q) = quantum_us {
+                for r in &mut run.rounds {
+                    r.quantum_us = Some(q);
+                }
+            }
+            print!("{}", report::markdown(&run));
+        }
         Cmd::Table { runs } => {
             let mut loaded = Vec::new();
             for r in &runs {

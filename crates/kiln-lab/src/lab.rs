@@ -309,6 +309,10 @@ pub struct Round {
     pub held: Vec<measure::Held>,
     #[serde(default)]
     pub fill_held: Vec<measure::Held>,
+    /// The step quantum the server's shards ran with, µs (`kiln_shard_quantum_seconds`, goal 9, plan 01a1a87b2cec
+    /// step 3): what the report holds what held the shards to. None from a build from before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantum_us: Option<f64>,
     /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
     /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
     /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
@@ -939,7 +943,8 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, locks })
+    let quantum_us = measure::quantum_us(&after);
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
@@ -1145,12 +1150,13 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     shards.len()
 }
 
-/// What each of the window's `requests` cost the shards in loop steps, polls, parks and wakes (goal 9, plan
-/// 01a1a87b2cec step 5, beside `server.cpu_ms_per_request`): each family's growth over the window summed over the
-/// shards, over the requests, as `shards.<what>_per_request`, where the build has the family. A park that waits
-/// is a system call and a sleep, and a kick a system call on its sender; a park withdrawn costs neither.
+/// What each of the window's `requests` cost the shards in loop steps, polls, parks, wakes and system calls (goal
+/// 9, plan 01a1a87b2cec step 5, beside `server.cpu_ms_per_request`): each family's growth over the window summed
+/// over the shards, over the requests, as `shards.<what>_per_request`, where the build has the family; and, where
+/// it has every one, the calls' sum (`shards.syscalls_per_request`). A park that waits is a system call and a
+/// sleep, and a kick a system call on its sender; a park withdrawn costs neither.
 fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
-    const FAMILIES: [(&str, &str, &[(&str, &str)]); 13] = [
+    const FAMILIES: [(&str, &str, &[(&str, &str)]); 20] = [
         ("steps", "kiln_shard_steps_total", &[]),
         ("polls", "kiln_shard_polls_total", &[]),
         ("parks", "kiln_shard_parks_total", &[]),
@@ -1164,7 +1170,17 @@ fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
         ("kicks_sent", "kiln_shard_kicks_sent_total", &[]),
         ("kicks_saved", "kiln_shard_kicks_saved_total", &[]),
         ("threads_woken", "kiln_shard_threads_woken_total", &[]),
+        ("harvests", "kiln_shard_harvests_total", &[]),
+        ("arms", "kiln_shard_arms_total", &[]),
+        ("socket_accepts", "kiln_shard_socket_calls_total", &[("call", "accept")]),
+        ("socket_reads", "kiln_shard_socket_calls_total", &[("call", "read")]),
+        ("socket_writes", "kiln_shard_socket_calls_total", &[("call", "write")]),
+        ("socket_reads_empty", "kiln_shard_socket_calls_idle_total", &[("call", "read")]),
+        ("socket_writes_full", "kiln_shard_socket_calls_idle_total", &[("call", "write")]),
     ];
+    // Each of these a system call on a shard: their sum is what a request costs the shards in calls into the
+    // kernel, as counted (docs/runtime-lab.md says what isn't).
+    const CALLS: [&str; 8] = ["parks", "kicks_sent", "threads_woken", "harvests", "arms", "socket_accepts", "socket_reads", "socket_writes"];
     if requests == 0 {
         return;
     }
@@ -1183,6 +1199,10 @@ fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
         if let Some(grown) = grown {
             n.insert(format!("shards.{what}_per_request"), grown / requests);
         }
+    }
+    let calls: Option<Vec<f64>> = CALLS.iter().map(|what| n.get(&format!("shards.{what}_per_request")).copied()).collect();
+    if let Some(calls) = calls {
+        n.insert("shards.syscalls_per_request".into(), calls.iter().sum());
     }
 }
 
@@ -1331,11 +1351,22 @@ mod tests {
                     t.push_str(&format!("kiln_shard_wakeups_total{{shard=\"{sh}\",by=\"{by}\"}} {}\n", each * k));
                 }
                 t.push_str(&format!("kiln_shard_kicks_sent_total{{shard=\"{sh}\"}} {}\n", 4.0 * k));
+                for (call, each, idle) in [("accept", 1.0, None), ("read", 6.0, Some(2.0)), ("write", 3.0, Some(0.0))] {
+                    t.push_str(&format!("kiln_shard_socket_calls_total{{shard=\"{sh}\",call=\"{call}\"}} {}\n", each * k));
+                    if let Some(idle) = idle {
+                        t.push_str(&format!("kiln_shard_socket_calls_idle_total{{shard=\"{sh}\",call=\"{call}\"}} {}\n", idle * k));
+                    }
+                }
             }
             measure::Scrape::parse(&t)
         };
         let mut n = BTreeMap::new();
         per_request_wakes(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("socket_accepts", 0.2), ("socket_reads", 1.2), ("socket_writes", 0.6), ("socket_reads_empty", 0.4), ("socket_writes_full", 0.0)] {
+            let got = n.get(&format!("shards.{key}_per_request")).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert!(!n.contains_key("shards.syscalls_per_request"), "the sum only where every call is counted: {n:?}");
         // Each shard's count grew by itself once more: two shards' growth over ten requests.
         for (key, want) in [("polls", 6.0), ("parks", 2.0), ("wakeups_kick", 1.0), ("wakeups_io", 0.6), ("wakeups_timer", 0.4), ("kicks_sent", 0.8)] {
             let got = n.get(&format!("shards.{key}_per_request")).copied();
@@ -1345,6 +1376,34 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_wakes(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: where the build counts every kind of system call a shard makes, a request's
+    /// calls are reported summed too: its parks, kicks, unparks, harvests, arms and socket calls.
+    #[test]
+    fn g9_s5_a_requests_system_calls_are_summed_where_all_are_counted() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for (family, label, each) in [
+                ("kiln_shard_polls_total", "", 9.0),
+                ("kiln_shard_parks_total", "", 1.0),
+                ("kiln_shard_kicks_sent_total", "", 2.0),
+                ("kiln_shard_threads_woken_total", "", 3.0),
+                ("kiln_shard_harvests_total", "", 4.0),
+                ("kiln_shard_arms_total", "", 5.0),
+                ("kiln_shard_socket_calls_total", ",call=\"accept\"", 6.0),
+                ("kiln_shard_socket_calls_total", ",call=\"read\"", 7.0),
+                ("kiln_shard_socket_calls_total", ",call=\"write\"", 8.0),
+            ] {
+                t.push_str(&format!("{family}{{shard=\"0\"{label}}} {}\n", each * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_wakes(&mut n, &scrape(1.0), &scrape(3.0), 4);
+        // Each grew by twice itself, over four requests: (1 + 2 + ... + 8) * 2 / 4.
+        let got = n.get("shards.syscalls_per_request").copied();
+        assert!(got.is_some_and(|v| (v - 18.0).abs() < 1e-9), "{got:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what the window's requests handed the pools is reported per request: the

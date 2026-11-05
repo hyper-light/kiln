@@ -6706,8 +6706,9 @@ fn server_health(hub: &Hub) -> Response {
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
             // Its place on its machine (docs/priority.md; goal 8, plan 01a1a59c2b29 step 7): its shards'
             // real-time class as they took it, or why not (`[server] realtime`), and where the legs and
-            // agents its own runner starts run beside its cores (`[server] cores`).
-            "priority": { "realtime": crate::rt::realtime_status(), "work": crate::os::work_said() },
+            // agents its own runner starts run beside its cores (`[server] cores`); its cores, its shards'
+            // and the partition they're in, if any (goal 9, plan 01a1a87b2cec step 4).
+            "priority": { "realtime": crate::rt::realtime_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
