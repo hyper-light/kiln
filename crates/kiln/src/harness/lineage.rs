@@ -1070,6 +1070,83 @@ pub fn children_brief(hub: &Hub, id: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// How far `caller` reached `id` before goal 10 (plan 01a1a87b2dae step 2) gave the callers who
+    /// see every session their answer without asking the store: what `access` must still answer.
+    async fn access_before(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Access {
+        let mine = match caller.agent.as_deref() {
+            Some(me) => crate::mcp::acts_for(hub, me).await,
+            None => None,
+        };
+        let theirs = crate::mcp::whose(hub, id).await;
+        let line = if caller.agent.as_deref().is_some_and(|me| me != id) { hub.harness.lineage_of(id) } else { Vec::new() };
+        access_of(caller, manages(caller), &line, id, mine.as_deref(), theirs.as_deref())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2: on every (caller, session), `access` decides as it did
+    /// before; it asks the store nothing for a caller who sees every session (the owner, a manager)
+    /// and still does for every other: an agent on its own line, its child's, another's, one unknown;
+    /// people on theirs and another's; a manager denied it, a manager's token narrower than its role,
+    /// an owner's token with a grant of its own.
+    #[test]
+    fn g10_s2_access_decides_as_before_and_asks_the_store_only_where_it_must() -> anyhow::Result<()> {
+        use crate::authz::gate::{Caller, Kind as By, Rights};
+        use crate::authz::{Grant, Scope};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = super::super::registry::Location::Machine("box".into());
+            // a and its child c are u1's; b is the owner's; zz is no session at all.
+            for (id, parent) in [("a", None), ("c", Some("a")), ("b", None)] {
+                let info = Info { id: id.into(), kind: "claude".into(), parent: parent.map(str::to_owned), ..Info::default() };
+                hub.harness.ingest(&hub, &there, id, super::super::core::Update::Open { info: Box::new(info), since: None }).await;
+            }
+            for (id, whose) in [("a", "user:u1"), ("c", "user:u1"), ("b", "owner")] {
+                hub.store.kv_set(crate::mcp::opener_key(id), whose.into()).await?;
+            }
+            let grant = |what: &str, deny: bool| Grant { what: what.into(), scope: Scope::Server, deny };
+            let rights = |grants: Vec<Grant>| Some(Rights { grants, custom: std::collections::HashMap::new() });
+            let person = |name: &str, user: &str| {
+                let mut c = Caller::with(By::User, name, rights(vec![grant("runs.read", false)]), None);
+                c.user = Some(user.into());
+                c
+            };
+            let agent = |me: &str| {
+                let mut c = Caller::with(By::Agent, &format!("agent:{me}"), None, None);
+                c.agent = Some(me.into());
+                c.user = Some("u1".into());
+                c
+            };
+            let callers = [
+                ("the owner", Caller::owner(), true),
+                ("a manager", Caller::with(By::User, "user:m", rights(vec![grant("agents.manage", false)]), None), true),
+                ("a manager denied it", Caller::with(By::User, "user:m", rights(vec![grant("agents.manage", false), grant("agents.manage", true)]), None), false),
+                ("a manager's narrower token", Caller::with(By::Pat, "pat:m", rights(vec![grant("agents.manage", false)]), rights(vec![grant("runs.read", false)])), false),
+                ("an owner's token with a grant of its own", Caller::with(By::Pat, "pat:o", None, rights(vec![grant("runs.read", false)])), false),
+                ("u1", person("user:u1", "u1"), false),
+                ("u2", person("user:u2", "u2"), false),
+                ("agent a", agent("a"), false),
+                ("agent c", agent("c"), false),
+                ("agent b", agent("b"), false),
+            ];
+            for (who, caller, sees_every) in &callers {
+                assert_eq!(sees_all(caller), *sees_every, "{who}");
+                for id in ["a", "c", "b", "zz"] {
+                    let asked = hub.store.asked();
+                    let now = access(&hub, caller, id).await;
+                    let asked_it = hub.store.asked() > asked;
+                    assert_eq!(now, access_before(&hub, caller, id).await, "{who} on {id}");
+                    if *sees_every {
+                        assert!(!asked_it, "{who} on {id}: the store asked");
+                        assert_eq!(now, Access::Act, "{who} on {id}");
+                    }
+                }
+            }
+            // An agent acts on its own line, and not on another's or on none.
+            assert_eq!(access(&hub, &agent("a"), "c").await, Access::Act, "its child");
+            assert!(access(&hub, &agent("c"), "zz").await < Access::Act, "no session");
+            Ok(())
+        })
+    }
+
     #[test]
     fn every_harness_s_modes_stand_in_one_order() {
         assert!(Level::Plan < Level::Ask && Level::Ask < Level::AcceptEdits && Level::AcceptEdits < Level::Auto && Level::Auto < Level::Bypass);
