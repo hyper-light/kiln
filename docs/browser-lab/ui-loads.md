@@ -105,6 +105,17 @@ content (about 18 to 22 s at 50 kbit/s, for 20 to 40 KiB of it), for Mission con
 about 89 and 82 s now. The fonts (52,533 bytes, Geist and Geist Mono's Latin cuts: 8.4 s at 50
 kbit/s) are 10% to 23% of a first visit; whether they may come after ready on slow links is Ada's.
 
+## The driver on the mock
+
+`ci/ui/pageload-mock.sh` (the mock on loopback, Chromium desktop, no shaped link: a check of the
+driver, not of a link) on the merged branch: a first visit to the conversation, Mission control or
+Ship downloads no file twice (before the update checks stopped asking for the shell as a page
+starts, each first visit took the shell twice, under `/` beside its own address); a repeat visit
+takes 0 bytes of hashed assets from the network. What the pages ask twice is API data
+(`/api/harness/sessions`, `/api/push/notices`, `/api/agents`, `/api/ship/commits`), goal 9's to
+cut. The conversation's highlighter (375 KB of WebAssembly with the mock's code blocks) starts
+after the page's load event.
+
 ## The lab's cells
 
 Not yet run: the page-load cells (every page, visit, link, engine and width, 10 runs each, link

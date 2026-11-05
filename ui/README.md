@@ -59,6 +59,8 @@ the arithmetic and the lab's numbers are in `docs/browser-lab/ui-loads.md`):
   serves them.
 - After a page is ready, not before: the editor, xterm (Ship's log boxes load it as a log shows),
   uPlot and tree-sitter come only where a page shows them, and the conversation's Plan and Tools
-  tabs load when one is pointed at or opened. Code shows plain until its grammar is here.
+  tabs load when one is pointed at or opened. Code shows plain until its grammar is here, and the
+  grammars start once the page's load event has fired. The update checks revalidate the shell
+  (a 304 while the build is the same) and take its import map as the build.
 - The splash is in every page's HTML (`components/shell/splash.tsx`, rendered by the document),
   so a slow link shows it before the code arrives.
