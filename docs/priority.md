@@ -258,7 +258,9 @@ shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-ti
   and no more. A system install's server runs as root and needs no grant. A user's service manager gives what
   its own limit allows (systemd sets the nearest it can, never failing the unit), which is 0 unless the
   machine's owner raised it for the user (a `limits.d` entry, `rtprio 1`). Not `CPUSchedulingPolicy=`: it would
-  put every thread of the server, and everything it starts, in the class.
+  put every thread of the server, and everything it starts, in the class. On 2026-11-05 fedora (the lab) gave its
+  user 0, in a shell and in a user scope; adacachy (production) gives its user 99, soft and hard, so there the class
+  needs nothing the installer can't give.
 - **Refused,** a shard runs as it would without it, with a slice of its step, and the server says so: in its
   log once every shard has answered, and in `/healthz/server` (`priority.realtime`: asked, shards, took,
   refused, why). It never fails for it. A kernel with real-time group scheduling (`CONFIG_RT_GROUP_SCHED`)
