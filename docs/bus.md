@@ -98,6 +98,7 @@ another class.
 | `kiln_bus_topics` | Topics the bus holds. |
 | `kiln_bus_viewers` | Viewers reading sessions' live feeds. |
 | `kiln_bus_memory_bytes`, `kiln_bus_memory_limit_bytes` | Bytes the bus's messages take, and may take. |
+| `kiln_bus_topic_bytes_peak` | The most bytes one topic has asked the bus to keep since the server started: a feed's newest 2048 frames, their keys and payloads as `topic_bytes` counts them, whether or not `topic_bytes` lets it (past it the bus keeps fewer frames). Each feed counts its topic's as it publishes (8 KiB of frame sizes a topic), so `topic_bytes` can be derived from a measurement (docs/runtime-lab.md, goal 11). |
 
 kiln's overview dashboard (`deploy/grafana/dashboards/kiln-overview.json`) has a "Live feed" row of
 them.
