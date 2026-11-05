@@ -1855,21 +1855,10 @@ impl Registry {
 
     /// [`Registry::list`] as `GET /api/harness/sessions` answers it, in its order: each session's
     /// info as its owner encoded it once ([`super::copies::View::info_json`]), joined into a JSON
-    /// array; nothing is encoded here (goal 10, plan 01a1a87b2dae step 2).
+    /// array once for every read that finds the sessions as they were, and answered as it is (goal 10,
+    /// plan 01a1a87b2dae steps 2 and 5: `super::copies::Copies::list_json`).
     pub fn list_json(&self) -> bytes::Bytes {
-        let mut all: Vec<(Arc<Info>, bytes::Bytes)> = Vec::new();
-        self.sessions.each(|_, view| all.push((Arc::clone(&view.info), view.info_json.clone())));
-        all.sort_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
-        let mut out = Vec::with_capacity(all.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 2);
-        out.push(b'[');
-        for (i, (_, json)) in all.iter().enumerate() {
-            if i > 0 {
-                out.push(b',');
-            }
-            out.extend_from_slice(json);
-        }
-        out.push(b']');
-        bytes::Bytes::from(out)
+        self.sessions.list_json()
     }
 
     /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
@@ -1883,6 +1872,12 @@ impl Registry {
     /// say all of them.
     pub fn events_json(&self, id: &str, before: Option<u64>, limit: usize) -> Option<bytes::Bytes> {
         self.sessions.with(id, |v| v.events_json(before, limit)).flatten()
+    }
+
+    /// [`Registry::events_json`] in the pieces it's made of, for an answer that sends them as they are
+    /// ([`super::copies::View::events_page`]; goal 10, plan 01a1a87b2dae step 5).
+    pub fn events_page(&self, id: &str, before: Option<u64>, limit: usize) -> Option<Vec<bytes::Bytes>> {
+        self.sessions.with(id, |v| v.events_page(before, limit)).flatten()
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
@@ -4292,6 +4287,57 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: `GET /api/harness/sessions`' list is joined once for all the reads
+    /// that find the sessions as they were, each answered those same bytes (nothing joined, sorted or copied
+    /// for it); a session whose info changed, one that came and one that went each have it joined again once,
+    /// saying what `list()` says, oldest first; events that change no session's info leave it as it was.
+    #[test]
+    fn g10_s5_the_sessions_list_is_joined_once_for_the_reads_that_find_it_as_it_was() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |id: &str, at: i64| Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), created_at: at, ..Info::default() }), since: None };
+            for (id, at) in [("b", 2), ("a", 1), ("c", 3)] {
+                hub.harness.ingest(&hub, &there, id, open(id, at)).await;
+            }
+            let listed = || anyhow::Ok(serde_json::to_vec(&hub.harness.list())?);
+            let joins = || hub.harness.sessions.list_joins();
+            let first = hub.harness.list_json();
+            let at = joins();
+            anyhow::ensure!(first.as_ref() == listed()?.as_slice(), "as the list says, oldest first: {}", String::from_utf8_lossy(&first));
+            for _ in 0..3 {
+                let again = hub.harness.list_json();
+                anyhow::ensure!(again.as_ptr() == first.as_ptr() && again == first, "the same bytes, not joined again");
+            }
+            anyhow::ensure!(joins() == at, "nothing joined for the reads after the first");
+            // A session's info changed: joined again once, for itself and the reads after.
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            hub.harness.ingest(&hub, &there, "b", Update::State { state: Box::new(state) }).await;
+            let changed = hub.harness.list_json();
+            anyhow::ensure!(changed.as_ptr() != first.as_ptr() && changed.as_ref() == listed()?.as_slice(), "the change in it");
+            anyhow::ensure!(String::from_utf8_lossy(&changed).contains("the retry loop reads its deadline"), "its summary said");
+            anyhow::ensure!(hub.harness.list_json().as_ptr() == changed.as_ptr() && joins() == at + 1, "joined once for it");
+            // Events whose copy's info stays as it was leave the list as it was.
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            let before = hub.harness.info_json("a");
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=3).map(said).collect() }).await;
+            if hub.harness.info_json("a") == before {
+                anyhow::ensure!(hub.harness.list_json().as_ptr() == changed.as_ptr() && joins() == at + 1, "events that changed no info: the list as it was");
+            }
+            // One comes, oldest of all; one goes.
+            let joined = joins();
+            hub.harness.ingest(&hub, &there, "d", open("d", 0)).await;
+            let more = hub.harness.list_json();
+            anyhow::ensure!(more.as_ref() == listed()?.as_slice() && more.starts_with(br#"[{"id":"d""#) && joins() == joined + 1, "one came: {}", String::from_utf8_lossy(&more));
+            hub.harness.ingest(&hub, &there, "c", Update::Closed).await;
+            let fewer = hub.harness.list_json();
+            anyhow::ensure!(fewer.as_ref() == listed()?.as_slice() && !String::from_utf8_lossy(&fewer).contains(r#""id":"c""#) && joins() == joined + 2, "one went: {}", String::from_utf8_lossy(&fewer));
+            anyhow::ensure!(hub.harness.list_json().as_ptr() == fewer.as_ptr() && joins() == joined + 2, "and then as it was");
             Ok(())
         })
     }
