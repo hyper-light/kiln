@@ -4309,7 +4309,7 @@ mod tests {
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
-            let mut events = hub.events.subscribe();
+            let mut events = hub.harness_events.subscribe();
             let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
             let was = encodings().await;

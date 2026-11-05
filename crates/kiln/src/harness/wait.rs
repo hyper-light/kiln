@@ -213,8 +213,9 @@ pub fn claim(id: &str) -> bool {
 /// ended. `waiter`, the agent that waits, if one does: the wait ends early once a message from
 /// another agent waits behind its turn ([`mail`]).
 pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: Duration, waiter: Option<&Waiter>) -> Value {
-    // Listening before the first look: a change between the two isn't missed.
-    let mut events = hub.events.subscribe();
+    // Listening before the first look: a change between the two isn't missed. An agent's info changing,
+    // or its end, is on the sessions' own ring (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5).
+    let mut events = hub.harness_events.subscribe();
     let started = Instant::now();
     let timeout = timeout.min(MAX);
     let first: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();

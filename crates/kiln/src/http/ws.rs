@@ -231,6 +231,24 @@ pub fn binary(b: impl Into<bytes::Bytes>) -> Message {
     Message::binary(b.into())
 }
 
+/// A text frame of `shared`, its bytes `shared`'s own, not copied: every socket that sends the same text
+/// (each viewer of the hub's events) sends the one allocation (goal 4, plan 01a1a59c2a9c step 5: each hub
+/// event was copied into a string of its own for each viewer's socket).
+pub fn shared_text(shared: &std::sync::Arc<str>) -> Message {
+    /// The text, as the bytes a frame's payload takes.
+    struct Shared(std::sync::Arc<str>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_bytes()
+        }
+    }
+    // A `str` is UTF-8 already: the check finds it so (and a frame of a copy, should it not).
+    match tungstenite::Utf8Bytes::try_from(bytes::Bytes::from_owner(Shared(std::sync::Arc::clone(shared)))) {
+        Ok(t) => Message::Text(t),
+        Err(_) => text(shared.as_ref()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
