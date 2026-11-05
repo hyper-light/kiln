@@ -866,10 +866,14 @@ impl ShardContext {
         } else {
             self.local.push(slot, self.listing_ns());
         }
-        // Counted at its admission, here, whenever the loop installs it (`Counters::spawns`).
+        // Counted at its admission, here, whenever the loop installs it (`Counters::spawns`), and recorded on the
+        // pulse (kiln's goal 9, plan 01a1a87b2cec step 5: the loop recorded it every step).
         self.live
             .spawns
             .set(self.live.spawns.get().saturating_add(1));
+        if let Some(entry) = self.entry {
+            entry.pulse.record_spawns(self.live.spawns.get());
+        }
         Ok(TaskId(word))
     }
 
