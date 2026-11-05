@@ -39,6 +39,8 @@ hot = [
   "crates/kiln/src/harness/limit.rs",
   # Reach's relay between runners: every relayed frame, one owner taking them in order.
   "crates/kiln/src/reach/relay.rs",
+  # Terminals: every terminal's output from its machine, its viewers' keystrokes, and their list.
+  "crates/kiln/src/termsess.rs",
   # A runner's front door with a replica of kiln's records (docs/p2p.md, the peer-to-peer
   # unification's P2): every request it answers from the replica, and the learner behind it.
   "crates/kiln/src/frontdoor/replica.rs",
@@ -174,6 +176,19 @@ why = "one write of holders.json at a time, on the blocking pool, as a session c
 at = "crates/kiln/src/harness/registry.rs"
 name = "waiting"
 why = "messages waiting for their session's inbox to answer (CP-T3.2): taken twice a message, as it's sent to a session and as its inbox's answer comes (an Inbox update, in the hub's loop); never on any other update, a viewer's read or a command"
+
+# Terminals: every session, their names and their list are copies (crate::rcu); a session's figures
+# (attached, active, size, title, end) are atomics and copies beside it.
+
+[[allowed]]
+at = "crates/kiln/src/termsess.rs"
+name = "use"
+why = "imports a terminal session's screen's lock (state, below)"
+
+[[allowed]]
+at = "crates/kiln/src/termsess.rs"
+name = "state"
+why = "one per terminal session, its screen and backlog: its relay takes it for its output, in order, and its own viewers as they attach or resize it, so a replay and the live output meet with no byte twice or lost; another session's, the list's reads, keystrokes and detaches never take it"
 
 # A runner's front door answering reads from its replica, and the learners behind it: the peer-to-peer
 # unification's (docs/p2p.md, P2: plan 01a1a283e14c), the custody of the cluster group added to them by

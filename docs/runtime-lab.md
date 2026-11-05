@@ -605,6 +605,12 @@ python3 scripts/locks.py rank census/run.json
   Three registry locks are off the hot path, `hot.toml` saying why: the server's own transcripts' scanner
   and holders.json's one writer, both on the blocking pool, and messages waiting for their inbox's answer
   (CP-T3.2), taken twice a message.
+- **Terminals** (`termsess.rs`): every session, the names given them and where those are kept are
+  copies, and what the list shows of a session (how many are attached, when it was last active, its
+  size, its title, how it ended) are atomics and copies beside it, so the list, a keystroke and a detach
+  take no lock. A session's screen keeps a lock of its own, taken by its relay for its output and by its
+  own viewers as they attach or resize it, so a replay and the live output meet with no byte twice or
+  lost; `hot.toml` says so.
 - **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
   cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
