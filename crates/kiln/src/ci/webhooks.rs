@@ -195,12 +195,12 @@ async fn enqueue(hub: &Arc<Hub>, queues: &mut HashMap<String, crate::memory::que
 /// `out` into its subscriber's queue while it holds fewer than [`QUEUE`] events, within [`QUEUE_BYTES`]
 /// of them: else handed back, to be logged as dropped. (One task hands them all: the count it reads is
 /// the count it hands into.)
-fn hand(tx: &crate::memory::queue::Sender<Out>, out: Out) -> Result<(), Out> {
+fn hand(tx: &crate::memory::queue::Sender<Out>, out: Out) -> Result<(), Box<Out>> {
     if tx.len() >= QUEUE {
-        return Err(out);
+        return Err(Box::new(out));
     }
     tx.try_send(out).map_err(|e| match e {
-        async_channel::TrySendError::Full(o) | async_channel::TrySendError::Closed(o) => o,
+        async_channel::TrySendError::Full(o) | async_channel::TrySendError::Closed(o) => Box::new(o),
     })
 }
 
