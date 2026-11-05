@@ -8017,4 +8017,110 @@ mod tests {
         }
         assert!(segments("/").is_empty());
     }
+
+    /// What each request cost the server: the allocations its connection's polls made, their bytes, and the polls'
+    /// time, by path, the median of its repeats.
+    type Costs = Vec<(&'static str, crate::os::counted::Made, Duration)>;
+
+    /// One kept-alive connection to kiln's API on a port of its own, over HTTP/1.1 or HTTP/2, the server's side of it
+    /// counted (`crate::os::counted`): what each of `paths`, asked `reps` times as the lab's readers ask it (the
+    /// owner's token, nothing packed, its own timing asked), cost the server once the connection had gone idle after
+    /// the request before, as theirs does (goal 9, plan 01a1a87b2cec step 5).
+    async fn served(api: Arc<Api>, h2: bool, paths: &[&'static str], reps: usize) -> anyhow::Result<Costs> {
+        use crate::os::counted::{Made, Tally, counted_into};
+        use http_body_util::{BodyExt as _, Empty};
+        let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tally = Arc::new(Tally::default());
+        let counting = Arc::clone(&tally);
+        crate::rt::spawn(async move {
+            if let Ok(stream) = tcp.accept().await {
+                let remote = stream.peer_addr().ok();
+                counted_into(&counting, crate::http::server::serve_accepted(stream, api, remote, None)).await;
+            }
+        });
+        let io = crate::http::io::TcpIo::new(hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?);
+        enum Client {
+            One(kiln_http::client::http1::SendRequest<Empty<Bytes>>),
+            Two(kiln_http::client::http2::SendRequest<Empty<Bytes>>),
+        }
+        let mut client = if h2 {
+            let (send, conn) = kiln_http::client::http2::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::Two(send)
+        } else {
+            let (send, conn) = kiln_http::client::http1::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::One(send)
+        };
+        let mut costs = Vec::new();
+        for path in paths {
+            let mut each = Vec::new();
+            for _ in 0..reps {
+                let uri = if h2 { format!("http://127.0.0.1:{}{path}", addr.port()) } else { (*path).to_owned() };
+                let req = http::Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, format!("127.0.0.1:{}", addr.port()))
+                    .header(header::AUTHORIZATION, "Bearer test-admin-token")
+                    .header(header::ACCEPT, "*/*")
+                    .header(header::ACCEPT_ENCODING, "identity")
+                    .header(ASK_TIMING, "1")
+                    .body(Empty::<Bytes>::new())?;
+                let before = tally.now();
+                let resp = match &mut client {
+                    Client::One(send) => send.send_request(req).await?,
+                    Client::Two(send) => send.send_request(req).await?,
+                };
+                let status = resp.status();
+                let body = resp.into_body().collect().await?.to_bytes();
+                anyhow::ensure!(status == StatusCode::OK, "{path}: {status} {}", String::from_utf8_lossy(&body));
+                // The server's polls for it ended: its connection is idle again.
+                crate::rt::sleep(Duration::from_millis(3)).await;
+                let after = tally.now();
+                each.push((after.0.blocks.saturating_sub(before.0.blocks), after.0.bytes.saturating_sub(before.0.bytes), after.1.saturating_sub(before.1)));
+            }
+            let mid = |mut v: Vec<u64>| {
+                v.sort_unstable();
+                v.get(v.len() / 2).copied().unwrap_or_default()
+            };
+            let made = Made { blocks: mid(each.iter().map(|e| e.0).collect()), bytes: mid(each.iter().map(|e| e.1).collect()) };
+            costs.push((*path, made, Duration::from_nanos(mid(each.iter().map(|e| e.2).collect()))));
+        }
+        Ok(costs)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (a tenth of the CPU): what serving each read the lab makes of an agent's
+    /// pages costs the server, over HTTP/1.1 and HTTP/2, once what's kept for them is made: the allocations a request
+    /// makes on its connection's polls (request, router, handler, answer and write, for the median of its repeats),
+    /// their bytes and the polls' time, said for the hand-over and held under what the serve path's cuts left.
+    #[test]
+    fn g9_s5_what_a_read_costs_the_server_route_by_route() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
+            crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let paths = ["/healthz", "/api/me", "/api/harness/sessions", "/api/harness/sessions/a", "/api/harness/sessions/a/events?limit=50", "/api/harness/sessions/a/goals", "/api/plans?session=a"];
+            // What's kept for these reads made (the first reads of each make it, off the request path).
+            for h2 in [false, true] {
+                served(Arc::clone(&api), h2, &paths, 2).await?;
+            }
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            let one = served(Arc::clone(&api), false, &paths, 15).await?;
+            let two = served(Arc::clone(&api), true, &paths, 15).await?;
+            for ((path, a, t), (_, b, u)) in one.iter().zip(&two) {
+                eprintln!("g9_s5 {path}: HTTP/1.1 {} allocations, {} bytes, {:.1} us; HTTP/2 {} allocations, {} bytes, {:.1} us", a.blocks, a.bytes, t.as_secs_f64() * 1e6, b.blocks, b.bytes, u.as_secs_f64() * 1e6);
+            }
+            Ok(())
+        })
+    }
 }

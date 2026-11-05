@@ -31,6 +31,9 @@ mod win32;
 /// 01a1a87b2e56 step 4).
 pub mod alloc;
 pub mod battery;
+/// The unit tests' allocator, counting what each thread allocates (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub mod counted;
 pub mod cgroup;
 /// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
 pub mod macsign;
