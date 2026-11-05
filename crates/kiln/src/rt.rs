@@ -17,8 +17,9 @@
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
 //!   task's own waker. Everything exported here works under any waker: timers fall back to a
 //!   helper task ([`Bridge`]) when polled through a combinator or library that substitutes its own
-//!   waker, and the cross-task primitives are built on `event-listener` / `async-channel` /
-//!   `async-broadcast`, which work with any executor.
+//!   waker, and the cross-task primitives work with any executor: [`Notify`] and [`Shutdown`] wait on
+//!   `crate::memory::queue`'s lock-free list of waiters (goal 5), [`Broadcast`] on `crate::memory::lanes`,
+//!   and the channels here are `async-channel`'s.
 
 use std::future::Future;
 use std::io;
@@ -1714,13 +1715,76 @@ impl Interval {
 
 // ---------------------------------------------------------------------------------- shutdown
 
+/// The waits on a [`Shutdown`] or a [`Notify`], with no lock (goal 5, plan 01a1a59c2aae, its top goal): each
+/// wait waits in a place on memory::queue's own lock-free list of waiters (`crate::memory::queue::Waiters`, a
+/// Dekker handshake, so no wake is lost), and a wake wakes every place listed then. Their waits were
+/// event-listener's, whose list sits behind a std `Mutex` that every wait, every wait dropped and every wake
+/// took: a terminal's relay listed and dropped two a frame on its shard while the hub's loop rang one on its
+/// own, and each loop selecting on the server's shutdown listed and dropped one a turn (goal 5's census of
+/// train 8's tree on fedora: event-listener the one lock the shards still shared, waiting 0.24 ms a second with
+/// hogs, 1.87 ms at the longest).
+///
+/// A wait's place goes back to `spares` as the wait ends or is dropped, listed still or not, and the next
+/// wait takes it up: a loop that waits each turn beside other arms (a select another arm wins) keeps one place
+/// listed, not one more a turn, and there are never more places than there were waits at once.
+struct Waits {
+    list: crate::memory::queue::Waiters,
+    spares: concurrent_queue::ConcurrentQueue<Arc<crate::memory::queue::Place>>,
+}
+
+impl Default for Waits {
+    fn default() -> Self {
+        Self { list: crate::memory::queue::Waiters::new(), spares: concurrent_queue::ConcurrentQueue::unbounded() }
+    }
+}
+
+impl Waits {
+    /// Waits until `ready` says so (it may take what it finds: a permit): at once if it does now, else in a
+    /// place on the list, looking again once the place is listed and each time it's woken.
+    async fn until(&self, ready: impl Fn() -> bool) {
+        if ready() {
+            return;
+        }
+        let held = Held { place: self.spares.pop().unwrap_or_else(|_| crate::memory::queue::Place::new()), spares: &self.spares };
+        std::future::poll_fn(|cx| {
+            if ready() {
+                return Poll::Ready(());
+            }
+            self.list.wait(&held.place, cx.waker());
+            if ready() { Poll::Ready(()) } else { Poll::Pending }
+        })
+        .await;
+    }
+
+    /// Wakes every wait listed now, each once.
+    fn wake(&self) {
+        self.list.wake();
+    }
+}
+
+/// A wait's place, back among its spares as the wait ends or is dropped ([`Waits`]), the waker it held let go
+/// first: a wake that finds it listed meanwhile wakes no one.
+struct Held<'a> {
+    place: Arc<crate::memory::queue::Place>,
+    spares: &'a concurrent_queue::ConcurrentQueue<Arc<crate::memory::queue::Place>>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.place.let_go();
+        // Unbounded and never closed: the push always goes.
+        let _ = self.spares.push(Arc::clone(&self.place));
+    }
+}
+
 #[derive(Default)]
 struct ShutdownInner {
     cancelled: AtomicBool,
-    event: event_listener::Event,
+    waits: Waits,
 }
 
-/// A cancellation signal any number of tasks can wait on (process shutdown, a job's cancel).
+/// A cancellation signal any number of tasks can wait on (process shutdown, a job's cancel), with no lock
+/// ([`Waits`]): a cancel wakes every wait once.
 #[derive(Clone, Default)]
 pub struct Shutdown(Arc<ShutdownInner>);
 
@@ -1731,7 +1795,7 @@ impl Shutdown {
 
     pub fn cancel(&self) {
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
-            self.0.event.notify(usize::MAX);
+            self.0.waits.wake();
         }
     }
 
@@ -1744,16 +1808,7 @@ impl Shutdown {
     /// `hyper_rt::coop`).
     pub async fn cancelled(&self) {
         hyper_rt::coop::consume_budget().await;
-        loop {
-            if self.is_cancelled() {
-                return;
-            }
-            let listener = self.0.event.listen();
-            if self.is_cancelled() {
-                return;
-            }
-            listener.await;
-        }
+        self.0.waits.until(|| self.is_cancelled()).await;
     }
 
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first.
@@ -1769,11 +1824,12 @@ impl Shutdown {
 
 // ------------------------------------------------------------------------------------- notify
 
-/// Wake one waiter, or leave a permit for the next one (like a binary semaphore).
+/// Wake one waiter, or leave a permit for the next one (like a binary semaphore). With no lock ([`Waits`]): a
+/// notify wakes every wait listed, the first to look takes the permit, and the rest wait on.
 #[derive(Default)]
 pub struct Notify {
     permit: AtomicBool,
-    event: event_listener::Event,
+    waits: Waits,
 }
 
 impl Notify {
@@ -1783,23 +1839,14 @@ impl Notify {
 
     pub fn notify(&self) {
         self.permit.store(true, Ordering::SeqCst);
-        self.event.notify(1);
+        self.waits.wake();
     }
 
     /// A notification, taken; a charge of the task's turn on its shard (`hyper_rt::coop`), so a loop on a
     /// notifier that is always set yields at its share.
     pub async fn notified(&self) {
         hyper_rt::coop::consume_budget().await;
-        loop {
-            if self.permit.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            let listener = self.event.listen();
-            if self.permit.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            listener.await;
-        }
+        self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
     }
 }
 
@@ -2561,6 +2608,178 @@ mod tests {
             drop(tx);
             assert!(done.await.is_err());
             assert!(file_source(dir.path().join("missing")).is_err());
+            Ok(())
+        })
+    }
+
+    /// The code of [`Shutdown`] and [`Notify`] and of their waits, outside comments: from rt.rs's shutdown
+    /// section's head to its broadcast section's.
+    fn shutdown_and_notify_code() -> String {
+        let src = include_str!("rt.rs").replace("\r\n", "\n");
+        let section = src.split("--- shutdown\n").nth(1).and_then(|rest| rest.split("--- broadcast\n").next()).unwrap_or_default();
+        section.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: a notifier and a shutdown take
+    /// no lock and wait on nothing that does. Their waits were event-listener's, whose list sits behind a `Mutex`
+    /// every wait and every wake took: goal 5's census of train 8's tree found it the one lock the shards still
+    /// shared.
+    #[test]
+    fn g5_notify_and_shutdown_take_no_lock() {
+        let code = shutdown_and_notify_code();
+        assert!(code.contains("pub struct Notify") && code.contains("pub struct Shutdown"), "not Notify's and Shutdown's code:\n{code}");
+        for lock in ["Mutex", "RwLock", "Condvar", "parking_lot", "async_lock", "event_listener", "Event::new", "async_channel"] {
+            assert!(!code.contains(lock), "rt::Notify or rt::Shutdown takes a lock, or waits on something that does: {lock}");
+        }
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a notify before its wait isn't lost, and two before a wait are
+    /// one permit, which that wait takes; the next wait waits for the next notify.
+    #[test]
+    fn g5_a_notify_before_its_wait_is_kept_and_taken_once() -> anyhow::Result<()> {
+        block_on(async {
+            let n = Notify::new();
+            n.notify();
+            n.notify();
+            timeout(Duration::from_secs(1), n.notified()).await?;
+            anyhow::ensure!(!n.permit.load(Ordering::SeqCst), "two notifies before a wait were more than one permit");
+            let mut next = std::pin::pin!(n.notified());
+            anyhow::ensure!(futures::poll!(next.as_mut()).is_pending(), "a wait after the permit was taken ended at once");
+            n.notify();
+            timeout(Duration::from_secs(1), next).await?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): notifies from another shard lose no wake. Two tasks hand a turn
+    /// back and forth through two notifiers, each wait listing its place while the other side's notify may be on
+    /// its way (the list's Dekker handshake has one of them see the other), and every turn is taken. Each side
+    /// waits on one notifier one wait at a time, so each keeps one place, reused.
+    #[test]
+    fn g5_notifies_from_another_shard_lose_no_wake() -> anyhow::Result<()> {
+        block_on(async {
+            let (ping, pong) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            let rounds = 5_000u32;
+            let (p, q) = (Arc::clone(&ping), Arc::clone(&pong));
+            let other = spawn_spread_joined(async move {
+                for _ in 0..rounds {
+                    p.notified().await;
+                    q.notify();
+                }
+            });
+            for round in 0..rounds {
+                ping.notify();
+                timeout(Duration::from_secs(5), pong.notified()).await.map_err(|_| anyhow::anyhow!("round {round}: a wake was lost"))?;
+            }
+            timeout(Duration::from_secs(5), other).await?.map_err(|_| anyhow::anyhow!("the other side ended"))?;
+            for (what, n) in [("ping", &ping), ("pong", &pong)] {
+                anyhow::ensure!(n.waits.list.listed() <= 1 && n.waits.spares.len() <= 1, "{what}: {} places listed, {} spare", n.waits.list.listed(), n.waits.spares.len());
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a loop that waits on a notifier and a shutdown each turn beside an
+    /// arm that wins (a terminal's relay, each loop on the server's shutdown) keeps one place on each, not one more
+    /// a turn; and its next waits on them are woken, from another shard, by the notify and the cancel after.
+    #[test]
+    fn g5_waits_given_up_each_turn_keep_one_place() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        block_on(async {
+            let (n, sd) = (Arc::new(Notify::new()), Shutdown::new());
+            for _ in 0..10_000 {
+                let ev = futures::select_biased! {
+                    () = sd.cancelled().fuse() => "cancelled",
+                    () = n.notified().fuse() => "notified",
+                    () = futures::future::ready(()).fuse() => "turn",
+                };
+                anyhow::ensure!(ev == "turn", "{ev}, with neither rung");
+            }
+            for (what, waits) in [("the notifier", &n.waits), ("the shutdown", &sd.0.waits)] {
+                anyhow::ensure!(waits.list.listed() <= 1 && waits.spares.len() <= 1, "{what}: {} places listed, {} spare after 10,000 turns", waits.list.listed(), waits.spares.len());
+            }
+            let (n2, sd2) = (Arc::clone(&n), sd.clone());
+            let ringing = spawn_spread_joined(async move {
+                sleep(Duration::from_millis(20)).await;
+                n2.notify();
+                sleep(Duration::from_millis(20)).await;
+                sd2.cancel();
+            });
+            timeout(Duration::from_secs(5), n.notified()).await?;
+            timeout(Duration::from_secs(5), sd.cancelled()).await?;
+            timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a cancel wakes every wait once, on every shard. Tasks wait at
+    /// once, half of them after giving up a wait first (as a loop's turn does, its place taken up again); none
+    /// ends before the cancel, each ends once after it, a second cancel changes nothing, and a wait after it ends
+    /// at once.
+    #[test]
+    fn g5_a_cancel_wakes_every_wait_once() -> anyhow::Result<()> {
+        block_on(async {
+            let sd = Shutdown::new();
+            let (waiters, ended) = (64usize, Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for i in 0..waiters {
+                let (sd, ended) = (sd.clone(), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    if i % 2 == 0 {
+                        let _ = timeout(Duration::from_millis(1), sd.cancelled()).await;
+                    }
+                    sd.cancelled().await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before the cancel");
+            sd.cancel();
+            sd.cancel();
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its wake"))?;
+            }
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == waiters, "{} of {waiters} waits ended", ended.load(Ordering::SeqCst));
+            // Every wait over, every place is a spare (some listed still, for a wake that wakes no one), and there
+            // were never more of them than waits at once.
+            let (listed, spares) = (sd.0.waits.list.listed(), sd.0.waits.spares.len());
+            anyhow::ensure!(listed <= spares && spares <= waiters, "{listed} places listed, {spares} spare, for {waiters} waits");
+            timeout(Duration::from_millis(100), sd.cancelled()).await?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a notify wakes every wait listed, and one of them takes its
+    /// permit. Of tasks waiting on one notifier on every shard, each notify ends one wait, never two, until all
+    /// have ended.
+    #[test]
+    fn g5_each_notify_ends_one_wait_of_many() -> anyhow::Result<()> {
+        block_on(async {
+            let n = Arc::new(Notify::new());
+            let (waiters, ended) = (16usize, Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for _ in 0..waiters {
+                let (n, ended) = (Arc::clone(&n), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    n.notified().await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before any notify");
+            for k in 1..=waiters {
+                n.notify();
+                let until = Instant::now() + Duration::from_secs(5);
+                while ended.load(Ordering::SeqCst) < k {
+                    anyhow::ensure!(Instant::now() < until, "notify {k} ended no wait");
+                    sleep(Duration::from_millis(1)).await;
+                }
+                sleep(Duration::from_millis(5)).await;
+                anyhow::ensure!(ended.load(Ordering::SeqCst) == k, "notify {k} ended {} waits in all", ended.load(Ordering::SeqCst));
+            }
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its notify"))?;
+            }
             Ok(())
         })
     }
