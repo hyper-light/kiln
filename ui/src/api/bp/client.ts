@@ -224,10 +224,12 @@ export class Client {
     this.phase = "closed";
   }
 
-  /** The bytes that came (plain: compressed batches already inflated by `Unpacker`), at `now`. */
-  receive(bytes: Uint8Array, now: number): void {
+  /** The bytes that came (plain: compressed batches already inflated by `Unpacker`), at `now`. `wire`:
+   * the bytes they came as on the carrier, which `got` (what the page says it has, in idle frames and
+   * probes' answers) counts, so a server's window over the bytes it sent isn't thrown by inflation. */
+  receive(bytes: Uint8Array, now: number, wire = bytes.length): void {
     if (bytes.length === 0) return;
-    this.got += bytes.length;
+    this.got += wire;
     this.live.arrived(now);
     const frames = new Frames(bytes);
     for (let raw = frames.nextRaw(); raw !== null; raw = frames.nextRaw()) {

@@ -151,7 +151,8 @@ export class Carrier implements CarrierLike {
       void this.unpacker.unpack(bytes).then(
         (plain) => {
           if (this.client !== client) return;
-          for (const p of plain) client.receive(p, this.now());
+          // The bytes as they came count once, toward the first of the plain messages they hold.
+          plain.forEach((p, i) => client.receive(p, this.now(), i === 0 ? bytes.length : 0));
           this.pump();
         },
         () => ws.close(4000, "a compressed batch didn't inflate"),
@@ -199,7 +200,8 @@ export class Carrier implements CarrierLike {
     while (ws.bufferedAmount < BUFFERED_MOST) {
       const t = c.pollTransmit(ROOM_UP, now);
       if (t === null) break;
-      ws.send(t.bytes);
+      // The client's bytes are its own ArrayBuffer's (never a SharedArrayBuffer's).
+      ws.send(t.bytes as Uint8Array<ArrayBuffer>);
     }
     // Looked at again when the client says, or soon while the socket's buffer is high (the API says
     // nothing when it drains).

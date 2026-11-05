@@ -125,6 +125,14 @@ impl Window {
         Self { cfg, phase: Phase::Startup, w, sent: 0, last: None, history: VecDeque::new(), min_rtt: None, probe_min: None, rates: VecDeque::new(), full_rate: 0, flat_rounds: 0, round_end: 0 }
     }
 
+    /// The least window from now on: the carrier's two chunks, as its chunk changes with the path (a
+    /// window smaller than the largest message would never let one go).
+    pub fn set_floor(&mut self, floor: u64) {
+        self.cfg.floor = floor;
+        self.cfg.ceiling = self.cfg.ceiling.max(floor);
+        self.w = self.w.max(floor);
+    }
+
     /// `bytes` more were sent.
     pub fn on_sent(&mut self, bytes: u64) {
         self.sent = self.sent.saturating_add(bytes);

@@ -218,6 +218,7 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
             if c != chunk {
                 chunk = c;
                 server.set_fragment(send::fragment(chunk));
+                window.set_floor(2 * u64::try_from(chunk).unwrap_or(u64::MAX));
             }
             if m != mark {
                 mark = m;
@@ -242,7 +243,10 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
             if window.stalled(chunk64, server.acks_out()) {
                 server.ask_ack();
             }
-            let room_w = usize::try_from(window.room()).unwrap_or(usize::MAX);
+            // The window's room, and a whole chunk while nothing is in flight (but while the round trip is
+            // probed, when the probe goes alone in a control frame's room).
+            let probing = matches!(window.phase(), kiln_bp::window::Phase::ProbeRtt { .. });
+            let room_w = if window.in_flight() == 0 && !probing { send::room(chunk) } else { usize::try_from(window.room()).unwrap_or(usize::MAX) };
             let room = send::room(chunk).min(room_w).max(CONTROL_ROOM);
             match server.poll_transmit(room, now) {
                 Some(m) => {
