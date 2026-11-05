@@ -713,15 +713,18 @@ waiters).
 (`jemalloc:arena.<i>.<mutex>`), and each arena's bins' summed (`jemalloc:arena.<i>.bins`, which a thread's cache
 takes as it fills or flushes). Taken is jemalloc's `num_ops`; held when asked, `num_wait` and `num_spin_acq`
 together (it spins up to 600 times before it blocks); waited, `total_wait_time` and `max_wait_time`, which time
-the blocked alone. kiln's own build is unchanged: the module and the statistics are the census tree's. musl's
-malloc (production's static build without the feature) takes one lock for the whole process on every allocation,
-and on each free that starts or finishes its group's freed slots (the rest free by compare-and-swap), once the
-process has a second thread: mallocng's `__malloc_lock`, a futex word behind musl's internal `__lock`, which spins
-10 times and then waits on the futex. It keeps no count of it, so nothing inside the process can say how often it
-was held: a counting `#[global_allocator]` around it would see calls and the time in malloc, not the waits apart
-from the work. The waits can be counted from outside, in a build that keeps its symbols
-(`CARGO_PROFILE_RELEASE_STRIP=false`), as the `futex` waits on `__malloc_lock`'s address (`perf trace` or
-bpftrace on `futex` with that address), given the kernel's tracing to the lab's user. glibc's malloc (the lab's build without the feature) keeps no count of its arenas' locks either.
+the blocked alone. jemalloc is production's allocator (goal 11: `ci/release/build.sh` builds the static musl
+binary with the feature unless `KILN_LINUX_ALLOCATOR=musl`), so these are production's allocator's locks. kiln's
+own build is unchanged: the module and the statistics are the census tree's. musl's malloc (a static build with
+`KILN_LINUX_ALLOCATOR=musl`) takes one lock for the whole process on every allocation, and on each free that
+starts or finishes its group's freed slots (the rest free by compare-and-swap), once the process has a second
+thread: mallocng's `__malloc_lock`, a futex word behind musl's internal `__lock`, which spins 10 times and then
+waits on the futex. It keeps no count of it, so nothing inside the process can say how often it was held: a
+counting `#[global_allocator]` around it would see calls and the time in malloc, not the waits apart from the
+work. The waits can be counted from outside, in a build that keeps its symbols (`CARGO_PROFILE_RELEASE_STRIP=false`),
+as the `futex` waits on `__malloc_lock`'s address (`perf trace` or bpftrace on `futex` with that address), given
+the kernel's tracing to the lab's user. glibc's malloc (a cargo build without the feature, the lab's) keeps no
+count of its arenas' locks either.
 
 ### What each became
 
