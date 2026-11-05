@@ -228,7 +228,10 @@ fn followed(text: &str) -> Option<Followed> {
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
 /// server runs, and says what each calls for.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let mut rx = hub.events.subscribe();
+    use futures::FutureExt as _;
+    // The machines' batteries on the hub's events, agent sessions' on a ring of their own
+    // (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5): both read, each as it comes.
+    let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe());
     if hub.cfg.push.enabled {
         let _ = Service::keys(&hub).await;
     }
@@ -243,7 +246,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "what was said of agents couldn't be read: some notes may be said again"),
     }
     loop {
-        let text = match rx.recv().await {
+        let got = futures::select_biased! {
+            m = rx.recv().fuse() => m,
+            m = sessions.recv().fuse() => m,
+        };
+        let text = match got {
             Ok(t) => t,
             Err(async_broadcast::RecvError::Overflowed(n)) => {
                 tracing::warn!(missed = n, "notifications fell behind the agents' changes");
