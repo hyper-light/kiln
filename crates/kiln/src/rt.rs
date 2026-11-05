@@ -25,7 +25,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -344,11 +344,59 @@ pub fn cores_status() -> Option<Cores> {
     })
 }
 
-/// The shards' step budget, nanoseconds: 250 µs, so sockets stay responsive on a busy shard ([`runtime_config`]).
-pub const STEP_BUDGET_NS: u64 = 250_000;
+
+/// The shards' timer wheel's tick, nanoseconds ([`runtime_config`]): the finest wait a shard keeps, and its
+/// thread's timer slack (hyper-rt's `Driver::set_timer_slack_ns`), so a sleep ends up to two ticks late.
+pub const TIMER_TICK_NS: u64 = 100_000;
+
+/// The shard delay goal 9 holds every shard's ready work to at p99.9, nanoseconds: a millisecond (Ada,
+/// 2026-11-05; plan 01a1a87b2cec).
+const DELAY_BAR_NS: u64 = 1_000_000;
+
+/// A ready task's floor, nanoseconds: its timer falls due on the wheel's next tick and the OS wakes the
+/// shard's thread within its timer slack, a tick again. The lab's calm shards ran their probes 192 µs late at
+/// the median (g6c2 calm on rt5, 2026-11-05: 191 to 194 µs over six rounds), the floor every wake pays.
+const DELAY_FLOOR_NS: u64 = 2 * TIMER_TICK_NS;
+
+/// The busiest shard's busy share in the lab, parts in a million: shard 1's 0.065 in g6c2 calm on rt5 (the
+/// shards' mean 0.052).
+const LAB_BUSY_PPM: u64 = 65_000;
+
+/// The polls a ready task finds in hand or ahead of it at p99.9, on a shard busy `busy_ppm` parts in a million
+/// of the time: the most n whose chance, about ρ^n (a single server's queue, as what arrives finds it), is a
+/// thousandth or more. A shard busy all the time has no such bound.
+const fn polls_ahead_at_p999(busy_ppm: u64) -> u64 {
+    if busy_ppm >= 1_000_000 {
+        return u64::MAX;
+    }
+    // ρ^n, in parts in a million.
+    let (mut n, mut chance_ppm) = (0u64, 1_000_000u64);
+    while chance_ppm.saturating_mul(busy_ppm) / 1_000_000 >= 1_000 {
+        chance_ppm = chance_ppm.saturating_mul(busy_ppm) / 1_000_000;
+        n = n.saturating_add(1);
+    }
+    n
+}
+
+/// The shards' step quantum, nanoseconds, derived from the lab's measurements (goal 9, plan 01a1a87b2cec step 3;
+/// docs/runtime-lab.md, "What moved (step 3)"): the longest a poll may hold its shard, so every shard runs its
+/// ready work within `DELAY_BAR_NS` at p99.9. A ready task waits its floor (`DELAY_FLOOR_NS`, 200 µs); then
+/// the polls it finds in hand or ahead of it, two at p99.9 on the lab's busiest shard (`polls_ahead_at_p999`:
+/// ρ² is 0.42%, ρ³ 0.027%), each a quantum at most where no poll holds a shard past it (step 3's done-when); then
+/// its CPU, where another thread holds it, for about a quantum again: the slice the shard asks the OS for is its
+/// quantum (`hyper_rt::compute::prefer_current_thread`; beside four pool threads on one core a shard's p99 wake
+/// took 0.21 ms with a 250 µs slice). The quantum is the largest that keeps the floor and three quanta within
+/// the bar, (1 ms − 200 µs) / 3, and it holds ordinary work's long polls (0.246 ms on average at the most, of a
+/// site step 2 didn't list: `reads.rs:338`), so ordinary work isn't cut finer than its own polls. With 250 µs the
+/// lab's two shards ran 12.1 polls a second past twice it (g6c2 calm on rt5): at 6 a shard and 500 µs each, a
+/// shard was held so 0.3% of the time or more, past the 0.1% its p99.9 can spare, so its p99.9 was 1295 µs. Under
+/// lazy preemption (fedora's) the host's wait is the CPU's next tick instead, up to 1 ms (docs/priority.md,
+/// wake-2): step 4's to keep off (cores of their own), not the quantum's. `KILN_RT_QUANTUM_US` sets another,
+/// for the lab's A/B of quanta.
+pub const STEP_BUDGET_NS: u64 = DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(LAB_BUSY_PPM).saturating_add(1);
 
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
-/// wheel never runs dry, a 250 µs step budget so sockets stay responsive on a busy shard, no spin.
+/// wheel never runs dry, the step quantum derived from the lab ([`STEP_BUDGET_NS`]), no spin.
 pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
     RuntimeConfig {
         shards,
@@ -357,7 +405,7 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
         interests_per_shard: hyper_rt::runtime::interests_for(tasks),
         ring_entries: 1024,
         step_budget_ns: STEP_BUDGET_NS,
-        timer_tick_ns: 100_000,
+        timer_tick_ns: TIMER_TICK_NS,
         batch: 64,
         pin: false,
         cores: Vec::new(),
@@ -1019,28 +1067,48 @@ pub async fn consume_budget() {
     hyper_rt::coop::consume_budget().await;
 }
 
-/// A loop's turns on its shard: it works on for as long as one of the shard's steps may (its step
-/// quantum: hyper-rt's online estimate of what a wake costs, else its configured step budget), then
-/// gives the shard to its other tasks where they want it ([`maybe_yield`]).
-pub struct Turns(Instant);
+/// A loop's turns on its shard: it works on while its next piece, taken to be as long as the longest it
+/// has done this turn, would still end within one of the shard's steps (its step quantum: hyper-rt's
+/// online estimate of what a wake costs, else its configured step budget), then gives the shard to its
+/// other tasks where they want it ([`maybe_yield`]). So a turn's poll ends within the quantum where its
+/// pieces don't grow (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum); a turn that looked
+/// only for its quantum to have passed held its shard a piece past it.
+pub struct Turns {
+    began: Instant,
+    /// When the loop last looked, nanoseconds since `began`, and the longest piece between two looks
+    /// this turn: atomics so a `&Turns` goes wherever a reference may (one task's, never contended).
+    looked_ns: AtomicU64,
+    piece_ns: AtomicU64,
+}
 
 impl Turns {
     pub fn new() -> Self {
-        Self(Instant::now())
+        Self { began: Instant::now(), looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
     }
 
-    /// After a piece of the loop's work: its turn given up once it has had a step's quantum.
+    /// After a piece of the loop's work: its turn given up once its next piece would pass its step's quantum.
     pub async fn after(&mut self) {
         if self.over() {
             maybe_yield().await;
-            self.0 = Instant::now();
+            *self = Self::new();
         }
     }
 
-    /// Whether the loop has had its step's quantum: what it does next waits for [`Turns::after`].
+    /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
+    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
     pub fn over(&self) -> bool {
-        let quantum = hyper_rt::futures::step_budget_ns().map(Duration::from_nanos);
-        quantum.is_some_and(|q| self.0.elapsed() >= q)
+        hyper_rt::futures::step_budget_ns().is_some_and(|q| self.over_at(Instant::now(), q))
+    }
+
+    /// [`Turns::over`] at `now`, against a quantum of `quantum_ns`.
+    fn over_at(&self, now: Instant, quantum_ns: u64) -> bool {
+        // One task's: a load and a store each, no read-modify-write.
+        let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
+        let piece_ns = at_ns.saturating_sub(self.looked_ns.load(Ordering::Relaxed));
+        self.looked_ns.store(at_ns, Ordering::Relaxed);
+        let longest_ns = self.piece_ns.load(Ordering::Relaxed).max(piece_ns);
+        self.piece_ns.store(longest_ns, Ordering::Relaxed);
+        at_ns.saturating_add(longest_ns) >= quantum_ns
     }
 }
 
@@ -1803,6 +1871,55 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9 (plan 01a1a87b2cec step 3): the step quantum is derived from the lab's measurements, not set. The
+    /// floor, the two polls a wake finds at p99.9 on the lab's busiest shard and the host's slice, a quantum each,
+    /// come to the bar at most, and a nanosecond more each would pass it; the floor is at or above what the lab's
+    /// calm shards measured; ordinary work's long polls fit a quantum; the runtime takes it. And the derivation
+    /// follows its measurements: at step 5's busy share a wake finds one poll at p99.9, so 400 µs would do.
+    #[test]
+    fn g9_s3_the_step_quantum_is_derived_from_the_lab() {
+        // What ordinary work's long polls hold a shard: the largest mean hold, of the polls past 100 µs, of a site
+        // outside step 2's list in the lab's window (g6c2 calm on rt5: `reads.rs:338`, 0.246 ms with shedding on,
+        // 0.232 ms with it off). A quantum below it would have ordinary work cut finer than its own polls.
+        const ORDINARY_POLL_NS: u64 = 246_000;
+        let ahead = polls_ahead_at_p999(LAB_BUSY_PPM);
+        assert_eq!(ahead, 2, "two polls in hand or ahead at p99.9 on a shard busy 0.065 of the time");
+        // ρ² a thousandth or more (4225 parts in a million), ρ³ less (274).
+        let (two, three) = (LAB_BUSY_PPM * LAB_BUSY_PPM / 1_000_000, LAB_BUSY_PPM * LAB_BUSY_PPM / 1_000_000 * LAB_BUSY_PPM / 1_000_000);
+        assert!(two >= 1_000 && three < 1_000, "{two} {three}");
+        let within = |q: u64| DELAY_FLOOR_NS + (ahead + 1) * q <= DELAY_BAR_NS;
+        assert!(within(STEP_BUDGET_NS), "the floor and three quanta within the bar");
+        assert!(!within(STEP_BUDGET_NS + 1), "the largest quantum within it");
+        assert_eq!(STEP_BUDGET_NS, 266_666);
+        assert!(DELAY_FLOOR_NS >= 192_000, "the floor by design, against the lab's calm median of 192 µs");
+        assert!(STEP_BUDGET_NS >= ORDINARY_POLL_NS, "ordinary work's long polls fit a quantum");
+        let c = runtime_config(2, 64);
+        assert_eq!((c.step_budget_ns, c.timer_tick_ns), (STEP_BUDGET_NS, TIMER_TICK_NS));
+        // Step 5's bar, a busy share of 0.011: one poll at p99.9.
+        assert_eq!(polls_ahead_at_p999(11_000), 1);
+        assert_eq!(DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(11_000).saturating_add(1), 400_000);
+        assert_eq!(polls_ahead_at_p999(900), 0, "busy less than a thousandth of the time: no poll at p99.9");
+        assert_eq!(polls_ahead_at_p999(1_000_000), u64::MAX, "busy all the time: no bound");
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 3): a loop's turn ends before the piece that would take it past its quantum,
+    /// by the longest piece it has done this turn, not once its quantum has passed: of 100 µs pieces against
+    /// 266.666 µs it ends after the second, at 200 µs, where looking for the quantum alone ran a third, to 300 µs.
+    #[test]
+    fn g9_s3_a_turn_ends_before_the_piece_that_would_pass_its_quantum() {
+        let t = Turns::new();
+        let at = |us: u64| t.began + Duration::from_micros(us);
+        assert!(!t.over_at(at(100), STEP_BUDGET_NS), "100 µs done and the next as long: 200 µs, within");
+        assert!(t.over_at(at(200), STEP_BUDGET_NS), "200 µs done and the next as long: 300 µs, past");
+        // A piece longer than those before it is what the next is taken to be.
+        let t = Turns::new();
+        let at = |us: u64| t.began + Duration::from_micros(us);
+        assert!(!t.over_at(at(10), STEP_BUDGET_NS) && !t.over_at(at(20), STEP_BUDGET_NS));
+        assert!(t.over_at(at(150), STEP_BUDGET_NS), "a 130 µs piece ending at 150 µs: the next as long ends at 280 µs");
+        // Off a shard there's no quantum: never over.
+        assert!(!Turns::new().over());
+    }
 
     /// Goal 8 (plan 01a1a59c2b29 step 6): with cores of its own the server's shards each get one,
     /// the first core kept for its other threads; more shards than cores go around again, and a

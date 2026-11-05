@@ -21,10 +21,13 @@
 //!   times at the scheduler's tick, so no series there). Time the host held a ready shard off the
 //!   CPU isn't busy: it shows in the delay, and as `host` slow polls.
 //! - **Slow polls** (`kiln_shard_slow_polls_total`, by `cause`): hyper-rt's long polls, each one that
-//!   held its shard past twice the step quantum (250 µs here, so past 500 µs), attributed as the
-//!   runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU), `blocking` (it waited
-//!   inside a call), `host` (it was runnable and off the CPU: preempted), `unknown` (where the OS
-//!   can't tell: off the CPU on macOS, every one on Windows).
+//!   held its shard past twice the step quantum (`crate::rt::STEP_BUDGET_NS`, 266.7 µs, so past 533
+//!   µs), attributed as the runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU),
+//!   `blocking` (it waited inside a call), `host` (it was runnable and off the CPU: preempted),
+//!   `unknown` (where the OS can't tell: off the CPU on macOS, every one on Windows).
+//! - **Quantum** (`kiln_shard_quantum_seconds`): the step quantum each shard runs with, so what reads
+//!   the slow polls and what held the shards can hold them to it (goal 9, plan 01a1a87b2cec step 3:
+//!   no poll past the quantum).
 //! - **Tasks** (`kiln_shard_tasks`, `kiln_shard_tasks_most`): the tasks each shard holds as its probe
 //!   wakes (admitted and not yet ended, by hyper-rt's counts), and the most it has held so: what a shard's
 //!   task slots, which it makes as it starts, are sized from (`crate::rt::Profile`; goal 11, plan
@@ -85,6 +88,8 @@ pub struct Shard {
     overrun_ns: AtomicU64,
     tasks: AtomicU64,
     most_tasks: AtomicU64,
+    /// The shard's step quantum, nanoseconds, as its probe last read it (0: not yet).
+    quantum_ns: AtomicU64,
     /// What its parks and wakes cost it ([`Wakes`]), as the probe last copied them.
     wakes: WakeCells,
     /// The system calls its thread made beside them ([`Calls`]), as the probe last copied them.
@@ -223,6 +228,7 @@ impl Shard {
             overrun_ns: AtomicU64::new(0),
             tasks: AtomicU64::new(0),
             most_tasks: AtomicU64::new(0),
+            quantum_ns: AtomicU64::new(0),
             wakes: WakeCells::default(),
             calls: CallCells::default(),
         }
@@ -249,6 +255,9 @@ impl Shard {
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
             self.wakes.store(&Wakes::of(&c));
             self.calls.store(&Calls::of(&c));
+        }
+        if let Some(q) = hyper_rt::futures::step_budget_ns() {
+            self.quantum_ns.store(q, Ordering::Relaxed);
         }
         let cpu = thread_cpu_ns();
         if let Some(cpu) = cpu {
@@ -501,6 +510,8 @@ pub fn render(o: &mut String) {
     for (i, s) in snaps.iter().enumerate() {
         let _ = writeln!(o, "kiln_shard_tasks_most{{shard=\"{i}\"}} {}", s.most_tasks);
     }
+    help(o, "kiln_shard_quantum_seconds", "gauge", "The step quantum each shard runs with: the longest a poll is to hold it, and half the hold its slow polls are counted past.");
+    render_quantum(o, all);
     render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
     render_calls(o, &all.iter().map(Shard::calls).collect::<Vec<_>>(), &help);
     render_held(o, &help);
@@ -530,6 +541,17 @@ fn render_calls(o: &mut String, all: &[Calls], help: &dyn Fn(&mut String, &str, 
             for (label, n) in labels {
                 let _ = writeln!(o, "{name}{{shard=\"{i}\"{label}}} {}", n(c));
             }
+        }
+    }
+}
+
+/// Each shard's step quantum, as its probe last read it (goal 9, plan 01a1a87b2cec step 3): what the lab holds what
+/// held the shards to. A shard whose probe hasn't run yet says none.
+fn render_quantum(o: &mut String, all: &[Shard]) {
+    for (i, s) in all.iter().enumerate() {
+        let q = s.quantum_ns.load(Ordering::Relaxed);
+        if q > 0 {
+            let _ = writeln!(o, "kiln_shard_quantum_seconds{{shard=\"{i}\"}} {}", secs(Duration::from_nanos(q)));
         }
     }
 }
@@ -612,6 +634,19 @@ fn escape(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9 (plan 01a1a87b2cec step 3): each shard's step quantum on `/metrics`, as its probe read it, so the lab
+    /// holds what held the shards to the quantum they ran with; a shard whose probe hasn't run yet says none.
+    #[test]
+    fn g9_s3_each_shards_quantum_is_on_metrics() {
+        let all = [Shard::new(), Shard::new()];
+        if let Some(s) = all.first() {
+            s.quantum_ns.store(crate::rt::STEP_BUDGET_NS, Ordering::Relaxed);
+        }
+        let mut o = String::new();
+        render_quantum(&mut o, &all);
+        assert_eq!(o, "kiln_shard_quantum_seconds{shard=\"0\"} 0.000266666\n");
+    }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's parks and wakes becomes its [`Wakes`],
     /// each count in its place, and survives the probe's atomics as it was.
