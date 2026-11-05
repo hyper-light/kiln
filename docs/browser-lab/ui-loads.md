@@ -114,7 +114,13 @@ starts, each first visit took the shell twice, under `/` beside its own address)
 takes 0 bytes of hashed assets from the network. What the pages ask twice is API data
 (`/api/harness/sessions`, `/api/push/notices`, `/api/agents`, `/api/ship/commits`), goal 9's to
 cut. The conversation's highlighter (375 KB of WebAssembly with the mock's code blocks) starts
-after the page's load event.
+after the page's load event. WebKit (Playwright's image, desktop and phone) the same: no file
+twice, a repeat visit's hashed assets all from its cache, nothing heavy before ready.
+
+`ci/ui/smoke.mjs` (`ci/ui/smoke-mock.sh`) loads each page in both engines at both widths and fails
+on a page error, an asset that didn't load, a page left on its splash, the conversation's Plan or
+Tools tab not opening, or the splash missing without JavaScript: every page passes in Chromium,
+and in WebKit all but the overview, whose React hydration error (#418) main has too.
 
 ## The lab's cells
 

@@ -2,7 +2,7 @@
 # ci/ui/pageload.mjs against the UI mock (MOCK_NO_AUTH=1, port 17073: never 7070), no shaped link:
 # a check of the driver itself (goal 8 step 1), not a measurement of a link. Its arguments go to it.
 set -uo pipefail
-ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || (builtin cd "$(dirname "$0")/../.." && pwd))
 PORT=${PORT:-17073}
 (builtin cd "$ROOT/ui" && MOCK_NO_AUTH=1 MOCK_SHIP=static PORT=$PORT HOST=127.0.0.1 exec npx tsx mock/server.ts >"${TMPDIR:-$HOME/.cache}/mock-$PORT.log" 2>&1) &
 MOCK=$!

@@ -3,7 +3,7 @@
 # fails on a page error or a failed asset (goal 8: a build's import map and packed files
 # work in the engines). ENGINES (chromium webkit), FORMS (desktop phone).
 set -uo pipefail
-ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || (builtin cd "$(dirname "$0")/../.." && pwd))
 PORT=${PORT:-17073}
 (builtin cd "$ROOT/ui" && MOCK_NO_AUTH=1 MOCK_SHIP=static PORT=$PORT HOST=127.0.0.1 exec npx tsx mock/server.ts >"${TMPDIR:-/tmp}/mock-$PORT.log" 2>&1) &
 MOCK=$!
