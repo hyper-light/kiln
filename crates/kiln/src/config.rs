@@ -125,18 +125,22 @@ pub struct Server {
     pub placement: crate::placement::Placement,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
-    /// these alone (`AllowedCPUs=`) and, installed system-wide, makes them a cpuset partition that
-    /// nothing outside the slice runs on; the server fixes its shards to them; and kiln's own legs
-    /// and agents keep off them, those its own runner starts and those of every runner whose config
-    /// this is (step 7). Unset (the default), the server shares every core with what runs beside it,
-    /// first by its weight.
+    /// these alone (`AllowedCPUs=`, where the service manager has the cpuset controller) and,
+    /// installed system-wide, makes them a cpuset partition that nothing outside the slice runs on
+    /// (given back without them, and by `kiln uninstall`); the server fixes its shards to them, says
+    /// whether they're a partition's (its log, `/healthz/server`); and kiln's own legs and agents keep
+    /// off them, those its own runner starts (off its shards' cores, where the slice holds the runner on
+    /// them) and those of every runner whose config this is (step 7; goal 9, plan 01a1a87b2cec step 4).
+    /// Unset (the default), the server shares every core with what runs beside it, first by its weight.
     pub cores: Option<String>,
     /// The server's shards in Linux's round-robin real-time class at its lowest priority
     /// (docs/priority.md, "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9,
     /// plan 01a1a87b2cec step 4), where the system grants it (`kiln install` writes the grant,
     /// `LimitRTPRIO=`): a shard waking takes its CPU at once, whatever runs there, under every kernel
     /// preemption mode. Refused, the shards run as without it and `/healthz/server` and the log say
-    /// why. Off until declared (docs/ci.md §0.3, "Opt-in automation"). `KILN_RT_REALTIME` overrides it.
+    /// why. Off until declared (docs/ci.md §0.3, "Opt-in automation"): on bare metal, `kiln install`
+    /// declares it in a new server's config wherever the systemd unit it writes grants it, saying why
+    /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
     pub realtime: bool,
     /// Each of the server's shards nudges its CPU while it waits (docs/priority.md, "A nudge for the
     /// shards"; goal 8, plan 01a1a59c2b29 step 7): its waits end at least every timer tick (100 µs), so

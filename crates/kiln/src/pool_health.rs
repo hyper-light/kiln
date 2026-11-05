@@ -9,7 +9,9 @@
 //! - **The compute pool** (`kiln_compute_*`): its jobs (`_jobs_total`, `_refused_total`), how long each waited
 //!   for a thread (`_wait_seconds`), its pieces (`_pieces_total`; `_yielded_total`, those after which their
 //!   job gave its thread to a waiting one), how long each piece ran (`_piece_seconds`) and the longest yet
-//!   (`_longest_piece_seconds`).
+//!   (`_longest_piece_seconds`); and what handing it work costs (goal 9, plan 01a1a87b2cec step 5): its workers
+//!   woken (`_unparks_total`, each a system call on the thread that queued the job) and gone to park
+//!   (`_parks_total`).
 //! - **The blocking pool's shares** (`kiln_blocking_*{share}`): how long each job waited for one of its
 //!   share's places (`_wait_seconds`), how long it ran (`_run_seconds`), and the share's places (`_places`).
 //!   By Little's law a share holds, on average, the rate its jobs come at times the time each takes: the lab
@@ -159,6 +161,9 @@ pub fn render(o: &mut String) {
         ("kiln_compute_refused_total", "counter", "Jobs the compute pool refused at its bound (each asked again).", s.refused),
         ("kiln_compute_pieces_total", "counter", "Pieces the compute pool's jobs ran (a job of one closure is one).", s.pieces),
         ("kiln_compute_yielded_total", "counter", "Pieces after which their job gave its thread to a waiting job, going on after it.", s.yielded),
+        // What handing work to the pool costs (goal 9, plan 01a1a87b2cec step 5).
+        ("kiln_compute_unparks_total", "counter", "Compute pool workers woken from their park: each a system call (a futex wake on Linux) on the thread that queued the job, a shard's most often, or on a worker that found more.", s.unparks),
+        ("kiln_compute_parks_total", "counter", "Times a compute pool worker went to park with nothing to do.", s.parks),
     ] {
         help(o, name, kind, h);
         let _ = writeln!(o, "{name} {v}");
@@ -200,7 +205,7 @@ mod tests {
         blocking_job("no such share", 1, 1);
         let mut o = String::new();
         render(&mut o);
-        for family in ["kiln_compute_jobs_total", "kiln_compute_wait_seconds_bucket", "kiln_compute_piece_seconds_count", "kiln_blocking_places{share=\"fs\"}"] {
+        for family in ["kiln_compute_jobs_total", "kiln_compute_unparks_total", "kiln_compute_parks_total", "kiln_compute_wait_seconds_bucket", "kiln_compute_piece_seconds_count", "kiln_blocking_places{share=\"fs\"}"] {
             assert!(o.contains(family), "{family} in {o}");
         }
         let count = |name: &str, share: &str| {

@@ -67,6 +67,8 @@ pub struct EpollDriver {
     /// The timer slack the shard's thread had before [`Driver::set_timer_slack_ns`] set its own,
     /// restored when the driver goes (the thread may outlive the shard: `block_on`).
     slack_before: Option<u64>,
+    /// The waits whose events held the kick ([`Driver::kicks_taken`]).
+    kicks_taken: u64,
 }
 
 impl Drop for EpollDriver {
@@ -92,14 +94,28 @@ impl EpollDriver {
     /// descriptor after this driver and all foreign kick borrows have ended.
     pub fn with_eventfd(efd: crate::driver::KickFd) -> Result<EpollDriver, RtError> {
         let epfd = epoll::create(CreateFlags::CLOEXEC).map_err(|e| refused("epoll_create1", e))?;
-        efd.with(|fd| epoll::add(&epfd, fd, EventData::new_u64(KICK_TAG), EventFlags::IN))
-            .ok_or(RtError::DriverLost)?
-            .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
         let mut events = Vec::with_capacity(EVENTS_PER_WAIT);
+        // Asked before the kick is registered: the probe's wait would take a kick already sent, which the
+        // registration below reports to the first wait instead.
         let precise = Self::precise(&epfd, &mut events)?;
-        // The probe's events (a kick sent before this driver existed) are level-triggered: the
-        // first wait reports them again.
         events.clear();
+        // Edge-triggered, and never read: each kick is one event to the next wait, and the eventfd's count
+        // only grows (kiln's goal 9, plan 01a1a87b2cec step 5: draining it took a read(2) on every kicked
+        // wake, a system call on the shard). mio's eventfd waker is the same (`sys/unix/waker/eventfd.rs`:
+        // registered edge-triggered, read only to reset an overflow). The count grows by one a kick, so it
+        // reaches eventfd(2)'s bound, 2^64 - 2, after that many: 584,000 years at a million kicks a second. A
+        // kick sent before this registration (to a slot's earlier driver, or before this one existed) is
+        // reported once, to the first wait: epoll reports a descriptor added already ready.
+        efd.with(|fd| {
+            epoll::add(
+                &epfd,
+                fd,
+                EventData::new_u64(KICK_TAG),
+                EventFlags::IN | EventFlags::ET,
+            )
+        })
+        .ok_or(RtError::DriverLost)?
+        .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
         Ok(EpollDriver {
             epfd,
             efd,
@@ -108,6 +124,7 @@ impl EpollDriver {
             nops: Vec::new(),
             precise,
             slack_before: None,
+            kicks_taken: 0,
         })
     }
 
@@ -192,11 +209,6 @@ impl EpollDriver {
         .map(|_| ())
         .map_err(|e| refused("timerfd_settime", e))
     }
-
-    fn drain_kick(&self) {
-        let mut word = [0u8; size_of::<u64>()];
-        let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
-    }
 }
 
 impl Driver for EpollDriver {
@@ -263,10 +275,15 @@ impl Driver for EpollDriver {
                 });
             }
         }
+        // The kick's event is edge-triggered: taken by this wait, with nothing to drain (`with_eventfd`).
         if kicked {
-            self.drain_kick();
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
         }
         Ok(())
+    }
+
+    fn kicks_taken(&self) -> u64 {
+        self.kicks_taken
     }
 
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {
@@ -559,6 +576,75 @@ mod tests {
                 ));
             }
         }
+        drop(registration);
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a wait a kick ended takes one kick, however many were sent
+    /// before it (the eventfd sums them into one event), and delivers nothing: a shard counts its wakes by a
+    /// kick from this, once a wait.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s5_a_wait_a_kick_ended_takes_one_kick() {
+        /// Shape: kicks sent before the wait: more than one, so they are seen to sum.
+        const KICKS: usize = 3;
+        let efd = prepare_eventfd().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(efd))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let crate::driver::Kick::Eventfd(efd) = kick else {
+            panic!("the epoll driver's kick is its eventfd");
+        };
+        let mut driver = EpollDriver::with_eventfd(efd).unwrap();
+        assert_eq!(driver.kicks_taken(), 0);
+        for _ in 0..KICKS {
+            kick.kick();
+        }
+        let mut out = Vec::new();
+        driver.wait(None, &mut out).unwrap();
+        assert_eq!(driver.kicks_taken(), 1, "{KICKS} kicks before one wait are one event");
+        assert!(out.is_empty(), "a kick delivers nothing: {out:?}");
+        drop(driver);
+        drop(registration);
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a wait a kick ends makes no read of the eventfd, and the kick it
+    /// took doesn't end the next wait: the next wait takes the next kick only. Until 2026-11-05 every kicked
+    /// wait drained the eventfd with a read(2), a system call on the shard on each of its kicked wakes; now
+    /// the eventfd is edge-triggered and its count left to grow (mio's waker's way).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s5_a_kicked_wait_reads_nothing_and_its_kick_ends_no_later_wait() {
+        /// Shape: kicks sent before the first wait: more than one, so their count is seen whole after it.
+        const KICKS: u64 = 3;
+        /// Shape: a timed wait no kick ends: long enough to see it run to its timeout, short for a test.
+        const QUIET_NS: u64 = 2_000_000;
+        let efd = prepare_eventfd().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(efd))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let crate::driver::Kick::Eventfd(efd) = kick else {
+            panic!("the epoll driver's kick is its eventfd");
+        };
+        let mut driver = EpollDriver::with_eventfd(efd).unwrap();
+        for _ in 0..KICKS {
+            kick.kick();
+        }
+        let mut out = Vec::new();
+        driver.wait(None, &mut out).unwrap();
+        assert_eq!(driver.kicks_taken(), 1, "the kicks ended the wait");
+        // Level-triggered, a count left unread would end this wait at once, and every one after it.
+        let began = driver.now_ns();
+        driver.wait(Some(QUIET_NS), &mut out).unwrap();
+        assert_eq!(driver.kicks_taken(), 1, "no kick since: the wait ran to its timeout");
+        assert!(driver.now_ns() - began >= QUIET_NS, "the quiet wait waited");
+        // The driver read nothing: the eventfd still holds every kick.
+        let mut word = [0u8; size_of::<u64>()];
+        let read = efd.with(|fd| rustix::io::read(fd, &mut word)).unwrap();
+        assert_eq!((read, u64::from_ne_bytes(word)), (Ok(8), KICKS), "the eventfd holds the kicks unread");
+        kick.kick();
+        driver.wait(None, &mut out).unwrap();
+        assert_eq!(driver.kicks_taken(), 2, "a kick after is the next wait's");
+        drop(driver);
         drop(registration);
     }
 }
