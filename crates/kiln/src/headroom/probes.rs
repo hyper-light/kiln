@@ -139,6 +139,8 @@ fn once(probe: &Probe, window: Duration, seen: &mut Seen) -> Result<Option<f64>,
         Probe::Http { url } => http(url, window).map(|()| None),
         Probe::Tcp { addr } => connect(addr, window).map(|_| None),
         Probe::Delay { url } => delay(url, window).and_then(|now| since(&mut seen.totals, &now)).map(Some),
+        // Measured on what agents are handed (`super::messages`), never probed.
+        Probe::Messages => Err(Failed::Down),
     }
 }
 

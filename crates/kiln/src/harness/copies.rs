@@ -1206,8 +1206,11 @@ mod tests {
 
     use super::*;
 
-    /// What a source file's code says outside its tests, its comments left out.
+    /// What a source file's code says outside its tests, its comments left out. Lines may end in
+    /// CRLF, as a Windows checkout writes them (git's autocrlf): read as LF, or the tests' own
+    /// words would be read as code.
     fn code_of(src: &str) -> String {
+        let src = src.replace("\r\n", "\n");
         let code = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default();
         code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
     }
@@ -1252,6 +1255,7 @@ mod tests {
         assert!(has_word("x: parking_lot::RwLock<View>", "RwLock"));
         assert!(!has_word("struct Mutexes;", "Mutex") && !has_word("MirrorView", "Mirror"));
         assert_eq!(code_of("a // Mutex\nb\n#[cfg(test)]\nmod tests {\n Mutex"), "a \nb");
+        assert_eq!(code_of("a // Mutex\r\nb\r\n#[cfg(test)]\r\nmod tests {\r\n Mutex"), "a \nb", "a Windows checkout's CRLF");
     }
 
     fn entry(id: &str, seq: u64) -> Arc<Entry> {

@@ -61,15 +61,22 @@ types and bodies are `http-body`'s, so handlers are written as they were on hype
 
 ## TLS sessions
 
-A TLS listener (`server.https`, and each runner's front door) keeps the sessions it makes in one
-store that all its connections share, so a browser that comes back resumes: the server sends no
-certificate and no signature again. Sessions are stateful: TLS 1.3 sends 2 tickets after each
-handshake, and each ticket resumes once, then is gone. The store holds at most 4,096 sessions
-(the oldest go first; none over 2 KiB), each resumable for 24 hours, the lifetime hyper-tls tells
-clients. It lives in memory: a restart empties it, and every browser's next connect is a full
-handshake. Resumption still exchanges keys (browsers resume with `psk_dhe_ke` only), so it saves
-bytes, not a round trip. `kiln_tls_handshakes_total{door,kind}` counts handshakes by door
-(`server`, `front_door`) and kind (`full`, `full_hello_retry`, `resumed`).
+A TLS listener (`server.https`, and each runner's front door) lets a browser that comes back
+resume its session: the server sends no certificate and no signature again. Sessions are
+stateless: nothing is kept on the server. After each handshake TLS 1.3 sends 2 tickets, each
+holding its session sealed with the listener's ticket key (AES-256-GCM), and a ticket resumes
+for 24 hours after it was issued, the lifetime clients are told. The key is one immutable copy
+that every connection reads without a lock, so a ticket made on one shard resumes on any other.
+A key seals tickets for 24 hours; then a new one takes over, and the old one still opens its
+tickets until the last of them is 24 hours old, then goes. The keys live in memory: a restart
+makes a new one, and every browser's next connect is a full handshake.
+
+Because nothing is kept, a ticket isn't used up: the same ticket can resume more than once. That
+is safe because 0-RTT is off (no early data is accepted), so a replayed ClientHello carries no
+request, and its handshake still needs the client's own key exchange. Resumption exchanges keys
+(browsers resume with `psk_dhe_ke` only), so it saves bytes, not a round trip.
+`kiln_tls_handshakes_total{door,kind}` counts handshakes by door (`server`, `front_door`) and kind
+(`full`, `full_hello_retry`, `resumed`).
 
 ## Clients
 

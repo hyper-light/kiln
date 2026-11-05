@@ -8,6 +8,7 @@
 //! runs on the runner alone: with the server away, from settings it kept.
 
 pub mod control;
+pub mod messages;
 mod pace;
 mod probes;
 pub mod settings;
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use kiln_ci::headroom::{Engine, Group, Learned, Observation, Target, Waiting};
+use kiln_ci::headroom::{Answer, Engine, Group, Learned, Observation, Target, Waiting};
 use parking_lot::{Condvar, Mutex};
 use serde::Serialize;
 
@@ -246,27 +247,38 @@ fn apply_shared(s: &Settings) {
 
 /// The targets probed: the settings' own, and kiln's when `automatic`.
 fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
+    let server = ctx.server_url.trim_end_matches('/');
+    targets_for(s, ctx, server.starts_with("http://") && server_here(server))
+}
+
+/// [`targets`], told whether the server the runner reports to runs on this machine (`here`).
+fn targets_for(s: &Settings, ctx: &Ctx, here: bool) -> Vec<settings::Target> {
     let mut out = Vec::new();
     if s.automatic {
         out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None, window_ms: None });
-        if ctx.server_url.starts_with("http://") {
+        // Whether messages get through to this runner's agents, whatever their harness (`messages`):
+        // measured on what they're handed, never probed, at the platform's tolerance.
+        out.push(settings::Target { name: messages::TARGET.into(), probe: settings::Probe::Messages, tolerance_ms: None, window_ms: None });
+        // The server's health, and its delay, only where it runs on this machine: work elsewhere
+        // can't slow it, and paced for it anyway it's held for nothing. On 2026-11-05 the Mac
+        // runners learned production's latency (its own machine loaded) as harm their builds did,
+        // and held every agent's run to about 1% of a CPU (goal 8, plan 01a1a59c2b29 step 5).
+        if here && ctx.server_url.starts_with("http://") {
             let server = ctx.server_url.trim_end_matches('/');
             out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None, window_ms: None });
-            // The server's own delay, where it runs on this machine (docs/priority.md; goal 8, plan
-            // 01a1a59c2b29 step 5): when its shards run ready work late, the legs and agents beside
-            // it are what's slowed first. What it answers is how late, on average, its ready work
-            // ran since the last look, so its tolerance is its shards' own clock, their probes'
-            // period (ready work a whole period late on average is a server behind), and trouble
-            // is caught within the platform's time, as every other target's is.
-            if server_here(server) {
-                let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
-                out.push(settings::Target {
-                    name: SERVER_DELAY.into(),
-                    probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
-                    tolerance_ms: Some(period),
-                    window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
-                });
-            }
+            // The server's own delay (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5): when its
+            // shards run ready work late, the legs and agents beside it are what's slowed first.
+            // What it answers is how late, on average, its ready work ran since the last look, so
+            // its tolerance is its shards' own clock, their probes' period (ready work a whole
+            // period late on average is a server behind), and trouble is caught within the
+            // platform's time, as every other target's is.
+            let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
+            out.push(settings::Target {
+                name: SERVER_DELAY.into(),
+                probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
+                tolerance_ms: Some(period),
+                window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
+            });
         }
     }
     out.extend(s.targets.iter().cloned());
@@ -398,7 +410,10 @@ fn ran_share(stopped: Option<&Duration>, before: Option<&Duration>, span: Option
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
-    let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect() };
+    // Every target but the one measured on what agents are handed (`messages`) is probed.
+    let specs = |s: &Settings| -> Vec<probes::Spec> {
+        targets(s, &ctx).into_iter().filter(|t| t.probe != settings::Probe::Messages).map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect()
+    };
     let engine_targets = |s: &Settings| -> Vec<Target> {
         targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), name: t.name }).collect()
     };
@@ -458,12 +473,18 @@ fn run(ctx: Ctx, mut settings: Settings) {
             ran = groups.iter().map(|g| (g.dir.clone(), ran_share(held.get(&g.dir), held_before.get(&g.dir), span))).collect();
             held_before = held;
         }
-        let (answers, inflight) = probes.drain();
+        let (mut answers, mut inflight) = probes.drain();
         let now = now_us();
+        // What agents were handed (`messages`): each wait that ended is an answer, the longest still
+        // waiting a probe out, and a session with anything waiting is a person's while it waits.
+        let (took, oldest, delivering) = messages::drain(now);
+        answers.extend(took.into_iter().map(|us| (messages::TARGET.to_owned(), Answer::Took(us))));
+        inflight.extend(oldest.map(|age| (messages::TARGET.to_owned(), age)));
+        let class_of = |session: Option<&String>| if session.is_some_and(|s| delivering.contains(s)) { Class::Person } else { Class::Agent };
         let (waiting, ended) = {
             let mut a = SHARED.admit.lock();
             a.granted.retain(|_, until| *until > now);
-            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: Class::Agent, since_us: *since }).collect();
+            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: class_of(Some(s)), since_us: *since }).collect();
             (waiting, std::mem::take(&mut a.ended))
         };
         // What a person paused is theirs, not the engine's: it neither counts nor learns from it.
@@ -475,7 +496,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             .map(|(g, l)| Group {
                 id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
-                class: Class::Agent,
+                class: class_of(g.session.as_ref()),
                 protected: false,
                 write_bps: l.write_rate,
                 cpu_cores: l.cpu_pct / 100.0,
@@ -652,14 +673,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn automatic_targets_are_the_runner_disk_and_its_server() {
-        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
-        let t = targets(&Settings::default(), &ctx);
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.get(1).map(|t| &t.probe), Some(&settings::Probe::Http { url: "http://192.168.49.2:30070/healthz".into() }));
-        assert!(t.iter().all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
+    fn automatic_targets_are_the_runner_disk_its_agents_messages_and_its_server_where_it_runs_here() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://127.0.0.1:7070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, true);
+        let probes: Vec<_> = t.iter().map(|t| &t.probe).collect();
+        assert_eq!(probes.len(), 4, "{probes:?}");
+        assert_eq!(probes.get(1), Some(&&settings::Probe::Messages));
+        assert_eq!(probes.get(2), Some(&&settings::Probe::Http { url: "http://127.0.0.1:7070/healthz".into() }));
+        assert_eq!(probes.get(3), Some(&&settings::Probe::Delay { url: "http://127.0.0.1:7070/healthz/delay".into() }));
+        assert!(t.iter().take(3).all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
         let off = Settings { automatic: false, ..Settings::default() };
-        assert!(targets(&off, &ctx).is_empty());
+        assert!(targets_for(&off, &ctx, true).is_empty());
+    }
+
+    /// Goal 8, plan 01a1a59c2b29 step 5: a runner on another machine than its server paces nothing
+    /// for the server (its work can't slow it), only for its own disk.
+    #[test]
+    fn g8_s5_a_runner_on_another_machine_paces_nothing_for_its_server() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, false);
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["runner disk", messages::TARGET]);
     }
 
     #[test]
