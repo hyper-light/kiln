@@ -178,9 +178,9 @@ pub struct Stream {
     /// often just after.
     touched: std::sync::atomic::AtomicI64,
     touches: Mutex<HashMap<i64, (f64, f64)>>,
-    inputs: async_channel::Sender<Vec<Input>>,
+    inputs: crate::memory::queue::Sender<Vec<Input>>,
     /// What its viewers ask of it, done in order (`controlled`).
-    controls: async_channel::Sender<Value>,
+    controls: crate::memory::queue::Sender<Value>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
     mobile: std::sync::atomic::AtomicBool,
     /// In a person's own profile (their sign-ins): theirs to use, not an agent's.
@@ -466,8 +466,7 @@ impl Streams {
         page.call("Runtime.enable", json!({})).await?;
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
-        let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let (controls, ordered) = async_channel::bounded::<Value>(64);
+        let ((inputs, queued), (controls, ordered)) = (inputs(), controls());
         let first = page.target().to_owned();
         let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(Tabs::new(page, chrome)), device, (inputs, controls), out.clone(), dir, (width, height, scale, mobile)));
         crate::rt::spawn(watch(stream.clone(), first));
@@ -516,8 +515,7 @@ impl Streams {
         };
         drop(started);
         self.listen(&enc).await?;
-        let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let (controls, ordered) = async_channel::bounded::<Value>(64);
+        let ((inputs, queued), (controls, ordered)) = (inputs(), controls());
         let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, (inputs, controls), out.clone(), dir, window));
         crate::rt::spawn(said(stream.clone(), out.clone()));
         crate::rt::spawn(pump(Arc::downgrade(&stream)));
@@ -696,6 +694,25 @@ fn agent_msg(o: Out) -> crate::proto::AgentMsg {
     }
 }
 
+/// Batches of a stream's viewers' input waiting for the page, at the most: as many as the channel they waited
+/// in held. A viewer further ahead loses what the page can't take ([`serve_input`]).
+const INPUTS: usize = 256;
+
+/// What a stream's viewers ask of it waiting to be done, at the most: as many as the channel it waited in held.
+const CONTROLS: usize = 64;
+
+/// A stream's viewers' input, [`INPUTS`] batches of it whatever each holds, lock-free (`crate::memory::queue`;
+/// goal 5, plan 01a1a59c2aae, its top goal: an async-channel's wait took event-listener's `Mutex`, the link's
+/// task handing it over on its shard and the stream's `apply` waiting on its own).
+fn inputs() -> (crate::memory::queue::Sender<Vec<Input>>, crate::memory::queue::Receiver<Vec<Input>>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, INPUTS)
+}
+
+/// What a stream's viewers ask of it, [`CONTROLS`] of them, lock-free (as [`inputs`]).
+fn controls() -> (crate::memory::queue::Sender<Value>, crate::memory::queue::Receiver<Value>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, CONTROLS)
+}
+
 /// `ServerMsg::StreamInput` on a runner: queued for its stream, in order.
 pub fn serve_input(id: &str, events: Vec<Input>) {
     let Some(s) = streams().get(id) else { return };
@@ -712,7 +729,7 @@ pub fn serve_control(id: &str, c: Value) {
 /// What its viewers ask of a stream, done in the order they asked, one at a time: a new size and a
 /// tab shown at once would each capture a tab, and an older size could be laid out last. Of sizes
 /// asked one after another while it was busy, the last.
-async fn controlled(s: std::sync::Weak<Stream>, ordered: async_channel::Receiver<Value>) {
+async fn controlled(s: std::sync::Weak<Stream>, ordered: crate::memory::queue::Receiver<Value>) {
     let only_size = |c: &Value| c.as_object().is_some_and(|o| o.len() == 1 && o.contains_key("resize"));
     while let Ok(mut c) = ordered.recv().await {
         while let Ok(next) = ordered.try_recv() {
@@ -928,7 +945,7 @@ const SELECTED: &str = r"(() => { const e = document.activeElement; if (e && typ
 
 /// What viewers do, applied in the order they did it (and logged, when it's recording). What
 /// piled up while the page was busy goes together (`merged`): it never falls behind.
-async fn apply(s: std::sync::Weak<Stream>, queued: async_channel::Receiver<Vec<Input>>) {
+async fn apply(s: std::sync::Weak<Stream>, queued: crate::memory::queue::Receiver<Vec<Input>>) {
     while let Ok(mut events) = queued.recv().await {
         while let Ok(more) = queued.try_recv() {
             events.extend(more);
@@ -1293,7 +1310,7 @@ fn punctuation(c: char) -> Option<i64> {
 
 impl Stream {
     #[allow(clippy::too_many_arguments)]
-    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, (inputs, controls): (async_channel::Sender<Vec<Input>>, async_channel::Sender<Value>), out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
+    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, (inputs, controls): (crate::memory::queue::Sender<Vec<Input>>, crate::memory::queue::Sender<Value>), out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
         let (width, height, scale, mobile) = window;
         Self {
             id: id.to_owned(),
@@ -1718,6 +1735,33 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a stream's viewers' input and what they ask of it wait on
+    /// lock-free queues now, as many as the channels held: [`INPUTS`] batches whatever each holds and
+    /// [`CONTROLS`] asks, in the order they came. The next past them is refused, as before: a viewer far
+    /// ahead of the page loses what it can't take.
+    #[test]
+    fn g5_a_streams_inputs_and_controls_hold_their_places_in_order() {
+        let press = |n: usize| Input::Pointer { k: n.to_string(), x: 0.0, y: 0.0, button: 0, buttons: 0, pt: String::new(), id: 0, mods: 0, clicks: 0 };
+        let (inputs, queued) = inputs();
+        for n in 0..INPUTS {
+            assert!(inputs.try_send(vec![press(n); 1 + n % 3]).is_ok(), "batch {n} had no room");
+        }
+        assert!(inputs.try_send(vec![press(INPUTS)]).is_err(), "a batch past its places");
+        for n in 0..INPUTS {
+            let batch = queued.try_recv();
+            assert!(batch.as_ref().is_ok_and(|b| b.len() == 1 + n % 3 && b.iter().all(|i| matches!(i, Input::Pointer { k, .. } if *k == n.to_string()))), "batch {n} lost or out of order");
+        }
+        assert!(queued.try_recv().is_err(), "nothing doubled");
+        let (controls, ordered) = controls();
+        for n in 0..CONTROLS {
+            assert!(controls.try_send(json!({ "n": n })).is_ok(), "ask {n} had no room");
+        }
+        assert!(controls.try_send(json!({ "n": CONTROLS })).is_err(), "an ask past its places");
+        for n in 0..CONTROLS {
+            assert_eq!(ordered.try_recv().ok(), Some(json!({ "n": n })), "ask {n} lost or out of order");
+        }
+    }
 
     #[test]
     fn the_extension_is_kilns_own() -> anyhow::Result<()> {

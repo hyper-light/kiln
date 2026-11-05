@@ -1781,7 +1781,7 @@ impl Hub {
     /// Reach's relay's one owner: it alone changes the relay, taking each frame, lost connection and
     /// question in the order sent, and sends what the relay passes on in that order. It holds the hub
     /// weakly: once the hub goes, its sender with it, so does this.
-    async fn relay_loop(hub: std::sync::Weak<Self>, rx: async_channel::Receiver<crate::reach::relay::Ask>) {
+    async fn relay_loop(hub: std::sync::Weak<Self>, rx: crate::memory::queue::Receiver<crate::reach::relay::Ask>) {
         use crate::reach::relay::Ask;
         let mut relay = crate::reach::relay::Relay::recording();
         while let Ok(ask) = rx.recv().await {

@@ -32,6 +32,9 @@ use crate::hub::Hub;
 const MOST: usize = 64;
 /// Chunks waiting for the peers before one is dropped (the next key frame mends it).
 const QUEUED: usize = 4096;
+/// What a peer has told its viewer's socket and the socket hasn't taken yet, at the most: as many as the
+/// channel it waited in held. Past it what the peer says is dropped, as it was.
+const SAID: usize = 16;
 /// A peer that hasn't connected by then goes (its viewer can't reach this server's port).
 const CONNECT_WITHIN: Duration = Duration::from_secs(30);
 /// Datagrams taken at a time before the rest of the loop has a turn.
@@ -59,8 +62,8 @@ pub enum Said {
 /// The server's WebRTC: off until [`run`] has its socket.
 pub struct Webrtc {
     on: OnceLock<On>,
-    to_loop: async_channel::Sender<Cmd>,
-    from: async_channel::Receiver<Cmd>,
+    to_loop: crate::memory::queue::Sender<Cmd>,
+    from: crate::memory::queue::Receiver<Cmd>,
     next: AtomicU64,
 }
 
@@ -73,7 +76,10 @@ struct On {
 
 impl Default for Webrtc {
     fn default() -> Self {
-        let (to_loop, from) = async_channel::bounded(QUEUED);
+        // Lock-free (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait
+        // took event-listener's `Mutex`, every viewer's socket sending on its shard and the loop waiting on
+        // its own. [`QUEUED`] of them whatever each carries, as the channel held.
+        let (to_loop, from) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, QUEUED);
         Self { on: OnceLock::new(), to_loop, from, next: AtomicU64::new(1) }
     }
 }
@@ -88,8 +94,8 @@ enum Cmd {
 /// A viewer's peer, as its socket holds it; dropped, it goes.
 pub struct Peer {
     id: u64,
-    to_loop: async_channel::Sender<Cmd>,
-    pub said: async_channel::Receiver<Said>,
+    to_loop: crate::memory::queue::Sender<Cmd>,
+    pub said: crate::memory::queue::Receiver<Said>,
 }
 
 impl Peer {
@@ -139,7 +145,8 @@ impl Webrtc {
         })
         .unwrap_or_else(|| Err(anyhow::anyhow!("its offer couldn't be taken")))?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tell, said) = async_channel::bounded(16);
+        // Lock-free, as the loop's queue: the loop tells on its shard, the viewer's socket waits on its own.
+        let (tell, said) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, SAID);
         self.to_loop.try_send(Cmd::Add(Box::new(Peering::new(id, rtc, family, (video, audio), tell)))).map_err(|_| anyhow::anyhow!("WebRTC is busy here"))?;
         Ok((Peer { id, to_loop: self.to_loop.clone(), said }, answer))
     }
@@ -229,7 +236,7 @@ fn parse(d: &[u8]) -> Option<Chunk<'_>> {
 struct Peering {
     id: u64,
     rtc: Rtc,
-    tell: async_channel::Sender<Said>,
+    tell: crate::memory::queue::Sender<Said>,
     family: Codec,
     video: Option<Mid>,
     audio: Option<Mid>,
@@ -256,7 +263,7 @@ struct Peering {
 }
 
 impl Peering {
-    fn new(id: u64, rtc: Rtc, family: Codec, (video, audio): (Option<Mid>, Option<Mid>), tell: async_channel::Sender<Said>) -> Self {
+    fn new(id: u64, rtc: Rtc, family: Codec, (video, audio): (Option<Mid>, Option<Mid>), tell: crate::memory::queue::Sender<Said>) -> Self {
         let now = Instant::now();
         Self {
             id,
@@ -552,7 +559,7 @@ enum Next {
 }
 
 impl Peers {
-    async fn serve(mut self, cmds: &async_channel::Receiver<Cmd>) -> anyhow::Result<()> {
+    async fn serve(mut self, cmds: &crate::memory::queue::Receiver<Cmd>) -> anyhow::Result<()> {
         let mut buf = vec![0u8; 2048];
         loop {
             let mut due = Instant::now() + Duration::from_secs(1);
@@ -654,6 +661,63 @@ impl Peers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): WebRTC's loop takes its peers' chunks on a lock-free queue now.
+    /// Peers' viewers' sockets on every shard at once: each chunk reaches the loop once, each peer's in the
+    /// order handed over, and a peer that goes says so after its chunks. Past [`QUEUED`] a chunk is dropped
+    /// (the next key frame mends it), and past [`SAID`] what a peer tells its socket is.
+    #[test]
+    fn g5_the_loop_takes_each_peers_chunks_once_in_order_and_drops_past_its_bound() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let w = std::sync::Arc::new(Webrtc::default());
+            let (peers, per) = (8u64, 400usize);
+            let mut handing = Vec::new();
+            for id in 1..=peers {
+                let w = std::sync::Arc::clone(&w);
+                handing.push(crate::rt::spawn_spread_joined(async move {
+                    let (_tell, said) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, SAID);
+                    let peer = Peer { id, to_loop: w.to_loop.clone(), said };
+                    for n in 0..per {
+                        peer.chunk(&Bytes::from(n.to_le_bytes().to_vec()));
+                    }
+                }));
+            }
+            for h in handing {
+                h.await.map_err(|_| anyhow::anyhow!("a peer ended before its chunks"))?;
+            }
+            let mut got: Vec<(Vec<usize>, bool)> = vec![(Vec::new(), false); usize::try_from(peers)?];
+            while let Ok(cmd) = w.from.try_recv() {
+                let (id, chunk) = match cmd {
+                    Cmd::Chunk(id, data, _) => (id, Some(usize::from_le_bytes(data.as_ref().try_into()?))),
+                    Cmd::Gone(id) => (id, None),
+                    Cmd::Add(_) => anyhow::bail!("a peer added that the test didn't"),
+                };
+                let (theirs, gone) = got.get_mut(usize::try_from(id)?.wrapping_sub(1)).ok_or_else(|| anyhow::anyhow!("no peer {id}"))?;
+                anyhow::ensure!(!*gone, "peer {id}'s chunk after it went");
+                match chunk {
+                    Some(n) => theirs.push(n),
+                    None => *gone = true,
+                }
+            }
+            for (i, (theirs, gone)) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per) && *gone, "peer {}'s: {} of {per}, in order: {}, gone: {gone}", i + 1, theirs.len(), theirs.windows(2).all(|x| x.first() < x.get(1)));
+            }
+            // Its bound: [`QUEUED`] chunks wait, the next is dropped.
+            let (_tell, said) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, SAID);
+            let peer = Peer { id: 99, to_loop: w.to_loop.clone(), said };
+            for _ in 0..=QUEUED {
+                peer.chunk(&Bytes::from_static(b"x"));
+            }
+            anyhow::ensure!(w.from.len() == QUEUED, "{} chunks waiting, of {QUEUED}", w.from.len());
+            // What a peer tells its socket: [`SAID`] wait, the next is refused (dropped, as it was).
+            let (tell, said) = crate::memory::queue::places::<Said>(&crate::memory::owners::CHANNELS, SAID);
+            for _ in 0..SAID {
+                anyhow::ensure!(tell.try_send(Said::Keyframe).is_ok(), "a word within its places had no room");
+            }
+            anyhow::ensure!(tell.try_send(Said::Connected).is_err() && said.len() == SAID, "{} words waiting, of {SAID}", said.len());
+            Ok(())
+        })
+    }
 
     #[test]
     fn a_streams_codec_finds_its_family_and_an_offer_that_takes_it() {
