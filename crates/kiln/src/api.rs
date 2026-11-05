@@ -5339,7 +5339,9 @@ async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response 
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
-    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    // The page asked for without a `limit` is what each session's copy keeps in memory, whatever else of it is
+    // spilled (goal 11, plan 01a1a87b2e56 step 5).
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(crate::harness::copies::EVENTS_PAGE).clamp(1, 1000);
     // From the session's copy when it holds them all: the events' texts as each was written once,
     // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
     if let Some(events) = hub.harness.events_json(id, before, limit) {

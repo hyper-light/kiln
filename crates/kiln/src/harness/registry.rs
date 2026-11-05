@@ -463,6 +463,11 @@ pub struct Snapshot {
     pub(super) parts: Parts,
     /// What's kept of the files its messages mention (`Keeper::frame`): ahead of the events.
     pub(super) files: Option<String>,
+    /// Where a spilled chunk whose file doesn't give it back is read from instead (`super::spill`; goal 11,
+    /// plan 01a1a87b2e56 step 5): the conversation store, which keeps every event of the session, by its
+    /// events' numbers, with the session's id. None where the server keeps no conversations (its runners
+    /// keep each session whole), and in tests.
+    pub(super) store: Option<(crate::convo::store::Store, Arc<str>)>,
 }
 
 /// One of a snapshot's frames, in the order they go: its head (`open` or `resumed`), its meta,
@@ -569,11 +574,43 @@ impl Snapshot {
             Part::Events(batch) => write::events(w, self.batch(plan, batch).iter().map(|e| &**e), None),
             Part::Chunk(i) => match p.events.chunks().get(*i) {
                 // A compact chunk's texts are its segment's, as they were joined.
-                Some(c) if c.is_compact() => write::joined_events(w, &c.joined()?, None),
+                Some(c) if c.is_compact() => write::joined_events(w, &self.joined(c)?, None),
                 Some(c) => write::events(w, c.evs()?.iter().map(|e| &*e.entry), None),
                 None => write::events(w, std::iter::empty::<&Entry>(), None),
             },
         }
+    }
+
+    /// A compact chunk's texts joined: its segment's, or a spilled one's its file doesn't give back, its
+    /// events as the conversation store keeps them ([`Snapshot::from_store`]).
+    fn joined(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
+        match c.joined() {
+            Ok(joined) => Ok(joined.into_owned()),
+            Err(e) if c.is_spilled() => self.from_store(c).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}"))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A spilled chunk whose file didn't give it back (`super::spill` refuses what doesn't read back as
+    /// written), its events' texts as the conversation store keeps them, by their numbers, joined as an
+    /// `events` frame joins them: the session's events are never lost to a viewer while the store has them
+    /// (goal 11, plan 01a1a87b2e56 step 5). Read where the snapshot is made, on the blocking pool.
+    fn from_store(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
+        let (store, id) = self.store.as_ref().ok_or_else(|| std::io::Error::other("no conversation store to read it from"))?;
+        let (Some(first), Some(last)) = (c.metas().first().and_then(|m| m.seq), c.metas().last().and_then(|m| m.seq)) else {
+            return Err(std::io::Error::other("its events have no numbers to read them by"));
+        };
+        let n = usize::try_from(last.saturating_sub(first).saturating_add(1)).unwrap_or(usize::MAX);
+        let rows = store.events(id, last.checked_add(1), n).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+        tracing::warn!(session = &**id, first, last, "a spilled chunk's file didn't give it back: its events are read from the conversation store");
+        let mut joined = Vec::new();
+        for (i, r) in rows.iter().filter(|r| r.seq >= first && r.seq <= last).enumerate() {
+            if i > 0 {
+                joined.push(b',');
+            }
+            joined.extend_from_slice(r.body.as_bytes());
+        }
+        Ok(joined)
     }
 
     /// The frames that bring a viewer to the copy as it was when this was taken, a message each,
@@ -606,7 +643,15 @@ impl Snapshot {
                     if *i + 1 == chunks.len() && !chunk.is_full() {
                         gz.segment(&chunk.deflate(Compression::fast())?);
                     } else {
-                        let packed = chunk.pack()?;
+                        let packed = match chunk.pack() {
+                            Ok(packed) => packed,
+                            // A spilled one its file doesn't give back: its events as the store keeps them.
+                            Err(e) if chunk.is_spilled() => {
+                                let joined = self.from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
+                                Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
+                            }
+                            Err(e) => return Err(e),
+                        };
                         gz.segment(&packed);
                     }
                     gz.stored(b"]}\n");
@@ -1193,8 +1238,14 @@ impl Registry {
         super::whose::note_kiln(&dir);
         let keeper = Keeper::new(&dir);
         let visuals = super::visuals::Visuals::new(&dir);
+        // Its copies' sealed chunks spilled beside its store (goal 11, plan 01a1a87b2e56 step 5): a folder
+        // that can't be made leaves them in memory, said.
+        let sessions = Copies::start(Arc::clone(&bus));
+        if let Err(e) = sessions.spill_to(&dir.join("spill")) {
+            tracing::warn!(error = %e, "the session copies' spill folder couldn't be made: their sealed chunks stay in memory");
+        }
         Self {
-            sessions: Copies::start(Arc::clone(&bus)),
+            sessions,
             bus,
             uploads: Rcu::default(),
             kinds: Rcu::default(),
@@ -2642,7 +2693,8 @@ impl Registry {
         let rev = parts.rev;
         // Written out by the caller off the runtime's threads: no other session's publish waits on
         // this one, nor any socket on its thread, nor its owner.
-        Some(Attachment { snapshot: Snapshot { parts, files }, topic: viewer.topic().to_owned(), at, viewer, refusals, rev })
+        let store = self.convo.clone().map(|s| (s, Arc::from(id)));
+        Some(Attachment { snapshot: Snapshot { parts, files, store }, topic: viewer.topic().to_owned(), at, viewer, refusals, rev })
     }
 
     /// Catch-up for `viewer`, which fell behind having had revision `rev`: what it missed (it begins
@@ -2661,7 +2713,8 @@ impl Registry {
         }
         let parts = view.parts_since(rev).unwrap_or_else(|| view.parts());
         let now = parts.rev;
-        Some((Snapshot { parts, files }, at, refusals, now))
+        let store = self.convo.clone().map(|s| (s, Arc::from(id)));
+        Some((Snapshot { parts, files, store }, at, refusals, now))
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
@@ -3996,7 +4049,7 @@ mod tests {
         assert!(m.sent.is_null());
         let (_viewer, at) = m.feed.attach(Patches::default());
         let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
-        let snapshot = Snapshot { parts: m.view().parts(), files: None }.frames();
+        let snapshot = Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
         assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": *m.state}))));
         set_state(&mut m, json!({"status": "idle"}));
         m.commit(|m| m.state_frame());

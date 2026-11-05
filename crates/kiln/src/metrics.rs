@@ -1298,6 +1298,8 @@ pub fn render() -> String {
     let search = kiln_search::memory();
     let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
     crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None), ("search_indexes", search.0, search.1)]);
+    // What the copies keep on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).
+    crate::harness::spill::render(&mut o);
 
     let samples = agent_samples().load();
     if !samples.is_empty() {
