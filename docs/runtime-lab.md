@@ -665,11 +665,66 @@ numbers an A/B compares), and `rank` ranks the locks (the sites that took one lo
 together) by how often the window took each:
 
 ```sh
+cargo fetch --locked     # the dependencies' sources, which census-tree copies from the cargo registry
 python3 scripts/locks.py census-tree --to ~/.cache/census --ui ui/dist
-(cd ~/.cache/census && CARGO_PROFILE_RELEASE_LTO=off cargo build --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab)
+(cd ~/.cache/census && CARGO_PROFILE_RELEASE_LTO=off cargo build --locked --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab --features kiln/jemalloc)
 taskset -c 16-31 ~/.cache/census/target/release/kiln-lab run --kiln ~/.cache/census/target/release/kiln --label census --rounds 3 --out census
-python3 scripts/locks.py rank census/run.json
+python3 scripts/locks.py rank census/run.json --tree ~/.cache/census
 ```
+
+### The dependencies' locks and the allocator's
+
+The census of train 3's tree (below) counted kiln's, kiln-http's and Quiver's locks, not those of the crates they
+call. `census-tree` counts those too: the crates `scripts/locks/deps.toml` lists, each one that kiln's request,
+websocket or runner path reaches and that takes a Mutex or RwLock inside. It copies each, at every version
+Cargo.lock has, from the cargo registry into the census tree (`census-deps/<crate>/<version>`), routes its std and
+parking_lot locks through the census (every line where it was; its imports' names, visibility and attributes
+kept; a helper that takes a lock for its callers marked `#[track_caller]`) and points the tree's
+`[patch.crates-io]` at the copy. `census.rs` is the crate `kiln-census` there, which kiln renders with its own,
+and Cargo.lock is written as cargo writes it, so a `--locked` build holds. A dependency's site is
+`<crate>@<version>:<file>:<line>:<column>`, its line read back from the census tree's copy or the cargo registry,
+and `rank` gives kiln's, Quiver's, the dependencies' and the allocator's locks tables of their own (each row's
+`group` and `owner` in its JSON).
+
+| crate | what it locks | where kiln reaches it |
+| --- | --- | --- |
+| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`) |
+| async-tungstenite 0.35.0 | a split WebSocket's stream, which its two halves share (a std Mutex) | every frame the API's WebSockets send, flush or read: each is split into a sender and a reader |
+| async-broadcast 0.7.2 | each channel's state (a std Mutex) | nowhere now: goal 4 made agent sessions' events, terminals' output, job logs and CD's changes lock-free lanes, and kiln takes only its error types |
+| parking 2.2.1 | a parked thread's `Parker` (a std Mutex beside its Condvar) | event-listener's blocking waits (a cluster copy's file read on the blocking pool, a child's output reader), unparked by the shard that sends or makes room |
+| uuid 1.28.0 | the process's one v7 context (a std Mutex) | `util::new_id`: each terminal session's, agent session's and upload's id |
+| futures-channel 0.3.34 | a bounded mpsc sender's task (a std Mutex) | what a person's device writes to an agent's app opened on it (`harness/opened.rs`); the hub's and the registry's answers are oneshots, whose try-lock never blocks |
+| tracing-subscriber 0.3.23 | EnvFilter's span maps and each span's extensions (std RwLocks) | kiln's log lines, from any thread, take them only for spans: kiln makes spans around a runner's upgrade alone, and hyper-quic one a packet at `trace`, which `info` never makes |
+
+Looked at and not counted, as nothing there locks on those paths: async-channel, async-lock,
+event-listener-strategy, concurrent-queue and arc-swap take no lock of their own (their waits are
+event-listener's); kiln's runtime (`crates/kiln-rt`) takes none (crossbeam's deques, and an `AtomicCell` of a
+pointer, which is lock-free); tracing-core's registry of callsites is lock-free while one dispatcher is set;
+futures-util's `Shared` and `futures::lock::Mutex` are the preview browser's alone; regex-automata's cache pool
+is taken only by a regex used from a thread other than its first, and kiln's regexes are off the hot path;
+sharded-slab and thread_local lock once a thread; Turso's locks are the conversation store's writer thread's
+alone. Nor can a census in Rust reach the C libraries' own locks (SQLite's, around the store's calls on the
+blocking pool and its writer's thread; aws-lc's) or the standard library's (stderr's, `std::sync::mpsc`'s
+waiters).
+
+**The allocator.** Built with kiln's `jemalloc` feature, the census tree turns jemalloc's statistics on
+(tikv-jemalloc-sys's `stats`: `--enable-stats`) and renders its mutexes (`scripts/locks/census_jemalloc.rs`) as
+`kiln_lock_*` series of kind `jemalloc`: its global ones (`jemalloc:global.<mutex>`), each arena's
+(`jemalloc:arena.<i>.<mutex>`), and each arena's bins' summed (`jemalloc:arena.<i>.bins`, which a thread's cache
+takes as it fills or flushes). Taken is jemalloc's `num_ops`; held when asked, `num_wait` and `num_spin_acq`
+together (it spins up to 600 times before it blocks); waited, `total_wait_time` and `max_wait_time`, which time
+the blocked alone. jemalloc is production's allocator (goal 11: `ci/release/build.sh` builds the static musl
+binary with the feature unless `KILN_LINUX_ALLOCATOR=musl`), so these are production's allocator's locks. kiln's
+own build is unchanged: the module and the statistics are the census tree's. musl's malloc (a static build with
+`KILN_LINUX_ALLOCATOR=musl`) takes one lock for the whole process on every allocation, and on each free that
+starts or finishes its group's freed slots (the rest free by compare-and-swap), once the process has a second
+thread: mallocng's `__malloc_lock`, a futex word behind musl's internal `__lock`, which spins 10 times and then
+waits on the futex. It keeps no count of it, so nothing inside the process can say how often it was held: a
+counting `#[global_allocator]` around it would see calls and the time in malloc, not the waits apart from the
+work. The waits can be counted from outside, in a build that keeps its symbols (`CARGO_PROFILE_RELEASE_STRIP=false`),
+as the `futex` waits on `__malloc_lock`'s address (`perf trace` or bpftrace on `futex` with that address), given
+the kernel's tracing to the lab's user. glibc's malloc (a cargo build without the feature, the lab's) keeps no
+count of its arenas' locks either.
 
 ### What each became
 
@@ -778,7 +833,8 @@ legs, pools and insights are read through, so a lock there fails the check.
 processes, the websockets' feeds, the bus, the logs, Ship, the store) outside a test build's code, but
 those the file lists, each with why it's off the hot path, or (`todo`) what replaces it. Both CIs run it
 (`.kiln/ci.yaml`'s `locks` job, `.github/workflows/ci.yml`'s), with `scripts/test_locks.py`, which plants
-a lock in a copy of the hub and holds the check to failing on it.
+a lock in a copy of the hub and holds the check to failing on it (and holds the census's copies of the
+dependencies, their Cargo.lock and `rank`'s tables by owner to what they say).
 
 Reach's relay between runners has one owner, a task of its own (`Hub::relay_loop`): the hub's loop
 hands it each relayed frame without waiting, it forwards them in order, and the reach directory reads
@@ -829,6 +885,21 @@ time to be taken with hogs (0.47 to 0.71 ms), and the compute pool, which now ru
 to 475 a second calm) and whose jobs wait longer for it at p99 (0.25 to 7.4 ms calm, 3.2 to 36 ms with
 hogs): the work goals 3, 9 and 10 moved off the shards (shard 0, which ran 18.5% of the time calm, runs
 2.2%). Goal 9's step 5 (a tenth of the CPU) and goal 10's step 4 (runner messages) take those up.
+
+### What's left, and why
+
+- **kiln's own.** None of kiln's or kiln-http's locks on the hot path waited in train 3's census, calm or with
+  hogs. `scripts/locks/hot.toml` lists those its modules still declare, each with why it's off the hot path, and
+  `scripts/locks.py check` keeps the rest out.
+- **Quiver's.** The only locks that waited: its topics' map and each topic's tail, 0.047 ms a second at the most.
+  Quiver is vendored (`vendor/quiver`, docs/vendoring.md), so its locks are Quiver's own change, made in Quiver
+  and vendored back, not kiln's to rewrite in its copy.
+- **The dependencies' and the allocator's.** The census counts them (above), each owner in a table of its own:
+  the dependencies kiln's hot path reaches that lock inside, and jemalloc's mutexes where the build has kiln's
+  `jemalloc` feature.
+- **What no census inside the process can count.** musl's and glibc's malloc (no count kept: musl's waits only
+  from outside, as `futex` waits on its lock), and the C libraries' and the standard library's own locks
+  (above).
 
 ## Goal 7: placement
 
@@ -1159,6 +1230,25 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
   past it.
+- **A runner's Build in pieces, its mirrors' file off the shards** (`hub::build`): the hub's loop took a
+  runner process's Build in one poll of ten things (its process, its legs' receipt, its upgrades, its
+  front door, sync's, observe's and the cluster's announcements, the conversation store's mirrors and a
+  restore, CI's word, its previews), and the mirrors' choice was written and synced there
+  (`mirrors.json`): g9p6's fill held the HTTP listener's shard 5 to 34 ms with it, calm and with hogs
+  alike (the disk's). Now each is a piece of its own, in the order they were, its process first (so its
+  Build still comes before its first job), the shard given up between them once its turn would pass the
+  quantum; and the kept files' writer writes the mirrors' file, synced, on the blocking pool
+  (`keep::synced`). A ReachHello is an announcement (a copy swapped in whole, and a message to the relay's
+  owner not waited for) and a line, whose write to stdout under its lock was its only wait: the log's
+  writer's now (`log_lines`).
+- **An Open going on from its copy keeps its chunks as they are** (`Mirror::keep_through`): a runner that
+  connects again sends each session it holds an Open going on from the copy's newest, and the owner kept
+  the events through it by reading every chunk of the copy again (inflating each, reading spilled ones
+  back from disk, parsing each event's JSON) and making them anew, on its shard, to keep them all. Now the
+  chunks before the cut stay as they are, the one it falls in is made again (read again only when it's
+  compact), and the index lets go of the rest alone. g9p6's fill doesn't have it (its server is fresh);
+  its Opens held up to 10.6 ms with hogs and 0.22 ms calm, a line written to stdout under its lock among
+  their work, now the log's writer's.
 
 ### Step 3's check
 
