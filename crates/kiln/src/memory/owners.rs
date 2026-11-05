@@ -170,7 +170,13 @@ pub static CD_INPUTS: Owner = Owner::new("cd_inputs");
 pub static CD_ACTIONS: Owner = Owner::new("cd_actions");
 
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 25] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS];
+/// kiln's log lines waiting for the thread that writes them to stdout (`crate::log_lines`; goal 9, plan 01a1a87b2cec
+/// step 3): at most [`crate::log_lines::LINES`] lines, journald's burst, and [`crate::log_lines::LINES_BYTES`], what
+/// observe keeps waiting of a source's log. At the bound a line is let go, counted (`kiln_log_lines_dropped_total`),
+/// and said as the thread next writes: a shard that logs never waits for the log's reader.
+pub static LOG_LINES: Owner = Owner::new("log_lines");
+
+pub(super) const ALL: [&Owner; 26] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {
