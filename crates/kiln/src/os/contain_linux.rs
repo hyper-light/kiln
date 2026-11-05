@@ -258,14 +258,123 @@ fn lower(dir: &Path) -> Result<(), String> {
     write_file(&dir.join("cpu.weight"), "1").map_err(|e| format!("its cpu.weight: {e}"))
 }
 
-/// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
+/// How legs and agents run here (docs/priority.md), for the runner's facts and its log: their
+/// weight, and where they run beside a server with cores of its own ([`keep_work_off`]).
 pub fn priority() -> String {
     let shared = base().or_else(jobs_base).filter(|b| b.cpu);
-    match (&arranged().cpu, shared) {
+    let weight = match (&arranged().cpu, shared) {
         (Ok(()), Some(_)) => "the least CPU weight: each leg's and agent's cgroup has cpu.weight 1".to_owned(),
         (Ok(()), None) => "normal: the CPU isn't shared among kiln's groups here".to_owned(),
         (Err(why), _) => format!("normal: {why}"),
+    };
+    match work_said() {
+        Some(work) => format!("{weight}; {work}"),
+        None => weight,
     }
+}
+
+/// Where this process starts kiln's own legs and agents beside a server with cores of its own, as
+/// [`keep_work_off`] worked it out (docs/priority.md, "Legs and agents keep off the server's cores";
+/// goal 8, plan 01a1a59c2b29 step 7): the server's cores as declared, what that means, and the work
+/// CPUs as a set, ready for a child to take between fork and exec.
+struct Work {
+    server: String,
+    cpus: super::WorkCpus,
+    set: Option<rustix::thread::CpuSet>,
+}
+
+static WORK: OnceLock<Work> = OnceLock::new();
+
+/// Works out where this process starts kiln's own legs and agents beside a server whose cores are
+/// `server` (`text` as declared): the CPUs the calling thread may run on less the server's
+/// (`super::work_cpus_for`). Affinity rather than a cpuset on kiln's folders of groups: a user's
+/// service manager doesn't delegate the cpuset controller (systemd's `user@.service` delegates
+/// `pids memory cpu`), and where a system install could, its partition already keeps everything
+/// outside the server's slice off its cores (docs/priority.md). Only the first call counts.
+pub fn keep_work_off(server: &[u32], text: &str) -> Result<super::WorkCpus, String> {
+    let allowed = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this process's CPUs can't be read: {e}"))?;
+    let mine: Vec<u32> = (0..rustix::thread::CpuSet::MAX_CPU).filter(|c| allowed.is_set(*c)).filter_map(|c| u32::try_from(c).ok()).collect();
+    let cpus = super::work_cpus_for(&mine, server);
+    let set = match &cpus {
+        super::WorkCpus::Apart(onto) => Some(cpu_set(onto)),
+        super::WorkCpus::Clear | super::WorkCpus::Shared => None,
+    };
+    let _ = WORK.set(Work { server: text.to_owned(), cpus: cpus.clone(), set });
+    Ok(cpus)
+}
+
+/// `cpus` as a CPU set, those past what a set holds left out.
+fn cpu_set(cpus: &[u32]) -> rustix::thread::CpuSet {
+    let mut set = rustix::thread::CpuSet::new();
+    for c in cpus.iter().filter_map(|c| usize::try_from(*c).ok()).filter(|c| *c < rustix::thread::CpuSet::MAX_CPU) {
+        set.set(c);
+    }
+    set
+}
+
+/// What of the CPUs `now` the work CPUs `work` hold, or `work` itself where they hold none of them (a
+/// thread fixed to a shard's core starts the process): where a leg's or an agent's process goes, so
+/// a leg's share of the runner's CPUs (`crate::runner::cpus`, all of them work CPUs) stays its own.
+fn narrowed(now: &rustix::thread::CpuSet, work: &rustix::thread::CpuSet) -> rustix::thread::CpuSet {
+    let mut out = *now;
+    for c in 0..rustix::thread::CpuSet::MAX_CPU {
+        if out.is_set(c) && !work.is_set(c) {
+            out.unset(c);
+        }
+    }
+    if out.count() == 0 { *work } else { out }
+}
+
+/// Makes `cmd`'s process start on the work CPUs ([`narrowed`] from those it would start on) before it
+/// runs anything, between fork and exec, so everything it starts inherits them. Nothing where nothing
+/// is kept off. A process that fails to move starts where it would have.
+pub fn onto_work_cpus(cmd: &mut Command) {
+    if let Some(work) = WORK.get().and_then(|w| w.set) {
+        start_on(cmd, work);
+    }
+}
+
+/// Makes `cmd`'s process start on what [`narrowed`] gives of `work`, between fork and exec.
+fn start_on(cmd: &mut Command, work: rustix::thread::CpuSet) {
+    #[allow(unsafe_code)]
+    // SAFETY: the closure runs in the child between fork and exec, and makes two system calls on the
+    // child's one thread (sched_getaffinity, sched_setaffinity) with CPU sets on its stack: nothing
+    // allocated, nothing locked.
+    unsafe {
+        cmd.pre_exec(move || {
+            let now = rustix::thread::sched_getaffinity(None).unwrap_or(work);
+            let _ = rustix::thread::sched_setaffinity(None, &narrowed(&now, &work));
+            Ok(())
+        });
+    }
+}
+
+/// Moves every thread of process `pid` onto the work CPUs, as [`onto_work_cpus`] starts one there:
+/// whether it moved any. Those gone meanwhile are passed over.
+pub fn onto_work_cpus_pid(pid: u32) -> bool {
+    let Some(work) = WORK.get().and_then(|w| w.set) else { return false };
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else { return false };
+    let mut moved = false;
+    for tid in tasks.flatten().filter_map(|t| t.file_name().to_str()?.parse::<i32>().ok()).filter_map(rustix::process::Pid::from_raw) {
+        if let Ok(now) = rustix::thread::sched_getaffinity(Some(tid)) {
+            let onto = narrowed(&now, &work);
+            moved |= onto != now && rustix::thread::sched_setaffinity(Some(tid), &onto).is_ok();
+        }
+    }
+    moved
+}
+
+/// The work CPUs, where kiln's own legs and agents keep off the server's cores.
+pub fn work_cpus() -> Option<Vec<usize>> {
+    match &WORK.get()?.cpus {
+        super::WorkCpus::Apart(cpus) => Some(cpus.iter().filter_map(|c| usize::try_from(*c).ok()).collect()),
+        super::WorkCpus::Clear | super::WorkCpus::Shared => None,
+    }
+}
+
+/// What [`keep_work_off`] decided, for a person.
+pub fn work_said() -> Option<String> {
+    WORK.get().map(|w| w.cpus.said(&w.server))
 }
 
 /// This runner's folder of agents' groups, worked out once (none in a process that doesn't start
@@ -892,6 +1001,70 @@ mod tests {
         checked?;
         anyhow::ensure!(ended, "ending the group ends all of it, the daemon too");
         anyhow::ensure!(removed, "an empty group goes");
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): a leg's or an agent's process takes what of the CPUs it would
+    /// start on are work CPUs (a leg's share stays its own), or the work CPUs whole where none of them
+    /// is (started from a thread fixed to a shard's core).
+    #[test]
+    fn g8_s7_a_process_keeps_what_of_its_cpus_are_work_cpus() {
+        let set = |cpus: &[u32]| cpu_set(cpus);
+        let work = set(&[0, 1, 2, 3, 8, 9, 10, 11]);
+        assert!(narrowed(&set(&[2, 3, 4, 5]), &work) == set(&[2, 3]), "a leg's share keeps what of it is work CPUs");
+        assert!(narrowed(&set(&[5]), &work) == work, "from a shard's core alone: the work CPUs whole");
+        assert!(narrowed(&work, &work) == work);
+        let everything: Vec<u32> = (0..16).collect();
+        assert!(narrowed(&set(&everything), &work) == work, "from every CPU: the work CPUs");
+        assert_eq!(cpu_set(&[1, 5000]).count(), 1, "a CPU past what a set holds is left out");
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): a process started on the work CPUs runs on them from its
+    /// first instruction, from a thread that may run anywhere and from one fixed to a CPU the work
+    /// CPUs leave out (a shard's), and so does what it starts.
+    #[test]
+    fn g8_s7_a_leg_or_agent_starts_on_the_work_cpus() -> anyhow::Result<()> {
+        use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+        let mine: Vec<u32> = {
+            let s = sched_getaffinity(None)?;
+            (0..CpuSet::MAX_CPU).filter(|c| s.is_set(*c)).filter_map(|c| u32::try_from(c).ok()).collect()
+        };
+        // The first of this test's CPUs stands in for the server's: two at least.
+        let (Some(server), Some(rest)) = (mine.first().copied(), mine.get(1..).filter(|r| !r.is_empty())) else { return Ok(()) };
+        let work = cpu_set(rest);
+        let started_on = move |fixed: Option<u32>| -> anyhow::Result<(CpuSet, CpuSet)> {
+            std::thread::spawn(move || -> anyhow::Result<(CpuSet, CpuSet)> {
+                if let Some(cpu) = fixed {
+                    sched_setaffinity(None, &cpu_set(&[cpu]))?;
+                }
+                // It starts a process of its own and says its id.
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 5 & echo $!; wait"]).stdout(std::process::Stdio::piped());
+                start_on(&mut cmd, work);
+                let mut child = cmd.spawn()?;
+                let pid = rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or_else(|| anyhow::anyhow!("no pid"))?;
+                let mut line = String::new();
+                if let Some(out) = child.stdout.take() {
+                    std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
+                }
+                let grandchild = line.trim().parse::<i32>().ok();
+                let theirs = sched_getaffinity(Some(pid));
+                let its = grandchild.and_then(rustix::process::Pid::from_raw).map(|g| sched_getaffinity(Some(g)));
+                if let Some(g) = grandchild {
+                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(g), nix::sys::signal::Signal::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let its = its.ok_or_else(|| anyhow::anyhow!("what it started never said its id: {line:?}"))??;
+                Ok((theirs?, its))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("the starting thread panicked"))?
+        };
+        for fixed in [None, Some(server)] {
+            let (theirs, its) = started_on(fixed)?;
+            anyhow::ensure!(theirs == work && its == work, "started from {fixed:?}: on {theirs:?}, what it started on {its:?}, not {work:?}");
+        }
         Ok(())
     }
 }
