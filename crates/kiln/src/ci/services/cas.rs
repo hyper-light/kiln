@@ -54,23 +54,25 @@ pub fn key(digest: &str) -> String {
 }
 
 /// What taking an object in and letting one go are serialized by, a digest at a time: a collection
-/// never lets go of an object a put has just found, nor one whose upload is under way.
+/// never lets go of an object a put has just found, nor one whose upload is under way. Each stripe a gate,
+/// one at a time in the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top
+/// goal: runners' cache and artifact uploads took async-lock's mutexes, whose waits are event-listener's).
 struct Guard {
-    stripes: Vec<async_lock::Mutex<()>>,
+    stripes: Vec<crate::turn::Gate>,
     /// Objects being uploaded now, by digest (as many as uploads under way).
     uploading: Mutex<HashSet<String>>,
 }
 
-static GUARD: LazyLock<Guard> = LazyLock::new(|| Guard { stripes: (0..STRIPES).map(|_| async_lock::Mutex::new(())).collect(), uploading: Mutex::default() });
+static GUARD: LazyLock<Guard> = LazyLock::new(|| Guard { stripes: (0..STRIPES).map(|_| crate::turn::Gate::one()).collect(), uploading: Mutex::default() });
 
-fn stripe(digest: &str) -> &'static async_lock::Mutex<()> {
+fn stripe(digest: &str) -> &'static crate::turn::Gate {
     let n = digest.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b))) % STRIPES;
     // `n` is below STRIPES, the length.
     GUARD.stripes.get(n).unwrap_or_else(|| first_stripe())
 }
 
-fn first_stripe() -> &'static async_lock::Mutex<()> {
-    static ONE: LazyLock<async_lock::Mutex<()>> = LazyLock::new(|| async_lock::Mutex::new(()));
+fn first_stripe() -> &'static crate::turn::Gate {
+    static ONE: crate::turn::Gate = crate::turn::Gate::one();
     GUARD.stripes.first().unwrap_or(&ONE)
 }
 
@@ -126,7 +128,7 @@ pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
     let object = Object { digest: digest.clone(), size };
     let blobs = Arc::clone(&hub.blobs.blobs);
     let uploading = {
-        let _held = stripe(&digest).lock().await;
+        let _held = stripe(&digest).turn().await;
         if record(hub, &digest, size).await? {
             match blobs.head(&key(&digest)).await {
                 Ok(m) if m.size == size => return Ok(object),
@@ -138,7 +140,7 @@ pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
     };
     let kept = crate::blobs::io::put_file(blobs.as_ref(), &key(&digest), path, Some(&digest)).await;
     {
-        let _held = stripe(&digest).lock().await;
+        let _held = stripe(&digest).turn().await;
         kept.map_err(refused)?;
         record(hub, &digest, size).await?;
         drop(uploading);
@@ -226,7 +228,7 @@ pub fn put_chunk(hub: &Hub, digest: &str, data: &[u8]) -> anyhow::Result<u64> {
 pub async fn put_chunked(hub: &Hub, digest: &str, chunks: crate::blobs::chunks::Chunks) -> anyhow::Result<Object> {
     let local = Arc::clone(chunked(hub).ok_or_else(|| anyhow::anyhow!("kiln's store of bytes keeps no chunks here ([blobs] store isn't local)"))?);
     let size = chunks.iter().map(|(_, n)| *n).sum::<u64>();
-    let _held = stripe(digest).lock().await;
+    let _held = stripe(digest).turn().await;
     local.put_chunks(&key(digest), digest, chunks).await.map_err(refused)?;
     record(hub, digest, size).await?;
     tracing::debug!(target: "kiln.blobs", event = "put", object = %digest, size, "kept from chunks");
@@ -322,7 +324,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
         .await?;
     let mut out = Collected::default();
     for digest in candidates {
-        let _held = stripe(&digest).lock().await;
+        let _held = stripe(&digest).turn().await;
         if GUARD.uploading.lock().contains(&digest) {
             continue;
         }

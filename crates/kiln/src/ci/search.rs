@@ -219,15 +219,16 @@ fn meta_path(hub: &Hub) -> PathBuf {
     hub.cfg.data("cache").join("search-meta.json")
 }
 
-/// The one writer of the meta file at a time.
-fn meta_lock() -> &'static async_lock::Mutex<()> {
-    static LOCK: OnceLock<async_lock::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| async_lock::Mutex::new(()))
+/// The one writer of the meta file at a time, in the order they came: a gate with no lock (`crate::turn`; goal 5,
+/// plan 01a1a59c2aae, its top goal).
+fn meta_lock() -> &'static crate::turn::Gate {
+    static LOCK: crate::turn::Gate = crate::turn::Gate::one();
+    &LOCK
 }
 
 /// `f` applied to the meta file, written back when it changed it (`f` says so).
 async fn with_meta<R: Send + 'static>(hub: &Hub, f: impl FnOnce(&mut Meta) -> (bool, R) + Send + 'static) -> anyhow::Result<R> {
-    let _g = meta_lock().lock().await;
+    let _g = meta_lock().turn().await;
     let path = meta_path(hub);
     crate::rt::blocking(move || -> anyhow::Result<R> {
         let mut meta: Meta = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -254,12 +255,12 @@ struct Source<'a> {
     owner: String,
 }
 
-/// One per tree while it's built: a second search of a tree being built waits for it.
-fn building(tree: &str) -> Arc<async_lock::Mutex<()>> {
-    static BUILDING: OnceLock<Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = OnceLock::new();
-    let mut all = BUILDING.get_or_init(Default::default).lock();
-    all.retain(|_, l| Arc::strong_count(l) > 1);
-    Arc::clone(all.entry(tree.to_owned()).or_default())
+/// One per tree while it's built: a second search of a tree being built waits for it. A gate per tree while anyone
+/// builds or waits, gone with its last (`crate::turn::Keyed`, no lock; goal 5, plan 01a1a59c2aae, its top goal),
+/// where a map behind a `Mutex` handed out async-lock's mutexes.
+fn building(tree: &str) -> crate::turn::Entry<'static, String, crate::turn::Gate> {
+    static BUILDING: std::sync::LazyLock<crate::turn::Keyed<String, crate::turn::Gate>> = std::sync::LazyLock::new(crate::turn::Keyed::new);
+    BUILDING.of(&tree.to_owned())
 }
 
 /// Searches what `src` names: its tree's index built first when it isn't.
@@ -271,7 +272,7 @@ async fn search_at(hub: &Hub, src: Source<'_>, q: &HashMap<String, String>) -> R
     let mut built = search.built(&tree).await.map_err(refused)?;
     if built.is_none() {
         let lock = building(&tree);
-        let _g = lock.lock().await;
+        let _g = lock.turn().await;
         built = search.built(&tree).await.map_err(refused)?;
         if built.is_none() {
             let (files, skipped) = files_of(hub, src.dir, &tree).await?;

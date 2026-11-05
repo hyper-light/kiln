@@ -14,6 +14,7 @@ pub mod events;
 pub mod keep;
 pub mod link;
 pub mod payload;
+pub mod stamp;
 pub mod sums;
 #[cfg(test)]
 pub mod ts;

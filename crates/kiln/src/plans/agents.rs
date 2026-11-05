@@ -24,7 +24,6 @@
 //! As each step is met, what its agent changed goes up for review as that step's diff, on the diff
 //! of the step met before it (`super::stack`): the run ends as a stack with one diff per step.
 
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -425,11 +424,13 @@ async fn load_run(hub: &Hub, run: &str) -> R<(Head, Vec<Row>)> {
 }
 
 /// One look at a run at a time (the server's, a start, a retry, a stop …), so a step's agent
-/// starts once and what's changed is changed on the run as it is.
-static LOOKING: LazyLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = LazyLock::new(Default::default);
+/// starts once and what's changed is changed on the run as it is. In the order they came: a gate per
+/// run while anyone looks or waits, gone with its last (`crate::turn::Keyed`, no lock; goal 5, plan
+/// 01a1a59c2aae, its top goal), where a map behind a `Mutex` kept async-lock's mutexes for every run.
+static LOOKING: LazyLock<crate::turn::Keyed<String, crate::turn::Gate>> = LazyLock::new(crate::turn::Keyed::new);
 
-fn looking(run: &str) -> Arc<async_lock::Mutex<()>> {
-    Arc::clone(LOOKING.lock().entry(run.to_owned()).or_default())
+fn looking(run: &str) -> crate::turn::Entry<'static, String, crate::turn::Gate> {
+    LOOKING.of(&run.to_owned())
 }
 
 /// Where a step stands, its agent as it is now.
@@ -817,7 +818,7 @@ fn held_up(rows: &[Row]) -> String {
 /// person retries them, or takes them over).
 pub async fn advance(hub: &Arc<Hub>, run: &str) -> R<()> {
     let lock = looking(run);
-    let _one = lock.lock().await;
+    let _one = lock.turn().await;
     advance_locked(hub, run).await
 }
 
@@ -922,7 +923,7 @@ pub async fn drive(hub: Arc<Hub>) -> anyhow::Result<()> {
 pub async fn stop(hub: &Hub, run: &str, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (head, rows) = load_run(hub, run).await?;
         if head.state == "running" {
             for row in rows.iter().filter(|r| matches!(r.status.as_str(), "started" | "taken")) {
@@ -948,7 +949,7 @@ fn step_row(rows: &[Row], n: usize) -> R<&Row> {
 pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if seen.is_some_and(|t| t != row.tries) {
@@ -992,7 +993,7 @@ pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &
 pub async fn take(hub: &Hub, run: &str, n: usize, by: &str, person: Option<&str>, signs: bool) -> R<serde_json::Value> {
     let custody = {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if !matches!(row.status.as_str(), "started" | "unmet" | "stopped") {
@@ -1068,7 +1069,7 @@ pub async fn receipt_for(hub: &Hub, run: &str, n: usize, person: &str, missing: 
 pub async fn met(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (head, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if row.status == "waiting" {

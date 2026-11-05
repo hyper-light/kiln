@@ -53,7 +53,9 @@ struct Mem {
 
 struct Inner {
     mem: Mutex<Mem>,
-    changed: event_listener::Event,
+    /// Told as a commit or a compaction lands: a wait for a family's change looks again (`crate::rt::Changed`, no lock;
+    /// goal 5, plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: crate::rt::Changed,
 }
 
 /// Records in kiln's store. Clones share one store.
@@ -128,7 +130,7 @@ impl StoreRecords {
                 let newest = s.query_map([], |r| Ok((r.get::<_, String>(0)?, rev(r.get::<_, i64>(1)?))))?.collect::<Result<HashMap<_, _>, _>>()?;
                 Ok(Mem { head: rev(head), horizon: rev(horizon), log_horizon: rev(log_horizon), newest })
             })?;
-        Ok(Self { store, inner: Arc::new(Inner { mem: Mutex::new(mem), changed: event_listener::Event::new() }) })
+        Ok(Self { store, inner: Arc::new(Inner { mem: Mutex::new(mem), changed: crate::rt::Changed::new() }) })
     }
 
     /// Forgets the history from before `before` (at most the head), as a compaction does: each key
@@ -161,7 +163,7 @@ impl StoreRecords {
             })
             .await?;
         // Waits from before it are refused now, not left waiting.
-        self.inner.changed.notify(usize::MAX);
+        self.inner.changed.notify();
         Ok(())
     }
 }
@@ -302,7 +304,7 @@ impl Records for StoreRecords {
                     *newest = (*newest).max(at);
                 }
             }
-            self.inner.changed.notify(usize::MAX);
+            self.inner.changed.notify();
             Ok(at)
         })
     }

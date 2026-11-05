@@ -1047,8 +1047,10 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
 
 /// The legs of a runner's message at the server that a round reports (`kiln_runner_wait_leg_seconds`), each by
 /// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
-/// each event it took.
-const RUNNER_LEGS: [&str; 4] = ["to_loop", "in_loop", "to_owner", "held"];
+/// each event it took; and step 5's `runner` and `server`, of each agent session's update whose runner said how
+/// long it held it: that hold, on the runner's clock, and the server's time from its frame's arrival to its owner
+/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's.
+const RUNNER_LEGS: [&str; 6] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1115,7 +1117,8 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
     // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
     // copy, and that owner taking it; and how long the loop held each event it took, its waits included (step 5:
-    // set against `to_loop`, it tells the loop held by its events from the loop waiting for its shard).
+    // set against `to_loop`, it tells the loop held by its events from the loop waiting for its shard); and of the
+    // updates whose runner said how long it held them, that hold and the server's time with them (step 5).
     for leg in RUNNER_LEGS {
         let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
         for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
@@ -1383,7 +1386,7 @@ mod tests {
     #[test]
     fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
         let legs = RUNNER_LEGS;
-        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held"], "goal 10 step 5: the loop's hold of each event is reported beside the legs");
+        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs");
         let scrape = |n: f64| {
             let mut t = String::new();
             for leg in legs {
@@ -1403,6 +1406,33 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports the runner's hold of its updates beside the server's time
+    /// with them, each its own, to the microsecond (`server.runner.runner_*`, `server.runner.server_*`): here the
+    /// runner's tail at 73.5 ms where the server's is under a millisecond, as g9p7's fifth round's frames would have
+    /// shown if the runner held them. A build, or runners, without the stamp report the legs before them alone.
+    #[test]
+    fn g10_s5_a_round_reports_the_runners_hold_beside_the_servers_time() {
+        let scrape = |n: f64, stamped: bool| {
+            let mut t = String::new();
+            for leg in RUNNER_LEGS.iter().filter(|l| stamped || !matches!(**l, "runner" | "server")) {
+                // The runner's: half at or under 0.1 ms, the rest up to 75 ms. The rest: half at or under 0.5 ms, all at or under 1 ms.
+                let buckets = if *leg == "runner" { [("0.0001", n / 2.0), ("0.075", n), ("+Inf", n)] } else { [("0.0005", n / 2.0), ("0.001", n), ("+Inf", n)] };
+                for (le, c) in buckets {
+                    t.push_str(&format!("kiln_runner_wait_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0, true), &scrape(1000.0, true), 60.0);
+        let at = |k: &str| n.get(k).copied();
+        let near = |k: &str, want: f64| at(k).is_some_and(|v| (v - want).abs() < 1.0);
+        assert!(near("server.runner.runner_p50_us", 100.0) && near("server.runner.runner_p99_us", 73_502.0), "the runner's: {:?} {:?}", at("server.runner.runner_p50_us"), at("server.runner.runner_p99_us"));
+        assert!(near("server.runner.server_p50_us", 500.0) && near("server.runner.server_p99_us", 990.0), "the server's: {:?} {:?}", at("server.runner.server_p50_us"), at("server.runner.server_p99_us"));
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0, false), &scrape(1000.0, false), 60.0);
+        assert!(n.contains_key("server.runner.to_owner_p99_us"), "the legs before them");
+        assert!(!n.keys().any(|k| k.starts_with("server.runner.runner_") || k.starts_with("server.runner.server_")), "no stamp, neither: {:?}", n.keys().collect::<Vec<_>>());
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a round reports its slowest API reads split, at p99 and at p99.9, by name;

@@ -525,8 +525,9 @@ pub enum FromRunner {
     AiSessions(Vec<crate::aisessions::AiSession>),
     /// `AiTranscript`, `AiView`, `HarnessTaskOutput`, `HarnessHistory`, `DirList`, `Answer`.
     Answer(Answer),
-    /// `Harness`: one update of agent session `session`.
-    Harness { session: String, update: Box<crate::harness::core::Update> },
+    /// `Harness`: one update of agent session `session`; and how long before its frame was made its runner
+    /// took it in, where its runner said (`crate::wire::stamp`; goal 10, plan 01a1a87b2dae step 5).
+    Harness { session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration> },
     HarnessInventory(Box<crate::harness::host::Inventory>),
     Sync { msg: Box<crate::sync::wire::Msg>, raft: Vec<u8> },
     FrontDoorStatus(Box<crate::frontdoor::Status>),
@@ -577,10 +578,15 @@ impl Carries for AgentMsg {
         let read = match self {
             AgentMsg::AiSessions { json } => FromRunner::AiSessions(payload(W, "AiSessions", &json)?),
             AgentMsg::AiTranscript { req, json } => FromRunner::Answer(Answer { of: "AiTranscript", req, json }),
-            AgentMsg::Harness { session, json } => match payload(W, "Harness", &json) {
-                Ok(update) => FromRunner::Harness { session, update },
-                Err(e) => return Err(e.about(&session)),
-            },
+            // Its runner's stamp, off its end first: the update is read as one without it (goal 10, plan
+            // 01a1a87b2dae step 5).
+            AgentMsg::Harness { session, mut json } => {
+                let taken = super::stamp::take(&mut json);
+                match payload(W, "Harness", &json) {
+                    Ok(update) => FromRunner::Harness { session, update, taken },
+                    Err(e) => return Err(e.about(&session)),
+                }
+            }
             AgentMsg::HarnessInventory { json } => FromRunner::HarnessInventory(payload(W, "HarnessInventory", &json)?),
             AgentMsg::AiView { req, json } => FromRunner::Answer(Answer { of: "AiView", req, json }),
             AgentMsg::HarnessTaskOutput { req, json } => FromRunner::Answer(Answer { of: "HarnessTaskOutput", req, json }),
@@ -998,6 +1004,31 @@ mod tests {
         anyhow::ensure!(fields == ["events[].stars", "events[].tone"], "{fields:?}");
         let counted = crate::metrics::wire().ignored.get(&[Wire::TunnelDown.name()]) - before;
         anyhow::ensure!(counted == 2, "one for each field of the message: {counted}");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's stamp is read off the end of its update where its frame is read,
+    /// and goes beside the update, which is read as one without it: the same update, with nothing in it this build
+    /// doesn't know. A build from before the stamp reads the same update and counts the field as one it doesn't
+    /// know. An update with no stamp reads as it always did, saying none.
+    #[test]
+    fn g10_s5_a_runners_stamp_is_read_off_its_update_and_goes_beside_it() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let u = Update::Events { events: vec![Event { id: "e1".into(), seq: 1, at: 1_000, parent: None, by: None, body: Body::Assistant { text: "hi".into(), streaming: false } }] };
+        let plain = serde_json::to_string(&u)?;
+        let mut stamped = plain.clone();
+        crate::wire::stamp::put(&mut stamped, Duration::from_micros(700));
+        let read = |json: &str| match (AgentMsg::Harness { session: "s1".into(), json: json.to_owned() }).read() {
+            Ok(Carried::Read(FromRunner::Harness { session, update, taken })) => Ok((session, *update, taken)),
+            _ => Err(anyhow::anyhow!("not read as a session's update: {json}")),
+        };
+        anyhow::ensure!(read(&stamped)? == ("s1".to_owned(), u.clone(), Some(Duration::from_micros(700))), "stamped: {stamped}");
+        anyhow::ensure!(read(&plain)? == ("s1".to_owned(), u, None), "plain: {plain}");
+        let mut cut = stamped.clone();
+        crate::wire::stamp::take(&mut cut);
+        let (known, older) = (unknown_in::<Update>(&cut), unknown_in::<Update>(&stamped));
+        anyhow::ensure!(known.is_empty() && older == ["taken_us"], "unknown here: {known:?}; to a build from before it: {older:?}");
         Ok(())
     }
 
