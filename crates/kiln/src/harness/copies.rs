@@ -1253,6 +1253,12 @@ pub struct Mirror {
     /// not a copy of it).
     pub(super) meta: Arc<Value>,
     pub(super) state: Arc<Value>,
+    /// The state and the meta as its machine last said them, each with the value made of it (goal 9, plan
+    /// 01a1a87b2cec step 5): the same one again isn't made into a value while the copy's is still that one
+    /// (`super::registry::Registry::apply`). Held here too, each value is copied before any change, so a
+    /// changed one is told apart by its pointer.
+    pub(super) state_of: Option<(Box<super::model::State>, Arc<Value>)>,
+    pub(super) meta_of: Option<(Box<super::model::Meta>, Arc<Value>)>,
     /// The state as its viewers last had it sent (what a state patch is made against).
     pub(super) sent: Arc<Value>,
     /// The bytes its last state frame took whole, and as a patch, and its last meta frame: the
@@ -1359,6 +1365,8 @@ impl Mirror {
             location,
             meta: null(),
             state: null(),
+            state_of: None,
+            meta_of: None,
             sent: null(),
             state_bytes: 0,
             patch_bytes: 0,
@@ -1481,6 +1489,11 @@ impl Mirror {
     /// a state none takes whole goes as its patch alone. Made only while someone watches
     /// ([`Mirror::commit`]).
     pub fn state_frame(&mut self) -> Option<Payload> {
+        // The state its viewers were last sent, not changed since (the same one again, goal 9, plan 01a1a87b2cec
+        // step 5): nothing to patch, as its patch would say, without comparing each field with itself.
+        if Arc::ptr_eq(&self.sent, &self.state) && self.state.is_object() {
+            return None;
+        }
         let rev = Some(self.rev);
         let (mut p, whole, patched) = {
             let patch = state_patch_of(&self.sent, &self.state);
@@ -2068,6 +2081,8 @@ pub struct Copies {
     /// The sessions' list as last joined ([`Copies::list_json`]), and how many times it was.
     listed: ArcSwapOption<Listed>,
     joins: AtomicU64,
+    /// [`Copies::inboxes_bound`].
+    inboxes_bound: usize,
 }
 
 impl Copies {
@@ -2090,7 +2105,14 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
+        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
+    }
+
+    /// What the owners' inboxes may hold together, in bytes: as much as may wait for the owners, and so as much
+    /// as their updates' rows may wait for the conversation store before what hands them updates waits
+    /// (`crate::convo::store::Store::room_within`; goal 10, plan 01a1a87b2dae step 5).
+    pub fn inboxes_bound(&self) -> usize {
+        self.inboxes_bound
     }
 
     /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
@@ -2328,13 +2350,11 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 }
             }
         }
-        // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
-        // 01a1a87b2e56 step 3): the updates it would take wait in its inbox, and those behind them upstream,
-        // rather than their rows piling up in the store's queue. The owner's task waits; its shard's thread
-        // goes on with its other tasks.
-        if let Some(store) = hub.get().and_then(Weak::upgrade).and_then(|h| h.harness.convo.clone()) {
-            store.room().await;
-        }
+        // The owner never waits for the conversation store (goal 10, plan 01a1a87b2dae step 5): it did, between its
+        // turns, while the store was over its bound (goal 11's, what its writer commits in 50 ms), and a disk that
+        // stalled the writer stalled every frame and attach of every session it owned. The rows its updates make
+        // wait in the store's queue instead, as many as would have waited in its inbox, and what hands it updates
+        // waits past that (`crate::harness::registry::Registry::from_runner`, `ingest_from`).
         turns.after().await;
     }
 }
