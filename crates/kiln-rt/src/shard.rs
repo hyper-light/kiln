@@ -702,6 +702,9 @@ impl ShardContext {
         counters.timer_waits = counters.timer_waits.saturating_add(self.timer_waits.get());
         counters.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
         counters.wake_cost_ns = self.quantum_ns.get();
+        counters.kicks_saved = self
+            .entry
+            .map_or(0, |entry| entry.parking.kicks_skipped());
         counters
     }
 
