@@ -67,6 +67,8 @@ pub struct EpollDriver {
     /// The timer slack the shard's thread had before [`Driver::set_timer_slack_ns`] set its own,
     /// restored when the driver goes (the thread may outlive the shard: `block_on`).
     slack_before: Option<u64>,
+    /// The waits whose events held the kick ([`Driver::kicks_taken`]).
+    kicks_taken: u64,
 }
 
 impl Drop for EpollDriver {
@@ -108,6 +110,7 @@ impl EpollDriver {
             nops: Vec::new(),
             precise,
             slack_before: None,
+            kicks_taken: 0,
         })
     }
 
@@ -261,9 +264,14 @@ impl Driver for EpollDriver {
             }
         }
         if kicked {
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
             self.drain_kick();
         }
         Ok(())
+    }
+
+    fn kicks_taken(&self) -> u64 {
+        self.kicks_taken
     }
 
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {
@@ -512,6 +520,34 @@ mod tests {
                 ));
             }
         }
+        drop(registration);
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a wait a kick ended takes one kick, however many were sent
+    /// before it (the eventfd sums them into one event), and delivers nothing: a shard counts its wakes by a
+    /// kick from this, once a wait.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s5_a_wait_a_kick_ended_takes_one_kick() {
+        /// Shape: kicks sent before the wait: more than one, so they are seen to sum.
+        const KICKS: usize = 3;
+        let efd = prepare_eventfd().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(efd))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let crate::driver::Kick::Eventfd(efd) = kick else {
+            panic!("the epoll driver's kick is its eventfd");
+        };
+        let mut driver = EpollDriver::with_eventfd(efd).unwrap();
+        assert_eq!(driver.kicks_taken(), 0);
+        for _ in 0..KICKS {
+            kick.kick();
+        }
+        let mut out = Vec::new();
+        driver.wait(None, &mut out).unwrap();
+        assert_eq!(driver.kicks_taken(), 1, "{KICKS} kicks before one wait are one event");
+        assert!(out.is_empty(), "a kick delivers nothing: {out:?}");
+        drop(driver);
         drop(registration);
     }
 }
