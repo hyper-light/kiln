@@ -383,6 +383,9 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+// One line of the sweep's report, every column a value the line prints (clippy -D warnings, all
+// targets: the gate builds benches too).
+#[allow(clippy::too_many_arguments)]
 fn report(a: &Args, which: &str, k: u64, overhead: u64, ns: &[u64], q: &Quality, messages: f64, raw: Option<String>) {
     if let Some(path) = raw
         && let Ok(mut f) = std::fs::File::create(&path)
