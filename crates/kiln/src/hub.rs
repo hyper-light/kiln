@@ -4082,15 +4082,31 @@ impl Hub {
 
     /// Sample the server host itself for the UI ("server" series).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut sampler = crate::host::Sampler::new(Some(&self.cfg.server.data_dir));
+        let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
         let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
             }
-            let s = sampler.sample();
-            self.record_sample("server", s);
+            // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
+            // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
+            // this loop about 2 s every minute (found by the Bare Metal Migration agent, 01a195ef; goal 9,
+            // plan 01a1a87b2cec step 3). The sampler goes with it and comes back, so each sample is the
+            // difference from the one before, as it was.
+            let mut s = sampler.take().unwrap_or_else(|| crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
+            match crate::rt::blocking(move || {
+                let sample = s.sample();
+                (s, sample)
+            })
+            .await
+            {
+                Ok((back, sample)) => {
+                    sampler = Some(back);
+                    self.record_sample("server", sample);
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+            }
         }
     }
 
