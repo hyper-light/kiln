@@ -246,27 +246,35 @@ fn apply_shared(s: &Settings) {
 
 /// The targets probed: the settings' own, and kiln's when `automatic`.
 fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
+    let server = ctx.server_url.trim_end_matches('/');
+    targets_for(s, ctx, server.starts_with("http://") && server_here(server))
+}
+
+/// [`targets`], told whether the server the runner reports to runs on this machine (`here`).
+fn targets_for(s: &Settings, ctx: &Ctx, here: bool) -> Vec<settings::Target> {
     let mut out = Vec::new();
     if s.automatic {
         out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None, window_ms: None });
-        if ctx.server_url.starts_with("http://") {
+        // The server's health, and its delay, only where it runs on this machine: work elsewhere
+        // can't slow it, and paced for it anyway it's held for nothing. On 2026-11-05 the Mac
+        // runners learned production's latency (its own machine loaded) as harm their builds did,
+        // and held every agent's run to about 1% of a CPU (goal 8, plan 01a1a59c2b29 step 5).
+        if here && ctx.server_url.starts_with("http://") {
             let server = ctx.server_url.trim_end_matches('/');
             out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None, window_ms: None });
-            // The server's own delay, where it runs on this machine (docs/priority.md; goal 8, plan
-            // 01a1a59c2b29 step 5): when its shards run ready work late, the legs and agents beside
-            // it are what's slowed first. What it answers is how late, on average, its ready work
-            // ran since the last look, so its tolerance is its shards' own clock, their probes'
-            // period (ready work a whole period late on average is a server behind), and trouble
-            // is caught within the platform's time, as every other target's is.
-            if server_here(server) {
-                let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
-                out.push(settings::Target {
-                    name: SERVER_DELAY.into(),
-                    probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
-                    tolerance_ms: Some(period),
-                    window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
-                });
-            }
+            // The server's own delay (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5): when its
+            // shards run ready work late, the legs and agents beside it are what's slowed first.
+            // What it answers is how late, on average, its ready work ran since the last look, so
+            // its tolerance is its shards' own clock, their probes' period (ready work a whole
+            // period late on average is a server behind), and trouble is caught within the
+            // platform's time, as every other target's is.
+            let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
+            out.push(settings::Target {
+                name: SERVER_DELAY.into(),
+                probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
+                tolerance_ms: Some(period),
+                window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
+            });
         }
     }
     out.extend(s.targets.iter().cloned());
@@ -652,14 +660,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn automatic_targets_are_the_runner_disk_and_its_server() {
-        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
-        let t = targets(&Settings::default(), &ctx);
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.get(1).map(|t| &t.probe), Some(&settings::Probe::Http { url: "http://192.168.49.2:30070/healthz".into() }));
-        assert!(t.iter().all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
+    fn automatic_targets_are_the_runner_disk_and_its_server_where_it_runs_here() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://127.0.0.1:7070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, true);
+        let probes: Vec<_> = t.iter().map(|t| &t.probe).collect();
+        assert_eq!(probes.len(), 3, "{probes:?}");
+        assert_eq!(probes.get(1), Some(&&settings::Probe::Http { url: "http://127.0.0.1:7070/healthz".into() }));
+        assert_eq!(probes.get(2), Some(&&settings::Probe::Delay { url: "http://127.0.0.1:7070/healthz/delay".into() }));
+        assert!(t.iter().take(2).all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
         let off = Settings { automatic: false, ..Settings::default() };
-        assert!(targets(&off, &ctx).is_empty());
+        assert!(targets_for(&off, &ctx, true).is_empty());
+    }
+
+    /// Goal 8, plan 01a1a59c2b29 step 5: a runner on another machine than its server paces nothing
+    /// for the server (its work can't slow it), only for its own disk.
+    #[test]
+    fn g8_s5_a_runner_on_another_machine_paces_nothing_for_its_server() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, false);
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["runner disk"]);
     }
 
     #[test]
