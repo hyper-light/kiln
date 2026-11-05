@@ -89,6 +89,10 @@ pub enum Probe {
     /// kept.
     #[serde(skip)]
     Delay { url: String },
+    /// Whether messages get through to this runner's agents (`super::messages`): measured on what
+    /// they're handed, never probed. kiln's own: never in settings sent or kept.
+    #[serde(skip)]
+    Messages,
 }
 
 impl Settings {
