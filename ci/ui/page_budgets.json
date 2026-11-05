@@ -52,7 +52,7 @@
       "first": {
         "total_br": 479768,
         "js_br": 361708,
-        "css_br": 61403,
+        "css_br": 61392,
         "font_br": 54581,
         "html_br": 8220,
         "requests": 98,
@@ -65,12 +65,12 @@
     },
     "conversation": {
       "first": {
-        "total_br": 533261,
-        "js_br": 412490,
-        "css_br": 64114,
+        "total_br": 522207,
+        "js_br": 401434,
+        "css_br": 64103,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 103,
+        "requests": 102,
         "waves": 4
       },
       "deploy": {
@@ -80,12 +80,12 @@
     },
     "runs": {
       "first": {
-        "total_br": 486711,
-        "js_br": 373010,
-        "css_br": 57472,
+        "total_br": 391492,
+        "js_br": 278140,
+        "css_br": 56682,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 87,
+        "requests": 81,
         "waves": 4
       },
       "deploy": {

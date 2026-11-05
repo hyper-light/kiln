@@ -113,6 +113,7 @@ export default defineConfig({
   build: {
     target: "es2022",
     chunkSizeWarningLimit: 600,
-    sourcemap: false,
+    // Source maps only to attribute bytes to modules (ci/ui/attribute.mjs, goal 8 step 6).
+    sourcemap: process.env.KILN_UI_SOURCEMAP === "1" ? "hidden" : false,
   },
 });

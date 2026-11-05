@@ -34,7 +34,8 @@ export const PAGES = {
 };
 
 const STATIC_IMPORT = /(?:\bimport|\bexport)\s*(?:[\w*{}\s,$]*?\s*from\s*)?["'`]([^"'`]+?\.js)["'`]/g;
-const DYNAMIC_IMPORT = /import\(\s*["'`]([^"'`]+?\.js)["'`]\s*\)\s*,\s*__vite__mapDeps\(\s*\[([\d,\s]*)\]\s*\)/g;
+// `import("./x.js")` (or `.then(e=>e.t)` on it, when the chunk is shared and re-exports), then the files it preloads.
+const DYNAMIC_IMPORT = /import\(\s*["'`]([^"'`]+?\.js)["'`]\s*\)(?:\.then\([^()]*\))?\s*,\s*__vite__mapDeps\(\s*\[([\d,\s]*)\]\s*\)/g;
 const DYNAMIC_BARE = /import\(\s*["'`]([^"'`]+?\.js)["'`]\s*\)/g;
 const MAP_DEPS = /m\.f\s*=\s*(\[[^\]]*\])/;
 

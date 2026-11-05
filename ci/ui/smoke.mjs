@@ -47,6 +47,15 @@ for (const engine of engines.length ? engines : ["chromium", "webkit"]) {
         await page.goto(base + at, { waitUntil: "load", timeout: 120_000 });
         await page.waitForTimeout(4000);
         if (await page.locator('[aria-busy="true"] >> text=Loading kiln').count()) problems.push("still on the splash");
+        // The conversation's deferred tabs (goal 8 step 6) open in place.
+        if (name === "conversation" && form === "desktop")
+          for (const tab of ["Plan", "Tools"]) {
+            const t = page.getByRole("tab", { name: new RegExp(`^${tab}`) });
+            if (!(await t.count())) continue;
+            await t.first().click();
+            await page.waitForTimeout(2500);
+            if (await page.getByText(/^Loading (the plan|its tools)$/).count()) problems.push(`the ${tab} tab is still loading`);
+          }
       } catch (e) {
         problems.push(`load: ${e.message.split("\n")[0]}`);
       }
