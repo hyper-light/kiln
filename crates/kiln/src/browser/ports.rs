@@ -30,11 +30,14 @@ const CONNECT: Duration = Duration::from_secs(5);
 const LISTED_FOR: Duration = Duration::from_secs(5);
 
 /// A connection, as this side needs it: what goes to its port, the server's acknowledgements, and
-/// its end (dropped, the connection's reader stops).
+/// its end (dropped, the connection's reader stops). What goes to its port, and its end, on lock-free
+/// queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae): an async-channel's wait took
+/// event-listener's `Mutex`, the runner's loop sending on its shard and the connection's writer and
+/// reader waiting on theirs.
 struct Near {
-    to_port: async_channel::Sender<Bytes>,
+    to_port: crate::memory::queue::Sender<Bytes>,
     acks: futures::channel::mpsc::UnboundedSender<u64>,
-    _stop: async_channel::Sender<()>,
+    _stop: crate::memory::queue::Sender<()>,
 }
 
 fn near() -> &'static Mutex<HashMap<u64, Near>> {
@@ -63,7 +66,7 @@ pub fn allowed(session: &str, root: Option<u32>, port: u16) -> bool {
 
 /// `ServerMsg::PortOpen`: connect `conn` to `port` (when `allowed`), say so, then carry its bytes
 /// until either side ends it.
-pub async fn serve_open(conn: u64, port: u16, allowed: bool, up: async_channel::Sender<Up>) {
+pub async fn serve_open(conn: u64, port: u16, allowed: bool, up: crate::memory::queue::Sender<Up>) {
     if !allowed {
         say(&up, AgentMsg::PortOpened { conn, error: Some(format!("nothing of this session's machine's own listens on port {port}")) }).await;
         return;
@@ -76,9 +79,11 @@ pub async fn serve_open(conn: u64, port: u16, allowed: bool, up: async_channel::
         }
     };
     let (mut rd, mut wr) = crate::http::io::RtFuturesIo::new(tcp).split();
-    let (to_port, from_server) = async_channel::unbounded::<Bytes>();
+    // Unbounded, as the channel it was: the server sends no more than [`WINDOW`] this side hasn't
+    // acknowledged (`crate::harness::opened`).
+    let (to_port, from_server) = crate::memory::queue::unbounded::<Bytes>(&crate::memory::owners::CHANNELS);
     let (acks, mut acked) = futures::channel::mpsc::unbounded::<u64>();
-    let (stop, stopped) = async_channel::bounded::<()>(1);
+    let (stop, stopped) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
     near().lock().insert(conn, Near { to_port, acks, _stop: stop });
     if !say(&up, AgentMsg::PortOpened { conn, error: None }).await {
         near().lock().remove(&conn);
@@ -140,7 +145,7 @@ pub async fn serve_open(conn: u64, port: u16, allowed: bool, up: async_channel::
 }
 
 /// Said to the server, on the ports' lane: whether it went.
-async fn say(up: &async_channel::Sender<Up>, m: AgentMsg) -> bool {
+async fn say(up: &crate::memory::queue::Sender<Up>, m: AgentMsg) -> bool {
     up.send(Up::Port(m)).await.is_ok()
 }
 
@@ -182,7 +187,7 @@ mod tests {
     use super::*;
 
     /// What a connection says, by kind: what it read, whether it opened, its acknowledgements.
-    async fn said(rx: &async_channel::Receiver<Up>) -> Option<AgentMsg> {
+    async fn said(rx: &crate::memory::queue::Receiver<Up>) -> Option<AgentMsg> {
         match crate::rt::timeout(Duration::from_secs(10), rx.recv()).await {
             Ok(Ok(Up::Port(m))) => Some(m),
             _ => None,
@@ -204,7 +209,7 @@ mod tests {
                     }
                 }
             });
-            let (up, rx) = async_channel::unbounded();
+            let (up, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             crate::rt::spawn(serve_open(7, port, true, up));
             assert_eq!(said(&rx).await, Some(AgentMsg::PortOpened { conn: 7, error: None }));
             data(7, b"world".to_vec());
@@ -229,7 +234,7 @@ mod tests {
     #[test]
     fn a_port_not_listed_or_not_listening_isnt_opened() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let (up, rx) = async_channel::unbounded();
+            let (up, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             serve_open(8, 1, false, up.clone()).await;
             assert!(matches!(said(&rx).await, Some(AgentMsg::PortOpened { conn: 8, error: Some(_) })));
             // Listed but nothing there any more.

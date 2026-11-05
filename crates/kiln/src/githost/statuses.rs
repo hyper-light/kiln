@@ -83,6 +83,10 @@ pub async fn report(hub: &Hub, run_id: &str) -> anyhow::Result<()> {
 pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.subscribe_events()?;
+    // Every minute, whatever else comes: a sleep made again on every pass never ended while events kept coming, and the
+    // catch-up never ran then (goal 9, plan 01a1a87b2cec step 3). Its first tick is at once: taken here.
+    let mut minute = crate::rt::Interval::new(RECONCILE_EVERY);
+    minute.tick().await;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
@@ -98,7 +102,7 @@ pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 Err(async_broadcast::RecvError::Overflowed(_)) => reconcile(&hub).await,
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
-            () = crate::rt::sleep(Duration::from_secs(60)).fuse() => reconcile(&hub).await,
+            () = minute.tick().fuse() => reconcile(&hub).await,
         }
     }
 }
@@ -115,8 +119,8 @@ fn run_of_event(text: &str) -> Option<String> {
 
 /// The runs whose status a host hasn't taken as they are, reported again.
 async fn reconcile(hub: &Hub) {
-    let Ok(marks) = hub.store.kv_prefix("ci/host-status/".into()).await else { return };
-    for (key, mark) in marks.into_iter().filter(|(_, m)| !settled(m.split('@').next().unwrap_or_default())).take(200) {
+    let Ok(marks) = unsettled(hub).await else { return };
+    for (key, mark) in marks {
         let Some(id) = key.strip_prefix("ci/host-status/") else { continue };
         if let Err(e) = report(hub, id).await {
             tracing::debug!(run = %id, mark = %mark, error = %format!("{e:#}"), "a run's commit status's catch-up");
@@ -124,9 +128,57 @@ async fn reconcile(hub: &Hub) {
     }
 }
 
+/// How often the runs a host didn't take are reported again.
+const RECONCILE_EVERY: Duration = Duration::from_secs(60);
+
+/// The most of them reported again at once.
+const RECONCILE_MOST: usize = 200;
+
+/// The marks of the runs whose status a host hasn't taken as they are (not settled), [`RECONCILE_MOST`] at the most, in
+/// their keys' order: read and picked out on the store's side. Every mark kept was read, then looked through and let go
+/// of on this task's shard each minute, one a run for as long as kiln has run them (goal 9, plan 01a1a87b2cec step 3).
+async fn unsettled(hub: &Hub) -> anyhow::Result<Vec<(String, String)>> {
+    hub.store
+        .read(|c| {
+            let mut st = c.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
+            let rows = st.query_map(["ci/host-status/"], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (k, v) = row?;
+                if !settled(v.split('@').next().unwrap_or_default()) {
+                    out.push((k, v));
+                    if out.len() >= RECONCILE_MOST {
+                        break;
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the runs a host hasn't taken are picked out on the store's side, settled ones left
+    /// there, in their keys' order and no more than the most reported again at once.
+    #[test]
+    fn g9_s3_the_unsettled_runs_are_picked_out_where_theyre_kept() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for (run, mark) in [("r1", "success@1"), ("r2", "running@1"), ("r3", "unreported"), ("r4", "failure@2"), ("r5", "pending@1")] {
+                hub.store.kv_set(format!("ci/host-status/{run}"), mark.into()).await?;
+            }
+            let picked: Vec<String> = unsettled(&hub).await?.into_iter().map(|(k, _)| k).collect();
+            anyhow::ensure!(picked == ["ci/host-status/r2", "ci/host-status/r3", "ci/host-status/r5"], "{picked:?}");
+            for n in 0..RECONCILE_MOST + 5 {
+                hub.store.kv_set(format!("ci/host-status/s{n:04}"), "running@1".into()).await?;
+            }
+            anyhow::ensure!(unsettled(&hub).await?.len() == RECONCILE_MOST, "no more than the most at once");
+            Ok(())
+        })
+    }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: a run's event says its run; any other, an agent session's info
     /// change among them, is passed over by its front.

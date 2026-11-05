@@ -906,7 +906,7 @@ mod tests {
             trusted: true,
             ..AssignmentV2::default()
         };
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = l.run().await;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());

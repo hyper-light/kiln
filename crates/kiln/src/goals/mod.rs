@@ -31,7 +31,7 @@ pub mod ops;
 mod sim;
 mod subagents;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -1935,7 +1935,8 @@ pub struct Driver<'a, P> {
     pub port: &'a P,
     /// The hub, for parents told of their children (`harness::told`) and paused sessions that go
     /// on elsewhere (`harness::elsewhere`): none for the driver alone (its tests), and for a step
-    /// of yours that goes at once (`push`).
+    /// of yours that goes at once (`push`). Where there's one it's the port too (`run`), and the
+    /// driver lists the sessions through it (`Driver::agents_now`, `Driver::agents_shared`).
     pub hub: Option<&'a Arc<Hub>>,
     /// What it counts its sends and the goals it saw end into (kiln's, `metrics::agents()`).
     pub metrics: &'a crate::metrics::AgentMetrics,
@@ -1961,7 +1962,7 @@ where
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but
             // for those `keep_going` leaves alone.
             let now = self.clock.unix_ms();
-            let all = self.port.agents();
+            let all = self.agents_now().await;
             let held = paused_for_usage(self.store).await;
             let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
             // Driven too: the subagents kiln started for plans' steps, which it follows itself
@@ -1970,21 +1971,31 @@ where
             if let Some(hub) = self.planner {
                 running.extend(subagents::held(hub).await);
             }
+            // What follows, up to the settings' read, was one poll but where keep-going sends: its
+            // turn on the shard is given up between the agents kept going and between the looks
+            // after them, and each agent's children are found among those gathered once (goal 9,
+            // plan 01a1a87b2cec step 3).
+            let mut turns = crate::rt::Turns::new();
+            let children = children_of(&all);
             for info in keep_going(&all, &running, &waiting, &quiet) {
-                keep::tick(self.port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
+                keep::tick(self.port, info, now, children_working(&children, &info.id)).await;
+                turns.after().await;
             }
-            keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+            keep::retain(all.iter().map(|i| i.id.as_str()));
             if let Some(hub) = self.hub {
                 // Programs' workers held to their usage thresholds, and settings' notices delivered
                 // (docs/programs.md), every 15 s.
                 if ticks.is_multiple_of(10) {
                     crate::programs::enforce(hub).await;
                 }
+                turns.after().await;
                 // Parents told of their children that settled, so none has to wait for them (one
                 // that's quiet once it goes on).
                 crate::harness::told::tick(hub, &all, now, &running, &quiet).await;
+                turns.after().await;
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
                 crate::harness::elsewhere::tick(hub, &all, now);
+                turns.after().await;
                 // Subagents given the rest of their agent's settings once their harness lists them.
                 crate::harness::lineage::settle_settings(hub).await;
                 // What agents' goals wait on a person for, on their info: Mission Control's Needs
@@ -2014,7 +2025,13 @@ where
     /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
     /// while.
     async fn round(&self, changing: &async_lock::Mutex<()>) -> (Vec<String>, Vec<String>) {
-        for info in self.port.agents() {
+        // Each agent as the registry shares it, none copied (`agents_shared`), and the loop's turn on
+        // its shard given up between agents, before the stacks are held: an agent with no goal of its
+        // own to adopt takes no wait, so the loop over every agent was one poll (goal 9, plan
+        // 01a1a87b2cec step 3).
+        let mut turns = crate::rt::Turns::new();
+        for info in self.agents_shared() {
+            turns.after().await;
             let _one = changing.lock().await;
             if let Err(e) = adopt(self, &info).await {
                 tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
@@ -2084,6 +2101,35 @@ where
         let slept = self.clock.sleep(TICK);
         matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
     }
+
+    /// Every agent the port knows now, as `HarnessPort::agents` lists them. Through the hub (the
+    /// port, where the driver has it), each session's info is copied on the compute pool
+    /// ([`listed`]), not on the driver's shard (goal 9, plan 01a1a87b2cec step 3).
+    async fn agents_now(&self) -> Vec<Info> {
+        match self.hub {
+            Some(hub) => listed(hub).await,
+            None => self.port.agents(),
+        }
+    }
+
+    /// [`Driver::agents_now`], for a loop that reads each agent alone: through the hub, each info
+    /// as the registry shares it, none copied (`Registry::list_shared`; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    fn agents_shared(&self) -> Vec<Arc<Info>> {
+        match self.hub {
+            Some(hub) => hub.harness.list_shared(),
+            None => self.port.agents().into_iter().map(Arc::new).collect(),
+        }
+    }
+}
+
+/// Every session as `Registry::list` has them (each info whole, oldest first), copied on the
+/// compute pool from the infos the registry shares (`Registry::list_shared`): made on the goal
+/// driver's shard, a copy of every session's whole info held it past its quantum where there are
+/// many (goal 9, plan 01a1a87b2cec step 3). Made here, as before, should the pool fail to take it.
+async fn listed(hub: &Hub) -> Vec<Info> {
+    let shared = hub.harness.list_shared();
+    crate::rt::compute(move || shared.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<Info>>()).await.unwrap_or_else(|_| hub.harness.list())
 }
 
 /// The agents keep-going looks at: those no goal stack drives (`running`), but for one that paused
@@ -2091,7 +2137,31 @@ where
 /// for usage (`quiet`: its session at a limit or its threshold, or its stack for its program's
 /// usage), which nothing prods (docs/programs.md, "Usage").
 fn keep_going<'a>(all: &'a [Info], running: &[String], waiting: &[String], quiet: &[String]) -> Vec<&'a Info> {
-    all.iter().filter(|i| !running.contains(&i.id) && !waiting.contains(&i.id) && !quiet.contains(&i.id)).collect()
+    // Each agent looked up in one set of those, not by a scan of each list (goal 9, plan
+    // 01a1a87b2cec step 3: O(N²) in one poll of the driver).
+    let left: HashSet<&str> = running.iter().chain(waiting).chain(quiet).map(String::as_str).collect();
+    all.iter().filter(|i| !left.contains(i.id.as_str())).collect()
+}
+
+/// The children of each agent among `all`, by its id, each agent's in `all`'s order: what
+/// `harness::told::children_working` scans every agent for, gathered in one pass (goal 9, plan
+/// 01a1a87b2cec step 3: that scan, for each agent kept going, was O(N²) in one poll of the driver).
+fn children_of(all: &[Info]) -> HashMap<&str, Vec<&Info>> {
+    let mut by: HashMap<&str, Vec<&Info>> = HashMap::new();
+    for c in all {
+        if let Some(parent) = c.parent.as_deref() {
+            by.entry(parent).or_default().push(c);
+        }
+    }
+    by
+}
+
+/// Whether `agent` has children at work, as `harness::told::children_working` says it: its children
+/// ([`children_of`]) looked at in the same order, until one is at work. Each look is `wait::stand`'s,
+/// which may forget a message it held as on its way: the same children are looked at as by that
+/// scan, so the same are forgotten.
+fn children_working(children: &HashMap<&str, Vec<&Info>>, agent: &str) -> bool {
+    children.get(agent).is_some_and(|cs| cs.iter().any(|c| crate::harness::wait::stand(c) == "working"))
 }
 
 /// A stack paused for a while, its time up: it runs again from where it stands (`run_from_here`),
@@ -2101,7 +2171,8 @@ async fn resume_due<P>(d: &Driver<'_, P>, agent: &str) -> anyhow::Result<()>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    let said_at = d.port.agents().into_iter().find(|i| i.id == agent).and_then(|i| i.objective).map_or(0, |o| o.at);
+    // Its own info, not a copy of every agent's to find it in (goal 9, plan 01a1a87b2cec step 3).
+    let said_at = d.port.agent(agent).and_then(|i| i.objective).map_or(0, |o| o.at);
     let (a, now) = (agent.to_owned(), d.clock.unix_ms());
     let running = d
         .store
@@ -2687,7 +2758,8 @@ where
     if paused.is_empty() {
         return;
     }
-    let all = d.port.agents();
+    // Copied off the shard (`Driver::agents_now`; goal 9, plan 01a1a87b2cec step 3).
+    let all = d.agents_now().await;
     for agent in paused {
         if crate::programs::rule(d.store, &all, &agent).await != crate::programs::Rule::Ok {
             continue;
@@ -2804,7 +2876,9 @@ where
         d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
-    let all = port.agents();
+    // Read here, with the stacks held, as each step reads it: through the hub, copied off the shard
+    // (`Driver::agents_now`; goal 9, plan 01a1a87b2cec step 3).
+    let all = d.agents_now().await;
     // Agents it started at work hold its next goal back (it ended its turn to let them), but for the
     // subagents kiln started for its plan's steps (`subagents`): its stack goes on beside those.
     let children = {
@@ -3139,6 +3213,65 @@ mod tests {
         assert_eq!(quiet, ["held", "limit"]);
         let looked_at: Vec<&str> = keep_going(&all, &["driven".to_owned()], &["waits".to_owned()], &quiet).into_iter().map(|i| i.id.as_str()).collect();
         assert_eq!(looked_at, ["free"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `keep_going`, each agent looked up in one set of those
+    /// driven, waiting and quiet, leaves out what the scans of each list did (ids given twice, ids
+    /// of no agent, an empty one), the rest in their order.
+    #[test]
+    fn g9_s3_keep_going_leaves_out_what_the_scans_left_out() {
+        let all: Vec<Info> = ["e", "a", "d", "b", "c", "a2"].into_iter().map(|id| Info { id: id.into(), ..Info::default() }).collect();
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        let (running, waiting, quiet) = (ids(&["d", "x", "d"]), ids(&["a", "d"]), ids(&["c", "", "c"]));
+        let scanned: Vec<&str> = all.iter().filter(|i| !running.contains(&i.id) && !waiting.contains(&i.id) && !quiet.contains(&i.id)).map(|i| i.id.as_str()).collect();
+        let kept: Vec<&str> = keep_going(&all, &running, &waiting, &quiet).into_iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(kept, scanned);
+        assert_eq!(kept, ["e", "b", "a2"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: whether an agent has children at work, by its children
+    /// gathered once (`children_of`), is what `told::children_working`'s scan of every agent says:
+    /// for each agent, for one gone that has children still, and for one with none.
+    #[test]
+    fn g9_s3_children_at_work_are_what_told_finds() {
+        let agent = |id: &str, parent: Option<&str>, status: Status, queued: usize| Info { id: id.into(), parent: parent.map(str::to_owned), status, queued, ..Info::default() };
+        let all = [
+            agent("g9s3-p1", None, Status::Idle, 0),
+            agent("g9s3-c1", Some("g9s3-p1"), Status::Idle, 0),
+            agent("g9s3-c2", Some("g9s3-p1"), Status::Running, 0),
+            agent("g9s3-p2", None, Status::Idle, 0),
+            agent("g9s3-c3", Some("g9s3-p2"), Status::Exited, 0),
+            agent("g9s3-c4", Some("g9s3-p2"), Status::Idle, 0),
+            agent("g9s3-p3", Some("g9s3-gone"), Status::Idle, 0),
+            agent("g9s3-c5", Some("g9s3-p3"), Status::Idle, 1),
+            agent("g9s3-c6", Some("g9s3-gone"), Status::Starting, 0),
+        ];
+        let children = children_of(&all);
+        for id in all.iter().map(|i| i.id.as_str()).chain(["g9s3-gone", "g9s3-nobody"]) {
+            assert_eq!(children_working(&children, id), crate::harness::told::children_working(&all, id), "{id}");
+        }
+        let at_work: Vec<&str> = all.iter().map(|i| i.id.as_str()).chain(["g9s3-gone", "g9s3-nobody"]).filter(|id| children_working(&children, id)).collect();
+        assert_eq!(at_work, ["g9s3-p1", "g9s3-p3", "g9s3-gone"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the sessions the driver copies off its shard (`listed`)
+    /// are the registry's list, each info whole, oldest first.
+    #[test]
+    fn g9_s3_the_sessions_copied_off_the_shard_are_the_registry_s_list() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for (id, at) in [("g9s3-b", 2), ("g9s3-c", 3), ("g9s3-a", 1)] {
+                let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), created_at: at, ..Info::default() };
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let copied = listed(&hub).await;
+            assert_eq!(copied, hub.harness.list());
+            let ids: Vec<&str> = copied.iter().map(|i| i.id.as_str()).filter(|id| id.starts_with("g9s3-")).collect();
+            assert_eq!(ids, ["g9s3-a", "g9s3-b", "g9s3-c"]);
+            Ok(())
+        })
     }
 
     /// CP-M3: a goal under way on another agent (a program's coordinator's, handed to its track's

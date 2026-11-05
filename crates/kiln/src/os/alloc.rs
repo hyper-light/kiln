@@ -80,6 +80,74 @@ pub const JEMALLOC_PROF_CONF: &str = "background_thread:true,narenas:5,dirty_dec
 /// What jemalloc reads: [`JEMALLOC_PROF_CONF`] where its heap profile is built in, else [`JEMALLOC_CONF`].
 pub const MALLOC_CONF_TEXT: &str = if cfg!(feature = "jemalloc-prof") { JEMALLOC_PROF_CONF } else { JEMALLOC_CONF };
 
+/// How a [`Candidate`]'s value reads (its type in jemalloc's manual, mallctl(3)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `bool`.
+    Bool,
+    /// `unsigned`.
+    Unsigned,
+    /// `size_t`.
+    Size,
+}
+
+/// One of jemalloc's settings past [`JEMALLOC_CONF`]'s that a lab's A/B gives a run through `_RJEM_MALLOC_CONF`
+/// (goal 11, plan 01a1a87b2e56 step 5), each said in the allocator's log line where a run's differs from
+/// jemalloc's default ([`said`]): its name in `malloc_conf`, its `opt.*` name, its type, and jemalloc 5.3.0's
+/// default (tikv-jemalloc-sys 0.6.1's copy: src/tcache.c, src/extent.c, src/extent_mmap.c,
+/// include/jemalloc/internal/arena_types.h). docs/runtime-lab.md ("The allocator's overhead, threads' stacks and
+/// observe's index (step 5)") gives each one's expected saving, its latency risk and the A/B that tells.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub name: &'static str,
+    pub ctl: &'static std::ffi::CStr,
+    pub kind: Kind,
+    pub default: &'static str,
+}
+
+/// The candidates, in the order the log says them:
+/// - `tcache_max`: the largest size a thread's cache keeps (32 KiB). TUNING.md's memory-first pick is 4096.
+/// - `tcache_nslots_small_max` and `tcache_nslots_large`: how many of a small size (200 at the most) and of a
+///   large one (20) a thread's cache keeps.
+/// - `lg_extent_max_active_fit`: how much larger (2^6) a dirty extent may be than the allocation it's cut for.
+/// - `oversize_threshold`: the size (8 MiB) from which an allocation takes the arena that purges at once.
+/// - `retain`: whether address space given back is kept for reuse (Linux: true); never resident either way.
+pub const CANDIDATES: [Candidate; 6] = [
+    Candidate { name: "tcache_max", ctl: c"opt.tcache_max", kind: Kind::Size, default: "32768" },
+    Candidate { name: "tcache_nslots_small_max", ctl: c"opt.tcache_nslots_small_max", kind: Kind::Unsigned, default: "200" },
+    Candidate { name: "tcache_nslots_large", ctl: c"opt.tcache_nslots_large", kind: Kind::Unsigned, default: "20" },
+    Candidate { name: "lg_extent_max_active_fit", ctl: c"opt.lg_extent_max_active_fit", kind: Kind::Size, default: "6" },
+    Candidate { name: "oversize_threshold", ctl: c"opt.oversize_threshold", kind: Kind::Size, default: "8388608" },
+    Candidate { name: "retain", ctl: c"opt.retain", kind: Kind::Bool, default: "true" },
+];
+
+/// The environment's word for the blocking pool's arena (goal 11, plan 01a1a87b2e56 step 5): its dirty decay, in
+/// milliseconds. Set, the blocking pool's workers allocate in an arena of their own (jemalloc's `arenas.create`;
+/// its TUNING.md, "Explicit arenas", "Explicit thread-to-arena binding"), whose dirty pages are kept that long,
+/// while the shards' arenas keep theirs [`DIRTY_DECAY_MS`]. The shards' work recurs every few seconds and reuses
+/// what it freed (the decay's basis); most of the pool's 54 workers wait, and a job's pages freed are idle until
+/// the next job of its kind. Unset, they share the shards' arenas, as before: the lab's A/B on one build
+/// (`--env-b KILN_ALLOC_POOL_DECAY_MS=1000`) says whether it's kept.
+pub const POOL_DECAY_VAR: &str = "KILN_ALLOC_POOL_DECAY_MS";
+
+/// The blocking pool's arena's dirty decay that `value` (the environment's [`POOL_DECAY_VAR`]) asks for, in
+/// milliseconds: none where it's unset or not a whole number of them. jemalloc takes any of them (up to its
+/// `NSTIME_SEC_MAX` seconds, past `u32`'s); 0 purges what's freed at once, on the thread that freed it.
+pub fn pool_decay_ms(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse::<u32>().ok()
+}
+
+/// The blocking pool's arena, once made: jemalloc's index of it and its dirty decay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolArena {
+    pub index: u32,
+    pub dirty_decay_ms: u32,
+}
+
+/// What [`init`] made of the blocking pool's arena, where the environment asked for one ([`POOL_DECAY_VAR`]).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+static POOL_ARENA: OnceLock<Result<PoolArena, &'static str>> = OnceLock::new();
+
 /// The settings as jemalloc's `malloc_conf` (tikv-jemalloc-sys's prefixed name for it), read at its first
 /// allocation; jemalloc's own is a weak `NULL` this replaces. `Option<&u8>` is a nullable pointer, as C's
 /// `const char *` is.
@@ -122,14 +190,23 @@ static ARENAS: OnceLock<Arenas> = OnceLock::new();
 
 /// The allocator's settings, as the process starts: `main`'s first call. jemalloc's are read by jemalloc
 /// itself; this keeps them linked into the binary. glibc's arenas are capped here, before the process's
-/// threads start (glibc makes an arena for a thread that finds the others busy, up to its cap).
+/// threads start (glibc makes an arena for a thread that finds the others busy, up to its cap). The blocking
+/// pool's arena is made here where the environment asks for one ([`POOL_DECAY_VAR`]), and what a pool's worker
+/// does as it starts and once it's cold is said, before the pools start (`hyper_rt::idle`).
 pub fn init() {
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     let _ = std::hint::black_box(&MALLOC_CONF);
     #[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
     let _ = PROFILE.set(profile::start());
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
-    let _ = hyper_rt::idle::when_cold(COLD_AFTER, give_back_thread_cache);
+    if let Some(ms) = pool_decay_ms(std::env::var(POOL_DECAY_VAR).ok().as_deref()) {
+        let _ = POOL_ARENA.set(make_pool_arena(ms));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = hyper_rt::idle::when_cold(COLD_AFTER, went_cold);
+        let _ = hyper_rt::idle::when_started(worker_started);
+    }
     // Before anything opens a database: SQLite takes its allocator only before it's first used, and while no other
     // thread uses it (sqlite3_config(3)), as at main's first line. Not in this crate's unit tests, which call this
     // beside other tests' databases: g11_s5_sqlite_allocates_through_jemalloc gives it in a process of its own.
@@ -174,6 +251,9 @@ pub fn said() -> String {
     if parts.is_empty() {
         parts.push("the system's allocator allocates".to_owned());
     }
+    if cfg!(target_os = "linux") {
+        parts.push(format!("a runtime thread's stack takes no huge pages, and a pool's worker idle {} s gives back its stack's pages below its frame", COLD_AFTER.as_secs()));
+    }
     parts.join("; ")
 }
 
@@ -192,7 +272,16 @@ fn jemalloc_said() -> Option<String> {
     if jemalloc_opt(c"opt.background_thread", false) == Some(true) && jemalloc_opt(c"background_thread", false) != Some(true) {
         said.push_str(", though its background threads didn't start: it purges only as its arenas are used");
     }
+    let past: Vec<String> = past_kilns().iter().map(|(c, took)| format!("{}:{took} (jemalloc's {})", c.name, c.default)).collect();
+    if !past.is_empty() {
+        said.push_str(&format!("; past kiln's settings, {}", past.join(", ")));
+    }
     said.push_str(&format!("; a pool's worker idle {} s gives its thread's cache back", COLD_AFTER.as_secs()));
+    said.push_str(&match POOL_ARENA.get() {
+        Some(Ok(arena)) => format!("; the blocking pool's workers allocate in an arena of their own ({}), its dirty pages kept {} ms ({POOL_DECAY_VAR})", arena.index, arena.dirty_decay_ms),
+        Some(Err(what)) => format!("; the blocking pool's workers share the shards' arenas: jemalloc refused {what} ({POOL_DECAY_VAR})"),
+        None => String::new(),
+    });
     said.push_str(match SQLITE.get() {
         Some(true) => "; SQLite allocates through it",
         Some(false) => "; SQLite refused it (it was in use already), so it allocates through the C library's malloc",
@@ -222,6 +311,23 @@ pub fn jemalloc_took() -> Option<String> {
         jemalloc_opt(c"opt.muzzy_decay_ms", 0_isize)?,
         jemalloc_opt_text(c"opt.thp")?,
     ))
+}
+
+/// The value jemalloc took for candidate `c` ([`CANDIDATES`]), written as `malloc_conf` writes it.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn candidate_took(c: &Candidate) -> Option<String> {
+    Some(match c.kind {
+        Kind::Bool => jemalloc_opt(c.ctl, false)?.to_string(),
+        Kind::Unsigned => jemalloc_opt(c.ctl, 0_u32)?.to_string(),
+        Kind::Size => jemalloc_opt(c.ctl, 0_usize)?.to_string(),
+    })
+}
+
+/// The candidates jemalloc took at other than its default, with what it took: what a run's `_RJEM_MALLOC_CONF`
+/// gave past kiln's settings (goal 11, plan 01a1a87b2e56 step 5).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+pub fn past_kilns() -> Vec<(&'static Candidate, String)> {
+    CANDIDATES.iter().filter_map(|c| candidate_took(c).filter(|took| took != c.default).map(|took| (c, took))).collect()
 }
 
 /// One of jemalloc's settings or states as it has it (mallctl(3)), read into `value`, a value of the name's
@@ -263,17 +369,72 @@ fn jemalloc_set<T: Copy>(name: &std::ffi::CStr, mut value: T) -> bool {
 /// ran a job and then waits keeps what the job freed for as long as it waits: in the lab, 54 of the blocking pool's
 /// workers and the compute pool's, most of them waiting at any time (the pool hands a job to the worker idle
 /// last). Past the decay, what the worker keeps is what jemalloc would have purged by now had it been given back
-/// as it was freed; given back then, it's purged within the next decay.
+/// as it was freed; given back then, it's purged within the next decay. Its stack's pages below its frame go then
+/// too, by the same reckoning: idle that long, the job they were touched for is done (`crate::os::stack`).
 pub const COLD_AFTER: std::time::Duration = std::time::Duration::from_millis(DIRTY_DECAY_MS as u64);
 
 /// Gives the calling thread's cache back to its arena (jemalloc's `thread.tcache.flush`): what a pool's worker does
-/// once it's cold ([`COLD_AFTER`]).
+/// once it's cold ([`COLD_AFTER`], [`went_cold`]).
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 #[allow(unsafe_code)]
 fn give_back_thread_cache() {
     // SAFETY: the name ends in a NUL; `thread.tcache.flush` reads and writes nothing of the caller's (no `oldp`, no
     // `newp`), and acts on the calling thread's cache alone.
     let _ = unsafe { tikv_jemalloc_sys::mallctl(c"thread.tcache.flush".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
+}
+
+/// What a pool's worker does once it's cold ([`COLD_AFTER`], `hyper_rt::idle`; goal 11, plan 01a1a87b2e56 step 5):
+/// gives its thread's cache back to jemalloc's arenas, where jemalloc allocates, then its stack's pages below its
+/// frame back to the kernel (`crate::os::stack`), from the shallowest frame it runs in.
+#[cfg(target_os = "linux")]
+fn went_cold() {
+    #[cfg(feature = "jemalloc")]
+    give_back_thread_cache();
+    let _ = crate::os::stack::give_back_unused();
+}
+
+/// What a pool's worker does as it starts, on its own thread (`hyper_rt::idle`; goal 11, plan 01a1a87b2e56 step 5):
+/// its stack takes no huge pages (`crate::os::stack`), and a blocking pool's worker takes the pools' arena where
+/// the run made one ([`POOL_DECAY_VAR`]).
+#[cfg(target_os = "linux")]
+fn worker_started(pool: hyper_rt::idle::Pool) {
+    let _ = crate::os::stack::no_huge_pages();
+    #[cfg(feature = "jemalloc")]
+    if pool == hyper_rt::idle::Pool::Blocking
+        && let Some(Ok(arena)) = POOL_ARENA.get()
+    {
+        let _ = bind_to_arena(arena.index);
+    }
+    #[cfg(not(feature = "jemalloc"))]
+    let _ = pool;
+}
+
+/// `arena.<index>.<what>`, one of an arena's own settings or states, as mallctl(3) names it.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn arena_ctl(index: u32, what: &str) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(format!("arena.{index}.{what}")).ok()
+}
+
+/// Makes an arena for the blocking pool's workers ([`POOL_DECAY_VAR`]) and has it keep its dirty pages
+/// `dirty_decay_ms`; its muzzy pages, as every arena's, [`MUZZY_DECAY_MS`] or the environment's. Its index, or what
+/// jemalloc refused.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn make_pool_arena(dirty_decay_ms: u32) -> Result<PoolArena, &'static str> {
+    // Reading `arenas.create` makes the arena, and answers its index.
+    let index = jemalloc_opt(c"arenas.create", 0_u32).ok_or("a new arena (arenas.create)")?;
+    let decay = isize::try_from(dirty_decay_ms).map_err(|_| "a decay past ssize_t")?;
+    let ctl = arena_ctl(index, "dirty_decay_ms").ok_or("its dirty decay's name")?;
+    if !jemalloc_set(&ctl, decay) {
+        return Err("its dirty decay (arena.<i>.dirty_decay_ms)");
+    }
+    Ok(PoolArena { index, dirty_decay_ms })
+}
+
+/// Has the calling thread allocate in arena `index` from now on (`thread.arena`): whether jemalloc took it. What the
+/// thread freed and its cache keeps goes back to the arenas it came from, as ever.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn bind_to_arena(index: u32) -> bool {
+    jemalloc_set(c"thread.arena", index)
 }
 
 /// Whether SQLite took jemalloc as its allocator ([`init`]).
@@ -853,6 +1014,157 @@ mod tests {
         assert_eq!(jemalloc_took(), Some(variant));
         let said = said();
         assert!(said.contains(&format!("kiln's {}, then _RJEM_MALLOC_CONF's {VARIANT})", JEMALLOC_CONF.trim_end_matches('\0'))), "{said}");
+        Ok(())
+    }
+
+    /// Runs this module's test `name` again in a process of its own (this test's binary, that test alone) with `env`
+    /// set: for what jemalloc and [`init`] read once, as a process starts.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    fn alone(name: &str, env: &[(&str, &str)]) -> anyhow::Result<()> {
+        let me = format!("{}::{name}", module_path!().split_once("::").map_or("", |(_, path)| path));
+        let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"]).envs(env.iter().copied()).output()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        anyhow::ensure!(out.status.success(), "{me} with {env:?} ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+        anyhow::ensure!(said.contains("1 passed"), "{me} with {env:?} didn't run alone: {said}");
+        Ok(())
+    }
+
+    /// The candidates are jemalloc's settings with jemalloc 5.3.0's defaults, as jemalloc reads them back where a run
+    /// gives none, and none is said past kiln's (goal 11, plan 01a1a87b2e56 step 5).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g11_s5_the_candidates_are_at_jemallocs_defaults_unless_a_run_says() {
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_some() {
+            return;
+        }
+        for c in &CANDIDATES {
+            assert_eq!(candidate_took(c).as_deref(), Some(c.default), "{}", c.name);
+        }
+        assert!(past_kilns().is_empty());
+        assert!(!said().contains("past kiln's settings"), "{}", said());
+    }
+
+    /// A run's settings past kiln's (a lab's variant, `_RJEM_MALLOC_CONF`) are taken over jemalloc's defaults, kiln's
+    /// own stay as kiln sets them, and the log says each with jemalloc's default beside it (goal 11, plan 01a1a87b2e56
+    /// step 5). jemalloc reads its settings once, so this runs again in a process of its own with the variant.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g11_s5_a_runs_settings_past_kilns_are_taken_and_said() -> anyhow::Result<()> {
+        const VARIANT: &str = "tcache_max:4096,lg_extent_max_active_fit:3,oversize_threshold:2097152,retain:false";
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_none() {
+            return alone("g11_s5_a_runs_settings_past_kilns_are_taken_and_said", &[("_RJEM_MALLOC_CONF", VARIANT)]);
+        }
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_some_and(|v| v != VARIANT) {
+            return Ok(());
+        }
+        let past: Vec<(&str, String)> = past_kilns().into_iter().map(|(c, took)| (c.name, took)).collect();
+        let want = [("tcache_max", "4096"), ("lg_extent_max_active_fit", "3"), ("oversize_threshold", "2097152"), ("retain", "false")];
+        anyhow::ensure!(past.iter().map(|(n, v)| (*n, v.as_str())).eq(want), "{past:?}");
+        let said = said();
+        anyhow::ensure!(said.contains(&format!("({}, as kiln sets it)", JEMALLOC_CONF.trim_end_matches('\0'))), "{said}");
+        anyhow::ensure!(
+            said.contains("past kiln's settings, tcache_max:4096 (jemalloc's 32768), lg_extent_max_active_fit:3 (jemalloc's 6), oversize_threshold:2097152 (jemalloc's 8388608), retain:false (jemalloc's true)"),
+            "{said}"
+        );
+        Ok(())
+    }
+
+    /// The pools' arena's decay is a whole number of milliseconds, or none asked (goal 11, plan 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_pools_arenas_decay_is_whole_milliseconds() {
+        assert_eq!(pool_decay_ms(None), None);
+        assert_eq!(pool_decay_ms(Some("1000")), Some(1000));
+        assert_eq!(pool_decay_ms(Some(" 0 ")), Some(0));
+        assert_eq!(pool_decay_ms(Some("")), None);
+        assert_eq!(pool_decay_ms(Some("-1")), None, "never purging isn't a pick");
+        assert_eq!(pool_decay_ms(Some("1.5")), None);
+        assert_eq!(pool_decay_ms(Some("1s")), None);
+    }
+
+    /// The freed pages an arena keeps, in bytes (`stats.arenas.<i>.pdirty`, as of a new epoch).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    fn arena_dirty_bytes(index: u32) -> Option<u64> {
+        if !jemalloc_set(c"epoch", 1_u64) {
+            return None;
+        }
+        let page = u64::try_from(jemalloc_opt(c"arenas.page", 0_usize)?).ok()?;
+        let name = std::ffi::CString::new(format!("stats.arenas.{index}.pdirty")).ok()?;
+        u64::try_from(jemalloc_opt(&name, 0_usize)?).ok()?.checked_mul(page)
+    }
+
+    /// An arena made for the pools keeps what its threads free for its own decay, not the shards' arenas': at 0 it
+    /// purges at once, at a minute it keeps it (goal 11, plan 01a1a87b2e56 step 5). On threads of their own, each
+    /// bound to its arena, whose blocks are asked of jemalloc directly (the test binary's allocator is the system's).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g11_s5_an_arenas_own_decay_keeps_or_purges_what_its_threads_free() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        // Past a thread's cache (`tcache_max`, 32 KiB) and below the arena that purges at once (`oversize_threshold`,
+        // 8 MiB): freed, it goes straight back to its arena.
+        const BLOCK: usize = 4 << 20;
+        for (decay, kept) in [(0_u32, false), (60_000, true)] {
+            let arena = make_pool_arena(decay).map_err(anyhow::Error::msg)?;
+            let ctl = arena_ctl(arena.index, "dirty_decay_ms").ok_or_else(|| anyhow::anyhow!("its name"))?;
+            anyhow::ensure!(jemalloc_opt(&ctl, -2_isize) == isize::try_from(decay).ok(), "arena {}'s decay", arena.index);
+            let dirty = std::thread::spawn(move || -> Option<u64> {
+                if !bind_to_arena(arena.index) || jemalloc_opt(c"thread.arena", u32::MAX) != Some(arena.index) {
+                    return None;
+                }
+                let layout = Layout::from_size_align(BLOCK, 4096).ok()?;
+                // SAFETY: a layout of non-zero size.
+                let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+                if block.is_null() {
+                    return None;
+                }
+                // SAFETY: `block` is BLOCK bytes, jemalloc's, written whole, then freed once with its layout.
+                unsafe {
+                    std::ptr::write_bytes(block, 1, BLOCK);
+                    tikv_jemallocator::Jemalloc.dealloc(block, layout);
+                }
+                arena_dirty_bytes(arena.index)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?
+            .ok_or_else(|| anyhow::anyhow!("arena {} wasn't taken, or said nothing", arena.index))?;
+            let block = u64::try_from(BLOCK)?;
+            if kept {
+                anyhow::ensure!(dirty >= block, "a minute's decay keeps the block: {dirty} bytes dirty");
+            } else {
+                anyhow::ensure!(dirty == 0, "no decay purges it at once: {dirty} bytes dirty");
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a run asks for the pools' arena, the blocking pool's workers take it as they start and the compute
+    /// pool's keep the shards' arenas; the log says so (goal 11, plan 01a1a87b2e56 step 5). [`init`] reads the
+    /// environment once, so this runs again in a process of its own with the variable set.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g11_s5_the_blocking_pools_workers_take_the_pools_arena() -> anyhow::Result<()> {
+        if std::env::var_os(POOL_DECAY_VAR).is_none() {
+            return alone("g11_s5_the_blocking_pools_workers_take_the_pools_arena", &[(POOL_DECAY_VAR, "1000")]);
+        }
+        init();
+        let arena = match POOL_ARENA.get() {
+            Some(Ok(arena)) => *arena,
+            other => anyhow::bail!("the pools' arena: {other:?}"),
+        };
+        anyhow::ensure!(arena.dirty_decay_ms == 1000, "{arena:?}");
+        let on = |pool: hyper_rt::idle::Pool| {
+            std::thread::spawn(move || {
+                worker_started(pool);
+                jemalloc_opt(c"thread.arena", u32::MAX)
+            })
+            .join()
+            .ok()
+            .flatten()
+        };
+        anyhow::ensure!(on(hyper_rt::idle::Pool::Blocking) == Some(arena.index), "a blocking pool's worker takes arena {}", arena.index);
+        anyhow::ensure!(on(hyper_rt::idle::Pool::Compute).is_some_and(|i| i != arena.index), "a compute pool's worker keeps the shards'");
+        let said = said();
+        anyhow::ensure!(said.contains(&format!("the blocking pool's workers allocate in an arena of their own ({}), its dirty pages kept 1000 ms", arena.index)), "{said}");
         Ok(())
     }
 }

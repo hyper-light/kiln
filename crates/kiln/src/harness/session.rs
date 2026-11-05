@@ -608,10 +608,10 @@ impl Info {
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it): a queue bounded in bytes
-/// (`crate::memory::queue`: the server's own sessions', goal 11, plan 01a1a87b2e56 step 3), or a channel's
-/// sending end (a runner's, which its uplink bounds in bytes, and tests'). Either way a sender waits for
-/// room: nothing is dropped.
+/// Where a session's updates go (the server's registry, or the uplink to it): a queue (`crate::memory::queue`)
+/// bounded in bytes (the server's own sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's,
+/// on their way to its loop, whose uplink bounds them in bytes; goal 5, plan 01a1a59c2aae), or a channel's
+/// sending end (tests'). Either way a sender waits for room: nothing is dropped.
 #[derive(Clone, Debug)]
 pub enum Sink {
     Bounded(crate::memory::queue::Sender<(String, Update)>),
@@ -850,7 +850,11 @@ pub struct Session {
     pub created_at: i64,
     pub core: Mutex<Core>,
     info: Mutex<Info>,
-    ctl: async_channel::Sender<Ctl>,
+    /// What it's told (commands, a hook's word, a hand-over's ask), in order: a lock-free queue (goal 5,
+    /// plan 01a1a59c2aae, its top goal), unbounded as the channel it was. An async-channel's wait took
+    /// event-listener's `Mutex`, on each sender's shard (its lane's, a hook's) and on the session's own as
+    /// it waited.
+    ctl: crate::memory::queue::Sender<Ctl>,
     /// The process's pid while it runs.
     pub pid: Mutex<Option<u32>>,
     /// A turn of its is under way: set as one starts, cleared only as one ends (its harness ending
@@ -1281,7 +1285,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
-    let (ctl, ctl_rx) = async_channel::unbounded();
+    let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let s = Arc::new(Session {
         id,
         spec: Mutex::new(spec),
@@ -1318,7 +1322,7 @@ const GATHER_MAX: usize = 100_000;
 /// (still in its channel, or carried while its harness was down) join the end of its queue, in the
 /// order they came, to go with it (one for a subagent, its subagent's). Everything else in its
 /// channel is held back, for if it stays.
-fn gather(s: &Session, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>) -> Vec<Ctl> {
+fn gather(s: &Session, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>) -> Vec<Ctl> {
     let mut held = Vec::new();
     let mut waiting = Vec::new();
     {
@@ -1391,7 +1395,7 @@ struct Jobs {
 }
 
 /// Hand out what the core produced: updates to the sink, lines to the process.
-async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Vec<u8>>>) -> Jobs {
+async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Sender<Vec<u8>>>) -> Jobs {
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
@@ -1419,7 +1423,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
 /// closed channel is always ready, so it would be chosen first on every turn of the loop, which
 /// would spin without ever yielding (starving every task on its thread, the one that reaps the
 /// harness among them) and never see the other pipe close or the process exit.
-async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u8>> {
+async fn pipe(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u8>> {
     if open { rx.recv().await.ok() } else { std::future::pending().await }
 }
 
@@ -1741,7 +1745,7 @@ impl Done {
 /// Carry out what the adapter asked for. A branch starts another session; runs, reads and fetches
 /// go off the event loop and come back on `done`. A restart is the caller's: its point (the
 /// harness's own resume point, if any) is returned.
-fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_channel::Sender<Done>) -> Option<Option<String>> {
+fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::memory::queue::Sender<Done>) -> Option<Option<String>> {
     let effects = std::mem::take(&mut s.core.lock().effects);
     let mut restart = None;
     for e in effects {
@@ -2674,7 +2678,7 @@ enum Arrived {
 /// A session that moved here goes on once its folder has taken its repo's sync log as far as the
 /// machine it left had it: it never starts on files older than the ones it left. Messages sent
 /// meanwhile wait in `carry`; closing it ends the wait.
-async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
+async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
     let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
     let Some(sync) = crate::sync::runner::global() else {
         note("This machine doesn't sync folders, so its folder here may not have its last changes".into(), Level::Warn);
@@ -3107,13 +3111,15 @@ fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static 
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 #[allow(clippy::too_many_arguments)]
-async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
+async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queue::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
-    let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
+    // Its previews' and its effects' results, each back from the task that made it: lock-free queues,
+    // unbounded as the channels they were (goal 5, plan 01a1a59c2aae), each as many as the session asked.
+    let (pv_tx, pv_rx) = crate::memory::queue::unbounded::<(String, Vec<super::model::FileDiff>)>(&crate::memory::owners::CHANNELS);
     let mut changes = futures::stream::FuturesUnordered::new();
-    let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
+    let (fx_tx, fx_rx) = crate::memory::queue::unbounded::<Done>(&crate::memory::owners::CHANNELS);
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
     let handed = adopt.is_some();
@@ -4192,8 +4198,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 #[cfg(test)]
 mod tests {
     /// A session that runs nothing, and the receiving end of its channel (what its task would read).
-    fn idle(id: &str) -> (Session, async_channel::Receiver<Ctl>) {
-        let (ctl, rx) = async_channel::unbounded();
+    fn idle(id: &str) -> (Session, crate::memory::queue::Receiver<Ctl>) {
+        let (ctl, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let s = Session {
             id: id.into(),
             spec: Mutex::new(Spec::default()),
@@ -4209,6 +4215,37 @@ mod tests {
             prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: what a session is told goes on a lock-free
+    /// queue. Messages told from every shard at once each reach it once, each sender's in the order sent (a
+    /// move gathers them into its queue so), and once the session is gone, its task sees the end.
+    #[test]
+    fn g5_a_session_takes_what_every_shard_tells_it_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (s, rx) = idle("told");
+            let s = Arc::new(s);
+            let (senders, per) = (8usize, 300usize);
+            let mut telling = Vec::new();
+            for t in 0..senders {
+                let s = Arc::clone(&s);
+                telling.push(crate::rt::spawn_spread_joined(async move { (0..per).all(|n| s.command(message(&format!("{t}-{n}"), "x"))) }));
+            }
+            for t in telling {
+                anyhow::ensure!(t.await.unwrap_or(false), "a message was refused");
+            }
+            let held = gather(&s, &rx, &mut Vec::new());
+            anyhow::ensure!(held.is_empty(), "{} held back", held.len());
+            let ids: Vec<String> = s.core.lock().state.queue.iter().map(|q| q.id.clone()).collect();
+            anyhow::ensure!(ids.len() == senders * per, "{} of {}", ids.len(), senders * per);
+            for t in 0..senders {
+                let theirs: Vec<usize> = ids.iter().filter_map(|id| id.strip_prefix(&format!("{t}-"))?.parse().ok()).collect();
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            drop(s);
+            anyhow::ensure!(matches!(rx.try_recv(), Err(async_channel::TryRecvError::Closed)), "its end, once the session went");
+            Ok(())
+        })
     }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by

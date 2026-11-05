@@ -582,7 +582,10 @@ enum Ev {
 async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
     let a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the leg's assignment")?;
     let job = a.job_id.clone();
-    let (out_tx, out_rx) = async_channel::unbounded::<FromGuest>();
+    // Frames to the host, the host's and its terminals' events, the leg's uplink and its result: lock-free
+    // queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae), each with the bound its channel had. An
+    // async-channel's wait took event-listener's `Mutex`, each sender's shard (or thread) and its taker's.
+    let (out_tx, out_rx) = crate::memory::queue::unbounded::<FromGuest>(&crate::memory::owners::CHANNELS);
     let (mut reader, mut writer) = (conn.try_clone()?, conn);
     let wrote = std::thread::Builder::new().name("guest-out".into()).spawn(move || {
         while let Ok(f) = out_rx.recv_blocking() {
@@ -592,7 +595,7 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
             }
         }
     })?;
-    let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
     let from_host = ev_tx.clone();
     std::thread::Builder::new().name("guest-in".into()).spawn(move || {
         while let Ok(Some(m)) = recv::<ToGuest>(&mut reader) {
@@ -609,8 +612,8 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
         Some(ca) => crate::http::client::Client::new(crate::http::client::Roots::WebPkiPlusDer(ca), None)?,
         None => crate::http::client::Client::public()?,
     });
-    let (up_tx, up_rx) = async_channel::unbounded::<crate::exec::Up>();
-    let (result_tx, result_rx) = async_channel::bounded::<JobResult>(1);
+    let (up_tx, up_rx) = crate::memory::queue::unbounded::<crate::exec::Up>(&crate::memory::owners::CHANNELS);
+    let (result_tx, result_rx) = crate::memory::queue::places::<JobResult>(&crate::memory::owners::CHANNELS, 1);
     let relay = crate::rt::spawn(relay_up(up_rx, result_rx, out_tx.clone()));
     let leg = super::runtime::Leg {
         a,
@@ -636,7 +639,7 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
 
 /// The leg's events as they come, its result once every event before it has gone, then what its
 /// kept leg says (its reruns) until the leg lets go of it.
-async fn relay_up(up_rx: async_channel::Receiver<crate::exec::Up>, result_rx: async_channel::Receiver<JobResult>, out: async_channel::Sender<FromGuest>) {
+async fn relay_up(up_rx: crate::memory::queue::Receiver<crate::exec::Up>, result_rx: crate::memory::queue::Receiver<JobResult>, out: crate::memory::queue::Sender<FromGuest>) {
     use futures::future::Either;
     loop {
         let next = {
@@ -671,7 +674,7 @@ async fn relay_up(up_rx: async_channel::Receiver<crate::exec::Up>, result_rx: as
     }
 }
 
-async fn to_host(out: &async_channel::Sender<FromGuest>, up: crate::exec::Up) {
+async fn to_host(out: &crate::memory::queue::Sender<FromGuest>, up: crate::exec::Up) {
     use crate::exec::Up;
     let f = match up {
         Up::Msg(m) => FromGuest::Msg(m),
@@ -685,9 +688,9 @@ async fn to_host(out: &async_channel::Sender<FromGuest>, up: crate::exec::Up) {
 /// The host's requests for the leg (its cancel, its kept leg's release, extension and reruns,
 /// terminals into it) and its terminals' output.
 async fn serve(
-    ev_rx: async_channel::Receiver<Ev>,
-    ev_tx: async_channel::Sender<Ev>,
-    out: async_channel::Sender<FromGuest>,
+    ev_rx: crate::memory::queue::Receiver<Ev>,
+    ev_tx: crate::memory::queue::Sender<Ev>,
+    out: crate::memory::queue::Sender<FromGuest>,
     cancel: crate::rt::Shutdown,
     blocked: async_channel::Sender<String>,
     job: String,
@@ -1312,6 +1315,55 @@ fn special<R: Read>(e: &tar::Entry<'_, R>, target: &Path) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a microVM leg's uplink, its result and
+    /// its frames to the host are lock-free queues. What the leg sends from every shard reaches the host
+    /// once each, each sender's in the order sent, its result after all of them, and the relay ends once
+    /// the leg's uplink has.
+    #[test]
+    fn g5_a_legs_frames_reach_the_host_once_in_order_its_result_last() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (up_tx, up_rx) = crate::memory::queue::unbounded::<crate::exec::Up>(&crate::memory::owners::CHANNELS);
+            let (out_tx, out_rx) = crate::memory::queue::unbounded::<FromGuest>(&crate::memory::owners::CHANNELS);
+            let (result_tx, result_rx) = crate::memory::queue::places::<JobResult>(&crate::memory::owners::CHANNELS, 1);
+            let relay = crate::rt::spawn_spread_joined(relay_up(up_rx, result_rx, out_tx));
+            let (senders, per) = (8usize, 500u32);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let up = crate::exec::Uplink(up_tx.clone());
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        up.log(&format!("job-{s}"), n, Vec::new()).await;
+                    }
+                }));
+            }
+            for t in sending {
+                t.await.map_err(|_| anyhow::anyhow!("a sender ended early"))?;
+            }
+            let result = JobResult { job: "leg".into(), status: crate::store::Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+            result_tx.send(result).await.map_err(|_| anyhow::anyhow!("its result was refused"))?;
+            drop((up_tx, result_tx));
+            crate::rt::timeout(Duration::from_secs(30), relay).await.map_err(|_| anyhow::anyhow!("the relay never ended"))?.map_err(|_| anyhow::anyhow!("the relay ended early"))?;
+            let mut got = vec![Vec::<u32>::new(); senders];
+            let mut done = false;
+            while let Ok(f) = out_rx.try_recv() {
+                match f {
+                    FromGuest::Log(c) if !done => {
+                        let s: usize = c.job.trim_start_matches("job-").parse()?;
+                        got.get_mut(s).ok_or_else(|| anyhow::anyhow!("no job {s}"))?.push(c.idx);
+                    }
+                    FromGuest::Done(r) if !done && r.job == "leg" => done = true,
+                    other => anyhow::bail!("{other:?} (its result in: {done})"),
+                }
+            }
+            anyhow::ensure!(done, "its result never came");
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "job {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            anyhow::ensure!(matches!(out_rx.try_recv(), Err(async_channel::TryRecvError::Closed)), "its end, once the relay went");
+            Ok(())
+        })
+    }
 
     fn layer(dir: &Path, name: &str, entries: &[(&str, Option<&str>)]) -> anyhow::Result<PathBuf> {
         let path = dir.join(name);

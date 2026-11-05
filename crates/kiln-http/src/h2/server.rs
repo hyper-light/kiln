@@ -46,6 +46,7 @@ pub struct Builder {
     max_header_list_size: u32,
     keep_alive_interval: Option<Duration>,
     keep_alive_timeout: Duration,
+    host_from_authority: bool,
 }
 
 impl Default for Builder {
@@ -57,6 +58,7 @@ impl Default for Builder {
             max_header_list_size: 64 << 10,
             keep_alive_interval: None,
             keep_alive_timeout: Duration::from_secs(20),
+            host_from_authority: false,
         }
     }
 }
@@ -98,6 +100,14 @@ impl Builder {
 
     pub fn keep_alive_timeout(&mut self, timeout: Duration) -> &mut Builder {
         self.keep_alive_timeout = timeout;
+        self
+    }
+
+    /// Whether a request with no `Host` is given its `:authority` as one, as HTTP/1.1 carries it (off unless set): the
+    /// authority's own bytes, as they were decoded, not a copy (goal 9 of kiln's API runtime program, plan
+    /// 01a1a87b2cec step 5: kiln shaped every HTTP/2 request so, copying the authority).
+    pub fn host_from_authority(&mut self, on: bool) -> &mut Builder {
+        self.host_from_authority = on;
         self
     }
 
@@ -212,8 +222,6 @@ struct Wire<I> {
     /// Received bytes taken (or thrown away) and not yet given back to the connection's window.
     owed: usize,
     cfg: Builder,
-    /// A response's header map, emptied, for the next request's headers to take.
-    spare: Option<HeaderMap>,
     /// The client acknowledged our settings: until it has, it may hold to the defaults.
     acked: bool,
     /// The date responses carry, read once a pass over what was read.
@@ -227,14 +235,6 @@ impl<I: AsyncRead + AsyncWrite + Unpin> Wire<I> {
 }
 
 impl<I> Wire<I> {
-    /// Keeps a header map's allocation for the next request (emptied).
-    fn keep_spare(&mut self, mut map: HeaderMap) {
-        if map.capacity() > 0 && self.spare.is_none() {
-            map.clear();
-            self.spare = Some(map);
-        }
-    }
-
     /// The next whole frame read, its payload taken from the buffer.
     fn next_frame(&mut self) -> Result<Option<(Head, Bytes)>, ConnError> {
         let Some(h) = frame::head(&self.rbuf) else { return Ok(None) };
@@ -288,10 +288,9 @@ impl<I> Wire<I> {
         let len = tail.len() - start - 9;
         let flags = if end_stream { frame::END_STREAM } else { 0 };
         if len <= self.peer_max_frame {
-            let mut h = Vec::with_capacity(9);
-            frame::put_head(&mut h, len, frame::HEADERS, flags | frame::END_HEADERS, stream);
+            // Its head where its place was kept (goal 9, plan 01a1a87b2cec step 5: each answer made a vector for it).
             if let Some(slot) = tail.get_mut(start..start + 9) {
-                slot.copy_from_slice(&h);
+                slot.copy_from_slice(&frame::head_bytes(len, frame::HEADERS, flags | frame::END_HEADERS, stream));
             }
             return;
         }
@@ -342,7 +341,8 @@ fn respond<I, F, B: SendBody + Unpin>(wire: &mut Wire<I>, id: u32, s: &mut Strea
     let length = body.size_hint().exact();
     let empty = s.head || body.is_end_stream() || length == Some(0);
     wire.headers(id, parts.status, &parts.headers, length.filter(|_| !s.head), empty);
-    wire.keep_spare(parts.headers);
+    // Its head written: its header map is given back for a later request's headers (`crate::maps`).
+    crate::maps::give(parts.headers);
     if empty {
         s.local_done = true;
         return true;
@@ -433,10 +433,8 @@ fn trailers<I>(wire: &mut Wire<I>, id: u32, t: &HeaderMap) {
         wire.encoder.header(name, value, tail);
     }
     let len = tail.len() - start - 9;
-    let mut h = Vec::with_capacity(9);
-    frame::put_head(&mut h, len, frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, id);
     if let Some(slot) = tail.get_mut(start..start + 9) {
-        slot.copy_from_slice(&h);
+        slot.copy_from_slice(&frame::head_bytes(len, frame::HEADERS, frame::END_STREAM | frame::END_HEADERS, id));
     }
 }
 
@@ -510,13 +508,14 @@ impl Building {
         }
     }
 
-    /// The request, its body from `body` (given the content-length): `Err` with the header map to
-    /// reuse when it's malformed.
-    fn finish(self, body: impl FnOnce(Option<u64>) -> Option<Incoming>) -> Result<http::Request<Incoming>, HeaderMap> {
+    /// The request, its body from `body` (given the content-length), with its authority as its `Host` when it has
+    /// none and `host` says so: `Err` with the header map to reuse when it's malformed.
+    fn finish(self, host: bool, body: impl FnOnce(Option<u64>) -> Option<Incoming>) -> Result<http::Request<Incoming>, HeaderMap> {
         let Building { method, scheme, authority, path, headers, length, bad, .. } = self;
         if bad {
             return Err(headers);
         }
+        let host = if host && !headers.contains_key(header::HOST) { authority.as_ref().filter(|a| !a.is_empty()).and_then(|a| HeaderValue::from_maybe_shared(a.clone()).ok()) } else { None };
         let uri = || -> Result<(Method, Uri), ()> {
             let method = match method.as_deref() {
                 Some(b"GET") => Method::GET,
@@ -552,6 +551,9 @@ impl Building {
         *req.uri_mut() = uri;
         *req.version_mut() = Version::HTTP_2;
         *req.headers_mut() = headers;
+        if let Some(host) = host {
+            req.headers_mut().insert(header::HOST, host);
+        }
         Ok(req)
     }
 }
@@ -905,7 +907,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
             }
             return Ok(());
         }
-        let mut building = Building::new(self.wire.spare.take().unwrap_or_default());
+        // Its headers take a header map an answer on this thread gave back, where there is one (`crate::maps`).
+        let mut building = Building::new(crate::maps::take(0));
         let whole = self.wire.decoder.decode_each(&block, max_list, |f| building.add(f))?;
         self.on_request(id, end_stream, whole, building, cx)
     }
@@ -936,7 +939,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
         // A client that hasn't taken our settings yet may send what the default window allows.
         let window = if self.wire.acked { i64::from(self.wire.cfg.stream_window) } else { i64::from(self.wire.cfg.stream_window).max(frame::DEFAULT_WINDOW) };
         let body_in = &mut s.body_in;
-        let built = building.finish(|length| {
+        let built = building.finish(self.wire.cfg.host_from_authority, |length| {
             if end_stream {
                 // A length that says there's a body, with none: malformed.
                 return length.is_none_or(|n| n == 0).then(Incoming::empty);
@@ -948,7 +951,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
         let req = match built {
             Ok(r) => r,
             Err(spare) => {
-                self.wire.keep_spare(spare);
+                crate::maps::give(spare);
                 self.wire.rst(id, frame::PROTOCOL_ERROR);
                 return Ok(());
             }
@@ -1201,7 +1204,6 @@ where
         recv_window: i64::from(cfg.connection_window),
         owed: 0,
         cfg,
-        spare: None,
         acked: false,
         date: date::now(),
     };
@@ -1254,4 +1256,38 @@ where
     let _ = poll_fn(|cx| conn.wire.poll_flush(cx)).await;
     let _ = poll_fn(|cx| Pin::new(&mut conn.wire.io).poll_close(cx)).await;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 9 of kiln's API runtime program, plan 01a1a87b2cec step 5: a request with no `Host` is given its
+    /// `:authority` as one when its connection says so, the value the authority's own bytes as they were decoded (no
+    /// copy); one that has a `Host` keeps it; and a connection that doesn't say so adds none.
+    #[test]
+    fn g9_s5_a_requests_authority_is_its_host_without_a_copy() {
+        let block = Bytes::from_static(b"GEThttpskiln.dev:8443/api/me");
+        let building = |host: Option<&'static str>| {
+            let mut b = Building::new(HeaderMap::new());
+            b.method = Some(block.slice(0..3));
+            b.scheme = Some(block.slice(3..8));
+            b.authority = Some(block.slice(8..21));
+            b.path = Some(block.slice(21..));
+            if let Some(h) = host {
+                b.headers.insert(header::HOST, HeaderValue::from_static(h));
+            }
+            b
+        };
+        let finished = |b: Building, host: bool| b.finish(host, |_| Some(Incoming::empty())).ok();
+        let req = finished(building(None), true);
+        let given = req.as_ref().and_then(|r| r.headers().get(header::HOST));
+        assert_eq!(given.map(HeaderValue::as_bytes), Some(&b"kiln.dev:8443"[..]));
+        assert_eq!(given.map(|v| v.as_bytes().as_ptr()), block.get(8..).map(<[u8]>::as_ptr), "the authority's own bytes");
+        assert_eq!(req.as_ref().map(|r| r.uri().to_string()), Some("https://kiln.dev:8443/api/me".to_owned()));
+        let req = finished(building(Some("other.test")), true);
+        assert_eq!(req.as_ref().and_then(|r| r.headers().get(header::HOST)).map(HeaderValue::as_bytes), Some(&b"other.test"[..]), "its own kept");
+        let req = finished(building(None), false);
+        assert_eq!(req.as_ref().map(|r| r.headers().contains_key(header::HOST)), Some(false), "none unless the connection says so");
+    }
 }
