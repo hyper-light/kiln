@@ -1592,6 +1592,18 @@ impl Copies {
     }
 }
 
+/// What an owner's polls taking `msg` are labeled with in the shards' table of what held them (goal 9, plan
+/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), a runner's as a taken one, and
+/// work on its copies as such.
+fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
+    static WORK: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "owner work on its copies" };
+    match msg {
+        Msg::Update(i) => crate::wire::update_label(&i.u),
+        Msg::Runner(r) => crate::wire::update_label(&r.update),
+        Msg::Run(_) => &WORK,
+    }
+}
+
 /// A shard's owner: its messages, in the order they came, as fast as they come, in bounded turns of
 /// its shard (the HTTP listener may share it). It waits on nothing but its inbox, and ends with it.
 /// A message its turn ran out in the middle of (an update's events) goes on at its next turn, before
@@ -1620,11 +1632,25 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
         let h = hub.get().and_then(Weak::upgrade);
         let over = || turns.over();
-        rest = shard.take(msg, h.as_ref(), &over);
+        // The turn's poll labeled by the kind of the message that took longest in it, should the poll hold the
+        // shard (goal 9, plan 01a1a87b2cec step 3: the lab's s7c named this owner's polls, up to 12 ms, not what
+        // held them).
+        let mut longest = std::time::Duration::ZERO;
+        let mut take = |shard: &mut Shard, msg: Msg| {
+            let (label, began) = (label_of(&msg), std::time::Instant::now());
+            let rest = shard.take(msg, h.as_ref(), &over);
+            let took = began.elapsed();
+            if took >= longest {
+                longest = took;
+                hyper_rt::futures::label(label);
+            }
+            rest
+        };
+        rest = take(&mut shard, msg);
         // What's waiting already goes in the same turn.
         while rest.is_none() && !over() {
             let Ok(msg) = rx.try_recv() else { break };
-            rest = shard.take(msg, h.as_ref(), &over);
+            rest = take(&mut shard, msg);
         }
         drop(h);
         // The conversation store over its bound holds this owner back before it takes more (goal 11, plan

@@ -3,14 +3,15 @@
 # Every round: as its window ends, each of the server's threads and children with the CPUs it may run on and the one it
 # last ran on (affinity.txt), so a round on cores of the server's own shows what shares the shards' cores. With PERF_ON=1
 # (the driver's profiled rounds), perf records the round's server over its window too: every thread, its call graph by
-# DWARF (a release build keeps .eh_frame), user space only (perf_event_paranoid 2 lets a user profile their own
+# PERF_CALL_GRAPH (DWARF by default: a release build keeps .eh_frame; `fp` for a build with frame pointers), user space only (perf_event_paranoid 2 lets a user profile their own
 # processes). The lab waits for the hook, so perf runs in the background from window-start until window-end stops it.
-#   hook.sh <event> <server pid> <dir>     (PERF_ON; PERF: the perf binary; PERF_LIBS: a folder of its libraries)
+#   hook.sh <event> <server pid> <dir>     (PERF_ON; PERF: the perf binary; PERF_LIBS: a folder of its libraries;
+#                                          PERF_CALL_GRAPH: perf record's --call-graph)
 event=$1 pid=$2 dir=$3
 case "$event" in
   window-start)
     if [ "${PERF_ON:-0}" = 1 ]; then
-      LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} nohup "${PERF:-perf}" record -F 499 --call-graph dwarf,16384 -p "$pid" -o "$dir/perf.data" > "$dir/perf.log" 2>&1 &
+      LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} nohup "${PERF:-perf}" record -F 499 --call-graph "${PERF_CALL_GRAPH:-dwarf,16384}" -p "$pid" -o "$dir/perf.data" > "$dir/perf.log" 2>&1 &
       echo $! > "$dir/perf.pid"
     fi
     ;;

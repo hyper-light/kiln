@@ -417,6 +417,34 @@ pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
     read_frame_by(&FRAMES, data, hello).await
 }
 
+/// The channel items the hub's loop reads ([`read_item`]): averages of their own, an item's message being
+/// of other sizes than a whole frame's.
+static ITEMS: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
+
+/// A runner's channel item (`crate::wire::channel::Frame::Item`), as [`read_item`] read it.
+pub enum Item {
+    /// The message it carries isn't one this build reads.
+    Unreadable(crate::proto::Unreadable),
+    /// The message it carries, what that carries read ([`payload_of`]), and the label of its kind for the
+    /// shards' table of what held them (`crate::wire::agent_label`).
+    Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
+}
+
+/// Reads the message channel item `body` carries, and what that carries, as [`read_frame`] reads a frame: on
+/// the shard while that's expected to take less than a slow poll, else on the compute pool, the caller
+/// waiting either way, so the items are still taken in order (goal 9, plan 01a1a87b2cec step 3: the channel
+/// carries most of what a runner sends, its sessions' updates among it, which the hub read on its shard
+/// whatever their length; the lab's s7c had its loop's polls under that label held up to 28 ms). An item
+/// comes after its runner's Hello.
+pub async fn read_item(body: Vec<u8>) -> Item {
+    match read_frame_by(&ITEMS, body, true).await {
+        Frame::Read { label, carried } => Item::Read { label, carried },
+        Frame::Unreadable(e) => Item::Unreadable(e),
+        // Read as after its Hello, so none comes before it; said as what it would be.
+        Frame::BeforeHello { what } => Item::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("{what}, before its runner's Hello") }),
+    }
+}
+
 /// [`read_frame`] by what `expect` learned. A read is timed where it runs, so one off the shard teaches
 /// it too: else one slow sample (a preempted read) could send every frame of a runner sending only long
 /// ones off the shard for good, none read on it to bring the expectation back down.
@@ -1167,6 +1195,24 @@ mod tests {
             // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
             let left = expect.expected(len);
             anyhow::ensure!(left < 100_000_000, "still expected to take {left} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a channel item is read as a frame is, the message it carries labeled by
+    /// its kind; a channel frame inside one comes back as itself, for the hub to refuse; bytes that aren't a
+    /// message are unreadable.
+    #[test]
+    fn g9_s3_a_channel_item_is_read_as_a_frame_is() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let term = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![1, 2, 3] })?;
+            match read_item(term).await {
+                Item::Read { label, carried: Ok(Carried::Nothing(AgentMsg::TermOutput { .. })) } => anyhow::ensure!(label.name.contains("TermOutput"), "labeled {}", label.name),
+                _ => anyhow::bail!("not read as the message it carries"),
+            }
+            let nested = crate::proto::encode(&AgentMsg::Wire(crate::wire::channel::Frame::Want { stream: "s".into(), from: 1 }))?;
+            anyhow::ensure!(matches!(read_item(nested).await, Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. }), "a channel frame inside one comes back as itself");
+            anyhow::ensure!(matches!(read_item(vec![0xff; 4]).await, Item::Unreadable(_)), "bytes that aren't a message");
             Ok(())
         })
     }

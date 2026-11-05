@@ -4,7 +4,7 @@
 # turns round by round so the machine's drift falls on each alike (goal 6's scripts/overload_lab/driver.sh). The lab's
 # clients and runners run on LAB_CPUS and the server on SERVER_CPUS, so the lab measures the server, not itself.
 #   driver.sh <kiln> <kiln-lab> <out>     (ROUNDS, N, LAB_CPUS, SERVER_CPUS, HOG_CPUS, CORES, CORES_HOGS, CONFIGS, PROFILE,
-#                                          SHARDS, SERVER_ENV, PROF, PROF_KILN, PERF, PERF_LIBS from the environment)
+#                                          SHARDS, SERVER_ENV, PROF, PROF_KILN, PERF, PERF_LIBS, PERF_CALL_GRAPH from the environment)
 # Every configuration's server runs SHARDS shards (KILN_RT_SHARDS; 4, what the server sizes itself to on the 16 CPUs of
 # SERVER_CPUS, so cores of its own, fewer CPUs, don't change the count), with SERVER_ENV's KEY=VALUE pairs besides.
 #   calm:        the server alone in a scope of its own at CPUWeight=1000 (kiln.slice's weight on bare metal) on
@@ -29,6 +29,10 @@ kiln=$(readlink -f "$1") lab=$(readlink -f "$2") D=$3
 ROUNDS=${ROUNDS:-8} N=${N:-16} LAB_CPUS=${LAB_CPUS:-0-15} SERVER_CPUS=${SERVER_CPUS:-16-31} HOG_CPUS=${HOG_CPUS:-$SERVER_CPUS}
 CORES=${CORES:-16-23} CORES_HOGS=${CORES_HOGS:-24-31} CONFIGS=${CONFIGS:-calm hogs cores-calm cores}
 PROFILE=${PROFILE:-realistic} PROF=${PROF:-0} PROF_KILN=${PROF_KILN:-} PERF=${PERF:-perf} PERF_LIBS=${PERF_LIBS:-}
+# How perf records the profiled rounds' call graphs (hook.sh): DWARF by default; `fp` for a PROF_KILN built with frame
+# pointers (RUSTFLAGS="-C force-frame-pointers=yes"), which perf unwinds as it records, where DWARF's unwinding at report
+# time didn't resolve on g9c's data (goal 9, plan 01a1a87b2cec step 5).
+PERF_CALL_GRAPH=${PERF_CALL_GRAPH:-dwarf,16384}
 SHARDS=${SHARDS-4} SERVER_ENV=${SERVER_ENV:-}
 export TMPDIR=${TMPDIR:-$HOME/.cache/kiln-lab/tmp}
 mkdir -p "$D/bin" "$D/runs" "$TMPDIR"
@@ -45,7 +49,7 @@ one() {
   local run=(-E KILN_LAB_HOOK="$D/bin/hook.sh")
   if [ -s "$out/run.json" ] && grep -q '"numbers"' "$out/run.json"; then say "round $i $cfg: measured before"; return; fi
   rm -rf "$out"; mkdir -p "$out"
-  case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS") ;; esac
+  case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS" -E PERF_CALL_GRAPH="$PERF_CALL_GRAPH") ;; esac
   local quantum=""
   case "$base" in q[0-9]*-*) quantum=${base%%-*}; quantum=${quantum#q}; base=${base#*-} ;; esac
   case "$base" in

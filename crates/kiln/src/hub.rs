@@ -2531,24 +2531,25 @@ impl Hub {
             Frame::Item { stream, seq, low, body } => {
                 let answer = match self.wire.on_item(agent, &stream, seq, low, body, Instant::now()) {
                     Arrival::Take(body) => {
-                        let refusal = match proto::read_agent(&body) {
-                            Ok(AgentMsg::Wire(_)) => {
+                        // Read where it's quick to, else off the shard, in order either way, as a frame is
+                        // (`crate::wire::payload::read_item`; goal 9, plan 01a1a87b2cec step 3).
+                        let refusal = match crate::wire::payload::read_item(body).await {
+                            crate::wire::payload::Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. } => {
                                 let why = "a channel frame inside a channel item".to_owned();
                                 self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
                                 Some((Refusal::Malformed, why))
                             }
-                            Ok(inner) => match crate::wire::payload_of(inner) {
-                                Ok(m) => Box::pin(self.on_agent_msg(peer, m, arrived)).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
-                                // What it carries can't be read: its NACK says so, as for an item
-                                // that can't be read, and it's noted.
-                                Err(e) => {
-                                    let refusal = (e.code.refusal(), e.why.clone());
-                                    self.unreadable_payload(peer, e, false).await;
-                                    Some(refusal)
-                                }
-                            },
+                            // Its polls labeled by the kind of message it carries.
+                            crate::wire::payload::Item::Read { label, carried: Ok(m) } => Box::pin(crate::rt::labeled(label, self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                            // What it carries can't be read: its NACK says so, as for an item
+                            // that can't be read, and it's noted.
+                            crate::wire::payload::Item::Read { carried: Err(e), .. } => {
+                                let refusal = (e.code.refusal(), e.why.clone());
+                                self.unreadable_payload(peer, e, false).await;
+                                Some(refusal)
+                            }
                             // Its NACK says it: unsupported for a variant this build doesn't know.
-                            Err(e) => {
+                            crate::wire::payload::Item::Unreadable(e) => {
                                 let why = e.why("AgentMsg");
                                 self.unreadable(peer, Wire::RunnerItem, e.what(), e.code(), why.clone(), false).await;
                                 Some((e.code().refusal(), why))
