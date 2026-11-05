@@ -281,8 +281,9 @@ pub enum Frame {
     /// A message that may not come before its runner's Hello, from a runner whose Hello hasn't come: its
     /// kind (`crate::wire::agent_name`), and nothing it carries read.
     BeforeHello { what: String },
-    /// A runner's message, what it carries read ([`payload_of`]).
-    Read(Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>>),
+    /// A runner's message, what it carries read ([`payload_of`]), and the label of its kind for the shards'
+    /// table of what held them (`crate::wire::agent_label`), for the polls that handle it.
+    Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
 }
 
 /// What reading a runner frame is expected to take, by its length ([`read_frame`]): moving averages of
@@ -354,7 +355,7 @@ fn read_now(data: &[u8], hello: bool) -> Frame {
     match crate::proto::read_agent(data) {
         Err(e) => Frame::Unreadable(e),
         Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
-        Ok(msg) => Frame::Read(payload_of(msg)),
+        Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
     }
 }
 
@@ -1069,7 +1070,7 @@ mod tests {
             anyhow::ensure!(expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS, "expected slow");
             for _ in 0..64 {
                 let frame = read_frame_by(&expect, data.clone(), true).await;
-                anyhow::ensure!(matches!(frame, Frame::Read(Ok(_))), "the frame is read");
+                anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
             }
             // Each read off the shard took its eighth of the averages: (7/8)^64 of the second is 0.19 ms,
             // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
