@@ -1146,7 +1146,7 @@ mod tests {
     /// agents it gives, their order and its filters are as they were.
     #[test]
     fn g10_s5_agents_list_takes_its_shards_turn_between_agents() {
-        let info = |n: usize| Info { id: format!("a{n}"), kind: if n % 2 == 0 { "claude" } else { "codex" }.into(), ..Info::default() };
+        let info = |n: usize| Info { id: format!("a{n}"), kind: if n.is_multiple_of(2) { "claude" } else { "codex" }.into(), ..Info::default() };
         let infos: Vec<Info> = (0..5).map(info).chain(std::iter::once(Info { helper: Some("a card's".into()), ..info(6) })).collect();
         let at_once = |keep: &dyn Fn(&Info) -> bool, wanted: &dyn Fn(&Value) -> bool| infos.iter().filter(|i| keep(i)).map(wait::brief).filter(|b| wanted(b)).collect::<Vec<Value>>();
         let turns = std::cell::Cell::new(0usize);

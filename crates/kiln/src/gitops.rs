@@ -827,7 +827,7 @@ pub async fn report_status(hub: &Hub, run: &Run, status: Status) {
 }
 
 /// `git archive` of a commit, for pods that build without git. Returns a tar stream.
-pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let mut cmd = git(hub);
     cmd.arg("-C").arg(path).args(["archive", "--format=tar", sha]);

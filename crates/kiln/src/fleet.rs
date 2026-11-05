@@ -935,7 +935,7 @@ pub fn building_commit(hub: &Hub, job: &str) -> Option<String> {
 }
 
 /// The source of the commit build job `job` builds: the server's archive of it (tar).
-pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let commit = building_commit(hub, job).ok_or_else(|| anyhow::anyhow!("no such build"))?;
     let repo = release_repo(hub).await.ok_or_else(|| anyhow::anyhow!("kiln doesn't build {}", hub.cfg.updates.release_repo))?;
     crate::gitops::archive(hub, &repo, &commit).await
