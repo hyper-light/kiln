@@ -222,13 +222,17 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
 - calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs); in the
   pilot's first jobs at K = 8, on the lab machine at a load of about 67 with no core idle, the worst
   job's was 232 µs and the median job's 75 µs: on a busy machine eight browsers' echoes wait for a
-  core, so the matrix's good-link times carry up to a quarter of a millisecond of clock error;
+  core, so the matrix's good-link times carry up to a quarter of a millisecond of clock error. With
+  groups of 40 echoes (2026-11-05, K = 8, `check4b`) Chromium's worst job was 26 µs and 226 µs in two
+  jobs, WebKit's (in the image) 606 µs and 662 µs: WebKit's residual stands above 200 µs;
 - capture against counters: 0.00% apart in all six jobs (2.1 MB to 15.8 MB each);
 - the probe's sizes above the transport against the real UI's, where the UI's payloads were the
   same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
   terminal's frames 0.1% apart; the message to an agent's answer was 3.7% apart with one id for
   every message, and 8.3% apart (169 bytes against 156) with a new id each time as the UI sends
-  them. Not yet explained: the answer most likely follows the agent's state (the run's agent gets
+  them. Then (2026-11-05, K = 8, ids unique to each link, `~/.cache/kiln-bp/g1/check4b`) 162.5
+against 156 (4.2%): every link had sent the same ids, which kiln answers as repeats; the rest of the
+difference is still not explained: the answer most likely follows the agent's state (the run's agent gets
   a message every 700 ms, the recording's every 10 s), which would make it a payload the two don't
   share; until that is read from the bodies, this check stands unmet; operations whose payloads follow the lab kiln's state (the sessions' list, the
   notices, the metrics' history, `/api/events`, a session's frames) aren't compared;

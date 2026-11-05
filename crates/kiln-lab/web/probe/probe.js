@@ -51,7 +51,10 @@ const utf8 = new TextDecoder();
  * offset from the one with the least round trip, then `check` more read against it. Returns the
  * round trips and residuals in µs.
  */
-lab.calibrate = async function calibrate(url, n = 200, check = 200) {
+// Echoes a calibration takes its least round trip from (its first, and each group of the check's).
+const GROUP = 40;
+
+lab.calibrate = async function calibrate(url, n = 200, check = 400) {
   const ws = new WebSocket(url);
   await new Promise((ok, bad) => {
     ws.onopen = ok;
@@ -70,15 +73,15 @@ lab.calibrate = async function calibrate(url, n = 200, check = 200) {
   for (let i = 0; i < n; i++) first.push(await once());
   first.sort((a, b) => a.rtt - b.rtt);
   lab.offsetUs = first[0].offset;
-  // The calibration again, in groups of 20 echoes each taken the same way: how far each group's
+  // The calibration again, in groups of GROUP echoes each taken the same way: how far each group's
   // offset lies from the one the page uses is the calibration's residual. Each echo's own offset
   // (off by up to half its round trip) is kept beside it.
   const residuals = [];
   const echoes = [];
   const rtts = [];
-  for (let g = 0; g < Math.max(1, Math.floor(check / 20)); g++) {
+  for (let g = 0; g < Math.max(1, Math.floor(check / GROUP)); g++) {
     const group = [];
-    for (let i = 0; i < 20; i++) group.push(await once());
+    for (let i = 0; i < GROUP; i++) group.push(await once());
     group.forEach((r) => {
       rtts.push(r.rtt);
       echoes.push(Math.abs(r.offset - lab.offsetUs));
@@ -192,8 +195,11 @@ lab.requests = function requests(op) {
       setTimeout(async () => {
         const sched = (performance.timeOrigin + due) * 1000 + lab.offsetUs;
         const req = op.requests[i % op.requests.length];
-        // A write's id is new each time, as the UI's are (`{n}` in its body).
-        const body = req.body ? req.body.replaceAll("{n}", String(i + 1)) : undefined;
+        // A write's id is new each time and every link's its own, as every UI's are (`{id}` in its
+        // body): ten characters, as long as the recorded UI's (`lab-rec-12`), so the answer, which
+        // carries it twice, is the same size; a repeated id would be answered as a repeat.
+        const id = `l${op.client ?? 0}${(i + 1).toString(36).padStart(8, "0")}`;
+        const body = req.body ? req.body.replaceAll("{id}", id) : undefined;
         try {
           if (req.ws_snapshot) {
             // A session socket opened for its packed snapshot, then closed: the UI's read of a session.

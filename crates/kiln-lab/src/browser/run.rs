@@ -65,7 +65,8 @@ fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>, lo
             } else {
                 json!({"name": "session snapshot", "ndjson": true, "path": "/api/snapshots/lab"})
             });
-            requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{id}/command"), "body": json!({"type": "send", "id": "lab-rec-{n}", "text": "lab:quiet"}).to_string()}));
+            // The write goes to the first session, so the third's snapshot stays the recorded one.
+            requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{}/command", sid(0)), "body": json!({"type": "send", "id": "{id}", "text": "lab:quiet"}).to_string()}));
             #[allow(clippy::cast_precision_loss)]
             let n = (w.duration_s * 1000 / w.request_ms.max(1)) as usize;
             let schedule: Vec<u64> = (0..n as u64).map(|i| i * w.request_ms).collect();
@@ -149,7 +150,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             "control": format!("wss://{}:{}/", link::control_server_ip(i), servers::CONTROL_PORT),
             "chromium_args": t.chromium_args(&c.certs.spki),
             "protocol_path": if t.server == Server::Kiln { "/api/me".to_owned() } else { "/api/agents".to_owned() },
-            "ops": ops,
+            "ops": ops.iter().map(|o| { let mut o = o.clone(); if let Some(m) = o.as_object_mut() { m.insert("client".into(), json!(i)); } o }).collect::<Vec<_>>(),
             "duration_s": w.duration_s,
             "tail_s": w.tail_s,
             "window_ms": c.s.window_ms,

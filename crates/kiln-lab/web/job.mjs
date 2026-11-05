@@ -78,7 +78,7 @@ export async function runJob(path) {
       });
       result.control_page = await page.evaluate((u) => fetch(u, { mode: "cors" }).then((r) => `page fetch: ${r.status}`, (e) => `page fetch: ${e.message}`), u.href);
     }
-    if (job.control) result.calibration = await page.evaluate(([u, n]) => window.__lab.calibrate(u, n, n), [job.control, job.calibrate_n || 200]);
+    if (job.control) result.calibration = await page.evaluate(([u, n]) => window.__lab.calibrate(u, n, 2 * n), [job.control, job.calibrate_n || 200]);
     // The link quiet before the job starts.
     await sleep(job.settle_ms ?? 1000);
     const start = nowUs();
