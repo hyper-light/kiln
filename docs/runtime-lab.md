@@ -583,6 +583,18 @@ found the shard idle kept it from standing (3 windows in 12 rounds). A shard's q
 the last tolerance's periods were past its calm and the shard ran most of it; replayed, that flood sheds
 Background half a tolerance in and Normal a tolerance later in every round (`overload::tests`).
 
+That rule's runs (fedora, 2026-11-05 12:25 to 12:59 UTC, rt-int `e7cdefced96`, 6 interleaved rounds each,
+the server alone in its scope on 8 CPUs of its own, the lab on 8 others): flooded, every shed-on round shed
+both classes (Background 568 to 1,693 requests a round, Normal 811 to 1,616), the one shard ran 52 to 55%
+of the time against 80 to 81% with shedding off, and pages were served with no error in all 12 rounds, at
+4.2 to 5.3 ms at the median against 13 to 15.5 ms with shedding off. Their p99 stayed where it was (20.8 to
+23.2 ms, against 18.2 to 24.6 ms), but in one shed-on round (round 7) the machine's load went from 17 to 33
+with other work as it ran: the lab sent 60% fewer requests, and 1% of pages took 4.1 s or more (6.6 s at
+the most), none failing. Calm (`realistic`, 4 shards), no shard's queue stood in any round. The only sheds,
+2 and 6 requests in two of the six shed-on rounds, came from the blocking pool's watch on `kiln.db`'s
+writer, whose line stood 2.4 to 3.7 s past its calm of 0.32 ms, its jobs waiting up to 2.5 s: a stall of
+seconds in the store's one writer, not a burst (fedora's disk was full and shared with other work then).
+
 `scripts/overload_lab/overload.sh` runs a profile shedding off against on, interleaved (`kiln-lab ab`, the
 server in its scope as above): one shard and `PROFILE=flood` overloads it on purpose; with
 `PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server, which should be nothing.
@@ -755,6 +767,40 @@ takes them for each item a runner sends and then its answer, as before, and publ
 of the stream it changed into a copy per stream, which the commands loop's have-again (every few
 seconds) and a link coming up read: what they say, and when and where acks go, are as they were.
 Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
+
+### The A/B against main before goal 5 (step 4)
+
+fedora, 2026-11-05, production's layout (each build's server alone in its scope at `CPUWeight=1000` on
+CPUs 16-31, the lab on the others), the `realistic` profile, 8 interleaved rounds each, calm and with 16
+hogs on the server's CPUs at weight 1: main before goal 5's first part (`426b02ea011`) against train 3's tree
+(`7dd67a5ce0f`, on main as `5c4047a47e5`). That tree holds goal 5's parts and also what goals 9, 10 and 11
+landed in trains 1 to 3, so this is the program's change, not goal 5's alone.
+
+First the locks (`scripts/locks.py census-tree`, then `rank`, train 3's tree, 3 rounds calm and 3 with the
+hogs): 180 call sites, ranked by how often the window took each. The most taken, the store's capture (2,746
+a second), its tables (902), its learner's joiner (603), its groups' point (556), Quiver's node (487) and
+the live channel's receivers (459, one taker), each waited 0.000 ms a second; only Quiver's own locks
+(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on.
+
+Then the A/B, the medians of the rounds (ms, but the busy share):
+
+| number | calm, before | calm, after | hogs, before | hogs, after |
+| --- | --- | --- | --- | --- |
+| `api_read.p99_ms` | 508.9 | 1.05 | 532.8 | 1.96 |
+| `api_read.p999_ms` | 1,429.7 | 1.97 | 1,596.7 | 5.33 |
+| `websocket.p99_ms` | 64.7 | 2.54 | 41.2 | 5.73 |
+| `attach.p99_ms` | 569.3 | 6.50 | 1,318.1 | 12.5 |
+| `server.runner.wait_p99_ms` | 57.2 | 3.00 | 39.2 | 4.90 |
+| `blocking.store.wait_p99_ms` | 866.8 | 0.46 | 1,015.1 | 1.73 |
+| `page.p99_ms` | 0.483 | 0.521 (same) | 1.677 | 1.680 (same) |
+| `shards.busy_share` | 0.057 | 0.036 | 0.050 | 0.030 |
+
+No tail got worse, calm or with hogs. What did, past noise: the medians of pages calm (0.200 to 0.226 ms,
++13%) and of API writes (1.02 to 1.16 ms calm, 1.39 to 1.58 with hogs, +14%), the runners' messages' p99
+time to be taken with hogs (0.47 to 0.71 ms), and the compute pool, which now runs seven times the jobs (69
+to 475 a second calm) and whose jobs wait longer for it at p99 (0.25 to 7.4 ms calm, 3.2 to 36 ms with
+hogs): the work goals 3, 9 and 10 moved off the shards (shard 0, which ran 18.5% of the time calm, runs
+2.2%). Goal 9's step 5 (a tenth of the CPU) and goal 10's step 4 (runner messages) take those up.
 
 ## Goal 7: placement
 
