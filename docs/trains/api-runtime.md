@@ -1,14 +1,14 @@
-# Train notes: the API runtime program, trains 1 to 6
+# Train notes: the API runtime program, trains 1 to 7
 
 The API runtime program (kiln agent 01a1aa52's goal stack, resumed on 2026-11-05 after its first
 coordinator was lost) aims to take the locks off kiln's server's hot path, to run its shards and
-answer its API within a millisecond, and to cut its memory to a tenth. What its six trains since
+answer its API within a millisecond, and to cut its memory to a tenth. What its seven trains since
 the resumption deliver, what deploying them does and how to watch it, its risks and its rollback,
 and what's still open. How the server is measured: docs/runtime-lab.md. How it comes first on bare
 metal: docs/priority.md.
 
-**Where it stands (2026-11-05, about 14:50Z, when written):**
-- **Landed: trains 1 to 5,** each a merge of the integration branch `rt-int` into main, main its
+**Where it stands (2026-11-05, updated about 18:35Z):**
+- **Landed: trains 1 to 7,** each a merge of the integration branch `rt-int` into main, main its
   first parent. Each merge's message says what it holds and what ran.
 
   | Train | Merge on main | Landed (UTC) | Gated tree | Holds |
@@ -19,22 +19,25 @@ metal: docs/priority.md.
   | 4 | `6a3f0072091` | 12:37 | `4b429f1a05c` | goal 11 step 3 (the deployments engine's inputs and actions, the bus's per-topic peak); goal 10 step 1's baseline and the server-cores lab, in docs |
   | 5 | `3e8f9f1c9b0` | 13:40 | `f5b2ce35c36` | goal 6 step 4 (the standing rule); goal 9 step 3; goal 5's A/B, goal 6's runs and goal 11's memory by owner, in docs |
   | 6 | `fa6d88b754f` | 16:11 | `58ebfa84134` | goal 9 step 3 (places.json off the hub's shard, learner catch-ups in parts, read costs per kind); goal 10 steps 4 and 5 (the runner wait's legs, deliveries timed, snapshots yielding); goal 11 steps 4 and 5 (gzip on request, the brotli window, 16 KiB agent sockets, the jemalloc feature, spill files); goal 5's checks in its message |
+  | 7 | `adefb3e4ab1` | 18:12 | `3ff004c457b` | goal 4 (harness frames on a ring of their own, listeners reading a frame's kind first); goal 6 step 3 (critical first on the run queue); goal 8 step 7 (`[server] nudge`); goal 9 steps 3 to 5 (the derived quantum, custody's work off the shards, parks, wakes and syscalls counted, batched writes, install's grants); goal 10 step 5 (reads); goal 11 steps 3 to 5 (segment and snapshot bounds, streaming snapshots, the allocator switch, startup's pages dropped, build-time brotli) |
 
-- **Landed since: train 6,** `fa6d88b754f` at 16:11Z (the table above). Its gate on `58ebfa84134`:
-  clippy passed on all three targets; 5,319 tests passed, and the one that failed in the run (w05_r03)
-  passed alone 3 of 3.
-- **In the next train (rt-next):** everything handed over since train 6, among it goal 11's bounds on
-  session segments and snapshots and its streaming snapshots, goal 10's one encoding of a session's info
-  and its read cuts, goal 9's step 3 quantum and step 5 counters, goal 9 step 4's install defaults, goal
-  6 step 3's run-queue order, goal 8 step 7's `[server] nudge`, goal 11 step 4's allocator settings, goal
-  11 step 5's dropped startup pages and build-time brotli copies, and goal 4's harness ring.
+- **Landed since: train 7,** `adefb3e4ab1` at 18:12Z (the table above). Its gate on `3ff004c457b`:
+  clippy passed on all three targets; 5,409 tests passed, and the two that failed in the run passed
+  alone after (w05_r03 3 of 3; w13_r04's Android image in 81.5 s, its push run having outlasted the
+  test under the host's load).
+- **In the next train (rt-next):** goal 4's lanes (harness frames on a lane per owner shard,
+  `Hub::events` on a lock-free lane, `memory::queue` lock-free with every queue moved to it, the owners'
+  inboxes and the net thread's among them, and terminal output, job log feeds and CD's change feeds on
+  lanes); goal 9's log lines written by a thread of their own, each slow poll's time on the CPU beside
+  its hold (the task clock), the one-allocation oneshot and the parks' durations; goal 11's bus bounds
+  derived from the bus lab; the shard lab's reports with `--no-inline`.
 - **Deployed: none of it.**
   - Production is the bare-metal server on adacachy: `kiln-server.service`, a system unit in
     `kiln.slice`, its process running since 04:45:18Z on 2026-11-05.
   - It runs main at `8234e9b61ed` (2026-11-04 16:58Z, "Merge g3b-finish"). That's the one commit
     its binary carries, and the commit every connected runner reports but one Mac's, which runs
     `1460599d430` (`updates.list`).
-  - So production has goals 1 to 3 and goal 8's first part (`82ca3c74d03`). It has none of the five
+  - So production has goals 1 to 3 and goal 8's first part (`82ca3c74d03`). It has none of the seven
     trains, nor the program's landings between its commit and train 1: goal 4, goal 5's part 1,
     goals 6 and 7, goal 8 step 5's first part, and goal 10's steps 1 to 3.
   - KilnCD's `default/kiln-production` still exists (Healthy, OutOfSync), but no kiln pod runs
@@ -55,8 +58,9 @@ metal: docs/priority.md.
   | 4 | 2: `hosting` w03_r09, w05_r03 |
   | 5 | 1, beside 5,303 passed: w05_r03 (3 of 3 alone) |
   | 6 | 1, beside 5,319 passed: w05_r03 (3 of 3 alone) |
+  | 7 | 2, beside 5,409 passed: w05_r03 (3 of 3 alone); `hosted_actions` w13_r04 (alone, 81.5 s) |
 
-  `w05_r03_a_host_leg_runs_on_its_cpus` failed beside the full suite in all six, its leg seeing
+  `w05_r03_a_host_leg_runs_on_its_cpus` failed beside the full suite in all seven, its leg seeing
   the host's load (W05-R03).
 
 ## What it delivers, by goal
@@ -73,7 +77,16 @@ hand-overs, all from fedora, mostly in production's layout: the server alone in 
   comes back around a copy.
 - Lab: calm, only resident memory was worse (+8.2%). Snapshots went back to the blocking pool after
   the compute pool made attaches 2.4 times slower beside hogs.
-- Open: step 5's A/B in production's layout and with many sessions.
+- **Train 7:** event listeners read a frame's kind off its front and parse only the kinds they
+  handle; harness frames go on a ring of their own, read by the events socket, push and agents.wait,
+  each event's bytes shared across viewers.
+- **Lab** (many sessions, main before goal 4 against train 6's tree, 8 rounds each):
+  - calm: API reads 755 to 5.6 ms at p99.9, attaches 234 to 2.4 ms at the median, resident memory
+    2,506 to 783 MB, no number worse;
+  - with hogs: reads and attaches as much better, but frames worse (p99 140 to 356 ms). Runners'
+    messages wait on the hub's one loop (231 ms at p99), which goal 10 step 4's loops per shard take
+    away.
+- Open: step 5's "better with many sessions" with hogs, waiting on goal 10 step 4.
 
 **Goal 5: no lock on the hot path** (plan `01a1a59c2aae`).
 - **Part 1** (landed before the trains, `0fb5b21309e`):
@@ -114,6 +127,8 @@ hand-overs, all from fedora, mostly in production's layout: the server alone in 
     rounds, at 4.2 to 5.3 ms at the median against 13 to 15.5 ms with shedding off.
   - Calm: no shard's queue stood. The only sheds, 2 and 6 requests, came from kiln.db's writer
     stalling 2.4 to 3.7 s on fedora's full disk.
+- **Train 7:** a request read in Critical's turn gives way to a woken Critical task, and on kiln-rt's
+  run queue a more urgent class leads by up to a quantum.
 - Open: step 3's Critical p99 with hogs, which fedora's kernel bounds (Ada's decisions).
 
 **Goal 7: placement** (plan `01a1a59c2aea`). In any deploy, though in no train:
@@ -138,7 +153,10 @@ step 10).
   - hogs on the server's CPUs cost its tail;
   - kept off its cores, they cost little more: API reads' p99 rose 10.7%, just past noise;
   - kiln's own fence did what `taskset` does.
-- Open: step 7's proof waits on fedora's root (Ada's decisions).
+- **Train 7:** `[server] nudge`, off until declared, holds each shard's wait to the timer's tick, so a
+  shard woken behind a hog on a lazily preempting kernel (fedora's) runs within about 200 µs, with no
+  privilege needed.
+- Open: step 7's proof: the nudge's A/B on fedora, or fedora's root (Ada's decisions).
 
 **Goal 9: shards under a millisecond** (plan `01a1a87b2cec`).
 - **Measured** (train 1):
@@ -158,10 +176,18 @@ step 10).
   - places.json is written off the hub's shard, and shares are worked out by key;
   - learner catch-ups go a part at a time;
   - read costs are learned per kind of message.
+- **Train 7:**
+  - the step quantum derived from the bar and the timer's floor (266.7 µs);
+  - custody's take and check off the shards;
+  - parks, wakes, kicks and system calls counted per shard, the kick's eventfd edge-triggered;
+  - HTTP handler futures boxed where made, live frames fed and flushed once a batch;
+  - `kiln install` grants each install what it may: weights, CPUs, a system install's cpuset
+    partition, the real-time limit.
 - **Lab:**
   - Main's calm baseline: shard 0, which ran every start-up task, was 94 ms late at p99.9.
   - s7c on train 2's tree: the shards ran ready work 1.1 ms late at p99.9 calm, 3.3 ms with hogs on
     their CPUs, and 2.0 ms on cores of their own with the hogs beside them.
+  - g9p6 on train 6's tree: 1.42 ms at p99.9 calm and 2.21 ms with hogs; busy share 0.040 and 0.031.
 - Open: steps 4 and 6 (p99.9 under 1 ms with hogs; busy share at most a tenth of goal 3's) and
   step 5 (a tenth of the CPU). fedora's kernel bounds the first two (Ada's decisions).
 
@@ -180,14 +206,19 @@ step 10).
   - the runner's wait split into its legs (`kiln_runner_wait_leg_seconds`);
   - kiln-lab times only frames that bring events;
   - a viewer's snapshot gives up its shard between its 128 KiB pieces.
+- **Train 7:** a session's info encoded once for its view and its events frame; its events page
+  inflated once a chunk and sent in pieces; the sessions list joined once per change; the per-request
+  future from 54,816 to 2,064 bytes.
 - **Lab:**
   - Baseline on train 2's tree: API reads 234 / 970 / 1,244 µs at p50 / p99 / p99.9 calm, and
     437 / 1,833 / 3,804 µs with hogs.
   - Frames reach their viewers while another viewer attaches (step 3).
   - On train 5's tree, calm, live frames took 7.4 ms at p99.9. Earlier tails were the lab's own: a
     state frame quoting an old stamp.
-- Open: step 4 (runners' messages waited 2.82 ms at p99 in train 5's lab) and step 5 (reads and
-  frames under 1 ms at p99.9 with hogs).
+  - g9p6 on train 6's tree: API reads 2.6 ms at p99.9 calm and 3.0 with hogs; frames 16 and 23 ms.
+- Open: step 4 (runners' messages waited 7.3 ms at p99 calm in g9p6, nearly all of it for the hub's
+  one loop; the loops per shard wait on the live channel's owner's review) and step 5 (reads and
+  frames under 1 ms at p99.9, calm and with hogs).
 
 **Goal 11: a tenth of the memory** (plan `01a1a87b2e56`).
 - **Train 1:**
@@ -207,10 +238,19 @@ step 10).
   - `--features jemalloc`, off, for the allocator's A/B;
   - a session copy's sealed chunks past its newest 100 events are spilled to a file of its own,
     leaving about 91 KB of segments a session in memory.
+- **Train 7:**
+  - session segments bounded a copy, and snapshots in flight by the fs share's places;
+  - packed snapshots streamed a piece at a time;
+  - jemalloc's settings set where the feature is on, glibc's arenas capped at 5, and
+    ci/release/build.sh's `KILN_LINUX_ALLOCATOR`;
+  - startup's pages and the UI's embedded files leave resident memory once the server is up (Linux;
+    `KILN_KEEP_PAGES=1` keeps them), and the UI's brotli copies are packed at build time.
 - **Lab** (step 1, production's static musl build, calm): 1,126 MB resident on main before goal 11,
   against 526 MB on train 4's tree. Of that, 127 MB is the binary's pages and 401 MB anonymous. The
   live heap is about 165 MB (jemalloc's profile of the same tree).
-- Open: step 4 (the allocator's A/B, with jemalloc) and step 5 (the 113 MB bar: Ada's decisions).
+- **Lab** (step 4, rt-next's builds, calm, 8 rounds each): musl 523 MB against 333 MB with jemalloc
+  (anonymous 398 to 207 MB), and glibc 530 against 338 MB; no latency worse.
+- Open: step 4's pick in production's build, and step 5 (the 113 MB bar: Ada's decisions).
 
 **Others' work in the same deploy** (from production's commit to main):
 - runners keyed by machine id (`1df4674ca2d`, with notes of its own: docs/trains/machine-ids.md);
