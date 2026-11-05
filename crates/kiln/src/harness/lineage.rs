@@ -319,12 +319,18 @@ pub async fn seen(hub: &Hub, caller: &crate::authz::Caller, all: Vec<Info>) -> V
     reached(hub, caller, all, Access::See).await
 }
 
+/// Whether `caller` sees every session, whatever it is: a person who owns the server or manages its
+/// agents (an agent sees by lineage).
+pub fn sees_all(caller: &crate::authz::Caller) -> bool {
+    caller.agent.is_none() && (caller.is_owner() || manages(caller))
+}
+
 /// The sessions of `all` that `caller` reaches at least as far as `least`, in their order.
 pub async fn reached(hub: &Hub, caller: &crate::authz::Caller, all: Vec<Info>, least: Access) -> Vec<Info> {
-    let manager = manages(caller);
-    if caller.agent.is_none() && (caller.is_owner() || manager) {
+    if sees_all(caller) {
         return all;
     }
+    let manager = manages(caller);
     let mine = match caller.agent.as_deref() {
         Some(me) => crate::mcp::acts_for(hub, me).await,
         None => None,

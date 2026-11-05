@@ -152,6 +152,16 @@ second, their run and wait at p99, the places they held on average (`busy`: thei
 window's) and the places Little's law asks of their rate and p99 run (`little_p99`, as hyper-rt sizes
 a shard's tasks: `admission_limit`) (`blocking.<share>.*`).
 
+Every latency is reported to the microsecond (goal 10, plan `01a1a87b2dae`, step 1: its bar is under
+a millisecond). Beside the numbers an A/B compares, not among them, each round breaks its classes down
+(`seen` in `run.json`): each API read by its route (`api_read.sessions`, `.session`, `.events`,
+`.agents`, `.me`, `.overview`, `.runs`, `.plans`, `.goals`), each API write by its kind
+(`api_write.command`, the MCP calls'), pages and their files apart, and the frames by how they met
+the attaches, as each viewer saw them: `websocket.own_attach`, published before the viewer's own
+snapshot came, which they wait for by protocol; `websocket.while_another_attaches`, published while
+another viewer of the same session attached, which shouldn't wait for that; and `websocket.live`, the
+rest.
+
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
 conversation written at once and sent by each runner's shipper to the server's intake, a batch of up to
@@ -195,6 +205,18 @@ kiln-lab ab --a kiln --b kiln --label-a fs-8 --label-b fs-26 --env-a KILN_RT_BLO
 kiln-lab compare first/run.json second/run.json
 kiln-lab report run/run.json
 kiln-lab table calm=calm/run.json "16 hogs=hogs/run.json"
+```
+
+On Linux, `--server-cpus <list>` starts the server and its hogs on those CPUs (`taskset`) and keeps
+the CPUs the lab was started on to its clients, runners and stand-ins, so the lab times the server, not
+itself; `Nx` hogs then count the server's CPUs. `--layout production` (with systemd's user manager)
+starts the server in a scope of its own at `CPUWeight=1000` and the hogs in one at `CPUWeight=1`, as
+kiln.slice and CI legs and agents run on bare metal (docs/priority.md); `shared`, the default, keeps
+everything in the lab's own cgroup. The two together are production's layout:
+
+```sh
+# the lab's clients on CPUs 8-15; the server and as many hogs as its CPUs on 16-31, at production's weights
+taskset -c 8-15 target/release/kiln-lab run --kiln target/release/kiln --server-cpus 16-31 --layout production --hogs 1x
 ```
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the

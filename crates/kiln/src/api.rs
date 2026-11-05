@@ -1229,10 +1229,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
+        (&Method::GET, ["api", "harness", "sessions"]) => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
-        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
-            Some(info) => Ok(srv::json(StatusCode::OK, &info)),
+        // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
+        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
+            Some(info) => Ok(pre_encoded(info)),
             None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         },
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
@@ -5167,10 +5168,30 @@ async fn harness_history(hub: &Hub, caller: &crate::authz::Caller, q: &HashMap<S
 /// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
 /// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
 /// first, the newest `limit` (100, at most 1000) before event number `before`.
+/// JSON encoded before it was asked for (a view's, encoded once per change of it): sent as it is.
+fn pre_encoded(json: bytes::Bytes) -> Response {
+    srv::response(StatusCode::OK, "application/json", srv::full(json))
+}
+
+/// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
+/// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
+/// sees by lineage, found as it reads.
+async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
+    if crate::harness::lineage::sees_all(caller) {
+        return pre_encoded(hub.harness.list_json());
+    }
+    srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
+}
+
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    // From the session's copy when it holds them all: the events' texts as each was written once,
+    // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
+    if let Some(events) = hub.harness.events_json(id, before, limit) {
+        return Ok(pre_encoded(events));
+    }
     let id = id.to_owned();
     let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
@@ -6579,6 +6600,92 @@ mod tests {
             want.push(synced());
             assert_eq!(lines, want);
             assert!(frames.iter().any(|f| f.contains("second line")), "{frames:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3: a long session's packed snapshot, put together from its
+    /// chunks' pieces packed once (the sealed ones), its newest deflated as it's taken and what's between
+    /// them stored, unpacks with flate2 to exactly what the whole gzip of its frames and `synced` held
+    /// before; and taken again, it takes the pieces as they were packed and unpacks the same.
+    #[test]
+    fn g10_s3_a_snapshot_put_together_from_packed_chunks_unpacks_as_the_whole_gzip_did() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::io::{Read as _, Write as _};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: {}", "the retry loop reads its deadline ".repeat(usize::try_from(n % 7 + 1).unwrap_or(1))), streaming: false } };
+            // Past two chunks, a third begun.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
+            let unpack = |b: &[u8]| -> anyhow::Result<String> {
+                let mut text = String::new();
+                flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
+                Ok(text)
+            };
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
+            let frames = att.frames();
+            assert!(frames.iter().filter(|f| f.starts_with(r#"{"t":"events""#)).count() >= 3, "a frame a chunk: {}", frames.len());
+            let mut whole = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            whole.write_all(format!("{}\n{}", frames.join("\n"), synced()).as_bytes())?;
+            let was = unpack(&whole.finish()?)?;
+            let packed = att.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&packed)?, was, "what the whole gzip held");
+            let again = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&again)?, was, "taken again, the same");
+            assert!(packed.len() * 5 < was.len(), "it packs: {} of {}", packed.len(), was.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2: the reads of agent sessions the lab makes come from the
+    /// copies' views as their owners encoded them, and say what they said when each read encoded
+    /// its answer: the list and one session as `srv::json` wrote their infos (a state's change
+    /// encoded again), and a session's newest events as the conversation store answers them; a copy
+    /// that lacks some of those asked for leaves them to the store.
+    #[test]
+    fn g10_s2_session_reads_come_from_the_views_as_they_were_written() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for (id, at) in [("b", 2), ("a", 1)] {
+                let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), created_at: at, ..crate::harness::session::Info::default() };
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its \"deadline\""), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            // The second's copy holds its timeline from its fifth event on.
+            hub.harness.ingest(&hub, &there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
+            assert_eq!(hub.harness.list_json().as_ref(), serde_json::to_vec(&hub.harness.list())?.as_slice(), "the list, oldest first");
+            let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
+            assert!(a.last_activity > 0, "the state changed its info");
+            assert_eq!(hub.harness.info_json("a").as_deref(), Some(serde_json::to_vec(&a)?.as_slice()), "one, as it is now");
+            assert!(hub.harness.info_json("nobody").is_none());
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking({
+                let store = store.clone();
+                move || store.sync()
+            })
+            .await??;
+            // As `conversation_events` answers from the store.
+            let stored = |id: &str, before: Option<u64>, limit: usize| -> anyhow::Result<Vec<u8>> {
+                let events: Vec<serde_json::Value> = store.events(id, before, limit)?.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+                Ok(serde_json::to_vec(&json!({ "events": events }))?)
+            };
+            for (before, limit) in [(None, 50), (Some(100), 50), (None, 1000), (Some(30), 10), (Some(1), 5)] {
+                let copy = hub.harness.events_json("a", before, limit).ok_or_else(|| anyhow::anyhow!("the copy didn't say {before:?}, {limit}"))?;
+                assert_eq!(String::from_utf8_lossy(&copy), String::from_utf8_lossy(&stored("a", before, limit)?), "{before:?}, {limit}");
+            }
+            assert_eq!(hub.harness.events_json("b", None, 10).as_deref(), Some(stored("b", None, 10)?.as_slice()), "ten of the sixteen it holds");
+            assert!(hub.harness.events_json("b", None, 50).is_none(), "fewer than asked, its first four elsewhere: the store's to say");
+            assert!(hub.harness.events_json("nobody", None, 50).is_none());
             Ok(())
         })
     }
