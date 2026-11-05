@@ -970,11 +970,20 @@ pub fn wake(word: Encoded) {
     }
 }
 
+/// Counts one on the counter `of` names among the calling thread's shard's, where it runs one (kiln's goal 9,
+/// plan 01a1a87b2cec step 5: what a shard's thread does that costs it a system call); a thread off the runtime
+/// counts nothing.
+pub(crate) fn count_here(
+    of: impl FnOnce(&crate::shard_loop::LiveCounters) -> &std::cell::Cell<u64>,
+) {
+    let _ = with_current(|ctx| crate::shard_loop::count(of(&ctx.live), 1));
+}
+
 /// Counts a thread the calling thread just unparked on its shard, where it runs one (kiln's goal 9, plan
 /// 01a1a87b2cec step 5: a compute worker woken for its job, a thread waiting on what its task published, each a
 /// system call on the shard); a thread off the runtime counts nothing.
 pub(crate) fn count_thread_woken() {
-    let _ = with_current(|ctx| crate::shard_loop::count(&ctx.live.threads_woken, 1));
+    count_here(|live| &live.threads_woken);
 }
 
 /// Counts a wake that found no live consumer (a stale waker, or a holder that exited): a tripwire,

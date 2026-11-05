@@ -34,6 +34,7 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_wakes_taken_total{shard}`, `kiln_shard_wakes_sent_total{shard,to}` | Wakes from other threads the shard took in (bits drained: a task's wakes before it runs are one), and the wakes its own thread made through tasks' wakers (a channel's send, a broadcast's subscribers, a cell's publisher): `to="own"` to its own tasks, `to="other"` to other shards'. |
 | `kiln_shard_kicks_sent_total{shard}`, `kiln_shard_kicks_saved_total{shard}` | The kicks its thread made to parked shards, each a system call on it, counted by the sender as it claims the park's kick; and the wakes and messages sent to it that found it running or its park's kick claimed, which cost their senders none (`hyper_rt::parking`). |
 | `kiln_shard_threads_woken_total{shard}` | The threads its thread unparked: compute pool workers woken for the jobs it queued, a thread waiting on what its task published; each a system call on it. |
+| `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -207,8 +208,13 @@ polls, parks and wakes over the window, summed over the shards, over its request
 `steps`, `polls`, `parks` (each a system call and a sleep) and `parks_withdrawn` (none), the parks by what
 ended them (`wakeups_kick`, `wakeups_io`, `wakeups_timer`), the wakes from other threads taken in
 (`wakes_taken`), the wakes the shards' threads made (`wakes_sent_own`, `wakes_sent_other`), the kicks they
-sent (`kicks_sent`, each a system call on the shard) and were saved (`kicks_saved`), and the threads they
-unparked (`threads_woken`). Beside them, what each request handed the pools: the compute pool's jobs, the
+sent (`kicks_sent`, each a system call on the shard) and were saved (`kicks_saved`), the threads they
+unparked (`threads_woken`), their driver's harvests (`harvests`) and readiness registrations (`arms`), and their tasks' TCP calls
+(`socket_accepts`, `socket_reads`, `socket_writes`) with those that moved nothing (`socket_reads_empty`,
+`socket_writes_full`): with the parks and kicks, most of the system calls a request costs the shards, summed
+as `shards.syscalls_per_request` (not counted: a socket's options and shutdown, the probe's clock, the futex
+a channel to a thread of kiln's own may wake inside std, and, before goal 9's step 5, the read that drained
+the kick's eventfd on each kicked wake). Beside them, what each request handed the pools: the compute pool's jobs, the
 workers they woke and the times a worker went to park (`compute.jobs_per_request`, `.unparks_per_request`,
 `.parks_per_request`), and each blocking share's jobs, kiln.db's writer's among them
 (`blocking.<share>.per_request`).
