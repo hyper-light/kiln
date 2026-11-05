@@ -2239,13 +2239,10 @@ impl Hub {
             NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
-                        // Written on the blocking pool, in order (each waited for): a busy disk
-                        // holds up the next of this loop's messages, never the shard and its
+                        // Written by the job's writer on the blocking pool, in order (each waited for):
+                        // a busy disk holds up the next of this loop's messages, never the shard and its
                         // sockets (the HTTP listener among them).
-                        let logs = self.logs.clone();
-                        if let Err(e) = crate::rt::blocking(move || logs.append(&chunk.job, chunk.idx, &chunk.data)).await {
-                            tracing::warn!(error = %format!("{e:#}"), "a job's log chunk couldn't be written");
-                        }
+                        self.logs.append_written(&chunk.job, chunk.idx, &chunk.data).await;
                     }
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,

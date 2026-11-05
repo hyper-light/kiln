@@ -151,19 +151,6 @@ at = "crates/kiln/src/hub.rs"
 name = "handovers"
 why = "agent sessions moving between a machine's runner processes (crate::handovers): taken as a runner process is replaced, and on a session's update only when two of a machine's processes both say they hold it"
 
-# Logs.
-
-[[allowed]]
-at = "crates/kiln/src/logs.rs"
-name = "use"
-why = "imports a live job's files' cell (files, below)"
-
-[[allowed]]
-at = "crates/kiln/src/logs.rs"
-name = "files"
-why = "one per live job, held by what writes that job's log alone (its runner's chunks, in order through the hub's loop; its steps; its end); no viewer takes it (a job's feed is its entry's, in the live jobs' copy), nor another job's writer"
-todo = "an owner per job's files, its chunks, steps and end its messages"
-
 # Agent sessions' registry: what a session's updates read beside its copy (names, epochs, holders,
 # keep-offs, changesets, what machines offer) are copies swapped in whole (crate::rcu); these three
 # are off the hot path.
