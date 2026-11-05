@@ -556,13 +556,72 @@ impl Chunk {
 
 /// A copy's events in order, in chunks ([`Chunk`]) of [`CHUNK`]: the first may hold fewer, once its
 /// oldest have gone ([`Events::drain_front`]), and the newest may; each is shared, so a view takes them
-/// whole by reference, and the owner's next change copies only what it touches.
+/// whole by reference, and the owner's next change copies only what it touches. The newest chunk is held
+/// apart from the list of the others (goal 9, plan 01a1a87b2cec step 5): an event taken in at it, or one in
+/// it changed, copies that chunk alone where a view shares it; with one list of every chunk, each such event
+/// copied the list too (a long session's ~72 chunks) and let the last one go.
 #[derive(Clone, Default)]
 pub struct Events {
-    chunks: Arc<Vec<Arc<Chunk>>>,
+    /// Every chunk but the newest, in order.
+    older: Arc<Vec<Arc<Chunk>>>,
+    /// The newest chunk, which takes the next event: none only with no events, and no older chunks.
+    newest: Option<Arc<Chunk>>,
     len: usize,
     /// The events in the first chunk.
     first: usize,
+}
+
+/// A copy's chunks in order, the newest last ([`Events::chunks`]): what a slice of them was, made of the older
+/// ones' list and the newest held apart, nothing collected.
+#[derive(Clone, Copy)]
+pub struct Chunks<'a> {
+    older: &'a [Arc<Chunk>],
+    newest: Option<&'a Arc<Chunk>>,
+}
+
+/// [`Chunks`]' chunks in order.
+pub type ChunksIter<'a> = std::iter::Chain<std::slice::Iter<'a, Arc<Chunk>>, std::option::IntoIter<&'a Arc<Chunk>>>;
+
+impl<'a> Chunks<'a> {
+    pub fn len(&self) -> usize {
+        self.older.len() + usize::from(self.newest.is_some())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> Option<&'a Arc<Chunk>> {
+        match self.older.get(i) {
+            Some(c) => Some(c),
+            None => self.newest.filter(|_| i == self.older.len()),
+        }
+    }
+
+    pub fn first(&self) -> Option<&'a Arc<Chunk>> {
+        self.get(0)
+    }
+
+    pub fn last(&self) -> Option<&'a Arc<Chunk>> {
+        self.newest.or_else(|| self.older.last())
+    }
+
+    pub fn iter(&self) -> ChunksIter<'a> {
+        self.older.iter().chain(self.newest)
+    }
+
+    pub fn to_vec(&self) -> Vec<Arc<Chunk>> {
+        self.iter().cloned().collect()
+    }
+}
+
+impl<'a> IntoIterator for Chunks<'a> {
+    type Item = &'a Arc<Chunk>;
+    type IntoIter = ChunksIter<'a>;
+
+    fn into_iter(self) -> ChunksIter<'a> {
+        self.iter()
+    }
 }
 
 impl Events {
@@ -574,7 +633,35 @@ impl Events {
         while rest.peek().is_some() {
             chunks.push(Arc::new(Chunk::of(rest.by_ref().take(CHUNK).collect())));
         }
-        Self { chunks: Arc::new(chunks), len, first: len.min(CHUNK) }
+        let newest = chunks.pop();
+        Self { older: Arc::new(chunks), newest, len, first: len.min(CHUNK) }
+    }
+
+    /// Chunk `c` of [`Events::chunks`].
+    fn chunk(&self, c: usize) -> Option<&Arc<Chunk>> {
+        self.chunks().get(c)
+    }
+
+    /// Its chunks as one list for `f` to change, the newest last, then held apart again: what's done other than taking an
+    /// event in at the newest or changing one there (a chunk sealing, a cut, a compaction, a spill, a chunk read back):
+    /// each copies the list where a view shares it, as each did.
+    fn with_list<R>(&mut self, f: impl FnOnce(&mut Vec<Arc<Chunk>>) -> R) -> R {
+        let mut list = Arc::unwrap_or_clone(std::mem::take(&mut self.older));
+        list.extend(self.newest.take());
+        let out = f(&mut list);
+        self.newest = list.pop();
+        self.older = Arc::new(list);
+        out
+    }
+
+    /// Whether these are `other`'s as they were: the same chunks, shared, and as many events.
+    pub(super) fn same_as(&self, other: &Events) -> bool {
+        let newest = match (&self.newest, &other.newest) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        newest && Arc::ptr_eq(&self.older, &other.older) && self.len == other.len
     }
 
     /// Where event `i` is: its chunk, and its place in it.
@@ -599,7 +686,7 @@ impl Events {
     /// Event `i`: as its chunk keeps it, or read again from a compact chunk's segment.
     pub fn get(&self, i: usize) -> Option<Cow<'_, Ev>> {
         let (c, k) = self.place(i)?;
-        let chunk = self.chunks.get(c)?;
+        let chunk = self.chunk(c)?;
         if !chunk.is_compact() {
             return chunk.evs.get(k).map(Cow::Borrowed);
         }
@@ -612,7 +699,7 @@ impl Events {
         let mut out = Vec::with_capacity(at.len());
         for i in at {
             let Some((c, k)) = self.place(*i) else { continue };
-            let Some(chunk) = self.chunks.get(c) else { continue };
+            let Some(chunk) = self.chunk(c) else { continue };
             if !chunk.is_compact() {
                 out.extend(chunk.evs.get(k).map(|e| Arc::clone(&e.entry)));
                 continue;
@@ -627,7 +714,7 @@ impl Events {
 
     pub fn meta(&self, i: usize) -> Option<&Meta> {
         let (c, k) = self.place(i)?;
-        self.chunks.get(c)?.meta.get(k)
+        self.chunk(c)?.meta.get(k)
     }
 
     /// The texts of the events in `range`, joined by `,` as an `events` frame joins them, onto `out`: a
@@ -640,7 +727,7 @@ impl Events {
         let mut i = range.start;
         while i < range.end {
             let (c, k) = self.place(i)?;
-            let chunk = self.chunks.get(c)?;
+            let chunk = self.chunk(c)?;
             let n = chunk.len().checked_sub(k)?.min(range.end - i);
             if n == 0 {
                 return None;
@@ -675,7 +762,7 @@ impl Events {
         let mut i = range.start;
         while i < range.end {
             let (c, k) = self.place(i)?;
-            let chunk = self.chunks.get(c)?;
+            let chunk = self.chunk(c)?;
             let n = chunk.len().checked_sub(k)?.min(range.end - i);
             if n == 0 || chunk.is_spilled() {
                 return None;
@@ -714,7 +801,7 @@ impl Events {
     /// Each event in order: as its chunk keeps it, or a compact chunk's read again from its segment as the
     /// iteration comes to it (a chunk that can't be is passed over, said in the log).
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = Cow<'_, Ev>> + '_ {
-        self.chunks.iter().flat_map(|c| {
+        self.chunks().iter().flat_map(|c| {
             let evs: Vec<Cow<'_, Ev>> = match c.evs() {
                 Ok(Cow::Borrowed(evs)) => evs.iter().map(Cow::Borrowed).collect(),
                 Ok(Cow::Owned(evs)) => evs.into_iter().map(Cow::Owned).collect(),
@@ -728,42 +815,48 @@ impl Events {
     }
 
     pub fn metas(&self) -> impl DoubleEndedIterator<Item = &Meta> + '_ {
-        self.chunks.iter().flat_map(|c| c.meta.iter())
+        self.chunks().iter().flat_map(|c| c.meta.iter())
     }
 
     /// Its chunks, in order: a snapshot's pieces.
-    pub fn chunks(&self) -> &[Arc<Chunk>] {
-        &self.chunks
+    pub fn chunks(&self) -> Chunks<'_> {
+        Chunks { older: self.older.as_slice(), newest: self.newest.as_ref() }
     }
 
-    /// Event `i` changed by `f`: its chunk (and the list of chunks) copied first when a view shares
-    /// it. Whether there was one.
+    /// Event `i` changed by `f`: its chunk copied first when a view shares it, and, for one of the older chunks, their
+    /// list too. Whether there was one.
     pub(super) fn change(&mut self, i: usize, f: impl FnOnce(&mut Ev)) -> bool {
         let Some((c, k)) = self.place(i) else { return false };
-        match Arc::make_mut(&mut self.chunks).get_mut(c) {
+        if c == self.older.len() {
+            return match self.newest.as_mut() {
+                Some(chunk) => Arc::make_mut(chunk).change(k, f),
+                None => false,
+            };
+        }
+        match Arc::make_mut(&mut self.older).get_mut(c) {
             Some(chunk) => Arc::make_mut(chunk).change(k, f),
             None => false,
         }
     }
 
-    /// `ev` last: the chunk that sealed as it came (full, and no longer the newest), if one did.
+    /// `ev` last: the chunk that sealed as it came (full, and no longer the newest), if one did. Where the newest has room,
+    /// that chunk alone is copied (when a view shares it); the older chunks' list only as one seals, once a chunk.
     pub(super) fn push(&mut self, ev: Ev) -> Option<Arc<Chunk>> {
-        let chunks = Arc::make_mut(&mut self.chunks);
-        let room = chunks.last().is_some_and(|c| c.len() < CHUNK);
-        let only = chunks.len() == 1;
+        let room = self.newest.as_ref().is_some_and(|c| c.len() < CHUNK);
         let sealed = if room {
-            if let Some(last) = chunks.last_mut() {
-                Arc::make_mut(last).push(ev);
+            if let Some(newest) = self.newest.as_mut() {
+                Arc::make_mut(newest).push(ev);
             }
-            if only {
+            if self.older.is_empty() {
                 self.first += 1;
             }
             None
         } else {
-            let sealed = chunks.last().cloned();
-            chunks.push(Arc::new(Chunk::of(vec![ev])));
-            if chunks.len() == 1 {
-                self.first = 1;
+            // The newest full (or none yet): it joins the older ones, and a chunk of this event is the newest.
+            let sealed = self.newest.replace(Arc::new(Chunk::of(vec![ev])));
+            match &sealed {
+                Some(full) => Arc::make_mut(&mut self.older).push(Arc::clone(full)),
+                None => self.first = 1,
             }
             sealed
         };
@@ -798,27 +891,29 @@ impl Events {
     /// chunks past it stay as they were, packed.
     pub(super) fn drain_front(&mut self, n: usize) -> (usize, Option<Arc<Chunk>>) {
         let n = n.min(self.len);
-        let chunks = Arc::make_mut(&mut self.chunks);
-        // Whole chunks go as they are; the one the cut falls in is made again of its rest.
-        let (mut left, mut whole) = (n, 0);
-        while let Some(c) = chunks.get(whole)
-            && left >= c.len()
-        {
-            left -= c.len();
-            whole += 1;
-        }
-        chunks.drain(..whole.min(chunks.len()));
-        let mut remade = None;
-        if left > 0
-            && let Some(c) = chunks.first_mut()
-        {
-            let rest: Vec<Ev> = c.evs().map(|evs| evs.iter().skip(left).cloned().collect()).unwrap_or_default();
-            *c = Arc::new(Chunk::of(rest));
-            remade = Some(Arc::clone(c));
-        }
+        let remade = self.with_list(|chunks| {
+            // Whole chunks go as they are; the one the cut falls in is made again of its rest.
+            let (mut left, mut whole) = (n, 0);
+            while let Some(c) = chunks.get(whole)
+                && left >= c.len()
+            {
+                left -= c.len();
+                whole += 1;
+            }
+            chunks.drain(..whole.min(chunks.len()));
+            let mut remade = None;
+            if left > 0
+                && let Some(c) = chunks.first_mut()
+            {
+                let rest: Vec<Ev> = c.evs().map(|evs| evs.iter().skip(left).cloned().collect()).unwrap_or_default();
+                *c = Arc::new(Chunk::of(rest));
+                remade = Some(Arc::clone(c));
+            }
+            remade.filter(|_| chunks.len() > 1)
+        });
         self.len -= n;
-        self.first = chunks.first().map_or(0, |c| c.len());
-        (n, remade.filter(|_| chunks.len() > 1))
+        self.first = self.chunks().first().map_or(0, |c| c.len());
+        (n, remade)
     }
 
     /// [`Events::drain_front`] where the chunk the cut falls in is compact, so it would be read again to be made
@@ -831,18 +926,19 @@ impl Events {
     pub(super) fn drain_whole(&mut self, n: usize) -> Option<(usize, Arc<Chunk>, usize)> {
         let n = n.min(self.len);
         let (mut left, mut whole) = (n, 0);
-        while let Some(c) = self.chunks.get(whole)
+        while let Some(c) = self.chunk(whole)
             && left >= c.len()
         {
             left -= c.len();
             whole += 1;
         }
-        let cut = Arc::clone(self.chunks.get(whole).filter(|c| left > 0 && c.is_compact())?);
+        let cut = Arc::clone(self.chunk(whole).filter(|c| left > 0 && c.is_compact())?);
         let now = n - left;
-        let chunks = Arc::make_mut(&mut self.chunks);
-        chunks.drain(..whole);
+        self.with_list(|chunks| {
+            chunks.drain(..whole.min(chunks.len()));
+        });
         self.len -= now;
-        self.first = chunks.first().map_or(0, |c| c.len());
+        self.first = self.chunks().first().map_or(0, |c| c.len());
         Some((now, cut, left))
     }
 
@@ -852,16 +948,17 @@ impl Events {
     /// rest. How many it let go of (`left`).
     pub(super) fn trim_first(&mut self, was: &Arc<Chunk>, left: usize, made: Chunk) -> Option<usize> {
         let rest = was.metas().get(left..)?;
-        let same = self.chunks.first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq == b.seq);
+        let same = self.chunks().first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq == b.seq);
         if !same {
             return None;
         }
-        let chunks = Arc::make_mut(&mut self.chunks);
-        if let Some(first) = chunks.first_mut() {
-            *first = Arc::new(made);
-        }
+        self.with_list(|chunks| {
+            if let Some(first) = chunks.first_mut() {
+                *first = Arc::new(made);
+            }
+        });
         self.len -= left;
-        self.first = chunks.first().map_or(0, |c| c.len());
+        self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
         Some(left)
     }
@@ -872,19 +969,19 @@ impl Events {
         if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq == b.seq) {
             return false;
         }
-        let Some(at) = self.chunks.iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
-        match Arc::make_mut(&mut self.chunks).get_mut(at) {
+        let Some(at) = self.chunks().iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
+        self.with_list(|chunks| match chunks.get_mut(at) {
             Some(slot) => {
                 *slot = Arc::new(made);
                 true
             }
             None => false,
-        }
+        })
     }
 
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Meta) -> bool) {
         let mut all = Vec::with_capacity(self.len);
-        for c in self.chunks.iter() {
+        for c in self.chunks().iter() {
             let evs = c.evs().map(Cow::into_owned).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: let go of");
                 Vec::new()
@@ -908,7 +1005,7 @@ impl Events {
         }
         // All of them kept: nothing to do.
         let Some((c, k)) = self.place(kept) else { return Some(kept) };
-        let remade = match self.chunks.get(c) {
+        let remade = match self.chunk(c) {
             Some(chunk) if k > 0 => match chunk.evs() {
                 Ok(evs) => Some(Chunk::of(evs.iter().take(k).cloned().collect())),
                 Err(e) => {
@@ -918,15 +1015,17 @@ impl Events {
             },
             _ => None,
         };
-        let chunks = Arc::make_mut(&mut self.chunks);
-        chunks.truncate(c);
-        let mut len = kept.saturating_sub(k);
-        if let Some(chunk) = remade {
-            len += chunk.len();
-            chunks.push(Arc::new(chunk));
-        }
+        let len = self.with_list(|chunks| {
+            chunks.truncate(c);
+            let mut len = kept.saturating_sub(k);
+            if let Some(chunk) = remade {
+                len += chunk.len();
+                chunks.push(Arc::new(chunk));
+            }
+            len
+        });
         self.len = len;
-        self.first = chunks.first().map_or(0, |c| c.len());
+        self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
         Some(len)
     }
@@ -939,15 +1038,15 @@ impl Events {
     /// packed yet sent to be (goal 11, plan 01a1a87b2e56 step 2). A view taking a chunk keeps it as it was
     /// until it lets go.
     pub(super) fn compact(&mut self, home: Option<&Home>) {
-        let Some(sealed) = self.chunks.len().checked_sub(1) else { return };
-        for c in self.chunks.iter().take(sealed).filter(|c| !c.is_compact() && c.packed().is_none()) {
+        // Every chunk but the newest: the older ones.
+        for c in self.older.iter().filter(|c| !c.is_compact() && c.packed().is_none()) {
             seal(c, home.cloned());
         }
-        let ready: Vec<usize> = (0..sealed).filter(|i| self.chunks.get(*i).is_some_and(|c| !c.is_compact() && c.packed().is_some())).collect();
+        let ready: Vec<usize> = (0..self.older.len()).filter(|i| self.older.get(*i).is_some_and(|c| !c.is_compact() && c.packed().is_some())).collect();
         if ready.is_empty() {
             return;
         }
-        let chunks = Arc::make_mut(&mut self.chunks);
+        let chunks = Arc::make_mut(&mut self.older);
         for i in ready {
             if let Some(slot) = chunks.get_mut(i)
                 && let Some(c) = slot.compacted()
@@ -963,7 +1062,7 @@ impl Events {
     /// until now, the only other one set) let go of, so a copy keeps one chunk's texts at the most.
     fn page_newest(&self) {
         let mut newest = true;
-        for c in self.chunks.iter().rev().filter(|c| c.is_compact() && !c.is_spilled()) {
+        for c in self.chunks().iter().rev().filter(|c| c.is_compact() && !c.is_spilled()) {
             if newest {
                 c.paged.store(true, Ordering::SeqCst);
                 newest = false;
@@ -981,7 +1080,7 @@ impl Events {
     pub(super) fn spillable(&self, page: usize, bytes: usize) -> Vec<Arc<Chunk>> {
         let (mut after, mut kept) = (0usize, 0usize);
         let mut out = Vec::new();
-        for c in self.chunks.iter().rev() {
+        for c in self.chunks().iter().rev() {
             if c.is_compact()
                 && !c.is_spilled()
                 && let Some(s) = c.packed()
@@ -1004,7 +1103,8 @@ impl Events {
     /// go when nothing refers to them). How many were.
     pub(super) fn spilled(&mut self, chunks: &[Arc<Chunk>], spilled: Vec<super::spill::Spilled>) -> usize {
         let mut n = 0;
-        let list = Arc::make_mut(&mut self.chunks);
+        // Spilled chunks are compact, so older ones: the newest never is.
+        let list = Arc::make_mut(&mut self.older);
         for (c, s) in chunks.iter().zip(spilled) {
             if let Some(slot) = list.iter_mut().find(|slot| Arc::ptr_eq(slot, c))
                 && let Some(made) = c.spilled_as(s)
@@ -1778,7 +1878,7 @@ impl Mirror {
             }
         };
         let (c, _) = self.events.place(at)?;
-        self.events.chunks.get(c).filter(|c| c.is_compact()).cloned()
+        self.events.chunks().get(c).filter(|c| c.is_compact()).cloned()
     }
 
     /// Where taking event `id` numbered `seq` would put it in among the copy's events (`upsert`: one it has under
@@ -1969,7 +2069,7 @@ impl Shard {
     /// its events are still `was`'s. Whether they were.
     fn take_inserted(&mut self, id: &str, was: &Events, made: Events, index: Index) -> bool {
         let Some(m) = self.mirrors.get_mut(id) else { return false };
-        if !Arc::ptr_eq(&m.events.chunks, &was.chunks) || m.events.len != was.len {
+        if !m.events.same_as(was) {
             return false;
         }
         m.events = made;
@@ -2667,6 +2767,49 @@ mod tests {
         assert!(events.is_empty() && events.get(0).is_none());
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: an event taken in at the newest chunk, or one in it changed, copies that chunk
+    /// alone where a view shares it: the older chunks' list stays the view's. The chunk sealing as the next event comes
+    /// joins the list (copied then, once a chunk) as it was; an event in an older chunk changed copies it and the list.
+    /// The events, their order and the view's are as one list of every chunk had them.
+    #[test]
+    fn g9_s5_an_event_taken_in_at_the_newest_chunk_copies_that_chunk_alone() -> anyhow::Result<()> {
+        let ids = |e: &Events| e.metas().map(|m| m.id().to_owned()).collect::<Vec<_>>();
+        let mut events = Events::default();
+        let n = u64::try_from(CHUNK * 3 + 5)?;
+        for s in 1..=n {
+            let _ = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
+        }
+        let view = events.clone();
+        let view_ids = ids(&view);
+        anyhow::ensure!(events.push(Ev { entry: entry("x1", n + 1), at: n + 1 }).is_none(), "the newest had room");
+        let newest_copied = !matches!((&events.newest, &view.newest), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
+        anyhow::ensure!(Arc::ptr_eq(&events.older, &view.older) && newest_copied, "the older chunks' list the view's, the newest copied");
+        let last = events.len() - 1;
+        let before = events.clone();
+        anyhow::ensure!(events.change(last, |e| e.at = 0) && Arc::ptr_eq(&events.older, &before.older), "a change in the newest copies it alone");
+        // Filled to the brim, the next event seals it: it joins the older ones as it was.
+        while events.chunks().last().is_some_and(|c| c.len() < CHUNK) {
+            let s = u64::try_from(events.len() + 1)?;
+            let _ = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
+        }
+        let full = events.newest.clone();
+        let before = events.clone();
+        let s = u64::try_from(events.len() + 1)?;
+        let sealed = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
+        anyhow::ensure!(matches!((&sealed, &full), (Some(a), Some(b)) if Arc::ptr_eq(a, b)), "the full one sealed");
+        anyhow::ensure!(!Arc::ptr_eq(&events.older, &before.older) && events.older.len() == before.older.len() + 1, "the list copied once, the sealed chunk in it");
+        anyhow::ensure!(events.chunks().len() == 5 && events.chunks().iter().map(|c| c.len()).sum::<usize>() == events.len(), "every chunk, in order");
+        // An event in an older chunk changed: that chunk and the list copied, the others shared.
+        let before = events.clone();
+        anyhow::ensure!(events.change(0, |e| e.at = 0) && !Arc::ptr_eq(&events.older, &before.older));
+        let shared = events.chunks().iter().zip(before.chunks().iter()).filter(|(a, b)| Arc::ptr_eq(a, b)).count();
+        anyhow::ensure!(shared == 4, "{shared} of five chunks still shared");
+        // As one list of every chunk had them: in order, the view's as they were.
+        let made = Events::of(events.iter().map(Cow::into_owned).collect());
+        anyhow::ensure!(ids(&events) == ids(&made) && events.first == made.first && ids(&view) == view_ids && view.len() == view_ids.len());
+        Ok(())
+    }
+
     /// A change copies the chunk it touches and the list of chunks, never every event: the other
     /// chunks stay shared with the view taken before it.
     #[test]
@@ -2677,7 +2820,7 @@ mod tests {
         }
         let view = events.clone();
         assert!(events.change(0, |e| e.at = 0));
-        let shared = events.chunks.iter().zip(view.chunks.iter()).filter(|(a, b)| Arc::ptr_eq(a, b)).count();
+        let shared = events.chunks().iter().zip(view.chunks().iter()).filter(|(a, b)| Arc::ptr_eq(a, b)).count();
         assert_eq!(shared, 3, "three of four chunks still shared with the view");
     }
 
