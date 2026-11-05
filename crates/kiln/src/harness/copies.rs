@@ -657,7 +657,8 @@ pub struct Mirror {
     pub(super) changes_sent: Option<Files>,
     /// Shared with its views, a chunk at a time ([`Events`]).
     pub(super) events: Events,
-    pub(super) index: HashMap<String, usize>,
+    /// Where each event is, by its id: the id its meta keeps, shared (goal 11, plan 01a1a87b2e56 step 2).
+    pub(super) index: HashMap<Arc<str>, usize>,
     /// Its live frames, on a topic of its own on the bus; each carries the copy's revision.
     pub(super) feed: Feed,
     /// Every update this copy has taken, counted: its revision, what a viewer resumes from
@@ -885,7 +886,7 @@ impl Mirror {
     }
 
     pub fn reindex(&mut self) {
-        self.index = self.events.metas().enumerate().filter(|(_, m)| !m.id.is_empty()).map(|(i, m)| (m.id.to_string(), i)).collect();
+        self.index = self.events.metas().enumerate().filter(|(_, m)| !m.id.is_empty()).map(|(i, m)| (Arc::clone(&m.id), i)).collect();
     }
 
     /// Lets go of every event.
@@ -902,7 +903,7 @@ impl Mirror {
     pub fn upsert(&mut self, e: Arc<Entry>) -> bool {
         let Some(id) = e.id().map(str::to_owned) else { return false };
         let ev = Ev { entry: e, at: self.rev };
-        if self.index.get(&id).copied().is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
+        if self.index.get(id.as_str()).copied().is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
             return false;
         }
         if let (Some(q), Some(top)) = (ev.entry.seq(), self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq))
@@ -918,8 +919,14 @@ impl Mirror {
             self.reindex();
             return displaced;
         }
-        self.index.insert(id, self.events.len());
-        if let Some(sealed) = self.events.push(ev) {
+        let at = self.events.len();
+        let sealed = self.events.push(ev);
+        // Indexed by the id its meta keeps (one copy of it).
+        match self.events.meta(at) {
+            Some(m) => self.index.insert(Arc::clone(&m.id), at),
+            None => self.index.insert(Arc::from(id), at),
+        };
+        if let Some(sealed) = sealed {
             seal(sealed, self.home());
         }
         if self.events.len() > MAX_EVENTS + MAX_EVENTS / 4 {
