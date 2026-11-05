@@ -345,7 +345,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.done",
-            summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
+            summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Of several goals under way at once (those you set under way with goals_update `active`), the one named ends alone and the rest stay under way. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsDone>(),
@@ -354,7 +354,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.update",
-            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for).",
+            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (one under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for); `active: true` sets it under way as yours, worked by your own subagents (your Agent or Task tool), beside your goal under way and any others so: several can be under way at once, nothing is sent to you for them and no subagent of kiln's is started for them, and each ends alone (goals_done with its `id`); `active: false` puts one you set so back among the goals to go.",
             read_only: false,
             destructive: true,
             input: Input::of::<input::GoalsUpdate>(),
@@ -484,8 +484,8 @@ pub mod input {
         pub action: GoalsControlAction,
         /// pause: why, shown with the stack (what it waits for).
         pub why: Option<String>,
-        /// skip, done: the goal it's for (the goal under way, by its id); asked again once that
-        /// goal has ended, nothing more ends.
+        /// skip, done: the goal it's for (a goal under way, by its id; without it, the goal under
+        /// way that's sent to the agent); asked again once that goal has ended, nothing more ends.
         pub id: Option<String>,
         /// An idempotency key, made once for this request (1 to 256 bytes): asked again under it
         /// (its answer lost), it's answered with the stack as it is and does nothing more, whatever
@@ -533,6 +533,11 @@ pub mod input {
         pub needs: Option<Vec<String>>,
         /// Take it out.
         pub remove: Option<bool>,
+        /// true: it's under way, yours, worked by your own subagents (your Agent or Task tool),
+        /// beside your goal under way and any others so; nothing is sent to you for it, and no
+        /// subagent of kiln's is started for it. Say it met with goals_done and its `id`: it ends
+        /// alone. false: one you set under way so goes back among the goals to go. Said alone.
+        pub active: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
