@@ -13,6 +13,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod lanes;
 pub mod owners;
 pub mod queue;
 pub mod ring;

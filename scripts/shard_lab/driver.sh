@@ -118,8 +118,11 @@ one() {
     [ -s "$data" ] || continue
     # Every thread's by symbol; then the shards' alone (their threads' names, hyper-rt-shard-N, cut to 15 bytes), by
     # symbol with who called it.
-    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-children --sort comm,dso,symbol --stdio -g none --percent-limit 0.2 > "${data%.data}.txt" 2>/dev/null
-    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-children --comms hyper-rt-shard- --sort symbol --stdio -g caller,0.5,callee,function,percent --percent-limit 0.5 > "${data%.data}-shards.txt" 2>/dev/null
+    # --no-inline: resolving inlined frames through a 1.2 GB unstripped build's line tables took perf 17+ minutes a
+    # report on g9p6 (2026-11-05), with it 19 s; the symbols are the same.
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --no-children --sort comm,dso,symbol --stdio -g none --percent-limit 0.2 > "${data%.data}.txt" 2>/dev/null
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --children --comms hyper-rt-shard- --sort symbol --stdio -g none --percent-limit 0.5 > "${data%.data}-shards-children.txt" 2>/dev/null
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --no-children --comms hyper-rt-shard- --sort symbol --stdio -g caller,0.5,callee,function,percent --percent-limit 0.5 > "${data%.data}-shards.txt" 2>/dev/null
   done
 }
 say "start: $ROUNDS rounds of$CONFIGS ($PROFILE), $N hogs; the lab on CPUs $LAB_CPUS, the server on $SERVER_CPUS with ${SHARDS:-its own count of} shards${SERVER_ENV:+ and $SERVER_ENV}, hogs on $HOG_CPUS (cores: $CORES, its hogs on $CORES_HOGS); real-time room ${rt_room:-unknown}; $(uptime)"

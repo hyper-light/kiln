@@ -246,6 +246,245 @@ fn events_ring_is_the_broadcasts_size() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The numbers of what [`Feed::since`] says: `None` for a gap.
+fn seqs(s: Since) -> Option<Vec<u64>> {
+    match s {
+        Since::Frames(f) => Some(f.iter().map(|f| f.seq).collect()),
+        Since::Gap => None,
+    }
+}
+
+/// `t.i`, the `i`th frame thread `t` pushed, read back.
+fn pushed_by(text: &str) -> anyhow::Result<(usize, usize)> {
+    let (t, i) = text.split_once('.').ok_or_else(|| anyhow::anyhow!("not a pusher's frame: {text}"))?;
+    Ok((t.parse()?, i.parse()?))
+}
+
+/// Pushes `each` frames from each of `threads` threads at once, `t.i` each: the numbers each thread's pushes
+/// were given, in the order it pushed.
+fn push_from_threads(feed: &Arc<Feed>, threads: usize, each: usize) -> Vec<std::thread::JoinHandle<Vec<u64>>> {
+    (0..threads)
+        .map(|t| {
+            let feed = Arc::clone(feed);
+            std::thread::spawn(move || (0..each).map(|i| feed.push(Arc::from(format!("{t}.{i}")))).collect())
+        })
+        .collect()
+}
+
+/// Goal 5, plan 01a1a59c2aae (its rule: no lock two shards share), on W21-R15's feed: pushes from several
+/// threads at once are numbered densely (1 to how many, each once) in the order they came, each thread's in
+/// the order it pushed them, and every frame is in its place when they're done.
+#[test]
+fn g5_feed_pushes_from_many_threads_are_numbered_densely_in_order() -> anyhow::Result<()> {
+    let (threads, each) = (8_usize, 2_000_usize);
+    let total = u64::try_from(threads * each)?;
+    let feed = Arc::new(Feed::with_capacity(1, threads * each));
+    let mut claimed = Vec::new();
+    for p in push_from_threads(&feed, threads, each) {
+        let seqs = p.join().map_err(|_| anyhow::anyhow!("a pusher ended early"))?;
+        anyhow::ensure!(seqs.windows(2).all(|w| w.first() < w.get(1)), "a thread's pushes weren't numbered in the order it made them");
+        claimed.extend(seqs);
+    }
+    claimed.sort_unstable();
+    anyhow::ensure!(claimed == (1..=total).collect::<Vec<_>>(), "the numbers aren't 1 to {total}, each once");
+    anyhow::ensure!(feed.head() == total, "head {} of {total}", feed.head());
+    let kept = feed.kept();
+    anyhow::ensure!(kept.iter().map(|f| f.seq).eq(1..=total), "{} kept of {total}, or not in order", kept.len());
+    // Each thread's frames in the order it pushed them.
+    let mut next = vec![0_usize; threads];
+    for f in &kept {
+        let (t, i) = pushed_by(&f.text)?;
+        anyhow::ensure!(next.get(t) == Some(&i), "frame {} is {t}.{i}, after {t}.{:?}", f.seq, next.get(t));
+        if let Some(n) = next.get_mut(t) {
+            *n += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Goal 5, plan 01a1a59c2aae, on W21-R15's feed: readers walking it while several threads push never skip a
+/// frame: each takes 1, 2, 3 ... in turn, stopping where a push is still putting its frame in its place (never
+/// past it), and, with a window no smaller than what's pushed, none is ever told of a gap.
+#[test]
+fn g5_feed_readers_never_skip_a_frame_below_head() -> anyhow::Result<()> {
+    let (threads, each, readers) = (6_usize, 3_000_usize, 3_usize);
+    let total = u64::try_from(threads * each)?;
+    let feed = Arc::new(Feed::with_capacity(2, threads * each));
+    let reading: Vec<_> = (0..readers)
+        .map(|_| {
+            let feed = Arc::clone(&feed);
+            std::thread::spawn(move || -> anyhow::Result<u64> {
+                let (mut at, deadline) = (0_u64, std::time::Instant::now() + std::time::Duration::from_secs(120));
+                while at < total {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "stuck at {at} of {total}, head {}", feed.head());
+                    let head = feed.head();
+                    let Since::Frames(frames) = feed.since(at) else { anyhow::bail!("a gap after {at}, head {head}, though the window holds every frame") };
+                    for f in frames {
+                        anyhow::ensure!(f.seq == at + 1, "after {at} it took {}: one skipped", f.seq);
+                        at = f.seq;
+                    }
+                    anyhow::ensure!(at <= feed.head(), "it took {at}, past the head {}", feed.head());
+                    std::thread::yield_now();
+                }
+                Ok(at)
+            })
+        })
+        .collect();
+    for p in push_from_threads(&feed, threads, each) {
+        p.join().map_err(|_| anyhow::anyhow!("a pusher ended early"))?;
+    }
+    for r in reading {
+        let at = r.join().map_err(|_| anyhow::anyhow!("a reader ended early"))??;
+        anyhow::ensure!(at == total, "a reader ended at {at} of {total}");
+    }
+    Ok(())
+}
+
+/// Goal 5, plan 01a1a59c2aae, on W21-R15's feed: a push that claimed its number but hasn't put its frame in its
+/// place yet (its thread preempted between the two) holds readers there: they take what's before it, never
+/// what's after it, until it's in, then all of it. One held up while a whole window of pushes went past it is
+/// a gap (its frame went before anyone could read it), and its late put doesn't take the newer frame's place.
+#[test]
+fn g5_feed_a_held_up_push_holds_readers_until_its_frame_is_in() -> anyhow::Result<()> {
+    let feed = Feed::with_capacity(9, 4);
+    feed.push(Arc::from("1"));
+    // The second push claims its number and is held up before it puts its frame in its place.
+    let held = feed.next.fetch_add(1, Ordering::AcqRel);
+    feed.push(Arc::from("3"));
+    feed.push(Arc::from("4"));
+    anyhow::ensure!((held, feed.head()) == (2, 4), "held {held}, head {}", feed.head());
+    anyhow::ensure!(seqs(feed.since(0)) == Some(vec![1]), "{:?}: past the frame not in yet", seqs(feed.since(0)));
+    anyhow::ensure!(seqs(feed.since(1)) == Some(vec![]), "{:?}", seqs(feed.since(1)));
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq([1]), "kept goes past the frame not in yet too");
+    feed.put(Arc::new(Frame::new(held, Arc::from("2"))));
+    anyhow::ensure!(seqs(feed.since(1)) == Some(vec![2, 3, 4]), "{:?}", seqs(feed.since(1)));
+    // Held up while a whole window went past: its place (5 % 4) takes 9 meanwhile.
+    let late = feed.next.fetch_add(1, Ordering::AcqRel);
+    for i in 6..=9 {
+        feed.push(Arc::from(i.to_string()));
+    }
+    anyhow::ensure!(late == 5 && seqs(feed.since(4)).is_none(), "a reader after 4 isn't told of a gap: {:?}", seqs(feed.since(4)));
+    feed.put(Arc::new(Frame::new(late, Arc::from("5"))));
+    anyhow::ensure!(seqs(feed.since(5)) == Some(vec![6, 7, 8, 9]), "the late frame took a newer one's place: {:?}", seqs(feed.since(5)));
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq(6..=9), "kept: {:?}", feed.kept().iter().map(|f| f.seq).collect::<Vec<_>>());
+    // A reader that took everything before a frame that's gone by the time it looks: a gap, not a wait.
+    let gone = Feed::with_capacity(9, 2);
+    gone.push(Arc::from("1"));
+    let lapped = gone.next.fetch_add(1, Ordering::AcqRel);
+    anyhow::ensure!(seqs(gone.since(1)) == Some(vec![]), "it waits for {lapped} while it may still come");
+    gone.push(Arc::from("3"));
+    gone.push(Arc::from("4"));
+    anyhow::ensure!(seqs(gone.since(1)).is_none(), "{lapped} is gone: {:?}", seqs(gone.since(1)));
+    Ok(())
+}
+
+/// Goal 5, plan 01a1a59c2aae, on W21-R15's feed: a reader that fell behind past the window while several
+/// threads push is told of the gap, and from the head it goes on in order, none twice and none skipped
+/// between gaps; it ends at the last frame.
+#[test]
+fn g5_feed_a_reader_behind_the_window_is_told_of_the_gap_and_goes_on() -> anyhow::Result<()> {
+    let (threads, each, cap) = (4_usize, 5_000_usize, 64_u64);
+    let total = u64::try_from(threads * each)?;
+    let feed = Arc::new(Feed::with_capacity(3, usize::try_from(cap)?));
+    let pushers = push_from_threads(&feed, threads, each);
+    let (mut at, mut gaps, deadline) = (0_u64, 0_usize, std::time::Instant::now() + std::time::Duration::from_secs(120));
+    // Two windows behind before it reads at all: its first read is a gap.
+    while feed.head() < 2 * cap {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the pushers stopped at {}", feed.head());
+        std::thread::yield_now();
+    }
+    while at < total {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "stuck at {at} of {total}, head {}", feed.head());
+        match feed.since(at) {
+            Since::Frames(frames) => {
+                for f in frames {
+                    anyhow::ensure!(f.seq == at + 1, "after {at} it took {}", f.seq);
+                    at = f.seq;
+                }
+            }
+            Since::Gap => {
+                let head = feed.head();
+                anyhow::ensure!(head > at, "a gap with nothing after {at}");
+                gaps += 1;
+                at = head;
+            }
+        }
+        std::thread::yield_now();
+    }
+    for p in pushers {
+        p.join().map_err(|_| anyhow::anyhow!("a pusher ended early"))?;
+    }
+    anyhow::ensure!(at == total && gaps > 0, "ended at {at} of {total} with {gaps} gaps");
+    Ok(())
+}
+
+/// Goal 5, plan 01a1a59c2aae, on W21-R15's feed: every listener is woken by a push after it listened, pushes
+/// before its wait are one wake (a permit: one while it looks isn't lost), and one that goes is taken off the
+/// list.
+#[test]
+fn g5_feed_wakes_every_listener_and_forgets_one_gone() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let wait = std::time::Duration::from_secs(5);
+        let feed = Feed::with_capacity(4, 16);
+        let (a, b) = (feed.listen(), feed.listen());
+        anyhow::ensure!(feed.listeners.load().len() == 2, "two listening");
+        {
+            let mut first = std::pin::pin!(a.woken());
+            anyhow::ensure!(futures::poll!(first.as_mut()).is_pending(), "woken with nothing pushed");
+            feed.push(Arc::from("1"));
+            crate::rt::timeout(wait, first).await?;
+        }
+        crate::rt::timeout(wait, b.woken()).await?;
+        // Two while it looked: one wake, then it waits for the next.
+        feed.push(Arc::from("2"));
+        feed.push(Arc::from("3"));
+        crate::rt::timeout(wait, a.woken()).await?;
+        {
+            let mut again = std::pin::pin!(a.woken());
+            anyhow::ensure!(futures::poll!(again.as_mut()).is_pending(), "two pushes were two wakes");
+            // From another thread.
+            let feed = &feed;
+            std::thread::scope(|s| s.spawn(|| feed.push(Arc::from("4"))).join().map_err(|_| anyhow::anyhow!("the pusher ended early")))?;
+            crate::rt::timeout(wait, again).await?;
+        }
+        drop(b);
+        anyhow::ensure!(feed.listeners.load().len() == 1, "a listener gone is still listed");
+        drop(a);
+        anyhow::ensure!(feed.listeners.load().is_empty(), "a listener gone is still listed");
+        Ok(())
+    })
+}
+
+/// Goal 5, plan 01a1a59c2aae, on W21-R15's feed: a socket's loop as the events socket runs it (listen, take
+/// what's after its number, wait for a wake) takes every frame several threads push at once, in order, none
+/// twice, and none of its waits outlasts a frame put in its place: no wake is lost between a push's put and
+/// a reader's look.
+#[test]
+fn g5_feed_a_listener_takes_every_frame_pushed_from_many_threads() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let (threads, each) = (4_usize, 2_500_usize);
+        let total = u64::try_from(threads * each)?;
+        let feed = Arc::new(Feed::with_capacity(5, threads * each));
+        let woke = feed.listen();
+        let pushers = push_from_threads(&feed, threads, each);
+        let mut at = 0_u64;
+        while at < total {
+            let Since::Frames(frames) = feed.since(at) else { anyhow::bail!("a gap after {at}, though the window holds every frame") };
+            for f in frames {
+                anyhow::ensure!(f.seq == at + 1, "after {at} it took {}", f.seq);
+                at = f.seq;
+            }
+            if at < total {
+                crate::rt::timeout(std::time::Duration::from_secs(30), woke.woken()).await.map_err(|_| anyhow::anyhow!("no wake at {at} of {total}, head {}", feed.head()))?;
+            }
+        }
+        for p in pushers {
+            p.join().map_err(|_| anyhow::anyhow!("a pusher ended early"))?;
+        }
+        Ok(())
+    })
+}
+
 /// A socket's sends of `events` (each when it's emitted, in ms), as `pump_events` makes them: each
 /// frame at once (before), or batched (after): a send at once after a quiet window, else at the
 /// window's end, or once [`MAX_BATCH`] are gathered. Its frames and bytes.

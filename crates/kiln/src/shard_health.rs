@@ -94,6 +94,8 @@ pub struct Shard {
     wakes: WakeCells,
     /// The system calls its thread made beside them ([`Calls`]), as the probe last copied them.
     calls: CallCells,
+    /// How long its parks lasted ([`ParkTimes`]), as the probe last copied them.
+    parks: ParkCells,
 }
 
 /// What a shard's parks and wakes cost it, as hyper-rt counts them on the shard (goal 9, plan 01a1a87b2cec step
@@ -211,6 +213,57 @@ impl CallCells {
     }
 }
 
+/// How long a shard's parks lasted (goal 9, plan 01a1a87b2cec step 5: whether a short spin before parking would catch
+/// their work for less than a park and its wake cost): their time summed, and the parks under each of hyper-rt's
+/// bounds (`hyper_rt::shard_loop::PARK_BOUNDS_NS`, doubling from 1 µs to 8,192 µs), a histogram's cumulative buckets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParkTimes {
+    pub parked_ns: u64,
+    pub under: [u64; hyper_rt::shard_loop::PARK_BOUNDS_NS.len()],
+}
+
+impl ParkTimes {
+    fn of(c: &hyper_rt::shard_loop::Counters) -> Self {
+        let under = [
+            c.parks_under_1us,
+            c.parks_under_2us,
+            c.parks_under_4us,
+            c.parks_under_8us,
+            c.parks_under_16us,
+            c.parks_under_32us,
+            c.parks_under_64us,
+            c.parks_under_128us,
+            c.parks_under_256us,
+            c.parks_under_512us,
+            c.parks_under_1024us,
+            c.parks_under_2048us,
+            c.parks_under_4096us,
+            c.parks_under_8192us,
+        ];
+        Self { parked_ns: c.parked_ns, under }
+    }
+}
+
+/// [`ParkTimes`] as the probe stores them: the time, then each bucket.
+#[derive(Default)]
+struct ParkCells {
+    parked_ns: AtomicU64,
+    under: [AtomicU64; hyper_rt::shard_loop::PARK_BOUNDS_NS.len()],
+}
+
+impl ParkCells {
+    fn store(&self, parks: &ParkTimes) {
+        self.parked_ns.store(parks.parked_ns, Ordering::Relaxed);
+        for (cell, n) in self.under.iter().zip(parks.under) {
+            cell.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> ParkTimes {
+        ParkTimes { parked_ns: self.parked_ns.load(Ordering::Relaxed), under: self.under.each_ref().map(|cell| cell.load(Ordering::Relaxed)) }
+    }
+}
+
 impl Shard {
     fn new() -> Self {
         Self {
@@ -231,6 +284,7 @@ impl Shard {
             quantum_ns: AtomicU64::new(0),
             wakes: WakeCells::default(),
             calls: CallCells::default(),
+            parks: ParkCells::default(),
         }
     }
 
@@ -255,6 +309,7 @@ impl Shard {
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
             self.wakes.store(&Wakes::of(&c));
             self.calls.store(&Calls::of(&c));
+            self.parks.store(&ParkTimes::of(&c));
         }
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
             self.quantum_ns.store(q, Ordering::Relaxed);
@@ -279,6 +334,11 @@ impl Shard {
     /// The system calls its thread has made beside them, as its probe last copied them ([`Calls`]).
     pub fn calls(&self) -> Calls {
         self.calls.load()
+    }
+
+    /// How long its parks have lasted, as its probe last copied them ([`ParkTimes`]).
+    pub fn parks(&self) -> ParkTimes {
+        self.parks.load()
     }
 
     /// What the shard's probe has noted, as it stands.
@@ -514,7 +574,23 @@ pub fn render(o: &mut String) {
     render_quantum(o, all);
     render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
     render_calls(o, &all.iter().map(Shard::calls).collect::<Vec<_>>(), &help);
+    render_parks(o, &all.iter().map(|s| (s.parks(), s.wakes().parks)).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+}
+
+/// `kiln_shard_park_seconds`: how long each shard's parks lasted ([`ParkTimes`]; goal 9, plan 01a1a87b2cec step 5), a
+/// histogram of hyper-rt's bounds, from `all`: each shard's times and its parks' count, in the runtime's order.
+fn render_parks(o: &mut String, all: &[(ParkTimes, u64)], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    let name = "kiln_shard_park_seconds";
+    help(o, name, "histogram", "How long each shard's parks lasted, from its driver wait's call to its return: under 16 us, a spin as long would have served its work sooner than its wake.");
+    for (i, (parks, count)) in all.iter().enumerate() {
+        for (bound, n) in hyper_rt::shard_loop::PARK_BOUNDS_NS.iter().zip(parks.under) {
+            let _ = writeln!(o, "{name}_bucket{{shard=\"{i}\",le=\"{}\"}} {n}", secs(Duration::from_nanos(*bound)));
+        }
+        let _ = writeln!(o, "{name}_bucket{{shard=\"{i}\",le=\"+Inf\"}} {count}");
+        let _ = writeln!(o, "{name}_sum{{shard=\"{i}\"}} {}", secs(Duration::from_nanos(parks.parked_ns)));
+        let _ = writeln!(o, "{name}_count{{shard=\"{i}\"}} {count}");
+    }
 }
 
 /// The families of the system calls each shard's thread made beside its parks and wakes ([`Calls`]; goal 9, plan
@@ -598,14 +674,34 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
         return;
     }
     // Each shard's entries by what the exposition names them (two labels of one name are one series): polls,
-    // their time, the longest, and those of them the host held with their time.
-    type Row = (u64, u64, u64, u64, u64);
+    // their time, the longest, those of them the host held with their time, and those whose thread said its time on
+    // the CPU with their holds, that time and the longest of it.
+    #[derive(Default)]
+    struct Row {
+        polls: u64,
+        ns: u64,
+        longest: u64,
+        host_polls: u64,
+        host_ns: u64,
+        cpu_polls: u64,
+        cpu_held_ns: u64,
+        cpu_ns: u64,
+        longest_cpu: u64,
+    }
     let mut rows: std::collections::BTreeMap<(usize, String, &'static str), Row> = std::collections::BTreeMap::new();
     for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
         for p in hyper_rt::slow::slow_polls(holder) {
             let site = p.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
             let row = rows.entry((i, site, p.label.map_or("", |l| l.name))).or_default();
-            *row = (row.0.saturating_add(p.polls), row.1.saturating_add(p.total_ns), row.2.max(p.longest_ns), row.3.saturating_add(p.host_polls), row.4.saturating_add(p.host_ns));
+            row.polls = row.polls.saturating_add(p.polls);
+            row.ns = row.ns.saturating_add(p.total_ns);
+            row.longest = row.longest.max(p.longest_ns);
+            row.host_polls = row.host_polls.saturating_add(p.host_polls);
+            row.host_ns = row.host_ns.saturating_add(p.host_ns);
+            row.cpu_polls = row.cpu_polls.saturating_add(p.cpu_polls);
+            row.cpu_held_ns = row.cpu_held_ns.saturating_add(p.cpu_held_ns);
+            row.cpu_ns = row.cpu_ns.saturating_add(p.cpu_ns);
+            row.longest_cpu = row.longest_cpu.max(p.longest_cpu_ns);
         }
     }
     let series = |o: &mut String, name: &str, value: &dyn Fn(&Row) -> String| {
@@ -614,16 +710,26 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
         }
     };
     help(o, "kiln_shard_held_polls_total", "counter", "Polls that held a shard past 100 us, by the spawn site of their task and the label its code set (a request's route).");
-    series(o, "kiln_shard_held_polls_total", &|r| r.0.to_string());
+    series(o, "kiln_shard_held_polls_total", &|r| r.polls.to_string());
     help(o, "kiln_shard_held_seconds_total", "counter", "How long those polls held their shard, added up.");
-    series(o, "kiln_shard_held_seconds_total", &|r| secs(Duration::from_nanos(r.1)).to_string());
+    series(o, "kiln_shard_held_seconds_total", &|r| secs(Duration::from_nanos(r.ns)).to_string());
     help(o, "kiln_shard_held_longest_seconds", "gauge", "The longest of those polls.");
-    series(o, "kiln_shard_held_longest_seconds", &|r| secs(Duration::from_nanos(r.2)).to_string());
+    series(o, "kiln_shard_held_longest_seconds", &|r| secs(Duration::from_nanos(r.longest)).to_string());
     // Goal 9, plan 01a1a87b2cec steps 3 and 4: what of it no code held.
     help(o, "kiln_shard_held_host_polls_total", "counter", "Of those polls, the ones the host held: the shard's thread runnable and off the CPU (preempted), as found for polls past twice the step quantum.");
-    series(o, "kiln_shard_held_host_polls_total", &|r| r.3.to_string());
+    series(o, "kiln_shard_held_host_polls_total", &|r| r.host_polls.to_string());
     help(o, "kiln_shard_held_host_seconds_total", "counter", "How long the polls the host held held their shard, added up.");
-    series(o, "kiln_shard_held_host_seconds_total", &|r| secs(Duration::from_nanos(r.4)).to_string());
+    series(o, "kiln_shard_held_host_seconds_total", &|r| secs(Duration::from_nanos(r.host_ns)).to_string());
+    // Goal 9, plan 01a1a87b2cec step 3: each poll's time on the CPU (`hyper_rt`'s task clock: Linux, where the OS
+    // lets the shard's thread open its perf event), what of a hold kiln's code ran; the rest was off the CPU.
+    help(o, "kiln_shard_held_cpu_polls_total", "counter", "Of those polls, the ones whose shard's thread said its time on the CPU (Linux).");
+    series(o, "kiln_shard_held_cpu_polls_total", &|r| r.cpu_polls.to_string());
+    help(o, "kiln_shard_held_cpu_held_seconds_total", "counter", "How long those polls held their shard, added up.");
+    series(o, "kiln_shard_held_cpu_held_seconds_total", &|r| secs(Duration::from_nanos(r.cpu_held_ns)).to_string());
+    help(o, "kiln_shard_held_cpu_seconds_total", "counter", "Their time on the CPU, added up: the rest of their holds was off it (the host's, or a call that blocked).");
+    series(o, "kiln_shard_held_cpu_seconds_total", &|r| secs(Duration::from_nanos(r.cpu_ns)).to_string());
+    help(o, "kiln_shard_held_longest_cpu_seconds", "gauge", "The longest any of them ran on the CPU.");
+    series(o, "kiln_shard_held_longest_cpu_seconds", &|r| secs(Duration::from_nanos(r.longest_cpu)).to_string());
 }
 
 /// A label's value as the exposition writes it: its backslashes, quotes and line ends escaped.
@@ -702,6 +808,50 @@ mod tests {
             assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
         }
         assert_eq!(o.lines().filter(|l| l.starts_with("# TYPE")).count(), 9, "nine families:\n{o}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: how long a shard's parks lasted is on `/metrics` as a histogram of hyper-rt's
+    /// bounds, its count the parks, its sum their time, and survives the probe's atomics as it was.
+    #[test]
+    fn g9_s5_each_shards_park_times_are_a_histogram_on_metrics() {
+        let c = hyper_rt::shard_loop::Counters {
+            parked_ns: 3_000_000,
+            parks_under_1us: 1,
+            parks_under_2us: 1,
+            parks_under_4us: 1,
+            parks_under_8us: 2,
+            parks_under_16us: 2,
+            parks_under_32us: 2,
+            parks_under_64us: 2,
+            parks_under_128us: 3,
+            parks_under_256us: 3,
+            parks_under_512us: 3,
+            parks_under_1024us: 3,
+            parks_under_2048us: 3,
+            parks_under_4096us: 3,
+            parks_under_8192us: 3,
+            ..Default::default()
+        };
+        let parks = ParkTimes::of(&c);
+        assert_eq!(parks.under, [1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3]);
+        let cells = ParkCells::default();
+        cells.store(&parks);
+        assert_eq!(cells.load(), parks);
+        let mut o = String::new();
+        render_parks(&mut o, &[(parks, 4)], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_park_seconds histogram",
+            "kiln_shard_park_seconds_bucket{shard=\"0\",le=\"0.000001\"} 1",
+            "kiln_shard_park_seconds_bucket{shard=\"0\",le=\"0.000016\"} 2",
+            "kiln_shard_park_seconds_bucket{shard=\"0\",le=\"0.008192\"} 3",
+            "kiln_shard_park_seconds_bucket{shard=\"0\",le=\"+Inf\"} 4",
+            "kiln_shard_park_seconds_sum{shard=\"0\"} 0.003",
+            "kiln_shard_park_seconds_count{shard=\"0\"} 4",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's arms and socket calls becomes its

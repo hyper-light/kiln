@@ -249,7 +249,15 @@ impl Model {
             return;
         }
         let (me, hub) = (Arc::clone(self), Arc::clone(hub));
-        let mut rx = hub.events.subscribe();
+        let mut rx = match hub.subscribe_events() {
+            Ok(rx) => rx,
+            Err(e) => {
+                // Asked again at the next listen.
+                tracing::warn!(error = %e, "Deploys can't follow kiln's events now");
+                self.listening.store(false, Ordering::Release);
+                return;
+            }
+        };
         crate::rt::spawn(async move {
             use futures::FutureExt as _;
             loop {

@@ -76,10 +76,21 @@ on any device (`crate::harness::live`):
 
 | Setting | Default | What it is |
 |---|---|---|
-| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. |
-| `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. |
+| `memory` | `memory = 179306496` (171 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. The default is the bus lab's most for each topic held (1,327,754 bytes) for as many topics as production's 134 sessions, every one watched, with room for one more of Quiver's largest messages, rounded up to a MiB (docs/runtime-lab.md, goal 11). |
+| `topic_bytes` | `topic_bytes = 5242880` (5 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. The default is the bus lab's largest topic (3,672,418 bytes: a feed's newest 2048 frames) with room for one more of the largest message, rounded up to a MiB. A feed whose frames are larger keeps fewer than 2048, and its viewers fall behind sooner. |
 
 The bus holds 65,536 topics and 65,536 subscriptions at once; a session's feed keeps 2048 frames.
+
+What the bus can hold follows the topics it holds, whatever `memory` allows, because each topic is held to
+`topic_bytes`. For each topic, it can hold:
+- the messages the topic keeps, with their framing (86 bytes a message at the most);
+- its oldest segment's messages let go while that segment still holds kept ones (64 KiB at the most);
+- a message being taken.
+
+For each subscription, it can hold the segment the subscription reads and a message. That bound, capped at
+`memory`, is `kiln_memory_bound_bytes{owner="bus"}` on `/metrics`: about 6.6 MB a feed at the defaults. A
+server watching few sessions is bound by those, not by `memory`. Quiver fixes a node's memory when the node is
+made, so `memory` itself doesn't follow the topics.
 
 ## Classes
 

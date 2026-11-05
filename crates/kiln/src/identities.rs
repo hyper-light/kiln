@@ -1251,15 +1251,52 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
 
 /// Every revocation, for the chain checker.
 pub async fn revocations(store: &Store) -> anyhow::Result<Vec<Revocation>> {
-    store
-        .call(|c| {
-            let mut q = c.prepare("SELECT serial, key_sha256, at, reason, by FROM revocations ORDER BY at, id")?;
-            let rows = q
-                .query_map([], |r| Ok(Revocation { serial: r.get(0)?, key: r.get(1)?, at: r.get(2)?, reason: r.get(3)?, by: r.get(4)? }))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .await
+    store.call(|c| Ok(revocations_on(c)?)).await
+}
+
+/// Every revocation `c` has, in order (when it took effect, then as it was added).
+fn revocations_on(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Revocation>> {
+    let mut q = c.prepare("SELECT serial, key_sha256, at, reason, by FROM revocations ORDER BY at, id")?;
+    q.query_map([], |r| Ok(Revocation { serial: r.get(0)?, key: r.get(1)?, at: r.get(2)?, reason: r.get(3)?, by: r.get(4)? }))?.collect()
+}
+
+/// What tells one set of revocations from another: how many there are, and the newest's id. Nothing changes or
+/// deletes a revocation; one is only added ([`revoke`]), under an id past every id before it (the table's
+/// `AUTOINCREMENT`, migration `w27_identities`), so the stamp moves with each one added, and with nothing else.
+pub type Stamp = (i64, i64);
+
+/// The revocations' [`Stamp`] as `c` has them now: a count and a lookup of the largest key, the same few pages
+/// read however many there are.
+pub fn revoked_stamp(c: &rusqlite::Connection) -> rusqlite::Result<Stamp> {
+    c.query_row("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM revocations", [], |r| Ok((r.get(0)?, r.get(1)?)))
+}
+
+/// Every revocation as one read of them found them, with their [`Stamp`] then (goal 9, plan 01a1a87b2cec step 5):
+/// what a custody record kiln takes is checked against off the store's thread, and kept only while the store's
+/// stamp is still this one (`crate::custody::take`), so no record is kept that a revocation added since its check
+/// would have refused.
+#[derive(Debug)]
+pub struct Revoked {
+    pub stamp: Stamp,
+    pub list: Arc<[Revocation]>,
+}
+
+/// Every revocation and its stamp, read now in one call, and kept beside `store` for [`revoked`].
+pub async fn revoked_now(store: &Store) -> anyhow::Result<Arc<Revoked>> {
+    let read = store.call(|c| Ok(Revoked { list: revocations_on(c)?.into(), stamp: revoked_stamp(c)? })).await?;
+    let read = Arc::new(read);
+    store.keep_revoked(Arc::clone(&read));
+    Ok(read)
+}
+
+/// The revocations as `store` last read them ([`revoked_now`]), or read now when it hasn't: no call to the store's
+/// thread while they're kept. Their stamp says whether they're still all there are ([`revoked_stamp`]); whoever
+/// keeps what it checked against them looks at it in the same call ([`crate::custody::take`]).
+pub async fn revoked(store: &Store) -> anyhow::Result<Arc<Revoked>> {
+    match store.revoked_kept() {
+        Some(kept) => Ok(kept),
+        None => revoked_now(store).await,
+    }
 }
 
 /// What the TLS directory says as it refuses a revoked key: `revoked at <RFC 3339> (<reason>, by

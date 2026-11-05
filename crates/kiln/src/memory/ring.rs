@@ -1,221 +1,100 @@
-//! Fan-out rings bounded in bytes (goal 11, plan 01a1a87b2e56 step 3): every subscriber gets every
-//! message, and a slow one loses the oldest (it's told how many, `RecvError::Overflowed`) instead of
-//! holding up the sender, as `crate::rt::Broadcast` does; what the ring holds for its slowest subscriber
-//! is bounded by the bytes its messages take ([`Weigh`]) as well as by their count, so a ring of
-//! event texts, log chunks or terminal output that vary a thousandfold holds no more than its bound
-//! whichever it carries.
+//! Fan-out rings bounded in bytes (goal 11, plan 01a1a87b2e56 step 3), with no lock on any path (goal 4, plan
+//! 01a1a59c2a9c step 5; goal 5's rule): every subscriber gets every message, and one that falls behind loses
+//! what it has no room for (it's told how many, `RecvError::Overflowed`) instead of holding up the sender or
+//! the other subscribers. What each subscriber holds is bounded by the bytes its messages take ([`Weigh`]) as
+//! well as by their count, so a ring of terminal output or log chunks that vary a thousandfold holds no more
+//! than its bound whichever it carries.
 //!
-//! - What's let go at the bound can be had again: each ring's subscribers start over from where it's
-//!   kept (a page refetches what it shows, a log's viewer reads its file, a terminal's viewer is
-//!   repainted from the session's backlog). Each use says which.
-//! - Its places are async-broadcast's queue, made at its count as the ring is made: they're counted from
-//!   then. Each message is counted by what it holds past its place, from when it's sent until the ring
-//!   lets it go (its last subscriber took it, or it went to make room).
-//! - Each ring's bytes and bound are its [`Owner`]'s on `/metrics` (`kiln_memory_bytes{owner}`,
-//!   `kiln_memory_bound_bytes{owner}`): an owner of many rings (one a job, one a terminal) shows their
-//!   sum.
-//!
-//! No lock of its own: the ring's count is an atomic, and the queue is async-broadcast's, as
-//! `crate::rt::Broadcast`'s is.
+//! - A ring is one lane of [`super::lanes`]: each subscriber its own channel (`hyper_rt::sync::channel`), its
+//!   places made as it subscribes, the senders' list of subscribers a copy swapped in whole. async-broadcast's
+//!   one channel, which rings were, took its `Mutex` for every send and every subscriber's receive: a
+//!   terminal's output from its relay and every viewer's read of it, a job's log chunks from its writer and
+//!   every viewer's, across their shards.
+//! - What's let go of at the bound can be had again: a subscriber that fell behind starts over from after
+//!   what it missed (`super::lanes`), as each use says: a log's viewer reads its file, a terminal's viewer is
+//!   repainted from the session's backlog.
+//! - Each ring's bytes and its subscribers' bounds are its [`Owner`]'s on `/metrics` (`kiln_memory_bytes{owner}`,
+//!   `kiln_memory_bound_bytes{owner}`): an owner of many rings (one a job, one a terminal) shows their sum.
 
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use async_broadcast::RecvError;
+pub use async_broadcast::{RecvError, TryRecvError};
 
 use super::Owner;
+use super::lanes::{Lanes, Reader};
 use super::queue::Weigh;
 
-/// What a ring holds against its bound: its places, and its messages' bytes past them.
-struct Space {
-    owner: &'static Owner,
-    bound: usize,
-    held: AtomicUsize,
-    /// Its subscribers now ([`Ring::receiver_count`]), counted here so that asking takes no lock: async-broadcast
-    /// answers it under its channel's lock, which every send takes too (goal 4, plan 01a1a59c2a9c step 5: every
-    /// change of an agent session's info asked, from each session's owner shard, before it sent).
-    subscribers: AtomicUsize,
-}
-
-impl Space {
-    fn take(&self, n: usize) {
-        self.held.fetch_add(n, Ordering::AcqRel);
-        self.owner.add(n);
-    }
-
-    /// Lets `n` bytes go: never below none.
-    fn give(&self, n: usize) {
-        let mut now = self.held.load(Ordering::Acquire);
-        while let Err(seen) = self.held.compare_exchange_weak(now, now.saturating_sub(n), Ordering::AcqRel, Ordering::Acquire) {
-            now = seen;
-        }
-        self.owner.sub(n.min(now));
-    }
-
-    fn held(&self) -> usize {
-        self.held.load(Ordering::Acquire)
-    }
-
-    fn over(&self) -> bool {
-        self.held() > self.bound
-    }
-}
-
-impl Drop for Space {
-    fn drop(&mut self) {
-        // Its places go with the last of its ends (the ring, its subscribers, its messages), and its
-        // bound with them.
-        self.owner.sub(*self.held.get_mut());
-        self.owner.bound_sub(self.bound);
-    }
-}
-
-/// A message's bytes, counted while the ring keeps it, given back as it lets it go.
-struct Charge {
-    space: Arc<Space>,
-    bytes: usize,
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        self.space.give(self.bytes);
-    }
-}
-
-/// A message as the ring's queue keeps it: its item, and, on the ring's own copy alone, its count. A
-/// subscriber's copy is the item alone, so the count is given back once, as the queue lets the ring's
-/// copy go: to its last subscriber, which takes it, or out to make room.
-pub struct Kept<T> {
-    item: T,
-    _charge: Option<Charge>,
-}
-
-impl<T: Clone> Clone for Kept<T> {
-    fn clone(&self) -> Self {
-        Self { item: self.item.clone(), _charge: None }
-    }
-}
-
-/// What one of a ring's places takes: async-broadcast keeps each message with its subscribers' count.
+/// What one of a subscriber's places takes: a slot's stamp, and a pointer to the message it shares.
 pub const fn place<T>() -> usize {
-    size_of::<(Kept<T>, usize)>()
+    super::lanes::place::<T>()
 }
 
-/// A fan-out ring of at most `places` messages and `bytes` of theirs past their places, counted as an
-/// [`Owner`]'s.
+/// A fan-out ring whose every subscriber holds at most `places` messages and `bytes` of theirs past their
+/// places, counted as an [`Owner`]'s.
 pub struct Ring<T> {
-    tx: async_broadcast::Sender<Kept<T>>,
-    /// Keeps the channel open while no one subscribes.
-    _keep_open: async_broadcast::InactiveReceiver<Kept<T>>,
-    space: Arc<Space>,
+    lanes: Lanes<T>,
     places: usize,
 }
 
-impl<T: Clone + Weigh> Ring<T> {
-    /// A ring of `places` messages, and `bytes` of what they hold past their places, counted as
-    /// `owner`'s: its bound is its places' bytes and `bytes`.
+impl<T: Clone + Weigh + Send + Sync + 'static> Ring<T> {
+    /// A ring each of whose subscribers holds `places` messages (one at the least) and `bytes` of what they
+    /// hold past their places, counted as `owner`'s: a subscriber's bound is its places' bytes and `bytes`.
     pub fn new(owner: &'static Owner, places: usize, bytes: usize) -> Self {
-        let places = places.max(1);
-        let (mut tx, rx) = async_broadcast::broadcast(places);
-        tx.set_overflow(true);
-        tx.set_await_active(false);
-        let made = places.saturating_mul(place::<T>());
-        let bound = made.saturating_add(bytes);
-        owner.bound_add(bound);
-        let space = Arc::new(Space { owner, bound, held: AtomicUsize::new(0), subscribers: AtomicUsize::new(0) });
-        space.take(made);
-        Self { tx, _keep_open: rx.deactivate(), space, places }
+        Self { lanes: Lanes::new(owner, 1, bytes), places: places.max(1) }
     }
 
-    /// Delivers `item` to every subscriber now (none: it's dropped). Past the ring's count its oldest
-    /// message goes, and past its bytes as many of its oldest as it takes to be within them, its newest
-    /// always kept: whoever hadn't taken them is told how many it lost.
+    /// Delivers `item` to every subscriber now (none: it's dropped). A subscriber with no room for it loses it,
+    /// and starts over from after it.
     pub fn send(&self, item: T) {
-        let bytes = item.weight().saturating_sub(size_of::<T>());
-        self.space.take(bytes);
-        let kept = Kept { item, _charge: Some(Charge { space: Arc::clone(&self.space), bytes }) };
-        // The oldest let go past its count comes back here, and goes (its bytes with it); so does the
-        // message itself when no one subscribes.
-        drop(self.tx.try_broadcast(kept));
-        if self.space.over() {
-            self.trim();
-        }
+        self.lanes.send(0, item);
     }
 
-    /// Lets the oldest messages go until the ring is within its bytes, the newest kept however large.
-    /// async-broadcast lets a channel's oldest go as its capacity is set below what it holds: so it's set
-    /// one below, as often as it takes, and back to its count (on a handle of its own: setting it takes
-    /// one). A send meanwhile may find it at the lower count and let one more of the oldest go.
-    fn trim(&self) {
-        let mut tx = self.tx.clone();
-        while self.space.over() {
-            let n = tx.len();
-            if n <= 1 {
-                break;
-            }
-            tx.set_capacity(n - 1);
-        }
-        tx.set_capacity(self.places);
-    }
-}
-
-impl<T> Ring<T> {
-    /// A subscriber from now: each message sent after this.
+    /// A subscriber from now: each message sent after this. When the runtime has no channel to give it (its
+    /// cells all in use, said in the log), one that has ended: its reader goes as one whose ring went.
     pub fn subscribe(&self) -> Subscription<T> {
-        self.space.subscribers.fetch_add(1, Ordering::AcqRel);
-        Subscription { rx: self.tx.new_receiver(), _space: Arc::clone(&self.space) }
+        Subscription { reader: self.lanes.subscribe_or_ended(self.places) }
     }
 
-    /// Subscribers now, counted as they come and go, so reading it takes none of the channel's lock.
+    /// Subscribers now.
     pub fn receiver_count(&self) -> usize {
-        self.space.subscribers.load(Ordering::Acquire)
+        self.lanes.receiver_count()
     }
 
-    /// What it holds now, in bytes: its places and its messages past them.
+    /// What it holds now, in bytes: its messages past their places (each counted once) and its subscribers'
+    /// places.
     pub fn held(&self) -> usize {
-        self.space.held()
+        self.lanes.held()
     }
 
-    /// The most it holds, in bytes: its places and its messages past them.
+    /// The most one subscriber holds, in bytes: its places and its messages past them.
     pub fn bound(&self) -> usize {
-        self.space.bound
+        self.lanes.bound_of(self.places)
     }
 }
 
-/// A subscriber of a [`Ring`]: its receive charges the task's turn on its shard (`hyper_rt::coop`, kiln's
-/// goal 6), as `crate::rt::Subscription`'s does, so a subscriber whose ring is always full yields at its
-/// share.
+/// A subscriber of a [`Ring`]: its receive charges the task's turn on its shard (`hyper_rt::coop`, kiln's goal
+/// 6), so a subscriber whose ring is always full yields at its share.
 pub struct Subscription<T> {
-    rx: async_broadcast::Receiver<Kept<T>>,
-    /// The ring's places are let go with the last of its ends: its subscribers among them.
-    _space: Arc<Space>,
-}
-
-impl<T> Drop for Subscription<T> {
-    fn drop(&mut self) {
-        self._space.subscribers.fetch_sub(1, Ordering::AcqRel);
-    }
+    reader: Reader<T>,
 }
 
 impl<T: Clone> Subscription<T> {
-    /// The next message, after a charge of the task's turn: `RecvError::Overflowed` when the ring let some
-    /// go before this subscriber took them, `Closed` once the ring is gone and nothing waits.
+    /// The next message, after a charge of the task's turn: `RecvError::Overflowed` when it missed some (it goes
+    /// on from after them), `Closed` once the ring is gone and nothing waits.
     pub async fn recv(&mut self) -> Result<T, RecvError> {
-        hyper_rt::coop::consume_budget().await;
-        self.rx.recv().await.map(|k| k.item)
+        self.reader.recv().await
     }
 
     /// The next message if one waits: `TryRecvError::Empty` when none does, `Overflowed` and `Closed` as
     /// [`Subscription::recv`]'s.
-    pub fn try_recv(&mut self) -> Result<T, async_broadcast::TryRecvError> {
-        self.rx.try_recv().map(|k| k.item)
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.reader.try_recv()
     }
 }
 
-/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn
-/// too; what was let go is skipped, as async-broadcast's stream skips it.
+/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too;
+/// what was missed is passed over, as async-broadcast's stream passed it over.
 impl<T: Clone> futures::Stream for Subscription<T> {
     type Item = T;
 
@@ -223,7 +102,14 @@ impl<T: Clone> futures::Stream for Subscription<T> {
         if hyper_rt::coop::poll_proceed(cx).is_pending() {
             return Poll::Pending;
         }
-        futures::StreamExt::poll_next_unpin(&mut self.rx, cx).map(|o| o.map(|k| k.item))
+        loop {
+            match self.reader.poll_recv(cx) {
+                Poll::Ready(Ok(item)) => return Poll::Ready(Some(item)),
+                Poll::Ready(Err(RecvError::Overflowed(_))) => {}
+                Poll::Ready(Err(RecvError::Closed)) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -231,7 +117,7 @@ impl<T: Clone> futures::Stream for Subscription<T> {
 mod tests {
     use super::*;
 
-    /// A test's message, holding `0` bytes past its place.
+    /// A test's message, holding `.0` bytes past its place.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Item(usize, u32);
 
@@ -241,28 +127,27 @@ mod tests {
         }
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: a ring counts its messages' bytes while it keeps them; past
-    /// its bytes it lets its oldest go (a subscriber that hadn't taken them is told how many) and keeps
-    /// its newest; what's taken is let go.
+    /// Goal 11, plan 01a1a87b2e56 step 3 (goal 4 step 5's lanes): a ring counts its messages' bytes while a
+    /// subscriber keeps them, each once; past a subscriber's bytes it misses what comes, is told how many (those
+    /// it held from before let go of with them), and goes on from after them; and its places and bound go with
+    /// it.
     #[test]
-    fn g11_s3_a_ring_lets_its_oldest_go_past_its_bytes() -> anyhow::Result<()> {
+    fn g11_s3_a_subscriber_past_its_bytes_starts_over_from_after_what_it_missed() -> anyhow::Result<()> {
         static OWNER: Owner = Owner::new("test_ring_bytes");
         crate::rt::block_on(async {
             let ring = Ring::<Item>::new(&OWNER, 100, 1000);
             let places = 100 * place::<Item>();
-            anyhow::ensure!(OWNER.bound() == Some(places + 1000) && OWNER.bytes() == places, "{:?} {}", OWNER.bound(), OWNER.bytes());
+            anyhow::ensure!(OWNER.bound().is_none() && OWNER.bytes() == 0, "no subscriber, nothing made: {:?} {}", OWNER.bound(), OWNER.bytes());
             let mut slow = ring.subscribe();
+            anyhow::ensure!(OWNER.bound() == Some(places + 1000) && OWNER.bytes() == places && ring.bound() == places + 1000, "{:?} {}", OWNER.bound(), OWNER.bytes());
             for n in 1..=5 {
                 ring.send(Item(300, n));
                 anyhow::ensure!(ring.held() <= ring.bound(), "{} past {} after {n}", ring.held(), ring.bound());
             }
-            anyhow::ensure!(ring.held() == places + 900, "the newest three kept: {}", ring.held() - places);
-            anyhow::ensure!(matches!(slow.recv().await, Err(RecvError::Overflowed(2))), "told it lost the oldest two");
-            for n in 3..=5 {
-                anyhow::ensure!(slow.recv().await? == Item(300, n), "then the rest, in order");
-            }
-            anyhow::ensure!(OWNER.bytes() == places, "taken, let go: {}", OWNER.bytes() - places);
-            // The newest stays whatever it holds.
+            anyhow::ensure!(ring.held() == places + 900, "the first three kept: {}", ring.held() - places);
+            anyhow::ensure!(matches!(slow.recv().await, Err(RecvError::Overflowed(5))), "told it missed them all: two lost, three from before them");
+            anyhow::ensure!(OWNER.bytes() == places, "let go of: {}", OWNER.bytes() - places);
+            // It goes on from after them; the newest goes whatever it holds into a subscriber holding none.
             ring.send(Item(5000, 6));
             anyhow::ensure!(ring.held() == places + 5000);
             anyhow::ensure!(slow.recv().await? == Item(5000, 6));
@@ -281,64 +166,91 @@ mod tests {
             let ring = Ring::<Item>::new(&OWNER, 8, 10_000);
             let places = 8 * place::<Item>();
             ring.send(Item(400, 1));
-            anyhow::ensure!(OWNER.bytes() == places, "no one subscribed: nothing kept");
+            anyhow::ensure!(OWNER.bytes() == 0, "no one subscribed: nothing kept");
             let (mut a, mut b) = (ring.subscribe(), ring.subscribe());
             ring.send(Item(400, 2));
             anyhow::ensure!(a.recv().await? == Item(400, 2));
-            anyhow::ensure!(OWNER.bytes() == places + 400, "kept for the other");
+            anyhow::ensure!(OWNER.bytes() == 2 * places + 400, "kept for the other");
             anyhow::ensure!(b.recv().await? == Item(400, 2));
-            anyhow::ensure!(OWNER.bytes() == places, "taken by both");
+            anyhow::ensure!(OWNER.bytes() == 2 * places, "taken by both");
             ring.send(Item(700, 3));
             drop(b);
             anyhow::ensure!(OWNER.bytes() == places + 700, "kept for the one left");
             drop(a);
-            anyhow::ensure!(OWNER.bytes() == places, "no one left to take it");
+            anyhow::ensure!(OWNER.bytes() == 0, "no one left to take it");
             anyhow::ensure!(ring.receiver_count() == 0);
             Ok(())
         })
     }
 
-    /// Goal 4, plan 01a1a59c2a9c step 5: a ring's subscribers are counted as they come and go, the count the
-    /// channel keeps under its lock, read without it.
+    /// Goal 4, plan 01a1a59c2a9c step 5 (goal 5's rule), run by kiln's CI with every test: a ring takes no lock,
+    /// nor uses a channel that takes one (async-broadcast's, which rings were).
     #[test]
-    fn g4_s5_a_rings_subscribers_are_counted_without_its_lock() {
-        static OWNER: Owner = Owner::new("test_ring_subscribers");
-        let ring = Ring::<Item>::new(&OWNER, 4, 1 << 10);
-        let counts = |ring: &Ring<Item>| (ring.receiver_count(), ring.tx.receiver_count());
-        assert_eq!(counts(&ring), (0, 0));
-        let (a, b) = (ring.subscribe(), ring.subscribe());
-        assert_eq!(counts(&ring), (2, 2));
-        drop(a);
-        assert_eq!(counts(&ring), (1, 1));
-        let c = ring.subscribe();
-        drop(b);
-        assert_eq!(counts(&ring), (1, 1));
-        drop(c);
-        assert_eq!(counts(&ring), (0, 0));
+    fn g4_s5_the_ring_takes_no_lock() {
+        let src = include_str!("ring.rs").replace("\r\n", "\n");
+        let code = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default();
+        let code: String = code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        for lock in ["Mutex", "RwLock", "Condvar", "parking_lot", "broadcast(", "async_channel", "event_listener"] {
+            assert!(!code.contains(lock), "memory/ring.rs takes a lock, or a channel that does: {lock}");
+        }
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: past its count a ring lets its oldest go as before, its bytes
-    /// with it, and it's as many places as it was made with after trimming by bytes.
+    /// Goal 4, plan 01a1a59c2a9c step 5: a ring's subscribers are counted as they come and go, read off their
+    /// list (no lock).
     #[test]
-    fn g11_s3_a_ring_keeps_its_count_too() -> anyhow::Result<()> {
+    fn g4_s5_a_rings_subscribers_are_counted_without_its_lock() -> anyhow::Result<()> {
+        static OWNER: Owner = Owner::new("test_ring_subscribers");
+        crate::rt::block_on(async {
+            let ring = Ring::<Item>::new(&OWNER, 4, 1 << 10);
+            anyhow::ensure!(ring.receiver_count() == 0);
+            let (a, b) = (ring.subscribe(), ring.subscribe());
+            anyhow::ensure!(ring.receiver_count() == 2);
+            drop(a);
+            anyhow::ensure!(ring.receiver_count() == 1);
+            let c = ring.subscribe();
+            drop(b);
+            anyhow::ensure!(ring.receiver_count() == 1);
+            drop(c);
+            anyhow::ensure!(ring.receiver_count() == 0);
+            Ok(())
+        })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: past its count a subscriber misses what comes as well, and goes on from
+    /// after it; one keeping up has every message, in order.
+    #[test]
+    fn g11_s3_a_subscriber_keeps_its_count_too() -> anyhow::Result<()> {
         static OWNER: Owner = Owner::new("test_ring_count");
         crate::rt::block_on(async {
             let ring = Ring::<Item>::new(&OWNER, 4, 1000);
-            let places = 4 * place::<Item>();
-            let mut slow = ring.subscribe();
-            // Bytes first: two of 600 can't both be kept.
-            ring.send(Item(600, 1));
-            ring.send(Item(600, 2));
-            anyhow::ensure!(ring.held() == places + 600);
-            // Then the count: six small ones, four kept.
-            for n in 3..=8 {
+            let (mut slow, mut keeping) = (ring.subscribe(), ring.subscribe());
+            for n in 1..=8 {
                 ring.send(Item(10, n));
+                anyhow::ensure!(keeping.recv().await? == Item(10, n), "the one keeping up, {n}");
             }
-            anyhow::ensure!(ring.held() == places + 40, "{}", ring.held() - places);
-            anyhow::ensure!(matches!(slow.recv().await, Err(RecvError::Overflowed(4))));
-            for n in 5..=8 {
-                anyhow::ensure!(slow.recv().await? == Item(10, n));
+            anyhow::ensure!(matches!(slow.recv().await, Err(RecvError::Overflowed(8))), "four lost past its count, four from before them");
+            ring.send(Item(10, 9));
+            anyhow::ensure!(slow.recv().await? == Item(10, 9) && keeping.recv().await? == Item(10, 9));
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: as a stream, a subscriber passes over what it missed and ends with the
+    /// ring.
+    #[test]
+    fn g4_s5_a_subscription_as_a_stream_passes_over_what_it_missed() -> anyhow::Result<()> {
+        use futures::StreamExt as _;
+        static OWNER: Owner = Owner::new("test_ring_stream");
+        crate::rt::block_on(async {
+            let ring = Ring::<Item>::new(&OWNER, 2, 1000);
+            let mut s = ring.subscribe();
+            for n in 1..=4 {
+                ring.send(Item(0, n));
             }
+            ring.send(Item(0, 5));
+            drop(ring);
+            let got: Vec<u32> = s.by_ref().map(|i| i.1).collect().await;
+            anyhow::ensure!(got.is_empty() || got == [5], "what it missed passed over: {got:?}");
             Ok(())
         })
     }

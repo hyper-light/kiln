@@ -219,6 +219,17 @@ pub struct Held {
     pub host_polls: f64,
     #[serde(default)]
     pub host_ms: f64,
+    /// Of those polls, the ones whose shard's thread said its time on the CPU (`kiln_shard_held_cpu_*`, goal 9, plan
+    /// 01a1a87b2cec step 3: Linux), their holds and that time, and the longest any ran on the CPU (since the server
+    /// started); none from a build from before it said, or where its OS wouldn't say.
+    #[serde(default)]
+    pub cpu_polls: f64,
+    #[serde(default)]
+    pub cpu_held_ms: f64,
+    #[serde(default)]
+    pub cpu_ms: f64,
+    #[serde(default)]
+    pub longest_cpu_ms: f64,
 }
 
 /// What held the shards between `before` and `after`, `secs` apart, the most time first.
@@ -236,6 +247,10 @@ pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
             "kiln_shard_held_longest_seconds" => row.longest_ms = row.longest_ms.max(value * 1000.0),
             "kiln_shard_held_host_polls_total" => row.host_polls += added,
             "kiln_shard_held_host_seconds_total" => row.host_ms += added * 1000.0,
+            "kiln_shard_held_cpu_polls_total" => row.cpu_polls += added,
+            "kiln_shard_held_cpu_held_seconds_total" => row.cpu_held_ms += added * 1000.0,
+            "kiln_shard_held_cpu_seconds_total" => row.cpu_ms += added * 1000.0,
+            "kiln_shard_held_longest_cpu_seconds" => row.longest_cpu_ms = row.longest_cpu_ms.max(value * 1000.0),
             _ => {}
         }
     }
@@ -337,6 +352,21 @@ mod tests {
         let s = Scrape::parse("kiln_shard_quantum_seconds{shard=\"0\"} 0.000266666\nkiln_shard_quantum_seconds{shard=\"1\"} 0.00025\n");
         assert!(quantum_us(&s).is_some_and(|q| (q - 266.666).abs() < 1e-6), "{:?}", quantum_us(&s));
         assert_eq!(quantum_us(&Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 5\n")), None);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: of what held the shards in a window, the polls whose thread said its time on
+    /// the CPU, their holds and that time are the window's own; the longest on the CPU is since the server started.
+    #[test]
+    fn g9_s3_a_polls_time_on_the_cpu_is_the_window_s_own() {
+        let series = |polls: u32, held: f64, cpu: f64, longest: f64| {
+            format!(
+                "kiln_shard_held_polls_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {polls}\nkiln_shard_held_cpu_polls_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {polls}\nkiln_shard_held_cpu_held_seconds_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {held}\nkiln_shard_held_cpu_seconds_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {cpu}\nkiln_shard_held_longest_cpu_seconds{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {longest}\n"
+            )
+        };
+        let (before, after) = (Scrape::parse(&series(10, 0.010, 0.004, 0.001)), Scrape::parse(&series(14, 0.020, 0.006, 0.0025)));
+        let h = held(&before, &after, 1.0);
+        let a = h.first().cloned().unwrap_or_default();
+        assert!((a.cpu_polls - 4.0).abs() < 1e-9 && (a.cpu_held_ms - 10.0).abs() < 1e-9 && (a.cpu_ms - 2.0).abs() < 1e-9 && (a.longest_cpu_ms - 2.5).abs() < 1e-9, "{a:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec steps 3 and 4: of what held the shards in a window, the polls the host held and

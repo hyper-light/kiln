@@ -10,9 +10,10 @@ use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
 
-/// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): what the lab's A/B measures
-/// against musl's (production's) and glibc's, by resident memory and latency; its settings, for giving memory
-/// back, are `kiln::os::alloc`'s. Elsewhere, and without the feature, the platform's allocator as before.
+/// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): production's, which the release
+/// build (ci/release/build.sh) takes by default since the lab's A/B picked it over musl's malloc, by resident memory
+/// and latency; its settings, for giving memory back, are `kiln::os::alloc`'s. Elsewhere, and without the feature,
+/// the platform's allocator as before.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -389,17 +390,30 @@ struct AgentArgs {
 }
 
 /// The log's lines, as `filter` says; and kiln's own spans that observe keeps (its own filter: what
-/// the log shows does not decide what observe sees).
-fn init_tracing(filter: &str, json: bool) {
+/// the log shows does not decide what observe sees). A server's and a runner's lines (`own_thread`) are
+/// written by a thread of their own (`kiln::log_lines`; goal 9, plan 01a1a87b2cec step 3), so a shard
+/// that logs never waits on stdout's lock or its reader: what's returned keeps that thread going until
+/// it's dropped. A command's lines stay where it writes them, in its output's order.
+fn init_tracing(filter: &str, json: bool, own_thread: bool) -> Option<kiln::log_lines::Writing> {
     use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let registry = tracing_subscriber::registry().with(kiln::observe::spans::layer());
+    if own_thread {
+        let (lines, writing) = kiln::log_lines::start();
+        let _ = if json {
+            registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        } else {
+            registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        };
+        return Some(writing);
+    }
     let _ = if json {
         registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_filter(filter)).try_init()
     } else {
         registry.with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).try_init()
     };
+    None
 }
 
 /// Panics are contained at task boundaries; the hook makes sure each one is logged loudly.
@@ -581,7 +595,8 @@ fn main() -> ExitCode {
     // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
     // itself, the same way.
     let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
-    init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
+    // Held to the end of `main`: the log's lines written before the process ends.
+    let _log = init_tracing(if quiet { "warn" } else { &cli.log }, cli.json, matches!(cli.cmd, Cmd::Server | Cmd::Up | Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_)));
     install_panic_hook();
     // Which allocator, and how it gives memory back (`kiln::os::alloc`): a server's and a runner's log say.
     if matches!(cli.cmd, Cmd::Server | Cmd::Agent(_)) {

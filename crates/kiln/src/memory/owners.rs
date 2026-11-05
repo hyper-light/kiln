@@ -72,13 +72,15 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 /// payload is let go unlooked at, counted and said: the message itself was taken whole already.
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
-/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets
-/// and kiln's own listeners hear; and its `harness_events`, agent sessions' own, on a ring of their own:
-/// goal 4, plan 01a1a59c2a9c step 5), kept until their slowest subscriber takes them
-/// (`crate::memory::ring`): each ring at most `crate::hub::EVENTS` of them, and
-/// [`crate::net::EVENTS_BYTES`] of their texts, as much as the hub's queue of runners' messages most of
-/// them are made from. At the bound the oldest go, as they go past the count: a page's socket is told to
-/// fetch what it shows again (`Resync`), and kiln's own listeners are told how many they missed.
+/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets and
+/// kiln's own listeners hear, on one lane; and its `harness_events`, agent sessions' own, on each owner shard's
+/// lane), each listener's own channels (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5): their texts,
+/// each counted once until its last listener takes it, and each listener's places, made as it subscribes
+/// (`crate::hub::EVENTS` in all its lanes, as many as the hub's ring held for its slowest; push's sessions'
+/// `EVENTS` a lane). Each listener's bound is its places and [`crate::net::EVENTS_BYTES`] of the texts (as much
+/// as the hub's queue of runners' messages most of them are made from). Past either, what comes is let go of
+/// for that listener alone and it starts over, told how many it missed: a page's socket fetches what it shows
+/// again (`Resync`), and kiln's own listeners are told how many they missed.
 pub static UI_EVENTS: Owner = Owner::new("ui_events");
 
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
@@ -167,8 +169,28 @@ pub static CD_INPUTS: Owner = Owner::new("cd_inputs");
 /// inputs behind it.
 pub static CD_ACTIONS: Owner = Owner::new("cd_actions");
 
+/// What `crate::rt::Broadcast`'s subscribers hold (goal 4, plan 01a1a59c2a9c step 5: each its own channel): their
+/// places, made as each subscribes, and nothing past them (a broadcast carries CD's changes, an id each). Not
+/// among [`ALL`]: there's nothing on `/metrics` to see of it.
+pub static BROADCASTS: Owner = Owner::new("broadcasts");
+
+/// What moved to `crate::memory::queue` from async-channels bounded by a count, or not at all (goal 4, plan
+/// 01a1a59c2a9c step 5): a terminal's keystrokes and its output from its machine (`crate::termsess`), a
+/// conversation feed's links, its parts to send and its intake's answers (`crate::convo::feed`), a live job's
+/// writes (`crate::logs`), the sealed chunks waiting for the packer (`crate::harness::copies`), files read ahead
+/// of their requests and a socket's audit rows (`crate::api`). Each item is counted at its place alone
+/// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
+/// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
+pub static CHANNELS: Owner = Owner::new("channels");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 25] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS];
+/// kiln's log lines waiting for the thread that writes them to stdout (`crate::log_lines`; goal 9, plan 01a1a87b2cec
+/// step 3): at most [`crate::log_lines::LINES`] lines, journald's burst, and [`crate::log_lines::LINES_BYTES`], what
+/// observe keeps waiting of a source's log. At the bound a line is let go, counted (`kiln_log_lines_dropped_total`),
+/// and said as the thread next writes: a shard that logs never waits for the log's reader.
+pub static LOG_LINES: Owner = Owner::new("log_lines");
+
+pub(super) const ALL: [&Owner; 26] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

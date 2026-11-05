@@ -1138,3 +1138,28 @@ fn a_detached_run_on_its_own_machine_goes_on_after_its_client() -> anyhow::Resul
         Ok(())
     })
 }
+
+/// Goal 9, plan 01a1a87b2cec step 3: a runner's ReachHello, as the hub's loop takes it, is an announcement
+/// and a line, and nothing in it waits: its announcement goes in the directory's copy at once (a copy of the
+/// runners' announcements swapped in whole) and in the relay's in its owner's turn, handed over without
+/// waiting, before any frame sent after it; its line goes to the log's writer (`crate::log_lines`), where it
+/// was a write to stdout under its lock. A link opened to it right after is one the relay knows it takes.
+#[test]
+fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> anyhow::Result<()> {
+    use crate::hub::tests::{hear, join_runner, scratch_hub};
+    use crate::proto::{CAP_WIRE, LANE_CONTROL, LANE_REACH};
+    crate::rt::block_on(async {
+        let hub = scratch_hub().await?;
+        join_runner(&hub, 1, "mac", CAP_WIRE);
+        join_runner(&hub, 2, "linux", CAP_WIRE);
+        let said = Announce { fingerprint: "f".into(), accept: true, version: 1 };
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&said)? }).await?;
+        anyhow::ensure!(hub.reach.announced().get("linux") == Some(&said), "the directory has it as soon as the hub's loop took it");
+        hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: "L1".into(), open: true, data: b"x".to_vec(), close: None }).await?;
+        let relayed = hub.relay().ask(|r| r.announced("linux").cloned()).await.flatten();
+        anyhow::ensure!(relayed.as_ref() == Some(&said), "the relay has it: {relayed:?}");
+        anyhow::ensure!(hub.relay().ask(|r| r.ends("L1")).await.flatten() == Some(("mac".into(), "linux".into())), "the link sent after it opened to it");
+        anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 2 && matches!(m, ServerMsg::Reach { from, open: true, .. } if from == "mac")), "and went on to it");
+        Ok(())
+    })
+}
