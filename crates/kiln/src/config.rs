@@ -109,6 +109,17 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
+    /// The HTTP/3 WebTransport door (goal 4, docs/http.md "HTTP/3"): the UDP address it listens
+    /// on, as `0.0.0.0:7443`. Unset (the default), there is no door and no socket is bound.
+    pub h3_addr: Option<String>,
+    /// The `host:port` pages reach the door at, when it isn't `public_url`'s host at the bound
+    /// port.
+    pub h3_advertise: Option<String>,
+    /// A publicly trusted PEM certificate chain for the door. Unset, the door serves self-signed
+    /// ECDSA P-256 certificates that pages pin by hash, rotated weekly.
+    pub h3_cert: Option<PathBuf>,
+    /// Its PEM private key.
+    pub h3_key: Option<PathBuf>,
     /// A shard whose queueing delay leaves its calm answers Background requests 503 with `Retry-After`,
     /// and Normal ones too while the API's own delay does; Critical ones (health, sign-in, a person's
     /// pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln
@@ -426,6 +437,10 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
+            h3_addr: None,
+            h3_advertise: None,
+            h3_cert: None,
+            h3_key: None,
             shed: false,
             cores: None,
         }
@@ -603,6 +618,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADDR") {
             cfg.server.webrtc_addr = Some(v).filter(|v| !v.trim().is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_H3_ADDR") {
+            cfg.server.h3_addr = Some(v).filter(|v| !v.trim().is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_H3_ADVERTISE") {
+            cfg.server.h3_advertise = Some(v).filter(|v| !v.trim().is_empty());
         }
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
             cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();

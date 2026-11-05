@@ -15,6 +15,7 @@ pub mod browser;
 pub mod cd;
 pub mod deploy;
 pub mod ci;
+pub mod h3door;
 pub mod http;
 pub mod kubeapi;
 pub mod config;

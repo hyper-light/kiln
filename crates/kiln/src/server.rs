@@ -248,6 +248,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         if cfg.server.webrtc_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
             child!("webrtc", h => crate::harness::webrtc::run(h));
         }
+        // The HTTP/3 WebTransport door, on its own UDP port, off until declared (goal 4 step 6).
+        if cfg.server.h3_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            child!("h3-door", h => crate::h3door::run(h));
+        }
     }
     // Observe (docs/observe.md): not in `kiln workflow run`'s own server, which runs CI alone.
     if cfg.observe.enabled && !cfg.ci.local {
