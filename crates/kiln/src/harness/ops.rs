@@ -67,9 +67,18 @@ async fn seen(cx: &Cx, id: &str) -> Result<Info, Fail> {
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
     let (machine, harness, state, parent, run) = (s("machine"), s("harness"), s("state"), s("parent"), s("plan_run"));
-    let agents: Vec<Value> = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list())
-        .await
-        .iter()
+    // Whoever sees every session reads each info as its owner shares it, none copied (goal 9, plan 01a1a87b2cec step 5);
+    // anyone else, those `lineage::seen` lets them.
+    let (shared, seen);
+    let all: Vec<&Info> = if lineage::sees_all(&cx.caller) {
+        shared = cx.hub.harness.list_shared();
+        shared.iter().map(|i| &**i).collect()
+    } else {
+        seen = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await;
+        seen.iter().collect()
+    };
+    let agents: Vec<Value> = all
+        .into_iter()
         // A card's helper (`super::about`) is the card's: no agent of these.
         .filter(|i| i.helper.is_none())
         .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
@@ -1245,6 +1254,24 @@ mod end_to_end {
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         Ok(hub)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a person who sees every session gets the agents listed from their infos as each
+    /// owner shares them (`Registry::list_shared`, none copied), and what the copied list gave: the same agents, in order.
+    #[test]
+    fn g9_s5_a_list_for_whoever_sees_every_session_is_the_copied_lists() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let (a, b) = (parent(&hub, "default", true).await?, parent(&hub, "default", true).await?);
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let listed = call(person, "agents.list", json!({})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let ids: Vec<String> = listed.get("agents").and_then(Value::as_array).map(|all| all.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect()).unwrap_or_default();
+            let copied: Vec<String> = hub.harness.list().into_iter().filter(|i| i.helper.is_none()).map(|i| i.id).collect();
+            anyhow::ensure!(ids == copied && ids.contains(&a) && ids.contains(&b), "{listed}");
+            let shared: Vec<String> = hub.harness.list_shared().iter().map(|i| i.id.clone()).collect();
+            anyhow::ensure!(shared == hub.harness.list().into_iter().map(|i| i.id).collect::<Vec<_>>(), "the same sessions, in the same order");
+            Ok(())
+        })
     }
 
     #[test]

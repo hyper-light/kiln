@@ -651,6 +651,12 @@ pub fn tool_name(op: &str) -> String {
     op.replace('.', "_")
 }
 
+/// Whether `tool` is operation `op`'s MCP name ([`tool_name`]), compared without making it (goal 9, plan 01a1a87b2cec
+/// step 5: each call made every operation's name until it found its own, twice).
+fn is_tool(op: &str, tool: &str) -> bool {
+    op.len() == tool.len() && op.bytes().zip(tool.bytes()).all(|(o, t)| (if o == b'.' { b'_' } else { o }) == t)
+}
+
 struct Server {
     hub: Arc<Hub>,
     caller: Caller,
@@ -702,7 +708,7 @@ impl Server {
             "tools/call" => {
                 let p: rpc::ToolsCall = req.params()?;
                 // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's.
-                if !matches!(p.name.as_str(), "code_search" | "code_run") && !crate::ops::all(&self.hub).iter().any(|o| tool_name(o.name) == p.name) {
+                if !matches!(p.name.as_str(), "code_search" | "code_run") && crate::ops::find(&self.hub, |op| is_tool(op, &p.name)).is_none() {
                     return Err(Box::new(req.unknown_tool(&p.name)));
                 }
                 self.call_tool(&p.name, Value::Object(p.arguments.unwrap_or_default())).await
@@ -811,7 +817,7 @@ impl Server {
                 }
             }
             _ => {
-                let Some(op) = crate::ops::all(&self.hub).into_iter().find(|o| tool_name(o.name) == name) else {
+                let Some(op) = crate::ops::find(&self.hub, |op| is_tool(op, name)) else {
                     return tool_error(&format!("no tool {name}"));
                 };
                 // An input that doesn't fit the operation: a tool error saying where and why, so
@@ -965,6 +971,23 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a tool is found by its name with no operation's name made: for every operation,
+    /// the one `tool_name` finds; none for a name that differs in a character or in length.
+    #[test]
+    fn g9_s5_a_tool_is_found_without_making_every_name() {
+        let ops = crate::ops::listed(true);
+        for op in &ops {
+            let tool = tool_name(op.name);
+            assert!(is_tool(op.name, &tool), "{tool}");
+            let found = ops.iter().find(|o| is_tool(o.name, &tool)).map(|o| o.name);
+            assert_eq!(found, ops.iter().find(|o| tool_name(o.name) == tool).map(|o| o.name), "{tool}");
+        }
+        assert!(is_tool("agents.list", "agents_list"));
+        for not in ["agents.list", "agents_lis", "agents_listx", "agents-list", ""] {
+            assert!(!is_tool("agents.list", not), "{not}");
+        }
+    }
 
     /// The operations docs/ci.md §4.1 names, each once: a row's `.x` is the last full name's
     /// area's `x` (`ci.caches.list`, `.delete`).
