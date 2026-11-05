@@ -166,6 +166,29 @@ library doesn't make, and stay with hyper-quic's own defences and tests: the NEW
 retirement flood with ACKs withheld (CVE-2024-22189: pending retirements are capped) and optimistic
 ACKs (skipped packet numbers).
 
+On a real socket (`examples/door_lab` under hyper-rt, `examples/door_soak` beside it over loopback
+on a Linux machine shared with CI; the Macs on the lab's Wi-Fi couldn't carry it, and macOS holds
+a new binary's LAN traffic for a person's consent): 10,000 admitted sessions echoing a stream every
+30 seconds and 1,000 attackers in step 8's attacks in rotation (each coming back when the door
+ends it: 415,000 and 623,000 times), 30 minutes each:
+
+| | 0% loss | 5% loss (the generator drops 5% each way) |
+|---|---|---|
+| resident memory, minute 1 / 5 / 30 | 365 / 433 / 540 MB | 371 / 440 / 648 MB |
+| end / minute 5 | 1.25 | 1.47 |
+| live heap at the end (the allocator's count) | | 612 MB |
+| sessions' echoes answered, missed | 516,436, 4,067 | 589,835, 0 |
+| door CPU per attack byte | 53 ns | 91 ns |
+
+Resident memory is the live heap (the allocator's count tracks it within 6%), and what it grows by
+is each session's stream state settling at the stream limit: hyper-quic keeps 368 bytes for each
+stream a connection has had open, up to the 132 the limit allows, and a session that opens a stream
+every 30 seconds reaches the limit after about half an hour, so a 30-minute soak ends still on the
+way there. The same sessions in memory (`attacks::long_lived_sessions_settle_to_a_steady_size`,
+four streams a minute) grow 1,472 bytes a minute and stop at 23,866 bytes a session once the
+limit is reached: that's in B. The 0% run's generator, one thread for 11,000 connections, fell
+behind and let 3,974 sessions time out on its side.
+
 ### Capsules, streams and the session
 
 The CONNECT stream's capsules are read as they come (`h3::capsule`): an unknown one is skipped by
