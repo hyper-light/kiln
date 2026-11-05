@@ -1229,10 +1229,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
+        (&Method::GET, ["api", "harness", "sessions"]) => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
-        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
-            Some(info) => Ok(srv::json(StatusCode::OK, &info)),
+        // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
+        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
+            Some(info) => Ok(pre_encoded(info)),
             None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         },
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
@@ -1794,12 +1795,12 @@ fn ai_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
     // Conversations kiln already runs as agent sessions (taken over, or resumed by hand there too).
     let managed: HashMap<String, String> = hub.harness.list().into_iter().filter_map(|i| Some((i.harness_session?, i.id))).collect();
     let mut out: Vec<serde_json::Value> = Vec::new();
-    for (machine, sessions) in hub.ai_sessions.lock().iter() {
+    for (machine, sessions) in hub.ai_sessions.load().iter() {
         // Only the machines whose terminal the caller may use (docs/agents.md, "Whose agents").
         if !caller.can("runners.terminal", &crate::harness::lineage::machine_scope(&format!("agent:{machine}"))) {
             continue;
         }
-        for s in sessions {
+        for s in sessions.iter() {
             let mut v = serde_json::to_value(s).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
                 o.insert("machine".into(), json!(machine));
@@ -1842,7 +1843,7 @@ fn forks_on(hub: &Hub, machine: &str) -> bool {
 /// Connected runners that have never reported AI sessions (an older kiln): what they run can't
 /// be listed. A current runner reports right after it connects, even when it has none.
 fn ai_silent(hub: &Hub, caller: &crate::authz::Caller) -> Response {
-    let reporting: std::collections::HashSet<String> = hub.ai_sessions.lock().keys().cloned().collect();
+    let reporting: std::collections::HashSet<String> = hub.ai_sessions.load().keys().cloned().collect();
     let mut machines: Vec<String> = hub
         .agents
         .lock()
@@ -1878,7 +1879,7 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
         serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
     };
     let stop = opts.stop || q.get("stop").is_some_and(|v| v == "1" || v == "true");
-    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let found = hub.ai_sessions.load().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
@@ -1949,7 +1950,7 @@ fn may_run_on(caller: &crate::authz::Caller, target: &str, what: &str) -> Result
 /// of its conversation, in the same folder), leaving the original running as it is.
 async fn ai_fork(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
-    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let found = hub.ai_sessions.load().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
@@ -2840,7 +2841,7 @@ async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
     let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
     let m = crate::metrics::global();
-    let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
+    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
     Ok(srv::json(
         StatusCode::OK,
         &json!({
@@ -2859,7 +2860,7 @@ async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
 }
 
 fn system_json(hub: &Hub) -> serde_json::Value {
-    let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
+    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_s": hub.started.elapsed().as_secs(),
@@ -2895,11 +2896,11 @@ async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
 }
 
 fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
-    let h = hub.history.lock();
+    let h = hub.history.load();
     let mut out = serde_json::Map::new();
     for (k, v) in h.iter() {
         if q.get("agent").is_none_or(|a| a == k) {
-            out.insert(k.clone(), json!(v));
+            out.insert(k.clone(), json!(&**v));
         }
     }
     srv::json(StatusCode::OK, &serde_json::Value::Object(out))
@@ -3638,8 +3639,8 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
-    let pod = if persistent { None } else { hub.executor_tokens.lock().remove(&r.token).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some());
+    let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some());
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -3647,7 +3648,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     }
     let name = match &pod {
         Some((executor, pod_name, _)) => {
-            hub.pod_executors.lock().insert(pod_name.clone(), executor.clone());
+            hub.pod_executors.update(|p| p.insert(pod_name.clone(), executor.clone()));
             pod_name.clone()
         }
         None => crate::pki::sanitize_name(&r.name),
@@ -5167,10 +5168,30 @@ async fn harness_history(hub: &Hub, caller: &crate::authz::Caller, q: &HashMap<S
 /// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
 /// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
 /// first, the newest `limit` (100, at most 1000) before event number `before`.
+/// JSON encoded before it was asked for (a view's, encoded once per change of it): sent as it is.
+fn pre_encoded(json: bytes::Bytes) -> Response {
+    srv::response(StatusCode::OK, "application/json", srv::full(json))
+}
+
+/// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
+/// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
+/// sees by lineage, found as it reads.
+async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
+    if crate::harness::lineage::sees_all(caller) {
+        return pre_encoded(hub.harness.list_json());
+    }
+    srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
+}
+
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    // From the session's copy when it holds them all: the events' texts as each was written once,
+    // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
+    if let Some(events) = hub.harness.events_json(id, before, limit) {
+        return Ok(pre_encoded(events));
+    }
     let id = id.to_owned();
     let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
@@ -6619,6 +6640,54 @@ mod tests {
             let again = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?.snapshot.packed(&synced())?;
             assert_eq!(unpack(&again)?, was, "taken again, the same");
             assert!(packed.len() * 5 < was.len(), "it packs: {} of {}", packed.len(), was.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2: the reads of agent sessions the lab makes come from the
+    /// copies' views as their owners encoded them, and say what they said when each read encoded
+    /// its answer: the list and one session as `srv::json` wrote their infos (a state's change
+    /// encoded again), and a session's newest events as the conversation store answers them; a copy
+    /// that lacks some of those asked for leaves them to the store.
+    #[test]
+    fn g10_s2_session_reads_come_from_the_views_as_they_were_written() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for (id, at) in [("b", 2), ("a", 1)] {
+                let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), created_at: at, ..crate::harness::session::Info::default() };
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its \"deadline\""), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            // The second's copy holds its timeline from its fifth event on.
+            hub.harness.ingest(&hub, &there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
+            assert_eq!(hub.harness.list_json().as_ref(), serde_json::to_vec(&hub.harness.list())?.as_slice(), "the list, oldest first");
+            let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
+            assert!(a.last_activity > 0, "the state changed its info");
+            assert_eq!(hub.harness.info_json("a").as_deref(), Some(serde_json::to_vec(&a)?.as_slice()), "one, as it is now");
+            assert!(hub.harness.info_json("nobody").is_none());
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking({
+                let store = store.clone();
+                move || store.sync()
+            })
+            .await??;
+            // As `conversation_events` answers from the store.
+            let stored = |id: &str, before: Option<u64>, limit: usize| -> anyhow::Result<Vec<u8>> {
+                let events: Vec<serde_json::Value> = store.events(id, before, limit)?.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+                Ok(serde_json::to_vec(&json!({ "events": events }))?)
+            };
+            for (before, limit) in [(None, 50), (Some(100), 50), (None, 1000), (Some(30), 10), (Some(1), 5)] {
+                let copy = hub.harness.events_json("a", before, limit).ok_or_else(|| anyhow::anyhow!("the copy didn't say {before:?}, {limit}"))?;
+                assert_eq!(String::from_utf8_lossy(&copy), String::from_utf8_lossy(&stored("a", before, limit)?), "{before:?}, {limit}");
+            }
+            assert_eq!(hub.harness.events_json("b", None, 10).as_deref(), Some(stored("b", None, 10)?.as_slice()), "ten of the sixteen it holds");
+            assert!(hub.harness.events_json("b", None, 50).is_none(), "fewer than asked, its first four elsewhere: the store's to say");
+            assert!(hub.harness.events_json("nobody", None, 50).is_none());
             Ok(())
         })
     }

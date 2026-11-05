@@ -662,7 +662,7 @@ impl Owner {
 
     /// The name people see of `machine`: its label, else its name.
     fn shown(&self, machine: &str) -> String {
-        self.labels.lock().get(machine).cloned().unwrap_or_else(|| machine.to_owned())
+        self.labels.load().get(machine).cloned().unwrap_or_else(|| machine.to_owned())
     }
 
     /// The members of `repo` whose copies are on `machine`.

@@ -111,10 +111,14 @@ http-body = "1.1.0"
 http-body-util = "0.1.5"
 async-channel = "2.5.0"
 # What each agent session's owner shard publishes for its readers, swapped in whole and loaded
-# without a lock (`harness::copies`); already in the tree through turso_core.
+# without a lock (`harness::copies`); already in the tree through turso_core. Goal 5 of the API
+# runtime program (plan 01a1a59c2aae) takes it for the hot path's read-mostly data too (`crate::rcu`).
 arc-swap = "1.9.3"
 async-broadcast = "0.7.2"
 event-listener = "5.4.2"
+# The store's read connections, handed out from a lock-free queue (`crate::store`; goal 5 of the API
+# runtime program, plan 01a1a59c2aae); already in the tree through async-channel.
+concurrent-queue = "2.5.0"
 webpki-roots = "1.0.9"
 flate2 = "1.1.10"
 # A packed snapshot's pieces' CRC-32s, combined (`harness::packed`).
