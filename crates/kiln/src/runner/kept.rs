@@ -109,10 +109,11 @@ impl Shell {
 
 /// A terminal's output with `masks` masked (W17-R01). The masker holds back what could be the start
 /// of a secret (as long as the leg's longest, a token of a kilobyte); the rest shows, masked, as
-/// soon as output pauses for 25 ms.
-pub fn masked(rx: async_channel::Receiver<crate::terminal::PtyOut>, masks: &[String]) -> async_channel::Receiver<crate::terminal::PtyOut> {
+/// soon as output pauses for 25 ms. What it masked waits on a lock-free queue of 64 pieces, as the channel
+/// it was held (goal 5, plan 01a1a59c2aae).
+pub fn masked(rx: crate::memory::queue::Receiver<crate::terminal::PtyOut>, masks: &[String]) -> crate::memory::queue::Receiver<crate::terminal::PtyOut> {
     use crate::terminal::PtyOut;
-    let (tx, out) = async_channel::bounded(64);
+    let (tx, out) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 64);
     let mut masker = kiln_ci::runner::mask::Masker::new(masks);
     crate::rt::spawn(async move {
         loop {

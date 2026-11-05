@@ -650,7 +650,7 @@ impl Streams {
 
 /// `ServerMsg::StreamOpen` on a runner: the stream opened, its chunks and events sent up on their
 /// lane; whether it opened, said.
-pub async fn serve_open(dir: PathBuf, id: String, session: String, mut spec: Spec, up: async_channel::Sender<crate::exec::Up>) {
+pub async fn serve_open(dir: PathBuf, id: String, session: String, mut spec: Spec, up: crate::memory::queue::Sender<crate::exec::Up>) {
     use crate::exec::Up;
     use futures::FutureExt as _;
     let (tx, rx) = async_channel::bounded::<Out>(512);
