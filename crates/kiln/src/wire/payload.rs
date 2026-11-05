@@ -417,7 +417,10 @@ impl Carries for AgentMsg {
             // A fenced message's own is read as it's taken (`crate::hub`), under its grant.
             | AgentMsg::Renew { .. }
             | AgentMsg::Refused { .. }
-            | AgentMsg::Fenced { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Fenced { .. }
+            | AgentMsg::Features { .. }
+            // The offers hint's JSON is read by its view (lb/offers-ui), which keeps what it can.
+            | AgentMsg::Offers { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -564,7 +567,8 @@ impl Carries for ServerMsg {
             | ServerMsg::Freeze { .. }
             | ServerMsg::SignAsLeg { .. }
             | ServerMsg::Renewed { .. }
-            | ServerMsg::Stop { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Stop { .. }
+            | ServerMsg::Features { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

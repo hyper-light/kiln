@@ -100,6 +100,9 @@ pub struct Instance {
     pub wide: u64,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`], docs/wire.md):
+    /// none for runners from before them.
+    pub features: Vec<String>,
 }
 
 impl Instance {
@@ -205,6 +208,7 @@ impl Instances {
                 caps: 0,
                 wide: 0,
                 kiln: None,
+                features: Vec::new(),
             },
         );
         // Ownership moves with the instance.
@@ -303,6 +307,13 @@ impl Instances {
     pub fn set_wide(&mut self, peer: PeerId, caps: u64) {
         if let Some(i) = self.by_peer.get_mut(&peer) {
             i.wide = caps;
+        }
+    }
+
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`]): each says them all.
+    pub fn set_features(&mut self, peer: PeerId, names: Vec<String>) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.features = names;
         }
     }
 

@@ -163,6 +163,10 @@ pub enum In {
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
     Tick,
+    /// A reading of this machine's host sampler: placement's room (docs/needs.md E5).
+    Sampled(crate::metrics::HostSample),
+    /// The time placement's timer asked for (`super::place::Placer::timer`).
+    PlaceTick,
 }
 
 /// What local tools ask of the node.
@@ -191,6 +195,20 @@ pub enum Local {
     AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
     /// A question for the server (JSON), answered with its answer (JSON).
     Query { json: String, reply: oneshot::Sender<anyhow::Result<String>> },
+    /// Place a run this node owns (docs/needs.md E5): what placement says of it goes to `says`.
+    /// Answers whether placement is ready (this machine measured, the directory known); when it
+    /// isn't, the run is placed as before.
+    Place { ask: Box<kiln_ci::place::ask::Ask>, says: async_channel::Sender<super::place::Placed>, reply: oneshot::Sender<bool> },
+    /// A run of this node's is about to start on `runner` under `fence`: whether it still may.
+    PlaceStarting { run: String, runner: String, fence: kiln_ci::sched::Fence, reply: oneshot::Sender<bool> },
+    /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
+    PlaceRun { peer: String, run: String, fence: kiln_ci::sched::Fence, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
+    /// A run of this node's that placement started here is up (`ended` None), or ended.
+    PlaceLocal { run: String, ended: Option<bool> },
+    /// Its asker doesn't want a run any more.
+    PlaceCancel { run: String },
+    /// What this runner's admission holds, for a view (JSON).
+    PlaceView { reply: oneshot::Sender<Value> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -254,6 +272,37 @@ impl Handle {
 
     pub async fn connect(&self, peer: &str) -> anyhow::Result<Host> {
         self.ask(|reply| Local::Connect { peer: peer.to_owned(), reply }).await?
+    }
+
+    /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
+    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: async_channel::Sender<super::place::Placed>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::Place { ask: Box::new(ask), says, reply }).await
+    }
+
+    /// Whether run `run` may still start on `runner` under `fence` (for this runner: whether its
+    /// admission starts it).
+    pub async fn place_starting(&self, run: &str, runner: &str, fence: kiln_ci::sched::Fence) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::PlaceStarting { run: run.to_owned(), runner: runner.to_owned(), fence, reply }).await
+    }
+
+    /// Run on `peer` under the claim placement gave run `run`.
+    pub async fn place_run(&self, peer: &str, run: &str, fence: kiln_ci::sched::Fence, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::PlaceRun { peer: peer.to_owned(), run: run.to_owned(), fence, spec: Box::new(spec), says, reply }).await
+    }
+
+    /// A placed run here is up (`ended` None) or ended.
+    pub async fn place_local(&self, run: &str, ended: Option<bool>) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended })).await;
+    }
+
+    /// Its asker doesn't want run `run` any more.
+    pub async fn place_cancel(&self, run: &str) {
+        let _ = self.tx.send(In::Local(Local::PlaceCancel { run: run.to_owned() })).await;
+    }
+
+    /// What this runner's admission holds (JSON), for `/api/reach/offers`.
+    pub async fn place_view(&self) -> anyhow::Result<Value> {
+        self.ask(|reply| Local::PlaceView { reply }).await
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
@@ -434,7 +483,7 @@ impl Handle {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: crate::proto::feature::all() };
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
@@ -449,6 +498,9 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         }
     });
     let node_name = cfg.name.clone();
+    // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
+    // run asked before a restart is never taken for one after (docs/needs.md §8).
+    let place_epoch = super::place::next_epoch(&cfg.dir);
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -476,6 +528,11 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         links: HashMap::new(),
         peers: HashMap::new(),
         served: HashMap::new(),
+        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()),
+        placing: HashMap::new(),
+        place_at: None,
+        measured: false,
+        place_later: Vec::new(),
     };
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
@@ -576,6 +633,9 @@ struct Peer {
     waiters: Vec<oneshot::Sender<anyhow::Result<Host>>>,
     last_used: Instant,
     error: Option<String>,
+    /// The features it speaks on this link ([`Say::Features`], docs/wire.md): none until it
+    /// answers, and for a runner from before them, none ever.
+    features: Vec<String>,
 }
 
 impl Peer {
@@ -593,6 +653,7 @@ impl Peer {
             waiters: Vec::new(),
             last_used: Instant::now(),
             error: None,
+            features: Vec::new(),
         }
     }
 
@@ -657,6 +718,9 @@ struct Session {
     /// Hand-overs arriving, by id: the bytes so far.
     adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
+    /// The features its asker speaks on links ([`Ask::Features`], docs/wire.md): none until it
+    /// says, and then a link variant past the first twelve goes to it only if it named it.
+    features: Vec<String>,
 }
 
 enum Waiting {
@@ -686,6 +750,17 @@ struct Node {
     links: HashMap<String, Link>,
     peers: HashMap<String, Peer>,
     served: HashMap<(String, String), Session>,
+    /// Placement (docs/needs.md E5): this node's owner and its runner's admission.
+    place: super::place::Placer,
+    /// Where what placement says of each run this node owns goes.
+    placing: HashMap<String, async_channel::Sender<super::place::Placed>>,
+    /// The time placement's timer is set for, if one is.
+    place_at: Option<i64>,
+    /// This machine has been measured: placement admits against that.
+    measured: bool,
+    /// What placement is to do that came up where doing it at once would loop back (a link
+    /// dropping): done once the input is.
+    place_later: Vec<super::place::Out>,
 }
 
 impl Node {
@@ -715,7 +790,14 @@ impl Node {
                     }
                 } else {
                     // Back: everyone with something to do reconnects now.
-                    let names: Vec<String> = self.peers.iter().filter(|(_, p)| p.busy()).map(|(n, _)| n.clone()).collect();
+                    let mut names: Vec<String> = self.peers.iter().filter(|(_, p)| p.busy()).map(|(n, _)| n.clone()).collect();
+                    // And every runner this node placed on: what it owns there waits for word.
+                    for n in self.place.told_to() {
+                        if !names.contains(&n) {
+                            self.peers.entry(n.clone()).or_insert_with(Peer::new);
+                            names.push(n);
+                        }
+                    }
                     for n in names {
                         if let Some(p) = self.peers.get_mut(&n) {
                             p.state = PeerState::Idle;
@@ -733,6 +815,69 @@ impl Node {
                 }
             }
             In::Tick => self.tick().await,
+            In::Sampled(s) => {
+                self.measured = true;
+                let outs = self.place.measured(super::place::sample_of(&s), crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::PlaceTick => {
+                self.place_at = None;
+                let outs = self.place.tick(crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+        }
+        while !self.place_later.is_empty() {
+            let outs = std::mem::take(&mut self.place_later);
+            self.place_do(outs).await;
+        }
+        self.place_timer();
+    }
+
+    /// Placement's timer, set for when it asks to be told the time (never a poll): one at a
+    /// time, the soonest.
+    fn place_timer(&mut self) {
+        let Some(at) = self.place.timer() else { return };
+        if self.place_at.is_some_and(|t| t <= at) {
+            return;
+        }
+        self.place_at = Some(at);
+        let tx = self.tx.clone();
+        let wait = Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
+        crate::rt::spawn(async move {
+            crate::rt::sleep(wait).await;
+            let _ = tx.send(In::PlaceTick).await;
+        });
+    }
+
+    /// Does what placement says to: its words to runners and owners on their links, its answers
+    /// to the local runs that asked.
+    async fn place_do(&mut self, outs: Vec<super::place::Out>) {
+        use super::place::{Out, Placed};
+        for o in outs {
+            match o {
+                Out::Tell { peer, json } => {
+                    self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                    self.send_or_queue(&peer, Ask::Place { json }).await;
+                }
+                Out::Say { peer, json } => {
+                    // To the owner's session that speaks placement, on its link.
+                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)).find_map(|(_, s)| s.link.clone());
+                    match link {
+                        Some(link) => {
+                            self.say_on(&link, &Say::Place { json }).await;
+                        }
+                        None => tracing::debug!(%peer, "a placement word for an owner with no link: it hears where its runs stand when it's back"),
+                    }
+                }
+                Out::Local { run, placed } => {
+                    let done = matches!(&placed, Placed::Answer(a) if matches!(a, kiln_ci::place::Answer::Never { .. } | kiln_ci::place::Answer::Ended { .. } | kiln_ci::place::Answer::Lost { .. }));
+                    if let Some(tx) = self.placing.get(&run)
+                        && (tx.send(placed).await.is_err() || done)
+                    {
+                        self.placing.remove(&run);
+                    }
+                }
+            }
         }
     }
 
@@ -767,6 +912,8 @@ impl Node {
         }
         let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
         self.directory = Some((Instant::now(), runners.clone()));
+        let outs = self.place.directory(&runners, crate::util::now_ms());
+        self.place_do(outs).await;
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {
                 Waiting::Directory(reply) => {
@@ -900,7 +1047,7 @@ impl Node {
                     p.state = PeerState::Retry { at: Instant::now() + crate::sup::jitter(backoff), backoff };
                     p.error = Some(why.to_owned());
                     // Asks for a run never sent wait for the next link; acks and pings do not matter.
-                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. }));
+                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. } | Ask::Place { .. }));
                     for w in p.waiters.drain(..) {
                         let _ = w.send(Err(anyhow::anyhow!("{why}")));
                     }
@@ -923,6 +1070,14 @@ impl Node {
                 }
             }
         }
+        // Placement waits for what the link held (docs/needs.md E5): the runs this node owns on
+        // that runner, or that owner's runs here, until it's back or gone.
+        let now = crate::util::now_ms();
+        let outs = match l.role {
+            Role::Asker => self.place.runner_link(&l.peer, false, now),
+            Role::Doer => self.place.owner_away(&l.peer, now),
+        };
+        self.place_later.extend(outs);
     }
 
     async fn on_frame(&mut self, from: String, link: String, open: bool, data: Vec<u8>, close: Option<String>) {
@@ -1134,12 +1289,22 @@ impl Node {
                     let _ = w.send(Ok(host.clone()));
                 }
                 tracing::debug!(peer = %name, resumed = resumed.len(), lost = lost.len(), "reach link ready");
+                // A runner whose announce lists `link-features` is told this one's, and answers
+                // with its own (docs/wire.md, "Named features"); one from before is never sent a
+                // link variant it doesn't know.
+                p.features.clear();
+                let negotiates = self.directory.as_ref().and_then(|(_, d)| d.iter().find(|r| r.name == name)).is_some_and(|r| crate::proto::feature::speaks(&r.features, crate::proto::feature::LINK_FEATURES));
                 for id in lost {
                     if let Some(f) = p.follows.remove(&id) {
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
+                if negotiates {
+                    self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await;
+                }
+                let outs = self.place.runner_link(&name, true, crate::util::now_ms());
                 self.flush_queue(&name).await;
+                self.place_do(outs).await;
             }
             Say::Refused { reason } => {
                 self.fail_peer(&name, &reason).await;
@@ -1209,6 +1374,19 @@ impl Node {
                 }
             }
             Say::Pong { .. } => {}
+            // The features it speaks on this link (docs/wire.md, "Named features").
+            Say::Features { names } => {
+                if let Some(p) = self.peers.get_mut(&name) {
+                    tracing::debug!(peer = %name, ?names, "the other runner speaks these link features");
+                    p.features = names;
+                }
+            }
+            // Placement's word from a runner this node probed (docs/needs.md E5): this build sends
+            // no probe on a link yet, so none comes, and one that does is noted.
+            Say::Place { json } => {
+                let outs = self.place.heard(&name, &json, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
             // The other end couldn't read a message of this one's: it ends the link.
             Say::Unread { what, code, why } => {
                 tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
@@ -1254,7 +1432,7 @@ impl Node {
             if let Some(l) = self.links.get_mut(link) {
                 l.session = Some(session.clone());
             }
-            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None });
+            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None, features: Vec::new() });
             let old = s.link.replace(link.to_owned());
             s.detached = None;
             let mut resumed = Vec::new();
@@ -1355,6 +1533,24 @@ impl Node {
                     }
                 }
             }
+            // The features its asker speaks on links: kept for this session, and this runner's
+            // said back (docs/wire.md, "Named features").
+            Ask::Features { names } => {
+                if let Some(s) = self.served.get_mut(&key) {
+                    s.features = names;
+                }
+                self.say_on(link, &Say::Features { names: crate::proto::feature::all() }).await;
+            }
+            // An owner's word to this runner's admission (docs/needs.md E5): only from an asker
+            // that said `place` on this link, as only it is answered.
+            Ask::Place { json } => {
+                if self.served.get(&key).is_some_and(|s| crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)) {
+                    let outs = self.place.told(&key.0, &json, crate::util::now_ms());
+                    self.place_do(outs).await;
+                } else {
+                    tracing::debug!(peer = %key.0, link, "a placement word from an asker that didn't say it places");
+                }
+            }
             // The asker couldn't read a message of this one's: it ends the link.
             Ask::Unread { what, code, why } => {
                 tracing::warn!(peer = %key.0, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
@@ -1367,6 +1563,12 @@ impl Node {
         let id = spec.id;
         let Some(s) = self.served.get_mut(key) else { return };
         if s.runs.contains_key(&id) {
+            return;
+        }
+        // A placed run starts only on its admission's word, and never twice (docs/needs.md E5);
+        // one its asker didn't place starts as before.
+        if let super::place::Spec::Refuse(why) = self.place.spec(&key.0, id) {
+            self.refuse_run(key, id, why).await;
             return;
         }
         let mirror = match spec.mirror.as_deref() {
@@ -1460,6 +1662,8 @@ impl Node {
                 if let Some(link) = link {
                     self.say_on(&link, &Say::Started { id, pid, cwd }).await;
                 }
+                let outs = self.place.spawned(&key.0, id, crate::util::now_ms());
+                self.place_do(outs).await;
             }
             serve::Event::Output { stream, data } => {
                 let off = r.next;
@@ -1469,9 +1673,16 @@ impl Node {
             }
             serve::Event::Exit { code, error } => {
                 let error = if r.timed_out { Some(error.unwrap_or_else(|| "timed out".into())) } else { error };
+                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited.
+                let outs = self.place.ended(&key.0, id, error.is_none(), crate::util::now_ms());
+                let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) else {
+                    self.place_do(outs).await;
+                    return;
+                };
                 r.exit = Some((code, error));
                 r.stdin = None;
                 self.pump(&key, id).await;
+                self.place_do(outs).await;
             }
         }
     }
@@ -1639,6 +1850,49 @@ impl Node {
                     p.state = PeerState::Idle;
                 }
                 self.ensure_link(&peer).await;
+            }
+            Local::Place { ask, says, reply } => {
+                let ready = self.measured && self.directory.is_some();
+                let _ = reply.send(ready);
+                if ready {
+                    self.placing.insert(ask.run.clone(), says);
+                    let outs = self.place.ask(*ask, crate::util::now_ms());
+                    self.place_do(outs).await;
+                }
+            }
+            Local::PlaceStarting { run, runner, fence, reply } => {
+                let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());
+                let _ = reply.send(ok);
+                self.place_do(outs).await;
+            }
+            Local::PlaceRun { peer, run, fence, mut spec, says, reply } => {
+                let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                let id = p.next_id;
+                p.next_id += 1;
+                spec.id = id;
+                p.follows.insert(id, Follow { says, got: 0, exited: false, detached: false });
+                let _ = reply.send(id);
+                // The claim's start first, then the spec it's for: the runner starts it only if
+                // its admission says so, and never twice.
+                let json = self.place.start_word(&run, fence, id);
+                self.send_or_queue(&peer, Ask::Place { json }).await;
+                self.send_or_queue(&peer, Ask::Run(spec)).await;
+            }
+            Local::PlaceLocal { run, ended } => {
+                let now = crate::util::now_ms();
+                let outs = match ended {
+                    None => self.place.local_spawned(&run, now),
+                    Some(ok) => self.place.local_ended(&run, ok, now),
+                };
+                self.place_do(outs).await;
+            }
+            Local::PlaceCancel { run } => {
+                self.placing.remove(&run);
+                let outs = self.place.cancel(&run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::PlaceView { reply } => {
+                let _ = reply.send(self.place.view());
             }
             Local::Run { peer, mut spec, says, reply } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);

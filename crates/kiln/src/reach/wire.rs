@@ -52,12 +52,21 @@ pub enum Ask {
     /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
     /// encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// The features the asker speaks on links, by name (`crate::proto::feature`, docs/wire.md,
+    /// "Named features"), answered by [`Say::Features`]. Sent right after `Hello`, and only to a
+    /// runner whose reach announce lists `link-features` (an older one, which would end the link
+    /// on a kind it doesn't know, lists none). Appended last: postcard encodes variants by index.
+    Features { names: Vec<String> },
+    /// Placement (docs/needs.md E5; `kiln_ci::place::msg::ToRunner` as JSON): the asker, a run's
+    /// owner, to the runner it probes. Only to a runner that said `place` in [`Say::Features`] on
+    /// this link. Appended last: postcard encodes variants by index.
+    Place { json: String },
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 12;
+pub const ASK_VARIANTS: usize = 14;
 /// How many variants [`Say`] has.
-pub const SAY_VARIANTS: usize = 12;
+pub const SAY_VARIANTS: usize = 14;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -93,6 +102,14 @@ pub enum Say {
     /// Word that a message of the asker's couldn't be read here, as [`Ask::Unread`]. Appended last:
     /// postcard encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// The features this runner speaks on links, by name: the answer to [`Ask::Features`], and
+    /// sent on no link whose asker didn't send that. Appended last: postcard encodes variants by
+    /// index.
+    Features { names: Vec<String> },
+    /// Placement (docs/needs.md E5; `kiln_ci::place::msg::ToOwner` as JSON): the runner probed, to
+    /// the run's owner. Only on a link whose asker said `place` in [`Ask::Features`]. Appended
+    /// last: postcard encodes variants by index.
+    Place { json: String },
 }
 
 /// The machine a link reached.
@@ -284,14 +301,26 @@ mod tests {
         use crate::wire::unread::Code;
         let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 12".into(), code: Code::Unknown, why: "Say has 12 variants".into() })?;
         let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
-        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 1).ok(), u8::try_from(SAY_VARIANTS - 1).ok()));
+        assert_eq!((ask.first().copied(), say.first().copied()), (Some(11), Some(11)));
+        // Named features and placement after it (docs/wire.md, "Named features"), and the counts
+        // say so.
+        let f = |n: &[&str]| n.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        let asks = [(Ask::Features { names: f(&["place"]) }, 12u8), (Ask::Place { json: "{}".into() }, 13)];
+        let says = [(Say::Features { names: f(&["place"]) }, 12u8), (Say::Place { json: "{}".into() }, 13)];
+        for (m, idx) in asks {
+            assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
+        }
+        for (m, idx) in says {
+            assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
+        }
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (14, 14));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 12]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 12"));
+        d.push(&[0, 0, 0, 1, 14]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 14"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));

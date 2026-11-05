@@ -310,6 +310,18 @@ pub enum AgentMsg {
     /// told from what its grant sends. Only to a server announcing [`CAP_LEASES`]. Appended last:
     /// postcard encodes variants by index.
     Fenced { grant: Grant, msg: Box<AgentMsg> },
+    /// The features this runner speaks, by name ([`feature`], docs/wire.md, "Named features"):
+    /// sent once a server's [`ServerMsg::Caps`] says [`CAP_FEATURES`], and again whenever they
+    /// change; each supersedes the last. From [`CAP_FEATURES`] on, a new capability is a name
+    /// here, not a bit. Only to a server announcing [`CAP_FEATURES`]. Appended last, after
+    /// needs-engine's `Fenced`: postcard encodes variants by index.
+    Features { names: Vec<String> },
+    /// What this runner's admission holds, as a hint for the server's offers view (docs/needs.md
+    /// E5; JSON `crate::offers::Hint`, lb/offers-ui): its budget and room, its line by class, its
+    /// quotes, and its own runs that wait. Sent only when a decision-relevant value changes, never
+    /// per sample; only to a server that named [`feature::OFFERS`]. Appended last: postcard encodes
+    /// variants by index.
+    Offers { json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -644,6 +656,50 @@ pub const CAP_FREEZE: u64 = 1 << 53;
 /// Bit 62, past every bit of main's: needs-engine had 38, which main gave [`CAP_IDENTITY`]
 /// (bit 63 is kept for a later change).
 pub const CAP_LEASES: u64 = 1 << 62;
+/// The last bit (docs/wire.md, "Named features"): this side speaks named features, and says
+/// which in [`AgentMsg::Features`] / [`ServerMsg::Features`] once the other side said this bit
+/// too. The 64 bits ran out (main and the lines on their way hold 0 to 62 between them): from
+/// here on a new capability is a name in [`feature`], never a bit, and two lines can't take the
+/// same one by accident, as they could a bit.
+pub const CAP_FEATURES: u64 = 1 << 63;
+
+/// Named features (docs/wire.md, "Named features"): what a side speaks past the capability bits,
+/// said by name ([`AgentMsg::Features`], [`ServerMsg::Features`], and in a runner's reach
+/// [`crate::reach::relay::Announce`] for its peers). A name means one thing for good: a change to
+/// what it means is a new name. A side that doesn't know a name ignores it.
+pub mod feature {
+    /// Placement with no engine in the middle (docs/needs.md E5, docs/reach.md §2): a runner
+    /// that says it admits runs owners probe it with against its own measured room
+    /// (`kiln_ci::place::runner`), over reach links (`Ask::Place`, `Say::Place`); an owner that
+    /// says it places its runs by probing (`kiln_ci::place::owner`).
+    pub const PLACE: &str = "place";
+    /// Reach links that negotiate features (`Ask::Features`, `Say::Features`, docs/wire.md): a
+    /// runner whose announce lists this may be sent `Ask::Features` on a link.
+    pub const LINK_FEATURES: &str = "link-features";
+
+    /// Hints of runners' admission state for the server's offers view (lb/offers-ui): a runner
+    /// that says it sends [`super::AgentMsg::Offers`], a server that says it reads them. Said once
+    /// both sides are built (runner: lb/core; server: lb/offers-ui).
+    pub const OFFERS: &str = "offers";
+    /// News of queued and started runs to the asking agent (lb/told; it replaces the bit 58 its
+    /// branch had).
+    pub const TOLD: &str = "told";
+    /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 14).
+    pub const SIZES: &str = "reach.sizes";
+
+    /// Every name this build speaks, in the order it says them.
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES];
+
+    /// [`ALL`], as a message carries them.
+    pub fn all() -> Vec<String> {
+        ALL.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// Whether `names` (what a peer said) has `name`.
+    pub fn speaks(names: &[String], name: &str) -> bool {
+        names.iter().any(|n| n == name)
+    }
+}
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -943,6 +999,11 @@ pub enum ServerMsg {
     /// the leg's grants (a later attempt, or one granted again) lets that one be. Only to runners
     /// announcing [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
     Stop { grant: Grant, reason: String },
+    /// The features this server speaks, by name, as [`AgentMsg::Features`]: sent after
+    /// [`ServerMsg::Caps`] to a runner whose [`AgentMsg::Caps`] says [`CAP_FEATURES`]. Only to
+    /// runners announcing [`CAP_FEATURES`]. Appended last, after needs-engine's `Stop`: postcard
+    /// encodes variants by index.
+    Features { names: Vec<String> },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1459,9 +1520,10 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // and W27 its legs' signing and custody (58 to 60, 65 and 66); needs-engine's leases after
-        // those (W05-R34: AgentMsg 61 to 63, ServerMsg 67 and 68).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 69), "each table has every variant once");
+        // and W27 its legs' signing and custody (58 to 60, 65 and 66); needs-engine its leases
+        // (`Renew`, `Refused`, `Fenced` 61 to 63; `Renewed`, `Stop` 67 and 68); named features
+        // their own (64 and 69; docs/wire.md's registry); the offers hint 65.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (66, 70), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1585,6 +1647,81 @@ mod tests {
         assert_eq!(lane_name(LANE_FENCED_LOGS), "fenced-logs");
         let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_FREEZE;
         assert!(CAP_LEASES.is_power_of_two() && CAP_LEASES == 1 << 62 && CAP_LEASES & before == 0);
+        Ok(())
+    }
+
+    /// docs/wire.md's registry, on this branch (docs/needs.md E5, M1 of the balancer's core): every
+    /// capability bit is one bit, held by one name, and the registry has its row; the variants
+    /// appended after main's last (861bbe60's `AgentMsg::Custody`, 60, and `ServerMsg::Custody`,
+    /// 66) are at their indexes, in the order the registry lists them; named features come after
+    /// the last bit. A new capability is a name in [`feature`], never a bit: none is left.
+    #[test]
+    fn wire_registry_holds_every_bit_and_variant_once() -> anyhow::Result<()> {
+        let doc = include_str!("../../../docs/wire.md");
+        let registry = doc.split("## Registry").nth(1).and_then(|r| r.split("\n## ").next()).unwrap_or_default();
+        let caps: [(u32, &str, u64); 50] = [(0, "CAP_UPGRADE", u64::from(CAP_UPGRADE)), (1, "CAP_TAKEOVER", u64::from(CAP_TAKEOVER)), (2, "CAP_DIRS", u64::from(CAP_DIRS)), (3, "CAP_TAKEOVER_STOP", u64::from(CAP_TAKEOVER_STOP)), (4, "CAP_FRONT_DOOR", u64::from(CAP_FRONT_DOOR)), (5, "CAP_OUTPOST", u64::from(CAP_OUTPOST)), (6, "CAP_SYNC", u64::from(CAP_SYNC)), (7, "CAP_OBSERVE", u64::from(CAP_OBSERVE)), (8, "CAP_UPDATES", u64::from(CAP_UPDATES)), (9, "CAP_BLUE_GREEN", u64::from(CAP_BLUE_GREEN)), (10, "CAP_CI2", u64::from(CAP_CI2)), (11, "CAP_ACTIONS", u64::from(CAP_ACTIONS)), (12, "CAP_DOCKER", u64::from(CAP_DOCKER)), (13, "CAP_FIRECRACKER", u64::from(CAP_FIRECRACKER)), (14, "CAP_SHARDS", u64::from(CAP_SHARDS)), (15, "CAP_FACTS", u64::from(CAP_FACTS)), (16, "CAP_JOB_TTY", u64::from(CAP_JOB_TTY)), (17, "CAP_REACH", u64::from(CAP_REACH)), (18, "CAP_REPOS", u64::from(CAP_REPOS)), (19, "CAP_CONVO", u64::from(CAP_CONVO)), (20, "CAP_DOCKER_ROOTLESS", u64::from(CAP_DOCKER_ROOTLESS)), (21, "CAP_DOCTOR", u64::from(CAP_DOCTOR)), (22, "CAP_FILES", u64::from(CAP_FILES)), (23, "CAP_STREAM", u64::from(CAP_STREAM)), (24, "CAP_PREVIEW", u64::from(CAP_PREVIEW)), (25, "CAP_PORTS", u64::from(CAP_PORTS)), (26, "CAP_ENGINES", u64::from(CAP_ENGINES)), (27, "CAP_WORKSPACE", u64::from(CAP_WORKSPACE)), (28, "CAP_POOLS", u64::from(CAP_POOLS)), (29, "CAP_RECEIVED", u64::from(CAP_RECEIVED)), (30, "CAP_UNDEPLOY", u64::from(CAP_UNDEPLOY)), (31, "CAP_CLUSTER", u64::from(CAP_CLUSTER)), (32, "CAP_WIRE", CAP_WIRE), (33, "CAP_NET_DROPS", CAP_NET_DROPS), (34, "CAP_INBOX", CAP_INBOX), (35, "CAP_HANDOVER", CAP_HANDOVER), (36, "CAP_WORK", CAP_WORK), (37, "CAP_AGENT_LIMIT", CAP_AGENT_LIMIT), (38, "CAP_IDENTITY", CAP_IDENTITY), (39, "CAP_HEADROOM", CAP_HEADROOM), (40, "CAP_CHANGES_PATCH", CAP_CHANGES_PATCH), (41, "CAP_UNREAD", CAP_UNREAD), (42, "CAP_WORKSPACE_COMMITS", CAP_WORKSPACE_COMMITS), (43, "CAP_WORKSPACE_COMPARE", CAP_WORKSPACE_COMPARE), (44, "CAP_AGENT_GIT", CAP_AGENT_GIT), (45, "CAP_LEG_SIGNS", CAP_LEG_SIGNS), (46, "CAP_CUSTODY", CAP_CUSTODY), (53, "CAP_FREEZE", CAP_FREEZE), (62, "CAP_LEASES", CAP_LEASES), (63, "CAP_FEATURES", CAP_FEATURES)];
+        let mut seen = 0u64;
+        for (bit, name, cap) in caps {
+            assert_eq!(cap, 1u64 << bit, "{name} is bit {bit}");
+            assert_eq!(seen & cap, 0, "{name}'s bit {bit} is another capability's too");
+            seen |= cap;
+            if bit >= 32 {
+                assert!(doc.contains(&format!("| {bit} | `{name}`")), "docs/wire.md's table of bits has no row for {name} ({bit})");
+            }
+        }
+        // The last bit is taken: there's none for another capability.
+        assert_eq!(seen & (1 << 63), CAP_FEATURES);
+        assert!(registry.contains("| 63 | `CAP_FEATURES` |") && registry.contains("| 62 | `CAP_LEASES` |") && registry.contains("| 61 | none |"));
+        // The appended variants, at their indexes and in order, each with its registry row.
+        let grant = Grant { leg: "leg".into(), attempt: 1, epoch: 1, n: 1 };
+        let names = feature::all();
+        let agent = [
+            ("Renew", AgentMsg::Renew { seq: 1, held: vec![grant.clone()] }),
+            ("Refused", AgentMsg::Refused { grant: grant.clone(), reason: String::new() }),
+            ("Fenced", AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(AgentMsg::Custody { json: String::new() }) }),
+            ("Features", AgentMsg::Features { names: names.clone() }),
+            ("Offers", AgentMsg::Offers { json: "{}".into() }),
+        ];
+        let mut last = 60u8;
+        for (name, m) in agent {
+            let idx = *encode(&m)?.first().unwrap_or(&0);
+            assert_eq!(idx, last + 1, "AgentMsg::{name} follows the variant before it");
+            assert!(registry.contains(&format!("| `AgentMsg` | {idx} | `{name}` |")), "the registry has no row for AgentMsg::{name} at {idx}");
+            assert_eq!(decode::<AgentMsg>(&encode(&m)?)?, m);
+            last = idx;
+        }
+        let server = [
+            ("Renewed", ServerMsg::Renewed { seq: 1, lease_ms: 1, epoch: 1, lost: Vec::new() }),
+            ("Stop", ServerMsg::Stop { grant: grant.clone(), reason: String::new() }),
+            ("Features", ServerMsg::Features { names: names.clone() }),
+        ];
+        let mut last = 66u8;
+        for (name, m) in server {
+            let idx = *encode(&m)?.first().unwrap_or(&0);
+            assert_eq!(idx, last + 1, "ServerMsg::{name} follows the variant before it");
+            assert!(registry.contains(&format!("| `ServerMsg` | {idx} | `{name}` |")), "the registry has no row for ServerMsg::{name} at {idx}");
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m);
+            last = idx;
+        }
+        // Reach links' own (docs/wire.md, "Named features"): after the twelve every runner reads.
+        use crate::reach::wire::{ASK_VARIANTS, Ask, SAY_VARIANTS, Say};
+        let links: [(&str, &str, u8, Vec<u8>); 4] = [
+            ("Ask", "Features", 12, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
+            ("Ask", "Place", 13, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
+            ("Say", "Features", 12, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
+            ("Say", "Place", 13, postcard::to_allocvec(&Say::Place { json: String::new() })?),
+        ];
+        for (side, name, idx, b) in links {
+            assert_eq!(b.first(), Some(&idx), "{side}::{name}");
+            assert!(registry.contains(&format!("| `reach::wire::{side}` | {idx} | `{name}` |")), "the registry has no row for {side}::{name}");
+        }
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (14, 14));
+        // Every name is said once, and a side speaks one only if the other named it.
+        let mut all = feature::ALL.to_vec();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), feature::ALL.len(), "a feature named twice");
+        assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));
         Ok(())
     }
 

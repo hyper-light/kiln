@@ -213,6 +213,8 @@ classes! {
         AgentMsg::Renew { .. } => Class::Telemetry,
         AgentMsg::Refused { .. } => Class::Answer,
         AgentMsg::Fenced { .. } => Class::Stream,
+        AgentMsg::Features { .. } => Class::Handshake,
+        AgentMsg::Offers { .. } => Class::State,
     }
 }
 
@@ -288,6 +290,7 @@ classes! {
         ServerMsg::Custody { .. } => Class::Ask,
         ServerMsg::Renewed { .. } => Class::Telemetry,
         ServerMsg::Stop { .. } => PARKED,
+        ServerMsg::Features { .. } => Class::Handshake,
     }
 }
 

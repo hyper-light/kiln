@@ -16,7 +16,9 @@
 //!   them: checked, not reserved.
 //! - `fact==value`, `fact!=value`, `fact>=n`, `fact<=n`, `fact>n`, `fact<n`: any fact routing knows
 //!   (`disk.free>=50Gi`, `os.distro==fedora`, `custom.rack==a3`).
-//! - `exclusive`: the runner whole, with nothing else beside the work.
+//! - `exclusive`: held alone (W05-R03, the engine's rule and every runner's admission's): asking no
+//!   CPUs, the runner whole, with nothing else beside the work; asking CPUs, those and its memory,
+//!   which nothing else shares and nothing overcommits.
 //! - `together:sim/3`: one of three items named `sim` that start together or not at all (a gang,
 //!   W05-R40), from 2 to 64 of them.
 //!

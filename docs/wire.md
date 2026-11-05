@@ -471,11 +471,95 @@ takes a new bit, never one that means something already, even in the other direc
 | 46 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 | 62 | `CAP_LEASES` | `AgentMsg::Caps`, `ServerMsg::Caps` | grants are leases (ci.md W05-R34): the runner renews the grants it holds (`Renew`) and names a leg's grant in what it sends about the leg (`Fenced`, `Refused`, and its output on the `fenced-logs` lane, 10); the server answers renewals (`Renewed`) and stops a leg by its grant (`Stop`) |
+| 63 | `CAP_FEATURES` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side speaks named features: each says which by name (`Features`), once the other said this bit ("Named features", below) |
 
-Bits 47 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
-branches before the Changes tab took 42 and 43, and W27's relays. Bit 62 is `CAP_LEASES` (needs-engine
-had 38 before main gave it to `CAP_IDENTITY`), and bit 63 is kept for a later change. Bits 54 to 61 are
-free. Take the next one, and add its row here in the same change.
+Bit 63 is the last. No new capability takes a bit: it is a name ("Named features"). The bits still
+free here (47 to 52, 54 to 61) are held by the lines in the registry below until they land or move
+to names.
+
+## Named features
+
+From `CAP_FEATURES` (bit 63) on, a capability is a name, not a bit (`proto::feature`). Names don't
+run out, and two lines can't take the same one by accident as they could a bit.
+
+- **Runner and server.** Each says `CAP_FEATURES` in its `Caps`. Once the other side has said it,
+  each sends its names once (`AgentMsg::Features`, `ServerMsg::Features`, appended after every
+  older variant), and again whenever they change; each list supersedes the last. Neither sends
+  `Features` to a side that didn't say the bit, so a runner or server from before never gets a
+  variant it can't read.
+- **Reach links.** A link's inner protocol (`reach::wire`) has no room for a new field in `Hello`
+  or `Welcome`: postcard can't skip one. So a runner says the features it speaks on links in its
+  reach announce (`Announce.features`, JSON, optional), and the directory (`RunnerInfo.features`)
+  carries them to askers. An asker sends `Ask::Features` (Ask variant 12) right after the link's
+  `Welcome`, and only to a runner listing `link-features`; that runner answers `Say::Features` (Say
+  variant 12) with its own and keeps the asker's. After that, each side sends a variant past the
+  first twelve only if the other side named its feature on that link. Placement's two
+  (`Ask::Place`, `Say::Place`, variant 13 each way, `kiln_ci::place::msg` as JSON) go only where
+  `place` was named. An older runner never lists `link-features`, so it is never sent `Ask::Features`
+  or anything after it, and an older asker never sends `Ask::Features`, so it is never sent a `Say`
+  past the first twelve. If a runner is replaced by an older build while the directory still lists
+  its features, the first `Ask::Features` it gets ends that link as unknown (`Ask::Unread`, "What
+  can't be read"); the asker's next link reads the directory again, which by then has the older
+  build's announce.
+- **Names.** `link-features`: the runner takes `Ask::Features`. `place`: the runner admits runs owners
+  probe it with over links (docs/needs.md E5), and an owner places by probing. `offers`: a runner sends
+  its admission hint (`AgentMsg::Offers`), a server reads it (lb/offers-ui). `told`: news of queued and
+  started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 14). A name keeps its
+  meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
+
+## Registry
+
+Every capability bit and appended wire variant, on main, on lb/integrate (needs-engine merged into
+main 861bbe60), on lb/core (this branch) and on the lines seen in flight on 2026-11-04 (every head on
+GitHub and every local branch). `proto::tests::wire_registry_holds_every_bit_and_variant_once` holds
+this branch's rows to the code: each bit once, each appended variant at its index, in this order.
+
+### Capability bits
+
+| Bit | Name | Where | State |
+|---|---|---|---|
+| 0–31 | `Build`'s caps (`CAP_UPGRADE` 0 … `CAP_CLUSTER` 31) | `AgentMsg::Build`, mirrored in `Caps` | main |
+| 32–46 | `CAP_WIRE` … `CAP_CUSTODY` (the table above) | `Caps` | main |
+| 47 | `CAP_RELAYS` | `Caps` | main since 426b02ea (after this branch's base, 861bbe60) |
+| 47–52 | `CAP_HARNESS_RELEASE` 47, `CAP_JOB_ATTEMPT` 48, `CAP_OPEN_ONCE` 49, `CAP_RETAINED_RECEIVED` 50, `CAP_RESOURCE_OWNERSHIP` 51, `CAP_FIRECRACKER_SHAPE` 52 | `Caps` | in flight: `agents/examine-the-duplicate-fixes-agent-s-work-2824972c` (fb1bf362). 47 collides with main's `CAP_RELAYS`: to become names before it lands |
+| 53 | `CAP_FREEZE` | `Caps` | main |
+| 54–59 | `CAP_AMPHORA` 54, `CAP_UNIFIED_LAYOUT` 55, `CAP_EXPLICIT_ACTIVATION` 56, `CAP_ORDINARY_EXECUTION_DEBT` 57, `CAP_JOB_LOG_V1` 58, `CAP_LOG_END_MARK` 59 | `Caps` | in flight, the same line: to become names |
+| 60 | `CAP_PRESSURE` | `Caps` | in flight: `placement/pressure` (bcf13a9f), being ported by lb/sense: to become a name |
+| 61 | none | | never to be taken: a new capability is a name |
+| 62 | `CAP_LEASES` | `Caps` | lb/integrate (needs-engine; it had 38 before main gave 38 to `CAP_IDENTITY`) |
+| 63 | `CAP_FEATURES` | `Caps` | lb/core |
+
+### Appended variants
+
+| Enum | Index | Variant | Where | State |
+|---|---|---|---|---|
+| `AgentMsg` | 0–60 | `Hello` … `Custody` | | main at 861bbe60 |
+| `AgentMsg` | 61 | `Machine` | | main since 426b02ea |
+| `AgentMsg` | 61 | `Renew` | | lb/integrate: collides with main's `Machine`; moves after it (62) when lb/integrate takes main past 861bbe60, never released at 61 |
+| `AgentMsg` | 62 | `Refused` | | lb/integrate (63 then) |
+| `AgentMsg` | 63 | `Fenced` | | lb/integrate (64 then) |
+| `AgentMsg` | 64 | `Features` | | lb/core (65 then) |
+| `AgentMsg` | 65 | `Offers` | | lb/core for lb/offers-ui: the admission hint, JSON, to a server that named `offers` (66 then) |
+| `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
+| `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
+| `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
+| `ServerMsg` | 67 | `Renewed` | | lb/integrate |
+| `ServerMsg` | 68 | `Stop` | | lb/integrate |
+| `ServerMsg` | 69 | `Features` | | lb/core |
+| `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
+| `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
+| `reach::wire::Ask` | 12 | `Features` | reach links | lb/core |
+| `reach::wire::Ask` | 13 | `Place` | reach links | lb/core |
+| `reach::wire::Ask` | 14 | `RunWith` | reach links | lb/history: a run with its sizes from history, only where `reach.sizes` was named on the link (it had 12) |
+| `reach::wire::Say` | 0–11 | `Welcome` … `Unread` | reach links | main |
+| `reach::wire::Say` | 12 | `Features` | reach links | lb/core |
+| `reach::wire::Say` | 13 | `Place` | reach links | lb/core |
+| `reach::wire::Say` | 14 | `Used` | reach links | lb/history: what a run used, before its `Exit` (it had 12) |
+
+A line that lands takes the indexes after the last on main then, and moves its rows here in the same
+change. No released build has `AgentMsg` 61 to 64 or `ServerMsg` 67 to 69 yet, so renumbering them when
+lb/integrate takes main's `Machine` breaks nobody.
 
 ## Grants on the wire
 
@@ -622,6 +706,8 @@ Four edges are left, and the lab steers clear of each:
 | `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and three times a lease, at most every 10 s (the lease its grants and `Renewed` say), in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
 | `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
 | `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
+| `Features` | handshake | The features the runner speaks, by name (docs/wire.md, "Named features"): every name it says, superseding the last list. | New: to a server announcing `CAP_FEATURES`, once its `Caps` said so, and again when they change. |
+| `Offers` | state | What the runner's admission holds, as a hint for the offers view (docs/needs.md E5): budget, room, its line by class, quotes, its own runs waiting. Sent when a decision-relevant value changes, never per sample. | New: to a server that named `offers`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -696,6 +782,7 @@ Four edges are left, and the lab steers clear of each:
 | `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. |
 | `Renewed` | telemetry | The answer to a `Renew` (ci.md W05-R34): the lease each grant it named lives from when the server took it, the server's epoch, and the grants it named that aren't the runner's any more (lost, or granted again). The next stands in for a lost one. | New: to runners announcing `CAP_LEASES`. |
 | `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
+| `Features` | handshake | The features the server speaks, by name ("Named features"). | New: to runners announcing `CAP_FEATURES`, after `Caps`. |
 
 ## Commands to a session: `Command`
 
