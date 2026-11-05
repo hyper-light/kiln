@@ -38,6 +38,11 @@
 //!   as the shard keeps them (`hyper_rt::slow`): how many, their holds added up, and the longest; and of
 //!   them, those the host held (preempted, as hyper-rt finds out for a poll past twice its step quantum),
 //!   with their time: what no code held (steps 3 and 4).
+//! - **What its parks, wakes and calls cost it** ([`Wakes`], [`Calls`]; goal 9, plan 01a1a87b2cec step 5, which
+//!   the lab reports per request): its steps, its parks by what ended them (`kiln_shard_wakeups_total{by}`) and
+//!   those withdrawn, the wakes it took in and those its thread made (`kiln_shard_wakes_sent_total{to}`), the kicks
+//!   it sent and was saved, the threads it unparked; its readiness registrations, and its tasks' TCP accepts,
+//!   reads and writes, with those that moved nothing (`kiln_shard_socket_calls_idle_total{call}`).
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -87,6 +92,8 @@ pub struct Shard {
     quantum_ns: AtomicU64,
     /// What its parks and wakes cost it ([`Wakes`]), as the probe last copied them.
     wakes: WakeCells,
+    /// The system calls its thread made beside them ([`Calls`]), as the probe last copied them.
+    calls: CallCells,
 }
 
 /// What a shard's parks and wakes cost it, as hyper-rt counts them on the shard (goal 9, plan 01a1a87b2cec step
@@ -163,6 +170,47 @@ impl WakeCells {
     }
 }
 
+/// The system calls a shard's thread makes beside its parks, kicks and unparks (goal 9, plan 01a1a87b2cec step 5:
+/// what a request costs a shard in calls into the kernel, per request in the lab's report, where batched writes
+/// show): its readiness registrations with its driver, and its tasks' TCP accepts, reads and writes, with the
+/// reads that found nothing ready and the writes that found the send buffer full (each a call that moved nothing,
+/// a wait after it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Calls {
+    /// The driver's non-blocking waits a busy shard made, once a quantum, for what its sockets have ready.
+    pub harvests: u64,
+    pub arms: u64,
+    pub accepts: u64,
+    pub reads: u64,
+    pub reads_empty: u64,
+    pub writes: u64,
+    pub writes_full: u64,
+}
+
+impl Calls {
+    fn of(c: &hyper_rt::shard_loop::Counters) -> Self {
+        Self { harvests: c.harvests, arms: c.arms, accepts: c.socket_accepts, reads: c.socket_reads, reads_empty: c.socket_reads_empty, writes: c.socket_writes, writes_full: c.socket_writes_full }
+    }
+}
+
+/// [`Calls`] as the probe stores them: an atomic each, in [`Calls`]' order.
+#[derive(Default)]
+struct CallCells([AtomicU64; 7]);
+
+impl CallCells {
+    fn store(&self, calls: &Calls) {
+        let row = [calls.harvests, calls.arms, calls.accepts, calls.reads, calls.reads_empty, calls.writes, calls.writes_full];
+        for (cell, n) in self.0.iter().zip(row) {
+            cell.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> Calls {
+        let [harvests, arms, accepts, reads, reads_empty, writes, writes_full] = self.0.each_ref().map(|cell| cell.load(Ordering::Relaxed));
+        Calls { harvests, arms, accepts, reads, reads_empty, writes, writes_full }
+    }
+}
+
 impl Shard {
     fn new() -> Self {
         Self {
@@ -182,6 +230,7 @@ impl Shard {
             most_tasks: AtomicU64::new(0),
             quantum_ns: AtomicU64::new(0),
             wakes: WakeCells::default(),
+            calls: CallCells::default(),
         }
     }
 
@@ -205,6 +254,7 @@ impl Shard {
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
             self.wakes.store(&Wakes::of(&c));
+            self.calls.store(&Calls::of(&c));
         }
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
             self.quantum_ns.store(q, Ordering::Relaxed);
@@ -224,6 +274,11 @@ impl Shard {
     /// What its parks and wakes have cost it, as its probe last copied them (goal 9, plan 01a1a87b2cec step 5).
     pub fn wakes(&self) -> Wakes {
         self.wakes.load()
+    }
+
+    /// The system calls its thread has made beside them, as its probe last copied them ([`Calls`]).
+    pub fn calls(&self) -> Calls {
+        self.calls.load()
     }
 
     /// What the shard's probe has noted, as it stands.
@@ -458,7 +513,36 @@ pub fn render(o: &mut String) {
     help(o, "kiln_shard_quantum_seconds", "gauge", "The step quantum each shard runs with: the longest a poll is to hold it, and half the hold its slow polls are counted past.");
     render_quantum(o, all);
     render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
+    render_calls(o, &all.iter().map(Shard::calls).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+}
+
+/// The families of the system calls each shard's thread made beside its parks and wakes ([`Calls`]; goal 9, plan
+/// 01a1a87b2cec step 5), from `all`, each shard's in the runtime's order.
+fn render_calls(o: &mut String, all: &[Calls], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    type Count = fn(&Calls) -> u64;
+    let families: [(&str, &str, &[(&str, Count)]); 4] = [
+        ("kiln_shard_harvests_total", "Non-blocking waits each shard made in its driver while busy, once a quantum, for what its sockets had ready: each a system call.", &[("", |c: &Calls| c.harvests)]),
+        ("kiln_shard_arms_total", "Readiness registrations each shard made with its driver: each a system call (epoll_ctl, kevent; an AFD poll on Windows).", &[("", |c: &Calls| c.arms)]),
+        (
+            "kiln_shard_socket_calls_total",
+            "TCP accepts, reads and writes each shard's tasks made: each a system call.",
+            &[(",call=\"accept\"", |c: &Calls| c.accepts), (",call=\"read\"", |c: &Calls| c.reads), (",call=\"write\"", |c: &Calls| c.writes)],
+        ),
+        (
+            "kiln_shard_socket_calls_idle_total",
+            "Of those, the reads that found nothing ready and the writes that found the send buffer full: calls that moved nothing, each with a wait after.",
+            &[(",call=\"read\"", |c: &Calls| c.reads_empty), (",call=\"write\"", |c: &Calls| c.writes_full)],
+        ),
+    ];
+    for (name, h, labels) in families {
+        help(o, name, "counter", h);
+        for (i, c) in all.iter().enumerate() {
+            for (label, n) in labels {
+                let _ = writeln!(o, "{name}{{shard=\"{i}\"{label}}} {}", n(c));
+            }
+        }
+    }
 }
 
 /// Each shard's step quantum, as its probe last read it (goal 9, plan 01a1a87b2cec step 3): what the lab holds what
@@ -618,5 +702,32 @@ mod tests {
             assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
         }
         assert_eq!(o.lines().filter(|l| l.starts_with("# TYPE")).count(), 9, "nine families:\n{o}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's arms and socket calls becomes its
+    /// [`Calls`], survives the probe's atomics, and is on `/metrics` a series a call, the idle ones apart.
+    #[test]
+    fn g9_s5_each_shards_system_calls_are_on_metrics() {
+        let c = hyper_rt::shard_loop::Counters { arms: 1, socket_accepts: 2, socket_reads: 3, socket_reads_empty: 4, socket_writes: 5, socket_writes_full: 6, harvests: 7, ..Default::default() };
+        let calls = Calls::of(&c);
+        assert_eq!(calls, Calls { harvests: 7, arms: 1, accepts: 2, reads: 3, reads_empty: 4, writes: 5, writes_full: 6 });
+        let cells = CallCells::default();
+        cells.store(&calls);
+        assert_eq!(cells.load(), calls);
+        let mut o = String::new();
+        render_calls(&mut o, &[calls], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "kiln_shard_harvests_total{shard=\"0\"} 7",
+            "kiln_shard_arms_total{shard=\"0\"} 1",
+            "kiln_shard_socket_calls_total{shard=\"0\",call=\"accept\"} 2",
+            "kiln_shard_socket_calls_total{shard=\"0\",call=\"read\"} 3",
+            "kiln_shard_socket_calls_total{shard=\"0\",call=\"write\"} 5",
+            "kiln_shard_socket_calls_idle_total{shard=\"0\",call=\"read\"} 4",
+            "kiln_shard_socket_calls_idle_total{shard=\"0\",call=\"write\"} 6",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
     }
 }

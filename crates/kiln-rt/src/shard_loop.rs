@@ -227,6 +227,19 @@ counters! {
     /// Threads this shard's thread unparked: compute pool workers woken for the jobs it queued, a thread waiting
     /// on what its task published; each a system call here (a futex wake on Linux).
     threads_woken,
+    /// Readiness registrations the shard made with its driver, a task's wait and a handle armed again for the
+    /// waits left after a fire: each a system call (epoll_ctl, kevent; an AFD poll on Windows).
+    arms,
+    /// Reads of TCP sockets the shard's tasks made (read, readv; recv on Windows): each a system call.
+    socket_reads,
+    /// Of those, the reads that found nothing ready: each a call that brought nothing, and a wait (an arm) after.
+    socket_reads_empty,
+    /// Writes to TCP sockets the shard's tasks made (write, writev; send on Windows): each a system call.
+    socket_writes,
+    /// Of those, the writes that found the send buffer full: a call that sent nothing, and a wait after.
+    socket_writes_full,
+    /// Accepts of TCP connections the shard's listeners made, each a system call, those that found none among them.
+    socket_accepts,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -1018,6 +1031,7 @@ impl Shard {
             .waiting
             .add(interest.raw, interest.writable, word, interest.ticket)
             .and_then(|wanted| {
+                count(&self.desk.live.arms, 1);
                 self.core
                     .driver
                     .arm(interest.raw, wanted, interests::tag_of(interest.raw))
@@ -1056,6 +1070,9 @@ impl Shard {
             let left = self.core.waiting.fire(raw, fired, |word, ticket| {
                 desk.fire_wait(ticket, Encoded::from_word(word));
             });
+            if !left.is_empty() {
+                count(&desk.live.arms, 1);
+            }
             if !left.is_empty()
                 && let Err(refusal) = self.core.driver.arm(raw, left, interests::tag_of(raw))
             {
@@ -1314,9 +1331,13 @@ impl Shard {
     }
 
     /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
-    /// first after the inputs are read again, which lists them behind what those made ready.
+    /// first after the inputs are read again, which lists them behind what those made ready. With classes
+    /// kept, a class goes ahead of less urgent ones while it has run no more than the quantum past the least
+    /// run of them (`crate::queue::LocalQueue::pop_within`, kiln's goal 6): a task's turn, which every other
+    /// task waits for anyway.
     fn next_in_batch(&mut self, at: &mut BatchMark) -> Option<u32> {
-        if let Some(slot) = self.desk.local.pop() {
+        let lead_ns = self.desk.quantum_ns.get();
+        if let Some(slot) = self.desk.local.pop_within(lead_ns) {
             return Some(slot);
         }
         if !self.desk.local.has_yielded() {
@@ -1327,7 +1348,7 @@ impl Shard {
             None => self.carried_now_ns(),
         };
         self.read_inputs_within(at, now);
-        self.desk.local.pop()
+        self.desk.local.pop_within(lead_ns)
     }
 
     /// The inputs read again within the batch at `now_ns`, the step's time from here; where they did work,

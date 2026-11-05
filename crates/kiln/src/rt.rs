@@ -283,13 +283,19 @@ fn took_realtime() -> bool {
     let one = if took.is_ok() { 1 } else { REFUSED_ONE };
     let answers = REALTIME_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
     let status = realtime_of(answers);
-    if status.took.saturating_add(status.refused) == status.shards
-        && let Some(line) = status.said()
-    {
-        if status.refused == 0 {
-            tracing::info!("{line}");
-        } else {
-            tracing::warn!("{line}");
+    if status.took.saturating_add(status.refused) == status.shards {
+        // The room the server's unit gave the shards (`LimitRTPRIO=`) is theirs alone: nothing the server
+        // starts from here on, its own runner's legs and agents among them, inherits it (goal 9, plan
+        // 01a1a87b2cec step 4). The shards keep the class they took.
+        if let Err(why) = crate::os::drop_realtime_room(None) {
+            tracing::warn!(why = %why, "what the server starts keeps its room for the real-time class");
+        }
+        if let Some(line) = status.said() {
+            if status.refused == 0 {
+                tracing::info!("{line}");
+            } else {
+                tracing::warn!("{line}");
+            }
         }
     }
     took.is_ok()
@@ -303,6 +309,41 @@ fn shard_cores(cores: &[u32], shards: u16) -> Vec<u32> {
     let rest = cores.get(1..).filter(|r| !r.is_empty()).unwrap_or(cores);
     (0..usize::from(shards)).filter_map(|i| rest.get(i.checked_rem(rest.len())?).copied()).collect()
 }
+
+/// The cores this runtime's shards are fixed to from cores of the process's own, `cores`, as [`pin`]
+/// fixes them, each once: what the server's own runner keeps its legs and agents off where the server's
+/// slice holds it on the server's cores (`crate::os::keep_work_off`; goal 9, plan 01a1a87b2cec step 4).
+pub fn shard_cores_for(cores: &[u32]) -> Vec<u32> {
+    let mut shards = shard_cores(cores, profile().shards);
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
+/// The cores of the server's own as its shards took them, for `/healthz/server` (goal 9, plan
+/// 01a1a87b2cec step 4): those of `[server] cores` it may run on, the shards' among them, and the
+/// cpuset partition it runs in as the kernel says it (`crate::os::cgroup::partition`), so a person and
+/// the lab see whether the partition a system install makes as the server starts took.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Cores {
+    /// Its cores, as a CPU list.
+    pub cores: String,
+    /// Those of them its shards are fixed to.
+    pub shards: String,
+    /// The partition it runs in (`/kiln.slice: root`), or none.
+    pub partition: Option<String>,
+}
+
+/// [`Cores`]; none where the server has no cores of its own ([`pin`] wasn't called).
+pub fn cores_status() -> Option<Cores> {
+    let cores = CORES.get()?;
+    Some(Cores {
+        cores: crate::os::cpu_list_text(cores),
+        shards: crate::os::cpu_list_text(&shard_cores_for(cores)),
+        partition: crate::os::cgroup::partition().map(|(path, state)| format!("{path}: {state}")),
+    })
+}
+
 
 /// The shards' timer wheel's tick, nanoseconds ([`runtime_config`]): the finest wait a shard keeps, and its
 /// thread's timer slack (hyper-rt's `Driver::set_timer_slack_ns`), so a sleep ends up to two ticks late.
