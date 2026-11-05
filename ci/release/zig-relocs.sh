@@ -15,19 +15,27 @@
 set -uo pipefail
 real=${KILN_ZIG_REAL:?KILN_ZIG_REAL names the zig this wraps}
 
-# Whether `zig <args>` is a cc that links: an output, and nothing that stops before linking.
+# Whether `zig <args>` is a cc that links: an output, and nothing that stops before linking. Arguments in a response
+# file (@file: rustc's, for a command line too long to run) count as given.
 links() {
   [ "${1:-}" = cc ] || return 1
   shift
-  local a out=false
+  local a l out=false
   for a in "$@"; do
-    case $a in
-      -c | -S | -E | -M | -MM | -fsyntax-only | --version | -v | '-###' | -print-* | --print-*) return 1 ;;
-      -o | -o?*) out=true ;;
-    esac
+    if [ "${a#@}" != "$a" ] && [ -f "${a#@}" ]; then
+      while IFS= read -r l; do
+        stops "$l" && return 1
+        outputs "$l" && out=true
+      done < "${a#@}"
+      continue
+    fi
+    stops "$a" && return 1
+    outputs "$a" && out=true
   done
   $out
 }
+stops() { case $1 in -c | -S | -E | -M | -MM | -fsyntax-only | --version | -v | '-###' | -print-* | --print-*) return 0 ;; *) return 1 ;; esac; }
+outputs() { case $1 in -o | -o?*) return 0 ;; *) return 1 ;; esac; }
 
 links "$@" || exec "$real" "$@"
 

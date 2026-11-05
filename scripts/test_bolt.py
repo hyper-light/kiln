@@ -86,6 +86,18 @@ exit 0
         self.assertIn("warning: zig said something", r.stderr, "zig's own words still reach the caller")
         self.assertNotIn("ld.lld --error-limit", r.stderr, "but not the command it was asked to print")
 
+    def test_g11_s5_a_link_in_a_response_file_is_a_link(self) -> None:
+        rsp = self.dir / "args.rsp"
+        rsp.write_text("-target\nx86_64-linux-musl\na.o\n-o\nout\n")
+        r = self.relocs("cc", f"@{rsp}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls()), 2, "run, then run again with its relocations")
+        self.assertTrue(self.calls()[1].endswith("--emit-relocs --build-id=sha1"))
+        rsp.write_text("-c\nx.c\n-o\nx.o\n")
+        self.log.unlink()
+        r = self.relocs("cc", f"@{rsp}")
+        self.assertEqual((r.returncode, len(self.calls())), (0, 1), "a compile in a response file runs as it is")
+
     def test_g11_s5_what_doesnt_link_runs_as_it_is(self) -> None:
         for args in (["cc", "-c", "x.c", "-o", "x.o"], ["cc", "-E", "x.c"], ["cc", "--version"], ["ar", "rcs", "l.a", "x.o"], ["cc", "x.c"]):
             self.log.unlink(missing_ok=True)
