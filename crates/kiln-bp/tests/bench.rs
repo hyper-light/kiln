@@ -142,3 +142,41 @@ fn bp_g2_s10_server_cpu_per_operation() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// bp-g2 step 8: a trained dictionary, measured. The browser's DecompressionStream takes no preset
+/// dictionary (f32), so one would need a JavaScript inflater; this says whether it would pay. The
+/// dictionary is the first half of each sequence's frames; what's measured is the second half,
+/// each operation's frames deflated in one kept context, against the same context primed with it.
+#[test]
+fn bp_g2_s8_a_trained_dictionary_measured() -> Result<(), String> {
+    use kiln_bp::compress::{Compressible, Compressors};
+    use kiln_bp::conn::Lane;
+    use kiln_bp::frames::Kind;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/tests/bp-measure.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut by: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    for f in doc.get("frames").and_then(|f| f.as_array()).into_iter().flatten() {
+        let seq = f.get("seq").and_then(|s| s.as_str()).unwrap_or("").to_owned();
+        let b = unhex(f.get("bp").and_then(|s| s.as_str()).unwrap_or("")).unwrap_or_default();
+        match by.last_mut() {
+            Some((s, v)) if *s == seq => v.push(b),
+            _ => by.push((seq, vec![b])),
+        }
+    }
+    println!("| Sequence | plain B | kept context B | with a trained dictionary B |\n|---|---|---|---|");
+    for (name, msgs) in by {
+        let (train, test) = msgs.split_at(msgs.len() / 2);
+        let dict: Vec<u8> = train.concat();
+        let deflate = |prime: bool| -> usize {
+            let mut z = Compressors::new(false);
+            if prime {
+                let _ = z.deflate(Lane::Control, &Compressible::of(Kind::Change, Trust::Text, &dict).into_iter().collect::<Vec<_>>());
+            }
+            test.iter().filter(|m| !m.is_empty()).map(|m| z.deflate(Lane::Control, &Compressible::of(Kind::Change, Trust::Text, m).into_iter().collect::<Vec<_>>()).1.len()).sum()
+        };
+        let plain: usize = test.iter().map(Vec::len).sum();
+        println!("| {name} | {plain} | {} | {} |", deflate(false), deflate(true));
+    }
+    Ok(())
+}
