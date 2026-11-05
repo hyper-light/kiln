@@ -127,8 +127,24 @@ pub static CI_INBOX: Owner = Owner::new("ci_inbox");
 /// that: the files' sizes are the registries'.
 pub static KEEP_WAITING: Owner = Owner::new("keep_waiting");
 
+/// Ship's read model (`crate::ship::ShipCache`): each repository's newest commits' rows, their records and
+/// their JSON drawn: at most `CAP` (5,000) rows a repository, so its bound is that many as large as its
+/// largest row held (each measured as it's drawn). Past the count the oldest go: older pages come from
+/// the store, as they did.
+pub static SHIP_CACHE: Owner = Owner::new("ship_cache");
+
+/// The package graphs kept for `affected()` (`crate::ci::graphs`): at most 64 graphs and `MAX_BYTES` of
+/// them (64 MiB, each counted as its JSON's bytes), as much as one commit's manifests may be read from.
+/// Past either the oldest go: read again from the repository's mirror when a run asks.
+pub static CI_GRAPHS: Owner = Owner::new("ci_graphs");
+
+/// Hosts' open pull requests kept for the inbox (`crate::githost::pulls`): each repository's list for its
+/// minute, and at most 32 MiB of them, one host response's worth as kiln reads them at the most (GitHub's
+/// are read up to 32 MiB). Past it the lists read longest ago go: read from the host again when asked.
+pub static PULL_LISTS: Owner = Owner::new("pull_lists");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 19] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING];
+pub(super) const ALL: [&Owner; 22] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS];
 
 #[cfg(test)]
 mod tests {
