@@ -148,14 +148,16 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child is killed. The child is reaped either way.
-pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
     crate::os::keep_child_off_shards(child.id());
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     nonblocking(&out)?;
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    // 16 chunks read ahead of their reader, as the channel it was held, with no lock (goal 5, plan
+    // 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
     crate::rt::spawn(async move {
         let mut buf = vec![0u8; CHUNK * 2];
         let mut consumer_gone = false;
@@ -179,7 +181,7 @@ pub struct Running {
     /// The child's pid, which is also its process-group id.
     pub pgid: i32,
     /// Output chunks; closed once both pipes reached EOF.
-    pub output: async_channel::Receiver<Vec<u8>>,
+    pub output: crate::memory::queue::Receiver<Vec<u8>>,
     /// Resolves with the exit code (`None`: killed by a signal) once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
 }
@@ -205,7 +207,8 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
     crate::os::keep_child_off_shards(child.id());
     let pgid = i32::try_from(child.id()).unwrap_or(0);
     let pipes = [child.stdout.take().map(OwnedFd::from), child.stderr.take().map(OwnedFd::from)];
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+    // 64 chunks of both pipes, as the channel it was held, with no lock (goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
     for fd in pipes.into_iter().flatten() {
         if let Err(e) = nonblocking(&fd) {
             tracing::warn!(error = %e, "cannot make a child pipe non-blocking; output dropped");
@@ -304,11 +307,11 @@ pub struct Duplex {
     /// The child's pid, which is also its process-group id.
     pub pid: u32,
     /// Bytes for its stdin; dropping every sender closes stdin.
-    pub stdin: async_channel::Sender<Vec<u8>>,
+    pub stdin: crate::memory::queue::Sender<Vec<u8>>,
     /// Its stdout, chunk by chunk; closed at EOF.
-    pub stdout: async_channel::Receiver<Vec<u8>>,
+    pub stdout: crate::memory::queue::Receiver<Vec<u8>>,
     /// Its stderr, chunk by chunk; closed at EOF.
-    pub stderr: async_channel::Receiver<Vec<u8>>,
+    pub stderr: crate::memory::queue::Receiver<Vec<u8>>,
     /// The exit code once reaped (`None`: killed by a signal).
     pub exit: oneshot::Receiver<Option<i32>>,
     /// The pipes' descriptors (stdin, stdout, stderr), for [`Duplex::detach`].
@@ -318,12 +321,12 @@ pub struct Duplex {
     /// Taken by [`Duplex::detach`], `stopped` set first, to stop the readers: they read nothing
     /// more. Dropped otherwise (the `Duplex` let go of with its stdout taken elsewhere), the
     /// readers read on to the end, as they always did.
-    stop: Option<async_channel::Sender<()>>,
+    stop: Option<crate::memory::queue::Sender<()>>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The writer has written everything sent to it, once stdin's sender closes.
     written: Option<oneshot::Receiver<()>>,
     /// Closed once both readers have ended: everything they read is in `stdout` and `stderr`.
-    read: Option<async_channel::Receiver<()>>,
+    read: Option<crate::memory::queue::Receiver<()>>,
 }
 
 /// A harness process let go of by one image of this process for the next (an in-place upgrade):
@@ -503,18 +506,21 @@ fn started_at(pid: u32) -> Option<u64> {
     sys.process(p).map(sysinfo::Process::start_time)
 }
 
-/// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin.
+/// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin. Each on a
+/// lock-free queue with the bound its channel had (goal 5, plan 01a1a59c2aae, its top goal): an
+/// async-channel's wait took event-listener's `Mutex`, a reader's shard sending each chunk and the
+/// session's taking it on its own.
 fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
     for fd in [&input, &out, &err] {
         nonblocking(fd)?;
     }
     let fds = [input.as_raw_fd(), out.as_raw_fd(), err.as_raw_fd()];
-    let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+    let (stop_tx, stop_rx) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Each reader holds a sender while it runs: the channel closes once both have ended.
-    let (reading_tx, read_rx) = async_channel::bounded::<()>(1);
+    let (reading_tx, read_rx) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
     let reader = |fd: OwnedFd, cap: usize| {
-        let (tx, rx) = async_channel::bounded::<Vec<u8>>(cap);
+        let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, cap);
         let (stop, stopped, reading) = (stop_rx.clone(), std::sync::Arc::clone(&stopped), reading_tx.clone());
         crate::rt::spawn(async move {
             let _reading = reading;
@@ -550,7 +556,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     let stdout = reader(out, 256);
     let stderr = reader(err, 64);
     drop(reading_tx);
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     let (written_tx, written_rx) = oneshot::channel();
     crate::rt::spawn(async move {
         while let Ok(data) = in_rx.recv().await {
@@ -567,6 +573,42 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a harness's pipes are lock-free queues
+    /// with the bounds their channels had. Its stdout, not taken while it writes far more than 256 chunks,
+    /// holds 256 and no more (its reader waits for room, and the process for its pipe); then taken, every
+    /// byte comes once, in order; its stderr after it; and each ends once the process has.
+    #[test]
+    fn g5_a_harness_pipes_hold_their_bound_keep_their_order_and_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            // Past 256 of the reader's largest chunks (`CHUNK` * 2) and the pipe's own buffer.
+            let lines = 3_000_000u32;
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", &format!("seq 1 {lines}; echo done >&2")]);
+            let p = spawn_duplex(cmd)?;
+            let full = crate::rt::timeout(Duration::from_secs(30), async {
+                while p.stdout.len() < 256 {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(full.is_ok(), "its stdout never filled: {} chunks", p.stdout.len());
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            anyhow::ensure!(p.stdout.len() == 256, "{} chunks held, past the 256 it holds", p.stdout.len());
+            let mut out = Vec::new();
+            while let Ok(c) = crate::rt::timeout(Duration::from_secs(30), p.stdout.recv()).await.map_err(|_| anyhow::anyhow!("its stdout never ended"))? {
+                out.extend(c);
+            }
+            let want: String = (1..=lines).map(|n| format!("{n}\n")).collect();
+            anyhow::ensure!(out == want.as_bytes(), "{} bytes of {}, in order: {}", out.len(), want.len(), out.starts_with(want.as_bytes()));
+            let mut err = Vec::new();
+            while let Ok(c) = crate::rt::timeout(Duration::from_secs(10), p.stderr.recv()).await.map_err(|_| anyhow::anyhow!("its stderr never ended"))? {
+                err.extend(c);
+            }
+            anyhow::ensure!(err == b"done\n", "{:?}", String::from_utf8_lossy(&err));
+            Ok(())
+        })
+    }
 
     #[test]
     fn let_go_of_with_its_stdout_taken_a_process_is_read_to_the_end() -> anyhow::Result<()> {

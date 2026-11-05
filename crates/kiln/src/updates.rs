@@ -2722,7 +2722,7 @@ mod tests {
     /// next one can start.
     #[test]
     fn an_upgrade_neither_waits_on_a_full_uplink_nor_outlives_itself() -> anyhow::Result<()> {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
         let up = crate::exec::Uplink(tx);
         let line = |l: &str| AgentMsg::UpgradeLog { job: "j".into(), line: l.into() };
         up.say(line("downloading"));

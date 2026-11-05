@@ -241,4 +241,34 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the scheduler walks a queue of jobs no runner can take one pick at a time, its turn
+    /// taken before each (`rt::Turns`), where it walked them all in one poll every second; a thousand walked so are all
+    /// still queued, as before. (Its store calls give the shard up before the walk, so another task's running while it
+    /// works can't tell the turns apart: the lab's held polls do, by its site.)
+    #[test]
+    fn g9_s3_the_schedulers_queue_is_walked_in_turns() -> anyhow::Result<()> {
+        use crate::store::{Repo, Run, Status};
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let repo = hub
+                .store
+                .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let mut yaml = String::from("name: ci\njobs:\n");
+            for n in 0..1000 {
+                yaml.push_str(&format!("  j{n}: {{steps: [{{run: x}}]}}\n"));
+            }
+            let planned = crate::pipeline::plan(&crate::pipeline::parse(&yaml)?, &crate::pipeline::Context::default())?;
+            let run = Run { id: "run1".into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
+            hub.store.create_run(run, planned).await?;
+            anyhow::ensure!(hub.store.queued_jobs(2000).await?.len() == 1000, "a thousand queued");
+            hub.schedule_once().await?;
+            anyhow::ensure!(hub.store.queued_jobs(2000).await?.len() == 1000, "no runner: every one still queued");
+            let code: String = include_str!("../hub.rs").split("\n#[cfg(test)]\npub(crate) mod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            let walk = code.split("async fn schedule_once(&self)").nth(1).and_then(|rest| rest.split("for job in queued {").nth(1)).unwrap_or_default();
+            anyhow::ensure!(walk.trim_start().starts_with("turns.after().await;"), "each job's pick in a turn: {}", walk.get(..200).unwrap_or(walk));
+            Ok(())
+        })
+    }
 }

@@ -442,7 +442,8 @@ async fn hand_out(hub: &Hub) {
     if running.is_empty() {
         return;
     }
-    let all = hub.harness.list();
+    // Copied off the shard (`super::listed`; goal 9, plan 01a1a87b2cec step 3).
+    let all = super::listed(hub).await;
     let now = super::now_ms(hub);
     for agent in running {
         let Some(info) = all.iter().find(|i| i.id == agent) else { continue };
