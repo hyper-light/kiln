@@ -19,6 +19,7 @@
 
 mod cells;
 pub mod link;
+mod pcap;
 mod plan;
 mod probe;
 mod report;
@@ -102,6 +103,13 @@ pub enum Cmd {
     },
     /// Rounds of the given targets over the given conditions (the pilot, the A/A, the matrix).
     Run(Box<RunArgs>),
+    /// Step 4's checks of a run: the calibration's residuals, the counters against a capture, the
+    /// probe's sizes against the real UI's (`--catalogue`), a stall's requests, the CPU's noise.
+    CheckProbe {
+        run: PathBuf,
+        #[arg(long)]
+        catalogue: PathBuf,
+    },
     /// Whether docs/browser-lab.md's tables are a run's, line by line.
     DocCheck { doc: PathBuf, run: PathBuf },
     /// A run's tables, in Markdown.
@@ -158,7 +166,13 @@ pub struct RunArgs {
         web: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
-    }
+        /// A packet capture on each client link during each job, with the browser's TLS keys.
+        #[arg(long)]
+        capture: bool,
+        /// Stop the server for 2 s this many seconds into each request job.
+        #[arg(long)]
+        stall: Option<u64>,
+}
 
 /// The web driver's folder: `--web`, `KILN_LAB_WEB`, else the one beside this crate's source.
 fn web(given: Option<PathBuf>) -> PathBuf {
@@ -236,6 +250,14 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Record { kiln, out, seconds, seed, web: w } => record_cmd(&kiln, &web(w), &out, seconds, seed),
+        Cmd::CheckProbe { run, catalogue } => {
+            let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
+            let c: serde_json::Value = serde_json::from_slice(&std::fs::read(&catalogue)?)?;
+            let (text, pass) = report::check_probe(&r, &c);
+            print!("{text}");
+            anyhow::ensure!(pass, "not every probe check passed");
+            Ok(())
+        }
         Cmd::DocCheck { doc, run } => {
             let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
             let d = report::doc_differs(&std::fs::read_to_string(&doc)?, &r);
@@ -247,7 +269,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Run(args) => {
-            let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out } = *args;
+            let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall } = *args;
             let settings = report_run::Settings {
                 targets: target_list(&t)?,
                 profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
@@ -265,6 +287,8 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
                 caddy: caddy.map(std::path::absolute).transpose()?,
                 payloads: payloads.map(std::path::absolute).transpose()?,
                 web: web(w),
+                capture,
+                stall_s: stall,
             };
             run_cmd(&settings, &out)
         }

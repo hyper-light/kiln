@@ -152,7 +152,57 @@ in. Each job's record says which protocol each path came over (`nextHopProtocol`
 
 ## The baselines
 
-(The reference servers and their tuning: step 5.)
+Two reference servers, each a lab program pinned by version and digest and never a kiln dependency
+(f40): their fetch and build are `crates/kiln-lab/web/servers/fetch-caddy.sh` and `build-h2o.sh`,
+their configs are written by `crates/kiln-lab/src/browser/servers.rs` (`h2o_conf`, `caddy_conf`)
+into each round's folder.
+
+| server | version | digest (sha256 of the binary) | HTTP/3 |
+| --- | --- | --- | --- |
+| h2o | 2.3.0-DEV at commit `1b5ef77eb` (built against the machine's OpenSSL 3.5, zlib, brotli 1.2.1) | `8b2d8a231345a9d3ad19fb0bd0321acf0c204dffeab454cdcd7983484b775ad8` | quicly, in the same server (f32) |
+| Caddy | 2.10.2 (release tarball, its published SHA-512 checked) | `4ef1f68c70219536b2711fd16547a79841a2dec2d6b4e56b1e3e5e9da76028e6` | quic-go (f33) |
+
+Each serves the catalogue's operations with kiln's own bodies:
+
+- **requests** as static files from the catalogue's docroot (`payloads/docroot`, each read's body as
+  the lab kiln answered it), the server's own best path, compressed as each does best (h2o: brotli,
+  then gzip; Caddy: zstd, then gzip), `cache-control: no-store` as kiln's API answers;
+- **streams and bursts** as Server-Sent Events, or as a streaming fetch (one frame a line), from the
+  lab's origin (`crates/kiln-lab/web/origin.mjs`) over a Unix socket: it replays the frames kiln
+  sent in step 3's recording, in order, each stamped as it goes out (the stamp keeps its length, so
+  every frame is the size kiln's was), on the schedule kiln's stand-ins keep; the stream is
+  compressed by the server as its static files are. The origin runs in a scope of its own: its CPU
+  counts with the server's and is shown apart;
+- **the write** (a message to an agent) passed to the origin, which answers what kiln answered.
+
+The tuning, and why:
+
+- TLS 1.3 only, with the lab kiln's chain (one ECDSA P-256 leaf under a lab CA), so the handshake's
+  certificate bytes are the same for every target.
+- TCP's congestion control is CUBIC for every target, kiln today's included: BBR needs root on the
+  lab host to load `tcp_bbr` (f21), which is Ada's to allow; the default qdisc on the server's veth
+  is the kernel's own for every target.
+- QUIC's congestion control: h2o's `cc` set to Cubic (h2o defaults to Reno; its choices are Reno,
+  Cubic and Pico: f32); Caddy's is quic-go's Cubic (quic-go has no BBR: f33). The pilot (step 7)
+  measures h2o's Reno against Cubic at 50 kbit/s with 1% loss and keeps the lower p99.
+- Flow-control windows: each server's own defaults, unchanged (h2o's HTTP/2 and quicly's, Go's
+  net/http2 and quic-go's): the lab's operations are small and its rates at most half a link, so no
+  window is what holds a stream back.
+- One thread for h2o (`num-threads: 1`) and Caddy's default `GOMAXPROCS` (the machine's CPUs): each
+  server's CPU is its cgroup's whatever its threads.
+- h2o runs in a user namespace of its own nested in the lab's, as uid 1000: started as root it would
+  try to become `nobody`, which the lab's namespace doesn't map.
+- No WebSocket over HTTP/2 (RFC 8441): neither h2o nor Caddy's file and proxy paths here serve it to
+  every browser (f34), so the baselines' streams are what every HTTP/2 and HTTP/3 server serves in
+  every browser.
+- HTTP/3 rows run in Chromium only: WebKit on Linux has no HTTP/3 (f30). Chromium reaches them with
+  `--origin-to-force-quic-on=10.77.0.1:<port>` and the leaf's key hash in
+  `--ignore-certificate-errors-spki-list`, since it takes no locally added root for QUIC (f31); the
+  HTTP/2 rows run with `--disable-quic`, so no Alt-Svc moves them. Each job's record says which
+  protocol every path came over (`nextHopProtocol`).
+- kiln today is measured on its own TLS listener (`server.https`, ALPN h2 and http/1.1, the same
+  chain), without the front door (f7): its requests ride HTTP/2, and each of its sockets is an
+  HTTP/1.1 connection of its own (kiln has no extended CONNECT).
 
 ## The statistics, the run plan and the decision rule
 

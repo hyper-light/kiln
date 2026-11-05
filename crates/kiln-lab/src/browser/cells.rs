@@ -131,6 +131,17 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
         }
         ops_all += op_times.len();
         all_op_times.extend(op_times);
+        // Each operation's own count and size above the transport (step 4's check against the
+        // real UI's).
+        for s in samples.iter().filter(|s| s.at_us > from_us) {
+            *n.entry(format!("op/{}/app_bytes", s.op)).or_insert(0.0) += s.app_bytes as f64;
+            if s.is_op() {
+                *n.entry(format!("op/{}/n", s.op)).or_insert(0.0) += 1.0;
+            }
+            if s.frame {
+                *n.entry(format!("op/{}/frames", s.op)).or_insert(0.0) += 1.0;
+            }
+        }
     }
     put_quantiles(&mut n, "time", times.clone());
     let mut sorted = times.clone();

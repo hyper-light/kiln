@@ -8,6 +8,7 @@
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { get as httpsGet } from "node:https";
 import { chromium, firefox, webkit } from "playwright";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -34,7 +35,9 @@ export async function runJob(path) {
   const result = { job: job.name, browser: job.browser, started_us: nowUs(), errors: [], protocols: {} };
   const type = BROWSERS[job.browser];
   if (!type) throw new Error(`no browser ${job.browser}`);
-  const browser = await type.launch({ args: job.browser === "chromium" ? job.chromium_args || [] : [] });
+  // With a capture, the browser's TLS keys beside it (goal 7 reads the handshakes).
+  const env = job.keylog ? { ...process.env, SSLKEYLOGFILE: job.keylog } : undefined;
+  const browser = await type.launch({ args: job.browser === "chromium" ? job.chromium_args || [] : [], env });
   result.version = browser.version();
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   try {
@@ -44,6 +47,9 @@ export async function runJob(path) {
     }
     const page = await context.newPage();
     page.on("pageerror", (e) => result.errors.push({ where: "page", error: String(e) }));
+    // A stream the page closes at the end is aborted, which is no failure.
+    page.on("requestfailed", (r) => r.failure()?.errorText !== "net::ERR_ABORTED" && result.errors.push({ where: "request", error: `${r.url()}: ${r.failure()?.errorText}` }));
+    page.on("console", (m) => m.type() === "error" && result.errors.push({ where: "console", error: m.text() }));
     // The probe page, on the target's own origin; then no more routing, so nothing the page asks
     // for after it passes through Playwright.
     await page.route(`${job.origin}/__lab/**`, (route) => {
@@ -59,6 +65,19 @@ export async function runJob(path) {
     // One request to the origin, so the page says which protocol its operations came over (a
     // socket has no timing entry of its own).
     if (job.protocol_path) await page.evaluate((p) => fetch(p, { cache: "no-store" }).then((r) => r.arrayBuffer()), job.protocol_path).catch((e) => result.errors.push({ where: "protocol", error: String(e) }));
+    // The control path checked from the driver itself first, so a failed calibration says why.
+    if (job.control) {
+      const u = new URL(job.control.replace(/^wss:/, "https:"));
+      result.control_check = await new Promise((ok) => {
+        const req = httpsGet({ host: u.hostname, port: u.port, path: "/", rejectUnauthorized: false, timeout: 5000 }, (res) => {
+          res.resume();
+          ok(`driver: ${res.statusCode}`);
+        });
+        req.on("error", (e) => ok(`driver: ${e.message}`));
+        req.on("timeout", () => req.destroy(new Error("timed out")));
+      });
+      result.control_page = await page.evaluate((u) => fetch(u, { mode: "cors" }).then((r) => `page fetch: ${r.status}`, (e) => `page fetch: ${e.message}`), u.href);
+    }
     if (job.control) result.calibration = await page.evaluate(([u, n]) => window.__lab.calibrate(u, n, n), [job.control, job.calibrate_n || 200]);
     // The link quiet before the job starts.
     await sleep(job.settle_ms ?? 1000);

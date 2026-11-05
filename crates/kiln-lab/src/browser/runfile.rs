@@ -67,6 +67,14 @@ pub struct Settings {
     pub caddy: Option<PathBuf>,
     pub payloads: Option<PathBuf>,
     pub web: PathBuf,
+    /// A packet capture on each client link during each job (`tcpdump`, headers only), with the
+    /// browser's TLS keys (`SSLKEYLOGFILE`) beside it: step 4's check of the counters, and goal 7's.
+    #[serde(default)]
+    pub capture: bool,
+    /// The server stopped (SIGSTOP) for 2 s this many seconds into each request job: step 4's
+    /// check that requests behind a stall count their whole wait.
+    #[serde(default)]
+    pub stall_s: Option<u64>,
 }
 
 /// One job's record: a cell's draw for one round.
@@ -90,6 +98,9 @@ pub struct JobRecord {
     pub background_us_per_s: f64,
     pub noise_us_per_s: f64,
     pub errors: Vec<String>,
+    /// With a capture: the bytes it saw over the job's window, and the counters' over the same.
+    #[serde(default)]
+    pub capture: Option<(u64, u64)>,
     pub machine: Value,
     pub started_us: u64,
 }

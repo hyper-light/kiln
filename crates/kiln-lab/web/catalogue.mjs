@@ -4,12 +4,12 @@
 // 01a1a832e9cc step 3.
 //   node catalogue.mjs build RECORDINGS_DIR CATALOGUE.json PAYLOADS_DIR
 //   node catalogue.mjs compare RECORDINGS_A RECORDINGS_B   (event bodies, stamps taken out)
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 
-const ID = /\b[0-9a-f]{32}\b/g;
+const ID = /[0-9a-f]{32}/g;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g;
 
 /** A path as an operation's name: ids taken out, the query's keys kept. */
@@ -24,6 +24,7 @@ export function pattern(url) {
 export function normal(text) {
   return text
     .replace(/@lab:\d{16}/g, "@lab:")
+    .replace(/(msg|toolu)_[0-9a-f]{12}/g, "$1_S")
     .replace(UUID, "ID")
     .replace(ID, "ID")
     .replace(/\b\d{10,19}\b/g, "N")
@@ -73,6 +74,26 @@ function frameBytes(p) {
   return r.opcode === 1 ? Buffer.byteLength(r.payloadData) : Buffer.from(r.payloadData, "base64").length;
 }
 
+/**
+ * A static body at `f`. A path that is also a folder's (`/api/agents` and `/api/agents/:id`) keeps
+ * its body as the folder's index.json, whichever comes first.
+ */
+function put(f, body) {
+  const parts = f.split("/");
+  for (let i = 2; i < parts.length; i++) {
+    const d = parts.slice(0, i).join("/");
+    if (existsSync(d) && !statSync(d).isDirectory()) {
+      const held = readFileSync(d);
+      unlinkSync(d);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, "index.json"), held);
+    }
+  }
+  mkdirSync(dirname(f), { recursive: true });
+  if (existsSync(f) && statSync(f).isDirectory()) writeFileSync(join(f, "index.json"), body);
+  else writeFileSync(f, body);
+}
+
 function build(recDir, cataloguePath, payloadDir) {
   const journeys = read(recDir);
   const sockets = new Map();
@@ -95,12 +116,15 @@ function build(recDir, cataloguePath, payloadDir) {
         const s = ws.get(e.requestId);
         if (!s) continue;
         const key = s.kind || s.pattern;
-        const entry = sockets.get(key) || { kind: s.kind, pattern: s.pattern, journeys: new Set(), down: [], up: [], downText: [], secs: 0, stamped: 0, packed: 0 };
+        const entry = sockets.get(key) || { kind: s.kind, pattern: s.pattern, journeys: new Set(), down: [], up: [], downText: [], secs: 0, stamped: 0, binary: 0 };
         entry.journeys.add(j.name);
         if (e.ev === "webSocketFrameReceived") {
           const text = frameText(e);
           entry.down.push(frameBytes(e));
-          if (e.response.opcode !== 1) entry.packed += 1;
+          if (e.response.opcode !== 1) entry.binary += 1;
+          // The packed snapshot a session socket opens with: the reference servers serve it as a read.
+          // (the `snapshot` journey's, a session no turn reached, as a run's reads open one).
+          if (e.response.opcode !== 1 && s.kind === "session" && (j.name === "snapshot" || replay.snapshot === undefined)) replay.snapshot = text;
           if (/@lab:\d{16}/.test(text)) entry.stamped += 1;
           // The replay: live frames as the UI got them (a packed snapshot is a read, not a frame).
           if (e.response.opcode === 1 || s.kind === "log" || s.kind === "terminal") entry.downText.push(text);
@@ -145,16 +169,11 @@ function build(recDir, cataloguePath, payloadDir) {
     const frames = s.downText;
     replay.streams[s.kind] = frames;
     const digest = createHash("sha256").update(frames.map(normal).join("\n")).digest("hex");
-    operations.push({ case: "stream", op: s.kind, socket: s.pattern, journeys: [...s.journeys], frames_down: sizes(s.down), frames_up: sizes(s.up), stamped_frames: s.stamped, packed_frames: s.packed, rate_per_s: +(s.down.length / Math.max(1, s.secs)).toFixed(3), recorded_s: Math.round(s.secs), digest });
+    operations.push({ case: "stream", op: s.kind, socket: s.pattern, journeys: [...s.journeys], frames_down: sizes(s.down), frames_up: sizes(s.up), stamped_frames: s.stamped, binary_frames: s.binary, rate_per_s: +(s.down.length / Math.max(1, s.secs)).toFixed(3), recorded_s: Math.round(s.secs), digest });
   }
   for (const r of requests.values()) {
     const read = r.method === "GET";
-    if (read && r.last) {
-      const f = join(payloadDir, "docroot", r.pattern.split("?")[0].replace(/:id/g, "lab").replace(/:n/g, "1"));
-      mkdirSync(dirname(f), { recursive: true });
-      // A path that is also a folder's (`/api/agents` and `/api/agents/:id`) keeps its body as index.json.
-      writeFileSync(existsSync(f) ? join(f, "index.json") : f, r.last);
-    }
+    if (read && r.last) put(join(payloadDir, "docroot", r.pattern.split("?")[0].replace(/:id/g, "lab").replace(/:n/g, "1")), r.last);
     if (!read) replay.writes[`${r.method} ${r.pattern.split("?")[0].replace(/:id/g, "lab").replace(/:n/g, "1")}`] = { status: 200, body: r.last ? r.last.toString("utf8") : "" };
     operations.push({
       case: "request",
@@ -169,6 +188,7 @@ function build(recDir, cataloguePath, payloadDir) {
       digest: r.last ? createHash("sha256").update(normal(r.last.toString("utf8"))).digest("hex") : null,
     });
   }
+  if (replay.snapshot !== undefined) put(join(payloadDir, "docroot/api/harness/sessions/lab/snapshot"), replay.snapshot);
   operations.sort((a, b) => (a.case + a.op).localeCompare(b.case + b.op));
   const catalogue = { built_from: recDir, journeys: journeys.map((j) => j.name), operations, left_out: [...leftOut.values()].sort((a, b) => a.what.localeCompare(b.what)) };
   writeFileSync(cataloguePath, JSON.stringify(catalogue, null, 1) + "\n");
@@ -183,26 +203,23 @@ function compare(a, b) {
       for (const e of j.events)
         if (e.ev === "webSocketFrameReceived" && e.response.opcode === 1 && /@lab:\d{16}/.test(e.response.payloadData)) {
           const t = JSON.parse(e.response.payloadData);
-          // An event's body: what the stand-in wrote, as the server sent it on.
+          // An event's body: what the stand-in wrote, as the server sent it on, keyed by the turn
+          // and place in it its ids carry (`msg_<session's first 12>_<turn>_<n>`).
           for (const ev of t.events || (t.event ? [t.event] : [])) {
-            const k = j.name;
-            (out[k] ||= []).push(createHash("sha256").update(normal(JSON.stringify(ev.body ?? ev.data ?? ev))).digest("hex"));
+            const text = JSON.stringify(ev);
+            const m = text.match(/(?:msg|toolu)_[0-9a-f]{12}_(\d+)_(\d+)/);
+            if (!m) continue;
+            const k = `${j.name} ${ev.kind || ""} ${ev.status || ""} ${m[1]}_${m[2]}`;
+            out[k] = createHash("sha256").update(normal(text)).digest("hex");
           }
         }
     return out;
   };
   const da = digests(a);
   const db = digests(b);
-  const report = {};
-  for (const k of new Set([...Object.keys(da), ...Object.keys(db)])) {
-    const x = da[k] || [];
-    const y = db[k] || [];
-    const n = Math.min(x.length, y.length);
-    let same = 0;
-    for (let i = 0; i < n; i++) if (x[i] === y[i]) same += 1;
-    report[k] = { a: x.length, b: y.length, compared: n, equal: same };
-  }
-  return report;
+  const both = Object.keys(da).filter((k) => k in db);
+  const differ = both.filter((k) => da[k] !== db[k]);
+  return { a: Object.keys(da).length, b: Object.keys(db).length, compared: both.length, equal: both.length - differ.length, differ: differ.slice(0, 20) };
 }
 
 const [mode, ...args] = process.argv.slice(2);

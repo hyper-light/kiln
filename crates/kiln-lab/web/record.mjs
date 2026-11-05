@@ -47,11 +47,30 @@ for (const j of spec.journeys) {
   const started = Date.now();
   put({ ev: "journey", name: j.name, path: j.path, wall_us: started * 1000 });
   await page.goto(`${spec.origin}${j.path}`, { waitUntil: "domcontentloaded" });
-  if (j.type) {
-    await page.waitForTimeout(3000);
-    await page.keyboard.type(j.type);
+  // What the page does as the UI would: open a socket as its terminal view opens one, or send a
+  // message to an agent as its composer does (the same fetch the UI's `call` makes), every
+  // `every_s`.
+  await page.waitForTimeout(3000);
+  for (const a of j.actions || []) {
+    if (a.ws) await page.evaluate((p) => {
+      const u = new URL(p, location.href);
+      u.protocol = "wss:";
+      const ws = new WebSocket(u);
+      ws.binaryType = "arraybuffer";
+      window.__labSockets = [...(window.__labSockets || []), ws];
+    }, a.ws);
   }
-  await page.waitForTimeout(j.seconds * 1000);
+  const posts = (j.actions || []).filter((a) => a.post);
+  const end = Date.now() + j.seconds * 1000;
+  let n = 0;
+  while (Date.now() < end) {
+    for (const a of posts) {
+      n += 1;
+      const body = JSON.stringify({ ...a.body, id: `lab-rec-${n}` });
+      await page.evaluate(([p, b]) => fetch(p, { method: "POST", headers: { "content-type": "application/json" }, body: b }).then((r) => r.text()), [a.post, body]);
+    }
+    await page.waitForTimeout(posts.length ? (posts[0].every_s || 10) * 1000 : Math.max(0, end - Date.now()));
+  }
   await Promise.all(pending);
   put({ ev: "end", wall_us: Date.now() * 1000 });
   await page.close();

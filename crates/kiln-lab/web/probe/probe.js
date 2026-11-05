@@ -135,7 +135,7 @@ lab.stream = function stream(op) {
   } else if (op.carrier === "sse") {
     const es = new EventSource(url);
     es.onmessage = (ev) => {
-      JSON.parse(ev.data);
+      if (op.json !== false) JSON.parse(ev.data);
       take(ev.data, ev.data.length);
     };
     es.onerror = () => {
@@ -158,7 +158,7 @@ lab.stream = function stream(op) {
           const line = rest.slice(0, nl);
           rest = rest.slice(nl + 1);
           if (!line) continue;
-          JSON.parse(line);
+          if (op.json !== false) JSON.parse(line);
           take(line, line.length + 1);
         }
       }
@@ -184,10 +184,28 @@ lab.requests = function requests(op) {
         const sched = (performance.timeOrigin + due) * 1000 + lab.offsetUs;
         const req = op.requests[i % op.requests.length];
         try {
+          if (req.ws_snapshot) {
+            // A session socket opened for its packed snapshot, then closed: the UI's read of a session.
+            const u = new URL(req.path, location.href);
+            u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+            const ws = new WebSocket(u);
+            ws.binaryType = "arraybuffer";
+            const data = await new Promise((ok, bad) => {
+              ws.onmessage = (ev) => typeof ev.data !== "string" && ok(ev.data);
+              ws.onerror = () => bad(new Error("snapshot socket error"));
+            });
+            const text = await gunzip(data);
+            for (const line of text.split("\n")) if (line) JSON.parse(line);
+            ws.close();
+            const at = nowUs();
+            note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: data.byteLength, ok: true });
+            return;
+          }
           const r = await fetch(req.path, { method: req.method || "GET", body: req.body, headers: req.body ? { "content-type": "application/json" } : undefined, cache: "no-store" });
           const buf = await r.arrayBuffer();
           const text = utf8.decode(buf);
-          if (text) JSON.parse(text);
+          if (req.ndjson) for (const line of text.split("\n")) line && JSON.parse(line);
+          else if (text) JSON.parse(text);
           const at = nowUs();
           note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: buf.byteLength, status: r.status, ok: r.ok });
         } catch (e) {

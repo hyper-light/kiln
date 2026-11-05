@@ -170,3 +170,64 @@ pub fn doc_differs(doc: &str, run: &BrowserRun) -> Vec<(String, String)> {
     }
     out
 }
+
+/// Step 4's checks of a run (plan 01a1a832e9cc): the calibration's residuals on the good link (p99
+/// at most 0.2 ms), the counters against a capture (within 1%), the probe's sizes above the
+/// transport against the real UI's in the catalogue (within 2%), the requests behind a stall (their
+/// whole wait counted), and each target's CPU noise floor. The text, and whether every check passed.
+pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, bool) {
+    let mut o = String::new();
+    let mut pass = true;
+    let good: Vec<&JobRecord> = run.jobs.iter().filter(|j| j.profile == "good").collect();
+    let mut cal: Vec<f64> = good.iter().filter_map(|j| j.calibration_p99_us).collect();
+    cal.sort_by(f64::total_cmp);
+    let worst = cal.last().copied();
+    let ok = worst.is_some_and(|w| w <= 200.0);
+    pass &= ok;
+    let _ = writeln!(o, "- calibration: p99 of the residuals on the good link, worst job {} µs, median job {} µs, over {} jobs: {}", worst.map_or_else(|| "-".to_owned(), fmt), super::cells::quantile(&cal, 0.5).map_or_else(|| "-".to_owned(), fmt), cal.len(), if ok { "within 200 µs" } else { "**not within 200 µs**" });
+    let caps: Vec<(&JobRecord, u64, u64)> = run.jobs.iter().filter_map(|j| j.capture.map(|(a, b)| (j, a, b))).collect();
+    if caps.is_empty() {
+        let _ = writeln!(o, "- capture: none in this run");
+    }
+    for (j, seen, counted) in &caps {
+        #[allow(clippy::cast_precision_loss)]
+        let off = (*seen as f64 - *counted as f64).abs() / (*counted).max(1) as f64 * 100.0;
+        pass &= off <= 1.0;
+        let _ = writeln!(o, "- capture: {} {} {} {}: {seen} bytes captured, {counted} counted, {off:.2}% apart{}", j.condition, j.target, j.browser, j.case, if off <= 1.0 { "" } else { " (**over 1%**)" });
+    }
+    // The probe's bytes above the transport for each operation against the UI's own.
+    let ops = catalogue.get("operations").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    for op in &ops {
+        let name = op.get("op").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let ui = op.pointer("/bodies/mean").or_else(|| op.pointer("/frames_down/p50")).and_then(serde_json::Value::as_f64);
+        let probe_name = if op.get("case").and_then(serde_json::Value::as_str) == Some("stream") { name.to_owned() } else { name.split('?').next().unwrap_or(name).to_owned() };
+        let jobs: Vec<&&JobRecord> = good.iter().filter(|j| j.target.starts_with("kiln-today") && j.numbers.contains_key(&format!("op/{probe_name}/app_bytes"))).collect();
+        let (Some(ui), false) = (ui, jobs.is_empty()) else { continue };
+        let app: f64 = jobs.iter().filter_map(|j| j.numbers.get(&format!("op/{probe_name}/app_bytes"))).sum();
+        let n: f64 = jobs.iter().map(|j| j.numbers.get(&format!("op/{probe_name}/n")).copied().unwrap_or(0.0) + j.numbers.get(&format!("op/{probe_name}/frames")).copied().unwrap_or(0.0)).sum();
+        if n == 0.0 {
+            continue;
+        }
+        let mine = app / n;
+        let off = (mine - ui).abs() / ui.max(1.0) * 100.0;
+        pass &= off <= 2.0;
+        let _ = writeln!(o, "- sizes: {name}: the probe's {} bytes an operation against the UI's {} ({off:.1}% apart{})", fmt(mine), fmt(ui), if off <= 2.0 { "" } else { ", **over 2%**" });
+    }
+    if let Some(at) = run.settings.stall_s {
+        for j in run.jobs.iter().filter(|j| j.case == "request") {
+            let top = j.numbers.get("time.p99_ms").copied().unwrap_or(0.0);
+            let ok = top >= 2000.0;
+            pass &= ok;
+            let _ = writeln!(o, "- stall at {at} s: {} {} {}: requests' p99 {} ms{}", j.condition, j.target, j.browser, fmt(top), if ok { ", the whole wait counted" } else { " (**the stall's wait is missing**)" });
+        }
+    }
+    let mut floors: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for j in &run.jobs {
+        floors.entry(j.target.clone()).or_default().push(j.noise_us_per_s);
+    }
+    for (t, mut v) in floors {
+        v.sort_by(f64::total_cmp);
+        let _ = writeln!(o, "- CPU noise floor: {t}: two background windows apart by {} µs of CPU a second (median of {} jobs)", super::cells::quantile(&v, 0.5).map_or_else(|| "-".to_owned(), fmt), v.len());
+    }
+    (o, pass)
+}

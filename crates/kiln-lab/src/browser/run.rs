@@ -36,7 +36,8 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Vec<T> {
 fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) -> Vec<Value> {
     let sid = |i: usize| kiln.and_then(|k| k.sessions.get(i).cloned()).unwrap_or_else(|| "lab".to_owned());
     let base = |kind: &str| if t.carrier == "fetch-stream" { format!("/fetch-stream/{kind}") } else { format!("/stream/{kind}") };
-    let stream = |name: &str, path: String, packed: bool| json!({"case": case, "name": name, "carrier": if t.server == Server::Kiln { "ws" } else { t.carrier.as_str() }, "path": path, "packed": packed});
+    // A terminal's and a log's frames are text lines, not JSON, as the UI reads them.
+    let stream = |name: &str, path: String, packed: bool| json!({"case": case, "name": name, "carrier": if t.server == Server::Kiln { "ws" } else { t.carrier.as_str() }, "path": path, "packed": packed, "json": !matches!(name, "terminal" | "log")});
     match (case, t.server) {
         ("stream", Server::Kiln) => {
             let mut v = vec![
@@ -53,9 +54,17 @@ fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) ->
         ("burst", Server::Kiln) => vec![stream("turn", format!("/api/harness/sessions/{}/ws?z=gzip&patch=state&patch=changes", sid(1)), true)],
         ("burst", _) => vec![stream("turn", base("session"), false)],
         _ => {
-            let id = sid(0);
-            let reads = ["/api/agents".to_owned(), "/api/harness/sessions".to_owned(), format!("/api/harness/sessions/{id}"), "/api/plans".to_owned(), "/api/overview".to_owned()];
-            let mut requests: Vec<Value> = reads.iter().map(|p| json!({"name": format!("GET {}", p.replace(&id, ":id")), "path": p})).collect();
+            // Reads go to the third session, which no turn reaches in a run, so its snapshot is
+            // the one step 3 recorded (the same seed and folder say the same things).
+            let id = sid(2);
+            // The reads the UI's pages made in step 3's recording (docs/browser-lab/catalogue.json).
+            let reads = ["/api/agents", "/api/harness/sessions", "/api/overview", "/api/me", "/api/push/notices"];
+            let mut requests: Vec<Value> = reads.iter().map(|p| json!({"name": format!("GET {p}"), "path": p})).collect();
+            requests.push(if t.server == Server::Kiln {
+                json!({"name": "session snapshot", "ws_snapshot": true, "path": format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes")})
+            } else {
+                json!({"name": "session snapshot", "ndjson": true, "path": "/api/harness/sessions/lab/snapshot"})
+            });
             requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{id}/command"), "body": json!({"type": "send", "id": "lab-req", "text": "lab:quiet"}).to_string()}));
             #[allow(clippy::cast_precision_loss)]
             let n = (w.duration_s * 1000 / w.request_ms.max(1)) as usize;
@@ -107,6 +116,16 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     let background = rate(&a, &d);
     let noise = (rate(&a, &b) - rate(&b, &d)).abs();
     let ops = ops(t, case, &w, r.kiln.as_ref());
+    // A capture on each client link, headers only, for as long as the job runs.
+    let mut captures = Vec::new();
+    if c.s.capture {
+        for i in 0..c.s.k {
+            let pcap = dir.join(format!("c{i}.pcap"));
+            let argv = vec!["tcpdump".to_owned(), "-i".to_owned(), "eth0".to_owned(), "-s".to_owned(), "128".to_owned(), "-w".to_owned(), pcap.display().to_string(), "-U".to_owned()];
+            captures.push((i, pcap, c.lab.command(Ns::Client(i), &argv)?.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let mut drivers = Vec::new();
     for i in 0..c.s.k {
         let jd = dir.join(format!("c{i}"));
@@ -124,6 +143,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             "tail_s": w.tail_s,
             "window_ms": c.s.window_ms,
             "settle_ms": 1500,
+            "keylog": c.s.capture.then(|| jd.join("keys.log").display().to_string()),
         });
         let path = jd.join("job.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&job)?)?;
@@ -204,6 +224,16 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
                 std::thread::sleep(Duration::from_secs(w.burst_gap_s));
             }
         }
+        ("request", _, _) => {
+            if let Some(at) = c.s.stall_s {
+                std::thread::sleep(Duration::from_secs(at));
+                // Every process of the server held for 2 s, as a stalled server is.
+                let pids: Vec<String> = r.pids().iter().map(|(_, p)| p.to_string()).collect();
+                let _ = std::process::Command::new("kill").arg("-STOP").args(&pids).status();
+                std::thread::sleep(Duration::from_secs(2));
+                let _ = std::process::Command::new("kill").arg("-CONT").args(&pids).status();
+            }
+        }
         _ => {}
     }
     let end = until + Duration::from_secs(w.tail_s + 120);
@@ -254,6 +284,20 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         }
         clients.push((samples, ticks));
     }
+    // The capture's bytes against the counters', over the window both saw.
+    let mut capture = None;
+    for (i, pcap, mut child) in captures {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let (Ok(bytes), Some((_, ticks))) = (std::fs::read(&pcap), clients.get(i))
+            && let (Some(f), Some(l)) = (ticks.iter().find(|t| t.t_us >= ready_us), ticks.last())
+        {
+            let seen = super::pcap::bytes_between(&bytes, f.t_us, l.t_us);
+            let counted = (l.rx_bytes + l.tx_bytes).saturating_sub(f.rx_bytes + f.tx_bytes);
+            let (a, b) = capture.unwrap_or((0, 0));
+            capture = Some((a + seen, b + counted));
+        }
+    }
     let nums = cells::job_numbers(&clients, &cpu, background, ready_us);
     std::fs::write(dir.join("times_ms.json"), serde_json::to_vec(&nums.times_ms)?)?;
     Ok(JobRecord {
@@ -272,6 +316,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         background_us_per_s: background,
         noise_us_per_s: noise,
         errors,
+        capture,
         machine: machine(),
         started_us: now_us(),
     })
@@ -286,7 +331,7 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
     let bin = super::standins::install(&out.join("bin"))?;
     let mut run = BrowserRun { command: std::env::args().collect::<Vec<_>>().join(" "), started_us: now_us(), settings: s.clone(), certs_spki: certs.spki.clone(), jobs: Vec::new(), failures: Vec::new(), network: lab.log.clone() };
     let control = {
-        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref() };
+        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, seed: s.seed };
         servers::start_control(&env, out)?
     };
     let mut turn_id = 0;
@@ -307,8 +352,8 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
                 for t in order {
                     let dir = out.join("servers").join(format!("{}-r{round}-{}", name.replace('/', "-"), t.name));
                     let started = {
-                        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref() };
-                        servers::start(&env, t, &dir, 2)
+                        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: workload("stream", p).lines_per_s, seed: s.seed };
+                        servers::start(&env, t, &dir, 3)
                     };
                     let running = match started {
                         Ok(r) => r,

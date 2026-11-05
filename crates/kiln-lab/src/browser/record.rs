@@ -26,7 +26,7 @@ pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64) -> anyh
     let certs = servers::certs(&out.join("certs"))?;
     let bin = super::standins::install(&out.join("bin"))?;
     let t = targets::named("kiln-today").ok_or_else(|| anyhow::anyhow!("no kiln-today target"))?;
-    let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web, bin: &bin, kiln: Some(kiln), h2o: None, caddy: None, payloads: None };
+    let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web, bin: &bin, kiln: Some(kiln), h2o: None, caddy: None, payloads: None, term_per_s: 10.0, seed };
     let running = servers::start(&env, &t, &out.join("kiln"), 3)?;
     let k = running.kiln.clone().ok_or_else(|| anyhow::anyhow!("no lab kiln"))?;
     eprintln!("kiln-lab: the lab kiln is up: sessions {:?}, log job {:?}", k.sessions, k.job);
@@ -37,7 +37,8 @@ pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64) -> anyh
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                for s in &k.sessions {
+                // The third session takes no turns: its snapshot is the one a run's reads take.
+                for s in k.sessions.iter().take(2) {
                     n += 1;
                     let _ = servers::turn(&k, s, 40, 25, 10_000 + n);
                 }
@@ -48,8 +49,10 @@ pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64) -> anyh
     let first = k.sessions.first().cloned().unwrap_or_default();
     let mut journeys = vec![
         json!({"name": "mission-control", "path": "/", "seconds": seconds}),
-        json!({"name": "agent", "path": format!("/agents/{first}"), "seconds": seconds}),
-        json!({"name": "terminal", "path": "/terminal", "seconds": seconds}),
+        json!({"name": "agent", "path": format!("/agents/{first}"), "seconds": seconds, "actions": [{"post": format!("/api/harness/sessions/{first}/command"), "body": {"type": "send", "text": "lab:turn:40:25"}, "every_s": 10}]}),
+        json!({"name": "terminal", "path": "/", "seconds": seconds, "actions": [{"ws": "/api/terminal/ws?target=local&cols=120&rows=40"}]}),
+        // A session's snapshot, as a run's reads take it (the third session, which no turn reached).
+        json!({"name": "snapshot", "path": "/", "seconds": 10, "actions": [{"ws": format!("/api/harness/sessions/{}/ws?z=gzip&patch=state&patch=changes", k.sessions.get(2).cloned().unwrap_or_default())}]}),
     ];
     if let (Some(run), Some(job)) = (&k.run, &k.job) {
         journeys.push(json!({"name": "job-log", "path": format!("/runs/{run}/jobs/{job}"), "seconds": seconds}));

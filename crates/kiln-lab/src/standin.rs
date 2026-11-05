@@ -201,7 +201,13 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
         .and_then(|w| w.get(1).cloned())
         .unwrap_or_else(|| format!("lab-{}", now_us()));
     let short: String = session.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
-    let seed = session.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    // `KILN_LAB_SEED` (the browser lab's): the same seed and folder say the same things in any
+    // run, whatever the session's id (goal 1 of the browser protocol program, step 3).
+    let key = match std::env::var("KILN_LAB_SEED") {
+        Ok(s) => format!("{s}/{}", std::env::current_dir().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()),
+        Err(_) => session.clone(),
+    };
+    let seed = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     let mut r = Lcg(seed);
     let (tx, rx) = mpsc::channel::<Value>();
     let stdout = std::io::stdout();

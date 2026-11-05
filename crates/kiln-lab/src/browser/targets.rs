@@ -69,7 +69,10 @@ pub fn named(name: &str) -> Option<Target> {
 impl Target {
     /// Chromium's flags for this target: QUIC forced for its origin, the lab leaf's key taken.
     pub fn chromium_args(&self, spki: &str) -> Vec<String> {
-        let mut a = vec![format!("--ignore-certificate-errors-spki-list={spki}")];
+        // Local Network Access off: the probe page reaches the lab's control echo on another
+        // private address than its own origin's (the calibration's unshaped path), which Chromium
+        // otherwise holds for a permission prompt. The target's own operations are same-origin.
+        let mut a = vec![format!("--ignore-certificate-errors-spki-list={spki}"), "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets".to_owned()];
         if self.http3 {
             a.push("--enable-quic".to_owned());
             a.push(format!("--origin-to-force-quic-on=10.77.0.1:{}", self.port));

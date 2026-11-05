@@ -51,9 +51,11 @@ pub fn certs(dir: &Path) -> anyhow::Result<Certs> {
              openssl ecparam -name prime256v1 -genkey -noout -out leaf.ec; \
              openssl pkcs8 -topk8 -nocrypt -in leaf.ec -out leaf.key; \
              openssl req -new -key leaf.key -subj '/CN=10.77.0.1' -out leaf.csr; \
-             printf 'subjectAltName=IP:10.77.0.1,DNS:lab.kiln\\nbasicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature\\nextendedKeyUsage=serverAuth\\n' > leaf.ext; \
+             printf 'subjectAltName=IP:10.77.0.1,DNS:lab.kiln,{control}\\nbasicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature\\nextendedKeyUsage=serverAuth\\n' > leaf.ext; \
              openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 13 -sha256 -extfile leaf.ext -out leaf.pem; \
-             cat leaf.pem ca.pem > chain.pem"
+             cat leaf.pem ca.pem > chain.pem",
+            // The control pairs' addresses too: the probe page reaches the control echo there.
+            control = (0..64).map(|i| format!("IP:{}", link::control_server_ip(i))).collect::<Vec<_>>().join(","),
         ))?;
     }
     let spki = sh(&format!("openssl x509 -in '{}' -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64", p("leaf.pem").display()))?;
@@ -114,11 +116,12 @@ fn spawn(lab: &Lab, scope: &Path, name: &str, argv: &[String], env: &[(&str, Str
     let wrapped = Scopes::wrap(scope, argv);
     let mut cmd = lab.command(Ns::Server, &wrapped)?;
     let out = std::fs::File::create(log)?;
+    // What points at another kiln (the runner the lab runs under) first, then the server's own.
+    for v in ["KILN_SUPERVISOR", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_SUPERVISE_CHILD", "KILN_TAKE_OVER_FROM", "KILN_UPGRADE_ID", "KILN_REACH_SOCK", "KILN_REACH_FROM", "KILN_HARNESS_SOCK", "KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SERVER", "KILN_JOIN_TOKEN", "KILN_AGENT_NAME", "KILN_STATE_DIR", "KILN_INSTANCE", "KILN_LOG", "KILN_CHAOS", "KILN_MACHINE_ID", "GIT_CONFIG_GLOBAL"] {
+        cmd.env_remove(v);
+    }
     for (k, v) in env {
         cmd.env(k, v);
-    }
-    for v in ["KILN_SUPERVISOR", "KILN_SUPERVISED", "KILN_REACH_SOCK", "KILN_REACH_FROM", "KILN_HARNESS_SOCK", "KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SERVER", "KILN_JOIN_TOKEN", "KILN_AGENT_NAME", "KILN_STATE_DIR", "KILN_INSTANCE", "KILN_MACHINE_ID", "GIT_CONFIG_GLOBAL"] {
-        cmd.env_remove(v);
     }
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let child = cmd.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn()?;
@@ -162,6 +165,10 @@ pub struct Env<'a> {
     pub h2o: Option<&'a Path>,
     pub caddy: Option<&'a Path>,
     pub payloads: Option<&'a Path>,
+    /// The terminal stand-in's pace, lines a second (each 96 bytes).
+    pub term_per_s: f64,
+    /// The stand-in agents' seed: the same seed says the same things in any run.
+    pub seed: u64,
 }
 
 /// Starts `t` fresh under `dir`.
@@ -227,7 +234,7 @@ enabled = false
     );
     std::fs::write(dir.join("kiln.toml"), config)?;
     let mut procs = Vec::new();
-    let env = vec![("HOME", home.display().to_string()), ("KILN_MACHINE_ID", format!("lab server {}", dir.display())), ("KILN_WARM_FLOOR", "0".to_owned()), ("NO_COLOR", "1".to_owned())];
+    let env = vec![("HOME", home.display().to_string()), ("KILN_LAB_TERM", format!("{}:96", e.term_per_s)), ("KILN_MACHINE_ID", format!("lab server {}", dir.display())), ("KILN_WARM_FLOOR", "0".to_owned()), ("NO_COLOR", "1".to_owned())];
     procs.push(spawn(e.lab, &scope, "kiln server", &[kiln.display().to_string(), s("--config"), dir.join("kiln.toml").display().to_string(), s("server")], &env, &dir.join("server.log"))?);
     let mut admin = String::new();
     wait(Duration::from_secs(120), "the lab kiln", || {
@@ -241,7 +248,7 @@ enabled = false
     let rhome = dir.join("runner-home");
     std::fs::create_dir_all(&rhome)?;
     let path = std::env::join_paths(std::iter::once(e.bin.to_path_buf()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())))?;
-    let renv = vec![("HOME", rhome.display().to_string()), ("KILN_MACHINE_ID", "lab-runner-0".to_owned()), ("KILN_WARM_FLOOR", "0".to_owned()), ("NO_COLOR", "1".to_owned()), ("PATH", path.to_string_lossy().into_owned())];
+    let renv = vec![("HOME", rhome.display().to_string()), ("KILN_LAB_SEED", e.seed.to_string()), ("KILN_MACHINE_ID", "lab-runner-0".to_owned()), ("KILN_WARM_FLOOR", "0".to_owned()), ("NO_COLOR", "1".to_owned()), ("PATH", path.to_string_lossy().into_owned())];
     let rscope = e.scopes.scope(&format!("runner-{}", t.name))?;
     procs.push(spawn(
         e.lab,
@@ -296,7 +303,7 @@ enabled = false
         let list = v.as_array().cloned().or_else(|| v.get("sessions").and_then(Value::as_array).cloned()).unwrap_or_default();
         Ok(ids.iter().all(|id| list.iter().any(|s| s.get("id").and_then(Value::as_str) == Some(id) && s.get("status").and_then(Value::as_str).is_some_and(|st| st != "running" && st != "starting"))))
     })?;
-    let (run, job) = match log_job(&mut http, dir, e.bin) {
+    let (run, job) = match log_job(&mut http, dir, e.bin, e.term_per_s) {
         Ok((r, j)) => (Some(r), Some(j)),
         Err(err) => {
             eprintln!("kiln-lab: the lab kiln has no log job: {err:#}");
@@ -308,16 +315,17 @@ enabled = false
 
 /// A lab repository whose one job writes stamped lines for fifteen minutes: its run's and its job's
 /// ids once it runs.
-fn log_job(http: &mut Http, dir: &Path, bin: &Path) -> anyhow::Result<(String, String)> {
+fn log_job(http: &mut Http, dir: &Path, bin: &Path, lines_per_s: f64) -> anyhow::Result<(String, String)> {
     let repo = dir.join("lab-repo");
     let d = repo.display();
     let log = bin.join("kiln-lab-log").display().to_string();
+    let per_s = lines_per_s;
     sh(&format!(
         "set -e; rm -rf '{d}'; mkdir -p '{d}/.kiln'; cd '{d}'; git init -q -b main; \
-         printf 'name: lab\\non:\\n  push: {{ branches: [main] }}\\n  manual: {{}}\\njobs:\\n  log:\\n    steps:\\n      - run: {log} 900 10 96\\n' > .kiln/ci.yaml; \
+         printf 'name: lab\\non:\\n  push: {{ branches: [main] }}\\n  manual: true\\njobs:\\n  log:\\n    runs-on: [baremetal]\\n    steps:\\n      - run: {log} 900 {per_s} 96\\n' > .kiln/ci.yaml; \
          git add -A; git -c user.name=lab -c user.email=lab@localhost commit -qm lab"
     ))?;
-    let a = http.send("POST", "/api/repos", Some(json!({"name": "lab", "clone_url": format!("file://{d}"), "branches": ["main"]}).to_string().as_bytes()))?;
+    let a = http.send("POST", "/api/repos", Some(json!({"name": "lab/lab", "clone_url": format!("file://{d}"), "branches": ["main"]}).to_string().as_bytes()))?;
     anyhow::ensure!(a.status < 300, "the lab repository: {} {}", a.status, String::from_utf8_lossy(&a.body));
     let v: Value = serde_json::from_slice(&a.body)?;
     let id = v.get("id").map(|i| i.as_str().map_or_else(|| i.to_string(), str::to_owned)).ok_or_else(|| anyhow::anyhow!("no repository id"))?;
@@ -326,13 +334,16 @@ fn log_job(http: &mut Http, dir: &Path, bin: &Path) -> anyhow::Result<(String, S
     let v: Value = serde_json::from_slice(&a.body)?;
     let run = v.pointer("/0/id").map(|i| i.as_str().map_or_else(|| i.to_string(), str::to_owned)).ok_or_else(|| anyhow::anyhow!("no run in {v}"))?;
     let mut job = None;
-    wait(Duration::from_secs(120), "the lab job", || {
+    let mut last = Value::Null;
+    let up = wait(Duration::from_secs(120), "the lab job", || {
         let a = http.send("GET", &format!("/api/runs/{run}"), None)?;
         let v: Value = serde_json::from_slice(&a.body)?;
         let j = v.pointer("/jobs/0").cloned().unwrap_or_default();
         job = j.get("id").map(|i| i.as_str().map_or_else(|| i.to_string(), str::to_owned));
+        last = json!({"run": v.pointer("/run/status"), "job": j.get("status"), "said": v.to_string().chars().take(700).collect::<String>()});
         Ok(j.get("status").and_then(Value::as_str) == Some("running"))
-    })?;
+    });
+    up.map_err(|e| anyhow::anyhow!("{e}: last {last}"))?;
     Ok((run, job.ok_or_else(|| anyhow::anyhow!("no job"))?))
 }
 
@@ -350,7 +361,9 @@ fn start_reference(e: &Env<'_>, t: &Target, dir: &Path) -> anyhow::Result<Runnin
             let bin = e.h2o.ok_or_else(|| anyhow::anyhow!("{} needs --h2o", t.name))?;
             let conf = dir.join("h2o.conf");
             std::fs::write(&conf, h2o_conf(t, e.certs, &docroot, &sock, port))?;
-            (bin.to_path_buf(), vec![s("-c"), conf.display().to_string()], conf)
+            // h2o started as root becomes `nobody`, which the lab's namespace doesn't map: in a user
+            // namespace of its own whose only uid is the lab's own, it is no one's root to drop.
+            (PathBuf::from("unshare"), vec![s("--user"), s("--map-user=1000"), s("--map-group=1000"), s("--"), bin.display().to_string(), s("-c"), conf.display().to_string()], conf)
         }
         Server::Caddy => {
             let bin = e.caddy.ok_or_else(|| anyhow::anyhow!("{} needs --caddy", t.name))?;
@@ -396,7 +409,7 @@ pub fn h2o_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16) -
 pub fn caddy_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16) -> String {
     let protocols = if t.http3 { "h1 h2 h3" } else { "h1 h2" };
     format!(
-        "# kiln browser lab: {name} ({about})\n{{\n\tadmin off\n\tauto_https off\n\tservers {{\n\t\tprotocols {protocols}\n\t\tidle_timeout 10m\n\t}}\n}}\n\
+        "# kiln browser lab: {name} ({about})\n{{\n\tadmin off\n\tauto_https off\n\tservers {{\n\t\tprotocols {protocols}\n\t\ttimeouts {{\n\t\t\tidle 10m\n\t\t}}\n\t}}\n}}\n\
          https://10.77.0.1:{port} {{\n\ttls {chain} {key} {{\n\t\tprotocols tls1.3\n\t}}\n\
          \t@origin path /stream/* /fetch-stream/* /__lab/* /api/harness/sessions/lab/command\n\
          \thandle @origin {{\n\t\tencode zstd gzip\n\t\treverse_proxy unix/{sock} {{\n\t\t\tflush_interval -1\n\t\t}}\n\t}}\n\

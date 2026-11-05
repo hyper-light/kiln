@@ -42,8 +42,13 @@ function open(req, res, kind, carrier) {
   req.on("close", () => set.delete(s));
 }
 
+// A terminal's and a log's output is lines of text, not JSON: each goes as one event (or line), its
+// own line end left to the carrier's framing.
+const TEXT = new Set(["terminal", "log"]);
+
 function send(kind, frame) {
-  for (const s of streams.get(kind) || []) s.res.write(s.carrier === "sse" ? `data: ${frame}\n\n` : `${frame}\n`);
+  const f = TEXT.has(kind) ? frame.replace(/\r?\n$/, "") : frame;
+  for (const s of streams.get(kind) || []) s.res.write(s.carrier === "sse" ? `data: ${f}\n\n` : `${f}\n`);
 }
 
 const pub = createServer((req, res) => {
