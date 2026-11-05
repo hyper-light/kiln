@@ -51,6 +51,17 @@ pub struct StepOutcome {
     pub exit: bool,
 }
 
+/// A reading of the driver's clock the loop made, with the counter's ticks beside it where the shard carries its
+/// clock by a counter: what a step that follows at once takes as its own (kiln's goal 9, plan 01a1a87b2cec step 5).
+/// A wait's return was read three times over (the park's length, the driver's retrieval age, the next step's
+/// clock) within a few hundred nanoseconds, and a busy step's last poll end again by the step after it; on x86-64,
+/// where the shard carries no counter, each is a call into the vDSO.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reading {
+    ns: u64,
+    ticks: Option<u64>,
+}
+
 /// Where a step's batch stands between two polls.
 struct BatchMark {
     /// The last poll's end, the next one's start; `None` where the inputs did work since, so the next start
@@ -370,10 +381,6 @@ struct Core {
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
     fixed_quantum_ns: u64,
-    /// The shard thread's run time, read with no call at each poll's start (`crate::task_clock`; kiln's goal 9, plan
-    /// 01a1a87b2cec step 3): a slow poll's time on the CPU beside its hold. None off Linux, in a simulation, and where
-    /// the OS refused the event.
-    task_clock: Option<crate::task_clock::TaskClock>,
     /// Whether the driver's clock is real time (the simulation's is not).
     real_time: bool,
     driver_lost: bool,
@@ -501,7 +508,7 @@ impl Shard {
         registry::bind_cleanup_thread(seed.holder)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
-        let desk = Box::new(ShardContext::new(
+        let mut desk = Box::new(ShardContext::new(
             seed.id,
             &DeskShape {
                 tasks: config.tasks_per_shard,
@@ -514,6 +521,9 @@ impl Shard {
             is_sim,
             driver.clock(),
         ));
+        // Opened on the shard's own thread, which builds it: the clock measures the thread that opens it. On the desk,
+        // so the shard's tasks read it too (`crate::futures::thread_run_ns`).
+        desk.task_clock = if is_sim { None } else { crate::task_clock::TaskClock::open() };
         let times_wakes = config.wake_tracking.is_some() && !is_sim;
         if times_wakes && let Some(entry) = registry::entry(seed.id) {
             entry.parking.time_wakes();
@@ -552,8 +562,6 @@ impl Shard {
             last_driver_ns: now_ns,
             harvest_owed: false,
             real_time: !is_sim,
-            // Opened on the shard's own thread, which builds it: the clock measures the thread that opens it.
-            task_clock: if is_sim { None } else { crate::task_clock::TaskClock::open() },
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
             batch: config.batch.max(1),
@@ -694,16 +702,29 @@ impl Shard {
 
     /// The step's reading of the driver's clock, published, and the counter's ticks beside it, which carry it
     /// forward to the step's later readings (docs/runtime.md §3.9, "a poll's end from the counter"); none
-    /// once the driver is lost, or where the shard reads no counter.
-    fn publish_and_carry_clock(&self) {
-        self.publish_clock();
-        let carried = match (self.core.counter_scale, self.core.driver_lost) {
-            (Some(scale), false) => crate::machine::clock::counter_ticks().map(|ticks| {
-                crate::machine::clock::Carried::new(self.desk.now_ns.get(), ticks, scale)
-            }),
+    /// once the driver is lost, or where the shard reads no counter. `reading`, where the caller's loop has one
+    /// that nothing but the loop's own bookkeeping has followed ([`Shard::step_after`]), is taken as the step's;
+    /// else the clock is read.
+    fn publish_and_carry_clock(&self, reading: Option<Reading>) {
+        let reading = reading.unwrap_or_else(|| self.read_clock());
+        self.desk.now_ns.set(reading.ns);
+        let carried = match (self.core.counter_scale, self.core.driver_lost, reading.ticks) {
+            (Some(scale), false, Some(ticks)) => {
+                Some(crate::machine::clock::Carried::new(reading.ns, ticks, scale))
+            }
             _ => None,
         };
         self.desk.carried.set(carried);
+    }
+
+    /// The driver's clock now, and the counter's ticks beside it where the shard carries its clock by one.
+    fn read_clock(&self) -> Reading {
+        let ns = self.now_ns();
+        let ticks = match (self.core.counter_scale, self.core.driver_lost) {
+            (Some(_), false) => crate::machine::clock::counter_ticks(),
+            _ => None,
+        };
+        Reading { ns, ticks }
     }
 
     /// The driver's clock now within a step: its step's reading carried forward by the counter where the
@@ -843,10 +864,12 @@ impl Shard {
             0
         } else {
             let timer = self.core.timers.next_deadline_ns().unwrap_or(u64::MAX);
+            // The desk's copy of the quantum, on its first line, where the estimate is a cold 128 bytes
+            // (`batch_budget_ns`; kiln's goal 9, plan 01a1a87b2cec step 5: read after every input read).
             let harvest = if self.core.waiting.is_empty() {
                 u64::MAX
             } else {
-                self.core.last_driver_ns.saturating_add(self.quantum_ns())
+                self.core.last_driver_ns.saturating_add(self.desk.quantum_ns.get())
             };
             timer.min(harvest)
         };
@@ -969,14 +992,17 @@ impl Shard {
 
     /// Runs the loop on the calling thread until shutdown completes. When idle within the window a client's
     /// last activity opened, the shard spins out the window checking its inboxes and driver before it parks;
-    /// outside every window it parks at once.
+    /// outside every window it parks at once. A step that follows a park or a busy step at once takes the
+    /// reading that ended it as its clock ([`Shard::step_after`]).
     pub fn run(&mut self) {
+        let mut reading = None;
         loop {
-            let outcome = self.step();
+            let (outcome, last) = self.step_after(reading.take());
             if outcome.exit {
                 break;
             }
             if outcome.did_work {
+                reading = last;
                 continue;
             }
             // Idle: movable tasks waiting in the shared queues or a sibling's take this shard's turn first
@@ -987,7 +1013,7 @@ impl Shard {
             if self.spin_after_activity(outcome.next_deadline_ns) {
                 continue;
             }
-            self.park_owned(outcome.next_deadline_ns);
+            reading = self.park_owned_then(outcome.next_deadline_ns);
         }
     }
 
@@ -1036,7 +1062,7 @@ impl Shard {
         let now = self.desk.now_ns.get();
         if !self.core.real_time
             || pending
-            || now.saturating_sub(self.core.last_driver_ns) >= self.quantum_ns()
+            || now.saturating_sub(self.core.last_driver_ns) >= self.desk.quantum_ns.get()
         {
             return self.harvest_io(now);
         }
@@ -1200,7 +1226,7 @@ impl Shard {
         }
         if found {
             // harvest_io already recorded any retrieval; an inbox hit is not one.
-            self.wait_ended(false);
+            self.wait_ended(false, None);
         }
         found
     }
@@ -1268,16 +1294,31 @@ impl Shard {
 
     /// One loop iteration without blocking.
     pub fn step(&mut self) -> StepOutcome {
+        self.step_after(None).0
+    }
+
+    /// [`Shard::step`] for a loop that takes its turns back to back ([`Shard::run`], `LocalRuntime::block_on`):
+    /// `reading`, the one that ended the loop's last turn where nothing but the loop's own bookkeeping has run
+    /// since (its park's wait returning, [`Shard::park_owned_then`]; its last step's last poll ending), is this
+    /// step's clock, and the step hands back its own last reading for the next where that holds of it (kiln's goal
+    /// 9, plan 01a1a87b2cec step 5: what the loop does per turn that it needn't). A step's last reading is offered
+    /// only where every reading within it is the OS's own (a shard carrying none by a counter: a carried reading
+    /// handed on would carry the next step's too, and the counter's drift from the OS's clock with it), and not
+    /// after a judgment of long polls read the thread's account (a system call) or the shard's exit.
+    pub(crate) fn step_after(&mut self, reading: Option<Reading>) -> (StepOutcome, Option<Reading>) {
         if self.core.exited {
-            return StepOutcome {
-                did_work: false,
-                next_deadline_ns: None,
-                exit: true,
-            };
+            return (
+                StepOutcome {
+                    did_work: false,
+                    next_deadline_ns: None,
+                    exit: true,
+                },
+                None,
+            );
         }
         // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
         // timers and the harvest's quantum all take it, and the counter carries it to the step's polls.
-        self.publish_and_carry_clock();
+        self.publish_and_carry_clock(reading);
         // Only where the step's start opens a window: the account is a system call, and every step paid it
         // before the tracker threw an unarmed read away; judging by step, the last step's reading is open.
         if self.core.real_time && self.core.attribution.reads_at_step_start() {
@@ -1305,13 +1346,14 @@ impl Shard {
         // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
         let mark = (!did_work && self.desk.live.harvests.get() == harvests)
             .then(|| self.desk.now_ns.get());
-        did_work |= self.poll_batch(mark);
-        self.judge_deferred();
+        let (polled, last) = self.poll_batch(mark);
+        did_work |= polled;
+        let judged = self.judge_deferred();
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
         let exit = self.exit_if_drained();
         self.core.attribution.step_ended(did_work);
-        StepOutcome {
+        let outcome = StepOutcome {
             did_work,
             next_deadline_ns: if self.core.driver_lost {
                 None
@@ -1319,7 +1361,12 @@ impl Shard {
                 self.core.timers.next_deadline_ns()
             },
             exit,
-        }
+        };
+        let offered = !judged && !exit && !self.core.driver_lost && self.desk.carried.get().is_none();
+        let last = last
+            .filter(|_| offered)
+            .map(|ns| Reading { ns, ticks: None });
+        (outcome, last)
     }
 
     /// The step's polls, from `mark`, the clock its first poll starts from where the step read nothing
@@ -1332,8 +1379,9 @@ impl Shard {
     /// listed tasks of their own (a wake of this shard's, a spawn), which go ahead of every wake still
     /// unread, the batch reads the inputs again before its next poll, and the step goes on to its count.
     /// Polls that list nothing leave the order as reading would: what arrives goes behind the tasks
-    /// already listed either way.
-    fn poll_batch(&mut self, mark: Option<u64>) -> bool {
+    /// already listed either way. With whether it polled any, the batch's last reading of the clock where
+    /// nothing has read its inputs again since (the last poll's end, or the step's own reading).
+    fn poll_batch(&mut self, mark: Option<u64>) -> (bool, Option<u64>) {
         registry::with_current_cell(self, |shard, current| shard.poll_batch_in(mark, current))
     }
 
@@ -1342,7 +1390,7 @@ impl Shard {
         &mut self,
         mark: Option<u64>,
         current: Option<registry::CurrentCell<'_>>,
-    ) -> bool {
+    ) -> (bool, Option<u64>) {
         let batch = self.core.batch;
         let budget_ns = self.batch_budget_ns();
         // The quantum a poll is judged by: the wake estimate, which moves only when the shard parks, so one
@@ -1377,7 +1425,7 @@ impl Shard {
                 self.read_inputs_within(&mut at, ended);
             }
         }
-        polled_any
+        (polled_any, at.mark)
     }
 
     /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
@@ -1418,6 +1466,16 @@ impl Shard {
     /// Whether any input did work.
     fn read_inputs(&mut self) -> bool {
         if !self.inputs_pending() {
+            // An idle turn of a shard with readiness waits leaves its driver to what follows, as `harvest_turn`
+            // would have: its harvest a quantum after its last is `due_ns`'s, so here the driver is not yet owed
+            // that, only a look before the shard waits or ends a nonblocking run.
+            if self.desk.local.is_empty()
+                && !self.core.waiting.is_empty()
+                && !self.core.driver_lost
+                && !self.core.exited
+            {
+                self.core.harvest_owed = true;
+            }
             self.desk.local.release_yielded(self.desk.now_ns.get());
             return false;
         }
@@ -1433,14 +1491,15 @@ impl Shard {
     }
 
     /// Whether the inputs may hold work (docs/runtime.md §3.10), from what tells without touching them: an
-    /// intent asked, the time against `due_ns`, an idle shard with readiness waits (whose turn asks the
-    /// driver at once), and the entry's flags for control and wakes from other threads. The simulation reads
-    /// every turn, as its harvest does.
+    /// intent asked, the time against `due_ns`, and the entry's flags for control and wakes from other threads.
+    /// The simulation reads every turn, as its harvest does. An idle shard with readiness waits read them all
+    /// too, though its driver was not due (kiln's goal 9, plan 01a1a87b2cec step 5): about half of a server
+    /// shard's steps are the idle one before each park, and each drained nothing, examined its wheel and asked
+    /// its driver twice, only to leave the driver to the park ([`Shard::read_inputs`] keeps that).
     fn inputs_pending(&self) -> bool {
         !self.core.real_time
             || self.desk.asked.get()
             || self.desk.now_ns.get() >= self.desk.due_ns.get()
-            || (self.desk.local.is_empty() && !self.core.waiting.is_empty())
             || self
                 .desk
                 .entry
@@ -1450,18 +1509,26 @@ impl Shard {
     /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement comes first
     /// and the inbox re-check second (the protocol and its loom model: [`crate::parking`]).
     pub fn park(&mut self, deadline_ns: Option<u64>) {
-        self.park_with_cleanup(deadline_ns, false);
+        let _ = self.park_with_cleanup(deadline_ns, false);
     }
 
     /// The owning run/block_on/Drop loop may await terminal channel completions.
     /// Manual and simulation park must instead return with cooperative work retained.
     pub(crate) fn park_owned(&mut self, deadline_ns: Option<u64>) {
-        self.park_with_cleanup(deadline_ns, true);
+        let _ = self.park_with_cleanup(deadline_ns, true);
     }
 
-    fn park_with_cleanup(&mut self, deadline_ns: Option<u64>, block_cleanup: bool) {
+    /// [`Shard::park_owned`] for a loop whose next step follows at once ([`Shard::step_after`]): the reading its
+    /// wait returned with, which the park counted its length to and its retrieval from; none where it didn't
+    /// wait, the driver was lost, or the shard learns its wake and its park's cost (whose readings of the
+    /// thread's switches and CPU, system calls, follow the wait).
+    pub(crate) fn park_owned_then(&mut self, deadline_ns: Option<u64>) -> Option<Reading> {
+        self.park_with_cleanup(deadline_ns, true)
+    }
+
+    fn park_with_cleanup(&mut self, deadline_ns: Option<u64>, block_cleanup: bool) -> Option<Reading> {
         if self.core.exited {
-            return;
+            return None;
         }
         // A wait closes the window, so nothing left for a step's end may wait past it.
         self.judge_deferred();
@@ -1470,7 +1537,7 @@ impl Shard {
             if block_cleanup && !self.core.exited {
                 self.park_cleanup();
             }
-            return;
+            return None;
         }
         self.apply();
         if self.core.driver_lost {
@@ -1478,28 +1545,36 @@ impl Shard {
             if block_cleanup && !self.core.exited {
                 self.park_cleanup();
             }
-            return;
+            return None;
         }
         self.core.waited_for_ns = deadline_ns;
         self.core.attribution.wait_began();
-        let (retrieved, lost) = match self.desk.entry {
+        let (retrieved, woke) = match self.desk.entry {
             Some(entry) => self.park_announced(entry, deadline_ns),
             None => (true, self.wait_in_driver(deadline_ns)),
         };
-        self.wait_ended(retrieved);
+        let lost = self.core.driver_lost;
+        self.wait_ended(retrieved, woke);
         if lost {
             self.fail_all();
             self.finish_hard_cancelled();
+            return None;
         }
+        let learns = self.core.real_time && self.core.wake.is_some();
+        woke.filter(|_| !learns)
     }
 
     /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
     /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
-    /// cost. Whether it waited, and whether the driver was lost.
-    fn park_announced(&mut self, entry: &'static Entry, deadline_ns: Option<u64>) -> (bool, bool) {
+    /// cost. Whether it waited, and the reading its wait returned with (none where the driver was lost).
+    fn park_announced(
+        &mut self,
+        entry: &'static Entry,
+        deadline_ns: Option<u64>,
+    ) -> (bool, Option<Reading>) {
         let learns = self.core.real_time && self.core.wake.is_some();
         let mut switches_before_wait = None;
-        let mut lost = false;
+        let mut woke = None;
         // The CPU clock is read (a system call) only by a learning shard, only around a wait it makes, and
         // the second time only after a first. A tuple of the two readings read it after every park, learning
         // or not: that doubled the cost of the loop item the runtime calibrates its poll batch by, which
@@ -1522,12 +1597,12 @@ impl Shard {
                     cpu_before = attribution::thread_cpu_now();
                     count(&self.desk.live.park_cost_reads, 1);
                 }
-                lost = self.wait_in_driver(deadline_ns);
+                woke = self.wait_in_driver(deadline_ns);
             },
         );
         let Parked::Waited(woken) = parked else {
             count(&self.desk.live.parks_withdrawn, 1);
-            return (false, lost);
+            return (false, None);
         };
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
@@ -1538,7 +1613,7 @@ impl Shard {
                 self.note_park_cost(entry, after.saturating_sub(before));
             }
         }
-        (true, lost)
+        (true, woke)
     }
 
     /// Driver loss closed admission and marked every live task. A single arena
@@ -1669,15 +1744,17 @@ impl Shard {
     }
 
     /// A wait ended: while a long poll has gone unattributed, a window opens now. Only an actual
-    /// driver wait renews the retrieval age; a skipped park or inbox-only spin cannot postpone I/O.
-    fn wait_ended(&mut self, retrieved: bool) {
-        let now = self.now_ns();
+    /// driver wait renews the retrieval age; a skipped park or inbox-only spin cannot postpone I/O. The age is
+    /// the reading the driver's wait returned with where there is one (`woke`), and the clock is read only for
+    /// what needs it now: the age without that reading, and a window's start beside the thread's account (kiln's
+    /// goal 9, plan 01a1a87b2cec step 5: every wait's end read it again, and a park withdrawn too).
+    fn wait_ended(&mut self, retrieved: bool, woke: Option<Reading>) {
         if retrieved {
-            self.core.last_driver_ns = now;
+            self.core.last_driver_ns = woke.map_or_else(|| self.now_ns(), |woke| woke.ns);
             self.core.harvest_owed = false;
         }
         if self.core.real_time && self.core.attribution.armed() {
-            let read = account_now(now);
+            let read = account_now(self.now_ns());
             count(&self.desk.live.thread_accounts, 1);
             self.core.attribution.wait_ended(|| read);
         }
@@ -1721,10 +1798,10 @@ impl Shard {
 
     /// The long polls left for the step's end, judged at one reading of the thread's account
     /// ([`Tracker::close_step`], [`attribution::judge_in_window`]) and counted as the polls' own attribution
-    /// would have been.
-    fn judge_deferred(&mut self) {
+    /// would have been. Whether there were any (and so a system call was made).
+    fn judge_deferred(&mut self) -> bool {
         if self.core.deferred.is_empty() {
-            return;
+            return false;
         }
         let now = self.now_ns();
         let end = attribution::thread_account();
@@ -1745,12 +1822,14 @@ impl Shard {
         if undecided {
             self.core.attribution.undecided();
         }
+        true
     }
 
-    /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
-    /// when the driver was lost. Each wait is counted by what ended it (kiln's goal 9, plan 01a1a87b2cec step 5):
-    /// a kick (the driver's count of them moved), else I/O (completions came), else its deadline.
-    fn wait_in_driver(&mut self, deadline_ns: Option<u64>) -> bool {
+    /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; the reading
+    /// of the clock it returned with, none when the driver was lost. Each wait is counted by what ended it (kiln's
+    /// goal 9, plan 01a1a87b2cec step 5): a kick (the driver's count of them moved), else I/O (completions came),
+    /// else its deadline; and by how long it lasted, to that reading.
+    fn wait_in_driver(&mut self, deadline_ns: Option<u64>) -> Option<Reading> {
         count(&self.desk.live.waits, 1);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_waits(self.desk.live.waits.get());
@@ -1759,18 +1838,20 @@ impl Shard {
         let timeout = deadline_ns.map(|d| d.saturating_sub(began));
         let kicks = self.core.driver.kicks_taken();
         let harvested = self.receive_completions(timeout);
-        if !self.core.driver_lost {
-            let by = if self.core.driver.kicks_taken() != kicks {
-                &self.desk.live.woken_by_kick
-            } else if harvested {
-                &self.desk.live.woken_by_io
-            } else {
-                &self.desk.live.woken_by_timer
-            };
-            count(by, 1);
-            self.note_parked(self.core.driver.now_ns().saturating_sub(began));
+        if self.core.driver_lost {
+            return None;
         }
-        self.core.driver_lost
+        let by = if self.core.driver.kicks_taken() != kicks {
+            &self.desk.live.woken_by_kick
+        } else if harvested {
+            &self.desk.live.woken_by_io
+        } else {
+            &self.desk.live.woken_by_timer
+        };
+        count(by, 1);
+        let woke = self.read_clock();
+        self.note_parked(woke.ns.saturating_sub(began));
+        Some(woke)
     }
 
     /// Counts a driver wait that lasted `parked_ns` into the shard's park durations ([`PARK_BOUNDS_NS`]).
@@ -2040,7 +2121,7 @@ impl Shard {
         }
         let entered = registry::enter_in(current, &self.desk);
         // The thread's run time as the poll starts, for a slow poll's time on the CPU (`crate::task_clock`).
-        let cpu_from = self.core.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
+        let cpu_from = self.desk.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
@@ -2077,7 +2158,7 @@ impl Shard {
             None
         };
         if elapsed > crate::slow::SLOW_POLL_NS {
-            let cpu = cpu_from.and_then(|from| Some(self.core.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
+            let cpu = cpu_from.and_then(|from| Some(self.desk.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
             self.note_slow(slot, elapsed, cpu, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
         }
         let Some(poll) = poll else {
@@ -2540,3 +2621,7 @@ fn unlink_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
 // Kiln's goal 9, plan 01a1a87b2cec step 5: what parks and wakes are counted as.
 #[cfg(test)]
 mod wake_counts;
+
+// Kiln's goal 9, plan 01a1a87b2cec step 5: what the loop does per turn that it needn't.
+#[cfg(test)]
+mod turn_costs;

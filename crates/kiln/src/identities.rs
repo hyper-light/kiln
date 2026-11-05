@@ -1310,7 +1310,13 @@ pub struct Revoked {
 pub async fn revoked_now(store: &Store) -> anyhow::Result<Arc<Revoked>> {
     let read = store.call(|c| Ok(Revoked { list: revocations_on(c)?.into(), stamp: revoked_stamp(c)? })).await?;
     let read = Arc::new(read);
-    store.keep_revoked(Arc::clone(&read));
+    // The list kept before let go of on the blocking pool: a revocation a superseded certificate, it grows for as long as
+    // kiln runs, and it was freed on the shard that read the new one, once a revocation (goal 9, plan 01a1a87b2cec step 3).
+    if let Some(was) = store.keep_revoked(Arc::clone(&read)) {
+        drop(crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || drop(was)).await;
+        }));
+    }
     Ok(read)
 }
 
@@ -1753,6 +1759,27 @@ mod tests {
             let issue = code.split("async fn issue(").nth(1).and_then(|rest| rest.split("\nasync fn certify(").next()).unwrap_or_default();
             anyhow::ensure!(!issue.is_empty() && !issue.contains("issue_identity(") && !issue.contains("fingerprints("), "issue makes or reads a certificate on its caller's shard");
             Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the revocations read again after one was added are kept from then on, and the list
+    /// kept before is let go of by the store, off the shard that read the new one: only its other holders keep it.
+    #[test]
+    fn g9_s3_the_revocations_kept_before_are_let_go_of_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let first = revoked_now(&store).await?;
+            revoke(&store, Target::Key("ab".repeat(32)), "a test's", "kiln", 1).await?;
+            let second = revoked_now(&store).await?;
+            anyhow::ensure!(second.list.len() == first.list.len() + 1, "the one added is in the list read again");
+            anyhow::ensure!(store.revoked_kept().is_some_and(|k| Arc::ptr_eq(&k, &second)), "kept from then on");
+            for _ in 0..500 {
+                if Arc::strong_count(&first) == 1 {
+                    return Ok(());
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("the store still holds the list it kept before: {} holders", Arc::strong_count(&first))
         })
     }
 }

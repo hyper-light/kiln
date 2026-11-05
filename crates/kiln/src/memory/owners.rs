@@ -178,7 +178,10 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// 01a1a59c2a9c step 5): a terminal's keystrokes and its output from its machine (`crate::termsess`), a
 /// conversation feed's links, its parts to send and its intake's answers (`crate::convo::feed`), a live job's
 /// writes (`crate::logs`), the sealed chunks waiting for the packer (`crate::harness::copies`), files read ahead
-/// of their requests and a socket's audit rows (`crate::api`). Each item is counted at its place alone
+/// of their requests and a socket's audit rows (`crate::api`); and the runner process's own (goal 5, plan
+/// 01a1a59c2aae): its uplink and what its loop takes (`crate::agent`, `crate::exec::Uplink`), its sessions'
+/// lanes, control and updates (`crate::harness`, `crate::convo::store::tee`), its harnesses' and steps'
+/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");
