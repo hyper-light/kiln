@@ -2858,16 +2858,19 @@ impl Hub {
     /// (a runner told to let go of a copy, custody's ask, a hand-over's checks) goes on beside it. Its
     /// wait, from its frame's arrival, and the time it took here are the runner class's
     /// (`crate::route_latency`).
-    pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate) {
+    /// What's left of it when the owner's turn ran out (`over`; goal 9, plan 01a1a87b2cec step 3) comes
+    /// back, for the owner to take first at its next turn.
+    pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
         let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived } = r;
-        self.judge_runner_update(s, peer, &agent, &session, update, shipped);
+        let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), began.elapsed());
+        rest
     }
 
     /// [`Hub::runner_update`]'s judgment, as the hub's loop made it: whether the update counts, which of
     /// its machine's processes holds the session, then the copy takes it.
-    fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool) {
+    fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
         use crate::harness::core::Update;
         match update {
             // A copy of a session that went on elsewhere since (an older epoch): its machine lets go
@@ -2880,10 +2883,11 @@ impl Hub {
                 let msg = if lets_go { ServerMsg::HarnessRelease { session: session.to_owned() } } else { ServerMsg::HarnessClose { session: session.to_owned() } };
                 let (hub, agent) = (Arc::clone(self), agent.to_owned());
                 crate::rt::spawn(async move { hub.command_peers(&agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN) });
+                None
             }
             // The rest of what a copy left behind says (its machine was told to let go of it): none
             // of it counts, and it doesn't take the session's messages from where it runs.
-            u if !matches!(u, Update::Open { .. }) && !self.harness.runs_on(session, agent) => {}
+            u if !matches!(u, Update::Open { .. }) && !self.harness.runs_on(session, agent) => None,
             u => {
                 let closed = matches!(u, Update::Closed);
                 // Two processes of one machine never both run a session: of two that say they hold
@@ -2929,13 +2933,13 @@ impl Hub {
                     crate::rt::spawn(async move { hub.let_go_of(&agent, older, &session).await });
                 }
                 if older == Some(peer) {
-                    return;
+                    return None;
                 }
                 if let Some(label) = holder {
                     self.harness.held_by(session, &label);
                 }
                 let opened = matches!(u, Update::Open { .. });
-                self.harness.take_from(s, self, &crate::harness::registry::Location::Machine(agent.to_owned()), session, u, shipped);
+                let rest = self.harness.take_from(s, self, &crate::harness::registry::Location::Machine(agent.to_owned()), session, u, shipped, over);
                 // Opened: the work kiln handed it as it started is asked to be signed for, as it takes
                 // it up (docs/ci.md W27-R08).
                 if opened {
@@ -2950,6 +2954,7 @@ impl Hub {
                         hub.check_handover().await;
                     });
                 }
+                rest
             }
         }
     }

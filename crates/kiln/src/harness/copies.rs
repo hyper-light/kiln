@@ -1377,7 +1377,7 @@ impl Shard {
             Msg::Run(job) => job(self),
             Msg::Runner(r) => {
                 if let Some(h) = hub {
-                    h.runner_update(self, *r);
+                    rest = h.runner_update(self, *r, over).map(|i| Msg::Update(Box::new(i)));
                 }
             }
         }));

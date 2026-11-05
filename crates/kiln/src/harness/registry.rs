@@ -1897,11 +1897,11 @@ impl Registry {
     }
 
     /// An update of session `id` from `from`, taken by the shard that owns its copy, `s` (goal 10, plan
-    /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop).
-    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool) {
-        if let Some(ingest) = self.prepare(hub, from, id, u, shipped) {
-            self.apply(s, hub, ingest);
-        }
+    /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop): what's
+    /// left of it when the owner's turn ran out (`over`, [`Registry::apply`]; goal 9), to take first next.
+    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<Ingest> {
+        let ingest = self.prepare(hub, from, id, u, shipped)?;
+        self.apply(s, hub, ingest, over)
     }
 
     /// An update of session `id` from `from` as its copy takes it ([`Registry::apply`]): an inbox's
