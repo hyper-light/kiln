@@ -693,6 +693,45 @@ impl Events {
         *self = Self::of(all);
     }
 
+    /// [`Events::retain`] where those `keeps` keeps are its first events (a copy's go in by number, so a
+    /// number's those through it are): the chunks before the first it lets go of stay as they are (packed,
+    /// spilled or neither, none read again), the one that falls in is made again of its events before it,
+    /// and the rest go. How many it keeps, and the ids of those it let go of. None, and nothing changed, when
+    /// `keeps` keeps one after one it doesn't: `retain`'s to do. Goal 9, plan 01a1a87b2cec step 3: an Open
+    /// going on from a number read every chunk of its copy again (inflating, reading back from its spill file
+    /// and parsing each event) on its owner's shard, at every runner's reconnect, to keep them all.
+    pub(super) fn keep_first(&mut self, keeps: impl Fn(&Meta) -> bool) -> Option<(usize, Vec<Arc<str>>)> {
+        let kept = self.metas().take_while(|m| keeps(*m)).count();
+        if self.metas().skip(kept).any(&keeps) {
+            return None;
+        }
+        // All of them kept: nothing to do.
+        let Some((c, k)) = self.place(kept) else { return Some((kept, Vec::new())) };
+        let mut gone: Vec<Arc<str>> = self.metas().skip(kept).map(|m| Arc::clone(&m.id)).collect();
+        let remade = match self.chunks.get(c) {
+            Some(chunk) if k > 0 => match chunk.evs() {
+                Ok(evs) => Some(Chunk::of(evs.iter().take(k).cloned().collect())),
+                Err(e) => {
+                    tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: let go of");
+                    gone.extend(chunk.meta.iter().take(k).map(|m| Arc::clone(&m.id)));
+                    None
+                }
+            },
+            _ => None,
+        };
+        let chunks = Arc::make_mut(&mut self.chunks);
+        chunks.truncate(c);
+        let mut len = kept.saturating_sub(k);
+        if let Some(chunk) = remade {
+            len += chunk.len();
+            chunks.push(Arc::new(chunk));
+        }
+        self.len = len;
+        self.first = chunks.first().map_or(0, |c| c.len());
+        self.page_newest();
+        Some((len, gone))
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
@@ -803,7 +842,15 @@ type Sealed = (Weak<Chunk>, Option<Home>);
 /// holding its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s), and
 /// a chunk a unit held a thread for a chunk's whole deflate (its pieces at p99, 5 to 45 ms). A chunk
 /// gone or packed by then (let go of, changed, packed by a snapshot that needed it) is passed over.
-static SEALED: OnceLock<async_channel::Sender<Sealed>> = OnceLock::new();
+static SEALED: OnceLock<crate::memory::queue::Sender<Sealed>> = OnceLock::new();
+
+/// The packer's queue ([`SEALED`]): lock-free, its owners on every shard sending and the packer taking (goal 4,
+/// plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex` on both sides). No bound, as
+/// the channel it was had none: an owner never waits for the packer, and each chunk seals once, so it holds at
+/// most one entry a chunk the copies keep as text (`crate::memory::owners::SESSION_ENTRIES`' bound).
+fn sealed_queue() -> (crate::memory::queue::Sender<Sealed>, crate::memory::queue::Receiver<Sealed>) {
+    crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
 /// it as it is (goal 10, plan 01a1a87b2dae step 3), and its copy's owner then keeps it compact (goal
@@ -813,7 +860,7 @@ fn seal(chunk: &Arc<Chunk>, home: Option<Home>) {
         return;
     }
     let packer = SEALED.get_or_init(|| {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = sealed_queue();
         drop(crate::rt::spawn(pack_sealed(rx)));
         tx
     });
@@ -830,7 +877,7 @@ fn compact_msg(home: &Home) -> Msg {
 /// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
 /// A packed chunk's owner is told from the pool when its inbox takes the message now, else once the
 /// job ends (its inbox full then: the owner busy).
-async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
+async fn pack_sealed(rx: crate::memory::queue::Receiver<Sealed>) {
     while let Ok(first) = rx.recv().await {
         let packer = Packer { rx: rx.clone(), waiting: vec![first], now: None, later: Vec::new() };
         let packed = crate::rt::compute_pieces(packer, |p, turn| p.piece(&|| turn.over())).await;
@@ -850,7 +897,7 @@ async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
 /// The packer's job ([`pack_sealed`]): the sealed chunks waiting, the one being packed, and the owners
 /// to tell once it ends.
 struct Packer {
-    rx: async_channel::Receiver<Sealed>,
+    rx: crate::memory::queue::Receiver<Sealed>,
     /// Those not begun, the newest last: taken newest first, so in a fill a long session's oldest, which
     /// it lets go of first ([`Events::drain_front`]), are gone before their turn comes rather than packed
     /// for nothing.
@@ -1457,6 +1504,28 @@ impl Mirror {
 
     pub fn reindex(&mut self) {
         self.index = self.events.metas().enumerate().filter(|(_, m)| !m.id.is_empty()).map(|(i, m)| (Arc::clone(&m.id), i)).collect();
+    }
+
+    /// Keeps its events through number `n` and lets go of those after it, and of any without a number: its
+    /// machine's runner started again and goes on from there (an Open's `since`, `Registry::apply`). Those kept
+    /// stay where they were, its chunks with them, and its index lets go of the rest alone, nothing read again
+    /// or indexed anew; where those it keeps aren't its first ones (never, as a copy takes them in by number)
+    /// its events and index are made again (goal 9, plan 01a1a87b2cec step 3).
+    pub fn keep_through(&mut self, n: u64) {
+        let keeps = |m: &Meta| m.seq.is_some_and(|q| q <= n);
+        match self.events.keep_first(keeps) {
+            Some((kept, gone)) => {
+                for id in gone {
+                    if self.index.get(&*id).is_some_and(|at| *at >= kept) {
+                        self.index.remove(&*id);
+                    }
+                }
+            }
+            None => {
+                self.events.retain(keeps);
+                self.reindex();
+            }
+        }
     }
 
     /// Lets go of every event.
@@ -2333,7 +2402,7 @@ mod tests {
         let want = newest.deflate(Compression::default())?;
         let (owner, told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, 8 * MSG);
         let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = sealed_queue();
         for c in [&oldest, &middle, &newest] {
             tx.try_send((Arc::downgrade(c), Some(home.clone()))).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
         }
@@ -2368,6 +2437,39 @@ mod tests {
         assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
         drop(owner);
         Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the packer's queue (`sealed_queue`, lock-free) takes every owner's
+    /// sealed chunks at once from every shard, none refused and none waiting (no bound, as the channel it was
+    /// had none), and the packer has each owner's in the order it sealed them.
+    #[test]
+    fn g4_s5_sealed_chunks_reach_the_packer_from_every_shard_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (owners, per) = (8usize, 2_000usize);
+            let (tx, rx) = sealed_queue();
+            let (inbox, _told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, MSG);
+            let mut sealing = Vec::new();
+            for o in 0..owners {
+                let (tx, inbox) = (tx.clone(), inbox.downgrade());
+                sealing.push(crate::rt::spawn_spread_joined(async move {
+                    (0..per).all(|n| tx.try_send((Weak::new(), Some(Home { inbox: inbox.clone(), id: Arc::from(format!("{o}/{n}")) }))).is_ok())
+                }));
+            }
+            drop(tx);
+            for s in sealing {
+                anyhow::ensure!(s.await.unwrap_or(false), "an owner's sealed chunk was refused");
+            }
+            let mut got = vec![Vec::new(); owners];
+            while let Ok((_, home)) = rx.try_recv() {
+                let id = home.map(|h| h.id.to_string()).unwrap_or_default();
+                let (o, n) = id.split_once('/').ok_or_else(|| anyhow::anyhow!("an entry without its home: {id}"))?;
+                got.get_mut(o.parse::<usize>()?).ok_or_else(|| anyhow::anyhow!("no owner {o}"))?.push(n.parse::<usize>()?);
+            }
+            for (o, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "owner {o}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 2: a copy whose sealed chunks are kept compact (their metas and
@@ -2921,5 +3023,104 @@ mod tests {
             anyhow::ensure!(copies.with(&id, |v| v.rev) == Some(changes));
             Ok(())
         })
+    }
+
+    /// A copy of events numbered 1 to `n`, its sealed chunks packed and kept compact, its newest open.
+    fn compact_copy(n: u64) -> anyhow::Result<Mirror> {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        Ok(m)
+    }
+
+    fn inflated() -> u64 {
+        super::super::packed::INFLATED.with(std::cell::Cell::get)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an Open that goes on from its copy's newest (a runner's reconnect, as
+    /// it mostly is: `crate::wire::sums::delta` says the copy's newest) keeps the copy as it is, on its owner's
+    /// shard: no chunk read again (none inflated), each the one it was, its index as it was. One going on from
+    /// past its newest the same. It read every chunk again, and parsed every event, to keep them all.
+    #[test]
+    fn g9_s3_an_open_going_on_from_its_copys_newest_reads_nothing_again() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let mut m = compact_copy(n)?;
+        anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_compact()).count() == 4, "four compact chunks, the newest open");
+        let (chunks, index) = (m.events.chunks().to_vec(), m.index.clone());
+        for since in [n, n + 100] {
+            let was = inflated();
+            m.keep_through(since);
+            anyhow::ensure!(inflated() == was, "going on from {since}, a chunk was read again");
+            anyhow::ensure!(m.events.chunks().len() == chunks.len() && m.events.chunks().iter().zip(&chunks).all(|(a, b)| Arc::ptr_eq(a, b)), "going on from {since}, each chunk the one it was");
+            anyhow::ensure!(m.events.len() == CHUNK * 4 + 9 && m.index == index, "going on from {since}, its events and index as they were");
+        }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an Open that goes on from before its copy's newest keeps its events
+    /// through that number as `Events::retain` keeps them: the chunks wholly before the cut the ones they were,
+    /// the one it falls in made again of its events before it (read again only when it's compact, once), the
+    /// rest let go of; its index finds each kept event where it is and none of the others; and the copy goes on
+    /// taking events after it.
+    #[test]
+    fn g9_s3_an_open_going_on_from_before_its_newest_reads_only_the_chunk_it_cuts() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let chunk = u64::try_from(CHUNK)?;
+        let texts = |e: &Events| e.iter().map(|e| e.entry.text().to_owned()).collect::<Vec<_>>();
+        // Into the newest, open chunk; into a compact one; on a chunk's edge; before them all.
+        for (since, reads) in [(chunk * 4 + 3, 0), (chunk + 5, 1), (chunk * 2, 0), (0, 0)] {
+            let mut m = compact_copy(n)?;
+            let before = m.events.chunks().to_vec();
+            let mut want = m.events.clone();
+            want.retain(|e| e.seq.is_some_and(|q| q <= since));
+            let was = inflated();
+            m.keep_through(since);
+            let read = inflated().saturating_sub(was);
+            anyhow::ensure!(read == reads, "going on from {since}: {read} chunks read again, not {reads}");
+            let whole = usize::try_from(since / chunk)?;
+            anyhow::ensure!(m.events.chunks().iter().zip(&before).take(whole).all(|(a, b)| Arc::ptr_eq(a, b)), "going on from {since}, the chunks before the cut the ones they were");
+            anyhow::ensure!(texts(&m.events) == texts(&want) && m.events.len() == usize::try_from(since)?, "going on from {since}: as retain keeps them");
+            let index = m.index.clone();
+            m.reindex();
+            anyhow::ensure!(m.index == index && index.len() == m.events.len(), "going on from {since}, its index as one made anew: {} entries", index.len());
+            for q in since + 1..=since + 3 {
+                m.rev += 1;
+                m.upsert(entry(&format!("e{q}"), q));
+            }
+            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq).collect();
+            anyhow::ensure!(seqs == (1..=since + 3).collect::<Vec<_>>(), "going on from {since}, it goes on: {seqs:?}");
+            anyhow::ensure!(m.index.get(format!("e{}", since + 3).as_str()) == Some(&m.events.len().saturating_sub(1)), "the newest indexed where it is");
+        }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: where those an Open keeps aren't the copy's first events (one without
+    /// a number among them), its events and index are made again, as before.
+    #[test]
+    fn g9_s3_a_copy_whose_kept_events_arent_its_first_is_made_again() {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let take = |m: &mut Mirror, e: Arc<Entry>| {
+            m.rev += 1;
+            m.upsert(e);
+        };
+        for q in 1..=5 {
+            take(&mut m, entry(&format!("e{q}"), q));
+        }
+        take(&mut m, Arc::new(Entry::new(json!({"id": "loose", "kind": "notice", "text": "no number"}))));
+        for q in 6..=8 {
+            take(&mut m, entry(&format!("e{q}"), q));
+        }
+        m.keep_through(7);
+        let ids: Vec<String> = m.events.metas().map(|meta| meta.id.to_string()).collect();
+        assert_eq!(ids, ["e1", "e2", "e3", "e4", "e5", "e6", "e7"]);
+        let index = m.index.clone();
+        m.reindex();
+        assert_eq!(m.index, index, "its index made anew");
     }
 }

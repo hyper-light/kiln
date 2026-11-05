@@ -1160,7 +1160,7 @@ pub struct Registry {
     pub convo: Option<crate::convo::store::Store>,
     /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
     pub feed: Option<crate::convo::feed::Intake>,
-    feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
+    feed_out: Option<crate::memory::queue::Receiver<crate::convo::feed::Out>>,
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
     copies_out: Option<crate::memory::queue::Receiver<crate::convo::mirror::Out>>,
@@ -2223,8 +2223,8 @@ impl Registry {
             match keep {
                 Some(n) => {
                     let had = m.events.len();
-                    m.events.retain(|e| e.seq.is_some_and(|q| q <= n));
-                    m.reindex();
+                    // Its chunks through `n` kept as they are, none read again (goal 9, plan 01a1a87b2cec step 3).
+                    m.keep_through(n);
                     // Past its machine's newest it had what the machine no longer has: its
                     // viewers let go of that too.
                     resync = m.events.len() != had;

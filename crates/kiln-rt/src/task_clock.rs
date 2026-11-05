@@ -54,7 +54,9 @@ impl TaskClock {
     }
 }
 
-/// One consistent reading of the page's times, and the counter as it was read.
+/// One consistent reading of the page's times, and the counter as it was read: read where the page is (Linux), and
+/// worked out by the tests everywhere.
+#[cfg(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)), test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Times {
     /// `time_enabled`: the event's enabled time when the kernel last wrote the page, nanoseconds.
@@ -73,10 +75,13 @@ pub(crate) struct Times {
 }
 
 /// `cap_user_time`: the scale above may be used.
+#[cfg(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)), test))]
 const CAP_USER_TIME: u64 = 1 << 3;
 /// `cap_user_time_short`: the counter is narrower than 64 bits, `time_cycles` and `time_mask` say how.
+#[cfg(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)), test))]
 const CAP_USER_TIME_SHORT: u64 = 1 << 5;
 
+#[cfg(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)), test))]
 impl Times {
     /// The run time this reading gives: the enabled time, and the counter's time since the page was written, as
     /// perf_event_open(2) works it out (`time_offset + quot * time_mult + ((rem * time_mult) >> time_shift)`).
