@@ -1267,6 +1267,24 @@ impl Turns {
         }
     }
 
+    /// The loop's next item off `rx`: one waiting already goes on in this turn; one it waited for starts its turn
+    /// afresh, as the wait gave its shard to its other work, as the copies' owners take their inboxes
+    /// (`crate::harness::copies`). `None` once `rx` is closed and empty. Goal 10, plan 01a1a87b2dae step 5: the
+    /// hub's loop counted its idle wait as a piece of its turn, so after any quiet spell its first frame spent
+    /// the turn, the loop gave its shard away, and the frames queued behind that one waited on the shard's other
+    /// tasks (runners' frames, `to_loop`: p50 44 µs, p99 6.1 ms in g11alloc2's calm rounds).
+    pub async fn next<T>(&mut self, rx: &crate::memory::queue::Receiver<T>) -> Option<T> {
+        match rx.try_recv() {
+            Ok(item) => Some(item),
+            Err(async_channel::TryRecvError::Closed) => None,
+            Err(async_channel::TryRecvError::Empty) => {
+                let item = rx.recv().await.ok()?;
+                *self = Self::new();
+                Some(item)
+            }
+        }
+    }
+
     /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
     /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
     pub fn over(&self) -> bool {
@@ -2145,6 +2163,37 @@ mod tests {
         assert!(t.over_at(at(150), STEP_BUDGET_NS), "a 130 µs piece ending at 150 µs: the next as long ends at 280 µs");
         // Off a shard there's no quantum: never over.
         assert!(!Turns::new().over());
+    }
+
+    /// Goal 10 (plan 01a1a87b2dae step 5): a loop takes an item waiting already in the turn it has, and starts its
+    /// turn afresh with one it waited for, as the copies' owners do: the hub's loop counted its idle wait as a
+    /// piece of its turn, so the first frame after any quiet spell spent it. Closed and empty, there's none.
+    #[test]
+    fn g10_s5_a_loops_wait_for_its_next_item_is_no_piece_of_its_turn() -> anyhow::Result<()> {
+        block_on(async {
+            // Counted as the hub's loop's own queue is (a few bytes, for a moment).
+            let (tx, rx) = crate::memory::queue::bounded::<Vec<u8>>(&crate::memory::owners::NET_EVENTS, 1 << 20);
+            let mut turns = Turns::new();
+            let began = turns.began;
+            // Waiting already: taken in the turn the loop has.
+            anyhow::ensure!(tx.try_send(vec![1]).is_ok(), "sent");
+            anyhow::ensure!(turns.next(&rx).await == Some(vec![1]), "the item waiting");
+            anyhow::ensure!(turns.began == began, "an item waiting already goes on in the turn");
+            // None waiting: the loop waits (polled once, it's pending), and the item it waited for starts its turn.
+            let asked = Instant::now();
+            {
+                let mut next = std::pin::pin!(turns.next(&rx));
+                anyhow::ensure!(futures::poll!(next.as_mut()).is_pending(), "nothing to take yet");
+                anyhow::ensure!(tx.try_send(vec![2]).is_ok(), "sent");
+                anyhow::ensure!(next.await == Some(vec![2]), "the item it waited for");
+            }
+            anyhow::ensure!(turns.began >= asked && turns.began != began, "its turn starts as the item it waited for comes");
+            anyhow::ensure!(!turns.over_at(turns.began + Duration::from_micros(100), STEP_BUDGET_NS), "a 100 µs piece after the wait is within its turn");
+            // Closed and empty: none.
+            drop(tx);
+            anyhow::ensure!(turns.next(&rx).await.is_none(), "closed and empty");
+            Ok(())
+        })
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 6): with cores of its own the server's shards each get one,

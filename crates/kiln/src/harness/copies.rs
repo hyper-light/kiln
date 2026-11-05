@@ -681,6 +681,53 @@ impl Events {
         (gone, remade.filter(|_| chunks.len() > 1))
     }
 
+    /// [`Events::drain_front`] where the chunk the cut falls in is compact, so it would be read again to be made
+    /// of its rest (inflated, or read back from its spill file, and each event parsed: a millisecond or more on
+    /// its owner's shard, every thousand events of a long session; goal 9, plan 01a1a87b2cec step 3): the
+    /// chunks wholly before it go now, and it stays as it is, its first `left` with it, for its owner to make
+    /// again off the shard and take in ([`Events::trim_first`]). The ids let go of now, that chunk, and `left`.
+    /// None, and nothing changed, where the cut falls on a chunk's edge or in one that isn't compact
+    /// (`drain_front`'s, which reads nothing again then).
+    pub(super) fn drain_whole(&mut self, n: usize) -> Option<(Vec<Arc<str>>, Arc<Chunk>, usize)> {
+        let n = n.min(self.len);
+        let (mut left, mut whole) = (n, 0);
+        while let Some(c) = self.chunks.get(whole)
+            && left >= c.len()
+        {
+            left -= c.len();
+            whole += 1;
+        }
+        let cut = Arc::clone(self.chunks.get(whole).filter(|c| left > 0 && c.is_compact())?);
+        let now = n - left;
+        let gone: Vec<Arc<str>> = self.metas().take(now).map(|m| Arc::clone(&m.id)).collect();
+        let chunks = Arc::make_mut(&mut self.chunks);
+        chunks.drain(..whole);
+        self.len -= now;
+        self.first = chunks.first().map_or(0, |c| c.len());
+        Some((gone, cut, left))
+    }
+
+    /// The chunk `was`, still its first as it was, made again of its events past its first `left` (`made`, read
+    /// off the shard: [`Events::drain_whole`]): the ids of those first ones, let go of. None, and nothing
+    /// changed, when its first chunk isn't `was` any more (an event in it changed, or a later cut let it go) or
+    /// `made` isn't its rest.
+    pub(super) fn trim_first(&mut self, was: &Arc<Chunk>, left: usize, made: Chunk) -> Option<Vec<Arc<str>>> {
+        let rest = was.metas().get(left..)?;
+        let same = self.chunks.first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq == b.seq);
+        if !same {
+            return None;
+        }
+        let gone: Vec<Arc<str>> = was.metas().iter().take(left).map(|m| Arc::clone(&m.id)).collect();
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if let Some(first) = chunks.first_mut() {
+            *first = Arc::new(made);
+        }
+        self.len -= left;
+        self.first = chunks.first().map_or(0, |c| c.len());
+        self.page_newest();
+        Some(gone)
+    }
+
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Meta) -> bool) {
         let mut all = Vec::with_capacity(self.len);
         for c in self.chunks.iter() {
@@ -865,6 +912,32 @@ fn seal(chunk: &Arc<Chunk>, home: Option<Home>) {
         tx
     });
     let _ = packer.try_send((Arc::downgrade(chunk), home));
+}
+
+/// The chunk a copy's cut fell in (`cut`, compact: [`Events::drain_whole`]) made again of its events past its
+/// first `left`, read on the blocking pool (from its spill file when it's there), and handed to the copy's
+/// owner (`home`) to take in its turn ([`Shard::trimmed`]). One that can't be read is said, and its owner
+/// keeps it whole until its next cut.
+fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
+    drop(crate::rt::spawn(async move {
+        let was = Arc::clone(&cut);
+        let made = crate::rt::blocking(move || cut.evs().map(|evs| Chunk::of(evs.iter().skip(left).cloned().collect()))).await;
+        let made = match made {
+            Ok(Ok(made)) => made,
+            Ok(Err(e)) => {
+                tracing::warn!(session = %home.id, error = %e, "a session copy's packed events couldn't be read again: its oldest are kept till its next cut");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(session = %home.id, error = %format!("{e:#}"), "a session copy's oldest weren't let go of: kept till its next cut");
+                return;
+            }
+        };
+        if let Some(inbox) = home.inbox.upgrade() {
+            let id = Arc::clone(&home.id);
+            let _ = inbox.send(Msg::Run(Box::new(move |s: &mut Shard| s.trimmed(&id, &was, left, made)))).await;
+        }
+    }));
 }
 
 /// What tells a copy's owner to keep its chunks compact (goal 11): at once once one is packed, not at
@@ -1582,8 +1655,16 @@ impl Mirror {
             // Those let go leave the index, and the rest move down by as many: the index isn't
             // made again (a long session lets go of its oldest every thousand events or so). The
             // chunks after the cut stay as they were, packed; the one it fell in is made again, and
-            // packed in its turn.
-            let (gone, remade) = self.events.drain_front(drop);
+            // packed in its turn: off the shard where it's compact, taken in by its owner after (goal 9,
+            // plan 01a1a87b2cec step 3), its first ones kept till then.
+            let later = self.home().filter(|_| crate::rt::on_shard()).and_then(|home| self.events.drain_whole(drop).map(|d| (home, d)));
+            let (gone, remade) = match later {
+                Some((home, (gone, cut, left))) => {
+                    trim_later(home, cut, left);
+                    (gone, None)
+                }
+                None => self.events.drain_front(drop),
+            };
             for id in &gone {
                 self.index.remove(&**id);
             }
@@ -1725,6 +1806,30 @@ impl Shard {
                 }
             }
         }
+    }
+
+    /// The chunk session `id`'s cut fell in, made again off the shard of its events past its first `left`
+    /// (`made`; [`trim_later`]): taken in where it's still the copy's first as it was, those first ones let go
+    /// of and the rest moved down by as many in its index, the new chunk sealed to be packed in its turn, and
+    /// its readers given the view of it (goal 9, plan 01a1a87b2cec step 3). Else the copy keeps them till its
+    /// next cut.
+    fn trimmed(&mut self, id: &str, was: &Arc<Chunk>, left: usize, made: Chunk) {
+        let Some(m) = self.mirrors.get_mut(id) else { return };
+        let Some(gone) = m.events.trim_first(was, left, made) else { return };
+        for g in &gone {
+            if m.index.get(&**g).is_some_and(|at| *at < left) {
+                m.index.remove(&**g);
+            }
+        }
+        for at in m.index.values_mut() {
+            *at = at.saturating_sub(gone.len());
+        }
+        if m.events.chunks().len() > 1
+            && let Some(first) = m.events.chunks().first()
+        {
+            seal(first, m.home());
+        }
+        m.publish();
     }
 
     /// Lets go of session `id`'s copy: its last view says it's gone (before its viewers are told,
@@ -3122,5 +3227,120 @@ mod tests {
         let index = m.index.clone();
         m.reindex();
         assert_eq!(m.index, index, "its index made anew");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: letting go of a long copy's oldest where the cut falls in a compact chunk
+    /// reads nothing again at once: the chunks wholly before it go, and it stays as it was; made again of its rest
+    /// (as its owner has it read off the shard) and taken in, the copy holds what `drain_front` leaves, the chunks
+    /// past the cut the ones they were. A cut on a chunk's edge, or in one that isn't compact, is `drain_front`'s;
+    /// and one taken in after its chunk changed changes nothing.
+    #[test]
+    fn g9_s3_a_cut_in_a_compact_chunk_reads_nothing_again_at_once() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let texts = |e: &Events| e.iter().map(|e| e.entry.text().to_owned()).collect::<Vec<_>>();
+        let compact = |n: u64| -> anyhow::Result<Events> {
+            let mut events = Events::default();
+            for s in 1..=n {
+                let _ = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
+            }
+            for c in events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            events.compact(None);
+            Ok(events)
+        };
+        let cut = CHUNK + 5;
+        let mut events = compact(n)?;
+        let before = events.chunks().to_vec();
+        let mut want = events.clone();
+        let _ = want.drain_front(cut);
+        let was = inflated();
+        let (gone, chunk, left) = events.drain_whole(cut).ok_or_else(|| anyhow::anyhow!("a cut in a compact chunk is left for later"))?;
+        anyhow::ensure!(inflated() == was, "a chunk was read again at once");
+        anyhow::ensure!(gone.len() == CHUNK && left == 5 && before.get(1).is_some_and(|c| Arc::ptr_eq(c, &chunk)), "{} gone, {left} left", gone.len());
+        anyhow::ensure!(events.chunks().first().is_some_and(|c| Arc::ptr_eq(c, &chunk)) && events.len() == CHUNK * 3 + 9, "the chunk the cut fell in stays as it was");
+        // As its owner has it made again, off the shard.
+        let made = Chunk::of(chunk.evs()?.iter().skip(left).cloned().collect());
+        let trimmed = events.trim_first(&chunk, left, made).ok_or_else(|| anyhow::anyhow!("not taken in"))?;
+        anyhow::ensure!(trimmed.len() == left && texts(&events) == texts(&want) && events.len() == want.len(), "as drain_front leaves it");
+        anyhow::ensure!(events.chunks().iter().skip(1).zip(before.iter().skip(2)).all(|(a, b)| Arc::ptr_eq(a, b)), "past the cut, the chunks as they were");
+        // On a chunk's edge, and in the open chunk: drain_front's.
+        let mut edge = compact(n)?;
+        anyhow::ensure!(edge.drain_whole(CHUNK * 2).is_none() && edge.len() == usize::try_from(n)?, "a cut on an edge reads nothing again anyway");
+        anyhow::ensure!(edge.drain_whole(CHUNK * 4 + 3).is_none(), "nor one in the open chunk");
+        // Its chunk changed before it's taken in: nothing changes.
+        let mut changed = compact(n)?;
+        let (_, chunk, left) = changed.drain_whole(cut).ok_or_else(|| anyhow::anyhow!("left for later"))?;
+        anyhow::ensure!(changed.change(0, |e| e.at = 0), "an event in it changed");
+        let len = changed.len();
+        let made = Chunk::of(chunk.evs()?.iter().skip(left).cloned().collect());
+        anyhow::ensure!(changed.trim_first(&chunk, left, made).is_none() && changed.len() == len, "taken in after its chunk changed");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a long session's copy, past its bound, lets go of its oldest on its owner's
+    /// shard with no chunk read again there: the chunks before the cut go at once, and the one it fell in is made
+    /// again on the blocking pool and taken in by its owner after, which then holds what it held before, from the
+    /// same event, indexed where each is.
+    #[test]
+    fn g9_s3_a_long_copys_cut_is_made_again_off_its_owners_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            let bound = u64::try_from(MAX_EVENTS + MAX_EVENTS / 4)?;
+            let id = "long".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=bound {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                })
+                .await;
+            // One more, past the bound: from the first run's start after its 1001st (`run_after`), 1025 on.
+            let i = id.clone();
+            let at_once = copies
+                .on(&id, move |s| {
+                    let m = s.get_mut(&i)?;
+                    let was = inflated();
+                    m.rev += 1;
+                    m.upsert(entry(&format!("e{}", bound + 1), bound + 1));
+                    Some((inflated() - was, m.events.len(), m.events.meta(0).and_then(|x| x.seq)))
+                })
+                .await
+                .flatten();
+            let from = crate::wire::sums::run_after(1002);
+            let whole = usize::try_from(from - 1)? / CHUNK * CHUNK;
+            anyhow::ensure!(at_once == Some((0, usize::try_from(bound + 1)? - whole, u64::try_from(whole + 1).ok())), "{at_once:?}: read on the owner's shard, or not cut by whole chunks");
+            // Taken in once it's made again.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let i = id.clone();
+                let now = copies
+                    .on(&id, move |s| {
+                        let m = s.get_mut(&i)?;
+                        let seqs: Vec<u64> = m.events.metas().filter_map(|x| x.seq).collect();
+                        let index = m.index.clone();
+                        m.reindex();
+                        Some((seqs, index == m.index, m.index.get(format!("e{}", bound + 1).as_str()).copied()))
+                    })
+                    .await
+                    .flatten();
+                if let Some((seqs, indexed, newest)) = now
+                    && seqs.first() == Some(&from)
+                {
+                    anyhow::ensure!(seqs == (from..=bound + 1).collect::<Vec<_>>() && indexed && newest == Some(seqs.len() - 1), "{indexed} {newest:?} {seqs:?}");
+                    return Ok(());
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the chunk the cut fell in was never taken in");
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
     }
 }

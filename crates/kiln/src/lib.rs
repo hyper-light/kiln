@@ -49,6 +49,7 @@ pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod net;
+pub mod net_budget;
 pub mod observe;
 pub mod overload;
 pub mod ops;

@@ -32,12 +32,18 @@ pub fn install(hub: &Arc<Hub>) {
         crate::rt::spawn_spread(async move {
             while let Ok(Receipt { given, receipt, came_from }) = rx.recv().await {
                 let Some(hub) = w.upgrade() else { return };
-                // The runner's hand-on as the batch carried it, then kiln's receipt of what came,
-                // signed off the shards (goal 9, plan 01a1a87b2cec step 3) in the job that reads it (step 5).
-                kept(&hub, given, &came_from).await;
-                match super::sign_and_take(&hub.store, &hub.pki, receipt, "kiln", crate::util::now_unix()).await {
-                    Ok((_, taken)) => said(taken, "kiln"),
-                    Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
+                // The runner's hand-on as the batch carried it, then kiln's receipt of what came, signed
+                // off the shards (goal 9, plan 01a1a87b2cec step 3): both read in one job, kept in one
+                // call (step 5).
+                match super::take_batch(&hub.store, &hub.pki, given, &came_from, receipt, crate::util::now_unix()).await {
+                    Ok((given, receipt)) => {
+                        said(given, &came_from);
+                        match receipt {
+                            Ok(taken) => said(taken, "kiln"),
+                            Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a record of a conversation feed's batch couldn't be kept"),
                 }
             }
         });
@@ -47,12 +53,6 @@ pub fn install(hub: &Arc<Hub>) {
         let w = Arc::downgrade(hub);
         mirrors.sign_with(Arc::new(move |machine: &str, peer: crate::convo::mirror::Peer| Arc::new(ToMirror { hub: w.clone(), machine: machine.to_owned(), peer }) as Arc<dyn Custodian>));
     }
-}
-
-/// Keeps `bundle`, as it came over `came_from`, saying so where kiln can't: handed over, not copied (goal 9, plan
-/// 01a1a87b2cec step 5).
-async fn kept(hub: &Hub, bundle: Value, came_from: &str) {
-    said(super::take_owned(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, crate::util::now_unix()).await, came_from);
 }
 
 /// What became of a record of a conversation feed's batch, as it came over `came_from`, said where kiln couldn't take it.

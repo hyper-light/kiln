@@ -1249,6 +1249,23 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   compact), and the index lets go of the rest alone. g9p6's fill doesn't have it (its server is fresh);
   its Opens held up to 10.6 ms with hogs and 0.22 ms calm, a line written to stdout under its lock among
   their work, now the log's writer's.
+- **g9p7's paths (train 7's tree), each moved or cut** (`write /api/mcp`'s is goal 10's: `agents.list` and its
+  answer in turns of their own):
+  - The net loop's `Identity` (about 50 a fill, 0.2 ms each calm, to 3 ms with hogs): its certificate is made
+    on the compute pool (the CSR's check, the CA's signature, its fingerprints: `identities::certify`), and
+    a leg's delegation signed on the blocking pool (the server's key is read from its files for each).
+  - The owners' `Update::Events` (6 to 20 ms the round's longest calm, where `Update::State` on the same
+    shards held 1.3 to 4.8): a long copy letting go of its oldest (every thousand events) read the chunk
+    its cut fell in back from its spill file, inflated and parsed it on the owner's shard. The chunks
+    before the cut go at once now, and that one is made again on the blocking pool and taken in by its
+    owner after (`Events::drain_whole`, `trim_first`).
+  - The mirrors' feed (2.3 ms median calm): what the mirror has is left out of a batch in the compute job
+    that writes it, not row by row on the shard; the feed takes its turns between what waits in its queue.
+  - Custody: a waiting record's two loads share kiln's root and the revocations with their compute jobs,
+    not copies made on the shard (a list growing by one with each certificate kiln supersedes).
+  - The server's own tasks: push parses a `harness` frame's info on the compute pool (1 to 6 ms calm);
+    the fleet's `builds.json` is written by the kept files' writer and read first on the blocking pool;
+    observe's sender takes turns (a replica catching up was sent in one poll).
 
 ### Step 3's check
 

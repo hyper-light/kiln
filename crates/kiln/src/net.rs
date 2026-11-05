@@ -35,10 +35,11 @@ use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::{Driver, Io};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, Tls};
 use hyper_transport::{
-    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
-    PeerId, RECEIVE_CHUNK, Refusal, StreamCredit,
+    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Limits, PeerId,
+    RECEIVE_CHUNK, Refusal, StreamCredit,
 };
 
+use crate::net_budget::Spares;
 use crate::pki::Leaf;
 
 /// The server is always peer 1 from an agent's point of view.
@@ -340,7 +341,7 @@ impl Named for AgentBook {
 }
 
 /// What `ep` measures now: its counts, and each named peer it has a connection to.
-fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Fixed, D>) -> QuicSample {
+fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> QuicSample {
     let st = ep.stats();
     let mut out = QuicSample {
         connections: st.connections as u64,
@@ -651,8 +652,8 @@ enum Dial {
     Connected,
 }
 
-type ServerDriver = Driver<Kiln, Fixed, ServerBook>;
-type AgentDriver = Driver<Kiln, Fixed, AgentBook>;
+type ServerDriver = Driver<Kiln, Spares, ServerBook>;
+type AgentDriver = Driver<Kiln, Spares, AgentBook>;
 
 enum AnyDriver {
     Server(ServerDriver),
@@ -672,7 +673,8 @@ macro_rules! with_driver {
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    let budget = Fixed::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {

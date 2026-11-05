@@ -194,28 +194,35 @@ async fn take_read(store: &Store, root: &[u8], org: &str, bundle: std::sync::Arc
             Looked::Again(digest) => return Ok(Ok(Taken { digest, again: true, broke: None })),
             Looked::New { taken, wanted, waiting } => (taken, wanted, waiting),
         };
-        let broke = match own {
-            Own::Unchecked => None,
-            Own::Alone(found) => found,
-            Own::Waits { checked, wanted } => {
-                let (root, revocations, org, d) = (std::sync::Arc::clone(&root), std::sync::Arc::clone(&revoked.list), org.to_owned(), taken.clone());
-                crate::rt::compute(move || broken(&d, *checked, checked_rows(wanted_rows, &root, &revocations), &wanted, &org)).await?
-            }
-        };
-        let broke = match broke {
-            Some((b, around, relay)) => {
-                record_break(store, &taken, &b, &around, &relay, at).await?;
-                Some(b.to_string())
-            }
-            None => None,
-        };
-        // The records that waited for it: a custody record's followers, or, a delegation, the records taken for
-        // someone under it (they come from other machines, in any order), each checked now.
-        for waiting in waiting {
-            check(store, &root, org, &waiting, &revoked.list, at).await?;
-        }
-        return Ok(Ok(Taken { digest: taken, again: false, broke }));
+        return settle(store, &root, org, &revoked, own, None, taken, wanted_rows, waiting, at).await.map(Ok);
     }
+}
+
+/// What follows a record kept new ([`take`]): its own hop, checked as `own` leaves it (or `found`, checked already with the
+/// records it follows as read: [`take_batch`]), with `wanted_rows` the rows of the records it needs that kiln has; a break
+/// recorded; then the records that waited for it (`waiting`: a custody record's followers, or, a delegation, the records
+/// taken for someone under it, which come from other machines in any order), each checked now.
+#[allow(clippy::too_many_arguments)]
+async fn settle(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, revoked: &crate::identities::Revoked, own: Own, found: Option<Option<Broken>>, taken: String, wanted_rows: Vec<(String, String, i64)>, waiting: Vec<String>, at: i64) -> anyhow::Result<Taken> {
+    let broke = match (found, own) {
+        (Some(found), _) | (None, Own::Alone(found)) => found,
+        (None, Own::Unchecked) => None,
+        (None, Own::Waits { checked, wanted }) => {
+            let (root, revocations, org, d) = (std::sync::Arc::clone(root), std::sync::Arc::clone(&revoked.list), org.to_owned(), taken.clone());
+            crate::rt::compute(move || broken(&d, *checked, checked_rows(wanted_rows, &root, &revocations), &wanted, &org)).await?
+        }
+    };
+    let broke = match broke {
+        Some((b, around, relay)) => {
+            record_break(store, &taken, &b, &around, &relay, at).await?;
+            Some(b.to_string())
+        }
+        None => None,
+    };
+    for waiting in waiting {
+        check(store, root, org, &waiting, &revoked.list, at).await?;
+    }
+    Ok(Taken { digest: taken, again: false, broke })
 }
 
 /// A statement as [`take`] reads it ([`read`]): its digest ("" when it can't be read), and what kiln makes of it.
@@ -273,12 +280,109 @@ async fn read(bundle: &std::sync::Arc<Value>, root: &std::sync::Arc<[u8]>, revoc
 
 /// [`read`], on the thread it's called on: a compute job's.
 fn read_now(bundle: &Value, root: &[u8], revocations: &[Revocation], came_from: String, at: i64, org: &str) -> Read {
+    read_keeping(bundle, root, revocations, came_from, at, org, false).0
+}
+
+/// [`read_now`], and with `keep`, the statement as it checked, when it did (what the next record's hop needs of it, when
+/// both are taken together: [`take_batch`]).
+fn read_keeping(bundle: &Value, root: &[u8], revocations: &[Revocation], came_from: String, at: i64, org: &str, keep: bool) -> (Read, Option<Checked>) {
     let (digest, envelope) = (digest_of(bundle), bundle.to_string());
+    let mut checked = None;
     let verdict = match statement::verify(bundle, root, revocations, at) {
-        Ok(c) => verdict_of(c, envelope, came_from, org),
+        Ok(c) => {
+            if keep {
+                checked = Some(c.clone());
+            }
+            verdict_of(c, envelope, came_from, org)
+        }
         Err(e) => Verdict::Unsigned { why: e.to_string(), signer: statement::verify(bundle, root, &[], at).map(|c| c.custodian).unwrap_or_default(), envelope },
     };
-    Read { digest, verdict }
+    (Read { digest, verdict }, checked)
+}
+
+/// What [`take`] made of a record ([`take_batch`]'s each).
+pub type TakeOutcome = anyhow::Result<Result<Taken, Refused>>;
+
+/// A conversation feed's batch as kiln's intake keeps its two records (goal 9, plan 01a1a87b2cec step 5): the runner's
+/// hand-on `given`, as it came over `came_from`, then kiln's receipt of it, `receipt`, signed here; each taken as [`take`]
+/// takes it, in that order. Both are read in one job on the compute pool (the receipt signed in it, and its hop checked
+/// with the hand-on as it was read, which is what kiln keeps of it, kept now), and kept in one call to the store's thread,
+/// one write: two waits for the shard where [`take`] and [`sign_and_take`] made five, and one write where they made two
+/// (each write a cluster group entry for every learner). What isn't the usual goes one at a time, as [`take`] has it: either
+/// refused, a revocation added since, the receipt's hop needing more than the hand-on, or the hand-on kept before (its
+/// copy kiln keeps may be signed apart). Each one's outcome, the receipt's an error when it couldn't be signed (the hand-on
+/// taken all the same); an error for both only when the store's revocations couldn't be read.
+pub async fn take_batch(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>, given: Value, came_from: &str, receipt: statement::Statement, at: i64) -> anyhow::Result<(TakeOutcome, anyhow::Result<TakeOutcome>)> {
+    let revoked = crate::identities::revoked(store).await?;
+    let org = pki.organization();
+    let given = std::sync::Arc::new(given);
+    let (signer, revocations, came, of, hand_on) = (std::sync::Arc::clone(pki), std::sync::Arc::clone(&revoked.list), came_from.to_owned(), org.clone(), std::sync::Arc::clone(&given));
+    let (read_given, signed) = crate::rt::compute(move || {
+        let (read_given, given_checked) = read_keeping(&hand_on, &signer.ca_der, &revocations, came, at, &of, true);
+        let signed = server_signed(&signer, &receipt).map(|b| {
+            let signed = std::sync::Arc::new(b);
+            let read_receipt = read_now(&signed, &signer.ca_der, &revocations, "kiln".to_owned(), at, &of);
+            // The receipt's hop with the hand-on as it checked: what kiln keeps of it once kept now, read back.
+            let together = match (&read_receipt.verdict, given_checked) {
+                (Verdict::Custody { own: Own::Waits { checked, wanted }, .. }, Some(g)) if wanted.len() == 1 && wanted.first() == Some(&g.digest) => {
+                    let map = BTreeMap::from([(g.digest.clone(), g)]);
+                    Some(broken(&checked.digest, (**checked).clone(), map, wanted, &of))
+                }
+                _ => None,
+            };
+            (signed, read_receipt, together)
+        });
+        (read_given, signed)
+    })
+    .await?;
+    let root = std::sync::Arc::<[u8]>::from(&*pki.ca_der);
+    let (signed, read_receipt, together) = match signed {
+        Ok(signed) => signed,
+        // Not signed: the hand-on is taken alone, as before kiln signed its receipt in the same job.
+        Err(e) => return Ok((take_read(store, &root, &org, given, Some((read_given, revoked)), came_from, at).await, Err(e))),
+    };
+    let (given_read, receipt_read) = match (read_given, read_receipt) {
+        (Read { digest: d1, verdict: Verdict::Custody { kind: k1, rows: r1, own: o1 } }, Read { digest: d2, verdict: Verdict::Custody { kind: k2, rows: r2, own: o2 } }) => ((d1, k1, r1, o1), (d2, k2, r2, o2)),
+        // Either refused: each taken alone, as `take` takes it, from what was read.
+        (read_given, read_receipt) => {
+            let first = take_read(store, &root, &org, given, Some((read_given, std::sync::Arc::clone(&revoked))), came_from, at).await;
+            let second = take_read(store, &root, &org, signed, Some((read_receipt, revoked)), "kiln", at).await;
+            return Ok((first, Ok(second)));
+        }
+    };
+    let ((given_digest, given_kind, given_rows, given_own), (receipt_digest, receipt_kind, receipt_rows, receipt_own)) = (given_read, receipt_read);
+    let first = Keeping { digest: given_digest, rows: *given_rows, wanted: given_own.wanted().to_vec(), delegation: given_kind.is_none() };
+    let second = Keeping { digest: receipt_digest, rows: *receipt_rows, wanted: receipt_own.wanted().to_vec(), delegation: receipt_kind.is_none() };
+    let stamp = revoked.stamp;
+    let both = match store.call(move |c| keep_both(c, stamp, first, second)).await {
+        Ok(both) => both,
+        Err(e) => {
+            let second = anyhow::anyhow!("{e:#}");
+            return Ok((Err(e), Ok(Err(second))));
+        }
+    };
+    let Some((given_looked, receipt_looked)) = both else {
+        // A revocation was added since they were read: each read again and taken alone, as `take` takes it.
+        let first = take_read(store, &root, &org, given, None, came_from, at).await;
+        let second = take_read(store, &root, &org, signed, None, "kiln", at).await;
+        return Ok((first, Ok(second)));
+    };
+    // The hand-on kept just now is what the receipt's hop was checked with; one kept before is read back, as `take` reads it.
+    let together = together.filter(|_| matches!(given_looked, Looked::New { .. }));
+    let first = taken_now(store, &root, &org, &revoked, given_own, None, given_looked, at).await;
+    let second = taken_now(store, &root, &org, &revoked, receipt_own, together, receipt_looked, at).await;
+    Ok((first, Ok(second)))
+}
+
+/// What became of one record [`keep_both`] kept or found ([`take_batch`]): settled when new ([`settle`]).
+#[allow(clippy::too_many_arguments)]
+async fn taken_now(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, revoked: &crate::identities::Revoked, own: Own, found: Option<Option<Broken>>, looked: Looked, at: i64) -> TakeOutcome {
+    match looked {
+        Looked::New { taken, wanted, waiting } => settle(store, root, org, revoked, own, found, taken, wanted, waiting, at).await.map(Ok),
+        Looked::Again(digest) => Ok(Ok(Taken { digest, again: true, broke: None })),
+        // Not one `keep_both` says of a record: it looks at the revocations for both, first.
+        Looked::Stale => Err(anyhow::anyhow!("its keeping found the revocations stale")),
+    }
 }
 
 /// kiln's server's own record `s` (a receipt of a feed's batch, a hand-on of one), signed and read for [`take`] in one
@@ -348,20 +452,59 @@ enum Looked {
 /// read, and the records that waited for it found: a custody record's followers, or a `delegation`'s records under it.
 fn keep_and_look(c: &mut rusqlite::Connection, stamp: Option<crate::identities::Stamp>, digest: &str, rows: Rows, wanted: &[String], delegation: bool) -> anyhow::Result<Looked> {
     // One kiln has is answered as such first, whatever the revocations now (as it was judged when taken).
-    if !digest.is_empty() && kept_on(c, digest)? {
+    if has(c, digest)? {
         return Ok(Looked::Again(digest.to_owned()));
     }
-    if let Some(s) = stamp
-        && crate::identities::revoked_stamp(c)? != s
-    {
+    if stale(c, stamp)? {
         return Ok(Looked::Stale);
     }
+    keep_looking(c, rows, wanted, delegation)
+}
+
+/// Whether kiln has the statement by `digest` ("": one that couldn't be read, which it hasn't).
+fn has(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<bool> {
+    Ok(!digest.is_empty() && kept_on(c, digest)?)
+}
+
+/// Whether a revocation was added since the revocations stamped `stamp` were read (none: not looked at).
+fn stale(c: &rusqlite::Connection, stamp: Option<crate::identities::Stamp>) -> rusqlite::Result<bool> {
+    Ok(match stamp {
+        Some(s) => crate::identities::revoked_stamp(c)? != s,
+        None => false,
+    })
+}
+
+/// `rows` kept, then what [`Looked::New`] says of them: the rows of `wanted`, and the records that waited for it.
+fn keep_looking(c: &rusqlite::Connection, rows: Rows, wanted: &[String], delegation: bool) -> anyhow::Result<Looked> {
     let taken = rows.digest.clone();
     if !keep_on(c, rows)? {
         return Ok(Looked::Again(taken));
     }
     let waiting = if delegation { under_on(c, &taken)? } else { followers_on(c, &taken)? };
     Ok(Looked::New { wanted: rows_on(c, wanted)?, waiting, taken })
+}
+
+/// One record as [`keep_both`] keeps it: the digest it's read by, its rows, the records its hop needs, and whether it's a
+/// delegation.
+struct Keeping {
+    digest: String,
+    rows: Rows,
+    wanted: Vec<String>,
+    delegation: bool,
+}
+
+/// [`keep_and_look`] for two records in turn, in one call and one write ([`take_batch`]): each one kiln has is answered as
+/// such; then, if either is new, none is kept when a revocation was added since `stamp` (none returned); else each new one
+/// kept and looked around in turn, the first's followers found before the second is kept.
+fn keep_both(c: &mut rusqlite::Connection, stamp: crate::identities::Stamp, first: Keeping, second: Keeping) -> anyhow::Result<Option<(Looked, Looked)>> {
+    let (had_first, had_second) = (has(c, &first.digest)?, has(c, &second.digest)?);
+    if !(had_first && had_second) && stale(c, Some(stamp))? {
+        return Ok(None);
+    }
+    let keep = |had: bool, k: Keeping| if had { Ok(Looked::Again(k.digest)) } else { keep_looking(c, k.rows, &k.wanted, k.delegation) };
+    let first = keep(had_first, first)?;
+    let second = keep(had_second, second)?;
+    Ok(Some((first, second)))
 }
 
 /// The records that act under delegation `digest`.
@@ -1304,17 +1447,19 @@ fn followers_on(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<Vec<
 
 /// The records kiln has among `digests`, each checked as of when kiln took it (a revocation
 /// since doesn't undo it).
-async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation]) -> anyhow::Result<BTreeMap<String, Checked>> {
+async fn load(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>) -> anyhow::Result<BTreeMap<String, Checked>> {
     load_with(store, root, digests, revocations, |records| records).await
 }
 
 /// [`load`], with `then` made of the records in the same job on the compute pool, off the shards, and the records let
-/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]).
-async fn load_with<T: Send + 'static>(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation], then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
+/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]). The root and
+/// the revocations go to it shared, not copied: each of a waiting record's two loads copied every revocation on its
+/// shard (goal 9, plan 01a1a87b2cec step 3).
+async fn load_with<T: Send + 'static>(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>, then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
     let wanted = digests.to_vec();
     let rows = store.call(move |c| Ok(rows_on(c, &wanted)?)).await?;
     // Each checked again as of when kiln took it, on the compute pool, off the shards (`read`).
-    let (root, revocations) = (root.to_vec(), revocations.to_vec());
+    let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
     crate::rt::compute(move || then(checked_rows(rows, &root, &revocations))).await
 }
 
@@ -1380,7 +1525,7 @@ fn broken(d: &str, mine: Checked, mut map: BTreeMap<String, Checked>, needed: &[
 /// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
 /// delegation it acts under (W27-R08: another machine's, which comes in any order). Its records are
 /// read and its hop walked on the compute pool, with their loads ([`load_with`]).
-async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
+async fn check(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, digest: &str, revocations: &std::sync::Arc<[Revocation]>, at: i64) -> anyhow::Result<Option<String>> {
     let d = digest.to_owned();
     let wants = load_with(store, root, std::slice::from_ref(&d), revocations, {
         let d = d.clone();
@@ -1682,7 +1827,8 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
 /// [`chain`], and the digests of the records it read.
 async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) -> anyhow::Result<Option<(Value, Vec<String>)>> {
     let Some(from) = start(store, digest).await? else { return Ok(None) };
-    let revocations = crate::identities::revocations(store).await?;
+    let (root, revocations): (std::sync::Arc<[u8]>, std::sync::Arc<[Revocation]>) = (root.into(), crate::identities::revocations(store).await?.into());
+    let root = &root;
     let mut map: BTreeMap<String, Checked> = BTreeMap::new();
     let mut frontier = vec![from.clone()];
     while !frontier.is_empty() && map.len() < WALK_MAX {
@@ -2095,6 +2241,17 @@ mod tests {
     use rcgen::SigningKey as _;
 
     const ORG: &str = "hyper-light";
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a record that waited for this one is checked with kiln's root and every
+    /// revocation handed to its loads' compute jobs as they're shared, not copied on its shard for each of its two
+    /// loads (a list that grows by one with each certificate kiln supersedes). What the check finds is the W27 tests'.
+    #[test]
+    fn g9_s3_a_checks_loads_share_the_root_and_revocations() {
+        let code: String = include_str!("custody.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let load_with = code.split("async fn load_with<").nth(1).and_then(|rest| rest.split("\nfn rows_on(").next()).unwrap_or_default();
+        assert!(load_with.contains("Arc::clone(root)") && load_with.contains("Arc::clone(revocations)"), "{load_with}");
+        assert!(!load_with.contains("root.to_vec()") && !load_with.contains("revocations.to_vec()"), "{load_with}");
+    }
     const FEDORA: &str = "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed";
     const JUPITER: &str = "kiln://hyper-light/person/ada/machine/jupiter/instance/01a18b00";
     const LEFT: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/0/machine/fedora/instance/01a14c4f";
@@ -2285,6 +2442,53 @@ mod tests {
             assert_eq!((store.asked() - before, taken.again, taken.broke.as_deref()), (1, false, None));
             assert_eq!(digest_of(&bundle), taken.digest, "the bundle it signed is the one kept");
             assert!(kept(&store, &taken.digest).await?);
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a feed's batch's two records (the runner's hand-on, kiln's receipt of it) are read
+    /// in one job and kept in one call to the store's thread, and come out as taking them one at a time does: the same
+    /// digests and breaks (the receipt's hop checked with the hand-on as it was read), the same rows; taken again, both again.
+    #[test]
+    fn g9_s5_a_batchs_two_records_are_one_call_and_come_out_as_one_at_a_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            let org = pki.organization();
+            let (server, fedora_uri, jupiter_uri) = (server_uri(&org), FEDORA.replace(ORG, &org), JUPITER.replace(ORG, &org));
+            let fedora = Signer::new(&pki, &fedora_uri)?;
+            let at = crate::util::now_unix();
+            // A batch handed on to kiln (its receipt's hop holds), and one handed on to jupiter that kiln took (it breaks).
+            for (to, breaks) in [(&server, false), (&jupiter_uri, true)] {
+                let batch = thing("conversation store s1 after 0 through 9", 'f');
+                let given = fedora.sign(&record(Kind::HandedOn, &batch, Some(to.as_str()), None, &[], "feed", 1))?;
+                let receipt = || {
+                    let b = Body { from: Some(fedora_uri.clone()), why: "a test".into(), ..Body::new(Kind::Received, &server) };
+                    Statement { subject: vec![batch.clone()], follows: vec![digest_of(&given)], ..Statement::new(to_value(&b)) }
+                };
+                let (one, two) = (Store::in_memory()?, Store::in_memory()?);
+                for s in [&one, &two] {
+                    crate::identities::own_identities(s, &pki).await?;
+                    crate::identities::revoked(s).await?;
+                }
+                let before = one.asked();
+                let (g, r) = take_batch(&one, &pki, given.clone(), "runner fedora-2", receipt(), at).await?;
+                let (g, r) = (kiln_or(g?)?, kiln_or(r??)?);
+                if !breaks {
+                    assert_eq!(one.asked() - before, 1, "both kept in one call");
+                }
+                let g2 = kiln_or(take(&two, &pki.ca_der, &org, &given, "runner fedora-2", at).await?)?;
+                let r2 = kiln_or(sign_and_take(&two, &pki, receipt(), "kiln", at).await?.1?)?;
+                assert_eq!((&g, &r), (&g2, &r2), "as taking them one at a time");
+                assert_eq!((g.broke.is_some(), r.broke.is_some()), (false, breaks), "{r:?}");
+                for s in [&one, &two] {
+                    assert_eq!((count(s, "custody").await?, count(s, "custody_follows").await?, count(s, "custody_breaks").await?), (2, 1, i64::from(breaks)));
+                }
+                // The same batch again: both again, nothing more kept.
+                let (g, r) = take_batch(&one, &pki, given.clone(), "runner fedora-2", receipt(), at).await?;
+                assert!(kiln_or(g?)?.again && kiln_or(r??)?.again);
+                assert_eq!(count(&one, "custody").await?, 2);
+            }
             Ok(())
         })
     }

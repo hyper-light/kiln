@@ -329,7 +329,12 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
     let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
+    // Its turns on its shard: what waits in its queue is taken without waiting (a commit's nudges pile up while its
+    // window is full, 20 a second for as long as its taker is slow), so it's given up between them once its turn would
+    // pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+    let mut turns = crate::rt::Turns::new();
     loop {
+        turns.after().await;
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(ev)) => Some(ev),
             Ok(Err(_)) => return,
@@ -419,20 +424,22 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
             if batch.rows.is_empty() {
                 break;
             }
-            // What the taker has already is left out; the batch still says through where it read.
-            if let Some(skip) = &skip {
-                batch.rows.retain(|c| !skip(c.rev));
-            }
             // Its JSON and the SHA-256 of it made on the compute pool (goal 3, plan 01a1a59c2a8e step 3): a
-            // batch of up to two MiB, written out and hashed on the shard, held it all the while.
-            let (upto, rows) = (batch.upto, batch.rows.len());
-            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String)> {
+            // batch of up to two MiB, written out and hashed on the shard, held it all the while. What the taker
+            // has already is left out there first, the rows let go of there too: a mirror's batch asked of each
+            // of its up to tens of thousands of rows whether it had it, on the shard (goal 9, plan 01a1a87b2cec
+            // step 3). The batch still says through where it read.
+            let (upto, skip) = (batch.upto, skip.clone());
+            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)> {
+                if let Some(skip) = &skip {
+                    batch.rows.retain(|c| !skip(c.rev));
+                }
                 let json = serde_json::to_vec(&batch)?;
                 let digest = crate::util::sha256_hex(&json);
-                Ok((json, digest))
+                Ok((json, digest, batch.rows.len()))
             })
             .await;
-            let (mut json, digest) = match encoded {
+            let (mut json, digest, rows) = match encoded {
                 Ok(Ok(e)) => e,
                 Ok(Err(e)) | Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
@@ -1611,6 +1618,19 @@ mod tests {
             assert_eq!(ids, vec!["m1".to_owned(), "m3".to_owned()]);
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a mirror has already is left out of a batch on the compute pool, in the
+    /// job that writes its JSON and digest, its rows let go of there, not asked of row by row on the feed's shard; and
+    /// the feed takes its turns between what waits in its queue. What it leaves out, and that its taker still goes
+    /// through it, is `a_shipper_leaves_out_what_the_taker_has_and_still_goes_through_it`'s.
+    #[test]
+    fn g9_s3_a_batch_is_left_out_of_off_the_shard() {
+        let code: String = include_str!("feed.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let ship = code.split("async fn ship(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+        let (on_shard, in_job) = ship.split_once("crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)>").unwrap_or_default();
+        assert!(!on_shard.is_empty() && !on_shard.contains("skip(c.rev)") && in_job.contains("skip(c.rev)"), "{ship}");
+        assert!(on_shard.contains("turns.after().await"), "its turns: {ship}");
     }
 
     /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.
