@@ -151,8 +151,9 @@ lab.stream = function stream(op) {
   } else if (op.carrier === "sse") {
     const es = new EventSource(url);
     es.onmessage = (ev) => {
-      if (op.json !== false) JSON.parse(ev.data);
-      take(ev.data, ev.data.length);
+      // A terminal's or a log's text comes as a JSON string (origin.mjs): its bytes as sent.
+      const text = JSON.parse(ev.data);
+      take(op.json !== false ? ev.data : String(text), ev.data.length);
     };
     es.onerror = () => {
       if (!lab.closing) err(op.name, "event source error");
@@ -174,8 +175,8 @@ lab.stream = function stream(op) {
           const line = rest.slice(0, nl);
           rest = rest.slice(nl + 1);
           if (!line) continue;
-          if (op.json !== false) JSON.parse(line);
-          take(line, line.length + 1);
+          const text = JSON.parse(line);
+          take(op.json !== false ? line : String(text), line.length + 1);
         }
       }
     })().catch((e) => {
@@ -193,16 +194,26 @@ lab.stream = function stream(op) {
 lab.requests = function requests(op) {
   const start = performance.now() + (op.start_in_ms || 200);
   const timers = [];
+  // Every scheduled request until it has its answer (or its error): what is left when the job
+  // closes is a miss, its wait until then counted (open loop: every scheduled request counts).
+  const pending = new Map();
   op.schedule_ms.forEach((at, i) => {
     const due = start + at;
+    const sched = (performance.timeOrigin + due) * 1000 + lab.offsetUs;
+    const req = op.requests[i % op.requests.length];
+    pending.set(i, { op: req.name, sched });
     timers.push(
       setTimeout(async () => {
-        const sched = (performance.timeOrigin + due) * 1000 + lab.offsetUs;
-        const req = op.requests[i % op.requests.length];
-        // A write's id is new each time and every link's its own, as every UI's are (`{id}` in its
-        // body): ten characters, as long as the recorded UI's (`lab-rec-12`), so the answer, which
-        // carries it twice, is the same size; a repeated id would be answered as a repeat.
-        const id = `l${op.client ?? 0}${(i + 1).toString(36).padStart(8, "0")}`;
+        // An answer after the job closed was already counted as a miss.
+        const note = (s) => {
+          if (!pending.delete(i)) return;
+          lab.samples.push(s);
+        };
+        // A write's id is new each time, every link's and every job's its own, as every UI's are
+        // (`{id}` in its body): ten characters, as long as the recorded UI's (`lab-rec-12`), so the
+        // answer, which carries it twice, is the same size; a repeated id (another job's against
+        // the same server) would be answered as a repeat, `"repeat":true` 14 bytes longer.
+        const id = `l${(op.client ?? 0).toString(36)}${(op.job ?? 0).toString(36).padStart(3, "0")}${(i + 1).toString(36).padStart(5, "0")}`;
         const body = req.body ? req.body.replaceAll("{id}", id) : undefined;
         try {
           if (req.ws_snapshot) {
@@ -238,7 +249,12 @@ lab.requests = function requests(op) {
       }, Math.max(0, due - performance.now())),
     );
   });
-  lab.open.push(() => timers.forEach(clearTimeout));
+  lab.open.push(() => {
+    timers.forEach(clearTimeout);
+    const at = nowUs();
+    for (const p of pending.values()) lab.samples.push({ op: p.op, case: op.case, sched_us: Math.round(p.sched), at_us: Math.round(at), lat_us: Math.round(at - p.sched), app_bytes: 0, ok: false, missed: true });
+    pending.clear();
+  });
 };
 
 /** What came since the last drain. */

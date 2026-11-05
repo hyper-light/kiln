@@ -187,12 +187,17 @@ and fetch for kiln today; Server-Sent Events, streaming fetch and fetch for the 
   page's handler having the parsed frame. A request runs from its scheduled time to its parsed
   body: requests go on a fixed open-loop schedule, each at its time whether or not those before it
   were answered, so a stall counts in full for every request behind it (no coordinated omission:
-  f35). The page's clock (`timeOrigin + now()`, cross-origin isolated, so 5 µs fine) is calibrated
-  against the server's each job by 200 WebSocket echoes over the unshaped control pair (to the
-  lab's control echo, `crates/kiln-lab/web/control.mjs`), taking the offset of the echo with the
-  least round trip (f29). Its residual is the calibration taken again the same way, in 10 groups of
-  20 more echoes: how far each group's offset lies from the one the page uses (each echo's own
-  offset, off by up to half its round trip, is kept beside it). Chromium runs with Local Network
+  f35). The page's clock (`timeOrigin + now()`, cross-origin isolated) is calibrated against the
+  server's each job by 200 WebSocket echoes over the unshaped control pair (to the lab's control
+  echo, `crates/kiln-lab/web/control.mjs`), taking the offset of the echo with the least round trip
+  (f29). Its residual is the calibration taken again the same way, in 10 groups of 40 more echoes
+  interleaved (echo i in group i mod 10, so each group spans the whole check): how far each group's
+  offset lies from the one the page uses (each echo's own offset, off by up to half its round trip,
+  is kept beside it). Each job records its page's timer grain (`timer_grain_us`: the smallest step
+  `performance.now()` takes): 5 µs in Chromium, and 1,000 µs in WebKit 27.2 even cross-origin
+  isolated, so **WebKit's time cells resolve to 1 ms**: its calibration, and every time it
+  measures, is a whole number of milliseconds on the page's side. The calibration's limit is
+  200 µs, or the job's grain where that is coarser (1 ms in WebKit: plan v5's step 4). Chromium runs with Local Network
   Access off (`--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets`):
   the control echo is on another private address than the page's origin, which Chromium would
   otherwise hold for a permission; the target's own operations are all same-origin.
@@ -223,19 +228,40 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   pilot's first jobs at K = 8, on the lab machine at a load of about 67 with no core idle, the worst
   job's was 232 µs and the median job's 75 µs: on a busy machine eight browsers' echoes wait for a
   core, so the matrix's good-link times carry up to a quarter of a millisecond of clock error. With
-  groups of 40 echoes (2026-11-05, K = 8, `check4b`) Chromium's worst job was 26 µs and 226 µs in two
-  jobs, WebKit's (in the image) 606 µs and 662 µs: WebKit's residual stands above 200 µs;
+  groups of 40 echoes taken back to back (2026-11-05, K = 8, `check4b`) Chromium's worst job was
+  26 µs and 226 µs in two jobs, WebKit's (in the image) 606 µs and 662 µs. Both have a cause, read
+  from the jobs' echoes:
+  - WebKit's page timer steps by 1 ms (`timer_grain_us` 1000, cross-origin isolated; Chromium's
+    5 µs; a 5 s job on one link, `~/.cache/kiln-bp/g1/grain`): its round trips read 0 or 1,000 µs,
+    so an offset from them is off by up to a millisecond whatever the link does. WebKit's residuals
+    (20 to 662 µs, within its grain) are its timer's, and its limit is its grain (plan v5);
+  - Chromium's 226 µs was one group of ten, in one job: every one of its 40 echoes took 745 µs or
+    more (the job's least 100 µs), a run of echoes all waiting for a core on the loaded machine, so
+    the group's least round trip was a slow one too. The groups are now interleaved across the
+    check (echo i in group i mod 10), so a stretch of waiting takes a few echoes from every group
+    and no group's least round trip;
 - capture against counters: 0.00% apart in all six jobs (2.1 MB to 15.8 MB each);
 - the probe's sizes above the transport against the real UI's, where the UI's payloads were the
   same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
   terminal's frames 0.1% apart; the message to an agent's answer was 3.7% apart with one id for
   every message, and 8.3% apart (169 bytes against 156) with a new id each time as the UI sends
-  them. Then (2026-11-05, K = 8, ids unique to each link, `~/.cache/kiln-bp/g1/check4b`) 162.5
-against 156 (4.2%): every link had sent the same ids, which kiln answers as repeats; the rest of the
-difference is still not explained: the answer most likely follows the agent's state (the run's agent gets
-  a message every 700 ms, the recording's every 10 s), which would make it a payload the two don't
-  share; until that is read from the bodies, this check stands unmet; operations whose payloads follow the lab kiln's state (the sessions' list, the
-  notices, the metrics' history, `/api/events`, a session's frames) aren't compared;
+  them. Then (2026-11-05, K = 8, ids unique to each link, `check4b`) 162.5 against 156 (4.2%), read
+  apart by browser from the jobs' samples: Chromium's answers were 154, 155 and 156 bytes (the
+  digits of `seq`, the session's event count, growing from one digit to three over a job, as the
+  recording's 154 to 156), WebKit's 168 to 170, each 14 bytes longer, in every link; the 162.5 was
+  the two browsers' mean. The answers, kept with their samples since, name the 14 bytes:
+  `,"repeat":true`. WebKit's jobs ran after Chromium's against the same kiln with the same ids
+  (unique to each link, not to each job), so kiln answered each as a repeat of Chromium's. A write's
+  id now carries the job's number in the run too (`l` + link + job in three base-36 digits + the
+  request's in five: still ten characters, as the UI's `lab-rec-12`). Then (2026-11-05, K = 8,
+  `~/.cache/kiln-bp/g1/check4c`, kiln today and h2o over HTTP/2, both browsers) every answer was
+  154 to 156 bytes, as the recording's, the `seq` digits apart: 155.8 against 156 (0.1%), within 2%;
+  in the same run `GET /api/agents` 1.3%, `GET /api/me` 0.0%, `GET /api/overview` 0.3%. The
+  calibration there, each browser held to its own limit: Chromium's worst job 67.2 µs and median
+  32.2 µs (within 200 µs), WebKit's worst 602.2 µs and median 588.8 µs (within its 1 ms grain);
+  `check-probe` exit 0.
+  Operations whose payloads follow the lab kiln's state (the sessions' list, the notices, the
+  metrics' history, `/api/events`, a session's frames) aren't compared;
 - the stall: the longest request waited 2,156 ms (kiln today), 2,097 ms (h2o) and 2,001 ms (Caddy)
   from its scheduled time: the whole wait counted;
 - the CPU measure's noise floor: kiln today 2,887 µs of CPU a second, h2o 8.2, Caddy 17.6.
@@ -245,6 +271,14 @@ and Caddy over HTTP/2 and HTTP/3) and kiln today 20 times: each came up on its p
 port for HTTP/3) every time, and each stop left none of its recorded processes and nothing in its
 scopes. Every static body each reference server served (14 of 14) came back byte for byte as the
 catalogue holds it.
+
+`node crates/kiln-lab/web/check-origin.mjs PAYLOADS CATALOGUE` checks the streams the same way: it
+starts the origin on sockets of its own, opens every recorded stream on both carriers (Server-Sent
+Events, read as a browser's EventSource reads them, and the streaming fetch, a frame a line), has
+the origin replay every frame, and holds that the replay it reads is the recording (each stream's
+frames hash to the catalogue's digest) and that every frame it sent, on each carrier, in order and
+none missing, is the replay's in normal form (stamps and ids out; a terminal's or a log's line end
+is the carrier's framing, so it is left out of both). ORIGIN_RESULT
 
 A target is a record (`crates/kiln-lab/src/browser/targets.rs`): its server, its port, whether it
 is HTTP/3, its carrier for streams, the protocol the page must have got, and the browsers it runs

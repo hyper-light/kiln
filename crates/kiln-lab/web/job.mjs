@@ -120,6 +120,8 @@ export async function runJob(path) {
     appendFileSync(out("counters.jsonl"), JSON.stringify({ t_us: nowUs(), ...counters() }) + "\n");
     result.window_end_us = nowUs();
     await page.evaluate(() => window.__lab.close());
+    // The requests closing found unanswered, as misses.
+    await drain();
     result.page_protocol = await page.evaluate(() => performance.getEntriesByType("navigation")[0]?.nextHopProtocol || "");
   } catch (e) {
     result.errors.push({ where: "driver", error: String(e && e.stack ? e.stack : e) });

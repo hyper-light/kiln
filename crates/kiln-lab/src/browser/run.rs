@@ -80,6 +80,9 @@ struct Ctx<'a> {
     certs: &'a Certs,
     s: &'a Settings,
     out: &'a Path,
+    /// The job's number in the run: a write's ids carry it, so no two jobs against one server send
+    /// the same id (kiln answers a repeated id as a repeat, 14 bytes longer).
+    job_n: u64,
 }
 
 fn spawn_driver(lab: &Lab, web: &Path, i: usize, browser: &str, job: &Path) -> anyhow::Result<Child> {
@@ -150,7 +153,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             "control": format!("wss://{}:{}/", link::control_server_ip(i), servers::CONTROL_PORT),
             "chromium_args": t.chromium_args(&c.certs.spki),
             "protocol_path": if t.server == Server::Kiln { "/api/me".to_owned() } else { "/api/agents".to_owned() },
-            "ops": ops.iter().map(|o| { let mut o = o.clone(); if let Some(m) = o.as_object_mut() { m.insert("client".into(), json!(i)); } o }).collect::<Vec<_>>(),
+            "ops": ops.iter().map(|o| { let mut o = o.clone(); if let Some(m) = o.as_object_mut() { m.insert("client".into(), json!(i)); m.insert("job".into(), json!(c.job_n)); } o }).collect::<Vec<_>>(),
             "duration_s": w.duration_s,
             "tail_s": w.tail_s,
             "window_ms": c.s.window_ms,
@@ -250,7 +253,10 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     }
     let end = until + Duration::from_secs(w.tail_s + 120);
     let mut blocked = false;
+    // How each driver ended: its exit status, and whether the lab stopped it at the job's end.
+    let mut ended: Vec<(Option<std::process::ExitStatus>, bool)> = Vec::new();
     for (_, child, _) in &mut drivers {
+        let mut killed = false;
         while child.try_wait()?.is_none() {
             // A link that drops UDP partway (goal 5's middlebox): from its time on.
             if let link::Udp::DroppedAfter { after_s } = cond.profile.udp
@@ -264,9 +270,11 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             }
             if Instant::now() > end {
                 let _ = child.kill();
+                killed = true;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+        ended.push((child.try_wait()?, killed));
     }
     stop.store(true, Ordering::Relaxed);
     let cpu = sampler.join().map_err(|_| anyhow::anyhow!("the CPU sampler stopped"))?;
@@ -282,10 +290,19 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     let mut errors = Vec::new();
     let mut calib: Option<f64> = None;
     let mut grain: Option<f64> = None;
-    for (i, _, jd) in &drivers {
+    let mut no_result = 0usize;
+    for (n, (i, _, jd)) in drivers.iter().enumerate() {
         let samples: Vec<Sample> = read_jsonl(&jd.join("samples.jsonl"));
         let ticks: Vec<Tick> = read_jsonl(&jd.join("counters.jsonl"));
         let res: Value = std::fs::read(jd.join("result.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // A driver that left no result didn't measure its link: a failure of the lab's, named,
+        // never a link whose operations had nothing to say.
+        if res.is_null() {
+            no_result += 1;
+            let (status, killed) = ended.get(n).copied().unwrap_or((None, false));
+            let how = if killed { "stopped by the lab at the job's end".to_owned() } else { status.map_or_else(|| "its end unknown".to_owned(), |s| format!("ended with {s}")) };
+            errors.push(format!("c{i}: the driver left no result ({how}; {} samples)", samples.len()));
+        }
         if let Some(p) = res.get("protocols").and_then(Value::as_object) {
             for (k, v) in p {
                 protocols.insert(k.clone(), v.as_str().unwrap_or_default().to_owned());
@@ -321,7 +338,13 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             capture = Some((a + seen, b + counted));
         }
     }
-    let nums = cells::job_numbers(&clients, &cpu, background, ready_us);
+    // Every capture is stopped first (above), so a failed job leaves nothing running.
+    if no_result > 0 && no_result == drivers.len() {
+        anyhow::bail!("no driver left a result: {}", errors.join("; "));
+    }
+    let mut nums = cells::job_numbers(&clients, &cpu, background, ready_us);
+    #[allow(clippy::cast_precision_loss)]
+    nums.numbers.insert("drivers.no_result".into(), no_result as f64);
     std::fs::write(dir.join("times_ms.json"), serde_json::to_vec(&nums.times_ms)?)?;
     Ok(JobRecord {
         condition: cond.name(),
@@ -359,6 +382,7 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
         servers::start_control(&env, out)?
     };
     let mut turn_id = 0;
+    let mut job_n: u64 = 0;
     for p in &s.profiles {
         for loss in &s.losses {
             for round in 0..s.rounds {
@@ -390,22 +414,27 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
                     eprintln!("kiln-lab: {name} round {round}: {} up ({:?})", t.name, running.pids());
                     for b in t.browsers.iter().filter(|b| s.browsers.contains(b)) {
                         for case in &s.cases {
-                            let mut ctx = Ctx { lab: &lab, certs: &certs, s, out };
+                            job_n += 1;
+                            let mut ctx = Ctx { lab: &lab, certs: &certs, s, out, job_n };
                             match job(&mut ctx, &running, t, b, case, &cond, round, &mut turn_id) {
                                 Ok(j) => {
                                     eprintln!(
-                                        "kiln-lab: {name} r{round} {} {b} {case}: time p50 {:.1} ms p99 {:.1} ms (n {}), bytes/op {:.0}, cpu/op {:.0} µs{}",
+                                        "kiln-lab: {name} r{round} {} {b} {case}: time p50 {:.1} ms p99 {:.1} ms (n {}, of them {} missed), bytes/op {:.0}, cpu/op {:.0} µs{}",
                                         t.name,
                                         j.numbers.get("time.p50_ms").copied().unwrap_or(f64::NAN),
                                         j.numbers.get("time.p99_ms").copied().unwrap_or(f64::NAN),
                                         j.numbers.get("time.n").copied().unwrap_or(0.0),
+                                        j.numbers.get("missed").copied().unwrap_or(0.0),
                                         j.numbers.get("bytes.mean").copied().unwrap_or(f64::NAN),
                                         j.numbers.get("cpu_us.mean").copied().unwrap_or(f64::NAN),
                                         if j.errors.is_empty() { String::new() } else { format!("; {} errors, first: {}", j.errors.len(), j.errors.first().cloned().unwrap_or_default()) }
                                     );
                                     run.jobs.push(j);
                                 }
-                                Err(e) => run.failures.push(format!("{name} r{round} {} {b} {case}: {e:#}", t.name)),
+                                Err(e) => {
+                                    eprintln!("kiln-lab: {name} r{round} {} {b} {case}: failed: {e:#}", t.name);
+                                    run.failures.push(format!("{name} r{round} {} {b} {case}: {e:#}", t.name));
+                                }
                             }
                             std::fs::write(out.join("run.json"), serde_json::to_vec_pretty(&run)?)?;
                         }

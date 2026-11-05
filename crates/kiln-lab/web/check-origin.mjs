@@ -6,8 +6,8 @@
 //   - the replay the origin reads (payloads/replay.json) is the recording: each stream's frames
 //     hash to the catalogue's digest for it;
 //   - each frame the origin sent, on each carrier, is the replay's frame (both in normal form:
-//     stamps and ids out), in order, none missing; a terminal's or a log's line end is the
-//     carrier's framing, so it is left out of both.
+//     stamps and ids out), in order, none missing; a terminal's or a log's text comes as a JSON
+//     string and is read back with JSON.parse, as the probe reads it.
 //   node check-origin.mjs PAYLOADS_DIR CATALOGUE.json    (exit 0 when every frame holds)
 import { spawn } from "node:child_process";
 import { request } from "node:http";
@@ -43,17 +43,22 @@ export function lines(text) {
   return text.split("\n").slice(0, -1);
 }
 
-/** How a frame should read once it has crossed a carrier. */
-export function expected(kind, frame) {
-  return normal(TEXT.has(kind) ? frame.replace(/\r?\n$/, "") : frame);
+/** A frame as the page reads it off a carrier: a terminal's or a log's text from its JSON string. */
+export function received(kind, data) {
+  if (!TEXT.has(kind)) return data;
+  try {
+    return String(JSON.parse(data));
+  } catch {
+    return `(not a JSON string) ${data}`;
+  }
 }
 
 /** Frames received against the replay's: the first that differ, or that are missing. */
 export function holds(kind, sent, got) {
   const bad = [];
   for (let i = 0; i < Math.max(sent.length, got.length); i++) {
-    const want = i < sent.length ? expected(kind, sent[i]) : null;
-    const have = i < got.length ? normal(got[i]) : null;
+    const want = i < sent.length ? normal(sent[i]) : null;
+    const have = i < got.length ? normal(received(kind, got[i])) : null;
     if (want !== have) bad.push({ i, want: want && want.slice(0, 120), got: have && have.slice(0, 120) });
   }
   return bad;
@@ -106,10 +111,16 @@ export async function check(payloads, cataloguePath) {
       const r = await post(ctl, "/replay", { kind, events: frames.length, every_ms: 0 });
       if (r.status !== 200) throw new Error(`replay of ${kind}: ${r.status} ${r.body}`);
       const read = () => ({ sse: sseEvents(texts.sse), "fetch-stream": lines(texts["fetch-stream"]) });
-      // Every frame is written at once; what's still in the socket comes within a moment, and a
-      // frame the carrier splits in two shows as more frames than were sent.
-      for (let i = 0; i < 200 && Object.values(read()).some((g) => g.length < frames.length); i++) await wait(50);
-      await wait(100);
+      // The origin sends a frame a timer tick (about 1 ms): read until every frame is there, or until
+      // a second passes with none new (a frame the carrier split in two shows as more frames).
+      let last = -1;
+      for (;;) {
+        await wait(1000);
+        const counts = Object.values(read()).map((g) => g.length);
+        const now = counts.reduce((a, b) => a + b, 0);
+        if (counts.every((n) => n >= frames.length) || now === last) break;
+        last = now;
+      }
       reqs.forEach((q) => q.destroy());
       const line = { kind, frames: frames.length, recording: op ? (recorded ? "the catalogue's digest" : "**not the catalogue's digest**") : "not in the catalogue" };
       for (const [carrier, got] of Object.entries(read())) {

@@ -15,16 +15,20 @@ test("g1_s5 server-sent events read as a browser reads them", () => {
 });
 
 test("g1_s5 a replayed frame holds with a new stamp, and a changed or missing one doesn't", () => {
-  const sent = ['{"text":"@lab:1793836525502235 hi"}', "line one\r\n"];
-  assert.deepEqual(holds("terminal", sent, ['{"text":"@lab:1793839999999123 hi"}', "line one"]), []);
+  const sent = ['{"text":"@lab:1793836525502235 hi"}', '{"n":2}'];
+  assert.deepEqual(holds("session", sent, ['{"text":"@lab:1793839999999123 hi"}', '{"n":2}']), []);
   assert.equal(holds("session", sent, ['{"text":"@lab:1793839999999123 ho"}']).length, 2);
+  // A terminal's text, CR CR LF and all, and a log's lines, come back whole from their JSON strings.
+  const text = ["@lab:1793836525502235 line 0 xx\r\r\n", "header\r\n@lab:1793836525502236 line 1\r\n"];
+  assert.deepEqual(holds("terminal", text, text.map((t) => JSON.stringify(t.replace("1793836525502", "1793839999999")))), []);
+  assert.equal(holds("log", text, text.map((t) => JSON.stringify(t.replace(/\r?\n$/, "")))).length, 2);
 });
 
 test("g1_s5 the origin replays every recorded frame on both carriers", async () => {
   const dir = mkdtempSync(join(tmpdir(), "kiln-lab-origin-test-"));
   try {
     const frames = ['{"seq":1,"text":"@lab:1793836525502235 a"}', '{"seq":2,"text":"@lab:1793836525502236 b"}'];
-    const term = ["$ ls\r\n", "a b c\r\n"];
+    const term = ["$ ls\r\r\n", "a b c\r\nd e f\r\n"];
     writeFileSync(join(dir, "replay.json"), JSON.stringify({ streams: { session: frames, terminal: term }, writes: {} }));
     const digest = (f) => createHash("sha256").update(f.map(normal).join("\n")).digest("hex");
     const cat = join(dir, "catalogue.json");

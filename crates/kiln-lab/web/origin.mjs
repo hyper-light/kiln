@@ -42,12 +42,15 @@ function open(req, res, kind, carrier) {
   req.on("close", () => set.delete(s));
 }
 
-// A terminal's and a log's output is lines of text, not JSON: each goes as one event (or line), its
-// own line end left to the carrier's framing.
+// A terminal's and a log's output is text, not JSON, and neither carrier frames it as it is: an
+// event's data ends at any CR or LF, and the streaming fetch's frame at a LF, while a terminal's
+// frames end in CR CR LF and a log's may hold several lines. Each goes as a JSON string, so the page
+// gets every byte back (JSON.parse) and the escapes are the carrier's cost; JSON frames go as they
+// are (JSON.stringify writes no raw line end).
 const TEXT = new Set(["terminal", "log"]);
 
 function send(kind, frame) {
-  const f = TEXT.has(kind) ? frame.replace(/\r?\n$/, "") : frame;
+  const f = TEXT.has(kind) ? JSON.stringify(frame) : frame;
   for (const s of streams.get(kind) || []) s.res.write(s.carrier === "sse" ? `data: ${f}\n\n` : `${f}\n`);
 }
 

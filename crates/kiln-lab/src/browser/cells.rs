@@ -35,6 +35,10 @@ pub struct Sample {
     pub frame: bool,
     #[serde(default)]
     pub ok: Option<bool>,
+    /// A request scheduled in the job that had no answer when the job ended: its time is its wait
+    /// until then (a lower bound), and it counts as a miss, never as missing data (open loop).
+    #[serde(default)]
+    pub missed: bool,
 }
 
 impl Sample {
@@ -113,13 +117,19 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
     let mut n = BTreeMap::new();
     let mut times = Vec::new();
     let mut bytes_w = Vec::new();
-    let (mut bytes_all, mut ops_all, mut app_all, mut failed) = (0u64, 0usize, 0u64, 0usize);
+    let (mut bytes_all, mut ops_all, mut app_all, mut failed, mut missed) = (0u64, 0usize, 0u64, 0usize, 0usize);
     let mut all_op_times = Vec::new();
     for (samples, ticks) in clients {
-        let ops: Vec<&Sample> = samples.iter().filter(|s| s.is_op() && s.at_us > from_us).collect();
+        let ops: Vec<&Sample> = samples.iter().filter(|s| s.is_op() && !s.missed && s.at_us > from_us).collect();
         failed += ops.iter().filter(|s| s.ok == Some(false)).count();
         #[allow(clippy::cast_precision_loss)]
         times.extend(ops.iter().filter(|s| s.ok != Some(false)).filter_map(|s| s.lat_us).map(|l| l as f64 / 1000.0));
+        // A request with no answer by the job's end waited at least until then: its wait counts
+        // in the times, so the tail can't leave it out, and the misses are counted beside them.
+        let misses: Vec<&Sample> = samples.iter().filter(|s| s.missed && s.sched_us.is_some_and(|t| t > from_us)).collect();
+        missed += misses.len();
+        #[allow(clippy::cast_precision_loss)]
+        times.extend(misses.iter().filter_map(|s| s.lat_us).map(|l| l as f64 / 1000.0));
         app_all += samples.iter().filter(|s| s.at_us > from_us).map(|s| s.app_bytes).sum::<u64>();
         let op_times: Vec<u64> = ops.iter().map(|s| s.at_us).collect();
         let ticks: Vec<&Tick> = ticks.iter().filter(|t| t.t_us >= from_us).collect();
@@ -135,7 +145,7 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
         // real UI's).
         for s in samples.iter().filter(|s| s.at_us > from_us) {
             *n.entry(format!("op/{}/app_bytes", s.op)).or_insert(0.0) += s.app_bytes as f64;
-            if s.is_op() {
+            if s.is_op() && !s.missed {
                 *n.entry(format!("op/{}/n", s.op)).or_insert(0.0) += 1.0;
             }
             if s.frame {
@@ -165,6 +175,7 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
         n.insert("app_bytes.mean".into(), app_all as f64 / ops_f);
         n.insert("ops".into(), ops_all as f64);
         n.insert("failed".into(), failed as f64);
+        n.insert("missed".into(), missed as f64);
     }
     // CPU: the server's and its origin's, each window less the background's share.
     let cpu: Vec<&CpuTick> = cpu.iter().filter(|c| c.t_us >= from_us).collect();
@@ -205,6 +216,21 @@ pub fn quantile_band(n: usize, q: f64) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request with no answer by the job's end is a miss: counted, and its wait until then is
+    /// in the times (open loop), never left out as missing data (goal 10's rule).
+    #[test]
+    fn g1_s4_requests_unanswered_by_the_end_are_misses_with_their_wait() {
+        let done = Sample { op: "GET /x".into(), case: "request".into(), sched_us: Some(2_000_000), at_us: 2_100_000, lat_us: Some(100_000), app_bytes: 10, ok: Some(true), ..Sample::default() };
+        let miss = Sample { op: "GET /x".into(), case: "request".into(), sched_us: Some(3_000_000), at_us: 30_000_000, lat_us: Some(27_000_000), ok: Some(false), missed: true, ..Sample::default() };
+        let ticks = vec![Tick { t_us: 1_000_000, rx_bytes: 0, tx_bytes: 0 }, Tick { t_us: 3_000_000, rx_bytes: 500, tx_bytes: 0 }];
+        let j = job_numbers(&[(vec![done, miss], ticks)], &[], 0.0, 1_000_000);
+        assert_eq!(j.numbers.get("missed").copied(), Some(1.0));
+        assert_eq!(j.numbers.get("failed").copied(), Some(0.0));
+        assert_eq!(j.numbers.get("ops").copied(), Some(1.0));
+        assert_eq!(j.times_ms.len(), 2);
+        assert!(j.numbers.get("time.max_ms").is_some_and(|m| (m - 27_000.0).abs() < 1e-6));
+    }
 
     fn op(at: u64, lat_ms: i64) -> Sample {
         Sample { op: "x".into(), case: "stream".into(), at_us: at, lat_us: Some(lat_ms * 1000), app_bytes: 100, ..Sample::default() }
