@@ -57,6 +57,7 @@ pub mod model;
 pub mod moving;
 pub mod opened;
 pub mod ops;
+pub mod packed;
 pub mod pause;
 pub mod port;
 pub mod queued;

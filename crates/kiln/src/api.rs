@@ -6583,6 +6583,44 @@ mod tests {
         })
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 3: a long session's packed snapshot, put together from its
+    /// chunks' pieces packed once (the sealed ones), its newest deflated as it's taken and what's between
+    /// them stored, unpacks with flate2 to exactly what the whole gzip of its frames and `synced` held
+    /// before; and taken again, it takes the pieces as they were packed and unpacks the same.
+    #[test]
+    fn g10_s3_a_snapshot_put_together_from_packed_chunks_unpacks_as_the_whole_gzip_did() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::io::{Read as _, Write as _};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: {}", "the retry loop reads its deadline ".repeat(usize::try_from(n % 7 + 1).unwrap_or(1))), streaming: false } };
+            // Past two chunks, a third begun.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
+            let unpack = |b: &[u8]| -> anyhow::Result<String> {
+                let mut text = String::new();
+                flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
+                Ok(text)
+            };
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
+            let frames = att.frames();
+            assert!(frames.iter().filter(|f| f.starts_with(r#"{"t":"events""#)).count() >= 3, "a frame a chunk: {}", frames.len());
+            let mut whole = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            whole.write_all(format!("{}\n{}", frames.join("\n"), synced()).as_bytes())?;
+            let was = unpack(&whole.finish()?)?;
+            let packed = att.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&packed)?, was, "what the whole gzip held");
+            let again = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&again)?, was, "taken again, the same");
+            assert!(packed.len() * 5 < was.len(), "it packs: {} of {}", packed.len(), was.len());
+            Ok(())
+        })
+    }
+
     /// A command on a session's socket doesn't wait for the store: with the store's one connection
     /// held (a checkpoint on a busy disk, another caller's long write), each one's audit row is
     /// taken at once and the command goes on, where it once waited for the row to be written first
