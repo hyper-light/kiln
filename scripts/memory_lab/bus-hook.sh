@@ -2,12 +2,13 @@
 # kiln-lab's hook (KILN_LAB_HOOK) for goal 11, plan 01a1a87b2e56 step 3: the bus's memory bound, from the lab.
 #
 # The bus's bounds ([bus] memory and topic_bytes: docs/bus.md) are derived from what it samples (docs/runtime-lab.md,
-# "Measuring the bus's bound"). This hook samples the round's server's /metrics once a second from fill-start to window-end, and keeps per
-# sample: the bus's bytes and limit (kiln_bus_memory_bytes, kiln_bus_memory_limit_bytes), its topics and viewers,
+# "Measuring the bus's bound"). This hook samples the round's server's /metrics once a second from fill-start to
+# window-end, and keeps per sample: the bus's bytes and limit (kiln_bus_memory_bytes, kiln_bus_memory_limit_bytes), its topics and viewers,
 # the most one topic has asked it to keep (kiln_bus_topic_bytes_peak: a feed's newest 2048 frames, by their keys and
 # payloads, as topic_bytes counts them), the frames published (kiln_bus_published_total), what it refused (every
 # kiln_bus_refused_total{op} series, summed) and the lag notices it sent (kiln_bus_lag_notices_total), every memory
-# owner (kiln_memory_bytes{owner}) and the process's resident memory by kind. bus-summary.py reads the rounds'
+# owner (kiln_memory_bytes{owner}) and the bus's bound (kiln_memory_bound_bytes{owner="bus"}: what its topics can hold),
+# and the process's resident memory by kind. bus-summary.py reads the rounds'
 # samples and says the bounds the measurement gives.
 #
 #   bus-hook.sh <event> <server pid> <round>.hook        (the lab runs it; NEXT_HOOK: a hook to run after it,
@@ -31,6 +32,7 @@ sample() {
           /^kiln_bus_refused_total[ {]/ { refused += $2; next }
           /^kiln_bus_(memory_bytes|memory_limit_bytes|topics|viewers|lag_notices_total|published_total|topic_bytes_peak) / { kept = kept " " $1 "=" $2; seen = 1 }
           /^kiln_memory_bytes\{owner="/ { o = $1; sub(/^kiln_memory_bytes\{owner="/, "", o); sub(/"\}$/, "", o); kept = kept " owner." o "=" $2 }
+          /^kiln_memory_bound_bytes\{owner="bus"\} / { kept = kept " bound.bus=" $2 }
           /^kiln_memory_resident_bytes\{kind="/ { k = $1; sub(/^kiln_memory_resident_bytes\{kind="/, "", k); sub(/"\}$/, "", k); kept = kept " rss." k "=" $2 }
           END { if (seen) print now kept " kiln_bus_refused_total=" refused }' >> "$dir/bus.tsv"
     sleep 1
