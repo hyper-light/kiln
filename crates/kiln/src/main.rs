@@ -596,13 +596,23 @@ fn main() -> ExitCode {
         && let Ok(cfg) = config::Config::load(&config_path)
     {
         if let Some(cores) = &cfg.server.cores {
+            let own = kiln::os::own_cores(cores);
             if cfg.local_agent.enabled {
-                kiln::os::keep_work_off(cores, "the server's own runner");
+                // Off the shards' cores, where its slice holds the server on its cores (goal 9, plan
+                // 01a1a87b2cec step 4: a system install's partition).
+                let shards = own.as_deref().map(kiln::rt::shard_cores_for).unwrap_or_default();
+                kiln::os::keep_work_off(cores, &shards, "the server's own runner");
             }
-            match kiln::os::own_cores(cores) {
+            match own {
                 Ok(own) => {
                     tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
                     kiln::rt::pin(own);
+                    // Whether they're its alone: the partition a system install makes as the server starts.
+                    match kiln::os::cgroup::partition() {
+                        Some((path, state)) if state == "root" || state == "isolated" => tracing::info!(partition = %path, "the server's cores are a cpuset partition's: nothing outside it runs on them"),
+                        Some((path, state)) => tracing::warn!(partition = %path, state = %state, "the server's cores aren't kept from other work: the kernel found its partition invalid"),
+                        None => tracing::info!("the server's cores aren't a partition's: other work may run on them too (a system install makes kiln.slice one)"),
+                    }
                 }
                 Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
             }
@@ -614,7 +624,7 @@ fn main() -> ExitCode {
     if matches!(cli.cmd, Cmd::Agent(_) | Cmd::Join(_))
         && let Some(cores) = config::Config::load(&config_path).ok().and_then(|c| c.server.cores)
     {
-        kiln::os::keep_work_off(&cores, "this runner");
+        kiln::os::keep_work_off(&cores, &[], "this runner");
     }
     match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,
