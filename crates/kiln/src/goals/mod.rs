@@ -719,7 +719,7 @@ pub fn under_way(items: &[Item]) -> Option<&Item> {
 /// The stack's goals as its graph sees them (`graph`), in its order: what each waits for, as it
 /// says (none: it says nothing yet; kiln couldn't get it ordered: in turn) and, for a plan's step,
 /// as its plan says (`plans`); where it's under way (on the agent, on a subagent or about to go to
-/// one, on the agent's own subagents, on another agent).
+/// one, on the agent's own subagents, on another agent); and who may take it ([`takes_of`]).
 fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
     items
         .iter()
@@ -741,10 +741,27 @@ fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
                 (None, None, Some(KILN)) => graph::Needs::InTurn,
                 (None, None, _) => graph::Needs::Unknown,
             },
-            takes: if i.back { graph::Takes::Agent } else { graph::Takes::Anyone },
+            takes: takes_of(i, items, plans),
             ..graph::Node::default()
         })
         .collect()
+}
+
+/// Who may take goal `i` once it's ready (docs/agentic.md G2). A subagent of the agent's, when the
+/// goal that goes for it says what it waits for and none of its work has started or gone anywhere
+/// (`subagents::unit`, `subagents::untouched`): `i` itself, or the goal it's a part of, with its
+/// parts. The agent itself takes the rest: a goal back from its subagent unmet, planning a goal, a
+/// part waiting for a plan's run, a plan's step its plan's graph leaves to it (P2 hands the others:
+/// `subagents::leave`), a goal that says nothing of what it waits for (it goes in turn: unordered,
+/// it goes to no subagent), and what's left of a goal whose work has started.
+fn takes_of(i: &Item, items: &[Item], plans: &subagents::Graph) -> graph::Takes {
+    if i.back || i.waits_on.is_some() || i.part_kind.as_deref() == Some("planning") {
+        return graph::Takes::Agent;
+    }
+    match subagents::unit(i, items, plans) {
+        Some(u) if subagents::untouched(u, items) => graph::Takes::Anyone,
+        _ => graph::Takes::Agent,
+    }
 }
 
 /// Who says what a goal waits for when kiln couldn't get it ordered: it goes in turn.
@@ -3056,9 +3073,15 @@ where
     {
         subagents::leave(&mut graph, hub, &stack, i, now).await;
     }
-    // Its next goal, one at a time on the agent: goals the agent set under way for its own subagents
-    // stay under way beside it (docs/agentic.md G2).
-    let room = graph::Room::Never;
+    // Its goals ready together side by side on subagents (docs/agentic.md G2), as its Subagents
+    // setting leaves room (none set, no limit), where a person left that on: those that go to
+    // subagents (`subagents::give_out`) aren't the agent's, and it coordinates. None while its
+    // program holds new goals for usage, or when no subagent can be started for it now
+    // (`subagents::may_hand`): it takes its goals itself then, one at a time.
+    let room = match (d.planner, info.as_ref()) {
+        (Some(hub), Some(i)) if stack.side_by_side && !rule.holds_new_goals() && subagents::may_hand(i, now) => subagents::room_now(hub, i).await,
+        _ => graph::Room::Never,
+    };
     let mut next = decide_on(&stack, &graph, info.as_ref(), now, children, push, room);
     // A big goal of the agent's own about to start, on a stack that plans those first: planned
     // first, as Make a plan does (researched inside and out, its steps written), its planning going
@@ -5887,6 +5910,9 @@ mod stack_tests {
         within(async {
             let (hub, id, _folder) = agent_with_goals(&["first", "b", "c", "e"]).await?;
             let (id, cx) = (id.as_str(), person(&hub));
+            // One goal at a time on the agent beside those it set under way: side by side, d would go
+            // to a subagent of kiln's once ready ("Goals side by side": subagents' g2_ tests).
+            call_ok(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id, "side_by_side": false})).await)?;
             let s = get(&hub, id).await?;
             let (first, b, c, e) = (id_of(&s, "first"), id_of(&s, "b"), id_of(&s, "c"), id_of(&s, "e"));
             // d waits for b.
