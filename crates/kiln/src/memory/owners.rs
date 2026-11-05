@@ -101,8 +101,21 @@ pub static TERMINAL_FEEDS: Owner = Owner::new("terminal_feeds");
 /// picture.
 pub static STREAM_VIEWERS: Owner = Owner::new("stream_viewers");
 
+/// Outgoing webhooks' deliveries waiting for their subscriber's worker (`crate::ci::webhooks`), every
+/// subscriber's together: each at most 1,000 events and [`crate::net::EVENTS_BYTES`] of them, as much as the
+/// hub's events ring they're taken from holds. At the bound a delivery is logged as dropped, its body kept
+/// in its row, to send again (`POST /api/ci/webhooks/deliveries/:id/redeliver`).
+pub static WEBHOOK_QUEUES: Owner = Owner::new("webhook_queues");
+
+/// Syslog records received and not yet offered to the observe node (`crate::observe::collect::syslog`),
+/// each source's queue together: each at most [`crate::observe::ingest::WAITING_LOG_BYTES`], what the node
+/// takes waiting to be written before it refuses more, where they go next. At the bound a datagram is
+/// dropped and counted in the source's state (syslog over UDP has no acknowledgement, as it never had),
+/// and a TCP sender waits: its connection isn't read until there's room.
+pub static SYSLOG_WAITING: Owner = Owner::new("syslog_waiting");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 15] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS];
+pub(super) const ALL: [&Owner; 17] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING];
 
 #[cfg(test)]
 mod tests {
