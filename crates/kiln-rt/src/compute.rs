@@ -174,10 +174,16 @@ pub enum Priority {
         /// The nice value.
         nice: i32,
     },
-    /// Linux's normal policy (or another but idle and batch), at a nice value.
+    /// Linux's normal policy (or another but idle, batch and the real-time ones), at a nice value.
     Other {
         /// The nice value.
         nice: i32,
+    },
+    /// One of Linux's real-time classes (`SCHED_RR`, `SCHED_FIFO`), at its priority: 1 the lowest, 99 the
+    /// highest (sched(7)); above every thread of the other policies.
+    Realtime {
+        /// The real-time priority.
+        priority: i32,
     },
     /// A macOS QoS class, as `sys/qos.h` numbers it ([`QOS_CLASS_UTILITY`]).
     Qos {
@@ -201,10 +207,11 @@ pub const QOS_CLASS_BACKGROUND: u32 = 0x09;
 pub const QOS_CLASS_DEFAULT: u32 = 0x15;
 
 impl Priority {
-    /// Whether a thread at this priority runs below one at `other`, as their OS ranks them: on Linux the idle
-    /// policy below every other, then a higher nice value, then the batch policy at the same one; on macOS a
-    /// lower QoS class (unspecified, zero, reads as the default); on Windows a lower level. Priorities of
-    /// different OSes compare as neither below.
+    /// Whether a thread at this priority runs below one at `other`, as their OS ranks them: on Linux a
+    /// real-time class above every other policy (a higher real-time priority above a lower), the idle policy
+    /// below every other, and between them a higher nice value below, then the batch policy at the same one;
+    /// on macOS a lower QoS class (unspecified, zero, reads as the default); on Windows a lower level.
+    /// Priorities of different OSes compare as neither below.
     pub fn is_below(self, other: Priority) -> bool {
         match (self.linux_rank(), other.linux_rank()) {
             (Some(mine), Some(theirs)) => return mine > theirs,
@@ -221,12 +228,15 @@ impl Priority {
         }
     }
 
-    /// A Linux priority's lowness, compared in order: the idle policy, the nice value, the batch policy.
-    fn linux_rank(self) -> Option<(bool, i32, bool)> {
+    /// A Linux priority's lowness, compared in order: its class (real-time, then the normal and batch
+    /// policies, then the idle one), within it the nice value (the real-time priority, negated, for a
+    /// real-time class), then the batch policy.
+    fn linux_rank(self) -> Option<(u8, i32, bool)> {
         match self {
-            Priority::Idle { nice } => Some((true, nice, false)),
-            Priority::Batch { nice } => Some((false, nice, true)),
-            Priority::Other { nice } => Some((false, nice, false)),
+            Priority::Realtime { priority } => Some((0, priority.saturating_neg(), false)),
+            Priority::Other { nice } => Some((1, nice, false)),
+            Priority::Batch { nice } => Some((1, nice, true)),
+            Priority::Idle { nice } => Some((2, nice, false)),
             Priority::Qos { .. } | Priority::Level { .. } | Priority::Unknown => None,
         }
     }
@@ -238,6 +248,7 @@ impl fmt::Display for Priority {
             Priority::Idle { nice } => write!(f, "SCHED_IDLE (nice {nice})"),
             Priority::Batch { nice } => write!(f, "SCHED_BATCH at nice {nice}"),
             Priority::Other { nice } => write!(f, "nice {nice}"),
+            Priority::Realtime { priority } => write!(f, "a real-time class at priority {priority}"),
             Priority::Qos { class } if class == QOS_CLASS_UTILITY => f.write_str("the utility QoS class"),
             Priority::Qos { class } if class == QOS_CLASS_BACKGROUND => f.write_str("the background QoS class"),
             Priority::Qos { class } => write!(f, "QoS class {class:#x}"),
@@ -292,6 +303,25 @@ pub enum Rank {
 /// policy stay as they are. Elsewhere there is no such call: refused, and nothing changes.
 pub fn prefer_current_thread(slice_ns: u64) -> Result<(), Refusal> {
     crate::prioritysys::prefer_current_thread(slice_ns)
+}
+
+/// The lowest real-time priority, the one a shard asks for ([`realtime_current_thread`]): "a static priority
+/// value ... in the range 1 (low) to 99 (high)" for the real-time policies [B: sched(7)]. Above every thread of
+/// the normal, batch and idle policies, whatever its nice value; below every other real-time thread, the
+/// kernel's own among them (its threaded interrupt handlers run at 50, `sched_set_fifo`). `RLIMIT_RTPRIO` at 1
+/// lets an unprivileged thread take it (sched(7), "Privileges and resource limits").
+pub const REALTIME_LOWEST: i32 = 1;
+
+/// Puts the calling thread, a shard, in Linux's round-robin real-time class (`SCHED_RR`) at `priority`, with
+/// the reset-on-fork flag, so a thread or process it starts runs at the normal policy (kiln's goal 8, plan
+/// 01a1a59c2b29 step 7; goal 9, plan 01a1a87b2cec step 4). A real-time thread waking on a CPU a normal thread
+/// holds preempts it at once under every preemption mode, the lazy one too, where a normal thread waking beside
+/// a thread busy in user space waits for the next tick, up to 1 ms at 1000 Hz (research 01a1a87b2cee f17).
+/// Refused where the thread has neither `CAP_SYS_NICE` nor `RLIMIT_RTPRIO` room for `priority` (EPERM), and
+/// on macOS and Windows, which have no such class kiln asks for (the OS-interface file says why): the thread
+/// then runs as it did.
+pub fn realtime_current_thread(priority: i32) -> Result<(), Refusal> {
+    crate::prioritysys::realtime_current_thread(priority)
 }
 
 /// The calling thread's priority as its OS reports it (a pool thread's is lowered; a shard's is not).
@@ -1040,5 +1070,51 @@ mod tests {
         assert!(!Priority::Unknown.is_below(other(0)));
         assert!(!batch(10).is_below(Priority::Level { level: 0 }));
         assert_eq!(Priority::Batch { nice: 10 }.to_string(), "SCHED_BATCH at nice 10");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a real-time class ranks above every other Linux policy, whatever their
+    /// nice values, and a higher real-time priority above a lower.
+    #[test]
+    fn g9_s4_a_real_time_class_ranks_above_every_other_policy() {
+        let rt = |priority| Priority::Realtime { priority };
+        assert!(Priority::Other { nice: -20 }.is_below(rt(REALTIME_LOWEST)), "the lowest real-time priority above nice -20");
+        assert!(Priority::Batch { nice: 0 }.is_below(rt(REALTIME_LOWEST)));
+        assert!(Priority::Idle { nice: 0 }.is_below(rt(REALTIME_LOWEST)));
+        assert!(!rt(REALTIME_LOWEST).is_below(Priority::Other { nice: -20 }));
+        assert!(rt(1).is_below(rt(2)) && !rt(2).is_below(rt(1)) && !rt(1).is_below(rt(1)));
+        assert!(!rt(1).is_below(Priority::Level { level: 0 }), "no OS's priority ranks against another's");
+        assert_eq!(rt(1).to_string(), "a real-time class at priority 1");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4 (goal 8, plan 01a1a59c2b29 step 7): a shard asking for the real-time class
+    /// either gets it whole, its priority read back and a thread it starts at the normal policy (reset on fork),
+    /// or is refused and runs as it did; never half. Which it is depends on the machine's grant (`CAP_SYS_NICE`,
+    /// `RLIMIT_RTPRIO`), so both are right here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_the_real_time_class_is_taken_whole_or_refused() {
+        let outcome = std::thread::spawn(|| {
+            let before = thread_priority();
+            match realtime_current_thread(REALTIME_LOWEST) {
+                Ok(()) => {
+                    let child = std::thread::spawn(thread_priority).join().ok();
+                    Ok((thread_priority(), child))
+                }
+                Err(refusal) => Err((refusal, before, thread_priority())),
+            }
+        })
+        .join();
+        match outcome {
+            Ok(Ok((mine, child))) => {
+                assert_eq!(mine, Priority::Realtime { priority: REALTIME_LOWEST });
+                assert!(matches!(child, Some(Priority::Other { .. })), "a thread it started runs at the normal policy: {child:?}");
+            }
+            Ok(Err((refusal, before, after))) => {
+                assert_eq!(refusal.call, "sched_setattr");
+                assert!(refusal.code.is_some(), "a refusal says why: {refusal}");
+                assert_eq!(before, after, "refused, the thread runs as it did");
+            }
+            Err(_) => panic!("the asking thread panicked"),
+        }
     }
 }
