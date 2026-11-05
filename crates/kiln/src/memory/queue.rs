@@ -50,6 +50,33 @@ impl Weigh for String {
     }
 }
 
+/// What a value's JSON would take, counted as it's written and none of it kept: a weight for structured
+/// items whose texts dominate what they hold (a runner's job event, a pool's word), near enough without a
+/// walk of its own for each type.
+pub fn json_bytes<T: serde::Serialize + ?Sized>(v: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(b.len());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
+}
+
+/// A shared text: its place, its two counts and its bytes, as one holder's (whoever holds it last lets it
+/// go).
+impl Weigh for std::sync::Arc<str> {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(2 * size_of::<usize>()).saturating_add(self.len())
+    }
+}
+
 impl<T: Weigh + ?Sized> Weigh for Box<T> {
     fn weight(&self) -> usize {
         size_of::<Self>().saturating_add((**self).weight())

@@ -76,6 +76,10 @@ struct Writer {
 
 impl Writer {
     fn start(conn: Connection, watch: Option<capture::Watch>) -> anyhow::Result<Self> {
+        // Unbounded, and bounded by its callers (goal 11, plan 01a1a87b2e56 step 3): every call is waited
+        // for by whoever sent it ([`Store::write`], [`Store::now`]), so it holds at most one call for each
+        // task or thread waiting on the store, each the closure that caller would hold anyway, moved here
+        // rather than copied. Its count is on `/metrics` (`crate::pool_health`'s store queue).
         let (tx, rx) = std::sync::mpsc::channel::<(WriteCall, Instant)>();
         let thread = std::thread::Builder::new()
             .name("kiln-store".to_owned())

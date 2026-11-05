@@ -1036,6 +1036,75 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **The server's host sample on the blocking pool** (`Hub::sampler_loop`), as a runner's already was: it
   held its shard about 2 s every minute where sysinfo samples (found by the Bare Metal Migration agent).
 
+## Goal 11: a tenth of the memory
+
+Goal 11 of the API runtime program (plan `01a1a87b2e5673758106c92602a8b04d`, research
+`01a1a87b2e577517ab4c81874f8700a2`): in the lab's realistic profile the server's resident memory is at
+most a tenth of goal 3's (113 MB, from 1,132 MB), with no latency number worse.
+
+### Every cache and buffer, bounded (step 3)
+
+Each holds at most a stated number of bytes, from a measurement or a stated derivation, and says what
+happens at its bound: a sender waits, or what's kept is let go where it can be had again. On `/metrics`:
+`kiln_memory_bytes{owner}` (what it holds now) and `kiln_memory_bound_bytes{owner}` (its bound, where it's
+a number; an owner of many queues or rings shows their sum). Queues are `crate::memory::queue`'s (made as
+they fill, items counted by what they carry); fan-out rings are `crate::memory::ring`'s (async-broadcast's
+queue, each message counted by its bytes until the ring lets it go, the oldest let go past the bytes as
+past the count).
+
+| Owner | What it holds | Bound | Basis | At the bound |
+| --- | --- | --- | --- | --- |
+| `net_out` | commands to the net thread (frames to runners) | 64 MiB | a connection's receive window (`net::WINDOW`, RFC 9000 §4.1): the most a peer takes unread | the sender waits (`try_send` is told it's full) |
+| `net_events` | runners' frames waiting for the hub | 64 MiB | the same window, at which the net thread holds its peers' lanes | the net thread holds the rest, then its lanes: QUIC holds the runners |
+| `session_inboxes` | messages to each session copy's owner, an inbox a shard | 64 MiB each | the hub's queue they're handed from | the hub's loop waits, then the net thread and QUIC |
+| `local_updates` | the server's own sessions' updates | 64 MiB | the inbox they go to next | the session waits |
+| `records_queue` | requests to a records file's thread (Turso) | 16 MiB a file | what the thread writes in one commit (`BATCH_BYTES`): the next batch gathers while one commits | the caller waits |
+| `feed_intake` | runners' conversation-feed parts waiting for the intake | 64 MiB | the hub's queue it's handed from | dropped as before: the runner holds the batch until acknowledged and sends it again |
+| `mirrors_out` | the conversation store's parts going to its mirrors | 64 MiB | the net thread's queue it feeds | the mirror's feed waits |
+| `wire_checks` | runners' payloads waiting for the unknown-fields check | 64 MiB | the hub's queue of runner events | let go unlooked at, counted and said (the message was taken whole) |
+| `custody_receipts` | receipts of runners' feed batches waiting to be signed | 64 MiB | the intake's queue the hand-ons came in | let go and logged; its hand-on goes unanswered |
+| `kept_files` | finished messages' files waiting to be kept | 64 MiB | an owner's inbox, where the messages came from | not kept now: read when someone looks |
+| `sqlite` | kiln.db's page caches (writer and readers) | the sum of their `cache_size`s with each page's header, a temp database's again: about 4.3 MB a connection | SQLite's default `cache_size` (-2000 KiB, kiln sets none); a page's header measured at 256 B | SQLite lets the group's least recently used page go, read again from the file |
+| `convo_queue` | rows the conversation store's writer hasn't committed | what the writer commits in `COMMIT_MS` at its measured rate | its "durable within `COMMIT_MS`" | senders wait |
+| `ui_assets` | the UI's files compressed (brotli, gzip) | what this build's files take compressed both ways | known as the server makes them at start | none: a fixed set |
+| `session_entries` | session copies' events as their JSON's text | each copy's `MAX_EVENTS`, its newest chunk alone as text, for each session | the copy's own bound | older chunks are kept packed |
+| `snapshots` | viewers' snapshots not yet written to their sockets | no bound of its own: one per viewer opening a session | - | - |
+| `ui_events` | the hub's events (`GET /api/events`, kiln's listeners) | 4,096 events and 64 MiB of their texts | the hub's queue of runners' messages most of them are made from | the oldest go: a page resyncs, a listener is told how many it missed |
+| `log_feeds` | each live job's log on its way to its viewers | 1,024 pieces and 32 MiB a job | one batch of its writer (`FEED` pieces) of the largest chunks a runner sends (`proto::LOG_CHUNK`, 32 KiB) | the oldest go: the viewer is told what it skipped; the log file has it |
+| `terminal_feeds` | each terminal's output on its way to its viewers | 1,024 frames and 256 KiB a terminal | `BACKLOG_BYTES`, the backlog a viewer that falls behind is repainted from | the oldest go: the viewer is repainted from the backlog and screen |
+| `stream_viewers` | each viewer's queue of a browser stream | 12.5 MB a viewer | 240 pictures at 60 a second (4 s) at the encoder's top rate (25 Mb/s, `bitrateFor`) | the chunk isn't sent to that viewer: its next key frame mends it |
+| `webhook_queues` | outgoing webhooks' deliveries waiting for their subscriber | 1,000 events and 64 MiB a subscriber | the hub's events ring they're taken from | logged as dropped, the body kept in its row to send again |
+| `syslog_waiting` | syslog records not yet offered to the observe node | 64 MiB a source (was 16,384 records of up to 256 KiB) | the node's waiting log bytes (`WAITING_LOG_BYTES`), where they go next | a datagram is dropped and counted; a TCP sender waits |
+| `ci_inbox` | messages waiting for the CI engine's dispatcher | 64 MiB | the hub's queue of runners' messages they're made from, one a message | the hub's loop waits (then the net thread and QUIC); a person's request never waits, counted all the same |
+| `keep_waiting` | small files kept whole, waiting for their writer | each file's newest bytes, one copy | a file's earlier bytes are let go as newer come | - |
+| `ship_cache` | Ship's rows: each repository's newest commits drawn | 5,000 rows a repository, each as large as its largest held (measured as drawn) | `CAP`; older pages come from the store | the oldest rows go: the store answers their pages |
+| `ci_graphs` | package graphs kept for `affected()` | 64 graphs and 64 MiB | `MAX_BYTES`, the most one commit's manifests are read from | the oldest go: read again from the mirror |
+| `pull_lists` | hosts' open pull requests for the inbox | a minute each, and 32 MiB | one host response as kiln reads it (GitHub's, up to 32 MiB) | the lists read longest ago go: read from the host again |
+| `search_indexes` | kiln-search's open indexes' tables | 8 indexes, each as large as the largest opened (measured as opened) | `OPEN_MAX` | the one searched least recently goes: opened again from its files |
+| `grok_dfa` | observe's grok rules compiled | each rule's lazy-DFA caches at regex's capacity (2 x 2 MiB) for each thread searching it at once | regex's default `dfa_size_limit`; it reports no figure of use, so this counts the rules compiled at one thread's capacity | regex resets a full cache |
+| `bus` | the bus's retained messages | `[bus] memory`, 256 MiB | none yet: the lab's script measures it (below) | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
+| `session_segments` | sealed chunks' segments | no bound of its own | - | - |
+
+Channels bounded by their senders (each sender waits for its answer, so a channel holds at most one call
+for each waiting task, which would hold it anyway): the store's writer (`Store::write`, `Store::now`), the
+wire commands' owner (`Owner::ask`; `tell`'s are a command each for a session told at once, each at most
+`ITEM_MOST`). Sync's two channels carry its groups' raft messages, each group in flight within the limits
+hyper-raft derives from the 64 MiB it states (`sync::group::settings`), each message at most
+`sync::group::MESSAGE`. The deploys' change ring (`Deploy::changes`) holds 256 numbers, a fixed 6 KiB.
+Not bounded yet: the CD engine's inputs and actions (`cd::Cd::input`, about forty callers that can't wait),
+bounded only by their sources' rates.
+
+### Measuring the bus's bound
+
+The bus's `[bus] memory` (256 MiB) and `topic_bytes` (16 MiB) have no measurement behind them. A lab run
+samples the bus each second of every round (its bytes, limit, refusals and lag notices, every memory owner,
+the resident memory by kind) through a `KILN_LAB_HOOK`, 8 rounds calm and 8 with hogs in production's
+layout, and derives the bound: the largest peak, with room for one more of Quiver's largest messages
+(1,083,392 B), never below the floor (2,166,784 B), rounded up to a MiB; proposed only when no round reached
+the limit. Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-over,
+to go under `scripts/memory_lab/` with their first run. A topic's bytes aren't on `/metrics`, so
+`topic_bytes` can't be derived until they are.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;

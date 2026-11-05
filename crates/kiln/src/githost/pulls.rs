@@ -213,12 +213,25 @@ pub async fn list(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<Value>> {
     })
 }
 
+/// How long a repository's list is used before it's read from its host again.
+const LIST_FRESH: Duration = Duration::from_secs(60);
+/// The lists kept, in bytes at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::PULL_LISTS`): one host response's worth, as kiln reads them at the most
+/// (`crate::githost::github::App::call` reads GitHub's up to 32 MiB). Past it the lists read longest ago
+/// go, the newest kept, as each goes past its minute ([`LIST_FRESH`]): read from the host again when
+/// asked.
+const LISTS_BYTES: usize = 32 << 20;
+
 /// [`list`], read from the host at most once a minute (the inbox asks often).
 async fn list_cached(hub: &Hub, repo: &Repo) -> Vec<Value> {
-    static C: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, (Instant, Vec<Value>)>>> = std::sync::OnceLock::new();
-    let cache = C.get_or_init(Default::default);
-    if let Some((at, l)) = cache.lock().get(&repo.id)
-        && at.elapsed() < Duration::from_secs(60)
+    type Kept = HashMap<String, (Instant, Vec<Value>, usize)>;
+    static C: std::sync::OnceLock<parking_lot::Mutex<Kept>> = std::sync::OnceLock::new();
+    let cache = C.get_or_init(|| {
+        crate::memory::owners::PULL_LISTS.bound_at(LISTS_BYTES);
+        parking_lot::Mutex::default()
+    });
+    if let Some((at, l, _)) = cache.lock().get(&repo.id)
+        && at.elapsed() < LIST_FRESH
     {
         return l.clone();
     }
@@ -226,7 +239,28 @@ async fn list_cached(hub: &Hub, repo: &Repo) -> Vec<Value> {
         tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "a host's pull requests can't be read");
         Vec::new()
     });
-    cache.lock().insert(repo.id.clone(), (Instant::now(), l.clone()));
+    let bytes = l.iter().map(crate::harness::weigh::value).fold(0usize, usize::saturating_add);
+    let owner = &crate::memory::owners::PULL_LISTS;
+    let mut kept = cache.lock();
+    owner.add(bytes);
+    if let Some((_, _, before)) = kept.insert(repo.id.clone(), (Instant::now(), l.clone(), bytes)) {
+        owner.sub(before);
+    }
+    let stale: Vec<String> = kept.iter().filter(|(_, (at, _, _))| at.elapsed() >= LIST_FRESH).map(|(id, _)| id.clone()).collect();
+    for id in stale {
+        if let Some((_, _, b)) = kept.remove(&id) {
+            owner.sub(b);
+        }
+    }
+    let mut total: usize = kept.values().map(|(_, _, b)| *b).fold(0, usize::saturating_add);
+    while total > LISTS_BYTES {
+        let Some(oldest) = kept.iter().filter(|(id, _)| **id != repo.id).min_by_key(|(_, (at, _, _))| *at).map(|(id, _)| id.clone()) else { break };
+        if let Some((_, _, b)) = kept.remove(&oldest) {
+            total = total.saturating_sub(b);
+            owner.sub(b);
+        }
+    }
+    drop(kept);
     l
 }
 

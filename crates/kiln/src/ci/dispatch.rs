@@ -191,6 +191,33 @@ pub enum Msg {
     LegPaused { leg: String, paused: bool },
 }
 
+/// The bytes of messages waiting for the dispatcher, at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::CI_INBOX`): as much as the hub's queue of runners' messages
+/// ([`crate::net::EVENTS_BYTES`]) its runners' messages are made from, one a message. Past it the hub's
+/// loop waits ([`Handle::send_held`]), and behind it the net thread and QUIC's flow control hold the
+/// runners; what's sent where nothing can wait ([`Handle::send`]) is counted all the same.
+const INBOX_BYTES: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Msg {
+    /// Its place, and what varies with what a runner said: its names, its payload as JSON's bytes
+    /// (`crate::memory::queue::json_bytes`). A person's asks count by their place and their own size.
+    fn weight(&self) -> usize {
+        use crate::memory::queue::json_bytes;
+        let names = |l: &[String]| l.iter().map(|n| size_of::<String>().saturating_add(n.len())).fold(0usize, usize::saturating_add);
+        size_of::<Self>().saturating_add(match self {
+            Msg::Start(_) | Msg::Preview { .. } => size_of::<Start>(),
+            Msg::RunnerUp { agent, running } => agent.len().saturating_add(names(running)),
+            Msg::Event { agent, leg, event } => agent.len().saturating_add(leg.len()).saturating_add(size_of::<crate::proto::JobEvent>()).saturating_add(json_bytes(event)),
+            Msg::Finished { agent, result } => agent.len().saturating_add(json_bytes(result)),
+            Msg::CancelLegs { run, legs, reason, .. } => run.len().saturating_add(names(legs)).saturating_add(reason.len()),
+            Msg::Executor { agent, said } => agent.len().saturating_add(json_bytes(said)),
+            Msg::WorkState { agent, state } => agent.len().saturating_add(size_of::<kiln_ci::work::slots::WorkState>()).saturating_add(json_bytes(state)),
+            Msg::Warm { agent, held, .. } => agent.len().saturating_add(size_of::<kiln_ci::sched::warm::Held>()).saturating_add(json_bytes(held)),
+            _ => 0,
+        })
+    }
+}
+
 /// Where and how a leg runs, as the scheduler placed it.
 struct Placement {
     executor: Option<String>,
@@ -580,9 +607,10 @@ fn with_docker(options: serde_json::Value, docker: &str) -> serde_json::Value {
 /// and runs. A reader sees every change made before it looked, as it did under the lock, and never
 /// waits on a writer.
 pub struct Handle {
-    tx: async_channel::Sender<Msg>,
+    /// Its inbox, bounded at [`INBOX_BYTES`].
+    tx: crate::memory::queue::Sender<Msg>,
     /// The dispatcher's end of its messages, taken once as it starts.
-    rx: ArcSwapOption<async_channel::Receiver<Msg>>,
+    rx: ArcSwapOption<crate::memory::queue::Receiver<Msg>>,
     on: AtomicBool,
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
     legs: Rcu<HashSet<Arc<str>>>,
@@ -603,16 +631,28 @@ pub struct Restored {
 
 impl Default for Handle {
     fn default() -> Self {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
         Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new() }
     }
 }
 
 impl Handle {
-    /// Sends a message, unless the engine is off (then nothing listens).
+    /// Sends a message, unless the engine is off (then nothing listens), never waiting: for callers that
+    /// can't (a person's request, a change to the settings: a message each), counted in the inbox's bytes
+    /// all the same, past [`INBOX_BYTES`] if it must be. Runners' messages wait for room instead
+    /// ([`Handle::send_held`]).
     pub fn send(&self, m: Msg) {
         if self.on.load(Ordering::Relaxed) {
-            let _ = self.tx.try_send(m);
+            let _ = self.tx.force_send(m);
+        }
+    }
+
+    /// Sends a runner's message, unless the engine is off, waiting while the inbox holds
+    /// [`INBOX_BYTES`]: the hub's loop waits, and behind it the net thread and QUIC's flow control hold
+    /// the runners, as for sessions' inboxes (goal 11, plan 01a1a87b2e56 step 3).
+    pub async fn send_held(&self, m: Msg) {
+        if self.on.load(Ordering::Relaxed) {
+            let _ = self.tx.send(m).await;
         }
     }
 
@@ -3788,6 +3828,27 @@ mod tests {
     /// engine's from then, until it lets it go; a finished run's legs go together, so a reader
     /// sees all of them or none; a kept leg is its runner's until it's let go or its time is up;
     /// what it rebuilt is said once; and its messages' end is taken once.
+    /// Goal 11, plan 01a1a87b2e56 step 3: the dispatcher's inbox is bounded in bytes (on `/metrics` as
+    /// the CI inbox's): past it a runner's message waits for room, and a person's goes all the same; a
+    /// message weighs what it carries.
+    #[test]
+    fn g11_s3_the_dispatchers_inbox_is_bounded_in_bytes() -> anyhow::Result<()> {
+        use crate::memory::queue::Weigh as _;
+        let h = super::Handle::default();
+        anyhow::ensure!(crate::memory::owners::CI_INBOX.bound().is_some_and(|b| b >= super::INBOX_BYTES));
+        h.on.store(true, std::sync::atomic::Ordering::Relaxed);
+        let up = |n: usize| super::Msg::RunnerUp { agent: "a".into(), running: vec!["l".repeat(n)] };
+        anyhow::ensure!(up(1000).weight() - up(0).weight() == 1000);
+        crate::rt::block_on(async move {
+            h.send_held(up(super::INBOX_BYTES / 2)).await;
+            let waited = crate::rt::timeout(std::time::Duration::from_millis(50), h.send_held(up(super::INBOX_BYTES / 2))).await.is_err();
+            anyhow::ensure!(waited, "a runner's message waits for room");
+            h.send(super::Msg::RoutingChanged);
+            anyhow::ensure!(h.tx.len() == 2, "a person's went: {}", h.tx.len());
+            Ok(())
+        })
+    }
+
     #[test]
     fn g5_the_dispatchers_legs_runs_and_kept_legs_read_without_a_lock() -> anyhow::Result<()> {
         let h = super::Handle::default();

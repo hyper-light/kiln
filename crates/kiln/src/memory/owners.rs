@@ -72,8 +72,85 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 /// payload is let go unlooked at, counted and said: the message itself was taken whole already.
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
+/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets
+/// and kiln's own listeners hear), kept until their slowest subscriber takes them
+/// (`crate::memory::ring`): at most `crate::hub::EVENTS` of them, and [`crate::net::EVENTS_BYTES`] of
+/// their texts, as much as the hub's queue of runners' messages most of them are made from. At the bound
+/// the oldest go, as they go past the count: a page's socket is told to fetch what it shows again
+/// (`Resync`), and kiln's own listeners are told how many they missed.
+pub static UI_EVENTS: Owner = Owner::new("ui_events");
+
+/// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
+/// it (`crate::memory::ring`): each job's at most `FEED` pieces, and `FEED` x [`crate::proto::LOG_CHUNK`]
+/// of their bytes, what the job's writer tells its viewers at once (`FEED` pieces a batch) of the largest
+/// chunks a runner sends. At the bound the oldest go: a viewer is told how many it skipped, and the job's
+/// log file has them all.
+pub static LOG_FEEDS: Owner = Owner::new("log_feeds");
+
+/// Each terminal session's output on its way to its attached viewers (`crate::termsess`), kept until
+/// their slowest takes it (`crate::memory::ring`): each session's at most `FANOUT` frames, and
+/// `BACKLOG_BYTES` of their bytes, the backlog a viewer that falls behind is repainted from (more would
+/// take a viewer longer to catch up through than the repaint). At the bound the oldest go: their viewer
+/// is repainted from the session's backlog and screen.
+pub static TERMINAL_FEEDS: Owner = Owner::new("terminal_feeds");
+
+/// Each viewer's queue of a browser stream's chunks and events (`crate::harness::streams`), every viewer's
+/// together: each at most [`crate::harness::streams::VIEWER_BYTES`], the time a viewer may be behind (240
+/// pictures at the stream's 60 a second: 4 s) at its encoder's top rate (25 Mb/s): 12.5 MB. At the bound
+/// the chunk isn't sent to that viewer, as one past 240 chunks wasn't: its next key frame mends the
+/// picture.
+pub static STREAM_VIEWERS: Owner = Owner::new("stream_viewers");
+
+/// Outgoing webhooks' deliveries waiting for their subscriber's worker (`crate::ci::webhooks`), every
+/// subscriber's together: each at most 1,000 events and [`crate::net::EVENTS_BYTES`] of them, as much as the
+/// hub's events ring they're taken from holds. At the bound a delivery is logged as dropped, its body kept
+/// in its row, to send again (`POST /api/ci/webhooks/deliveries/:id/redeliver`).
+pub static WEBHOOK_QUEUES: Owner = Owner::new("webhook_queues");
+
+/// Syslog records received and not yet offered to the observe node (`crate::observe::collect::syslog`),
+/// each source's queue together: each at most [`crate::observe::ingest::WAITING_LOG_BYTES`], what the node
+/// takes waiting to be written before it refuses more, where they go next. At the bound a datagram is
+/// dropped and counted in the source's state (syslog over UDP has no acknowledgement, as it never had),
+/// and a TCP sender waits: its connection isn't read until there's room.
+pub static SYSLOG_WAITING: Owner = Owner::new("syslog_waiting");
+
+/// Messages waiting for the CI engine's dispatcher (`crate::ci::dispatch::Handle`): at most
+/// [`crate::net::EVENTS_BYTES`], as much as the hub's queue of runners' messages its runners' messages are
+/// made from, one a message. At the bound the hub's loop waits to hand it a runner's message, and behind
+/// it the net thread and QUIC's flow control hold the runners. A person's request (a run started, a
+/// cancel, a rerun) never waits: one message each, counted all the same.
+pub static CI_INBOX: Owner = Owner::new("ci_inbox");
+
+/// Small files kept whole (`crate::keep`: a registry's names and epochs, its holders, the terminals'
+/// names), waiting for their writer: each file's newest bytes alone, so at most one copy of each kept
+/// file waits (and one is written), the bytes before them let go as they come. No bound of its own past
+/// that: the files' sizes are the registries'.
+pub static KEEP_WAITING: Owner = Owner::new("keep_waiting");
+
+/// Ship's read model (`crate::ship::ShipCache`): each repository's newest commits' rows, their records and
+/// their JSON drawn: at most `CAP` (5,000) rows a repository, so its bound is that many as large as its
+/// largest row held (each measured as it's drawn). Past the count the oldest go: older pages come from
+/// the store, as they did.
+pub static SHIP_CACHE: Owner = Owner::new("ship_cache");
+
+/// The package graphs kept for `affected()` (`crate::ci::graphs`): at most 64 graphs and `MAX_BYTES` of
+/// them (64 MiB, each counted as its JSON's bytes), as much as one commit's manifests may be read from.
+/// Past either the oldest go: read again from the repository's mirror when a run asks.
+pub static CI_GRAPHS: Owner = Owner::new("ci_graphs");
+
+/// Hosts' open pull requests kept for the inbox (`crate::githost::pulls`): each repository's list for its
+/// minute, and at most 32 MiB of them, one host response's worth as kiln reads them at the most (GitHub's
+/// are read up to 32 MiB). Past it the lists read longest ago go: read from the host again when asked.
+pub static PULL_LISTS: Owner = Owner::new("pull_lists");
+
+/// observe's grok rules compiled (`crate::observe::pipeline::grok::Lazy`), each counted at what its regex's
+/// lazy DFA may keep for one thread searching it (forward and reverse caches at regex's capacity, 2 MiB
+/// each; regex reports no figure of what they hold). For each further thread searching a rule at once it
+/// may keep that again. Let go with their pipeline.
+pub static GROK_DFA: Owner = Owner::new("grok_dfa");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 11] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE];
+pub(super) const ALL: [&Owner; 23] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA];
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +208,7 @@ mod tests {
         anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
-        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite"] {
+        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite", "ui_events", "log_feeds", "terminal_feeds"] {
             anyhow::ensure!(o.contains(&format!("kiln_memory_bytes{{owner=\"{name}\"}} ")), "{name} isn't on /metrics:\n{o}");
         }
         anyhow::ensure!(o.contains("kiln_memory_bound_bytes{owner=\"local_updates\"} "), "{o}");
