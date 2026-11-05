@@ -4992,11 +4992,15 @@ fn caller_name(req: &Request) -> String {
 
 async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let (mut tx, mut rx_ws) = socket.split();
-    let mut rx = hub.events.subscribe();
-    // Agent sessions' own events come on their owners' lanes (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c
-    // step 5): the socket sends both, each as it comes, holding as many of the sessions' as the hub's ring
-    // held for a socket ([`crate::hub::EVENTS`], in all its lanes).
+    let (mut tx, rx_ws) = socket.split();
+    // The page's own messages are asked for only once its socket woke (`ws::Gated`; goal 9, plan 01a1a87b2cec
+    // step 5): every event wakes this task, and each ask zero-filled the socket's read buffer and read nothing.
+    let mut rx_ws = ws::Gated::new(rx_ws);
+    // The hub's events, and agent sessions' own on their owners' lanes (`Hub::events`, `Hub::harness_events`;
+    // goal 4, plan 01a1a59c2a9c step 5): no lock between this socket's shard and their senders'. The socket
+    // sends both, each as it comes, holding as many of each as the hub's ring held for a socket
+    // ([`crate::hub::EVENTS`], in all its lanes).
+    let mut rx = hub.subscribe_events()?;
     let mut sessions = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes()))?;
     hub.emit_queue();
     loop {
@@ -5010,23 +5014,22 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
                 continue;
             }
         };
-        let mut rings: [&mut (dyn Ready + Send); 2] = [&mut rx, &mut sessions];
-        if !send_ready(hub, &mut tx, first, &mut rings, &mut narrow, &mut agents).await? {
+        if !send_ready(hub, &mut tx, first, &mut [&mut rx, &mut sessions], &mut narrow, &mut agents).await? {
             return Ok(());
         }
     }
 }
 
-/// An events socket's hub events: `first`, then every one ready after it on its `rings`, each sent unless
+/// An events socket's hub events: `first`, then every one ready after it from its `sources`, each sent unless
 /// the socket's filters keep it off, written as one: fed, then flushed once (goal 4, plan 01a1a59c2a9c step 5;
 /// as goal 9 step 5 found, an event a flush was a write to the connection an event). At most one ring's
 /// worth goes in one flush ([`crate::hub::EVENTS`]), so what comes while it writes waits for the next. A
-/// ring that let some go before the socket took them says `Resync`; false once a ring is gone.
+/// source that let some go before the socket took them says `Resync`; false once a source is gone.
 async fn send_ready<S>(
     hub: &Hub,
     tx: &mut S,
     first: Result<Arc<str>, async_broadcast::RecvError>,
-    rings: &mut [&mut (dyn Ready + Send)],
+    sources: &mut [&mut crate::memory::lanes::Reader<Arc<str>>],
     narrow: &mut Option<Narrow>,
     agents: &mut Option<AgentsSeen>,
 ) -> anyhow::Result<bool>
@@ -5058,39 +5061,20 @@ where
         }
         taken += 1;
         if taken < crate::hub::EVENTS {
-            next = rings.iter_mut().find_map(|ring| ring.ready());
+            next = sources.iter_mut().find_map(|source| ready(source));
         }
     }
     tx.flush().await?;
     Ok(true)
 }
 
-/// The next of `ring`'s events that's ready now, if one is: what its `recv` would have said at once.
-/// An events socket's source of hub events: the hub's ring, and agent sessions' lanes.
-trait Ready {
-    /// The next of its events that's ready now, if one is: what its `recv` would have said at once.
-    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>>;
-}
-
-/// What a source's `try_recv` said, as its `recv` would have said it (none: nothing ready).
-fn ready_of(taken: Result<Arc<str>, async_broadcast::TryRecvError>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
-    match taken {
+/// The next of `source`'s events that's ready now, if one is: what its `recv` would have said at once.
+fn ready(source: &mut crate::memory::lanes::Reader<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+    match source.try_recv() {
         Ok(text) => Some(Ok(text)),
         Err(async_broadcast::TryRecvError::Overflowed(n)) => Some(Err(async_broadcast::RecvError::Overflowed(n))),
         Err(async_broadcast::TryRecvError::Closed) => Some(Err(async_broadcast::RecvError::Closed)),
         Err(async_broadcast::TryRecvError::Empty) => None,
-    }
-}
-
-impl Ready for crate::memory::ring::Subscription<Arc<str>> {
-    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
-        ready_of(self.try_recv())
-    }
-}
-
-impl Ready for crate::memory::lanes::Reader<Arc<str>> {
-    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
-        ready_of(self.try_recv())
     }
 }
 
@@ -6883,8 +6867,8 @@ mod tests {
         use crate::wire::events::{ServerEvent, kind_of};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe(16)?);
-            let (mut rx2, mut sessions2) = (hub.events.subscribe(), hub.harness_events.subscribe(16)?);
+            let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(16)?);
+            let (mut rx2, mut sessions2) = (hub.subscribe_events()?, hub.harness_events.subscribe(16)?);
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
             hub.emit_harness("s1", &serde_json::to_vec(&info)?);
@@ -6892,9 +6876,9 @@ mod tests {
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());
             let first = rx.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx as &mut (dyn Ready + Send), &mut sessions], &mut None, &mut None).await?, "the rings are there");
+            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx, &mut sessions], &mut None, &mut None).await?, "the rings are there");
             let first = rx2.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2 as &mut (dyn Ready + Send), &mut sessions2], &mut None, &mut None).await?, "the rings are there");
+            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2, &mut sessions2], &mut None, &mut None).await?, "the rings are there");
             let text = |m: &ws::Message| match m {
                 ws::Message::Text(t) => Some(t.as_str().to_owned()),
                 _ => None,
@@ -6917,15 +6901,15 @@ mod tests {
             };
             let (a, b) = (ours(&one), ours(&two));
             anyhow::ensure!(a.len() == 4 && a == b, "not the same bytes: {a:?} and {b:?}");
-            // A ring that let some go: `Resync`, in the same write.
-            let small = crate::memory::ring::Ring::<Arc<str>>::new(&crate::memory::owners::UI_EVENTS, 2, 1 << 10);
-            let mut behind = small.subscribe();
+            // A source that let some go: `Resync`, in the same write.
+            let small = crate::memory::lanes::Lanes::<Arc<str>>::new(&crate::memory::owners::UI_EVENTS, 1, 1 << 10);
+            let mut behind = small.subscribe(2)?;
             for k in 0..4 {
-                small.send(Arc::from(format!(r#"{{"type":"updates","n":{k}}}"#)));
+                small.send(0, Arc::from(format!(r#"{{"type":"updates","n":{k}}}"#)));
             }
             let mut three = Written::default();
             let first = behind.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind as &mut (dyn Ready + Send)], &mut None, &mut None).await?);
+            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind], &mut None, &mut None).await?);
             let said: Vec<String> = three.sent.iter().filter_map(text).collect();
             anyhow::ensure!(said.first().map(String::as_str) == Some(ServerEvent::Resync.text().as_str()) && said.len() == 3 && three.flushes == 1, "{said:?}");
             Ok(())

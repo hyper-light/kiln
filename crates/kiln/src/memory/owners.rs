@@ -72,16 +72,15 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 /// payload is let go unlooked at, counted and said: the message itself was taken whole already.
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
-/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets
-/// and kiln's own listeners hear), kept until their slowest subscriber takes them (`crate::memory::ring`): at
-/// most `crate::hub::EVENTS` of them, and [`crate::net::EVENTS_BYTES`] of their texts, as much as the hub's
-/// queue of runners' messages most of them are made from. At the bound the oldest go, as they go past the
-/// count: a page's socket is told to fetch what it shows again (`Resync`), and kiln's own listeners are told
-/// how many they missed. And its `harness_events`, agent sessions' own, on each owner shard's lane to each of
-/// their readers (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5): their texts, each counted once
-/// until its last reader takes it, within [`crate::net::EVENTS_BYTES`] too, and each reader's places, as it
-/// asked for them (an events socket's `crate::hub::EVENTS` in all its lanes); past either, a reader is told
-/// what it lost.
+/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets and
+/// kiln's own listeners hear, on one lane; and its `harness_events`, agent sessions' own, on each owner shard's
+/// lane), each listener's own channels (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5): their texts,
+/// each counted once until its last listener takes it, within [`crate::net::EVENTS_BYTES`] for each of the two
+/// (as much as the hub's queue of runners' messages most of them are made from), and each listener's places,
+/// made as it subscribes (`crate::hub::EVENTS` in all its lanes, as many as the hub's ring held for its
+/// slowest; push's sessions' `EVENTS` a lane). Past either, what comes is let go of for that listener and it's
+/// told how many: a page's socket fetches what it shows again (`Resync`), and kiln's own listeners are told how
+/// many they missed.
 pub static UI_EVENTS: Owner = Owner::new("ui_events");
 
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
