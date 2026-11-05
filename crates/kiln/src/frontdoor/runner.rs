@@ -595,7 +595,7 @@ impl FrontDoor {
         };
         let leaf = tls.leaf().map(crate::util::sha256_hex);
         if leaf != self.tls_leaf {
-            *self.https_shared.tls.write() = Some(tls);
+            self.https_shared.set_tls(tls);
             self.tls_leaf = leaf;
         }
         if self.https.as_ref().is_some_and(|l| l.bound.port() != s.https.port) {
