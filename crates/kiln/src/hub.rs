@@ -2252,7 +2252,8 @@ impl Hub {
         // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
         // listener's) for as long as they send.
         let mut turns = crate::rt::Turns::new();
-        while let Ok(ev) = rx.recv().await {
+        // A turn starts afresh with an event this loop waited for (goal 10, plan 01a1a87b2dae step 5).
+        while let Some(ev) = turns.next(&rx).await {
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
             let began = Instant::now();
@@ -2278,6 +2279,9 @@ impl Hub {
             if let Some(a) = arrived {
                 crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(a.at)), began.elapsed());
             }
+            // How long this loop held the event, its waits included, whatever it was: what the frames queued
+            // behind it waited for (goal 10, plan 01a1a87b2dae step 5).
+            crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Held, began.elapsed());
             turns.after().await;
         }
         anyhow::bail!("transport event stream ended")

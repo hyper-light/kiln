@@ -77,18 +77,34 @@ async fn list(cx: Cx, v: Value) -> Out {
         seen = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await;
         seen.iter().collect()
     };
-    let agents: Vec<Value> = all
-        .into_iter()
+    let keep = |i: &Info| {
         // A card's helper (`super::about`) is the card's: no agent of these.
-        .filter(|i| i.helper.is_none())
-        .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
-        .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
-        .filter(|i| parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p)))
-        .filter(|i| run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r)))
-        .map(wait::brief)
-        .filter(|b| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st)))
-        .collect();
+        i.helper.is_none()
+            && machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local"))
+            && harness.as_deref().is_none_or(|h| i.kind == h)
+            && parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p))
+            && run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r))
+    };
+    let wanted = |b: &Value| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st));
+    let agents = briefs(all, keep, wanted, crate::rt::consume_budget).await;
     Ok(json!({"agents": agents}))
+}
+
+/// The briefs (`wait::brief`) of the agents of `infos` that `keep` keeps and whose brief `wanted` wants, in their
+/// order, one a piece: after each, `turn`, the shard's (`crate::rt::consume_budget`: its turn given up once spent,
+/// while something else wants the shard). Goal 10, plan 01a1a87b2dae step 5: `agents_list` made them all in one
+/// poll, holding its shard 1.2 ms a call at the mean and 7 ms at the longest in g11alloc2's calm rounds, the longest
+/// of any request there, and every read on that shard waited behind it.
+async fn briefs<'a, F: std::future::Future<Output = ()>>(infos: impl IntoIterator<Item = &'a Info>, keep: impl Fn(&Info) -> bool, wanted: impl Fn(&Value) -> bool, mut turn: impl FnMut() -> F) -> Vec<Value> {
+    let mut out = Vec::new();
+    for i in infos.into_iter().filter(|i| keep(i)) {
+        let b = wait::brief(i);
+        if wanted(&b) {
+            out.push(b);
+        }
+        turn().await;
+    }
+    out
 }
 
 /// What a state says that `agents.get` leaves out: catalogs and lists only a console needs.
@@ -1124,6 +1140,37 @@ pub mod input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 5: `agents.list` makes each agent's brief a piece of its own, the shard's turn
+    /// taken after each one made, so a long list gives its shard up between agents as a long computation does; the
+    /// agents it gives, their order and its filters are as they were.
+    #[test]
+    fn g10_s5_agents_list_takes_its_shards_turn_between_agents() {
+        let info = |n: usize| Info { id: format!("a{n}"), kind: if n % 2 == 0 { "claude" } else { "codex" }.into(), ..Info::default() };
+        let infos: Vec<Info> = (0..5).map(info).chain(std::iter::once(Info { helper: Some("a card's".into()), ..info(6) })).collect();
+        let at_once = |keep: &dyn Fn(&Info) -> bool, wanted: &dyn Fn(&Value) -> bool| infos.iter().filter(|i| keep(i)).map(wait::brief).filter(|b| wanted(b)).collect::<Vec<Value>>();
+        let turns = std::cell::Cell::new(0usize);
+        let turn = || {
+            turns.set(turns.get() + 1);
+            std::future::ready(())
+        };
+        // As `list` keeps them: every agent but a card's helper.
+        let keep = |i: &Info| i.helper.is_none();
+        let all = |_: &Value| true;
+        let made = futures::FutureExt::now_or_never(briefs(&infos, keep, all, turn));
+        assert_eq!(made, Some(at_once(&keep, &all)), "the same briefs, in order");
+        assert_eq!(turns.get(), 5, "a turn after each agent's brief");
+        // A filter on what it is, and one on its brief: a turn for each brief made, whether wanted or not.
+        turns.set(0);
+        let claude = |i: &Info| i.helper.is_none() && i.kind == "claude";
+        let none = |_: &Value| false;
+        assert_eq!(futures::FutureExt::now_or_never(briefs(&infos, claude, none, turn)), Some(Vec::new()));
+        assert_eq!(turns.get(), 3, "three claude agents' briefs made");
+        turns.set(0);
+        let made = futures::FutureExt::now_or_never(briefs(&infos, claude, all, turn));
+        assert_eq!(made, Some(at_once(&claude, &all)));
+        assert_eq!(made.map(|m| m.len()), Some(3));
+    }
 
     #[test]
     fn about_asks_what_was_tapped_in_the_four_parts_the_card_reads() {
