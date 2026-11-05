@@ -4304,7 +4304,7 @@ mod tests {
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
-            let mut events = hub.events.subscribe();
+            let mut events = hub.harness_events.subscribe();
             let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
             let was = encodings().await;
@@ -4805,6 +4805,78 @@ mod tests {
             }
             // Most joined while the updates came, and took the rest of them live.
             anyhow::ensure!(lively * 2 > count, "{lively} of {count} viewers took live frames");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the same through runners' path, each update judged and taken by
+    /// its session's owner (`Registry::from_runner`; goal 10, plan 01a1a87b2dae step 4), an update's events
+    /// taken in turns of its owner's (goal 9, plan 01a1a87b2cec step 3). Sixteen sessions' runner updates are
+    /// handed over from every shard at once, every shard kept busy, every fourth a run of eight events an
+    /// owner's turn may run out in, each event's words streamed after it and a state after each: each copy
+    /// takes every event once, in order, with its words in the order they came, and its last state.
+    #[test]
+    fn g4_s5_runner_updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let ids: Vec<String> = (0..16).map(|n| format!("r{n}")).collect();
+            for id in &ids {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            }
+            // Every shard kept busy, giving itself up only to what wants it.
+            let busy = Arc::new(AtomicBool::new(true));
+            for _ in 0..crate::rt::shard_count().max(1) * 2 {
+                let busy = Arc::clone(&busy);
+                crate::rt::spawn_spread(async move {
+                    while busy.load(Ordering::Acquire) {
+                        let t = std::time::Instant::now();
+                        while t.elapsed() < std::time::Duration::from_micros(200) {
+                            std::hint::spin_loop();
+                        }
+                        crate::rt::maybe_yield().await;
+                    }
+                });
+            }
+            let per = 60u64;
+            let (sent_tx, sent_rx) = async_channel::unbounded::<()>();
+            for id in ids.clone() {
+                let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
+                crate::rt::spawn_spread(async move {
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None };
+                    let mut n = 0u64;
+                    while n < per {
+                        let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
+                        let events: Vec<Event> = (n + 1..=n + run).map(|q| Event { id: format!("{id}-e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: String::new(), streaming: true } }).collect();
+                        hub.harness.from_runner(runner(Update::Events { events })).await;
+                        for q in n + 1..=n + run {
+                            for part in ["a", "b"] {
+                                hub.harness.from_runner(runner(Update::Stream { id: format!("{id}-e{q}"), text: format!("{q}{part}") })).await;
+                            }
+                        }
+                        n += run;
+                        hub.harness.from_runner(runner(Update::State { state: Box::new(State { summary: format!("through {n}"), ..State::default() }) })).await;
+                        if n.is_multiple_of(2) {
+                            crate::rt::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
+                    let _ = sent.send(()).await;
+                });
+            }
+            drop(sent_tx);
+            for _ in 0..ids.len() {
+                sent_rx.recv().await?;
+            }
+            hub.harness.settled().await;
+            busy.store(false, Ordering::Release);
+            for id in &ids {
+                let want: Vec<(String, String)> = (1..=per).map(|n| (format!("{id}-e{n}"), format!("{n}a{n}b"))).collect();
+                anyhow::ensure!(said_in(&hub, id) == want, "{id}'s copy: {:?}", said_in(&hub, id).iter().take(4).collect::<Vec<_>>());
+                let summary = hub.harness.sessions.with(id, |v| v.info.summary.clone());
+                anyhow::ensure!(summary.as_deref() == Some(format!("through {per}").as_str()), "{id}'s last state: {summary:?}");
+            }
             Ok(())
         })
     }

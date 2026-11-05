@@ -129,7 +129,10 @@ crc32fast = "1.5.2"
 scrypt = { version = "0.11", default-features = false }
 crypto_secretbox = "0.1"
 brotli = "8.0.4"
-async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake"] }
+# `futures-03-sink` (futures-util, already in the tree): a socket's sender as a `Sink`, so what's ready is fed and
+# flushed once: the events socket's events (goal 4, plan 01a1a59c2a9c step 5) and a viewer's batch of live frames
+# (goal 9, plan 01a1a87b2cec step 5; `api::write_live_batch`), each one write where each was a write of its own.
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake", "futures-03-sink"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 async-lock = "3.4.2"
 argon2 = "0.6"

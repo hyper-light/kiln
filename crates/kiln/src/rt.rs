@@ -2064,8 +2064,8 @@ mod tests {
         assert!(within(STEP_BUDGET_NS), "the floor and three quanta within the bar");
         assert!(!within(STEP_BUDGET_NS + 1), "the largest quantum within it");
         assert_eq!(STEP_BUDGET_NS, 266_666);
-        assert!(DELAY_FLOOR_NS >= 192_000, "the floor by design, against the lab's calm median of 192 µs");
-        assert!(STEP_BUDGET_NS >= ORDINARY_POLL_NS, "ordinary work's long polls fit a quantum");
+        const { assert!(DELAY_FLOOR_NS >= 192_000, "the floor by design, against the lab's calm median of 192 µs") };
+        const { assert!(STEP_BUDGET_NS >= ORDINARY_POLL_NS, "ordinary work's long polls fit a quantum") };
         let c = runtime_config(2, 64);
         assert_eq!((c.step_budget_ns, c.timer_tick_ns), (STEP_BUDGET_NS, TIMER_TICK_NS));
         // Step 5's bar, a busy share of 0.011: one poll at p99.9.

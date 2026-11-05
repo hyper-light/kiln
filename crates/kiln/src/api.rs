@@ -4994,33 +4994,83 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
+    // Agent sessions' own events come on a ring of their own (`Hub::harness_events`; goal 4, plan
+    // 01a1a59c2a9c step 5): the socket sends both, each as it comes.
+    let mut sessions = hub.harness_events.subscribe();
     hub.emit_queue();
     loop {
-        futures::select_biased! {
-            ev = rx.recv().fuse() => match ev {
-                Ok(text) => {
-                    let keep = match narrow.as_mut() {
-                        Some(n) => n.lets(hub, text.as_ref()).await,
-                        None => true,
-                    } && match agents.as_mut() {
-                        Some(a) => a.lets(hub, text.as_ref()).await,
-                        None => true,
-                    };
-                    if keep {
-                        tx.send(ws::text(text.as_ref())).await?;
-                    }
-                }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    tx.send(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
-                }
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
-            },
+        let first = futures::select_biased! {
+            ev = rx.recv().fuse() => ev,
+            ev = sessions.recv().fuse() => ev,
             msg = rx_ws.next().fuse() => {
                 if hub.unread_only(sock, &mut tx, ui::came(msg), |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
                     return Ok(());
                 }
+                continue;
+            }
+        };
+        let mut rings = [&mut rx, &mut sessions];
+        if !send_ready(hub, &mut tx, first, &mut rings, &mut narrow, &mut agents).await? {
+            return Ok(());
+        }
+    }
+}
+
+/// An events socket's hub events: `first`, then every one ready after it on its `rings`, each sent unless
+/// the socket's filters keep it off, written as one: fed, then flushed once (goal 4, plan 01a1a59c2a9c step 5;
+/// as goal 9 step 5 found, an event a flush was a write to the connection an event). At most one ring's
+/// worth goes in one flush ([`crate::hub::EVENTS`]), so what comes while it writes waits for the next. A
+/// ring that let some go before the socket took them says `Resync`; false once a ring is gone.
+async fn send_ready<S>(
+    hub: &Hub,
+    tx: &mut S,
+    first: Result<Arc<str>, async_broadcast::RecvError>,
+    rings: &mut [&mut crate::memory::ring::Subscription<Arc<str>>],
+    narrow: &mut Option<Narrow>,
+    agents: &mut Option<AgentsSeen>,
+) -> anyhow::Result<bool>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt as _;
+    let (mut next, mut taken) = (Some(first), 0usize);
+    while let Some(ev) = next.take() {
+        match ev {
+            Ok(text) => {
+                let keep = match narrow.as_mut() {
+                    Some(n) => n.lets(hub, text.as_ref()).await,
+                    None => true,
+                } && match agents.as_mut() {
+                    Some(a) => a.lets(hub, text.as_ref()).await,
+                    None => true,
+                };
+                if keep {
+                    tx.feed(ws::shared_text(&text)).await?;
+                }
+            }
+            Err(async_broadcast::RecvError::Overflowed(_)) => tx.feed(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?,
+            Err(async_broadcast::RecvError::Closed) => {
+                tx.flush().await?;
+                return Ok(false);
             }
         }
+        taken += 1;
+        if taken < crate::hub::EVENTS {
+            next = rings.iter_mut().find_map(|ring| ready(ring));
+        }
+    }
+    tx.flush().await?;
+    Ok(true)
+}
+
+/// The next of `ring`'s events that's ready now, if one is: what its `recv` would have said at once.
+fn ready(ring: &mut crate::memory::ring::Subscription<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+    match ring.try_recv() {
+        Ok(text) => Some(Ok(text)),
+        Err(async_broadcast::TryRecvError::Overflowed(n)) => Some(Err(async_broadcast::RecvError::Overflowed(n))),
+        Err(async_broadcast::TryRecvError::Closed) => Some(Err(async_broadcast::RecvError::Closed)),
+        Err(async_broadcast::TryRecvError::Empty) => None,
     }
 }
 
@@ -6344,6 +6394,76 @@ enum Live {
     Quiet,
 }
 
+/// What a batch of a session's feed came to for its viewer ([`write_live_batch`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Fed {
+    /// Its frames went out: the next read goes on from the batch's end.
+    Written,
+    /// A frame the feed didn't make, its resync marker, or a frame the viewer can't take: the viewer starts
+    /// over, the batch's frames before it gone out.
+    StartOver,
+    /// The session's last frame went out: the viewer ends with it.
+    Closed,
+}
+
+/// Writes a batch of a session's feed to its viewer's socket `tx` (goal 9, plan 01a1a87b2cec step 5): each frame
+/// the viewer takes is fed to the socket and the batch flushed once, one write for the batch where each frame
+/// was a write of its own (a system call on the shard each). Each frame goes as its payload's own bytes, read
+/// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
+/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
+/// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
+/// written (goal 1, plan 01a1a59c2a68 step 2).
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant) -> Result<Fed, S::Error>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+{
+    use futures::SinkExt as _;
+    let mut fed = 0u64;
+    let mut came_to = Fed::Written;
+    for m in messages {
+        let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
+            tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
+            came_to = Fed::StartOver;
+            break;
+        };
+        if frame.text == crate::harness::live::RESYNC {
+            came_to = Fed::StartOver;
+            break;
+        }
+        // The session's last frame: the viewer ends with it, and its place, given back, lets the topic go.
+        if frame.text == crate::harness::live::closed() {
+            tx.feed(ws::text(frame.for_viewer(patches))).await?;
+            came_to = Fed::Closed;
+            break;
+        }
+        // One its catch-up already held.
+        if frame.rev != 0 && frame.rev <= *have {
+            continue;
+        }
+        let (rev, range) = (frame.rev, frame.range_for_viewer(patches));
+        let published = crate::harness::live::published_us(&m.payload);
+        let said = crate::harness::live::into_text(m.payload, range);
+        // A state or changeset that went as its patch alone, to a viewer that takes it whole (none did as it
+        // went: `live::Feed::wants_whole`): it starts over rather than take nothing.
+        if said.is_empty() {
+            came_to = Fed::StartOver;
+            break;
+        }
+        if let Some(waited) = published.map(|at| Duration::from_micros(now_us.saturating_sub(at))) {
+            crate::metrics::bus().delivery_seconds.observe(waited.as_secs_f64());
+            crate::route_latency::observe_wait(crate::route_latency::Class::Websocket, waited);
+        }
+        *have = (*have).max(rev);
+        tx.feed(ws::text(said)).await?;
+        fed = fed.saturating_add(1);
+    }
+    if fed > 0 || came_to == Fed::Closed {
+        tx.flush().await?;
+    }
+    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, read_at.elapsed(), fed);
+    Ok(came_to)
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
@@ -6357,7 +6477,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
-    let (mut tx, mut rx) = socket.split();
+    let (mut tx, rx) = socket.split();
+    // What its person sends, read only once its socket has some (goal 9, plan 01a1a87b2cec step 5): every frame
+    // and answer wakes this loop, and an ask with nothing come zero-fills the reader's 16 KiB and reads nothing.
+    let mut rx = ws::Gated::new(rx);
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
@@ -6426,50 +6549,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     Ok(batch) => {
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
-                        let now = crate::harness::live::now_us();
-                        let read_at = Instant::now();
-                        let next = batch.next;
-                        // Each frame read where it is in its payload, and sent as the payload's own
-                        // bytes (this viewer's copy of it, moved): no other copy of it is made.
-                        for m in batch.messages {
-                            let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
-                                tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
-                                start_over = true;
-                                break;
-                            };
-                            if frame.text == crate::harness::live::RESYNC {
-                                start_over = true;
-                                break;
-                            }
-                            // The session's last frame: the viewer ends with it, and its place,
-                            // given back, lets the topic go.
-                            if frame.text == crate::harness::live::closed() {
-                                tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
-                                return Ok(());
-                            }
-                            // One its catch-up already held.
-                            if frame.rev != 0 && frame.rev <= have {
-                                continue;
-                            }
-                            let (rev, range) = (frame.rev, frame.range_for_viewer(takes.patches));
-                            let published = crate::harness::live::published_us(&m.payload);
-                            let said = crate::harness::live::into_text(m.payload, range);
-                            // A state or changeset that went as its patch alone, to a viewer that
-                            // takes it whole (none did as it went: `live::Feed::wants_whole`):
-                            // it starts over rather than take nothing.
-                            if said.is_empty() {
-                                start_over = true;
-                                break;
-                            }
-                            let waited = published.map(|at| Duration::from_micros(now.saturating_sub(at)));
-                            if let Some(w) = waited {
-                                crate::metrics::bus().delivery_seconds.observe(w.as_secs_f64());
-                            }
-                            have = have.max(rev);
-                            tx.send(ws::text(said)).await?;
-                            // From its publish to this viewer's read, then to its write on the socket
-                            // (goal 1, plan 01a1a59c2a68 step 2).
-                            crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
+                        let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
+                        match write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at).await? {
+                            Fed::Written => {}
+                            Fed::StartOver => start_over = true,
+                            Fed::Closed => return Ok(()),
                         }
                         at = Some(next);
                         // A viewer behind its feed reads batch after batch, each ready at once: past its
@@ -6744,6 +6828,100 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed.
+    #[derive(Default)]
+    struct Written {
+        sent: Vec<ws::Message>,
+        flushes: usize,
+    }
+
+    impl futures::Sink<ws::Message> for Written {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            self.get_mut().sent.push(item);
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            self.get_mut().flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5 (as goal 9 step 5 found): an events socket sends every hub event
+    /// that's ready, from both of the hub's rings, written as one (one flush, not one an event); a ring that
+    /// let some go says `Resync` among them; and two sockets sending the same event send one allocation, the
+    /// event's own text, not a copy each.
+    #[test]
+    fn g4_s5_an_events_socket_writes_whats_ready_at_once_its_bytes_shared() -> anyhow::Result<()> {
+        use crate::wire::events::{ServerEvent, kind_of};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe());
+            let (mut rx2, mut sessions2) = (hub.events.subscribe(), hub.harness_events.subscribe());
+            let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
+            hub.emit(&ServerEvent::Updates);
+            hub.emit_harness(&serde_json::to_vec(&info)?);
+            hub.emit(&ServerEvent::Terminals);
+            hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
+            let (mut one, mut two) = (Written::default(), Written::default());
+            let first = rx.recv().await;
+            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx, &mut sessions], &mut None, &mut None).await?, "the rings are there");
+            let first = rx2.recv().await;
+            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2, &mut sessions2], &mut None, &mut None).await?, "the rings are there");
+            let text = |m: &ws::Message| match m {
+                ws::Message::Text(t) => Some(t.as_str().to_owned()),
+                _ => None,
+            };
+            let kinds: Vec<String> = one.sent.iter().filter_map(text).filter_map(|t| kind_of(&t).map(str::to_owned)).collect();
+            // The hub's own work may emit beside these: each of ours once, the hub's before the sessions'.
+            for k in ["updates", "terminals", "harness", "harness_closed"] {
+                anyhow::ensure!(kinds.iter().filter(|s| *s == k).count() == 1, "{k} in {kinds:?}");
+            }
+            anyhow::ensure!(one.flushes == 1 && two.flushes == 1, "flushed {} and {} times for {} events", one.flushes, two.flushes, one.sent.len());
+            // Each of ours went to both sockets as one allocation between them.
+            let ours = |w: &Written| -> Vec<(String, usize)> {
+                w.sent
+                    .iter()
+                    .filter_map(|m| match m {
+                        ws::Message::Text(t) if kind_of(t.as_str()).is_some_and(|k| ["updates", "terminals", "harness", "harness_closed"].contains(&k)) => Some((t.as_str().to_owned(), t.as_str().as_ptr().addr())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let (a, b) = (ours(&one), ours(&two));
+            anyhow::ensure!(a.len() == 4 && a == b, "not the same bytes: {a:?} and {b:?}");
+            // A ring that let some go: `Resync`, in the same write.
+            let small = crate::memory::ring::Ring::<Arc<str>>::new(&crate::memory::owners::UI_EVENTS, 2, 1 << 10);
+            let mut behind = small.subscribe();
+            for k in 0..4 {
+                small.send(Arc::from(format!(r#"{{"type":"updates","n":{k}}}"#)));
+            }
+            let mut three = Written::default();
+            let first = behind.recv().await;
+            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind], &mut None, &mut None).await?);
+            let said: Vec<String> = three.sent.iter().filter_map(text).collect();
+            anyhow::ensure!(said.first().map(String::as_str) == Some(ServerEvent::Resync.text().as_str()) && said.len() == 3 && three.flushes == 1, "{said:?}");
+            Ok(())
+        })
+    }
+
+    /// The text frame of a shared text is that text's own bytes, not a copy.
+    #[test]
+    fn g4_s5_a_shared_text_frame_is_its_texts_own_bytes() -> anyhow::Result<()> {
+        let text: Arc<str> = Arc::from(r#"{"type":"harness","info":{"id":"s1","summary":"a \"quoted\" ünïcode word"}}"#);
+        for m in [ws::shared_text(&text), ws::shared_text(&text)] {
+            let ws::Message::Text(t) = &m else { anyhow::bail!("not text") };
+            anyhow::ensure!(t.as_str() == &*text && std::ptr::eq(t.as_str().as_ptr(), text.as_ptr()), "copied");
+        }
+        Ok(())
+    }
 
     /// Goal 8 (plan 01a1a59c2b29 step 5, docs/priority.md): the server's delay is its worst shard's,
     /// the latest probe's lateness, or a hold under way past the probes' period; a shard not probed
@@ -7486,6 +7664,92 @@ mod tests {
         }
         assert!(policy.starts_with("sandbox allow-scripts ") && policy.ends_with("; frame-ancestors 'self'"), "{policy}");
         assert_eq!(page_policy("", "frame-ancestors 'self'"), format!("{PAGE_POLICY}; frame-ancestors 'self'"), "none named: the policy as it was");
+    }
+
+    /// A connection that takes each write whole and says it on its channel: what a socket's writes were, as
+    /// many as its system calls would be.
+    struct Writes(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl futures::io::AsyncRead for Writes {
+        fn poll_read(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &mut [u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures::io::AsyncWrite for Writes {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            let _ = self.0.send(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A session's frame of revision `rev` saying `text`, as its feed puts it on the bus.
+    fn fed_frame(offset: u64, text: &str, rev: u64) -> kiln_seams::bus::Message {
+        let frame = crate::harness::registry::Frame { text: Arc::from(text), patch: None, patch_of: crate::harness::registry::PatchOf::State, rev };
+        kiln_seams::bus::Message { offset, key: None, payload: crate::harness::live::encode(&frame), at_ms: 0 }
+    }
+
+    /// The text messages a client reads from `wire`, a server's writes, in order.
+    fn texts_read(wire: Vec<u8>) -> anyhow::Result<Vec<String>> {
+        let mut client = tungstenite::protocol::WebSocket::from_raw_socket(std::io::Cursor::new(wire), tungstenite::protocol::Role::Client, None);
+        let mut texts = Vec::new();
+        loop {
+            match client.read() {
+                Ok(ws::Message::Text(t)) => texts.push(t.as_str().to_owned()),
+                Ok(other) => anyhow::bail!("not text: {other:?}"),
+                // The writes' end, at a frame's: tungstenite says the stream ended with no close.
+                Err(tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => return Ok(texts),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a batch of a session's feed goes to its viewer's socket in one write:
+    /// each live frame fed, the batch flushed once, where sending each frame wrote each (a system call on the
+    /// shard a frame). A frame the viewer's catch-up held is skipped, the rest arrive whole and in order, the
+    /// viewer's revision moves to the newest sent; a batch ending with the session's last frame is one write too,
+    /// and says the viewer ends.
+    #[test]
+    fn g9_s5_a_feeds_batch_goes_to_its_viewer_in_one_write() -> anyhow::Result<()> {
+        /// Shape: the live frames of the batch: more than one, so one write for them all is seen.
+        const FRAMES: u64 = 5;
+        crate::rt::block_on(async {
+            let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
+            let (mut tx, _rx) = socket.split();
+            let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
+            // The viewer's catch-up held revision 1: that frame isn't sent again.
+            let mut have = 1;
+            let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
+            anyhow::ensure!(have == FRAMES, "the viewer has the newest sent: {have}");
+            let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
+            anyhow::ensure!(wrote.len() == 1, "{} frames of one batch went in {} writes", FRAMES - 1, wrote.len());
+            anyhow::ensure!(texts_read(wrote.concat())? == texts.get(1..).unwrap_or_default(), "the frames, whole and in order, the held one skipped");
+            // As they went before: a write a frame.
+            for text in &texts {
+                tx.send(ws::text(text.as_str())).await?;
+            }
+            anyhow::ensure!(writes.try_iter().count() == texts.len(), "sending each frame writes each");
+            // A batch the session's last frame ends: one write, and the viewer ends with it.
+            let closed = crate::harness::registry::Frame::of(SessionDown::from(SessionFrame::Closed));
+            let last = vec![fed_frame(9, r#"{"t":"events","rev":9}"#, 9), kiln_seams::bus::Message { offset: 10, key: None, payload: crate::harness::live::encode(&closed), at_ms: 0 }];
+            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            anyhow::ensure!(came_to == Fed::Closed, "{came_to:?}");
+            let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
+            anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
+            anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            Ok(())
+        })
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a request's future holds its router's state by a pointer, not a copy

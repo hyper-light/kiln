@@ -73,11 +73,12 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
 /// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets
-/// and kiln's own listeners hear), kept until their slowest subscriber takes them
-/// (`crate::memory::ring`): at most `crate::hub::EVENTS` of them, and [`crate::net::EVENTS_BYTES`] of
-/// their texts, as much as the hub's queue of runners' messages most of them are made from. At the bound
-/// the oldest go, as they go past the count: a page's socket is told to fetch what it shows again
-/// (`Resync`), and kiln's own listeners are told how many they missed.
+/// and kiln's own listeners hear; and its `harness_events`, agent sessions' own, on a ring of their own:
+/// goal 4, plan 01a1a59c2a9c step 5), kept until their slowest subscriber takes them
+/// (`crate::memory::ring`): each ring at most `crate::hub::EVENTS` of them, and
+/// [`crate::net::EVENTS_BYTES`] of their texts, as much as the hub's queue of runners' messages most of
+/// them are made from. At the bound the oldest go, as they go past the count: a page's socket is told to
+/// fetch what it shows again (`Resync`), and kiln's own listeners are told how many they missed.
 pub static UI_EVENTS: Owner = Owner::new("ui_events");
 
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes

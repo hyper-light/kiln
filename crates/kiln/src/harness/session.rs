@@ -542,10 +542,69 @@ impl Info {
     }
 
     /// The parts lists care about changed (activity timestamps aside, the words of what's queued: a
-    /// message edited while it waits changes nothing they show, and what kiln's own were handed).
+    /// message edited while it waits changes nothing they show, and what kiln's own were handed). Field by
+    /// field where each is, neither side copied: both were copied whole for each state a session's owner
+    /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
+    /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
-        strip(self) != strip(o)
+        let Self { id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        !(*id == o.id
+            && *kind == o.kind
+            && *kind_name == o.kind_name
+            && *target == o.target
+            && *name == o.name
+            && *shell == o.shell
+            && *cwd == o.cwd
+            && *tree == o.tree
+            && *created_at == o.created_at
+            && *status == o.status
+            && *title == o.title
+            && *model == o.model
+            && *mode == o.mode
+            && *harness_session == o.harness_session
+            && *approvals == o.approvals
+            && *queued == o.queued
+            && *tasks_running == o.tasks_running
+            && *subagents == o.subagents
+            && *cost_usd == o.cost_usd
+            && *activity == o.activity
+            && *exit == o.exit
+            && *goal == o.goal
+            && *objective == o.objective
+            && *summary == o.summary
+            && *doing == o.doing
+            && *epoch == o.epoch
+            && *todos_done == o.todos_done
+            && *todos_total == o.todos_total
+            && *files_changed == o.files_changed
+            && *lines_added == o.lines_added
+            && *lines_removed == o.lines_removed
+            && *context_pct == o.context_pct
+            && *turn_started == o.turn_started
+            && *limits == o.limits
+            && *account == o.account
+            && *plan == o.plan
+            && *left_behind == o.left_behind
+            && *reach == o.reach
+            && *pause == o.pause
+            && *frozen == o.frozen
+            && *perms == o.perms
+            && *room_wait == o.room_wait
+            && *last_turn == o.last_turn
+            && *keep_off == o.keep_off
+            && *held == o.held
+            && *refused == o.refused
+            && *move_on_limit == o.move_on_limit
+            && *move_plan == o.move_plan
+            && *pause_at == o.pause_at
+            && *max_subagents == o.max_subagents
+            && *parent == o.parent
+            && *plan_run == o.plan_run
+            && *helper == o.helper
+            && *subagent == o.subagent
+            && *variant_of == o.variant_of
+            && *no_bypass == o.no_bypass
+            && *workspace == o.workspace)
     }
 }
 
@@ -4150,6 +4209,42 @@ mod tests {
             prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by
+    /// field without copying either, is what comparing their copies with the activity time, the queue's
+    /// words and what was said cleared said: every field changed alone, and those three changed together.
+    #[test]
+    fn g4_s5_infos_differ_as_their_copies_did() {
+        let was = |a: &Info, b: &Info| {
+            let strip = |i: &Info| Info { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
+            strip(a) != strip(b)
+        };
+        let base = Info { id: "s1".into(), kind: "claude".into(), name: "n".into(), cost_usd: 0.25, ..Info::default() };
+        let changes: Vec<(&str, Info)> = vec![
+            ("id", Info { id: "s2".into(), ..base.clone() }),
+            ("name", Info { name: "m".into(), ..base.clone() }),
+            ("status", Info { status: super::super::model::Status::Running, ..base.clone() }),
+            ("queued", Info { queued: 1, ..base.clone() }),
+            ("cost_usd", Info { cost_usd: 0.5, ..base.clone() }),
+            ("summary", Info { summary: "said".into(), ..base.clone() }),
+            ("doing", Info { doing: Some("reading".into()), ..base.clone() }),
+            ("epoch", Info { epoch: 2, ..base.clone() }),
+            ("context_pct", Info { context_pct: Some(40), ..base.clone() }),
+            ("keep_off", Info { keep_off: true, ..base.clone() }),
+            ("no_bypass", Info { no_bypass: true, ..base.clone() }),
+            ("parent", Info { parent: Some("p".into()), ..base.clone() }),
+            ("last_activity", Info { last_activity: 99, ..base.clone() }),
+            ("queue", Info { queue: vec![super::super::queued::Queued::of("q1", "later")], ..base.clone() }),
+            ("all three", Info { last_activity: 7, queue: vec![super::super::queued::Queued::of("q1", "x")], said: vec![super::super::model::Given::default()], ..base.clone() }),
+        ];
+        assert!(!base.differs(&base.clone()), "the same");
+        for (what, other) in &changes {
+            assert_eq!(base.differs(other), was(&base, other), "{what}");
+            assert_eq!(other.differs(&base), was(other, &base), "{what}, the other way");
+        }
+        assert!(changes.iter().filter(|(w, _)| ["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| !base.differs(o)), "what lists don't show");
+        assert!(changes.iter().filter(|(w, _)| !["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| base.differs(o)), "what they show");
     }
 
     fn message(id: &str, text: &str) -> Command {

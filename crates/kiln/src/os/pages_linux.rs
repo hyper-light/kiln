@@ -151,7 +151,7 @@ fn drop_within(ranges: &[Range<usize>], mappings: &[Mapping]) -> io::Result<Drop
                 let pages = ((to - at) / page).min(per_read);
                 let bytes = buf.get_mut(..pages.saturating_mul(ENTRY)).ok_or_else(|| io::Error::other("pagemap's buffer"))?;
                 pagemap.read_exact_at(bytes, u64::try_from(at / page * ENTRY).map_err(io::Error::other)?)?;
-                let entries: Vec<u64> = bytes.chunks_exact(ENTRY).map(|c| c.try_into().map_or(0, u64::from_ne_bytes)).collect();
+                let entries: Vec<u64> = bytes.as_chunks::<ENTRY>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
                 let (found, held, kept) = runs(&entries, at, page);
                 for run in &found {
                     dontneed(run, m)?;
@@ -215,7 +215,7 @@ pub fn drop_spans(spans: &[(usize, usize)]) -> io::Result<Dropped> {
 pub fn drop_all_own() -> io::Result<Dropped> {
     let mut done = Dropped::default();
     for m in own_mappings()? {
-        done.add(drop_within(&[m.start..m.end], std::slice::from_ref(&m))?);
+        done.add(drop_within(std::slice::from_ref(&(m.start..m.end)), std::slice::from_ref(&m))?);
     }
     Ok(done)
 }
@@ -342,7 +342,7 @@ mod tests {
             let pagemap = std::fs::File::open("/proc/self/pagemap")?;
             let mut buf = vec![0u8; self.len / page * ENTRY];
             pagemap.read_exact_at(&mut buf, u64::try_from(self.at() / page * ENTRY).map_err(io::Error::other)?)?;
-            Ok(buf.chunks_exact(ENTRY).map(|c| c.try_into().map_or(0, u64::from_ne_bytes) & PRESENT != 0).collect())
+            Ok(buf.as_chunks::<ENTRY>().0.iter().map(|c| u64::from_ne_bytes(*c) & PRESENT != 0).collect())
         }
     }
 
@@ -374,7 +374,7 @@ mod tests {
         let m = Mapped::new(f.as_file(), bytes.len(), false)?;
         assert_eq!(m.read(), bytes);
         assert!(m.resident()?.iter().all(|r| *r), "every page read is resident");
-        let done = drop_within(&[m.at()..m.at() + m.len], &[m.mapping()])?;
+        let done = drop_within(std::slice::from_ref(&(m.at()..m.at() + m.len)), &[m.mapping()])?;
         assert_eq!(done.bytes, u64::try_from(bytes.len()).unwrap_or(0));
         assert!(m.resident()?.iter().all(|r| !r), "none resident after the drop");
         assert_eq!(m.read(), bytes, "the same bytes, faulted back from the file");
@@ -392,7 +392,7 @@ mod tests {
         let _ = m.read();
         m.write(3 * page + 5, 0xAB);
         m.protect()?;
-        let done = drop_within(&[m.at()..m.at() + m.len], &[m.mapping()])?;
+        let done = drop_within(std::slice::from_ref(&(m.at()..m.at() + m.len)), &[m.mapping()])?;
         assert_eq!(done.kept, u64::try_from(page).unwrap_or(0), "the written page is kept");
         assert_eq!(done.bytes, u64::try_from((pages - 1) * page).unwrap_or(0));
         let resident = m.resident()?;
@@ -422,7 +422,7 @@ mod tests {
         let sum = |d: &[u8]| d.iter().map(|b| u64::from(*b)).sum::<u64>();
         let want = u64::try_from(OWN.len()).unwrap_or(0) * 0x5A;
         assert_eq!(sum(data), want);
-        let done = drop_own(&[at..at + OWN.len()])?;
+        let done = drop_own(std::slice::from_ref(&(at..at + OWN.len())))?;
         // Its whole pages, every one read just now: dropped, but for one a test beside it may have faulted
         // back in the meantime (the kernel maps the 64 KiB around a fault).
         let page = u64::try_from(page_size()).unwrap_or(u64::MAX);
