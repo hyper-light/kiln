@@ -12,8 +12,15 @@ chaos = []
 # server's anonymous memory was 261 MB on jemalloc (one round, its profile on), 393 MB on glibc's malloc and
 # 401 MB on musl's (the median of 8; g11load, 2026-11-05). Off until the A/B, latency included, says so;
 # ci/release/build.sh takes it with KILN_LINUX_ALLOCATOR=jemalloc. Its settings are `os::alloc`'s, which its
-# tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl).
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+# tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl). jemalloc keeps its statistics (`stats`,
+# its own default; tikv-jemalloc-sys's is off), which /metrics gives as kiln_memory_allocator_bytes: what's
+# live, what threads' caches keep, freed pages not yet given back, its own metadata (goal 11, plan
+# 01a1a87b2e56 step 5).
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "tikv-jemalloc-sys/stats"]
+# jemalloc's heap profile built in, for the lab (goal 11, plan 01a1a87b2e56 step 5): a static musl build takes
+# no preloaded profiler. Off at run time until `_RJEM_MALLOC_CONF` says `prof:true`; then kiln samples through
+# its own unwinder (`os::alloc`). Never a release's.
+jemalloc-prof = ["jemalloc", "tikv-jemalloc-sys/profiling"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
 # rather than running nothing (docs/wire.md, "The lab").
