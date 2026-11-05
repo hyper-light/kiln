@@ -522,10 +522,18 @@ pub struct Hub {
     pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
-    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text: kept
-    /// for their slowest at most [`EVENTS`] of them and one receive window of their bytes (goal 11, plan
-    /// 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
+    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text, but
+    /// agent sessions' own ([`Hub::harness_events`]): kept for their slowest at most [`EVENTS`] of them
+    /// and one receive window of their bytes (goal 11, plan 01a1a87b2e56 step 3:
+    /// `crate::memory::owners::UI_EVENTS`).
     pub events: crate::memory::ring::Ring<Arc<str>>,
+    /// Agent sessions' own events (`harness`: an info changed, `harness_closed`: a session gone), on a
+    /// ring of their own, kept as [`Hub::events`]' are (goal 4, plan 01a1a59c2a9c step 5). Every change
+    /// of a session's info is one, sent from the session's owner shard: about 1,700 a second in the lab's
+    /// many-sessions profile. Only `GET /api/events` sockets, the notifications' listener (`crate::push`)
+    /// and `agents.wait` read them, so the rest of kiln's listeners aren't woken for each, nor is their
+    /// ring's lock taken for them across the owners' shards.
+    pub harness_events: crate::memory::ring::Ring<Arc<str>>,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`).
     pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
@@ -724,6 +732,7 @@ impl Hub {
             pending_peers: Default::default(),
             tunnels: Arc::default(),
             events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
+            harness_events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,
@@ -982,18 +991,24 @@ impl Hub {
         self.emit(&ServerEvent::Terminals);
     }
 
-    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
+    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners: an agent
+    /// session's own (its info, its end) on [`Hub::harness_events`], the rest on [`Hub::events`].
     pub fn emit(&self, e: &ServerEvent) {
-        if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(e.text()));
+        let ring = match e {
+            ServerEvent::Harness { .. } | ServerEvent::HarnessClosed { .. } => &self.harness_events,
+            _ => &self.events,
+        };
+        if ring.receiver_count() > 0 {
+            ring.send(Arc::from(e.text()));
         }
     }
 
     /// An agent session's info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
-    /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5).
+    /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5), on the
+    /// sessions' own ring ([`Hub::harness_events`]; goal 4, plan 01a1a59c2a9c step 5).
     pub fn emit_harness(&self, info_json: &[u8]) {
-        if self.events.receiver_count() > 0 {
-            self.events.send(crate::wire::events::harness_frame(info_json));
+        if self.harness_events.receiver_count() > 0 {
+            self.harness_events.send(crate::wire::events::harness_frame(info_json));
         }
     }
 
@@ -4535,6 +4550,37 @@ pub(crate) mod tests {
         })
     }
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: an agent session's own events (its info changed, however it's
+    /// sent, and its end) go on the sessions' ring alone, in the order they're sent, and every other event
+    /// on the hub's events alone: a listener of the hub's events isn't woken for a session's change.
+    #[test]
+    fn g4_s5_a_sessions_events_go_on_a_ring_of_their_own() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let (mut all, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe());
+            let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
+            hub.emit(&ServerEvent::Updates);
+            hub.emit(&ServerEvent::Harness { info: Box::new(info.clone()) });
+            hub.emit_harness(&serde_json::to_vec(&info)?);
+            hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
+            hub.emit(&ServerEvent::Terminals);
+            let kinds = |rx: &mut crate::memory::ring::Subscription<Arc<str>>| {
+                let mut out = Vec::new();
+                while let Ok(text) = rx.try_recv() {
+                    out.push(crate::wire::events::kind_of(&text).unwrap_or_default().to_owned());
+                }
+                out
+            };
+            let (all, sessions) = (kinds(&mut all), kinds(&mut sessions));
+            anyhow::ensure!(sessions == ["harness", "harness", "harness_closed"], "the sessions' ring: {sessions:?}");
+            // The hub's events: these two, in order, among whatever its own work emits meanwhile.
+            anyhow::ensure!(!all.iter().any(|k| k.starts_with("harness")), "a session's event on the hub's: {all:?}");
+            let ours: Vec<&String> = all.iter().filter(|k| *k == "updates" || *k == "terminals").collect();
+            anyhow::ensure!(ours == ["updates", "terminals"], "the hub's events: {all:?}");
+            Ok(())
+        })
+    }
+
     /// A runner's update of an agent session that couldn't be read shows on the session's page too:
     /// its info carries it, its viewers are told, and the runner's next Open of it keeps it.
     #[test]
@@ -4546,7 +4592,7 @@ pub(crate) mod tests {
             let there = Location::Machine("box".into());
             let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
             hub.harness.ingest(&hub, &there, "s1", open()).await;
-            let mut events = hub.events.subscribe();
+            let mut events = hub.harness_events.subscribe();
             let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
             hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
             let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
