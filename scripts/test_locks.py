@@ -2,7 +2,9 @@
 """Tests of scripts/locks.py (goal 5 of the API runtime program, plan 01a1a59c2aae).
 
 `check` (step 3): it fails on a lock planted on the hot path, and passes what only a test build compiles,
-what comments and strings say, and the locks hot.toml lists with why.
+what comments and strings say, and the locks hot.toml lists with why. Its `waits` (goal 5's top goal): it fails
+on async-lock or event-listener named in kiln's code (their waits are event-listener's list, behind its Mutex),
+and passes the same in comments, strings and tests, and those hot.toml lists under `waiting`.
 
 The census of the dependencies' and the allocator's locks: `census-tree` copies the dependencies
 scripts/locks/deps.toml names from the cargo registry, their locks the census's with every line where it
@@ -42,11 +44,15 @@ def check(root: Path) -> subprocess.CompletedProcess[str]:
 class Tree:
     """A tree of its own: hot.toml and the files it names."""
 
-    def __init__(self, hot: list[str], allowed: list[tuple[str, str, str]] | None = None):
+    def __init__(self, hot: list[str], allowed: list[tuple[str, str, str]] | None = None, waits: list[str] | None = None, waiting: list[tuple[str, str, str]] | None = None):
         self.dir = Path(tempfile.mkdtemp(prefix="kiln-locks-"))
         lines = ["hot = [" + ", ".join(f'"{h}"' for h in hot) + "]"]
+        if waits is not None:
+            lines += ["waits = [" + ", ".join(f'"{w}"' for w in waits) + "]"]
         for at, name, why in allowed or []:
             lines += ["[[allowed]]", f'at = "{at}"', f'name = "{name}"', f'why = "{why}"']
+        for at, name, why in waiting or []:
+            lines += ["[[waiting]]", f'at = "{at}"', f'name = "{name}"', f'why = "{why}"']
         (self.dir / "scripts" / "locks").mkdir(parents=True)
         (self.dir / "scripts" / "locks" / "hot.toml").write_text("\n".join(lines) + "\n")
 
@@ -139,10 +145,10 @@ class Check(unittest.TestCase):
         try:
             (dest / "scripts" / "locks").mkdir(parents=True)
             shutil.copy2(ROOT / "scripts" / "locks" / "hot.toml", dest / "scripts" / "locks" / "hot.toml")
-            for h in spec["hot"]:
+            for h in [*spec["hot"], *spec.get("waits", [])]:
                 src = ROOT / h
                 if src.is_dir():
-                    shutil.copytree(src, dest / h)
+                    shutil.copytree(src, dest / h, dirs_exist_ok=True)
                 else:
                     (dest / h).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dest / h)
@@ -155,6 +161,113 @@ class Check(unittest.TestCase):
             self.assertIn(": planted:", after.stdout)
         finally:
             shutil.rmtree(dest, ignore_errors=True)
+
+    def test_g5_waits_on_event_listener_planted_in_kilns_code_fail(self) -> None:
+        """The real hot.toml and every folder its `waits` names: as they are, then an async-lock mutex and an Event
+        planted in modules off the hot path's list (a request's and a runner's), each failing the check."""
+        spec = tomllib.loads((ROOT / "scripts" / "locks" / "hot.toml").read_text())
+        self.assertIn("crates/kiln/src", spec.get("waits", []))
+        dest = Path(tempfile.mkdtemp(prefix="kiln-locks-waits-"))
+        try:
+            (dest / "scripts" / "locks").mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "locks" / "hot.toml", dest / "scripts" / "locks" / "hot.toml")
+            for h in [*spec["hot"], *spec["waits"]]:
+                src = ROOT / h
+                if src.is_dir():
+                    shutil.copytree(src, dest / h, dirs_exist_ok=True)
+                else:
+                    (dest / h).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest / h)
+            before = check(dest)
+            self.assertEqual(before.returncode, 0, before.stdout)
+            for rel, planted, name in [
+                ("crates/kiln/src/plans/review.rs", "static PLANTED: async_lock::Mutex<()> = async_lock::Mutex::new(());\n", "PLANTED"),
+                ("crates/kiln/src/sync/tasks.rs", "static RUNG: std::sync::LazyLock<event_listener::Event> = std::sync::LazyLock::new(event_listener::Event::new);\n", "RUNG"),
+            ]:
+                f = dest / rel
+                was = f.read_text()
+                f.write_text(planted + was)
+                after = check(dest)
+                self.assertEqual(after.returncode, 1, after.stdout)
+                self.assertIn(f"{rel}:1: {name}:", after.stdout)
+                f.write_text(was)
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+
+WAITS = '''//! A module off the hot path: async_lock::Mutex named in a comment is no wait.
+use std::sync::Arc;
+
+/// Waits as event_listener::Event did, in its docs.
+pub struct Feed {
+    changed: crate::rt::Changed,
+}
+
+impl Feed {
+    pub fn say(&self) -> &'static str {
+        "an async_lock::Semaphore in a string is no wait either"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    static ONE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+    fn f() { let e = event_listener::Event::new(); drop(e); }
+}
+'''
+
+
+class Waits(unittest.TestCase):
+    def test_g5_waits_a_clean_module_passes(self) -> None:
+        t = Tree([], waits=["src"])
+        try:
+            t.file("src/feed.rs", WAITS)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_planted_wait_on_event_listener_fails(self) -> None:
+        for planted, name in [
+            ("    gate: async_lock::Mutex<()>,\n", "gate"),
+            ("    copies: async_lock::Semaphore,\n", "copies"),
+            ("    mirror: std::sync::Arc<async_lock::RwLock<()>>,\n", "mirror"),
+            ("    ready: async_lock::OnceCell<()>,\n", "ready"),
+            ("    room: event_listener::Event,\n", "room"),
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", WAITS.replace("    changed: crate::rt::Changed,\n", "    changed: crate::rt::Changed,\n" + planted))
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(f"src/feed.rs:7: {name}:", r.stdout)
+            finally:
+                t.close()
+
+    def test_g5_waits_an_import_a_static_or_a_local_fails_too(self) -> None:
+        t = Tree([], waits=["src"])
+        try:
+            t.file("src/feed.rs", "use event_listener::Listener as _;\n" + WAITS + "\nstatic GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());\nfn g() {\n    let rung = event_listener::Event::new();\n    drop(rung);\n}\n")
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            for name in ("use", "GATE", "rung"):
+                self.assertIn(f": {name}:", r.stdout)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_listed_one_passes_and_a_gone_one_fails(self) -> None:
+        listed = WAITS.replace("    changed: crate::rt::Changed,\n", "    changed: crate::rt::Changed,\n    room: event_listener::Event,\n")
+        t = Tree([], waits=["src"], waiting=[("src/feed.rs", "room", "one task's: its forwarder alone waits on it")])
+        try:
+            t.file("src/feed.rs", listed)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            t.file("src/feed.rs", WAITS)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("src/feed.rs room", r.stdout)
+        finally:
+            t.close()
 
 
 def rewritten(text: str, track_caller: tuple[str, ...] = ()) -> tuple[str, int]:

@@ -84,7 +84,9 @@ struct Job {
 #[derive(Default)]
 struct Pending {
     by_grant: Mutex<HashMap<String, usize>>,
-    changed: event_listener::Event,
+    /// Told as an upload ends: a wait for them to settle looks again (`crate::rt::Changed`, no lock; goal 5, plan
+    /// 01a1a59c2aae, its top goal).
+    changed: crate::rt::Changed,
     sent: AtomicU64,
     failed: AtomicU64,
 }
@@ -104,7 +106,7 @@ impl Pending {
                 }
             }
         }
-        self.changed.notify(usize::MAX);
+        self.changed.notify();
     }
 
     /// Once nothing `grant` (any, with `None`) wrote is still going up.
@@ -158,8 +160,9 @@ impl std::fmt::Debug for Service {
 static RUNNING: OnceLock<Arc<Service>> = OnceLock::new();
 /// Where this runner's work is ([`set_home`]).
 static HOME: OnceLock<PathBuf> = OnceLock::new();
-/// The one start of the service on demand ([`ensure`]), and whether it worked.
-static STARTED: async_lock::OnceCell<bool> = async_lock::OnceCell::new();
+/// The one start of the service on demand ([`ensure`]), and whether it worked: those asking meanwhile wait their
+/// turn, with no lock (`crate::turn::Once`; goal 5, plan 01a1a59c2aae, its top goal).
+static STARTED: crate::turn::Once<bool> = crate::turn::Once::new();
 
 /// This runner's service, once it serves one.
 pub fn running() -> Option<&'static Arc<Service>> {

@@ -522,7 +522,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
 /// new build removes the user's older ones. `None` for any other image.
 pub async fn runner_image(cli: &Cli, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Option<String>> {
     let Some(dockerfile) = runner_dockerfile(image, user) else { return Ok(None) };
-    let _g = IMAGE_BUILD.lock().await;
+    let _g = IMAGE_BUILD.turn().await;
     let digest = crate::util::sha256_hex(dockerfile.as_bytes());
     let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
     if cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
@@ -563,8 +563,8 @@ async fn forget_older(cli: &Cli, image: &str, owner: &str, keep: &str) {
     }
 }
 
-/// One runner image build at a time on this machine.
-static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One runner image build at a time on this machine, in the order asked for, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static IMAGE_BUILD: crate::turn::Gate = crate::turn::Gate::one();
 
 /// The label on everything a runner starts: its legs' networks and containers, and its pools'
 /// executors. It comes from the runner's work directory, so another runner on the same engine

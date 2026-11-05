@@ -202,8 +202,8 @@ impl Waiters {
 }
 
 /// A waker that unparks the thread that made it: a blocking call's wait, on a thread of its own (never the
-/// runtime's).
-fn thread_waker() -> Waker {
+/// runtime's). Also `crate::rt::Listen::wait_deadline`'s (goal 5, plan 01a1a59c2aae, its top goal).
+pub(crate) fn thread_waker() -> Waker {
     struct Unpark(std::thread::Thread);
     impl futures::task::ArcWake for Unpark {
         fn wake_by_ref(this: &Arc<Self>) {
