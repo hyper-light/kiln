@@ -1402,7 +1402,7 @@ mod tests {
     #[test]
     fn g4_s5_the_runs_loop_reads_only_the_kinds_it_acts_on() -> anyhow::Result<()> {
         use crate::wire::events::{ServerEvent, is_one_of};
-        anyhow::ensure!(!is_one_of(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string(), &RUNS_LOOP_READS) && !is_one_of(&ServerEvent::Updates.text(), &RUNS_LOOP_READS));
+        anyhow::ensure!(!is_one_of(crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).as_ref(), &RUNS_LOOP_READS) && !is_one_of(&ServerEvent::Updates.text(), &RUNS_LOOP_READS));
         for text in [ServerEvent::Comment(Box::default()).text(), ServerEvent::CdApps { apps: vec![] }.text(), r#"{"type":"run","run":{"id":"r1"}}"#.to_owned(), r#"{"type":"review"}"#.to_owned()] {
             anyhow::ensure!(is_one_of(&text, &RUNS_LOOP_READS), "{text}");
         }

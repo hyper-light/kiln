@@ -4,7 +4,8 @@
 # turns round by round so the machine's drift falls on each alike (goal 6's scripts/overload_lab/driver.sh). The lab's
 # clients and runners run on LAB_CPUS and the server on SERVER_CPUS, so the lab measures the server, not itself.
 #   driver.sh <kiln> <kiln-lab> <out>     (ROUNDS, N, LAB_CPUS, SERVER_CPUS, HOG_CPUS, CORES, CORES_HOGS, CONFIGS, PROFILE,
-#                                          SHARDS, SERVER_ENV, PROF, PROF_KILN, PERF, PERF_LIBS, PERF_CALL_GRAPH, COMPARE
+#                                          SHARDS, SERVER_ENV, PROF, PROF_KILN, PERF, PERF_LIBS, PERF_CALL_GRAPH, PERF_FROM,
+#                                          COMPARE
 #                                          from the environment)
 # Every configuration's server runs SHARDS shards (KILN_RT_SHARDS; 4, what the server sizes itself to on the 16 CPUs of
 # SERVER_CPUS, so cores of its own, fewer CPUs, don't change the count), with SERVER_ENV's KEY=VALUE pairs besides.
@@ -41,6 +42,10 @@ PROFILE=${PROFILE:-realistic} PROF=${PROF:-0} PROF_KILN=${PROF_KILN:-} PERF=${PE
 # pointers (RUSTFLAGS="-C force-frame-pointers=yes"), which perf unwinds as it records, where DWARF's unwinding at report
 # time didn't resolve on g9c's data (goal 9, plan 01a1a87b2cec step 5).
 PERF_CALL_GRAPH=${PERF_CALL_GRAPH:-dwarf,16384}
+# Where the profiled rounds' perf starts (hook.sh): `window` (the default), `fill` (sessions' Open, the owners' first
+# events) or `server` (before the runners connect: their Build and ReachHello); it stops as the window ends (goal 9,
+# plan 01a1a87b2cec step 3).
+PERF_FROM=${PERF_FROM:-window}
 SHARDS=${SHARDS-4} SERVER_ENV=${SERVER_ENV:-}
 # The pairs the report compares: each configuration against weights alone with hogs, cores against the class on them,
 # and calm against the class calm (goal 9 step 4's A/B).
@@ -73,7 +78,7 @@ one() {
   local run=(-E KILN_LAB_HOOK="$D/bin/hook.sh") unit=()
   if [ -s "$out/run.json" ] && grep -q '"numbers"' "$out/run.json"; then say "round $i $cfg: measured before"; return; fi
   rm -rf "$out"; mkdir -p "$out"
-  case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS" -E PERF_CALL_GRAPH="$PERF_CALL_GRAPH") ;; esac
+  case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS" -E PERF_CALL_GRAPH="$PERF_CALL_GRAPH" -E PERF_FROM="$PERF_FROM") ;; esac
   local quantum=""
   case "$base" in q[0-9]*-*) quantum=${base%%-*}; quantum=${quantum#q}; base=${base#*-} ;; esac
   local rt=""
@@ -113,8 +118,11 @@ one() {
     [ -s "$data" ] || continue
     # Every thread's by symbol; then the shards' alone (their threads' names, hyper-rt-shard-N, cut to 15 bytes), by
     # symbol with who called it.
-    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-children --sort comm,dso,symbol --stdio -g none --percent-limit 0.2 > "${data%.data}.txt" 2>/dev/null
-    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-children --comms hyper-rt-shard- --sort symbol --stdio -g caller,0.5,callee,function,percent --percent-limit 0.5 > "${data%.data}-shards.txt" 2>/dev/null
+    # --no-inline: resolving inlined frames through a 1.2 GB unstripped build's line tables took perf 17+ minutes a
+    # report on g9p6 (2026-11-05), with it 19 s; the symbols are the same.
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --no-children --sort comm,dso,symbol --stdio -g none --percent-limit 0.2 > "${data%.data}.txt" 2>/dev/null
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --children --comms hyper-rt-shard- --sort symbol --stdio -g none --percent-limit 0.5 > "${data%.data}-shards-children.txt" 2>/dev/null
+    LD_LIBRARY_PATH=$PERF_LIBS "$PERF" report -i "$data" --no-inline --no-children --comms hyper-rt-shard- --sort symbol --stdio -g caller,0.5,callee,function,percent --percent-limit 0.5 > "${data%.data}-shards.txt" 2>/dev/null
   done
 }
 say "start: $ROUNDS rounds of$CONFIGS ($PROFILE), $N hogs; the lab on CPUs $LAB_CPUS, the server on $SERVER_CPUS with ${SHARDS:-its own count of} shards${SERVER_ENV:+ and $SERVER_ENV}, hogs on $HOG_CPUS (cores: $CORES, its hogs on $CORES_HOGS); real-time room ${rt_room:-unknown}; $(uptime)"

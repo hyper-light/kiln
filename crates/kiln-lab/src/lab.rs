@@ -795,6 +795,10 @@ impl Hook {
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
     let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
+    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
+    let hook = Hook::from_env(&fleet, dir);
+    hook.run("server-up");
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
@@ -805,7 +809,6 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     // server's /metrics either side of it too: the conversation feed at its busiest, every session's
     // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
     let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
-    let hook = Hook::from_env(&fleet, dir);
     let fill_before = scrape(&fleet)?;
     hook.run("fill-start");
     let filled = Instant::now();
