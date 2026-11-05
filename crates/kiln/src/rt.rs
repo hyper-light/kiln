@@ -52,10 +52,8 @@ pub struct Profile {
     /// as hyper-rt sizes a shard's tasks (`hyper_rt::runtime::admission_limit`): the jobs a share holds at
     /// once are the rate they come at times the time each runs, here its p99 ([`AtOnce`]):
     /// - `fs` (files, `/proc`, archives, a child's wait): [`SERVER_FS`];
-    /// - `store` (kiln.db's statements): its one connection takes one at a time (`crate::store`), so places
-    ///   past the connection's and one waiting its turn at it would only wait on its lock: two
-    ///   ([`SERVER_STORE`]). The lab's rate times p99 run asks far more, 24 places calm: what its statements
-    ///   wait for is the connection, not the share (`blocking.store.wait_p99_ms`, 440 ms calm);
+    /// - `store` (kiln.db's reads, each on a read-only connection of its own; its writes go to its writer's
+    ///   thread, goal 5, plan 01a1a59c2aae): [`SERVER_STORE`];
     /// - `dns` (`getaddrinfo`): the lab's kiln resolves no name (every address it dials is a literal), so
     ///   the lab can't size it: four, kiln's count from its move onto hyper-rt (f202896cb2d), until
     ///   production's `kiln_blocking_run_seconds{share="dns"}` says how many it holds at once.
@@ -88,11 +86,12 @@ impl AtOnce {
 /// pool's threads' own wait for a CPU beside the hogs, not a share that's full.
 pub const SERVER_FS: AtOnce = AtOnce(25.54);
 
-/// The connections `crate::store` holds (its one `conn`), each taking a statement at a time.
-pub const STORE_CONNECTIONS: usize = 1;
-
-/// The server's `store` share: a place for each connection's statement, and one waiting its turn at it.
-pub const SERVER_STORE: usize = STORE_CONNECTIONS + 1;
+/// The server's `store` share: kiln.db's reads, each on a read-only connection of its own (`crate::store`,
+/// goal 5 of the API runtime program, plan 01a1a59c2aae), as many at once as the lab measured its calls
+/// hold: 982 a second at a p99 run of 24.9 ms calm, 23.9 at once (goal 3's measure, when every call, reads
+/// and writes, took the one connection in turn, and two places held it). Its writes go to the writer's
+/// thread, as many as SQLite takes at once: one.
+pub const SERVER_STORE: AtOnce = AtOnce(23.9);
 
 /// The server's `dns` share: kiln's count from its move onto hyper-rt, which the lab can't measure
 /// ([`Profile::pool`]).
@@ -103,7 +102,7 @@ impl Profile {
     pub fn server() -> Self {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let shards = u16::try_from((cpus / 4).clamp(2, 4)).unwrap_or(2);
-        Self { shards, tasks_per_shard: 8192, pool: (SERVER_DNS, SERVER_STORE, SERVER_FS.places()), announce: true }
+        Self { shards, tasks_per_shard: 8192, pool: (SERVER_DNS, SERVER_STORE.places(), SERVER_FS.places()), announce: true }
     }
 
     /// An agent: a few jobs, their output pumps, terminals.
@@ -1895,8 +1894,8 @@ mod tests {
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share
-    /// holds at once by Little's law, rounded up to whole places, at least one; the store's by its one
-    /// connection.
+    /// holds at once by Little's law, rounded up to whole places, at least one; the store's reads too, each
+    /// on a connection of its own (goal 5, plan 01a1a59c2aae step 2).
     #[test]
     fn g3_s4_the_servers_shares_are_derived() {
         assert_eq!(AtOnce(25.54).places(), 26);
@@ -1906,7 +1905,7 @@ mod tests {
             assert_eq!(AtOnce(none).places(), 1, "{none}");
         }
         let (dns, store, fs) = Profile::server().pool;
-        assert_eq!((dns, store, fs), (SERVER_DNS, STORE_CONNECTIONS + 1, SERVER_FS.places()));
+        assert_eq!((dns, store, fs), (SERVER_DNS, SERVER_STORE.places(), SERVER_FS.places()));
     }
 
     /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2, AC-M2.2): the clock the

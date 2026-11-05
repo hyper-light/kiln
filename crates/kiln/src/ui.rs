@@ -17,9 +17,9 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use http::{StatusCode, header};
-use parking_lot::Mutex;
 
 use crate::http::server::{self as srv, Request, Response};
+use crate::rcu::Rcu;
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../ui/dist/client"]
@@ -82,19 +82,22 @@ fn kept(path: &str) -> Option<Vec<u8>> {
     std::fs::read(KEPT.get()?.join(asset_file(path)?)).ok()
 }
 
-fn gz_cache() -> &'static Mutex<HashMap<String, Bytes>> {
-    static C: OnceLock<Mutex<HashMap<String, Bytes>>> = OnceLock::new();
+/// The files gzipped so far, by name: read on every request for one, written once a file (goal 5 of the API
+/// runtime program, plan 01a1a59c2aae: a copy swapped in whole, `crate::rcu`).
+fn gz_cache() -> &'static Rcu<HashMap<String, Bytes>> {
+    static C: OnceLock<Rcu<HashMap<String, Bytes>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
-fn br_cache() -> &'static Mutex<HashMap<String, Bytes>> {
-    static C: OnceLock<Mutex<HashMap<String, Bytes>>> = OnceLock::new();
+/// The files brotli-compressed so far, as [`gz_cache`].
+fn br_cache() -> &'static Rcu<HashMap<String, Bytes>> {
+    static C: OnceLock<Rcu<HashMap<String, Bytes>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
 /// `data` brotli-compressed at the highest quality, once per file.
 fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
-    if let Some(b) = br_cache().lock().get(name) {
+    if let Some(b) = br_cache().load().get(name) {
         return Some(b.clone());
     }
     let mut out = Vec::with_capacity(data.len() / 3);
@@ -104,21 +107,21 @@ fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
         w.flush().ok()?;
     }
     let out = Bytes::from(out);
-    br_cache().lock().insert(name.to_owned(), out.clone());
+    br_cache().update(|m| m.insert(name.to_owned(), out.clone()));
     Some(out)
 }
 
 /// `name` packed (brotli or gzip, by its cache), made already; else none now, and both made on the
 /// compute pool for the next request (once at a time for a file): CPU work, which held a place of the
 /// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4).
-fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>>) -> Option<(Bytes, &'static str)> {
+fn packed(name: &str, data: &Bytes, cache: &'static Rcu<HashMap<String, Bytes>>) -> Option<(Bytes, &'static str)> {
     let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
-    if let Some(b) = cache.lock().get(name) {
+    if let Some(b) = cache.load().get(name) {
         return Some((b.clone(), coding));
     }
-    static MAKING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    static MAKING: OnceLock<Rcu<std::collections::HashSet<String>>> = OnceLock::new();
     let making = MAKING.get_or_init(Default::default);
-    if making.lock().insert(name.to_owned()) {
+    if making.update(|m| m.insert(name.to_owned())) {
         let (name, data) = (name.to_owned(), data.clone());
         drop(crate::rt::spawn(async move {
             let n = name.clone();
@@ -127,7 +130,7 @@ fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>
                 let _ = gzip(&n, &data);
             })
             .await;
-            making.lock().remove(&name);
+            making.update(|m| m.remove(&name));
         }));
     }
     None
@@ -167,13 +170,13 @@ fn compressible(mime: &str) -> bool {
 }
 
 fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
-    if let Some(b) = gz_cache().lock().get(name) {
+    if let Some(b) = gz_cache().load().get(name) {
         return Some(b.clone());
     }
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     enc.write_all(data).ok()?;
     let out = Bytes::from(enc.finish().ok()?);
-    gz_cache().lock().insert(name.to_owned(), out.clone());
+    gz_cache().update(|m| m.insert(name.to_owned(), out.clone()));
     Some(out)
 }
 
