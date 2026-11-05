@@ -135,6 +135,9 @@ pub struct Build {
     pub label: String,
     pub kiln: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Its server's `[bus] memory` in bytes, when the run sets it (`--bus-memory`).
+    #[serde(default)]
+    pub bus_memory: Option<u64>,
 }
 
 /// The machine around a round.
@@ -777,7 +780,7 @@ impl Hook {
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;

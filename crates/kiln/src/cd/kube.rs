@@ -32,8 +32,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// dropped), as against one the API server answered, whatever it said: what was done there is
 /// unknown (`crate::deploy::kilncd::unanswered`).
 pub const NO_ANSWER: &str = "doesn't answer";
-/// Most bytes a (non-watch) response may hold.
-const BODY_LIMIT: usize = 256 << 20;
+/// Most bytes a (non-watch) response may hold: also the bound of the engine's inbox
+/// (`super::INPUTS_BYTES`), most of what it's told being what clusters answer.
+pub(crate) const BODY_LIMIT: usize = 256 << 20;
 /// Kept-alive connections a cluster's pool holds.
 const POOL: usize = 32;
 /// What most requests ask for.

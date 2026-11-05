@@ -69,6 +69,39 @@ pub fn json_bytes<T: serde::Serialize + ?Sized>(v: &T) -> usize {
     n.0
 }
 
+/// A JSON value as serde_json keeps it, walked (a Kubernetes object, a render's output): its place, and
+/// what it holds past it ([`json_heap`]). Several times its text's bytes: each value has a place of its
+/// own, and each of an object's keys its entry.
+impl Weigh for serde_json::Value {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(json_heap(self))
+    }
+}
+
+/// One of a JSON object's entries beside its key's bytes and what its value holds: its key's and its
+/// value's places, and the map's own two words for it (an ordered map's hash and index, a B-tree's share
+/// of its node), whichever map serde_json was built with.
+const JSON_ENTRY: usize = size_of::<String>() + size_of::<serde_json::Value>() + 2 * size_of::<usize>();
+
+/// What a JSON value holds past its own place (goal 11, plan 01a1a87b2e56 step 3): its text's bytes, an
+/// array's places and what each of its values holds, an object's entries ([`JSON_ENTRY`]) with their keys'
+/// bytes and what each value holds. A walk of it, cheaper than the parse that made it; as deep as
+/// serde_json parses (128 levels).
+pub fn json_heap(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(s) => s.capacity(),
+        Value::Array(a) => json_values_heap(a),
+        Value::Object(m) => m.iter().map(|(k, v)| JSON_ENTRY.saturating_add(k.capacity()).saturating_add(json_heap(v))).fold(0, usize::saturating_add),
+    }
+}
+
+/// What a list of JSON values holds past its own place: its places, and what each value holds.
+pub fn json_values_heap(a: &Vec<serde_json::Value>) -> usize {
+    a.capacity().saturating_mul(size_of::<serde_json::Value>()).saturating_add(a.iter().map(json_heap).fold(0, usize::saturating_add))
+}
+
 /// A shared text: its place, its two counts and its bytes, as one holder's (whoever holds it last lets it
 /// go).
 impl Weigh for std::sync::Arc<str> {
@@ -565,6 +598,27 @@ mod tests {
         drop(rx);
         assert_eq!(waiting.join().ok().flatten(), Some(PLACE + 5), "the waiting send ended, its item handed back");
         assert!(matches!(tx.try_send(Item(PLACE)), Err(TrySendError::Closed(_))));
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a JSON value weighs what serde_json keeps of it, at least its
+    /// text's bytes: its strings' bytes, an array's places, an object's entries and keys.
+    #[test]
+    fn g11_s3_a_json_value_weighs_what_serde_json_keeps() -> anyhow::Result<()> {
+        use serde_json::{Value, json};
+        let small = json!({"kind": "ConfigMap"});
+        let data = json!({"kind": "ConfigMap", "data": "x".repeat(1 << 20)});
+        anyhow::ensure!(data.weight() >= small.weight() + (1 << 20), "a megabyte's text weighs a megabyte: {} against {}", data.weight(), small.weight());
+        let list = Value::Array((0..1000).map(|n| json!(n)).collect());
+        anyhow::ensure!(list.weight() >= 1000 * size_of::<Value>(), "each of an array's values has its place: {}", list.weight());
+        let keys: serde_json::Map<String, Value> = (0..100).map(|n| (format!("key-{n}"), Value::Null)).collect();
+        let object = Value::Object(keys);
+        anyhow::ensure!(object.weight() >= 100 * (JSON_ENTRY + "key-0".len()), "each entry and its key counted: {}", object.weight());
+        // What a Kubernetes object takes kept is more than its text.
+        let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "web-0", "namespace": "shop", "labels": {"app": "web", "tier": "front"}},
+            "spec": {"containers": [{"name": "web", "image": "nginx:1.27", "ports": [{"containerPort": 80}], "args": ["--a", "--b"]}]}});
+        let text = serde_json::to_vec(&pod)?.len();
+        anyhow::ensure!(pod.weight() > text, "a pod of {text} bytes of JSON weighs {}", pod.weight());
+        Ok(())
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a forced send goes past the bound (counted all the same), a weak

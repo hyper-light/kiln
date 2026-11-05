@@ -13,6 +13,7 @@
 //! viewer back to a snapshot. A mirror let go (the session ended) drops its feed, and the feed's
 //! topic goes with it.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -25,6 +26,48 @@ use super::registry::{Frame, PatchOf, Patches};
 
 /// Frames a session's topic keeps: a viewer further behind starts over from a snapshot.
 pub const RETAIN: usize = 2048;
+
+/// Frames a topic made now keeps: [`RETAIN`], or fewer in a test build that asks (so a viewer that
+/// stops reading falls behind sooner).
+fn retain() -> usize {
+    crate::runner::chaos::get().and_then(|c| c.fanout).unwrap_or(RETAIN)
+}
+
+/// What a feed's topic keeps by its retention, frame by frame (goal 11, plan 01a1a87b2e56 step 3):
+/// each frame's bytes as the bus counts them against `[bus] topic_bytes` (its key and payload; a
+/// feed's frames have no key), its newest `retain` alone, and their sum. That's what the topic asks
+/// the bus to keep, whether or not `topic_bytes` lets it (past it the bus keeps fewer frames): the
+/// largest any topic has asked since the server started is on `/metrics`
+/// (`kiln_bus_topic_bytes_peak`), what `topic_bytes` is derived from. Its owner's alone, as the feed
+/// is; at most `retain` sizes of 4 bytes (8 KiB a topic), let go with the topic.
+#[derive(Default)]
+struct Kept {
+    sizes: VecDeque<u32>,
+    retain: usize,
+    bytes: u64,
+}
+
+impl Kept {
+    /// A new topic's, keeping `retain` frames.
+    fn new(retain: usize) -> Self {
+        Self { sizes: VecDeque::new(), retain: retain.max(1), bytes: 0 }
+    }
+
+    /// A frame of `n` bytes went on the topic: past the retention its oldest goes. What the topic
+    /// keeps now.
+    fn add(&mut self, n: usize) -> u64 {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        self.sizes.push_back(n);
+        self.bytes = self.bytes.saturating_add(u64::from(n));
+        while self.sizes.len() > self.retain {
+            match self.sizes.pop_front() {
+                Some(old) => self.bytes = self.bytes.saturating_sub(u64::from(old)),
+                None => break,
+            }
+        }
+        self.bytes
+    }
+}
 
 /// The marker a feed publishes after a frame the bus refused: its viewers start over. The feed's
 /// own, never sent to a viewer: every other frame on a feed is one of the session socket's
@@ -241,9 +284,7 @@ impl Shared {
     /// Makes generation `generation`'s topic, which the bus makes once however often it's asked (a
     /// topic made again with the same settings is the one made). A refusal is counted.
     fn make(&self, generation: u32) -> Result<(), Refusal> {
-        // A test build's may keep fewer, so a viewer that stops reading falls behind sooner.
-        let retain = crate::runner::chaos::get().and_then(|c| c.fanout).unwrap_or(RETAIN);
-        at_once(self.bus.create(&self.topic(generation), Topic { class: Class::Ephemeral, retain })).inspect_err(|_| {
+        at_once(self.bus.create(&self.topic(generation), Topic { class: Class::Ephemeral, retain: retain() })).inspect_err(|_| {
             self.refusals.fetch_add(1, Ordering::AcqRel);
             crate::metrics::bus().refused.inc(&["create"]);
         })
@@ -376,6 +417,8 @@ pub struct Feed {
     /// A frame was refused: the next publish goes after [`RESYNC`]. Set too while the topic
     /// couldn't be made (it's asked again at the next publish).
     broken: bool,
+    /// What the topic it made keeps by its retention (goal 11, plan 01a1a87b2e56 step 3).
+    kept: Kept,
 }
 
 impl Feed {
@@ -392,7 +435,7 @@ impl Feed {
             ended: AtomicBool::new(false),
             deleted: AtomicBool::new(false),
         };
-        Self { shared: Arc::new(shared), made: None, broken: false }
+        Self { shared: Arc::new(shared), made: None, broken: false, kept: Kept::default() }
     }
 
     /// What its readers hold of it: viewers join through it.
@@ -455,6 +498,7 @@ impl Feed {
                     delete(self.shared.bus.as_ref(), &self.shared.topic(generation));
                     self.made = None;
                     self.broken = false;
+                    self.kept = Kept::default();
                     return None;
                 }
                 // A viewer joined meanwhile: it's watched after all.
@@ -496,25 +540,39 @@ impl Feed {
                 return Published::Refused;
             }
             self.made = Some(generation);
+            // A topic of its own: none of the last one's frames.
+            self.kept = Kept::new(retain());
         }
         let topic = self.shared.topic(generation);
         let m = crate::metrics::bus();
         if self.broken {
-            match at_once(self.shared.bus.publish(&topic, None, encode(&Frame::resync()))) {
+            let resync = encode(&Frame::resync());
+            let n = resync.len();
+            match at_once(self.shared.bus.publish(&topic, None, resync)) {
                 Ok(_) => {
                     self.broken = false;
                     m.published.inc();
+                    self.kept_frame(n);
                 }
                 Err(e) => return self.refused(&topic, &e),
             }
         }
+        let n = payload.len();
         match at_once(self.shared.bus.publish(&topic, None, payload)) {
             Ok(_) => {
                 m.published.inc();
+                self.kept_frame(n);
                 Published::Sent
             }
             Err(e) => self.refused(&topic, &e),
         }
+    }
+
+    /// A frame of `n` bytes went on its topic: counted in what the topic keeps by its retention, and
+    /// the most any topic has (`kiln_bus_topic_bytes_peak`) raised to it.
+    fn kept_frame(&mut self, n: usize) {
+        let bytes = self.kept.add(n);
+        crate::metrics::bus_gauges().topic_bytes_peak.raise(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     fn refused(&mut self, topic: &str, e: &Refusal) -> Published {
@@ -619,6 +677,51 @@ mod tests {
         assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic)));
         Ok(())
     }
+    /// Goal 11, plan 01a1a87b2e56 step 3: what a topic keeps by its retention is its newest frames'
+    /// bytes, as many as it retains: past that its oldest go from the sum.
+    #[test]
+    fn g11_s3_a_topics_bytes_are_its_newest_frames() {
+        let mut kept = Kept::new(3);
+        assert_eq!([10, 20, 30].map(|n| kept.add(n)), [10, 30, 60]);
+        assert_eq!(kept.add(40), 90, "the oldest went");
+        assert_eq!(kept.add(5), 75);
+        assert_eq!(kept.sizes.len(), 3);
+        let mut one = Kept::new(0);
+        assert_eq!((one.add(7), one.add(9)), (7, 9), "a topic keeps its newest frame at least");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a feed counts what its topic keeps as the bus counts it (each
+    /// frame's payload, the resync marker too), raises `kiln_bus_topic_bytes_peak` to it, and starts
+    /// from nothing with each topic: one let go while nobody watches takes its count with it.
+    #[test]
+    fn g11_s3_a_feed_counts_what_its_topic_keeps() -> anyhow::Result<()> {
+        let b = bus()?;
+        let mut feed = Feed::open(Arc::clone(&b), "s1");
+        let (viewer, _) = feed.attach(Patches::default());
+        let frames = [Frame::text("first"), Frame::text(&"x".repeat(5000))];
+        for f in &frames {
+            anyhow::ensure!(feed.publish(f) == Published::Sent);
+        }
+        let sent: u64 = frames.iter().map(|f| encode(f).len() as u64).sum();
+        anyhow::ensure!(feed.kept.bytes == sent, "counted {} of the {sent} bytes published", feed.kept.bytes);
+        // What the bus keeps of the topic, as it counts its retention: the same bytes.
+        let read = futures::executor::block_on(b.read(viewer.topic(), 0, 10))?;
+        let kept: u64 = read.messages.iter().map(|m| m.payload.len() as u64).sum();
+        anyhow::ensure!(kept == feed.kept.bytes, "the bus keeps {kept} bytes, the feed counted {}", feed.kept.bytes);
+        anyhow::ensure!(crate::metrics::bus_gauges().topic_bytes_peak.get() >= i64::try_from(sent)?, "the peak on /metrics is at least this topic's");
+        // A refused frame isn't kept; the resync marker after it is.
+        let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+        anyhow::ensure!(feed.publish(&huge) == Published::Refused);
+        anyhow::ensure!(feed.kept.bytes == sent);
+        anyhow::ensure!(feed.publish(&Frame::text("after")) == Published::Sent);
+        let after = (encode(&Frame::resync()).len() + encode(&Frame::text("after")).len()) as u64;
+        anyhow::ensure!(feed.kept.bytes == sent + after, "the marker and the frame after it: {}", feed.kept.bytes);
+        drop(viewer);
+        anyhow::ensure!(feed.publish(&Frame::text("unseen")) == Published::Unwatched);
+        anyhow::ensure!(feed.kept.bytes == 0 && feed.kept.sizes.capacity() == 0, "a topic let go takes its count with it");
+        Ok(())
+    }
+
     /// A feed nobody watches keeps none of the bus's memory: its next frame lets the topic go,
     /// and the next viewer joins the next generation, its topic made from its start.
     #[test]

@@ -254,6 +254,9 @@ taskset -c 8-15 target/release/kiln-lab run --kiln target/release/kiln --server-
 folder `<round>.hook`, kept when the round's kiln is removed): `scripts/shard_lab/hook.sh` has perf
 record the server over the window.
 
+`--bus-memory <bytes>` writes `[bus] memory` into the kiln.toml each round's server starts with
+(kiln's default otherwise, 256 MiB), so a run measures the bus past its default (goal 11 below).
+
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
 files below: they hold the baseline's numbers and machine, which another machine (or this one under
 other work) doesn't share.
@@ -1082,7 +1085,9 @@ past the count).
 | `pull_lists` | hosts' open pull requests for the inbox | a minute each, and 32 MiB | one host response as kiln reads it (GitHub's, up to 32 MiB) | the lists read longest ago go: read from the host again |
 | `search_indexes` | kiln-search's open indexes' tables | 8 indexes, each as large as the largest opened (measured as opened) | `OPEN_MAX` | the one searched least recently goes: opened again from its files |
 | `grok_dfa` | observe's grok rules compiled | each rule's lazy-DFA caches at regex's capacity (2 x 2 MiB) for each thread searching it at once | regex's default `dfa_size_limit`; it reports no figure of use, so this counts the rules compiled at one thread's capacity | regex resets a full cache |
-| `bus` | the bus's retained messages | `[bus] memory`, 256 MiB | none yet: the lab's script measures it (below) | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
+| `cd_inputs` | what the deployments engine is told and hasn't taken: clusters' lists, watch events and apply answers, renders, people's and the source poll's word, each object as serde_json keeps it | 256 MiB | one answer of a cluster's API server as kiln reads it at the most (`cd::kube::BODY_LIMIT`), which most of its inputs are | the sender waits as a task: a watch stops reading its stream (the API server holds what follows), a render or answer waits to be handed in, a request waits its turn; the poll's and a rollback's inputs wait for room before the gate that keeps them in order, so none is past it |
+| `cd_actions` | what the deployments engine asked for and its dispatcher hasn't taken: applies (each its object), deletes, renders, watches, statuses, records | 256 MiB | as much as its inputs, which what it asks for is made of (an apply's object is a render's) | the engine's thread waits (its own, not the runtime's), and its inputs behind it |
+| `bus` | the bus's retained messages (`kiln_bus_memory_bytes`), each topic's as its retention asks (`kiln_bus_topic_bytes_peak`, the largest since start) | `[bus] memory`, 256 MiB; a topic `[bus] topic_bytes`, 16 MiB | none yet: the lab's scripts measure both (below) | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
 | `session_segments` | sealed chunks' segments | no bound of its own | - | - |
 
 Channels bounded by their senders (each sender waits for its answer, so a channel holds at most one call
@@ -1091,19 +1096,111 @@ wire commands' owner (`Owner::ask`; `tell`'s are a command each for a session to
 `ITEM_MOST`). Sync's two channels carry its groups' raft messages, each group in flight within the limits
 hyper-raft derives from the 64 MiB it states (`sync::group::settings`), each message at most
 `sync::group::MESSAGE`. The deploys' change ring (`Deploy::changes`) holds 256 numbers, a fixed 6 KiB.
-Not bounded yet: the CD engine's inputs and actions (`cd::Cd::input`, about forty callers that can't wait),
-bounded only by their sources' rates.
+The deployments engine's queries (`Cd::query`) are bounded by their senders too, each waiting for its
+answer, and wait for room in its inbox besides. Its other channels carry a person's or a check's word:
+a rollout's driver's inbox (an approval, a retry), a self-deploy guard's measurements (one a check as it
+comes due), and the store's changes (an app's or setting's name each).
+
+The deployments engine's inbox (`cd_inputs`) is std's channel, made as it fills, which the engine's
+thread waits on with a timeout for its timers, with a `crate::memory::queue::Room` for its bytes; its
+about forty senders are all tasks now and each waits for room (`Cd::input`, `Cd::register`,
+`Cd::unregister`, `Cd::query`). The source poll's inputs and a rollback's, which are sent under the gate
+that keeps them in order (`inputs_gate`, a lock no one holds across a wait), take their room first
+(`Cd::reserve_input`) and send under the gate without waiting, giving the room back if they don't send.
+Its actions queue (`cd_actions`) is a `crate::memory::queue`, which the engine's thread waits on when it's
+full; the dispatcher that takes from it never waits on the inbox (what answers an action is a task of its
+own) and starts before the apps kept are registered, so the engine always goes on.
 
 ### Measuring the bus's bound
 
 The bus's `[bus] memory` (256 MiB) and `topic_bytes` (16 MiB) have no measurement behind them. A lab run
-samples the bus each second of every round (its bytes, limit, refusals and lag notices, every memory owner,
-the resident memory by kind) through a `KILN_LAB_HOOK`, 8 rounds calm and 8 with hogs in production's
-layout, and derives the bound: the largest peak, with room for one more of Quiver's largest messages
-(1,083,392 B), never below the floor (2,166,784 B), rounded up to a MiB; proposed only when no round reached
-the limit. Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-over,
-to go under `scripts/memory_lab/` with their first run. A topic's bytes aren't on `/metrics`, so
-`topic_bytes` can't be derived until they are.
+samples the bus each second of every round (its bytes, limit, frames, refusals and lag notices, its largest
+topic, every memory owner, the resident memory by kind) through a `KILN_LAB_HOOK`, 8 rounds calm and 8 with
+hogs in production's layout, each round's server started with `--bus-memory` 1 GiB: twice what the
+realistic profile's 32 sessions' topics may keep at `topic_bytes` each, the rest for Quiver's framing and
+the segments readers still hold, so no round reaches it and the peaks are the load's, past 256 MiB if it
+needs that. Each topic's bytes come from its feed (`crate::harness::live`): as it publishes, it counts its
+topic's newest 2048 frames by their keys and payloads, as `topic_bytes` counts them, whether or not
+`topic_bytes` lets the bus keep them all, and raises `kiln_bus_topic_bytes_peak`; Quiver's own count of a
+topic isn't something kiln can ask it. The bounds it derives:
+
+- `[bus] memory`: the largest peak, with room for one more of Quiver's largest messages (1,083,392 B),
+  never below the floor (2,166,784 B), rounded up to a MiB; proposed only when no round refused frames,
+  sent lag notices, or came within that message of its limit.
+- `[bus] topic_bytes`: the largest topic, with room for one more of the largest message a topic takes
+  (1 MiB of payload), never below it (Quiver refuses a message larger than `topic_bytes`), rounded up to a
+  MiB; a topic that asked for more than today's 16 MiB is said (its viewers fell behind after fewer than
+  2048 frames).
+
+Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-overs, to go
+under `scripts/memory_lab/` with their first run.
+
+## Goal 10: API reads and frames in under a millisecond
+
+Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
+encoded ahead; frames never wait behind another viewer's snapshot; a runner's session update goes
+straight to its session's owner shard.
+
+### Main's baseline (step 1)
+
+Measured on 2026-11-05 from 09:26 to 10:43 UTC on fedora, as the calm and hogs configurations of goal 8
+step 7's lab (`scripts/priority_lab/s7c.sh`, below): production's layout, the server on 16-31 at
+`CPUWeight=1000`, 16 spinning hogs at `cpu.weight` 1 beside it in `hogs`, the lab on 0-15, 4 shards, 8
+rounds each. The build: rt-int `d46ceb48d67`, whose tree is main's since `3e427eae99b` (zig, glibc 2.43).
+Each cell the median of the rounds, in microseconds.
+
+| number | calm | hogs |
+| --- | --- | --- |
+| API read p50 / p99 / p99.9 | 234 / 970 / 1244 | 437 / 1833 / 3804 |
+| frame p50 / p99 / p99.9 (all) | 703 / 2025 / 16,443 | 1713 / 5657 / 39,909 |
+| frame p99, live (not a viewer's own attach) | 1891 to 2169 | 4680 to 5625 |
+| page p50 / p99 | 207 / 407 | 392 / 1453 |
+| runner's wait for its owner p99 | 6595 | 14,526 |
+
+A frame published while another viewer attaches reached its viewer in 0.39 to 4.7 ms in every round
+that had one (29 of them, across all of the lab's configurations), at or under that round's live p99,
+while the attaches took 6 ms to 1.7 s at the median: frames don't wait behind a snapshot (step 3).
+The frames' p99.9 is a viewer's own attach (its snapshot), counted with the rest.
+
+## Goal 8 step 7 and goal 9 step 4: the server's cores
+
+`[server] cores` gives the server cores of its own; kiln then keeps its own legs and agents off them
+(Linux affinity, the CPU ledger, Docker's cpusets), and `[server] realtime` gives the shards Linux's
+round-robin class at its lowest priority where the server's unit grants it (docs/priority.md).
+`scripts/priority_lab/s7c.sh` ran 8 rounds of each configuration, interleaved, on fedora on
+2026-11-05 (09:26 to 10:43 UTC; the build as above):
+
+- `calm`: the server on 16-31, nothing else of the lab's there;
+- `hogs`: and 16 spinning hogs on 16-31 at weight 1;
+- `cores-calm`: the server on its cores, 16-23;
+- `cores`: and the hogs on 24-31;
+- `fence`: the hogs started as a kiln runner's agent, which kiln itself put on 24-31.
+
+| number (µs) | calm | hogs | cores-calm | cores | fence |
+| --- | --- | --- | --- | --- | --- |
+| page p99 | 407 | 1453 | 1028 | 1157 | 1108 |
+| API read p99 | 970 | 1833 | 1151 | 1274 | 1312 |
+| API write p99 | 446,456 | 406,874 | 434,740 | 434,803 | 425,894 |
+| frame p99 | 2025 | 5657 | 2798 | 3665 | 3500 |
+| shards' delay p99 | 338 | 1139 | 1056 | 1188 | 1178 |
+| shards' delay p99.9 | 1115 | 3284 | 1558 | 1964 | 1971 |
+| shards' busy share | 0.037 | 0.037 | 0.035 | 0.037 | 0.037 |
+
+What it says:
+
+- **Hogs on the server's CPUs cost its tail** (calm against hogs, beyond noise): pages 0.41 to 1.45 ms
+  at p99, API reads 0.97 to 1.83 ms, frames 2.0 to 5.7 ms, the shards' delay 1.1 to 3.3 ms at p99.9.
+- **Kept off its cores, they cost little more** (cores-calm against cores): pages, API writes and
+  frames the same within noise; API reads 1.15 to 1.27 ms at p99, 10.7% worse, just past the noise.
+  kiln's own placement does what `taskset` does (cores against fence: every number the same), and
+  the fence's verdict each round was that none of the hog agent's threads may run on 16-23.
+- **The rest is fedora's**: with 8 cores instead of 16, and other sessions' work on those 8 (fedora
+  has no cpuset partition, and its kernel preempts lazily at 1000 Hz, so a wake onto a busy CPU waits
+  up to a tick: docs/priority.md, wakelab wake-2), every configuration with the server on its cores
+  ran its shards about a millisecond late at p99, and none made goal 9 step 4's bar (p99.9 under 1
+  ms with hogs). Production's machine preempts fully and its installer can make the cores a
+  partition; on fedora that needs root, as does the real-time class (`RLIMIT_RTPRIO` 0 there), so
+  neither ran here.
 
 ## What the lab doesn't do yet
 
