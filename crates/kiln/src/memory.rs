@@ -64,8 +64,14 @@ impl Owner {
 /// made them as it starts.
 pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 
+/// Session copies' events and changeset files as their JSON's text, where it's kept as text (not packed):
+/// each copy's newest events, and what a reader asked for of a packed chunk while it holds it
+/// (`crate::harness::registry::Entry`). Its bound is each copy's (`crate::harness::core::MAX_EVENTS`
+/// events, its newest chunk alone kept as text), for as many copies as there are sessions.
+pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
+
 /// The owners counted here, in the order the exposition says them.
-const OWNERS: [&Owner; 1] = [&UI_ASSETS];
+const OWNERS: [&Owner; 2] = [&UI_ASSETS, &SESSION_ENTRIES];
 
 /// The process's resident memory by kind, in bytes: `anon`, `file` and `shmem` (Linux; elsewhere none).
 pub fn resident() -> Option<[(&'static str, u64); 3]> {
