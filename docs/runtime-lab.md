@@ -74,13 +74,16 @@ telemetry). Goal 1's probe on each shard ticks a watch for each of the shard's q
 for Normal, its Background tasks' waits for Background. The first shard's probe also ticks one for the
 compute pool's line, each of the blocking pool's shares' and kiln.db's writer's, on the mean wait of the
 jobs whose waits the pool told over the period, since what a request waits on off its shard waits there,
-where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of the periods it came
-back to) and sheds only on a queue that *stands*, CoDel's test (research f14): every period for a whole
-tolerance (1 s, Kubernetes' default probe timeout) past its calm and past the shard's quantum, a pool's
-line never emptying, and a pool's line kept standing by work that came after it formed (it stood a
-tolerance longer than its jobs' longest wait), not one request's batch worked off. A queue that stood a
-tolerance sheds Background requests; one that stood another with Background shed, Normal ones too (a
-shard's: its API queue's); Critical never; shedding stops the period it comes back. A shed request is
+where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of its periods outside
+its standing) and sheds only on a queue that *stands*, as CoDel bounds queues (research f14), over a
+tolerance (1 s, Kubernetes' default probe timeout), a wait counting past its calm when past the calm and
+the shard's quantum. A shard's queue stands while most of the last tolerance's periods were past its calm
+and, where the OS keeps a thread's CPU time, the shard ran most of it (a mostly idle shard's late wakes are
+the host's). A pool's line stands once every period for a tolerance was past its calm, the line never
+emptying, and work that came after it formed kept it standing (it stood a tolerance longer than its jobs'
+longest wait), not one request's batch worked off. A queue that stands sheds Background requests; one that
+stood another tolerance with Background shed, Normal ones too (a shard's: its API queue's); Critical never;
+shedding stops once it no longer stands. A shed request is
 answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
 seconds) and `x-kiln-shed` (its class); kiln's client sends it again after that (a file's upload read
 again from its start, a WebSocket's opening too). Shedding is off until `[server] shed = true` or
@@ -92,14 +95,15 @@ other while the share held under one of its 24 places on average) and every roun
 250 ms late; the CUSUM on each period's mean wait that this replaced (headroom's, with nothing it
 learned of calm's excursions) read those as shifts and shed 6.5 Background requests a calm round. Its
 unit tests replay those waits (`overload::tests`, `g6_s4_*`): the lab's calm store share, fan-outs whose
-reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a scheduler's tick of jitter
-shed nothing; work outrunning a pool, a closed loop past its places and a saturated shard shed
-Background a tolerance in and Normal a tolerance later.
+reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a mostly idle shard's tick of
+jitter shed nothing; work outrunning a pool and a closed loop past its places shed Background a tolerance
+in and Normal a tolerance later; the lab's flood and a saturated shard, half a tolerance in and a
+tolerance later.
 
 | series | what it says |
 | --- | --- |
 | `kiln_shard_queue_delay_seconds{shard,class}` | Each class's mean wait from ready to run on the shard, over the probe's last period. |
-| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stayed past its calm (0 once back): it sheds at a tolerance. |
+| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stood (most of the last tolerance past its calm, the shard running most of it), 0 once it no longer does. |
 | `kiln_shard_shedding{shard,class}` | 1 while the shard's own queue, standing, sheds the class's requests. |
 | `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its watch read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares), `store_write` (kiln.db's writer). |
 | `kiln_pool_queue_standing_seconds{pool}` | How long the pool's line has stood past its calm, never emptying (0 once back). |
@@ -570,6 +574,27 @@ the overloaded run now uses `--profile flood`, the overload profile with 64 read
 MCP, none thinking, more work than one shard runs, its readers' event catch-ups Background, its other
 reads and MCP calls Normal, its pages and `/api/me` Critical.
 
+The standing rule's first runs (fedora, 2026-11-05 10:44 to 11:17 UTC, d46ceb48d67, 6 interleaved rounds
+each): calm, every shed-on round shed nothing (pages p99 0.48 to 0.66 ms). Flooded, the one shard ran 81 to
+82% of the time, its probes 4.2 to 6.4 ms late at the median and 24 ms at p99 and pages 16 ms at the median
+(25 ms at p99), served throughout, yet one shed-on round of six shed (68 Background requests, 27 Normal):
+the rule then asked every period of a tolerance to be past its calm, and the few probes each second that
+found the shard idle kept it from standing (3 windows in 12 rounds). A shard's queue now stands while most of
+the last tolerance's periods were past its calm and the shard ran most of it; replayed, that flood sheds
+Background half a tolerance in and Normal a tolerance later in every round (`overload::tests`).
+
+That rule's runs (fedora, 2026-11-05 12:25 to 12:59 UTC, rt-int `e7cdefced96`, 6 interleaved rounds each,
+the server alone in its scope on 8 CPUs of its own, the lab on 8 others): flooded, every shed-on round shed
+both classes (Background 568 to 1,693 requests a round, Normal 811 to 1,616), the one shard ran 52 to 55%
+of the time against 80 to 81% with shedding off, and pages were served with no error in all 12 rounds, at
+4.2 to 5.3 ms at the median against 13 to 15.5 ms with shedding off. Their p99 stayed where it was (20.8 to
+23.2 ms, against 18.2 to 24.6 ms), but in one shed-on round (round 7) the machine's load went from 17 to 33
+with other work as it ran: the lab sent 60% fewer requests, and 1% of pages took 4.1 s or more (6.6 s at
+the most), none failing. Calm (`realistic`, 4 shards), no shard's queue stood in any round. The only sheds,
+2 and 6 requests in two of the six shed-on rounds, came from the blocking pool's watch on `kiln.db`'s
+writer, whose line stood 2.4 to 3.7 s past its calm of 0.32 ms, its jobs waiting up to 2.5 s: a stall of
+seconds in the store's one writer, not a burst (fedora's disk was full and shared with other work then).
+
 `scripts/overload_lab/overload.sh` runs a profile shedding off against on, interleaved (`kiln-lab ab`, the
 server in its scope as above): one shard and `PROFILE=flood` overloads it on purpose; with
 `PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server, which should be nothing.
@@ -742,6 +767,40 @@ takes them for each item a runner sends and then its answer, as before, and publ
 of the stream it changed into a copy per stream, which the commands loop's have-again (every few
 seconds) and a link coming up read: what they say, and when and where acks go, are as they were.
 Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
+
+### The A/B against main before goal 5 (step 4)
+
+fedora, 2026-11-05, production's layout (each build's server alone in its scope at `CPUWeight=1000` on
+CPUs 16-31, the lab on the others), the `realistic` profile, 8 interleaved rounds each, calm and with 16
+hogs on the server's CPUs at weight 1: main before goal 5's first part (`426b02ea011`) against train 3's tree
+(`7dd67a5ce0f`, on main as `5c4047a47e5`). That tree holds goal 5's parts and also what goals 9, 10 and 11
+landed in trains 1 to 3, so this is the program's change, not goal 5's alone.
+
+First the locks (`scripts/locks.py census-tree`, then `rank`, train 3's tree, 3 rounds calm and 3 with the
+hogs): 180 call sites, ranked by how often the window took each. The most taken, the store's capture (2,746
+a second), its tables (902), its learner's joiner (603), its groups' point (556), Quiver's node (487) and
+the live channel's receivers (459, one taker), each waited 0.000 ms a second; only Quiver's own locks
+(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on.
+
+Then the A/B, the medians of the rounds (ms, but the busy share):
+
+| number | calm, before | calm, after | hogs, before | hogs, after |
+| --- | --- | --- | --- | --- |
+| `api_read.p99_ms` | 508.9 | 1.05 | 532.8 | 1.96 |
+| `api_read.p999_ms` | 1,429.7 | 1.97 | 1,596.7 | 5.33 |
+| `websocket.p99_ms` | 64.7 | 2.54 | 41.2 | 5.73 |
+| `attach.p99_ms` | 569.3 | 6.50 | 1,318.1 | 12.5 |
+| `server.runner.wait_p99_ms` | 57.2 | 3.00 | 39.2 | 4.90 |
+| `blocking.store.wait_p99_ms` | 866.8 | 0.46 | 1,015.1 | 1.73 |
+| `page.p99_ms` | 0.483 | 0.521 (same) | 1.677 | 1.680 (same) |
+| `shards.busy_share` | 0.057 | 0.036 | 0.050 | 0.030 |
+
+No tail got worse, calm or with hogs. What did, past noise: the medians of pages calm (0.200 to 0.226 ms,
++13%) and of API writes (1.02 to 1.16 ms calm, 1.39 to 1.58 with hogs, +14%), the runners' messages' p99
+time to be taken with hogs (0.47 to 0.71 ms), and the compute pool, which now runs seven times the jobs (69
+to 475 a second calm) and whose jobs wait longer for it at p99 (0.25 to 7.4 ms calm, 3.2 to 36 ms with
+hogs): the work goals 3, 9 and 10 moved off the shards (shard 0, which ran 18.5% of the time calm, runs
+2.2%). Goal 9's step 5 (a tenth of the CPU) and goal 10's step 4 (runner messages) take those up.
 
 ## Goal 7: placement
 
@@ -1044,6 +1103,46 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 Goal 11 of the API runtime program (plan `01a1a87b2e5673758106c92602a8b04d`, research
 `01a1a87b2e577517ab4c81874f8700a2`): in the lab's realistic profile the server's resident memory is at
 most a tenth of goal 3's (113 MB, from 1,132 MB), with no latency number worse.
+
+### Where the memory goes (step 1)
+
+fedora, 2026-11-05 12:59 to 13:24 UTC, the realistic profile, calm, 4 shards, the server on 8 CPUs of its
+own (16-23) and the lab on 0-7: main before goal 11 (`1460599d430`) against train 4's tree (`4b429f1a05c`),
+both the static musl build production runs, 8 interleaved rounds each; then one round each of the same
+tree's glibc build, under jemalloc's heap profile and on glibc's own malloc with `malloc_info`
+(`g11load.sh`, with step 3's scripts). Resident memory at the window's end, MB, the median of 8 rounds:
+
+| | main | train 4 |
+| --- | --- | --- |
+| all (`server.rss_mb`) | 1,126 (1,028 to 1,141) | 526 (454 to 570) |
+| the binary's pages (file) | | 127 (104 to 127) |
+| anonymous | | 401 (328 to 443) |
+| of it, named on `/metrics` | | 51: `session_segments` 30.0, `bus` 7.2, `session_entries` 6.3, `sqlite` 3.9, `ui_assets` 3.0, `custody_receipts` 0.4, `ui_events` 0.2 |
+| of it, not named | | 351 (277 to 395) |
+
+What's live, by jemalloc's heap profile at the window's end: 165 MB (its estimate from samples), by owner:
+
+| owner | MB | the most of it |
+| --- | --- | --- |
+| sessions' copies | 45.5 | packed segments 29.7 (`session_segments`), the registry's entries and mirrors 12.6, compaction 3.2 |
+| the runtime | 27.7 | each shard's context 16.4, and its interests, timer wheel and queues |
+| other | 18.5 | hyper_log's device and its buffers 16.4 |
+| the network (QUIC, the net thread) | 15.2 | the send budget's reserve 8.3, QUIC's transmits 5.2 |
+| observe | 11.9 | its index 4.0, its owner 3.2, its store 2.1 |
+| kiln.db (SQLite and its group) | 11.7 | SQLite's page cache 4.7, the group's driver 2.6, the capture's tables 2.1 |
+| the bus (live feeds' frames) | 10.1 | Quiver's frames 6.8 |
+| the conversation store | 9.0 | its feed's decoding 5.2, custody's intake 2.6, turso 1.1 |
+| snapshots in flight | 6.3 | packed for viewers 3.3, being sent 2.4 |
+| UI assets | 5.4 | gzip 3.8, brotli 1.6 |
+| HTTP | 2.3 | websockets' buffers 1.8 |
+| queues made up front; runners, CI and CD | 1.0 | |
+
+The rest of the anonymous memory is the allocator's: on glibc's malloc, 88 arenas (one for nearly each of
+the server's 88 threads) had taken 438 MB from the system with 297 MB of it free; under jemalloc, 261 MB
+resident held the 165 MB live. On musl's malloc, which production runs, the same code's 401 MB holds about
+the same live heap, so about 235 MB is what the allocator keeps. Against the bar: the live heap alone (165
+MB) is past 113 MB, and the binary's own resident pages (127 MB) are past it too, so step 5 needs the
+allocator's (step 4), less held live, and a word on whether file pages count.
 
 ### Every cache and buffer, bounded (step 3)
 

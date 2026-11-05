@@ -13,31 +13,40 @@
 //! ([`tick`]), with no probe of this module's own: the API's (Normal) reads the shard's delay, how late the
 //! probe, a Normal task, ran; Background's reads what the shard's Background tasks waited from joining a ready
 //! list to their polls (`Counters::queue_ns_background`). Each watch learns its queue's calm, the typical wait (the
-//! geometric mean) of the periods its queue came back to calm in, and sheds only on a queue that *stands*: CoDel's
-//! test, as Facebook bounds its queues (research 01a1a59c2abf, f14), a queue that has not come back to its calm
-//! for a whole interval is one the server falls behind; one that comes back is not, however late it ran in
-//! between. Calm is bursty: in the lab's calm (fedora, 2026-11-05, research f32) the store share's jobs waited 300
-//! to 620 ms at p99, one request's reads queued behind each other while the share held 3% of its places on
-//! average, and every round's shards ran a probe 250 ms late; the CUSUM this replaced read those as shifts and
-//! shed 6.5 Background requests a calm round. Every number is the platform's or the shard's own, not picked here:
-//! - **Standing**: every period since some time, the queue's wait was past its calm and past its floor, the
-//!   shard's quantum (a shorter wait is no queue: a task waits that long behind the poll running as it woke,
-//!   whatever the load; a probe's floor adds its timer's tick, a lateness the shard's timers have by design);
-//!   a pool's line, besides, held a job waiting at every tick (it never emptied).
-//! - **Background is shed** once its queue has stood a whole tolerance: Kubernetes' default probe timeout, 1 s
-//!   (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`), past which a request waiting fails a health probe of
-//!   that timeout (research f18: starvation that fails health checks cascades), and the soonest `Retry-After`
-//!   brings a shed client back (HTTP's unit, a second).
-//! - **Then Normal**, once it has stood another tolerance with Background shed: shedding Background did not
-//!   drain it. Critical never.
-//! - Shedding stops in the period the queue comes back to its calm.
+//! geometric mean) of its periods outside its standing, and sheds only on a queue that *stands*, as CoDel bounds
+//! its queues (research 01a1a59c2abf, f14): a queue that sits past its calm for a whole interval is one the server
+//! falls behind; one that comes back is not, however late it ran in between. Calm is bursty: in the lab's calm
+//! (fedora, 2026-11-05, research f32) the store share's jobs waited 307 to 620 ms at p99, one request's reads queued
+//! behind each other while the share held 3% of its places on average, and every round's shards ran a probe 250 ms
+//! late; the CUSUM this replaced read those as shifts and shed 6.5 Background requests a calm round. Every number
+//! is the platform's or the shard's own, not picked here:
+//! - **The interval**, a tolerance: Kubernetes' default probe timeout, 1 s
+//!   (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`), past which a request waiting fails a health probe of that
+//!   timeout (research f18: starvation that fails health checks cascades), and the soonest `Retry-After` brings a
+//!   shed client back (HTTP's unit, a second).
+//! - **Past its calm**: a period's wait past the calm and past the floor, the shard's quantum (a shorter wait is no
+//!   queue: a task waits that long behind the poll running as it woke, whatever the load; a probe's floor adds the
+//!   wheel's tick and the thread's timer slack, the tick again, a lateness the shard's timers have by design).
+//! - **A shard's queue stands** while most of the last tolerance's periods were past its calm (its median wait over
+//!   a tolerance past its calm) and, where the OS keeps a thread's CPU time (Linux, macOS), the shard ran most of
+//!   that tolerance. Most, not every: a shard 82% busy under the lab's flood, its probes 6 ms late at the median and
+//!   pages 16 ms, still found some probes idle each second, and a test of every period stood in 3 windows of 12
+//!   rounds. While it runs most of the time: a probe lands at any moment, so most can wait behind the shard's own
+//!   work only if it runs most of the time; a mostly idle shard whose wakes the host makes late (a hog holding the
+//!   CPU to the scheduler's tick on a kernel that preempts lazily) is not overloaded by its own work, and shedding
+//!   would not shorten its waits.
+//! - **A pool's line stands** once every period for a tolerance was past its calm, the line never emptying, and work
+//!   that came after it formed kept it standing (the pools, below).
+//! - **Background is shed** once a queue stands; **then Normal**, once it has stood another tolerance with
+//!   Background shed: shedding Background did not drain it. Critical never. Shedding stops once the queue no longer
+//!   stands.
 //!
-//! A shard sheds Background while either of its watches has stood, and Normal while the API's has stood its
-//! second tolerance: shedding the API frees no time for Background's own queue, the less urgent. A lone late
-//! probe, a stall (the watchdog's), a server's start holding a shard for seconds (one late probe each), and CPU
-//! hogs that make each of a shard's wakes wait up to a scheduler's tick on a kernel that preempts lazily: in
-//! none does a queue stand, since some period comes back. The waits of an excursion that comes back short of
-//! standing are folded into the calm; those of one that stands are not.
+//! A shard sheds Background while either of its watches stands, and Normal while the API's has stood its second
+//! tolerance: shedding the API frees no time for Background's own queue, the less urgent. A lone late probe, a stall
+//! (the watchdog's) and a server's start holding a shard for seconds (one late probe each) never make most of a
+//! tolerance. A period's wait is learned into the calm once it leaves the tolerance's window, if the queue never
+//! stood while it was in it (a pool's line: once its excursion comes back short of standing), so an overload, its
+//! onset with it, never becomes the calm it is measured against.
 //!
 //! **The pools.** What a request waits on off its shard waits in kiln-rt's pools (goal 3): the compute pool for a
 //! thread, each of the blocking pool's shares (`dns`, `store`, `fs`) for one of its places, kiln.db's writer for
@@ -62,6 +71,7 @@
 //! file read again from its start), and a WebSocket's opening likewise (`crate::http::client`). `/readyz` says
 //! what is shed, and answers 503 when every shard sheds the API.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -362,6 +372,15 @@ fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// How a queue's watch decides that it stands (the module's notes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    /// A pool's line: every period past its calm, never emptying, and kept standing by work that came after it formed.
+    Line,
+    /// A shard's queue: most of the last tolerance's periods past its calm, while the shard ran most of it.
+    Most,
+}
+
 /// One period of a queue, as a [`Standing`] reads it.
 #[derive(Clone, Copy, Debug)]
 struct Period {
@@ -376,14 +395,16 @@ struct Period {
     waiting: bool,
     /// The longest wait that is no queue: the shard's quantum (a probe's adds its timer's tick).
     floor_ns: u64,
-    /// A pool's line: it stands only once work that came after it formed has kept it standing a whole tolerance.
-    line: bool,
+    rule: Rule,
+    /// A shard's: the share of the last tolerance its thread ran on the CPU, where the OS keeps a thread's CPU time.
+    busy: Option<f64>,
 }
 
 impl Period {
-    /// A shard's period: the queue's mean wait `wait_ns` over it (the probe's lateness, or a class's mean wait).
-    fn of_shard(now_us: u64, wait_ns: u64, floor_ns: u64) -> Self {
-        Self { now_us, wait_ns: Some(wait_ns), longest_ns: wait_ns, waiting: true, floor_ns, line: false }
+    /// A shard's period: the queue's mean wait `wait_ns` over it (the probe's lateness, or a class's mean wait), and
+    /// how much of the last tolerance the shard ran.
+    fn of_shard(now_us: u64, wait_ns: u64, floor_ns: u64, busy: Option<f64>) -> Self {
+        Self { now_us, wait_ns: Some(wait_ns), longest_ns: wait_ns, waiting: true, floor_ns, rule: Rule::Most, busy }
     }
 }
 
@@ -394,16 +415,23 @@ struct Standing {
     /// The calm: ln of each calm period's wait (µs, never under the floor) added up, and how many.
     calm_ln_sum: f64,
     calm_n: u64,
-    /// The excursion under way: its periods, folded into the calm if it comes back short of standing.
+    /// A line's excursion under way: its periods, folded into the calm if it comes back short of standing.
     excursion_ln_sum: f64,
     excursion_n: u64,
-    /// Since when (µs) every period was past the calm, the queue never emptying; when it stood (its first
-    /// tolerance done), held until it comes back.
+    /// Since when (µs) the queue has been past its calm (a line: every period; a shard's queue: most of the last
+    /// tolerance's); when it stood, held until it comes back.
     over_since_us: Option<u64>,
     stood_at_us: Option<u64>,
     /// The longest wait told since it went past its calm, and the latest period's wait, µs.
     longest_us: f64,
     last_us: f64,
+    /// A shard's queue: the last tolerance's periods (when, past its calm, ln of its wait), how many were past it,
+    /// when the watch began, the last period it stood in, and how much of the last tolerance the shard ran.
+    window: VecDeque<(u64, bool, f64)>,
+    over_in_window: usize,
+    started_us: Option<u64>,
+    stood_last_us: Option<u64>,
+    busy: Option<f64>,
 }
 
 impl Standing {
@@ -415,8 +443,8 @@ impl Standing {
         (self.calm_ln_sum / self.calm_n as f64).exp().max(floor_us)
     }
 
-    /// One period of its queue; what it sheds now: 0, nothing; 1, Background (it stood a tolerance); 2, Normal too
-    /// (it stood another with Background shed).
+    /// One period of its queue; what it sheds now: 0, nothing; 1, Background (it stood); 2, Normal too (it stood
+    /// another tolerance with Background shed).
     fn period(&mut self, p: Period) -> u8 {
         let floor_us = (p.floor_ns as f64 / 1e3).max(1.0);
         let calm_us = self.calm_us(floor_us);
@@ -426,6 +454,15 @@ impl Standing {
             (Some(ns), Some(us)) => ns > p.floor_ns && us > calm_us,
             _ => true,
         };
+        match p.rule {
+            Rule::Line => self.line(p, over, sample_us),
+            Rule::Most => self.most(p, over, sample_us.unwrap_or(floor_us)),
+        }
+    }
+
+    /// A pool's line: it stands once every period for a tolerance was past its calm, the line never emptying, and it
+    /// stood a tolerance longer than the longest wait its jobs told since (the module's notes).
+    fn line(&mut self, p: Period, over: bool, sample_us: Option<f64>) -> u8 {
         if !p.waiting || !over {
             // Back at its calm, or its line emptied: an excursion that came back short of standing was calm's own.
             if self.stood_at_us.is_none() {
@@ -451,16 +488,58 @@ impl Standing {
             if self.stood_at_us.is_none() {
                 self.excursion_ln_sum += us.ln();
                 self.excursion_n = self.excursion_n.saturating_add(1);
-                let over_for_us = p.now_us.saturating_sub(since) as f64;
-                // A pool's line: work that came after it formed kept it standing, not one batch worked off.
-                let held_us = if p.line { over_for_us - self.longest_us } else { over_for_us };
-                if held_us >= TOLERANCE_US {
+                // Work that came after the line formed kept it standing, not one batch worked off.
+                if p.now_us.saturating_sub(since) as f64 - self.longest_us >= TOLERANCE_US {
                     self.stood_at_us = Some(p.now_us);
                 }
             }
         }
+        self.level(p.now_us)
+    }
+
+    /// A shard's queue: it stands while most of the last tolerance's periods were past its calm (its median wait over
+    /// a tolerance past its calm) and, where the OS keeps a thread's CPU time, the shard ran most of that tolerance:
+    /// a probe lands at any moment, so most can wait behind the shard's own work only if it runs most of the time;
+    /// a mostly idle shard whose wakes the host makes late (a hog holding the CPU to the scheduler's tick) is not
+    /// overloaded by its own work, and shedding would not shorten its waits. A period's wait is learned into the calm
+    /// as it leaves the window, if the queue never stood while it was in it: an overload's onset is no part of it.
+    fn most(&mut self, p: Period, over: bool, sample_us: f64) -> u8 {
+        let started = *self.started_us.get_or_insert(p.now_us);
+        self.last_us = sample_us;
+        self.busy = p.busy;
+        self.window.push_back((p.now_us, over, sample_us.ln()));
+        self.over_in_window += usize::from(over);
+        while let Some(&(at, was_over, ln_us)) = self.window.front() {
+            if (p.now_us.saturating_sub(at) as f64) < TOLERANCE_US {
+                break;
+            }
+            self.window.pop_front();
+            self.over_in_window = self.over_in_window.saturating_sub(usize::from(was_over));
+            if self.stood_last_us.is_none_or(|stood| stood < at) {
+                self.calm_ln_sum += ln_us;
+                self.calm_n = self.calm_n.saturating_add(1);
+            }
+        }
+        let whole = p.now_us.saturating_sub(started) as f64 >= TOLERANCE_US;
+        let most_over = whole && self.over_in_window.saturating_mul(2) > self.window.len();
+        let ran_most = p.busy.is_none_or(|busy| busy * 2.0 > 1.0);
+        if !(most_over && ran_most) {
+            self.over_since_us = None;
+            self.stood_at_us = None;
+            return 0;
+        }
+        self.stood_last_us = Some(p.now_us);
+        if self.stood_at_us.is_none() {
+            self.over_since_us = Some(p.now_us);
+            self.stood_at_us = Some(p.now_us);
+        }
+        self.level(p.now_us)
+    }
+
+    /// What a queue that stood at `stood_at_us` sheds at `now_us`: Background at once, Normal a tolerance later.
+    fn level(&self, now_us: u64) -> u8 {
         match self.stood_at_us {
-            Some(at) if p.now_us.saturating_sub(at) as f64 >= TOLERANCE_US => 2,
+            Some(at) if now_us.saturating_sub(at) as f64 >= TOLERANCE_US => 2,
             Some(_) => 1,
             None => 0,
         }
@@ -472,11 +551,21 @@ impl Standing {
     }
 
     /// Why it sheds, for the log: `None` while it hasn't stood.
-    fn why(&self, name: &str, now_us: u64, floor_ns: u64, line: bool) -> Option<String> {
+    fn why(&self, name: &str, now_us: u64, floor_ns: u64, rule: Rule) -> Option<String> {
         self.stood_at_us?;
-        let (calm_ms, over_s) = (self.calm_us((floor_ns as f64 / 1e3).max(1.0)) / 1e3, self.over_for_us(now_us) as f64 / 1e6);
-        let past = if line { format!(", a tolerance past the longest wait its jobs told, {:.1} ms,", self.longest_us / 1e3) } else { String::new() };
-        Some(format!("{name}: its queue stood {over_s:.2} s{past} past its calm of {calm_ms:.2} ms (now {:.1} ms)", self.last_us / 1e3))
+        let (calm_ms, over_s, now_ms) = (self.calm_us((floor_ns as f64 / 1e3).max(1.0)) / 1e3, self.over_for_us(now_us) as f64 / 1e6, self.last_us / 1e3);
+        Some(match rule {
+            Rule::Line => format!(
+                "{name}: its line stood {over_s:.2} s past its calm of {calm_ms:.2} ms, a tolerance past the longest wait its jobs told, {:.1} ms (now {now_ms:.1} ms)",
+                self.longest_us / 1e3
+            ),
+            Rule::Most => format!(
+                "{name}: {} of its last {} periods past its calm of {calm_ms:.2} ms{}, standing {over_s:.2} s (now {now_ms:.1} ms)",
+                self.over_in_window,
+                self.window.len(),
+                self.busy.map_or_else(String::new, |busy| format!(", the shard running {:.0}% of them", busy * 100.0))
+            ),
+        })
     }
 }
 
@@ -495,6 +584,8 @@ struct Watches {
     /// Background work's: on the Background tasks' waits, from the runtime's counts.
     background: Standing,
     last: hyper_rt::shard_loop::Counters,
+    /// The shard thread's CPU time at each period of the last tolerance (when, ns), for how much of it the shard ran.
+    cpu: VecDeque<(u64, u64)>,
     /// The watchdog's newest report of the shard already logged.
     reported: u64,
     /// The pools' watches: the first shard's alone.
@@ -518,8 +609,8 @@ thread_local! {
 ///
 /// - **Normal** (the API) sheds on the shard's delay: the probe is a Normal task, so its lateness is what the
 ///   API's own work waits on the shard, the classes ahead of it and its own share counted. Its floor is the
-///   quantum and the timer's tick: a probe that waited for the poll running as its timer fell due, and for the
-///   tick, waited for no queue.
+///   quantum, the wheel's tick and the thread's timer slack: a probe that waited for the poll running as its timer
+///   fell due, and for its timer's own lateness by design, waited for no queue.
 /// - **Background** sheds on what the shard's Background tasks waited, from joining a ready list to their polls,
 ///   over the period (`Counters::queue_ns_background`): Background work waits behind its own kind alone and a
 ///   share of the others', so its own flood shows there and not in the API's delay. A period with no Background
@@ -528,12 +619,14 @@ thread_local! {
 /// The route waits goal 1 counts (`crate::route_latency`) are no signal here: they run from a request's head read
 /// off its socket, which its connection's task reads at Critical (`Connection`) and serves at once, so they do not
 /// carry the waits a class makes.
-pub fn tick(index: usize, late: Duration) {
+pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>) {
     let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else {
         return;
     };
     let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
-    let probe_floor_ns = quantum_ns.saturating_add(hyper_rt::futures::timer_tick_ns());
+    // A probe's lateness by design: up to the wheel's tick, and the thread's timer slack, which the shard sets to its
+    // tick (`hyper_rt`'s `Driver::set_timer_slack_ns`; `crate::shard_health`).
+    let probe_floor_ns = quantum_ns.saturating_add(hyper_rt::futures::timer_tick_ns().saturating_mul(2));
     WATCHES.with(|cell| {
         let mut held = cell.borrow_mut();
         let w = held.get_or_insert_with(|| Watches {
@@ -541,10 +634,12 @@ pub fn tick(index: usize, late: Duration) {
             normal: Standing::default(),
             background: Standing::default(),
             last: now,
+            cpu: VecDeque::new(),
             reported: 0,
             pools: (index == 0).then(|| PoolWatches { watches: Default::default(), last: pool_health::queues() }),
         });
         let now_us = micros_since(w.base);
+        let busy = busy_share(&mut w.cpu, now_us, cpu_ns);
         let last = w.last;
         let waits = [
             mean_ns(now.queue_ns_background, last.queue_ns_background, now.queue_polls_background, last.queue_polls_background),
@@ -552,8 +647,8 @@ pub fn tick(index: usize, late: Duration) {
             mean_ns(now.queue_ns_critical, last.queue_ns_critical, now.queue_polls_critical, last.queue_polls_critical),
         ];
         let late_ns = nanos(late);
-        let normal = w.normal.period(Period::of_shard(now_us, late_ns, probe_floor_ns));
-        let background = w.background.period(Period::of_shard(now_us, waits[0].unwrap_or(0), quantum_ns));
+        let normal = w.normal.period(Period::of_shard(now_us, late_ns, probe_floor_ns, busy));
+        let background = w.background.period(Period::of_shard(now_us, waits[0].unwrap_or(0), quantum_ns, busy));
         publish(state, waits, late_ns, w, now_us, (quantum_ns, probe_floor_ns));
         let level = shard_level(normal, background);
         if state.level.swap(level, Ordering::Relaxed) != level {
@@ -568,6 +663,22 @@ pub fn tick(index: usize, late: Duration) {
     });
 }
 
+/// The share of the last tolerance the shard's thread ran on the CPU, from its CPU time now (`cpu_ns`, where the OS keeps
+/// a thread's: Linux and macOS) and at each period since, kept in `cpu`; `None` where it isn't kept.
+fn busy_share(cpu: &mut VecDeque<(u64, u64)>, now_us: u64, cpu_ns: Option<u64>) -> Option<f64> {
+    let Some(cpu_ns) = cpu_ns else {
+        cpu.clear();
+        return None;
+    };
+    cpu.push_back((now_us, cpu_ns));
+    while cpu.len() > 1 && cpu.front().is_some_and(|&(at, _)| now_us.saturating_sub(at) as f64 > TOLERANCE_US) {
+        cpu.pop_front();
+    }
+    let &(from_us, from_ns) = cpu.front()?;
+    let wall_ns = now_us.saturating_sub(from_us).saturating_mul(1_000);
+    (wall_ns > 0).then(|| cpu_ns.saturating_sub(from_ns) as f64 / wall_ns as f64)
+}
+
 /// The pools' tick, on the first shard, from its probe: each pool's period to its watch ([`pool_sample`]), and what
 /// each sheds published for every shard.
 fn tick_pools(p: &mut PoolWatches, floor_ns: u64, now_us: u64) {
@@ -575,7 +686,7 @@ fn tick_pools(p: &mut PoolWatches, floor_ns: u64, now_us: u64) {
     let longest_us = pool_health::take_longest();
     for (i, (((w, queue), last), longest_us)) in p.watches.iter_mut().zip(now).zip(p.last).zip(longest_us).enumerate() {
         let wait_ns = pool_sample(queue, last);
-        let level = w.period(Period { now_us, wait_ns, longest_ns: longest_us.saturating_mul(1_000), waiting: queue.waiting, floor_ns, line: true });
+        let level = w.period(Period { now_us, wait_ns, longest_ns: longest_us.saturating_mul(1_000), waiting: queue.waiting, floor_ns, rule: Rule::Line, busy: None });
         if let (Some(ns), Some(slot)) = (wait_ns, POOLS.delay_ns.get(i)) {
             slot.store(ns.max(floor_ns), Ordering::Relaxed);
         }
@@ -637,7 +748,7 @@ fn what(level: u8) -> &'static str {
 
 /// The log of a change of what a shard sheds, with why. `floors` as [`publish`]'s.
 fn note_level(index: usize, state: &ShardState, level: u8, w: &Watches, now_us: u64, floors: (u64, u64)) {
-    let reasons: Vec<String> = [w.normal.why("normal", now_us, floors.1, false), w.background.why("background", now_us, floors.0, false)].into_iter().flatten().collect();
+    let reasons: Vec<String> = [w.normal.why("normal", now_us, floors.1, Rule::Most), w.background.why("background", now_us, floors.0, Rule::Most)].into_iter().flatten().collect();
     let delay = |class: Class| state.delay_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
     match level {
         0 => tracing::info!(shard = index, "shard no longer sheds requests: its queue came back to its calm"),
@@ -662,7 +773,7 @@ fn note_pool_level(i: usize, level: u8, w: &Standing, now_us: u64, floor_ns: u64
             pool = %pool,
             sheds = what(level),
             delay_us = pool_delay_ns(i) / 1_000,
-            why = %w.why(&pool, now_us, floor_ns, true).unwrap_or_default(),
+            why = %w.why(&pool, now_us, floor_ns, Rule::Line).unwrap_or_default(),
             shedding = ENABLED.load(Ordering::Relaxed),
             "work waiting in a pool stood past its calm: every shard sheds requests"
         ),
@@ -815,7 +926,7 @@ pub fn render(o: &mut String) {
     let _ = writeln!(o, "# HELP kiln_shard_queue_delay_seconds Each class's mean wait from ready to run on the shard, over the last 10 ms.\n# TYPE kiln_shard_queue_delay_seconds gauge");
     let _ = writeln!(
         o,
-        "# HELP kiln_shard_queue_standing_seconds How long each class's queue on the shard has stayed past its calm, 0 once it came back: it sheds once that reaches a tolerance (1 s).\n# TYPE kiln_shard_queue_standing_seconds gauge"
+        "# HELP kiln_shard_queue_standing_seconds How long each class's queue on the shard has stood, most of the last tolerance (1 s) past its calm while the shard ran most of it, 0 once it no longer does: it sheds while it stands.\n# TYPE kiln_shard_queue_standing_seconds gauge"
     );
     let _ = writeln!(o, "# HELP kiln_shard_shedding 1 while the shard's own queue, standing past its calm, sheds the class's requests (the pools': kiln_pool_shedding).\n# TYPE kiln_shard_shedding gauge");
     for (index, state) in shards().iter().enumerate() {
@@ -943,9 +1054,10 @@ mod tests {
 
     /// Goal 1's probe period, the watches' tick, µs.
     const PERIOD_US: u64 = 10_000;
-    /// The server's step quantum (`crate::rt::STEP_BUDGET_NS`), and a probe's floor: the quantum and the timer's tick.
+    /// The server's step quantum (`crate::rt::STEP_BUDGET_NS`), and a probe's floor: the quantum, the wheel's tick and the
+    /// thread's timer slack (the tick again), 100 µs each.
     const QUANTUM_NS: u64 = crate::rt::STEP_BUDGET_NS;
-    const PROBE_FLOOR_NS: u64 = crate::rt::STEP_BUDGET_NS + 100_000;
+    const PROBE_FLOOR_NS: u64 = crate::rt::STEP_BUDGET_NS + 2 * 100_000;
 
     /// A pool's line replayed: each period as its watch reads it (the mean and longest wait told over it, a share
     /// telling each job's wait as it ends; whether a job waited at its tick), and the trace's own numbers, held to
@@ -1012,26 +1124,33 @@ mod tests {
         Replay { periods, p99_ms: at(0.99), most_ms: at(1.0), busy: busy / end_us, per_s: jobs.len() as f64 / secs }
     }
 
-    /// What a pool's watch sheds at each of `r`'s periods; `line`: as a pool's (the module's notes), or as a queue
-    /// with no line of its own.
-    fn watch_pool(r: &Replay, line: bool) -> Vec<u8> {
+    /// What a watch of `rule` sheds at each of `r`'s periods: a pool's line's, or (to show what the line's rule holds)
+    /// a shard's queue's.
+    fn watch_pool(r: &Replay, rule: Rule) -> Vec<u8> {
         let mut w = Standing::default();
         let mut now_us = 0;
         r.periods
             .iter()
             .map(|&(wait_ns, longest_ns, waiting)| {
-                let level = w.period(Period { now_us, wait_ns, longest_ns, waiting, floor_ns: QUANTUM_NS, line });
+                let level = w.period(Period { now_us, wait_ns, longest_ns, waiting, floor_ns: QUANTUM_NS, rule, busy: None });
                 now_us += PERIOD_US;
                 level
             })
             .collect()
     }
 
-    /// What a shard's watch sheds at each probe of `late` (ns), on a probe's floor.
-    fn watch_shard(late: &[u64]) -> Vec<u8> {
+    /// What a shard's watch sheds at each probe of `late` (ns), on a probe's floor, the shard running `busy[k]` of the
+    /// tolerance up to probe `k` (the last share given holding past the end of `busy`; none: no CPU time known).
+    fn watch_shard(late: &[u64], busy: &[f64]) -> Vec<u8> {
         let mut w = Standing::default();
-        late.iter().zip((0u64..).map(|k| k * PERIOD_US)).map(|(&ns, now_us)| w.period(Period::of_shard(now_us, ns, PROBE_FLOOR_NS))).collect()
+        late.iter()
+            .enumerate()
+            .map(|(k, &ns)| w.period(Period::of_shard(k as u64 * PERIOD_US, ns, PROBE_FLOOR_NS, busy.get(k).or(busy.last()).copied())))
+            .collect()
     }
+
+    /// The lab's calm shard runs about 7% of the time (fedora, 2026-11-05: `shards.busy_share` 0.064 to 0.073).
+    const CALM_BUSY: f64 = 0.07;
 
     /// The first period at or after `from` whose level is at least `level`.
     fn first(levels: &[u8], level: u8, from: usize) -> Option<usize> {
@@ -1104,7 +1223,7 @@ mod tests {
             let r = replay(calm_store(seed, 180.0), 24, 180.0);
             assert!((300.0..=650.0).contains(&r.p99_ms), "seed {seed}: the lab's calm p99 wait (307 to 620 ms), not {:.0} ms", r.p99_ms);
             assert!((0.5..=1.0).contains(&r.busy) && (1_100.0..=1_300.0).contains(&r.per_s), "seed {seed}: the lab's calm share: {:.2} places, {:.0} a second", r.busy, r.per_s);
-            let levels = watch_pool(&r, true);
+            let levels = watch_pool(&r, Rule::Line);
             assert_eq!(first(&levels, 1, 0), None, "seed {seed}: the calm sheds nothing (most wait {:.0} ms)", r.most_ms);
         }
     }
@@ -1122,9 +1241,9 @@ mod tests {
                 fan_out(&mut Rng(seed ^ 0xfa11), &mut jobs, n, 30e6);
                 let r = replay(jobs, 24, 60.0);
                 assert!(r.most_ms >= most_s * 1e3, "seed {seed}: {n} reads wait past {most_s} s, not {:.0} ms", r.most_ms);
-                assert_eq!(first(&watch_pool(&r, true), 1, 0), None, "seed {seed}: {n} reads at once shed nothing");
+                assert_eq!(first(&watch_pool(&r, Rule::Line), 1, 0), None, "seed {seed}: {n} reads at once shed nothing");
                 if n == 4_000 {
-                    assert!(first(&watch_pool(&r, false), 2, 0).is_some(), "seed {seed}: read as a queue with no line, it would shed both classes");
+                    assert!(first(&watch_pool(&r, Rule::Most), 2, 0).is_some(), "seed {seed}: read as a shard's queue, with no line's rule, it would shed both classes");
                 }
             }
         }
@@ -1147,7 +1266,7 @@ mod tests {
                 }
                 jobs.push((t, r.uniform(0.5, 1.5) * run_us));
             }
-            let levels = watch_pool(&replay(jobs, 24, 60.0), true);
+            let levels = watch_pool(&replay(jobs, 24, 60.0), Rule::Line);
             let onset = 2_000;
             assert_eq!(first(&levels, 1, 0).map(|k| k >= onset), Some(true), "seed {seed}: nothing shed before the work outran it");
             let background = first(&levels, 1, onset).unwrap_or(usize::MAX) - onset;
@@ -1180,7 +1299,7 @@ mod tests {
                 jobs.push((at as f64, run));
                 clients.push(Reverse(end));
             }
-            let levels = watch_pool(&replay(jobs, 24, 60.0), true);
+            let levels = watch_pool(&replay(jobs, 24, 60.0), Rule::Line);
             let onset = 2_000;
             let background = first(&levels, 1, 0).unwrap_or(usize::MAX).saturating_sub(onset);
             assert!((100..=110).contains(&background), "seed {seed}: Background a tolerance and a run in: {} ms", background * 10);
@@ -1206,30 +1325,31 @@ mod tests {
             let window = late.get(1_000..).unwrap_or_default();
             let (p99, p999) = (quantile_ms(window, 0.99), quantile_ms(window, 0.999));
             assert!((0.5..=0.8).contains(&p99) && (15.0..=80.0).contains(&p999), "seed {seed}: the lab's calm probes (p99 0.6 to 0.77 ms, p99.9 18 to 31 ms), not {p99:.2} and {p999:.1} ms");
-            assert_eq!(first(&watch_shard(&late), 1, 0), None, "seed {seed}: the calm and its stalls shed nothing");
+            assert_eq!(first(&watch_shard(&late, &[CALM_BUSY]), 1, 0), None, "seed {seed}: the calm and its stalls shed nothing");
         }
     }
 
     /// Step 4: CPU hogs on a kernel that preempts lazily make each of a shard's wakes wait up to a scheduler's tick
-    /// (1 ms at 1000 Hz) for the hog on its CPU to let go: its probes run late by up to a tick, but some always on
-    /// time, so its queue never stands; the overload lab's one shard, 34% busy on its saturated CPUs, ran so.
+    /// (1 ms at 1000 Hz) for the hog on its CPU to let go: most of its probes run late past its calm, but the shard
+    /// runs 7% of the time, so the waits are the host's, not a queue of its own work, and shedding would not shorten
+    /// them: nothing is shed (the overload lab's one shard, 34% busy on CPUs the pools' threads took, was so too).
     #[test]
-    fn g6_s4_a_schedulers_tick_of_jitter_is_no_standing_queue() {
+    fn g6_s4_a_mostly_idle_shards_late_wakes_shed_nothing() {
         for seed in 1..=5u64 {
             let mut r = Rng(seed);
             let mut late = calm_probes(&mut r, 3_000);
             let jitter: Vec<u64> = calm_probes(&mut r, 6_000).into_iter().map(|ns| ns + r.uniform(0.0, 1e6) as u64).collect();
             assert!(quantile_ms(&jitter, 0.99) > 1.0, "seed {seed}: a tick's jitter and the calm's tail");
             late.extend(jitter);
-            assert_eq!(first(&watch_shard(&late), 1, 0), None, "seed {seed}: jitter that comes back sheds nothing");
+            assert_eq!(first(&watch_shard(&late, &[CALM_BUSY]), 1, 0), None, "seed {seed}: a mostly idle shard's late wakes are the host's: nothing shed");
         }
     }
 
     /// Step 4: a shard whose probes never come back to their calm (a saturated shard's: a few milliseconds late each,
-    /// never under 0.6 ms) sheds Background a tolerance in, Normal a tolerance later, and nothing from its first
-    /// probe back at its calm.
+    /// never under 0.6 ms, the shard running 95% of the time) sheds Background once most of a tolerance's probes were
+    /// late (half a tolerance in), Normal a tolerance later, and nothing once most of a tolerance's are back.
     #[test]
-    fn g6_s4_a_saturated_shard_sheds_background_then_normal_and_stops_at_once() {
+    fn g6_s4_a_saturated_shard_sheds_background_then_normal_and_stops_once_back() {
         for seed in 1..=5u64 {
             let mut r = Rng(seed);
             let mut late = calm_probes(&mut r, 3_000);
@@ -1239,11 +1359,57 @@ mod tests {
             }
             late.extend((0..1_500).map(|_| ((5e6f64.ln() + 0.8 * r.normal()).exp() as u64).max(600_000)));
             late.extend(calm_probes(&mut r, 500));
-            let levels = watch_shard(&late);
-            assert_eq!(first(&levels, 1, 0), Some(3_100), "seed {seed}: Background a tolerance in");
-            assert_eq!(first(&levels, 2, 0), Some(3_200), "seed {seed}: Normal a tolerance later");
-            assert!(levels.iter().skip(4_500).all(|l| *l == 0), "seed {seed}: nothing once its probes are back");
+            let busy: Vec<f64> = (0..late.len()).map(|k| if (3_000..4_500).contains(&k) { 0.95 } else { CALM_BUSY }).collect();
+            let levels = watch_shard(&late, &busy);
+            let background = first(&levels, 1, 0).unwrap_or(usize::MAX);
+            assert!((3_045..=3_051).contains(&background), "seed {seed}: Background once most of a tolerance's probes were late: {background}");
+            assert_eq!(first(&levels, 2, 0), Some(background + 100), "seed {seed}: Normal a tolerance later");
+            assert!(levels.iter().skip(4_551).all(|l| *l == 0), "seed {seed}: nothing once most of a tolerance's probes are back");
         }
+    }
+
+    /// The lab's flood (fedora, 2026-11-05 11:01-11:17Z, `--profile flood`, one shard): the shard ran 81 to 82% of the
+    /// time and its probes ran 4.2 to 6.4 ms late at the median and 24 ms at p99 (its batches of polls held its timers
+    /// and sockets: pages took 16 ms at the median), while a few each second found it idle and ran on time. Lateness, ns.
+    fn flood_probes(r: &mut Rng, n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|_| {
+                let us = if r.next() < 0.075 { r.uniform(5.0, 120.0) } else { (6_200f64.ln() + 0.75 * r.normal()).exp().min(25_000.0) };
+                (us * 1e3) as u64
+            })
+            .collect()
+    }
+
+    /// Step 4: the lab's flood, replayed: most of every tolerance's probes ran late past their calm while the shard ran
+    /// 82% of the time, so Background is shed half a tolerance in and Normal a tolerance later, in every round. Read as
+    /// a line, every period past its calm, as the rule before read a shard's queue, the few probes each second that found
+    /// the shard idle kept it from standing: in the lab it stood in 3 windows of 12 rounds, and one shed-on round shed.
+    #[test]
+    fn g6_s4_the_lab_flood_sheds_background_then_normal_in_every_round() {
+        let mut stood_as_a_line = 0;
+        for seed in 1..=12u64 {
+            let mut r = Rng(seed);
+            let mut late = calm_probes(&mut r, 3_000);
+            let flood = flood_probes(&mut r, 6_000);
+            let (p50, p99) = (quantile_ms(&flood, 0.5), quantile_ms(&flood, 0.99));
+            assert!((4.0..=7.0).contains(&p50) && (20.0..=25.0).contains(&p99), "seed {seed}: the lab's flood probes (p50 4.2 to 6.4 ms, p99 24 ms), not {p50:.1} and {p99:.1} ms");
+            late.extend(flood);
+            let busy: Vec<f64> = (0..late.len()).map(|k| if k < 3_000 { CALM_BUSY } else { 0.82 }).collect();
+            let levels = watch_shard(&late, &busy);
+            assert_eq!(first(&levels, 1, 0).map(|k| k >= 3_000), Some(true), "seed {seed}: nothing shed in the calm before");
+            let background = first(&levels, 1, 3_000).unwrap_or(usize::MAX).saturating_sub(3_000);
+            assert!((45..=60).contains(&background), "seed {seed}: Background once most of a tolerance's probes were late: {} ms in", background * 10);
+            assert_eq!(first(&levels, 2, 3_000).map(|k| k - 3_000), Some(background + 100), "seed {seed}: Normal a tolerance later");
+            let mut line = Standing::default();
+            let read_as_a_line = late
+                .iter()
+                .enumerate()
+                .map(|(k, &ns)| line.period(Period { now_us: k as u64 * PERIOD_US, wait_ns: Some(ns), longest_ns: 0, waiting: true, floor_ns: PROBE_FLOOR_NS, rule: Rule::Line, busy: None }))
+                .max()
+                .unwrap_or(0);
+            stood_as_a_line += usize::from(read_as_a_line > 0);
+        }
+        assert!(stood_as_a_line <= 3, "read as a line, the flood stood in {stood_as_a_line} of 12 rounds");
     }
 
     /// Step 4: a shard sheds Background while either of its queues has stood, Normal while the API's has stood its
@@ -1258,15 +1424,16 @@ mod tests {
         assert_eq!(shard_level(2, 2), 2);
     }
 
-    /// Step 4: the calm is learned from what comes back: an excursion that comes back short of a tolerance is folded
-    /// into it; one that stands is not, so an overload never becomes the calm it is measured against.
+    /// Step 4: the calm is learned from what didn't stand: a shard's excursion that never stood is folded into it as its
+    /// periods leave the tolerance's window; one that stood is not, nor its onset, so an overload never becomes the
+    /// calm it is measured against.
     #[test]
-    fn g6_s4_an_excursion_that_comes_back_is_calm_and_one_that_stands_is_not() {
+    fn g6_s4_an_excursion_that_never_stood_is_calm_and_one_that_stood_is_not() {
         let mut w = Standing::default();
         let mut now_us = 0;
         let mut step = |w: &mut Standing, ns: u64| {
             now_us += PERIOD_US;
-            w.period(Period::of_shard(now_us, ns, QUANTUM_NS))
+            w.period(Period::of_shard(now_us, ns, QUANTUM_NS, Some(0.95)))
         };
         for _ in 0..1_000 {
             assert_eq!(step(&mut w, 0), 0);
@@ -1274,18 +1441,27 @@ mod tests {
         let floor_us = QUANTUM_NS as f64 / 1e3;
         assert!((w.calm_us(floor_us) - floor_us).abs() < 1e-6, "a calm of nothing waiting: the floor");
         for _ in 0..50 {
-            assert_eq!(step(&mut w, 10_000_000), 0, "half a tolerance at 10 ms sheds nothing");
+            assert_eq!(step(&mut w, 10_000_000), 0, "half a tolerance at 10 ms is not most of one: nothing shed");
         }
-        assert_eq!(step(&mut w, 0), 0);
+        for _ in 0..150 {
+            assert_eq!(step(&mut w, 0), 0);
+        }
         let learned = w.calm_us(floor_us);
-        assert!(learned > floor_us * 1.1, "the excursion that came back is the calm's own: {learned:.0} µs");
+        assert!(learned > floor_us * 1.1, "the excursion that never stood is the calm's own: {learned:.0} µs");
         let mut shed = 0;
         for _ in 0..300 {
             shed = shed.max(step(&mut w, 50_000_000));
         }
         assert_eq!(shed, 2, "three tolerances at 50 ms shed both classes");
-        assert_eq!(step(&mut w, 0), 0, "and stop at the first period back");
-        assert!((w.calm_us(floor_us) - learned).abs() / learned < 1e-2, "the overload is no part of the calm: {:.0} against {learned:.0} µs", w.calm_us(floor_us));
+        let stops = (1..=100).find(|_| step(&mut w, 0) == 0);
+        assert!(stops.is_some_and(|k| k <= 51), "it stops once most of a tolerance is back: {stops:?} periods");
+        for _ in 0..150 {
+            step(&mut w, 0);
+        }
+        // Only the calm's own periods since: the waits at the floor after it, which lower it. Twenty of the overload's
+        // periods, 200 times the floor, would raise it about 9%; its onset's fifty, about 19%.
+        let after = w.calm_us(floor_us);
+        assert!(after <= learned, "the overload, its onset with it, is no part of the calm: {after:.1} against {learned:.1} µs");
     }
 
     /// Step 4, the pools: a pool's period is the mean of the waits told over it; with none told, the floor while
@@ -1306,7 +1482,7 @@ mod tests {
         let mut now_us = 0;
         let mut step = |w: &mut Standing, wait_ns: Option<u64>, waiting: bool| {
             now_us += PERIOD_US;
-            w.period(Period { now_us, wait_ns, longest_ns: wait_ns.unwrap_or(0), waiting, floor_ns: QUANTUM_NS, line: true })
+            w.period(Period { now_us, wait_ns, longest_ns: wait_ns.unwrap_or(0), waiting, floor_ns: QUANTUM_NS, rule: Rule::Line, busy: None })
         };
         for _ in 0..500 {
             step(&mut w, Some(0), false);
