@@ -593,6 +593,18 @@ python3 scripts/locks.py rank census/run.json
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
   every change and question as a message, in order; a sync path's command (`Hub::command_soon`) is queued
   in its turn and its answer comes on its one wait.
+- **CI's engine's legs, runs and kept legs** (`ci::dispatch::Handle`), which the hub reads on every message
+  a runner sends about a job (is it one of the engine's legs, does this runner keep it) and the API on its
+  calls, are copies: the dispatcher, the legs' and runs' one writer, swaps a new one in as they come and go,
+  and a kept leg's (the dispatcher's or the API's) is a compare-and-swap. A reader sees every change made
+  before it looked, as under the lock; a finished run's legs go in one swap, so it sees all of them or
+  none. What the dispatcher rebuilt as it started is set once, and its messages' end is taken once.
+- **CI's caches** that the API's calls and the runs being planned read are copies too: each repository's
+  trunk files (`.kiln/config.yaml`, `routing.yaml`, `environments.yaml`, read again at most every 20 s),
+  its tests' timings (shards balanced by time), the package graphs of the newest commits, the patch-ids
+  of commits signed over, and how far each runner's checkouts are behind. A value read again goes in with
+  the others' pointers (each value its own `Arc` where it's more than a few words); readers that found one
+  stale both read it again, as under the lock.
 
 ### Keeping them out
 

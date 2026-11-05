@@ -40,6 +40,23 @@ hot = [
   "crates/kiln/src/store.rs",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
+  # CI (goal 5 step 2): the engine's legs, runs and kept legs, which the hub reads on its runners' job
+  # messages; the caches the API's calls and the runs planned read; the modules the API's runs, legs,
+  # pools and insights are read through.
+  "crates/kiln/src/ci/dispatch.rs",
+  "crates/kiln/src/ci/repo_config.rs",
+  "crates/kiln/src/ci/routing.rs",
+  "crates/kiln/src/ci/environments.rs",
+  "crates/kiln/src/ci/results.rs",
+  "crates/kiln/src/ci/warm.rs",
+  "crates/kiln/src/ci/graphs.rs",
+  "crates/kiln/src/ci/verdicts.rs",
+  "crates/kiln/src/ci/api.rs",
+  "crates/kiln/src/ci/runs_api.rs",
+  "crates/kiln/src/ci/runs.rs",
+  "crates/kiln/src/ci/pools.rs",
+  "crates/kiln/src/ci/insights.rs",
+  "crates/kiln/src/reads.rs",
 ]
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.
