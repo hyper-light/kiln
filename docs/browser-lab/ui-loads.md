@@ -76,12 +76,14 @@ After a deploy of a one-line change in the conversation's view (`ci/ui/two_build
 
 ## kiln's serving, against a real server
 
-`ci/ui/serve_check.sh` on fedora (a debug kiln on loopback, build A then build B with A kept):
+`ci/ui/serve_check.sh` on adacachy (a debug kiln on loopback built with build A, then build B with
+A kept; on main's build-time Brotli packing, after the port onto main of 2026-11-05):
 
 - compressible files sent compressed just after a start: 286; uncompressed: 0;
 - the shell (any page), the manifest, `sw.js` and icons asked again with their ETags: each a 304,
-  180 bytes with its head; 1,260 bytes for the seven;
-- build B's changed chunk asked with A's version as the dictionary: `dcb`, 62 bytes, against 65,960
+  180 to 183 bytes with its head; 1,272 bytes for the seven;
+- build A's version of the changed chunk, only in the kept assets now: Brotli, as A's build packed it;
+- build B's changed chunk asked with A's version as the dictionary: `dcb`, 62 bytes, against 66,226
   for Brotli alone; its header names the dictionary's SHA-256; `Use-As-Dictionary:
   match="/assets/_app.agents._id-*.js", match-dest=("script")`, `Vary: Accept-Encoding,
   Available-Dictionary`;
