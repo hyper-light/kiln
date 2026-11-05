@@ -1,0 +1,56 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56 step 2): goal 11's compact session copies, on goal 10's
+# chunks, checked on Linux: clippy of kiln, the harness's tests and goal 11's, and session_resident with and
+# without the conversation store. Results go to the branch g11-memory-convo-results.
+name: g11-memory-convo
+
+on:
+  push:
+    branches: [g11-memory-convo]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-convo
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  linux:
+    name: linux (clippy, harness tests, session_resident)
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo fallocate -l 16G /mnt/g11-swap && sudo chmod 600 /mnt/g11-swap && sudo mkswap /mnt/g11-swap && sudo swapon /mnt/g11-swap || true
+          sudo mkdir -p /mnt/target && sudo chown "$USER" /mnt/target
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Checks
+        env:
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set +e
+          R=$RUNNER_TEMP/c; mkdir -p "$R"
+          cargo test --locked -p kiln --lib -j 4 -- convo:: harness:: g11 memory:: > "$R/lib-tests.txt" 2>&1; echo "lib tests exit $?" | tee -a "$R/summary.txt"
+          cargo test --locked -p kiln --test session_resident -j 4 -- --nocapture > "$R/on.txt" 2>&1; echo "resident (store on) exit $?" | tee -a "$R/summary.txt"
+          G11_RESIDENT_CONVERSATIONS=off cargo test --locked -p kiln --test session_resident -j 4 -- --nocapture > "$R/off.txt" 2>&1; echo "resident (store off) exit $?" | tee -a "$R/summary.txt"
+          cargo clippy --locked -p kiln -p kiln-lab --all-targets -j 4 -- -D warnings > "$R/clippy.txt" 2>&1; echo "clippy exit $?" | tee -a "$R/summary.txt"
+          grep -h -E "g11 resident|^test result|panicked|FAILED|^failures:|^    [a-z_:]+$" "$R/lib-tests.txt" "$R/on.txt" "$R/off.txt" | head -80 >> "$R/summary.txt"
+          grep -E "^(error|warning)" -A 12 "$R/lib-tests.txt" "$R/clippy.txt" | grep -v "focal-memory\|fetch_update\|try_update" | head -200 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          for f in lib-tests on off clippy; do grep -v -E '^ *(Compiling|Checking|Downloaded|Downloading) ' "$R/$f.txt" | tail -300 > "results/$f.txt"; done
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 compact checks for ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-convo-results
+          grep -q "lib tests exit 0" "$R/summary.txt" && grep -q "clippy exit 0" "$R/summary.txt"
