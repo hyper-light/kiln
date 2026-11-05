@@ -358,6 +358,8 @@ impl Feed {
             E::Experiment { repo, .. } => self.carried(repo, "experiment", ev),
             E::PreviewRemoved { repo, .. } => self.carried(repo, "preview.removed", ev),
             E::Conflict(c) => self.carried(&c.repo, "conflict", ev),
+            // Ship's rows that changed (W21-R15), in their repository's scope as the events socket narrows them.
+            E::Ship(s) => self.carried(&s.repo, "ship", ev),
             E::RunNotice(n) => self.carried(&n.repo.name, "run_notice", ev),
             E::Incident { incident } => self.carried(incident.repo.as_deref().unwrap_or(""), "incident", ev),
             E::CdPlan(p) => self.carried(p.repo.as_deref().unwrap_or(""), "cd_plan", ev),

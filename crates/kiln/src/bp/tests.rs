@@ -268,7 +268,7 @@ fn bp_g2_s9_a_session_converges_as_its_socket_would() -> Result<(), String> {
     let mut ws = WsView::default();
     let ev = |seq: u64, id: &str, text: &str| json!({"id": id, "seq": seq, "at": 1_793_825_000_000u64 + seq, "kind": "assistant", "text": text});
     let mut frames = vec![
-        SessionFrame::Open { info: json!({"id": "s1", "harness": "claude"}), born: None },
+        SessionFrame::Open { info: json!({"id": "s1", "harness": "claude"}), born: None, window: None },
         SessionFrame::Meta { meta: json!({"model": "opus", "cwd": "/work"}) },
         SessionFrame::State { state: json!({"busy": false, "turn": 0, "mode": "default"}) },
         SessionFrame::Changes { files: json!([{"path": "a.rs", "tree": "/w"}, {"path": "b.rs"}]) },
