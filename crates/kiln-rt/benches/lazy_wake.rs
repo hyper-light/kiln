@@ -6,11 +6,11 @@
 //! off the runtime takes: the shard's control queue, and its kick when it's parked) at random times, gaps drawn
 //! exponential at `--gap-us` on average, one wake out at a time; the task notes when it first ran. A wake's
 //! latency is from just before the send to that first poll. Each arm runs `--secs` seconds in a runtime of its own
-//! (one shard, kiln's server configuration: a 250 µs step, a 100 µs timer tick and the shard's timer slack that
+//! (one shard, kiln's server configuration: its 266.7 µs step, a 100 µs timer tick and the shard's timer slack that
 //! tick), and the arms take turns round by round, in reverse every other round, so drift on the host falls on all.
 //!
 //! The arms (`--arms`, by name; all by default):
-//! - `calm`: no hogs; the shard asks for kiln's slice, its step (250 µs): the baseline.
+//! - `calm`: no hogs; the shard asks for kiln's slice, its step (266.7 µs): the baseline.
 //! - `calm-tick:US`: no hogs; kiln's slice and a nudge of `US` µs: what the nudge costs a calm machine.
 //! - `plain`: hogs; the shard at the kernel's slice.
 //! - `slice`: hogs; kiln's slice: what kiln's shards run at today.
@@ -83,9 +83,9 @@ mod linux {
     use hyper_rt::compute;
     use hyper_rt::runtime::{Runtime, RuntimeConfig, submit_to_holder};
 
-    /// kiln's server's step and timer tick (crates/kiln/src/rt.rs, `STEP_BUDGET_NS` and `runtime_config`): the
-    /// slice its shards ask for, and the nudge's period `[server] nudge` gives them.
-    const STEP_NS: u64 = 250_000;
+    /// kiln's server's step, (1 ms − 200 µs) / 3, and timer tick (crates/kiln/src/rt.rs, `STEP_BUDGET_NS` and
+    /// `TIMER_TICK_NS`): the slice its shards ask for, and the nudge's period `[server] nudge` gives them.
+    const STEP_NS: u64 = 266_666;
     const TICK_NS: u64 = 100_000;
     /// The least slice the kernel takes for the normal policy (Linux 6.19's `__setparam_fair`: 0.1 ms).
     const SLICE_MIN_NS: u64 = 100_000;
