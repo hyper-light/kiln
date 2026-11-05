@@ -743,6 +743,12 @@ pub fn schema(kind: &str) -> Result<Response, Fail> {
     Ok(srv::response(StatusCode::OK, "application/schema+json", srv::full(body)))
 }
 
+/// `GET /api/ci/sdk/kiln.d.ts`: `@kiln/sdk`'s declarations, for the editor and people's own
+/// (W29-R27).
+pub fn sdk_types() -> Result<Response, Fail> {
+    Ok(srv::response(StatusCode::OK, "application/typescript; charset=utf-8", srv::full(wf::sdk::dts())))
+}
+
 async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, Fail> {
     let repos = hub.store.repos().await.map_err(|e| internal(&e))?;
     repos.into_iter().find(|r| r.id == id || r.name == id).ok_or_else(|| missing(format!("no repository `{id}`")))
@@ -938,6 +944,18 @@ pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming, started_by: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W29-R27: `GET /api/ci/sdk/kiln.d.ts` answers with the generator's declarations.
+    #[test]
+    fn w29_r27_the_sdk_types_are_served() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        let resp = sdk_types().map_err(|(s, m)| anyhow::anyhow!("{s}: {m}"))?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/typescript; charset=utf-8"));
+        let body = crate::rt::block_on(async move { Ok(resp.into_body().collect().await?.to_bytes()) })?;
+        assert_eq!(String::from_utf8_lossy(&body), wf::sdk::dts());
+        Ok(())
+    }
 
     fn runner(name: &str, labels: &[&str], os: &str, arch: &str) -> crate::store::AgentRow {
         crate::store::AgentRow {

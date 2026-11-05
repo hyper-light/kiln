@@ -359,6 +359,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
+    r("GET", "/api/ci/sdk/*", SIGNED_IN, At::Server),
     // A person of some repositories gets theirs (W10).
     r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),

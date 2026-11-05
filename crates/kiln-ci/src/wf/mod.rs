@@ -11,6 +11,7 @@
 //! - [`action`]: action metadata (`action.yml`).
 //! - [`schema`]: JSON Schemas.
 //! - [`code`]: code workflows' types, erased (W29-R27).
+//! - [`sdk`]: `@kiln/sdk`, what code workflows import (W29-R27).
 
 pub mod action;
 pub mod code;
@@ -22,6 +23,7 @@ pub mod ir;
 pub mod keys;
 pub mod overlay;
 pub mod schema;
+pub mod sdk;
 pub mod validate;
 pub mod yaml;
 

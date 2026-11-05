@@ -292,6 +292,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             boxed(|| super::preview::route(hub, caller.as_ref(), req.into_body())).await
         }
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
+        // W29-R27: `@kiln/sdk`'s types, for editors.
+        (&Method::GET, ["sdk", "kiln.d.ts"]) => workflows::sdk_types(),
         (&Method::GET, ["repos", repo, "workflows"]) => boxed(|| workflows::list(hub, repo, q)).await,
         (&Method::GET, ["repos", repo, "labels"]) => boxed(|| workflows::labels(hub, repo)).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => {
