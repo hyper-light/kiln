@@ -2072,6 +2072,7 @@ impl Registry {
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        self.room_for_rows(shipped).await;
         if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
         }
@@ -2082,8 +2083,19 @@ impl Registry {
     /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
         let id = r.session.clone();
+        self.room_for_rows(r.shipped).await;
         if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
             tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// Waits, before an update that makes rows (one whose machine doesn't keep it in a store it ships, `shipped`) is
+    /// handed to its owner, while the conversation store holds more of them than the owners' inboxes may hold
+    /// together (`super::copies::Copies::inboxes_bound`): the owner never waits for the store itself (goal 10, plan
+    /// 01a1a87b2dae step 5; `crate::convo::store::Store::room_within`), so what hands it updates does, past that.
+    async fn room_for_rows(&self, shipped: bool) {
+        if !shipped && let Some(store) = &self.convo {
+            store.room_within(self.sessions.inboxes_bound()).await;
         }
     }
 
@@ -5104,6 +5116,44 @@ mod tests {
             // Its row is the one the event written out again makes.
             assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
         }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's owner never waits for the conversation store. With the store past
+    /// its writer's bound, one update after another is taken by the owner and its copy has them (the owner waited
+    /// between turns, so the second waited for the writer); only once the store holds as much as the owners' inboxes
+    /// may does what hands it updates wait, and goes on as the writer lets rows go.
+    #[test]
+    fn g10_s5_an_owner_never_waits_for_the_conversation_store() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let Some(store) = hub.harness.convo.clone() else { anyhow::bail!("the scratch hub keeps no conversations") };
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Update::Events { events: vec![Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let q = store.queue();
+            // Past the writer's own bound, within the inboxes'.
+            let past = q.bound().saturating_add(1);
+            q.pretend_waiting(past);
+            let within = std::time::Duration::from_secs(10);
+            for n in 1..=2 {
+                crate::rt::timeout(within, hub.harness.ingest(&hub, &there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
+            }
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
+            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
+            let more = hub.harness.sessions.inboxes_bound();
+            q.pretend_waiting(more);
+            {
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&hub, &there, "s", said(3), false));
+                anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "past what the inboxes may hold: it waits");
+                q.pretend_written(more);
+                crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
+            }
+            q.pretend_written(past);
+            hub.harness.sessions.applied("s").await;
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2", "m3"], "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at

@@ -2020,6 +2020,8 @@ pub struct Copies {
     /// The sessions' list as last joined ([`Copies::list_json`]), and how many times it was.
     listed: ArcSwapOption<Listed>,
     joins: AtomicU64,
+    /// [`Copies::inboxes_bound`].
+    inboxes_bound: usize,
 }
 
 impl Copies {
@@ -2042,7 +2044,14 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
+        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
+    }
+
+    /// What the owners' inboxes may hold together, in bytes: as much as may wait for the owners, and so as much
+    /// as their updates' rows may wait for the conversation store before what hands them updates waits
+    /// (`crate::convo::store::Store::room_within`; goal 10, plan 01a1a87b2dae step 5).
+    pub fn inboxes_bound(&self) -> usize {
+        self.inboxes_bound
     }
 
     /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
@@ -2261,13 +2270,11 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
             rest = take(&mut shard, msg);
         }
         drop(h);
-        // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
-        // 01a1a87b2e56 step 3): the updates it would take wait in its inbox, and those behind them upstream,
-        // rather than their rows piling up in the store's queue. The owner's task waits; its shard's thread
-        // goes on with its other tasks.
-        if let Some(store) = hub.get().and_then(Weak::upgrade).and_then(|h| h.harness.convo.clone()) {
-            store.room().await;
-        }
+        // The owner never waits for the conversation store (goal 10, plan 01a1a87b2dae step 5): it did, between its
+        // turns, while the store was over its bound (goal 11's, what its writer commits in 50 ms), and a disk that
+        // stalled the writer stalled every frame and attach of every session it owned. The rows its updates make
+        // wait in the store's queue instead, as many as would have waited in its inbox, and what hands it updates
+        // waits past that (`crate::harness::registry::Registry::from_runner`, `ingest_from`).
         turns.after().await;
     }
 }
