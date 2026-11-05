@@ -1314,7 +1314,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::NOT_FOUND, "no such stream"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
+        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| harness_goals(&hub, id)).await,
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
         (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
         // Said met, split, one goal changed, or the stack started, paused (for a while, too) …: each
@@ -2501,15 +2501,31 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
 }
 
 async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
-    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
-    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked; in brief, for
+    // a list that opens each on asking (an agent's Plan tab).
+    let session = q.get("session").map(String::as_str).filter(|s| !s.is_empty());
     let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
-    let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
-    // In brief, for a list that opens each on asking (an agent's Plan tab).
-    if q.get("brief").is_some_and(|b| b == "1" || b == "true") {
+    let brief = q.get("brief").is_some_and(|b| b == "1" || b == "true");
+    // Kept in memory while it's what the store holds, each plan encoded once (goal 10, plan
+    // 01a1a87b2dae step 2); otherwise from the store, as before.
+    if let Some(listed) = hub.harness.views.plans.fresh(&hub.store, crate::plans::listed) {
+        return Ok(pre_encoded(listed.1.answer(q.get("q").map(String::as_str), q.get("tag").map(String::as_str), session, proposed, brief)));
+    }
+    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
+    let plans = crate::plans::of_source(plans, session, proposed);
+    if brief {
         return Ok(srv::json(StatusCode::OK, &plans.iter().map(crate::plans::brief).collect::<Vec<_>>()));
     }
     Ok(srv::json(StatusCode::OK, &plans))
+}
+
+/// `GET /api/harness/sessions/{id}/goals`: its goal stack, kept in memory while it's what the store
+/// holds, each stack encoded once (goal 10, plan 01a1a87b2dae step 2); otherwise from the store.
+async fn harness_goals(hub: &Hub, id: &str) -> R {
+    if let Some(stacks) = hub.harness.views.goals.fresh(&hub.store, crate::goals::stacks) {
+        return stacks.1.answer(id).map(pre_encoded).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    crate::goals::get(hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err)
 }
 
 async fn plans_create(hub: &Hub, req: Request) -> R {
@@ -6686,6 +6702,83 @@ mod tests {
             assert_eq!(hub.harness.events_json("b", None, 10).as_deref(), Some(stored("b", None, 10)?.as_slice()), "ten of the sixteen it holds");
             assert!(hub.harness.events_json("b", None, 50).is_none(), "fewer than asked, its first four elsewhere: the store's to say");
             assert!(hub.harness.events_json("nobody", None, 50).is_none());
+            Ok(())
+        })
+    }
+
+    /// A response's body, whole.
+    async fn body_of(r: Response) -> anyhow::Result<Vec<u8>> {
+        use http_body_util::BodyExt as _;
+        Ok(r.into_body().collect().await?.to_bytes().to_vec())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2, traced: once the reads kept in memory are made, the reads the
+    /// lab makes of agents' pages (the sessions, one session, its newest events, its plans, its goals
+    /// and an agent's with none) never ask the store, each answering the bytes the store's path makes;
+    /// a write to its goals sends the next read to the store, which says what it holds, and the kept
+    /// read is made again.
+    #[test]
+    fn g10_s2_the_labs_reads_never_ask_the_store() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), tags: vec!["Lab".into()], source: Some(source), ..crate::plans::New::default() }, "admin").await?;
+            crate::plans::create(&hub, crate::plans::New { body: "Another's".into(), ..crate::plans::New::default() }, "admin").await?;
+            crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
+            let q = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<HashMap<String, String>>();
+            let api = |e: ApiError| anyhow::anyhow!("{} {}", e.0, e.1);
+            // Made: the reads meanwhile are the store's.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.views.plans.fresh(&hub.store, crate::plans::listed).is_none() || hub.harness.views.goals.fresh(&hub.store, crate::goals::stacks).is_none() {
+                anyhow::ensure!(Instant::now() < deadline, "the reads kept in memory weren't made");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let asked = hub.store.asked();
+            let list = body_of(harness_sessions(&hub, &crate::authz::Caller::owner()).await).await?;
+            let one = hub.harness.info_json("a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
+            let events = body_of(conversation_events(&hub, "a", &q(&[("limit", "50")])).await.map_err(api)?).await?;
+            let mut plans = Vec::new();
+            for query in [q(&[("session", "a")]), q(&[]), q(&[("brief", "1")]), q(&[("q", "MEASURE")]), q(&[("tag", "Lab")]), q(&[("q", "  ")]), q(&[("session", "nobody")])] {
+                let got = body_of(plans_list(&hub, &query).await.map_err(api)?).await?;
+                plans.push((query, got));
+            }
+            let goals = body_of(harness_goals(&hub, "a").await.map_err(api)?).await?;
+            let none = body_of(harness_goals(&hub, "nobody").await.map_err(api)?).await?;
+            assert_eq!(hub.store.asked(), asked, "none of the reads asked the store");
+            assert_eq!(list, serde_json::to_vec(&hub.harness.list())?);
+            let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a in the list"))?;
+            assert_eq!(one.as_ref(), serde_json::to_vec(&a)?.as_slice());
+            assert!(events.starts_with(br#"{"events":[{"#), "{}", String::from_utf8_lossy(&events));
+            for (query, got) in &plans {
+                let p = crate::plans::list(&hub, query.get("q").cloned(), query.get("tag").cloned()).await?;
+                let p = crate::plans::of_source(p, query.get("session").map(String::as_str).filter(|s| !s.is_empty()), false);
+                let want = if query.contains_key("brief") { serde_json::to_vec(&p.iter().map(crate::plans::brief).collect::<Vec<_>>())? } else { serde_json::to_vec(&p)? };
+                assert_eq!(String::from_utf8_lossy(got), String::from_utf8_lossy(&want), "{query:?}");
+            }
+            assert_eq!(goals, serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
+            assert_eq!(none, serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
+            // A goal added: the next read asks the store, which has it.
+            crate::goals::add(&hub, "a", vec!["and then prove it".into()], false).await?;
+            let asked = hub.store.asked();
+            let goals = body_of(harness_goals(&hub, "a").await.map_err(api)?).await?;
+            assert!(hub.store.asked() > asked, "stale: the store answered");
+            assert_eq!(goals, serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
+            assert!(String::from_utf8_lossy(&goals).contains("and then prove it"));
+            while hub.harness.views.goals.fresh(&hub.store, crate::goals::stacks).is_none() {
+                anyhow::ensure!(Instant::now() < deadline, "the goal stacks weren't made again");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let asked = hub.store.asked();
+            assert_eq!(body_of(harness_goals(&hub, "a").await.map_err(api)?).await?, goals, "made again, as the store has it");
+            assert_eq!(hub.store.asked(), asked);
             Ok(())
         })
     }
