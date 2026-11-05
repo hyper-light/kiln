@@ -20,7 +20,10 @@
       The locks a lab run's rounds took, one row a lock (the sites that took one lock, by its
       address, together), ranked by how often the window took it, with the fill's beside it:
       kiln's, Quiver's, the dependencies' and the allocator's apart (`group` and `owner` in JSON); then
-      the store's calls by caller. A dependency's lines are read from the cargo registry.
+      the store's calls by caller. A dependency's lines are read from the cargo registry. Each site's
+      figures are its counters' growth as kiln-lab took it, its copies summed (`copies`: one a generic
+      caller's instance or an inlined one's codegen unit); a run without `copies`, or with a growth
+      below zero, is refused.
   scripts/locks.py list
       Every Mutex and RwLock the instrumented crates declare, with where it's taken.
   scripts/locks.py check [--root DIR]
@@ -702,12 +705,41 @@ def declarations(tree: Path) -> list[dict]:
     return out
 
 
+# The figures kiln-lab keeps of a site (`LockSeen`) that are its counters' growth, over the window and the fill.
+GROWTH = ("taken", "contended", "wait_s", "fill_taken", "fill_contended", "fill_wait_s")
+
+
+def unsound(run: Path, rounds: list[dict]) -> str | None:
+    """Why a run's lock census can't be ranked, or None (goal 5, plan 01a1a59c2aae step 1). The census counts a
+    site under each copy of its location the compiler made (a generic caller's instances, an inlined caller's
+    codegen units), a series each under the same labels, and kiln-lab sums a site's copies in every scrape before
+    it takes the growth, and says how many (`copies`). A kiln-lab from before took a site's start from one copy
+    and its end from another wherever there were two or more (53 sites of 280 in census-B's build,
+    event-listener's among them), and nothing in its run says which sites those were. Either way, counters'
+    growth can't be below zero."""
+    old = len({key for rd in rounds for key, seen in rd["locks"].items() if not seen.get("copies")})
+    below = [f"{key} {f} {seen[f]:g} (round {rd.get('index', i + 1)})" for i, rd in enumerate(rounds) for key, seen in sorted(rd["locks"].items()) for f in GROWTH if seen.get(f, 0) < 0]
+    if not old and not below:
+        return None
+    why = []
+    if old:
+        why.append(
+            f"its kiln-lab didn't sum a site's copies ({old} site{'s' if old != 1 else ''} without `copies`), so a site the build counted under two or more copies of its location has one copy's count at the start and another's at the end"
+        )
+    if below:
+        why.append(f"{len(below)} growths below zero: " + "; ".join(below[:8]) + ("; ..." if len(below) > 8 else ""))
+    return f"{run}: its lock census can't be ranked: " + "; and ".join(why) + ". Run it again with a kiln-lab that sums them (the census build can stay)."
+
+
 def rank(runs: list[Path], tree: Path) -> tuple[list[dict], list[dict]]:
     rounds = []
     for r in runs:
         data = json.loads(r.read_text())
         window = float(data.get("profile", {}).get("window_s") or 60)
-        rounds.extend((x, window) for x in data.get("rounds", []) if x.get("locks"))
+        mine = [x for x in data.get("rounds", []) if x.get("locks")]
+        if why := unsound(r, mine):
+            fail(why)
+        rounds.extend((x, window) for x in mine)
     if not rounds:
         fail("no round with a lock census: run kiln-lab on a census build (`locks.py census-tree`)")
     # Each site's figures per round, then its median over the rounds; and the addresses it took.
