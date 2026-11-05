@@ -184,8 +184,12 @@ pub enum Local {
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
-    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]).
-    Detach { peer: String, run: u64 },
+    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]); `reply`
+    /// hears the session it's followed in (what follows it on after a restart names, `super::told`).
+    Detach { peer: String, run: u64, reply: Option<oneshot::Sender<String>> },
+    /// Follow on detached run `run` of session `session` on `peer`, as a runner process before this
+    /// one did (`super::told`, after a restart or upgrade): whether it can be.
+    Refollow { peer: String, session: String, run: u64, says: Says, reply: oneshot::Sender<bool> },
     /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
     #[cfg(test)]
     Garble { peer: String, bytes: Vec<u8> },
@@ -335,7 +339,22 @@ impl Handle {
     /// The client of `run`, a detached run on `peer`, went (docs/reach.md §4.2): it's followed on
     /// without one until it ends.
     pub async fn detach(&self, peer: &str, run: u64) {
-        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run })).await;
+        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run, reply: None })).await;
+    }
+
+    /// [`Handle::detach`], answering with the session the run is followed in.
+    pub async fn detach_in(&self, peer: &str, run: u64) -> Option<String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run, reply: Some(reply) })).await.ok()?;
+        rx.await.ok()
+    }
+
+    /// Follow on detached run `run` of reach session `session` on `peer` (`super::told`: a runner
+    /// process before this one followed it, and went): what it says from here on goes to `says`.
+    pub async fn refollow(&self, peer: &str, session: &str, run: u64, says: Says) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let ask = Local::Refollow { peer: peer.to_owned(), session: session.to_owned(), run, says, reply };
+        self.tx.send(In::Local(ask)).await.is_ok() && rx.await.unwrap_or(false)
     }
 
     /// A test's: `bytes` sent as they are on this node's link to `peer`, where a message would go.
@@ -1332,8 +1351,9 @@ impl Node {
                 let start = offset.max(f.got);
                 let data = data.get(usize::try_from(start - offset).unwrap_or(0)..).map(<[u8]>::to_vec).unwrap_or_default();
                 f.got = end;
-                // A detached run followed on alone: taken and let go, nobody here reads it.
-                if !f.detached {
+                // A detached run followed on alone: taken and let go, to what follows it for its
+                // agent if anything does (`super::told`; its channel never waits).
+                {
                     let says = f.says.clone();
                     if lost > 0 {
                         let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
@@ -1983,11 +2003,17 @@ impl Node {
                     }
                 }
             }
-            Local::Detach { peer, run } => {
-                if let Some(f) = self.peers.get_mut(&peer).and_then(|p| p.follows.get_mut(&run)) {
+            Local::Detach { peer, run, reply } => {
+                if let Some(p) = self.peers.get_mut(&peer)
+                    && let Some(f) = p.follows.get_mut(&run)
+                {
                     f.detached = true;
+                    if let Some(r) = reply {
+                        let _ = r.send(p.session.clone());
+                    }
                 }
             }
+            Local::Refollow { peer, session, run, says, reply } => self.refollow(peer, session, run, says, reply).await,
             Local::Status { reply } => {
                 let _ = reply.send(self.status());
             }
@@ -2001,6 +2027,24 @@ impl Node {
                 p.adopts.insert(id, says);
                 let _ = reply.send(id);
             }
+        }
+    }
+
+    /// [`Local::Refollow`]: the run followed on, detached, in `session`, its link made (the doer
+    /// replays what it holds of it, then its exit). A peer already followed in another session
+    /// can't be (a link carries one session). Ids this process gives runs on it start past the
+    /// run's own (a new 2^32 block), so none meets one of the process before.
+    async fn refollow(&mut self, peer: String, session: String, run: u64, says: Says, reply: oneshot::Sender<bool>) {
+        let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+        let free = p.session == session || (p.follows.is_empty() && p.syncs.is_empty() && p.adopts.is_empty() && p.queue.is_empty() && p.link.is_none());
+        if free {
+            p.session = session;
+            p.next_id = p.next_id.max(((run >> 32) + 1) << 32);
+            p.follows.insert(run, Follow { says, got: 0, exited: false, detached: true });
+        }
+        let _ = reply.send(free);
+        if free {
+            self.ensure_link(&peer).await;
         }
     }
 

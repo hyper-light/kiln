@@ -244,12 +244,16 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
+    // News of a session's run (docs/reach.md §7), heard before where the session is or who holds it (T5).
+    if let Question::Told { session, news } = ask {
+        return crate::harness::told::heard(hub, runner, session, news).await;
+    }
     let (session, terminal) = match ask {
         Question::Directory => return json!({ "runners": hub.reach_directory() }),
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
-        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } => (session.as_str(), ""),
+        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
@@ -385,7 +389,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         }
         // An act its runner asks kiln to take before it does it (a run on another machine):
         // taken above, as the session's holder's now (W27-R08).
-        Question::Act { .. } => json!({"ok": {}}),
+        Question::Act { .. } | Question::Told { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => json!({"error": "not a question for kiln's operations"}),

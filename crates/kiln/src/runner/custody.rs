@@ -153,6 +153,14 @@ pub fn session_of_pid(pid: u32) -> Option<String> {
     crate::harness::survivors::session_of(pid, &sessions)
 }
 
+/// The agent session process `pid` belongs to by the process alone (its session's group, or a
+/// harness among its ancestors), never by the environment's mark any process can set: whom news
+/// of a run it says is for (`crate::reach::told`, T12). Blocking.
+pub fn session_by_pid(pid: u32) -> Option<String> {
+    let sessions = SESSIONS.get().map(|f| f()).unwrap_or_default();
+    crate::harness::survivors::session_by_process(pid, &sessions)
+}
+
 /// Whether this runner's server takes custody records and checks its sessions' acts
 /// (`CAP_CUSTODY`), as it last said.
 static SERVER_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

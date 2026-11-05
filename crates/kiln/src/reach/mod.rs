@@ -19,6 +19,7 @@ pub mod relay;
 pub mod reuse;
 pub mod serve;
 pub mod sync;
+pub mod told;
 pub mod wire;
 
 /// What a runner asks the server, for itself or one of its agent sessions
@@ -136,6 +137,15 @@ pub enum Question {
         size: Option<Box<kiln_ci::sizes::Size>>,
         #[serde(default)]
         used: Box<kiln_ci::sizes::Usage>,
+    },
+    /// News of a run an agent session left in the background or detached, from what follows it
+    /// (`told`; docs/reach.md §7): kiln tells the agent in its news (`crate::harness::told`).
+    /// Asked only of a server that says it takes it (the named feature `crate::proto::feature::TOLD`).
+    Told {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        news: crate::harness::told::RunNews,
     },
 }
 
