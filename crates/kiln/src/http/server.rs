@@ -115,7 +115,7 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
             let io = super::tls::Prefixed::new(head, io);
             match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
                 Ok(Ok(mut s)) => {
-                    // Full or resumed (goal 7 step 3): the listener's sessions are shared.
+                    // Full or resumed (goal 7 step 3): the listener's ticket keys are shared.
                     crate::metrics::tls().handshake("server", s.handshake());
                     if s.alpn_protocol() == Some(super::tls::H2) {
                         Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await
@@ -491,8 +491,8 @@ mod tests {
         })
     }
 
-    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac): `server.https` keeps its TLS
-    /// sessions across connections, so the second connection from one client configuration
+    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac): `server.https` resumes TLS
+    /// sessions across connections (its ticket keys are the listener's), so the second connection from one client configuration
     /// resumes, and `kiln_tls_handshakes_total` counts both kinds.
     #[test]
     fn g7_s3_server_https_resumes_across_connections() -> anyhow::Result<()> {

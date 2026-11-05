@@ -59,10 +59,13 @@ requests at once, where HTTP/1.1 takes six at a time. The front door asks the up
 seconds, and at once when the upstream changes. A kiln server from before HTTP/2 answers no, and
 browsers get HTTP/1.1 as before. WebSockets always use HTTP/1.1 connections of their own.
 
-A browser's next connection resumes its TLS session, without the certificate and its signature
-(docs/http.md, "TLS sessions"). A renewal of the certificate (the same names) keeps the sessions;
-a certificate for other names, turning HTTPS off, or restarting the runner ends them, and each
-browser's next connect is a full handshake that sees the new certificate.
+A browser's next connection resumes its TLS session from a ticket, without the certificate and
+its signature (docs/http.md, "TLS sessions"). A renewal of the certificate (the same names) keeps
+the ticket key, so tickets from before it still resume; a certificate for other names gets a new
+key, and turning HTTPS off or restarting the runner does too: earlier tickets stop resuming, and
+each browser's next connect is a full handshake that sees the new certificate. A connection
+takes no lock on its way through: the certificate, the upstream and the rest of the front door's
+settings are immutable copies, swapped in whole when they change.
 
 Plain HTTP on port 80 answers every request with a redirect (307) to the same path over HTTPS,
 keeping the name or address that was asked when it is one of the front door's (else the domain).

@@ -44,6 +44,12 @@ impl Knee {
             // Trouble with none of it in use: nothing of kiln's to cut, and no level learned.
             return format!("{} not cut: none in use when trouble began", unit.what());
         }
+        if r < unit.least() {
+            // Too little in use to cause it ([`Unit::least`]): cutting it would only stop kiln's
+            // work. On 2026-11-05 a Mac's agents used about 0.01 cores and a few kB/s between them,
+            // and one slow fsync cut them to 0.0 cores, which stopped every one of them.
+            return format!("{} not cut: {} in use when trouble began, too little to cause it", unit.what(), unit.fmt(r));
+        }
         if let Some(u) = self.unsafe_at
             && r < u
         {
@@ -55,7 +61,9 @@ impl Knee {
             self.safe = None;
         }
         let drained = drain.filter(|d| *d < r).map(|d| d.max(0.0));
-        let to = drained.unwrap_or_else(|| self.safe.unwrap_or(r / 2.0));
+        // Never below the least that's worth cutting to, unless the disks' known capacity says
+        // what drains the queue (where kiln's writers may be stopped on purpose).
+        let to = drained.unwrap_or_else(|| self.safe.unwrap_or(r / 2.0).max(unit.least()));
         self.budget = Some(to);
         self.held_since = None;
         self.held_area = 0.0;
@@ -183,6 +191,16 @@ pub enum Unit {
 }
 
 impl Unit {
+    /// The least of it worth cutting kiln's work for, or cutting it to: 1 MB/s of writes, 1 core.
+    /// Below it, kiln's work can't be what slows a target, and a budget held there stops it while
+    /// helping nothing; and from zero, a budget raised by doubling never comes back.
+    pub fn least(self) -> f64 {
+        match self {
+            Unit::Writes => 1e6,
+            Unit::Cpu => 1.0,
+        }
+    }
+
     fn what(self) -> &'static str {
         match self {
             Unit::Writes => "kiln's writes",
