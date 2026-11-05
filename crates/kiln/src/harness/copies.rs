@@ -24,10 +24,10 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use flate2::Compression;
 use serde_json::Value;
@@ -59,6 +59,29 @@ const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
 /// (goal 10, plan 01a1a87b2dae step 2). A sealed chunk past it, once packed, goes to its copy's spill file:
 /// a copy keeps its index, its open chunk and the chunks among these (two at the most, of [`CHUNK`]).
 pub const EVENTS_PAGE: usize = 100;
+
+/// The packed bytes an event measured (research f20: a 20,000-event session's copy kept 4,640 events packed
+/// in 3.00 MB, 647 bytes each): what the bounds of what's packed are reckoned in (goal 11, plan 01a1a87b2e56
+/// step 3).
+pub const PACKED_EVENT_BYTES: usize = 647;
+
+/// The most of its packed segments a copy keeps in memory once its spills land (goal 11, plan 01a1a87b2e56
+/// step 3): the sealed chunks among its newest [`EVENTS_PAGE`] events, two at the most (the open chunk holds
+/// at least one of those events), at the packed size an event measured: 2 × [`CHUNK`] × [`PACKED_EVENT_BYTES`],
+/// 90,580 bytes. Chunks of larger events than that past it are spilled too, the newest page or not (the
+/// events API then reads that copy's page from the store), so `session_segments` holds at most this for each
+/// copy ([`segments_bound`]), beside what's still on its way to a spill: a copy's one spill in flight, the
+/// packer's backlog, and the views a snapshot being made still holds.
+pub const PAGE_BYTES: usize = 2 * CHUNK * PACKED_EVENT_BYTES;
+
+/// Session copies there are (a copy made, less one let go of): what `session_segments`' bound is reckoned for.
+static COPIES: AtomicUsize = AtomicUsize::new(0);
+
+/// `session_segments`' bound on `/metrics` (`kiln_memory_bound_bytes{owner="session_segments"}`): [`PAGE_BYTES`]
+/// for each copy there is.
+pub fn segments_bound() -> u64 {
+    u64::try_from(COPIES.load(Ordering::Relaxed).saturating_mul(PAGE_BYTES)).unwrap_or(u64::MAX)
+}
 
 /// What a reader needs of one of a copy's events without its text: its id and number, the copy's
 /// revision when it last changed, where its text is among its chunk's texts joined by `,` (as an
@@ -126,6 +149,15 @@ pub struct Chunk {
     /// Where its segment went, once spilled (`super::spill`): a spilled chunk keeps its metas alone in
     /// memory, its segment read back where it's asked for (a snapshot, on the blocking pool).
     spilled: Option<super::spill::Spilled>,
+    /// A compact one's texts, inflated by the first read of its copy's newest page that needed them and kept
+    /// for the reads after it while it's the newest compact chunk of its copy ([`Chunk::page_texts`]; goal 10,
+    /// plan 01a1a87b2dae step 5): the lab's events reads inflated a chunk's whole segment each time, on the
+    /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
+    /// packed chunk (`crate::memory::SESSION_ENTRIES`).
+    texts: ArcSwapOption<Bytes>,
+    /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
+    /// alone, as chunks are compacted ([`Events::compact`]).
+    paged: AtomicBool,
 }
 
 impl Clone for Chunk {
@@ -140,13 +172,14 @@ impl Clone for Chunk {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
         let spilled = self.spilled.clone().filter(|_| self.is_compact());
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: ArcSwapOption::empty(), paged: AtomicBool::new(false) }
     }
 }
 
 impl Drop for Chunk {
     fn drop(&mut self) {
         self.unpack();
+        self.unpage();
     }
 }
 
@@ -161,7 +194,7 @@ impl Chunk {
                 m
             })
             .collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: ArcSwapOption::empty(), paged: AtomicBool::new(false) }
     }
 
     pub fn len(&self) -> usize {
@@ -225,6 +258,40 @@ impl Chunk {
         Ok(Cow::Owned(joined))
     }
 
+    /// A compact one's texts joined ([`Chunk::joined`]) as bytes a page's answer takes slices of, none copied:
+    /// as a read of its copy's newest page kept them, else inflated now, and kept for the reads after while
+    /// it's its copy's newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). The first to keep
+    /// them stays; its owner unsetting `paged` lets them go, and so does a read that finds it unset just after
+    /// keeping them (one of the two sees the other).
+    fn page_texts(&self) -> std::io::Result<Bytes> {
+        if let Some(kept) = self.texts.load_full() {
+            return Ok(Bytes::clone(&kept));
+        }
+        let made = Bytes::from(self.joined()?.into_owned());
+        if self.is_compact() && self.paged.load(Ordering::SeqCst) {
+            let was = self.texts.compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
+            if was.is_none() {
+                crate::memory::SESSION_ENTRIES.add(made.len());
+                if !self.paged.load(Ordering::SeqCst) {
+                    self.unpage();
+                }
+            }
+        }
+        Ok(made)
+    }
+
+    /// Lets go of the texts a page's read kept ([`Chunk::page_texts`]).
+    fn unpage(&self) {
+        if let Some(kept) = self.texts.swap(None) {
+            crate::memory::SESSION_ENTRIES.sub(kept.len());
+        }
+    }
+
+    /// The bytes of its texts a page's read keeps now ([`Chunk::page_texts`]), if any.
+    pub fn page_kept(&self) -> Option<usize> {
+        self.texts.load().as_ref().map(|t| t.len())
+    }
+
     /// It kept compact, once packed: its metas and its segment (which a view of it still taking it shares).
     /// None when it isn't packed, or is compact already.
     fn compacted(&self) -> Option<Self> {
@@ -236,7 +303,7 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: ArcSwapOption::empty(), paged: AtomicBool::new(false) })
     }
 
     /// Whether its segment is on disk (`super::spill`), not in memory.
@@ -244,10 +311,15 @@ impl Chunk {
         self.spilled.is_some()
     }
 
+    /// Its segment's bytes on disk, once spilled.
+    pub fn spilled_bytes(&self) -> Option<usize> {
+        self.spilled.as_ref().map(super::spill::Spilled::bytes)
+    }
+
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
     /// memory (one changed since is kept as it is).
     fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
-        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s) })
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: ArcSwapOption::empty(), paged: AtomicBool::new(false) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -313,8 +385,11 @@ impl Chunk {
         if let Some(s) = self.packed.take() {
             SEGMENT_BYTES.fetch_sub(s.deflated.len(), Ordering::Relaxed);
         }
-        // Changed, it's to be packed again once it's sealed (`Events::compact`).
+        // Changed, it's to be packed again once it's sealed (`Events::compact`), and what a page's read kept
+        // of its texts is no longer what it holds.
         *self.sealing.get_mut() = false;
+        *self.paged.get_mut() = false;
+        self.unpage();
     }
 
     /// Its event `k` changed by `f`, with its meta and where those after it begin.
@@ -455,6 +530,46 @@ impl Events {
                     }
                     out.extend_from_slice(e.entry.text().as_bytes());
                 }
+            }
+            i += n;
+        }
+        Some(())
+    }
+
+    /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
+    /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
+    /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
+    /// events' texts written out once. None as `texts_into` says none.
+    pub fn pieces_into(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>) -> Option<()> {
+        let mut i = range.start;
+        while i < range.end {
+            let (c, k) = self.place(i)?;
+            let chunk = self.chunks.get(c)?;
+            let n = chunk.len().checked_sub(k)?.min(range.end - i);
+            if n == 0 || chunk.is_spilled() {
+                return None;
+            }
+            if i > range.start {
+                out.push(Bytes::from_static(b","));
+            }
+            if chunk.is_compact() {
+                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
+                let (from, to) = (first.off, last.off.checked_add(last.len)?);
+                let texts = chunk.page_texts().ok()?;
+                if from > to || to > texts.len() {
+                    return None;
+                }
+                out.push(texts.slice(from..to));
+            } else {
+                let evs = chunk.evs.get(k..k + n)?;
+                let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
+                for (j, e) in evs.iter().enumerate() {
+                    if j > 0 {
+                        joined.push(b',');
+                    }
+                    joined.extend_from_slice(e.entry.text().as_bytes());
+                }
+                out.push(Bytes::from(joined));
             }
             i += n;
         }
@@ -602,16 +717,43 @@ impl Events {
                 *slot = Arc::new(c);
             }
         }
+        self.page_newest();
     }
 
-    /// Its sealed chunks past its newest `page` events that are packed and in memory: what its copy's owner
-    /// spills (`super::spill`), oldest first.
-    pub(super) fn spillable(&self, page: usize) -> Vec<Arc<Chunk>> {
-        let mut after = 0usize;
+    /// Its newest compact chunk in memory is the one whose texts a read of its newest page keeps
+    /// ([`Chunk::page_texts`]; goal 10, plan 01a1a87b2dae step 5): set so, and the one before it (the newest
+    /// until now, the only other one set) let go of, so a copy keeps one chunk's texts at the most.
+    fn page_newest(&self) {
+        let mut newest = true;
+        for c in self.chunks.iter().rev().filter(|c| c.is_compact() && !c.is_spilled()) {
+            if newest {
+                c.paged.store(true, Ordering::SeqCst);
+                newest = false;
+            } else if c.paged.swap(false, Ordering::SeqCst) {
+                c.unpage();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Its sealed chunks that are packed and in memory past its newest `page` events, and those among them
+    /// past the first `bytes` of segments they keep (counted from the newest): what its copy's owner spills
+    /// (`super::spill`), oldest first.
+    pub(super) fn spillable(&self, page: usize, bytes: usize) -> Vec<Arc<Chunk>> {
+        let (mut after, mut kept) = (0usize, 0usize);
         let mut out = Vec::new();
         for c in self.chunks.iter().rev() {
-            if after >= page && c.is_compact() && !c.is_spilled() && c.packed().is_some() {
-                out.push(Arc::clone(c));
+            if c.is_compact()
+                && !c.is_spilled()
+                && let Some(s) = c.packed()
+            {
+                let with = kept.saturating_add(s.deflated.len());
+                if after < page && with <= bytes {
+                    kept = with;
+                } else {
+                    out.push(Arc::clone(c));
+                }
             }
             after = after.saturating_add(c.len());
         }
@@ -809,7 +951,8 @@ pub struct View {
     pub info: Arc<Info>,
     /// Its info as the API answers with it (`GET /api/harness/sessions` and `.../{id}`): encoded by
     /// its owner once per change of it, shared by every view until the next, so no read encodes it
-    /// (goal 10, plan 01a1a87b2dae step 2).
+    /// (goal 10, plan 01a1a87b2dae step 2); the events socket's frame of the change is made of it too
+    /// (`crate::wire::events::harness_frame`, step 5).
     pub info_json: Bytes,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
@@ -894,6 +1037,20 @@ impl View {
     /// went on from part of it), or one of them has no number or id. Fresher than the store's while
     /// an event streams: the store keeps an event as it last came whole.
     pub fn events_json(&self, before: Option<u64>, limit: usize) -> Option<Bytes> {
+        let parts = self.events_page(before, limit)?;
+        let mut out = Vec::with_capacity(parts.iter().map(Bytes::len).sum());
+        for p in &parts {
+            out.extend_from_slice(p);
+        }
+        Some(Bytes::from(out))
+    }
+
+    /// [`View::events_json`] in the pieces it's made of, in order, for an answer that sends them as they are
+    /// (`crate::http::server::pieces`): a compact chunk's part a slice of its texts as the reads of its newest
+    /// page keep them, inflated once for all of those reads, so a read neither inflates nor copies them (goal
+    /// 10, plan 01a1a87b2dae step 5: the lab's events reads, at p99 1.1 to 2.0 ms on rt5 calm, inflated a
+    /// whole chunk's segment each, on the request's shard).
+    pub fn events_page(&self, before: Option<u64>, limit: usize) -> Option<Vec<Bytes>> {
         let end = match before {
             Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
             None => self.events.len(),
@@ -902,19 +1059,16 @@ impl View {
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
             return None;
         }
-        let mut len = r#"{"events":[]}"#.len();
         for i in start..end {
             let m = self.events.meta(i)?;
             if m.seq.is_none() || m.id.is_empty() {
                 return None;
             }
-            len += m.len + 1;
         }
-        let mut out = Vec::with_capacity(len);
-        out.extend_from_slice(br#"{"events":["#);
-        self.events.texts_into(start..end, &mut out)?;
-        out.extend_from_slice(b"]}");
-        Some(Bytes::from(out))
+        let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
+        self.events.pieces_into(start..end, &mut parts)?;
+        parts.push(Bytes::from_static(b"]}"));
+        Some(parts)
     }
 }
 
@@ -997,6 +1151,8 @@ pub struct Mirror {
     slot: Arc<Slot>,
     /// Its info's encoding ([`View::info_json`]), and the info it's of: made again when that changes.
     info_json: (Arc<Info>, Bytes),
+    /// How often its info and meta were encoded.
+    pub(super) encodings: Encodings,
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
     owner: Option<crate::memory::queue::WeakSender<Msg>>,
@@ -1009,9 +1165,27 @@ pub struct Mirror {
     spill_refused: bool,
 }
 
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        let mut now = COPIES.load(Ordering::Relaxed);
+        while let Err(seen) = COPIES.compare_exchange_weak(now, now.saturating_sub(1), Ordering::Relaxed, Ordering::Relaxed) {
+            now = seen;
+        }
+    }
+}
+
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
 fn info_json(info: &Info) -> Bytes {
     serde_json::to_vec(info).map_or_else(|_| Bytes::from_static(b"null"), Bytes::from)
+}
+
+/// How many times a copy encoded its info (for its view, which the API's reads of it and the events
+/// socket's frame of it take as it is) and its meta (for its viewers' frame): once a change of each (goal
+/// 10, plan 01a1a87b2dae step 5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Encodings {
+    pub info: u64,
+    pub meta: u64,
 }
 
 /// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
@@ -1042,6 +1216,7 @@ impl Mirror {
         };
         let slot = Arc::new(Slot { id: Arc::from(info.id.as_str()), view: ArcSwap::from_pointee(view), tap: feed.tap() });
         let encoding = (Arc::clone(&info), encoded);
+        COPIES.fetch_add(1, Ordering::Relaxed);
         Self {
             info,
             reported: String::new(),
@@ -1063,6 +1238,7 @@ impl Mirror {
             opened_at: None,
             slot,
             info_json: encoding,
+            encodings: Encodings::default(),
             owner: None,
             spill: None,
             spill_file: None,
@@ -1086,7 +1262,7 @@ impl Mirror {
         if self.spilling || !crate::rt::on_shard() {
             return;
         }
-        let chunks = self.events.spillable(EVENTS_PAGE);
+        let chunks = self.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         if chunks.is_empty() || segments.len() != chunks.len() {
             return;
@@ -1132,8 +1308,16 @@ impl Mirror {
     pub fn publish(&mut self) {
         if !Arc::ptr_eq(&self.info_json.0, &self.info) {
             self.info_json = (Arc::clone(&self.info), info_json(&self.info));
+            self.encodings.info += 1;
         }
         self.slot.view.store(Arc::new(self.view()));
+    }
+
+    /// Its info as it was last published, encoded ([`View::info_json`]): what the events socket's frame
+    /// of a change of it is made of, rather than encoded again (`crate::wire::events::harness_frame`;
+    /// goal 10, plan 01a1a87b2dae step 5).
+    pub fn info_encoded(&self) -> &Bytes {
+        &self.info_json.1
     }
 
     /// After a change: the copy goes out to its readers, then, if anyone watches, its viewers are
@@ -1164,6 +1348,11 @@ impl Mirror {
         let rev = Some(self.rev);
         let (mut p, whole, patched) = {
             let patch = state_patch_of(&self.sent, &self.state);
+            // A state that changed nothing its viewers were last sent goes as nothing: no field to patch,
+            // and those that take it whole have it (goal 10, plan 01a1a87b2dae step 5).
+            if patch.as_ref().is_some_and(|(set, gone)| set.is_empty() && gone.is_empty()) {
+                return None;
+            }
             let whole = patch.is_none() || self.feed.wants_whole(PatchOf::State);
             let room = if whole { self.state_bytes } else { 0 } + if patch.is_some() { self.patch_bytes } else { 0 };
             let mut p = Payload::new(self.rev, room);
@@ -1235,6 +1424,7 @@ impl Mirror {
                 let start = p.text().len();
                 let _ = write::value(p.text(), "meta", "meta", &self.meta, rev);
                 self.meta_bytes = p.text().len() - start;
+                self.encodings.meta += 1;
                 p
             }
             other => {
@@ -1593,6 +1783,45 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
     usize::try_from(hash % u64::try_from(shards.max(1)).unwrap_or(1)).unwrap_or(0)
 }
 
+/// The sessions' list as `GET /api/harness/sessions` answers it, joined once for every read that finds the
+/// sessions as they were ([`Copies::list_json`]; goal 10, plan 01a1a87b2dae step 5), with what it was joined
+/// of, held by identity: each shard's board, weakly (a session gone from one is let go of, and no other board
+/// takes its place unseen), and each session's info as its view said it, in the boards' order (no other
+/// encoding takes its place unseen).
+struct Listed {
+    boards: Vec<Weak<Board>>,
+    infos: Vec<Bytes>,
+    json: Bytes,
+}
+
+impl Listed {
+    /// Whether `boards` hold the sessions it was joined of, each as its view said it then: the same board on
+    /// every shard, and in each, the same sessions open with the same info's encoding.
+    fn holds(&self, boards: &[ArcSwap<Board>]) -> bool {
+        if self.boards.len() != boards.len() {
+            return false;
+        }
+        let mut infos = self.infos.iter();
+        for (was, board) in self.boards.iter().zip(boards.iter()) {
+            let board = board.load();
+            if !std::ptr::eq(was.as_ptr(), Arc::as_ptr(&board)) {
+                return false;
+            }
+            for slot in board.values() {
+                let view = slot.view.load();
+                if view.closed {
+                    continue;
+                }
+                match infos.next() {
+                    Some(info) if info.as_ptr() == view.info_json.as_ptr() && info.len() == view.info_json.len() => {}
+                    _ => return false,
+                }
+            }
+        }
+        infos.next().is_none()
+    }
+}
+
 /// Every session's copy, each owned by one shard: where messages to them go, and what readers read.
 pub struct Copies {
     inboxes: Vec<crate::memory::queue::Sender<Msg>>,
@@ -1601,6 +1830,9 @@ pub struct Copies {
     hub: Arc<OnceLock<Weak<Hub>>>,
     /// Where the owners spill their copies' sealed chunks, once set.
     spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
+    /// The sessions' list as last joined ([`Copies::list_json`]), and how many times it was.
+    listed: ArcSwapOption<Listed>,
+    joins: AtomicU64,
 }
 
 impl Copies {
@@ -1623,7 +1855,7 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill }
+        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
     }
 
     /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
@@ -1660,6 +1892,40 @@ impl Copies {
         let board = self.boards.get(self.owner_of(id))?.load();
         let view = board.get(id)?.view.load();
         (!view.closed).then(|| f(&view))
+    }
+
+    /// `GET /api/harness/sessions` as it answers: every session's info as its owner encoded it, oldest first
+    /// (by when it was made, then its id), joined into a JSON array once for all the reads that find the
+    /// sessions as they were ([`Listed`]), each of those answered the same bytes: nothing encoded, sorted,
+    /// joined or copied (goal 10, plan 01a1a87b2dae steps 2 and 5). A read that finds a session come, gone
+    /// or changed since joins it again, for itself and the reads after it.
+    pub fn list_json(&self) -> Bytes {
+        if let Some(listed) = self.listed.load().as_ref().filter(|l| l.holds(&self.boards)) {
+            return listed.json.clone();
+        }
+        self.joins.fetch_add(1, Ordering::Relaxed);
+        let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
+        for board in self.boards.iter() {
+            let board = board.load_full();
+            for slot in board.values() {
+                let view = slot.view.load_full();
+                if !view.closed {
+                    infos.push(view.info_json.clone());
+                    views.push(view);
+                }
+            }
+            boards.push(Arc::downgrade(&board));
+        }
+        views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
+        let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
+        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone() })));
+        json
+    }
+
+    /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
+    /// was didn't do.
+    pub fn list_joins(&self) -> u64 {
+        self.joins.load(Ordering::Relaxed)
     }
 
     /// `f` of every session's newest view, with its id.
@@ -2132,6 +2398,56 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a copy's newest page read twice inflates its compact chunk once. The
+    /// first read keeps the texts of the newest compact chunk (its alone), the second takes a slice of them,
+    /// nothing inflated, and both say what the events' texts joined say. A newer chunk compacted, the older's
+    /// texts go; a read of a view from before then inflates and keeps nothing, and one of the new view keeps
+    /// the newest's.
+    #[test]
+    fn g10_s5_a_page_read_twice_inflates_its_chunk_once() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let push = |m: &mut Mirror, seqs: std::ops::RangeInclusive<u64>| -> anyhow::Result<()> {
+            for q in seqs {
+                m.rev = q;
+                m.upsert(entry(&format!("e{q}"), q));
+            }
+            for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            m.events.compact(None);
+            m.publish();
+            Ok(())
+        };
+        // Two sealed chunks and the newest open with nine: the newest fifty reach into the second.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        push(&mut m, 1..=n)?;
+        let page = |m: &Mirror| -> String {
+            let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+            format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","))
+        };
+        let (want, view) = (page(&m), m.view());
+        let kept = |v: &View, i: usize| v.events.chunks().get(i).and_then(|c| c.page_kept());
+        let was = inflated();
+        let first = view.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page from memory"))?;
+        anyhow::ensure!(inflated() == was + 1, "the first read inflates its compact chunk once");
+        anyhow::ensure!(String::from_utf8_lossy(&first) == want, "the events' texts joined");
+        anyhow::ensure!(kept(&view, 1).is_some() && kept(&view, 0).is_none(), "the newest compact chunk's texts kept, the older's not");
+        let parts = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page again"))?;
+        anyhow::ensure!(inflated() == was + 1, "the second read inflates nothing");
+        anyhow::ensure!(parts.concat() == first.as_ref(), "the same page");
+        // A newer chunk sealed and compacted: the older's texts go.
+        push(&mut m, n + 1..=n + u64::try_from(CHUNK)?)?;
+        anyhow::ensure!(kept(&m.view(), 1).is_none(), "the older's texts let go of");
+        let was = inflated();
+        let _ = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the view from before"))?;
+        anyhow::ensure!(inflated() == was + 1 && kept(&view, 1).is_none(), "a view from before inflates its own and keeps nothing");
+        let now = m.view();
+        let newest = now.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page now"))?;
+        anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 2).is_some(), "the newest compact chunk's kept now");
+        Ok(())
+    }
+
     /// A viewer's snapshot of `m` as it is: its frames, all of it packed as one message, and a catch-up from
     /// revision 3 (as `crate::api`'s `send_snapshot` writes them, here on the test's thread).
     fn attached(m: &Mirror) -> anyhow::Result<(Vec<String>, Vec<u8>, Option<Vec<String>>)> {
@@ -2163,16 +2479,18 @@ mod tests {
         let before = attached(&m)?;
         let newest = m.view().events_json(None, 50);
         anyhow::ensure!(newest.is_some(), "the newest page from memory");
-        let chunks = m.events.spillable(EVENTS_PAGE);
+        let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         anyhow::ensure!(chunks.len() == 4, "{} chunks past the newest page", chunks.len());
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
-        let held = SEGMENT_BYTES.load(Ordering::Relaxed);
+        // This copy's own segments in memory (not the process's: other tests pack beside it).
+        let resident = |m: &Mirror| m.events.chunks().iter().filter_map(|c| c.packed()).map(|s| s.deflated.len()).sum::<usize>();
+        let held = resident(&m);
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4, "every one of them spilled");
         drop((chunks, segments));
         m.publish();
         anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_spilled()).all(|c| c.packed().is_none()), "a spilled chunk keeps no segment in memory");
-        anyhow::ensure!(SEGMENT_BYTES.load(Ordering::Relaxed) < held, "what went to the file left memory");
+        anyhow::ensure!(resident(&m) < held, "what went to the file left the copy's memory: {} of {held}", resident(&m));
         anyhow::ensure!(attached(&m)? == before, "the same bytes, in the same order, after the spill");
         anyhow::ensure!(m.view().events_json(None, 50) == newest, "the newest page still from memory");
         anyhow::ensure!(m.view().events_json(Some(20), 10).is_none(), "an older page is the store's to answer");
@@ -2211,7 +2529,7 @@ mod tests {
         }
         m.events.compact(None);
         let before = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
-        let chunks = m.events.spillable(EVENTS_PAGE);
+        let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4);
@@ -2294,6 +2612,58 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: once its spills land a copy keeps at most [`PAGE_BYTES`] of segments
+    /// in memory: the sealed chunks among its newest page while they fit (two of events the lab's size), and of
+    /// events too large for two chunks of them to fit, those past it spilled as well; `session_segments`' bound
+    /// counts each copy.
+    #[test]
+    fn g11_s3_a_copy_keeps_its_page_bytes_of_segments_at_most() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let resident = |m: &Mirror| m.events.chunks().iter().filter(|c| !c.is_spilled()).filter_map(|c| c.packed()).map(|s| s.deflated.len()).sum::<usize>();
+        let spill = |m: &mut Mirror| -> anyhow::Result<usize> {
+            for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            m.events.compact(None);
+            let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
+            let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+            let (_file, spilled) = super::super::spill::write(&dir, None, &m.info.id, &segments)?;
+            Ok(m.events.spilled(&chunks, spilled))
+        };
+        // Events the lab's size: the two sealed chunks among the newest page stay.
+        let mut small = Mirror::new(Info { id: "small".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=u64::try_from(CHUNK * 6 + 9)? {
+            small.rev = q;
+            small.upsert(entry(&format!("e{q}"), q));
+        }
+        anyhow::ensure!(spill(&mut small)? == 4, "past the newest page");
+        anyhow::ensure!(small.events.chunks().iter().filter(|c| c.is_compact() && !c.is_spilled()).count() == 2, "the newest page's two stay");
+        anyhow::ensure!(resident(&small) <= PAGE_BYTES, "{} resident", resident(&small));
+        // Events of 1,500 bytes that don't compress: two chunks of them are past PAGE_BYTES.
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        let mut noise = |n: usize| -> String {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    char::from(b"0123456789abcdef".get(usize::try_from(x & 15).unwrap_or(0)).copied().unwrap_or(b'0'))
+                })
+                .collect()
+        };
+        let mut large = Mirror::new(Info { id: "large".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=u64::try_from(CHUNK * 4 + 9)? {
+            large.rev = q;
+            large.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": noise(1500)}))));
+        }
+        spill(&mut large)?;
+        anyhow::ensure!(resident(&large) <= PAGE_BYTES, "{} resident of large events", resident(&large));
+        anyhow::ensure!(large.events.chunks().iter().rev().skip(1).take(2).any(|c| c.is_spilled()), "the newest page's too, past its bytes");
+        anyhow::ensure!(segments_bound() >= u64::try_from(2 * PAGE_BYTES)?, "both copies counted");
+        Ok(())
     }
 
     /// Each order of `owner` steps of the owner's and `viewer` steps of a viewer's, each keeping its

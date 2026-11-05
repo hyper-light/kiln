@@ -470,6 +470,65 @@ pub struct Snapshot {
     pub(super) store: Option<(crate::convo::store::Store, Arc<str>)>,
 }
 
+/// A whole snapshot's events at the most: as many as a copy keeps before it lets its oldest go
+/// (`MAX_EVENTS` and a quarter: `super::copies::Mirror::upsert`), at the packed size an event measured
+/// (`super::copies::PACKED_EVENT_BYTES`, research f20), 3.2 MB (goal 11, plan 01a1a87b2e56 step 3).
+const SNAPSHOT_BYTES: usize = (super::core::MAX_EVENTS + super::core::MAX_EVENTS / 4) * super::copies::PACKED_EVENT_BYTES;
+
+/// The room of viewers' snapshots in flight, made and not yet written to their sockets
+/// (`crate::memory::SNAPSHOTS`; goal 11, plan 01a1a87b2e56 step 3): as many as the blocking pool makes at
+/// once (its `fs` share's places, which the server's profile takes from the lab's measure,
+/// `crate::rt::SERVER_FS`: 26), each a whole snapshot's events at the most ([`SNAPSHOT_BYTES`]), 84 MB on
+/// the server. At the bound an attach waits its turn ([`InFlight::take`]: a task's wait, its shard goes on
+/// with its other work) until one in flight is written out; one larger than the room goes alone.
+pub fn snapshot_room() -> &'static crate::memory::queue::Room {
+    static ROOM: std::sync::OnceLock<crate::memory::queue::Room> = std::sync::OnceLock::new();
+    ROOM.get_or_init(|| crate::memory::queue::Room::new(&crate::memory::SNAPSHOTS, snapshot_bound(crate::rt::profile().pool.2)))
+}
+
+/// The room of snapshots in flight for a blocking pool whose `fs` share has `places`.
+fn snapshot_bound(places: usize) -> usize {
+    places.max(1).saturating_mul(SNAPSHOT_BYTES)
+}
+
+/// A snapshot's bytes taken of a room of snapshots in flight ([`snapshot_room`]): what's left of them given
+/// back as it goes, however it ends (written, an error, a socket gone).
+pub struct InFlight {
+    room: &'static crate::memory::queue::Room,
+    bytes: usize,
+}
+
+impl InFlight {
+    /// `bytes` of `room`, waiting for them to fit (a task's wait): none taken once it's closed.
+    pub async fn take(room: &'static crate::memory::queue::Room, bytes: usize) -> Self {
+        let bytes = if room.take(bytes).await { bytes } else { 0 };
+        Self { room, bytes }
+    }
+
+    /// The snapshot as it was made, `n` bytes: the room holds that, not the guess it was taken by (more taken
+    /// whatever the room holds then, as it's made already; or what wasn't needed given back).
+    pub fn made(&mut self, n: usize) {
+        match n.checked_sub(self.bytes) {
+            Some(more) => self.room.force(more),
+            None => self.room.give(self.bytes.saturating_sub(n)),
+        }
+        self.bytes = n;
+    }
+
+    /// `n` of its bytes written to the socket: given back now.
+    pub fn written(&mut self, n: usize) {
+        let n = n.min(self.bytes);
+        self.room.give(n);
+        self.bytes = self.bytes.saturating_sub(n);
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.room.give(self.bytes);
+    }
+}
+
 /// One of a snapshot's frames, in the order they go: its head (`open` or `resumed`), its meta,
 /// state, changes and kept files, then its events: a whole snapshot's a chunk of the copy's at a time
 /// (`super::copies::Chunk`, each packed once: `super::packed`), a catch-up's those it brings a batch at
@@ -493,6 +552,25 @@ struct Plan {
 }
 
 impl Snapshot {
+    /// About the bytes it takes made, `packed` as one message or as frames: what it takes of the room of
+    /// snapshots in flight before it's made ([`snapshot_room`]; [`InFlight::made`] counts it as it was made).
+    /// Packed, each chunk's segment as it's kept (in memory or spilled) and a quarter of the texts of one
+    /// that isn't packed (deflate's ratio on them), beside the other frames whole.
+    pub fn weight(&self, packed: bool) -> usize {
+        let p = &self.parts;
+        let frames = p.meta_bytes.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
+        let events = p.events.chunks().iter().map(|c| {
+            let texts = c.metas().last().map_or(0, |m| m.off + m.len);
+            match (packed, c.packed(), c.spilled_bytes()) {
+                (false, _, _) => texts,
+                (true, Some(s), _) => s.deflated.len(),
+                (true, None, Some(n)) => n,
+                (true, None, None) => texts / 4,
+            }
+        });
+        events.fold(frames, usize::saturating_add)
+    }
+
     /// Its frames, in order. The events it brings are all of them, a frame for each of the copy's
     /// chunks (goal 10, plan 01a1a87b2dae step 3: each chunk's frame is packed once, then taken as it
     /// is), or those changed since its revision, in batches of about [`EVENTS_FRAME`] bytes each (one
@@ -626,7 +704,6 @@ impl Snapshot {
     /// deflated now and kept only once it's full), between them the few bytes of its frame stored as
     /// they are, and the other frames deflated as they come. One gzip member: every decoder reads it.
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
-        use flate2::Compression;
         let plan = self.plan();
         let chunks = self.parts.events.chunks();
         let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.metas().last().map_or(0, |m| m.off + m.len) / 4, |s| s.deflated.len())).sum::<usize>();
@@ -634,38 +711,90 @@ impl Snapshot {
         // The frames between the chunks, deflated together.
         let mut loose: Vec<u8> = Vec::new();
         for part in &plan.parts {
-            match part {
-                Part::Chunk(i) => {
-                    let Some(chunk) = chunks.get(*i) else { continue };
-                    gz.deflate(Compression::fast(), &loose)?;
-                    loose.clear();
-                    gz.stored(br#"{"t":"events","events":["#);
-                    if *i + 1 == chunks.len() && !chunk.is_full() {
-                        gz.segment(&chunk.deflate(Compression::fast())?);
-                    } else {
-                        let packed = match chunk.pack() {
-                            Ok(packed) => packed,
-                            // A spilled one its file doesn't give back: its events as the store keeps them.
-                            Err(e) if chunk.is_spilled() => {
-                                let joined = self.read_from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
-                                Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        gz.segment(&packed);
-                    }
-                    gz.stored(b"]}\n");
-                }
-                other => {
-                    loose.reserve(self.room(&plan, other).saturating_add(1));
-                    self.write(&plan, other, &mut loose)?;
-                    loose.push(b'\n');
-                }
-            }
+            self.part_into(&plan, part, &mut gz, &mut loose)?;
         }
         loose.extend_from_slice(last.as_bytes());
-        gz.deflate(Compression::fast(), &loose)?;
+        gz.deflate(flate2::Compression::fast(), &loose)?;
         Ok(gz.finish())
+    }
+
+    /// `part` of `plan` as [`Snapshot::packed`] puts it in: a chunk of events after the frames before it (in
+    /// `loose`, deflated together), as it was packed (the newest, which the next event changes, deflated now),
+    /// between the few bytes of its frame stored as they are; another frame onto `loose`.
+    fn part_into(&self, plan: &Plan, part: &Part, gz: &mut super::packed::Gzip, loose: &mut Vec<u8>) -> std::io::Result<()> {
+        use flate2::Compression;
+        match part {
+            Part::Chunk(i) => {
+                let chunks = self.parts.events.chunks();
+                let Some(chunk) = chunks.get(*i) else { return Ok(()) };
+                gz.deflate(Compression::fast(), loose)?;
+                loose.clear();
+                gz.stored(br#"{"t":"events","events":["#);
+                if *i + 1 == chunks.len() && !chunk.is_full() {
+                    gz.segment(&chunk.deflate(Compression::fast())?);
+                } else {
+                    let packed = match chunk.pack() {
+                        Ok(packed) => packed,
+                        // A spilled one its file doesn't give back: its events as the store keeps them.
+                        Err(e) if chunk.is_spilled() => {
+                            let joined = self.read_from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
+                            Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    gz.segment(&packed);
+                }
+                gz.stored(b"]}\n");
+            }
+            other => {
+                loose.reserve(self.room(plan, other).saturating_add(1));
+                self.write(plan, other, loose)?;
+                loose.push(b'\n');
+            }
+        }
+        Ok(())
+    }
+
+    /// It packed as it goes out ([`Packing`]): the message [`Snapshot::packed`] makes at once, made a piece
+    /// at a time, `last` its end.
+    pub fn packing(self, last: &str) -> Packing {
+        let plan = self.plan();
+        Packing { snapshot: self, plan, next: 0, gz: Some(super::packed::Gzip::new(0)), loose: Vec::new(), last: last.to_owned() }
+    }
+}
+
+/// A snapshot packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): its message a piece at a time, each
+/// made on the blocking pool and written before the next is made. A viewer that reads slowly holds a piece and
+/// the next, not its whole snapshot, nor a place of the pool while it reads: made at once, a long session's
+/// packed snapshot (megabytes) was held until its last piece went, and a place held for all of its making.
+pub struct Packing {
+    snapshot: Snapshot,
+    plan: Plan,
+    /// Its next part.
+    next: usize,
+    /// The message being made; none once it's all out.
+    gz: Option<super::packed::Gzip>,
+    loose: Vec<u8>,
+    last: String,
+}
+
+impl Packing {
+    /// Its next piece: at least `piece` bytes of the message as it's made (the last may be fewer), none once
+    /// it's all out. Piece after piece, the bytes [`Snapshot::packed`] makes at once.
+    pub fn next_piece(&mut self, piece: usize) -> std::io::Result<Option<Vec<u8>>> {
+        let Some(gz) = self.gz.as_mut() else { return Ok(None) };
+        while gz.made() < piece {
+            let Some(part) = self.plan.parts.get(self.next) else {
+                // Every part in: the frames after the last chunk and `last`, then the member's end.
+                self.loose.extend_from_slice(self.last.as_bytes());
+                gz.deflate(flate2::Compression::fast(), &self.loose)?;
+                self.loose = Vec::new();
+                return Ok(self.gz.take().map(super::packed::Gzip::finish));
+            };
+            self.next += 1;
+            self.snapshot.part_into(&self.plan, part, gz, &mut self.loose)?;
+        }
+        Ok(Some(gz.take()))
     }
 }
 
@@ -1244,6 +1373,9 @@ impl Registry {
         if let Err(e) = sessions.spill_to(&dir.join("spill")) {
             tracing::warn!(error = %e, "the session copies' spill folder couldn't be made: their sealed chunks stay in memory");
         }
+        // The room of viewers' snapshots in flight made now, so /metrics says its bound from the start (goal 11,
+        // plan 01a1a87b2e56 step 3).
+        let _ = snapshot_room();
         Self {
             sessions,
             bus,
@@ -1774,21 +1906,10 @@ impl Registry {
 
     /// [`Registry::list`] as `GET /api/harness/sessions` answers it, in its order: each session's
     /// info as its owner encoded it once ([`super::copies::View::info_json`]), joined into a JSON
-    /// array; nothing is encoded here (goal 10, plan 01a1a87b2dae step 2).
+    /// array once for every read that finds the sessions as they were, and answered as it is (goal 10,
+    /// plan 01a1a87b2dae steps 2 and 5: `super::copies::Copies::list_json`).
     pub fn list_json(&self) -> bytes::Bytes {
-        let mut all: Vec<(Arc<Info>, bytes::Bytes)> = Vec::new();
-        self.sessions.each(|_, view| all.push((Arc::clone(&view.info), view.info_json.clone())));
-        all.sort_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
-        let mut out = Vec::with_capacity(all.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 2);
-        out.push(b'[');
-        for (i, (_, json)) in all.iter().enumerate() {
-            if i > 0 {
-                out.push(b',');
-            }
-            out.extend_from_slice(json);
-        }
-        out.push(b']');
-        bytes::Bytes::from(out)
+        self.sessions.list_json()
     }
 
     /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
@@ -1802,6 +1923,12 @@ impl Registry {
     /// say all of them.
     pub fn events_json(&self, id: &str, before: Option<u64>, limit: usize) -> Option<bytes::Bytes> {
         self.sessions.with(id, |v| v.events_json(before, limit)).flatten()
+    }
+
+    /// [`Registry::events_json`] in the pieces it's made of, for an answer that sends them as they are
+    /// ([`super::copies::View::events_page`]; goal 10, plan 01a1a87b2dae step 5).
+    pub fn events_page(&self, id: &str, before: Option<u64>, limit: usize) -> Option<Vec<bytes::Bytes>> {
+        self.sessions.with(id, |v| v.events_page(before, limit)).flatten()
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
@@ -2041,7 +2168,11 @@ impl Registry {
             Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
             _ => None,
         };
-        let mut changed: Option<Info> = None;
+        // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
+        // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
+        let mut changed = false;
+        // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
+        let mut meta_same = false;
         let mut gone = false;
         // The copy's events went another way than its viewers have them: they start over from it.
         let mut resync = false;
@@ -2086,7 +2217,7 @@ impl Registry {
             let m = s.entry(id, || Mirror::new(info.clone(), from.clone(), bus));
             // Its machine announced it: what it reports from now on counts.
             m.opened_at = None;
-            m.info = Arc::new(info.clone());
+            m.info = Arc::new(info);
             m.reported = reported;
             m.location = Arc::new(from.clone());
             match keep {
@@ -2105,7 +2236,7 @@ impl Registry {
             }
             m.changes = None;
             m.changes_sent = None;
-            changed = Some(info);
+            changed = true;
         }
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
@@ -2174,7 +2305,7 @@ impl Registry {
                 }
                 drop(names);
                 if m.info.differs(&before) {
-                    changed = Some(Info::clone(&m.info));
+                    changed = true;
                 }
                 if before.pause.is_none()
                     && let Some(p) = m.info.pause.as_ref().filter(|p| p.reason == super::pause::LIMIT && p.by == "harness")
@@ -2186,7 +2317,14 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { .. } => m.meta = Arc::new(made.take().unwrap_or(Value::Null)),
+            Update::Meta { .. } => {
+                let meta = made.take().unwrap_or(Value::Null);
+                if *m.meta == meta {
+                    meta_same = true;
+                } else {
+                    m.meta = Arc::new(meta);
+                }
+            }
             Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
             Update::ChangesPatch { set, gone } => {
                 m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
@@ -2252,6 +2390,7 @@ impl Registry {
             Update::Open { since: Some(_), .. } => None,
             Update::State { .. } => m.state_frame(),
             Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
+            Update::Meta { .. } if meta_same => None,
             _ => Some(m.frame_of(&u, &entries)),
         });
         if gone {
@@ -2306,8 +2445,8 @@ impl Registry {
             self.asked.forget(id);
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
-        } else if let Some(info) = changed {
-            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        } else if changed && let Some(m) = s.get(id) {
+            hub.emit_harness(m.info_encoded());
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -4151,6 +4290,109 @@ mod tests {
         read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect()
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5 (and goal 9 step 3's owner's poll): a state's update encodes its
+    /// session's info once, for its view, and the events socket's frame of it is those bytes, as
+    /// `ServerEvent::Harness` wrote it before; a state that changes nothing its viewer has goes as no frame;
+    /// the same meta again is kept, encoded and sent as nothing, a new one encoded once, its frame as before.
+    #[test]
+    fn g10_s5_an_update_encodes_once_what_it_changed() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            let mut events = hub.harness_events.subscribe();
+            let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            let was = encodings().await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let now = encodings().await;
+            anyhow::ensure!(now.info == was.info + 1, "the info encoded once: {was:?} then {now:?}");
+            let view = hub.harness.sessions.view("s").ok_or_else(|| anyhow::anyhow!("no view"))?;
+            let frame = loop {
+                let f = events.try_recv().map_err(|e| anyhow::anyhow!("no info frame on the events socket: {e:?}"))?;
+                if f.starts_with(r#"{"type":"harness""#) {
+                    break f;
+                }
+            };
+            assert_eq!(&*frame, crate::wire::events::ServerEvent::Harness { info: Box::new((*view.info).clone()) }.text(), "the frame as before");
+            assert_eq!(frame.as_bytes().get(r#"{"type":"harness","info":"#.len()..frame.len() - 1), Some(view.info_json.as_ref()), "the view's own bytes");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "one state frame: {heard:?}");
+            // The same state again: its info encoded for its view (its last activity moves), no frame.
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty(), "no frame for a state that changed nothing its viewer has: {heard:?}");
+            // A meta: one frame, as it was written before, encoded once; the same again, nothing.
+            let meta = Meta { version: "2.1".into(), agents: vec!["explore".into()], ..Meta::default() };
+            let was = encodings().await;
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            let mut want = Vec::new();
+            write::value(&mut want, "meta", "meta", &serde_json::to_value(&meta)?, hub.harness.rev("s"))?;
+            anyhow::ensure!(heard == vec![String::from_utf8(want)?], "the meta's frame as before: {heard:?}");
+            anyhow::ensure!(encodings().await.meta == was.meta + 1, "the meta encoded once");
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: `GET /api/harness/sessions`' list is joined once for all the reads
+    /// that find the sessions as they were, each answered those same bytes (nothing joined, sorted or copied
+    /// for it); a session whose info changed, one that came and one that went each have it joined again once,
+    /// saying what `list()` says, oldest first; events that change no session's info leave it as it was.
+    #[test]
+    fn g10_s5_the_sessions_list_is_joined_once_for_the_reads_that_find_it_as_it_was() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |id: &str, at: i64| Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), created_at: at, ..Info::default() }), since: None };
+            for (id, at) in [("b", 2), ("a", 1), ("c", 3)] {
+                hub.harness.ingest(&hub, &there, id, open(id, at)).await;
+            }
+            let listed = || anyhow::Ok(serde_json::to_vec(&hub.harness.list())?);
+            let joins = || hub.harness.sessions.list_joins();
+            let first = hub.harness.list_json();
+            let at = joins();
+            anyhow::ensure!(first.as_ref() == listed()?.as_slice(), "as the list says, oldest first: {}", String::from_utf8_lossy(&first));
+            for _ in 0..3 {
+                let again = hub.harness.list_json();
+                anyhow::ensure!(again.as_ptr() == first.as_ptr() && again == first, "the same bytes, not joined again");
+            }
+            anyhow::ensure!(joins() == at, "nothing joined for the reads after the first");
+            // A session's info changed: joined again once, for itself and the reads after.
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            hub.harness.ingest(&hub, &there, "b", Update::State { state: Box::new(state) }).await;
+            let changed = hub.harness.list_json();
+            anyhow::ensure!(changed.as_ptr() != first.as_ptr() && changed.as_ref() == listed()?.as_slice(), "the change in it");
+            anyhow::ensure!(String::from_utf8_lossy(&changed).contains("the retry loop reads its deadline"), "its summary said");
+            anyhow::ensure!(hub.harness.list_json().as_ptr() == changed.as_ptr() && joins() == at + 1, "joined once for it");
+            // Events whose copy's info stays as it was leave the list as it was.
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            let before = hub.harness.info_json("a");
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=3).map(said).collect() }).await;
+            if hub.harness.info_json("a") == before {
+                anyhow::ensure!(hub.harness.list_json().as_ptr() == changed.as_ptr() && joins() == at + 1, "events that changed no info: the list as it was");
+            }
+            // One comes, oldest of all; one goes.
+            let joined = joins();
+            hub.harness.ingest(&hub, &there, "d", open("d", 0)).await;
+            let more = hub.harness.list_json();
+            anyhow::ensure!(more.as_ref() == listed()?.as_slice() && more.starts_with(br#"[{"id":"d""#) && joins() == joined + 1, "one came: {}", String::from_utf8_lossy(&more));
+            hub.harness.ingest(&hub, &there, "c", Update::Closed).await;
+            let fewer = hub.harness.list_json();
+            anyhow::ensure!(fewer.as_ref() == listed()?.as_slice() && !String::from_utf8_lossy(&fewer).contains(r#""id":"c""#) && joins() == joined + 2, "one went: {}", String::from_utf8_lossy(&fewer));
+            anyhow::ensure!(hub.harness.list_json().as_ptr() == fewer.as_ptr() && joins() == joined + 2, "and then as it was");
+            Ok(())
+        })
+    }
+
     /// CP-T3.2 (the thirteenth and fourteenth adversarial checks'): what kiln's own words (a goal
     /// stack's, a parent's news) said when their harness was handed them is kept on the session's
     /// info (`queued::Kept::look` reads it): from its runner's state (`State::given`), and from its
@@ -4567,6 +4809,78 @@ mod tests {
         })
     }
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: the same through runners' path, each update judged and taken by
+    /// its session's owner (`Registry::from_runner`; goal 10, plan 01a1a87b2dae step 4), an update's events
+    /// taken in turns of its owner's (goal 9, plan 01a1a87b2cec step 3). Sixteen sessions' runner updates are
+    /// handed over from every shard at once, every shard kept busy, every fourth a run of eight events an
+    /// owner's turn may run out in, each event's words streamed after it and a state after each: each copy
+    /// takes every event once, in order, with its words in the order they came, and its last state.
+    #[test]
+    fn g4_s5_runner_updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let ids: Vec<String> = (0..16).map(|n| format!("r{n}")).collect();
+            for id in &ids {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            }
+            // Every shard kept busy, giving itself up only to what wants it.
+            let busy = Arc::new(AtomicBool::new(true));
+            for _ in 0..crate::rt::shard_count().max(1) * 2 {
+                let busy = Arc::clone(&busy);
+                crate::rt::spawn_spread(async move {
+                    while busy.load(Ordering::Acquire) {
+                        let t = std::time::Instant::now();
+                        while t.elapsed() < std::time::Duration::from_micros(200) {
+                            std::hint::spin_loop();
+                        }
+                        crate::rt::maybe_yield().await;
+                    }
+                });
+            }
+            let per = 60u64;
+            let (sent_tx, sent_rx) = async_channel::unbounded::<()>();
+            for id in ids.clone() {
+                let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
+                crate::rt::spawn_spread(async move {
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None };
+                    let mut n = 0u64;
+                    while n < per {
+                        let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
+                        let events: Vec<Event> = (n + 1..=n + run).map(|q| Event { id: format!("{id}-e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: String::new(), streaming: true } }).collect();
+                        hub.harness.from_runner(runner(Update::Events { events })).await;
+                        for q in n + 1..=n + run {
+                            for part in ["a", "b"] {
+                                hub.harness.from_runner(runner(Update::Stream { id: format!("{id}-e{q}"), text: format!("{q}{part}") })).await;
+                            }
+                        }
+                        n += run;
+                        hub.harness.from_runner(runner(Update::State { state: Box::new(State { summary: format!("through {n}"), ..State::default() }) })).await;
+                        if n.is_multiple_of(2) {
+                            crate::rt::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
+                    let _ = sent.send(()).await;
+                });
+            }
+            drop(sent_tx);
+            for _ in 0..ids.len() {
+                sent_rx.recv().await?;
+            }
+            hub.harness.settled().await;
+            busy.store(false, Ordering::Release);
+            for id in &ids {
+                let want: Vec<(String, String)> = (1..=per).map(|n| (format!("{id}-e{n}"), format!("{n}a{n}b"))).collect();
+                anyhow::ensure!(said_in(&hub, id) == want, "{id}'s copy: {:?}", said_in(&hub, id).iter().take(4).collect::<Vec<_>>());
+                let summary = hub.harness.sessions.with(id, |v| v.info.summary.clone());
+                anyhow::ensure!(summary.as_deref() == Some(format!("through {per}").as_str()), "{id}'s last state: {summary:?}");
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn names_are_kept_across_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4763,5 +5077,99 @@ mod tests {
             anyhow::ensure!(turns >= 1, "the update's turns: {turns}");
             Ok(())
         })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: snapshots in flight hold at most their room: one past it waits its
+    /// turn until one in flight is written out; each holds what it was made at, given back as it's written
+    /// and the rest as it goes; one larger than the room goes alone into an empty one. The server's room is
+    /// its blocking pool's `fs` places of whole snapshots.
+    #[test]
+    fn g11_s3_snapshots_past_their_room_wait_their_turn() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            static ROOM: std::sync::OnceLock<crate::memory::queue::Room> = std::sync::OnceLock::new();
+            let room = ROOM.get_or_init(|| crate::memory::queue::Room::new(&crate::memory::SNAPSHOTS, 1000));
+            let mut first = InFlight::take(room, 800).await;
+            anyhow::ensure!(room.held() == 800);
+            let went = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let next = {
+                let went = Arc::clone(&went);
+                crate::rt::spawn(async move {
+                    let held = InFlight::take(room, 300).await;
+                    went.store(true, std::sync::atomic::Ordering::SeqCst);
+                    held
+                })
+            };
+            crate::rt::sleep(std::time::Duration::from_millis(50)).await;
+            anyhow::ensure!(!went.load(std::sync::atomic::Ordering::SeqCst), "past the room, it waits");
+            first.made(900);
+            anyhow::ensure!(room.held() == 900, "made, it holds what it was made at");
+            first.written(600);
+            let next = next.await.map_err(|_| anyhow::anyhow!("the next never went"))?;
+            anyhow::ensure!(went.load(std::sync::atomic::Ordering::SeqCst) && room.held() == 600, "its turn once there was room: {}", room.held());
+            drop((first, next));
+            anyhow::ensure!(room.held() == 0, "the rest given back as each goes");
+            let alone = InFlight::take(room, 5000).await;
+            anyhow::ensure!(room.held() == 5000, "larger than the room, alone");
+            drop(alone);
+            anyhow::ensure!(snapshot_bound(26) == 26 * SNAPSHOT_BYTES && SNAPSHOT_BYTES == 5000 * 647, "the server's: its fs places of whole snapshots");
+            Ok(())
+        })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a snapshot's weight, what it takes of the room before it's made, is
+    /// its chunks' segments as they're kept (and a quarter of the texts of one not packed) packed, and their
+    /// texts as frames, beside its other frames.
+    #[test]
+    fn g11_s3_a_snapshots_weight_is_its_segments_packed_and_its_texts_as_frames() -> anyhow::Result<()> {
+        let mut m = super::super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+        for q in 1..=300u64 {
+            m.rev = q;
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": format!("line {q} of what was said")}))));
+        }
+        let parts = m.view().parts();
+        let segments: usize = parts.events.chunks().iter().filter(|c| c.is_full()).filter_map(|c| c.pack().ok().map(|s| s.deflated.len())).sum();
+        let texts: usize = parts.events.chunks().iter().map(|c| c.metas().last().map_or(0, |m| m.off + m.len)).sum();
+        let s = Snapshot { parts: m.view().parts(), files: None, store: None };
+        anyhow::ensure!(s.weight(false) == texts, "as frames, its texts: {} of {texts}", s.weight(false));
+        anyhow::ensure!(s.weight(true) >= segments && s.weight(true) < texts, "packed, its segments: {} of {segments}", s.weight(true));
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a snapshot packed as it goes out is, piece after piece, the message
+    /// made at once: each piece but the last at least the size asked for, none once it's all out; whatever its
+    /// chunks are (packed, spilled, the open one) and its other frames (kept files among them).
+    #[test]
+    fn g11_s5_a_snapshot_packed_as_it_goes_is_the_one_made_at_once() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut m = super::super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+        for q in 1..=500u64 {
+            m.rev = q;
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": format!("line {q}: {}", "of what was said ".repeat(usize::try_from(q % 7)?))}))));
+        }
+        // Some chunks packed, the oldest of them spilled, the newest open.
+        let parts = m.view().parts();
+        for c in parts.events.chunks().iter().filter(|c| c.is_full()).take(5) {
+            c.pack()?;
+        }
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let mut events = parts.events.clone();
+        events.compact(None);
+        let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
+        let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
+        anyhow::ensure!(events.spilled(&chunks, spilled) > 0, "some spilled");
+        let snapshot = || Snapshot { parts: Parts { events: events.clone(), ..m.view().parts() }, files: Some(r#"{"t":"files","files":[]}"#.into()), store: None };
+        let whole = snapshot().packed("synced")?;
+        for size in [1, 1024, 64 << 10, usize::MAX] {
+            let mut packing = snapshot().packing("synced");
+            let mut pieces = Vec::new();
+            while let Some(piece) = packing.next_piece(size)? {
+                pieces.push(piece);
+            }
+            anyhow::ensure!(pieces.iter().rev().skip(1).all(|p| p.len() >= size), "each but the last at least {size}");
+            anyhow::ensure!(pieces.concat() == whole, "pieces of {size}: the message made at once");
+            anyhow::ensure!(packing.next_piece(size)?.is_none(), "none once it's all out");
+        }
+        Ok(())
     }
 }

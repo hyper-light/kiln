@@ -3,6 +3,7 @@
 //! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt).
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{StatusCode, header};
@@ -226,9 +227,81 @@ pub fn text(s: impl Into<String>) -> Message {
     Message::text(s.into())
 }
 
+/// A socket's receiver asked for its next message only once the socket woke it since it last had none (goal 9,
+/// plan 01a1a87b2cec step 5). A loop that `select!`s a socket's next message beside other work polls the
+/// receiver each time anything wakes its task, and each poll of tungstenite's reader zero-fills its read buffer
+/// before it reads (tungstenite 0.30's `FrameCodec::read_in`: 16 KiB on an agent page's socket, 128 KiB on the
+/// others) and makes a read(2) that finds nothing, then a readiness wait armed again: in g9p6's calm profile, an
+/// agent page's viewers' zero-fills alone were 1.6% of the shards' CPU. Gated, the receiver is asked when the
+/// socket's readiness woke it, and again at once after a message (its read may have brought more).
+pub struct Gated<S> {
+    inner: S,
+    gate: Arc<Gate>,
+    /// The gate's waker, made once: what the receiver wakes when its socket has something.
+    waker: std::task::Waker,
+}
+
+/// Whether a [`Gated`] receiver is to be asked, and the task to wake when it is.
+struct Gate {
+    open: std::sync::atomic::AtomicBool,
+    task: futures::task::AtomicWaker,
+}
+
+impl futures::task::ArcWake for Gate {
+    fn wake_by_ref(gate: &Arc<Self>) {
+        gate.open.store(true, std::sync::atomic::Ordering::Release);
+        gate.task.wake();
+    }
+}
+
+impl<S> Gated<S> {
+    /// `inner`, gated: asked at its first poll.
+    pub fn new(inner: S) -> Self {
+        let gate = Arc::new(Gate { open: std::sync::atomic::AtomicBool::new(true), task: futures::task::AtomicWaker::new() });
+        let waker = futures::task::waker(Arc::clone(&gate));
+        Self { inner, gate, waker }
+    }
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for Gated<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        let this = self.get_mut();
+        this.gate.task.register(cx.waker());
+        // Shut before the receiver is asked: a wake while it's asked opens the gate again, so none is lost.
+        if !this.gate.open.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Poll::Pending;
+        }
+        let polled = Pin::new(&mut this.inner).poll_next(&mut Context::from_waker(&this.waker));
+        if polled.is_ready() {
+            this.gate.open.store(true, std::sync::atomic::Ordering::Release);
+        }
+        polled
+    }
+}
+
 /// Binary frame helper.
 pub fn binary(b: impl Into<bytes::Bytes>) -> Message {
     Message::binary(b.into())
+}
+
+/// A text frame of `shared`, its bytes `shared`'s own, not copied: every socket that sends the same text
+/// (each viewer of the hub's events) sends the one allocation (goal 4, plan 01a1a59c2a9c step 5: each hub
+/// event was copied into a string of its own for each viewer's socket).
+pub fn shared_text(shared: &std::sync::Arc<str>) -> Message {
+    /// The text, as the bytes a frame's payload takes.
+    struct Shared(std::sync::Arc<str>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_bytes()
+        }
+    }
+    // A `str` is UTF-8 already: the check finds it so (and a frame of a copy, should it not).
+    match tungstenite::Utf8Bytes::try_from(bytes::Bytes::from_owner(Shared(std::sync::Arc::clone(shared)))) {
+        Ok(t) => Message::Text(t),
+        Err(_) => text(shared.as_ref()),
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +572,94 @@ mod tests {
         let got = server.read()?.into_text()?;
         anyhow::ensure!(got.as_str() == big, "{} bytes came of {}", got.len(), big.len());
         Ok(())
+    }
+
+    /// A connection whose reads are counted: what the test sends it is read in turn, and with nothing come a read
+    /// says so (pending), its waker the test's to wake as the socket's readiness would.
+    struct Counted {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        arriving: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+        readable: Arc<futures::task::AtomicWaker>,
+    }
+
+    impl futures::io::AsyncRead for Counted {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.pending.is_empty()
+                && let Ok(came) = self.arriving.try_recv()
+            {
+                self.pending = came;
+            }
+            if self.pending.is_empty() {
+                self.readable.register(cx.waker());
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.pending.len());
+            let rest = self.pending.split_off(n);
+            let read = std::mem::replace(&mut self.pending, rest);
+            if let Some(into) = buf.get_mut(..n) {
+                into.copy_from_slice(&read);
+            }
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl futures::io::AsyncWrite for Counted {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One poll of `stream`, as a `select!` that something else woke makes of it.
+    async fn poll_once<S: futures::Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *stream).poll_next(cx))).await
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a gated receiver asks its socket for a message only when the socket woke
+    /// it: polled again and again for other reasons, it reads once (tungstenite zero-fills its read buffer and
+    /// makes a read at each ask); woken by its socket, it reads the message; after a message it asks once more,
+    /// and then waits for the socket again.
+    #[test]
+    fn g9_s5_a_gated_receiver_reads_only_when_its_socket_woke_it() -> anyhow::Result<()> {
+        /// Shape: polls the task makes for other reasons between the socket's wakes: more than one.
+        const OTHER_WAKES: usize = 5;
+        crate::rt::block_on(async {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let readable = Arc::new(futures::task::AtomicWaker::new());
+            let (arrive, arriving) = std::sync::mpsc::channel::<Vec<u8>>();
+            let io = Counted { reads: Arc::clone(&reads), arriving, pending: Vec::new(), readable: Arc::clone(&readable) };
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(io, tungstenite::protocol::Role::Server, None).await;
+            let (_tx, rx) = socket.split();
+            let mut rx = Gated::new(rx);
+            let read = || reads.load(std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(poll_once(&mut rx).await.is_pending() && read() == 1, "the first poll asks: {} reads", read());
+            for _ in 0..OTHER_WAKES {
+                anyhow::ensure!(poll_once(&mut rx).await.is_pending(), "nothing came");
+            }
+            anyhow::ensure!(read() == 1, "{OTHER_WAKES} polls the socket didn't wake read nothing: {} reads", read());
+            let mut client = tungstenite::protocol::WebSocket::from_raw_socket(std::io::Cursor::new(Vec::new()), tungstenite::protocol::Role::Client, None);
+            client.send(Message::text("hi"))?;
+            arrive.send(client.get_ref().get_ref().clone())?;
+            readable.wake();
+            match poll_once(&mut rx).await {
+                Poll::Ready(Some(Ok(Message::Text(t)))) => anyhow::ensure!(t.as_str() == "hi", "{t}"),
+                other => anyhow::bail!("the socket woke it, and it read {other:?}"),
+            }
+            anyhow::ensure!(read() == 2, "woken, it read: {} reads", read());
+            for _ in 0..OTHER_WAKES {
+                anyhow::ensure!(poll_once(&mut rx).await.is_pending(), "nothing more came");
+            }
+            anyhow::ensure!(read() == 3, "after a message it asked once more, then waited: {} reads", read());
+            Ok(())
+        })
     }
 }

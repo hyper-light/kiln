@@ -377,11 +377,24 @@ impl LocalQueue {
     /// Normal's while no task took another class; else the oldest of the class that has run least while it had
     /// tasks listed, Critical before Normal before Background where they have run alike, so each class with work
     /// gets an equal share of the shard's time and the most urgent goes first (kiln's goal 6, `crate::coop::Class`).
+    /// [`LocalQueue::pop_within`] with no lead.
     #[inline]
     pub fn pop(&self) -> Option<u32> {
+        self.pop_within(0)
+    }
+
+    /// [`LocalQueue::pop`], a class going ahead of less urgent ones while it has run no more than `lead_ns` past the
+    /// least-run class with a slot ready: the shard's loop gives its quantum (kiln's goal 6, plan 01a1a59c2abe step
+    /// 3), the most one task's turn holds the shard anyway, so the less urgent wait at most that much longer and the
+    /// shares stay equal over time (each class's lag bounded by the lead and a poll). With no lead, urgency only
+    /// breaks ties: a Critical request of more than one poll (a handshake's round trips, a handler awaiting a reply)
+    /// went behind the lower classes' polls at each poll after its first, its first poll's time having put it past
+    /// them.
+    #[inline]
+    pub fn pop_within(&self, lead_ns: u64) -> Option<u32> {
         let lists = match self.others.get() {
             None => &self.normal,
-            Some(others) => self.pick(others)?,
+            Some(others) => self.pick(others, lead_ns)?,
         };
         let slot = lists.ready_list().pop()?;
         if let Some(place) = self.place(slot) {
@@ -390,24 +403,27 @@ impl LocalQueue {
         Some(slot)
     }
 
-    /// The lists to take from: of those with a slot ready, the class that has run least, the first in priority
-    /// order where they have run alike.
-    fn pick<'a>(&'a self, others: &'a Others) -> Option<&'a Lists> {
-        let mut best: Option<(u64, &Lists)> = None;
-        for (class, lists) in [
+    /// The lists to take from: of those with a slot ready, the first in priority order that has run no more than
+    /// `lead_ns` past the least-run of them (with no lead, the least-run, the first in priority order where they
+    /// have run alike).
+    fn pick<'a>(&'a self, others: &'a Others, lead_ns: u64) -> Option<&'a Lists> {
+        let classes = [
             (Class::Critical, &others.critical),
             (Class::Normal, &self.normal),
             (Class::Background, &others.background),
-        ] {
-            if lists.ready_list().is_empty() {
-                continue;
-            }
-            let ran = others.ran(class).get();
-            if best.is_none_or(|(least, _)| ran < least) {
-                best = Some((ran, lists));
-            }
-        }
-        best.map(|(_, lists)| lists)
+        ];
+        let least = classes
+            .iter()
+            .filter(|(_, lists)| !lists.ready_list().is_empty())
+            .map(|(class, _)| others.ran(*class).get())
+            .min()?;
+        let within = least.saturating_add(lead_ns);
+        classes
+            .into_iter()
+            .find(|(class, lists)| {
+                !lists.ready_list().is_empty() && others.ran(*class).get() <= within
+            })
+            .map(|(_, lists)| lists)
     }
 
     /// Counts `ns` of poll time to the class of the task in `slot`, while classes are kept, and moves the shard's
@@ -449,6 +465,20 @@ impl LocalQueue {
     /// then go ahead of what is listed.
     pub fn has_classes(&self) -> bool {
         self.others.get().is_some()
+    }
+
+    /// Whether a slot of a class more urgent than `class` is listed, or woke itself and waits for its release
+    /// (kiln's goal 6, plan 01a1a59c2abe step 3: what a task that lowered its class gives way to,
+    /// `crate::coop::give_way`). False while no task of the shard took a class other than Normal.
+    pub fn waiting_above(&self, class: Class) -> bool {
+        let Some(others) = self.others.get() else {
+            return false;
+        };
+        match class {
+            Class::Critical => false,
+            Class::Normal => !others.critical.is_empty(),
+            Class::Background => !others.critical.is_empty() || !self.normal.is_empty(),
+        }
     }
 
     /// Wakes for slots beyond the arena, ignored.
@@ -611,6 +641,86 @@ mod tests {
         q.push(5, 0);
         q.push(2, 0);
         assert_eq!(q.pop(), Some(2));
+    }
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 3: a Critical slot woken behind queued Normal and Background work is
+    /// taken next, ahead of all of it; and, within the lead (a quantum), its next polls are too, where with no lead
+    /// each went behind a poll of a lower class (its first poll's time having put it past them). Past the lead, the
+    /// lower classes take their turns: the shares hold. Do: four Normal and four Background slots queued, one of
+    /// each polled a quantum; a Critical slot woken; it polls a fifth of a quantum and is woken again, twice; then it
+    /// runs a quantum. Expect: Critical three times (where no lead would have put Normal first), then Normal and
+    /// Background before Critical again.
+    #[test]
+    fn g6_s3_a_critical_slot_overtakes_queued_normal_and_background_work() {
+        const QUANTUM: u64 = 250_000;
+        let q = LocalQueue::new(16);
+        for slot in 5..=8 {
+            q.set_class(slot, Class::Background);
+        }
+        q.set_class(9, Class::Critical);
+        for slot in [1, 5, 2, 6, 3, 7, 4, 8] {
+            q.push(slot, 0);
+        }
+        // A poll of each lower class, a quantum each: they have run alike.
+        assert_eq!(q.pop(), Some(1));
+        q.charge(1, QUANTUM);
+        assert_eq!(q.pop(), Some(5));
+        q.charge(5, QUANTUM);
+        // Six slots queued ahead of it, the Critical one is woken last, and taken first.
+        q.push(9, 10);
+        assert_eq!(q.pop_within(QUANTUM), Some(9), "critical overtakes the queued work");
+        q.charge(9, QUANTUM / 5);
+        // Woken again (a handshake's next round trip, a reply its handler awaited): still first.
+        q.push(9, 20);
+        assert_eq!(q.pop_within(QUANTUM), Some(9), "its second poll, a fifth of a quantum ahead: still first");
+        q.charge(9, QUANTUM / 5);
+        q.push(9, 30);
+        assert_eq!(q.pop(), Some(2), "with no lead, a Normal poll first: Critical ran past the least");
+        q.charge(2, 1);
+        assert_eq!(q.pop_within(QUANTUM), Some(9), "within the lead: first again");
+        // Past its lead, the lower classes go first: Normal (within its own lead of Background), then Background;
+        // then Critical, within the lead of the least again.
+        q.charge(9, QUANTUM);
+        q.push(9, 40);
+        assert_eq!(q.pop_within(QUANTUM), Some(3), "Normal, Critical past its lead");
+        q.charge(3, QUANTUM);
+        assert_eq!(q.pop_within(QUANTUM), Some(6), "Background, the least run");
+        q.charge(6, QUANTUM);
+        assert_eq!(q.pop_within(QUANTUM), Some(9), "Critical within the lead of the least again");
+    }
+
+    /// The lead keeps the shares equal over time: three classes always busy (two slots each, so none ever rests),
+    /// each poll a fifth of the quantum, run alike within the lead and a poll of each other, the most urgent first
+    /// within that: Critical takes its lead first (six polls: five make a quantum, and the sixth starts at it).
+    #[test]
+    fn g6_s3_the_lead_keeps_the_shares_equal_over_time() {
+        const QUANTUM: u64 = 250_000;
+        const POLL: u64 = QUANTUM / 5;
+        let q = LocalQueue::new(8);
+        for (slot, class) in [(1, Class::Critical), (4, Class::Critical), (3, Class::Background), (6, Class::Background)] {
+            q.set_class(slot, class);
+        }
+        for slot in 1..=6 {
+            q.push(slot, 0);
+        }
+        let class_of = |slot: u32| usize::from(slot % 3 != 1) + usize::from(slot.is_multiple_of(3));
+        let (mut ran, mut polls) = ([0u64; 3], [0u64; 3]);
+        let mut first = Vec::new();
+        for round in 0..3_000 {
+            let slot = q.pop_within(QUANTUM).expect("six slots, each pushed back as it is taken");
+            if round < 6 {
+                first.push(slot);
+            }
+            q.charge(slot, POLL);
+            ran[class_of(slot)] += POLL;
+            polls[class_of(slot)] += 1;
+            q.push(slot, 0);
+            let (most, least) = (ran.iter().max().copied().unwrap_or(0), ran.iter().min().copied().unwrap_or(0));
+            assert!(most - least <= QUANTUM + POLL, "round {round}: {ran:?} apart by more than the lead and a poll");
+        }
+        assert!(first.iter().all(|slot| [1, 4].contains(slot)), "the most urgent first, within its lead: {first:?}");
+        let (most, least) = (polls.iter().max().copied().unwrap_or(0), polls.iter().min().copied().unwrap_or(0));
+        assert!(most - least <= QUANTUM / POLL + 1, "equal shares over time: {polls:?} polls");
     }
 
     /// kiln's goal 11 (plan 01a1a87b2e56): a queue makes a slot's place as it first sees the slot, and its lists'

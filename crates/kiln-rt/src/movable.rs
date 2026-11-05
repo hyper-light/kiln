@@ -411,6 +411,17 @@ impl Pool {
         self.shared.iter().any(|shared| !shared.is_empty())
     }
 
+    /// Whether a movable task was ever spawned on this runtime (kiln's goal 9, plan 01a1a87b2cec step 5). Before the
+    /// first, every queue is empty and every task a shard runs is pinned, so an idle shard's look and a parking
+    /// shard's re-check of the shared queues have nothing to find: both skip. kiln's default placement makes no
+    /// movable task, and each idle turn paid a pool-wide count's two read-modify-writes and a read of every
+    /// sibling's queues, and each park an `Arc` count's two, on lines every shard shares. A spawn counts itself
+    /// before its task is queued; a task put on a shared queue kicks a parked shard after (`inject`), the kick's
+    /// fence ordering the count before the park's read of it, so a shard that parked having read none is kicked.
+    fn in_use(&self) -> bool {
+        read(&self.counts.spawned) != 0
+    }
+
     /// Moves the queued tasks of the shard at `index` to the shared queues and kicks parked siblings, as many as
     /// tasks moved: the watchdog's, for a shard held in one poll past its limit. How many moved.
     pub(crate) fn hand_off(&self, index: usize) -> u64 {
@@ -505,9 +516,12 @@ impl Local {
         self.installed.get()
     }
 
-    /// The shard's runtime's pool, once installed: what the shard's park re-reads after its announcement.
+    /// The shard's runtime's pool, once installed and in use ([`Pool::in_use`]): what the shard's park re-reads after
+    /// its announcement.
     pub(crate) fn pool(&self) -> Option<Arc<Pool>> {
-        self.installed().map(|local| Arc::clone(&local.pool))
+        self.installed()
+            .filter(|local| local.pool.in_use())
+            .map(|local| Arc::clone(&local.pool))
     }
 
     /// Queues `task` here when this shard is of its runtime (`pool`); the task back otherwise.
@@ -551,13 +565,14 @@ impl Local {
     /// look and its park is not left behind.
     pub(crate) fn shared_waiting(&self) -> bool {
         self.installed()
-            .is_some_and(|local| local.pool.shared_waiting())
+            .is_some_and(|local| local.pool.in_use() && local.pool.shared_waiting())
     }
 
     /// The shard is idle: takes tasks from the shared queues, else half of a sibling's queue, and wakes the
     /// carriers that run them. Whether it took any.
     pub(crate) fn look(&self, ctx: &ShardContext) -> bool {
-        self.installed().is_some_and(|local| local.look(ctx))
+        self.installed()
+            .is_some_and(|local| local.pool.in_use() && local.look(ctx))
     }
 }
 
@@ -1006,6 +1021,21 @@ mod tests {
         assert_eq!(queues[1][index_of(Class::Normal)].len(), 1, "the other shard's queue stays");
         assert_eq!(pool.stats().handed_off, 8);
         assert_eq!(pool.hand_off(7), 0, "no such shard");
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a pool no movable task was spawned on is not in use, so an idle
+    /// shard's look and a parking shard's re-check skip it; its first spawn puts it in use, and the task that spawn
+    /// put on the shared queue is there for a parking shard's re-check to find.
+    #[test]
+    fn g9_s5_a_pool_no_movable_task_was_spawned_on_is_skipped_until_its_first() {
+        let holders = vec![SlotHolder::for_test(), SlotHolder::for_test()];
+        let (pool, _queues) = Pool::new(holders, 64);
+        assert!(!pool.in_use(), "nothing spawned: not in use");
+        assert!(!pool.shared_waiting());
+        pool.spawn_shared(Class::Normal, async {});
+        assert!(pool.in_use(), "its first spawn puts it in use");
+        assert!(pool.shared_waiting(), "and its task waits on the shared queue");
+        assert_eq!(pool.stats().spawned, 1);
     }
 
     #[test]

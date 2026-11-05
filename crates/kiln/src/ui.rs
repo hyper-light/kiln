@@ -29,6 +29,26 @@ use crate::rcu::Rcu;
 #[allow_missing = true]
 struct Assets;
 
+/// The UI's files the build packed with brotli (`build.rs`, by `crate::ui_pack`): `PACKED`, each a file's name,
+/// the SHA-256 of the file it was packed from and its packed bytes, in name order. They're served from the
+/// binary's own pages: no server compresses them as it starts, nor keeps the copies on its heap (goal 11, plan
+/// 01a1a87b2e56 step 5).
+mod built {
+    include!(concat!(env!("OUT_DIR"), "/ui_brotli.rs"));
+}
+
+/// `name`'s copy in `table` (one like [`built::PACKED`]), if it was packed from the very file whose SHA-256 is
+/// `sha`: a debug build reads its files from disk, which may have changed since it was built.
+fn built_in(table: &'static [(&'static str, [u8; 32], &'static [u8])], name: &str, sha: &[u8; 32]) -> Option<Bytes> {
+    let at = table.binary_search_by(|(n, _, _)| (*n).cmp(name)).ok()?;
+    table.get(at).filter(|(_, s, _)| s == sha).map(|(_, _, b)| Bytes::from_static(b))
+}
+
+/// `name`'s copy that this build packed, if it was packed from this very file.
+fn built(name: &str, sha: &[u8; 32]) -> Option<Bytes> {
+    built_in(built::PACKED, name, sha)
+}
+
 const PLACEHOLDER: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>kiln</title>
 <style>body{background:#08090a;color:#ededee;font:15px/1.6 system-ui;display:grid;place-items:center;height:100vh;margin:0}
 code{color:#cdc4e0}</style></head><body><div><h1>kiln</h1><p>The UI was not built into this binary.
@@ -116,25 +136,14 @@ fn keep(cache: &Rcu<HashMap<String, Bytes>>, name: &str, packed: &Bytes) {
     }
 }
 
-/// The brotli window for a file of `len` bytes: the smallest that holds the whole file
-/// (`crate::util::brotli_window`), where kiln took 22 bits (4 MiB) for every file before: 34 MB of encoder
-/// for each at quality 11, a 20 KB file's 256 KB (goal 11, plan 01a1a87b2e56 step 3).
-fn window_bits(len: usize) -> u32 {
-    crate::util::brotli_window(len)
-}
-
-/// `data` brotli-compressed at the highest quality, once per file.
+/// `data` brotli-compressed at the highest quality, once per file, in the smallest window that holds it
+/// (`crate::ui_pack::window_bits`): kiln took 22 bits (4 MiB) for every file before, 34 MB of encoder for each at
+/// quality 11, a 20 KB file's 256 KB (goal 11, plan 01a1a87b2e56 step 3). The build packs them the same way.
 fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
     if let Some(b) = br_cache().load().get(name) {
         return Some(b.clone());
     }
-    let mut out = Vec::with_capacity(data.len() / 3);
-    {
-        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 11, window_bits(data.len()));
-        w.write_all(data).ok()?;
-        w.flush().ok()?;
-    }
-    smaller(name, data, out, br_cache())
+    smaller(name, data, crate::ui_pack::brotli(data)?, br_cache())
 }
 
 /// `out`, `data` packed, kept for `name` in `cache` if it's smaller than `data` (else `data` goes as it is),
@@ -200,27 +209,45 @@ fn accepts(header: Option<&str>, coding: &str) -> bool {
 /// file as well, gzip took 3.8 MB of the 5.4 MB the UI's files held in the lab's realistic profile, whose
 /// pages (as a browser's: `br, gzip`) never asked for one (goal 11, plan 01a1a87b2e56 step 5). The bound of
 /// what the UI's files keep in memory (`crate::memory::UI_ASSETS`) is the brotli copies made here and, for
-/// each, its file's own size: a gzip copy is kept only when it's smaller than its file.
+/// each, its file's own size: a gzip copy is kept only when it's smaller than its file. A file the build packed
+/// (`built`) is served from the binary, so nothing is made here for it, and only a gzip copy counts.
 pub async fn warm() {
     let names: Vec<String> = Assets::iter().map(|n| n.into_owned()).collect();
     let made = crate::rt::compute_map(names, |name| {
         let Some(f) = Assets::get(&name) else { return 0 };
-        let mime = mime_guess::from_path(&name).first_or_octet_stream();
-        if compressible(mime.as_ref()) && f.data.len() > 1024 {
-            brotli(&name, &f.data).map_or(0, |b| b.len()).saturating_add(f.data.len())
-        } else {
-            0
+        if !crate::ui_pack::worth(&crate::ui_pack::mime_of(&name), f.data.len()) {
+            return 0;
         }
+        if built(&name, &f.metadata.sha256_hash()).is_some() {
+            return f.data.len();
+        }
+        brotli(&name, &f.data).map_or(0, |b| b.len()).saturating_add(f.data.len())
     })
     .await;
     match made {
         Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().fold(0usize, |a, b| a.saturating_add(*b))),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for"),
     }
+    // Every file has been read whole by now (here, and by `keep_assets` before it), and what's served of
+    // those worth compressing is their brotli copies: the files' own pages in the binary leave resident
+    // memory, and come back from the page cache when one is read again (goal 11, plan 01a1a87b2e56 step 5).
+    crate::resident::ui_files(embedded_spans()).await;
+    crate::resident::warmed();
 }
 
-fn compressible(mime: &str) -> bool {
-    mime.starts_with("text/") || mime.contains("javascript") || mime.contains("json") || mime.contains("svg")
+/// Where each embedded file's bytes are in the binary, as an address and a length: a release build's, whose
+/// files are in its read-only data. None for a build that reads them from disk (a debug build's).
+fn embedded_spans() -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for name in Assets::iter() {
+        match Assets::get(&name).map(|f| f.data) {
+            Some(Cow::Borrowed(b)) => spans.push((b.as_ptr().addr(), b.len())),
+            // Read from disk: so is every other.
+            Some(Cow::Owned(_)) => return Vec::new(),
+            None => {}
+        }
+    }
+    spans
 }
 
 fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
@@ -240,9 +267,12 @@ pub fn static_file(req: &Request) -> Option<Response> {
         return None;
     }
     let (data, ours) = match Assets::get(path) {
-        Some(f) => (embedded(f.data), true),
+        Some(f) => {
+            let sha = f.metadata.sha256_hash();
+            (embedded(f.data), Some(sha))
+        }
         None if path.starts_with("assets/") => match kept(path) {
-            Some(b) => (Bytes::from(b), false),
+            Some(b) => (Bytes::from(b), None),
             None => return Some(srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n"))),
         },
         None => return None,
@@ -265,24 +295,29 @@ pub fn font(name: &str) -> Option<Bytes> {
 /// The app's shell (any page, rendered in the browser): for when the UI server isn't there.
 pub fn shell(req: &Request) -> Response {
     match Assets::get("_shell.html") {
-        Some(f) => respond(req, "_shell.html", embedded(f.data), true),
+        Some(f) => {
+            let sha = f.metadata.sha256_hash();
+            respond(req, "_shell.html", embedded(f.data), Some(sha))
+        }
         None => srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
     }
 }
 
-/// `data`, `name`'s, packed as the request takes it where it's worth it; `ours`: this build's file.
-fn respond(req: &Request, name: &str, data: Bytes, ours: bool) -> Response {
+/// `data`, `name`'s, packed as the request takes it where it's worth it; `ours`: this build's file, by its
+/// SHA-256 (none for an earlier build's).
+fn respond(req: &Request, name: &str, data: Bytes, ours: Option<[u8; 32]>) -> Response {
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
-    let worth = compressible(mime.as_ref()) && data.len() > 1024;
-    // Packed as made already: one not made yet goes as it is this once, and is packed on the
-    // blocking pool for the requests after it (a large file at brotli's best takes seconds, and
-    // this request's thread serves every socket on it, a restart's first pages most of all).
+    let worth = crate::ui_pack::worth(mime.as_ref(), data.len());
+    // Packed as the build packed it, else as made already: one not made yet goes as it is this once,
+    // and is packed on the blocking pool for the requests after it (a large file at brotli's best
+    // takes seconds, and this request's thread serves every socket on it, a restart's first pages
+    // most of all).
     let packed = if worth && accepts(asked, "br") {
-        packed(name, &data, br_cache(), ours)
+        ours.and_then(|sha| built(name, &sha)).map(|b| (b, "br")).or_else(|| packed(name, &data, br_cache(), ours.is_some()))
     } else if worth && accepts(asked, "gzip") {
-        packed(name, &data, gz_cache(), ours)
+        packed(name, &data, gz_cache(), ours.is_some())
     } else {
         None
     };
@@ -330,6 +365,7 @@ mod tests {
     /// 22 bits kiln took for every file, and a file packed in its own window comes back whole.
     #[test]
     fn g11_s3_brotlis_window_holds_the_file_and_no_more() {
+        let window_bits = crate::ui_pack::window_bits;
         assert_eq!(window_bits(0), 10);
         assert_eq!(window_bits(1008), 10);
         assert_eq!(window_bits(1009), 11);
@@ -384,5 +420,25 @@ mod tests {
         let gz = make("assets/asked-g11s5.js", text.as_bytes(), "gzip").unwrap_or_default();
         assert!(!gz.is_empty() && gz.len() < text.len());
         assert!(gz_cache().load().contains_key("assets/asked-g11s5.js"));
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a copy the build packed goes out only for the very file it was packed
+    /// from, found by name in the table's order; and each copy this build packed comes back as its file.
+    #[test]
+    fn g11_s5_a_copy_the_build_packed_goes_out_only_for_its_own_file() {
+        static TABLE: &[(&str, [u8; 32], &[u8])] = &[("assets/a.js", [1; 32], b"A"), ("assets/b.js", [2; 32], b"B"), ("z.html", [3; 32], b"Z")];
+        assert_eq!(built_in(TABLE, "assets/b.js", &[2; 32]).as_deref(), Some(b"B".as_slice()));
+        assert_eq!(built_in(TABLE, "z.html", &[3; 32]).as_deref(), Some(b"Z".as_slice()));
+        assert!(built_in(TABLE, "assets/b.js", &[9; 32]).is_none(), "a file changed since the build has no copy");
+        assert!(built_in(TABLE, "assets/c.js", &[2; 32]).is_none());
+        for (name, sha, packed) in built::PACKED {
+            // A debug build reads its files from disk: one changed since the build isn't its copy's.
+            let Some(f) = Assets::get(name).filter(|f| &f.metadata.sha256_hash() == sha) else { continue };
+            let mut back = Vec::new();
+            let mut from: &[u8] = packed;
+            let _ = brotli::BrotliDecompress(&mut from, &mut back);
+            assert_eq!(back.as_slice(), f.data.as_ref(), "{name}");
+            assert!(packed.len() < f.data.len(), "{name}: kept only when smaller");
+        }
     }
 }

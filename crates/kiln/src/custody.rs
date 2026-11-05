@@ -124,82 +124,100 @@ struct Refusal {
 /// revocations kiln has; kept by its digest; its own hop checked, and the hops of records that
 /// waited for it. Refused, and recorded, when kiln can't take it. One kiln has already (sent again
 /// after a reconnect, or carried by another) is answered as such, as it was judged when taken: its
-/// signer may have moved on since.
+/// signer may have moved on since. What reading and checking it takes is made off the shards
+/// (`read`, `check`: goal 9, plan 01a1a87b2cec step 3); the shard only waits for that and for the store.
 pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<Result<Taken, Refused>> {
-    let digest = digest_of(bundle);
+    let revocations = crate::identities::revocations(store).await?;
+    let Read { digest, envelope, verdict } = read(bundle, root, &revocations, came_from, at).await?;
     if !digest.is_empty() && kept(store, &digest).await? {
         return Ok(Ok(Taken { digest, again: true, broke: None }));
     }
-    let revocations = crate::identities::revocations(store).await?;
-    let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at, ..Refusal::default() };
-    let (checked, signer) = verified(bundle, root, &revocations, at).await?;
-    let c = match checked {
-        Ok(c) => c,
-        Err(e) => {
-            // Who signed it, as its certificate says, revocations aside (`verified`): a copy left
+    let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest.clone(), act: act.to_owned(), signer, why, envelope: envelope.clone(), came_from: came_from.to_owned(), at, ..Refusal::default() };
+    let (kind, rows) = match verdict {
+        Verdict::Custody { kind, rows } => (kind, *rows),
+        Verdict::Unsigned { why, signer } => {
+            // Who signed it, as its certificate says, revocations aside (`read`): a copy left
             // behind signs as the epoch it left.
             let (epoch, superseded_by) = left(store, &signer).await?;
-            let why = e.to_string();
             refuse(store, Refusal { epoch, superseded_by, ..refusal("a signed statement", signer, why.clone()) }).await?;
             return Ok(Err(Refused::Unsigned(why)));
         }
-    };
-    let (kind, counterpart) = match c.payload_type.as_str() {
-        PAYLOAD_CUSTODY => match custody::body(&c) {
-            Ok(b) => (Some(b.kind), if b.kind == Kind::Received { b.from } else { b.to }),
-            Err(e) => {
-                refuse(store, refusal("a custody record", c.custodian.clone(), e.to_string())).await?;
-                return Ok(Err(Refused::NotCustody(e.to_string())));
-            }
-        },
-        PAYLOAD_DELEGATION => match custody::grant(&c) {
-            Ok(g) => (None, Some(g.delegate)),
-            Err(why) => {
-                refuse(store, refusal("a delegation", c.custodian.clone(), why.clone())).await?;
-                return Ok(Err(Refused::NotCustody(why)));
-            }
-        },
-        other => {
-            let why = format!("it's a {other} statement, not a custody record or a delegation");
-            refuse(store, refusal("a signed statement", c.custodian.clone(), why.clone())).await?;
+        Verdict::NotCustody { act, why, custodian } => {
+            refuse(store, refusal(act, custodian, why.clone())).await?;
             return Ok(Err(Refused::NotCustody(why)));
         }
     };
-    let again = !keep(store, &c, kind, counterpart, bundle, came_from).await?;
+    let taken = rows.digest.clone();
+    let again = !keep(store, rows).await?;
     let mut broke = None;
     if kind.is_some() && !again {
-        broke = check(store, root, org, &c.digest, &revocations, at).await?;
-        for waiting in followers(store, &c.digest).await? {
+        broke = check(store, root, org, &taken, &revocations, at).await?;
+        for waiting in followers(store, &taken).await? {
             check(store, root, org, &waiting, &revocations, at).await?;
         }
     }
     // A delegation: the records taken for someone under it that waited for it (they come from
     // other machines, in any order) are checked now.
     if kind.is_none() && !again {
-        for waiting in under_it(store, &c.digest).await? {
+        for waiting in under_it(store, &taken).await? {
             check(store, root, org, &waiting, &revocations, at).await?;
         }
     }
-    Ok(Ok(Taken { digest: c.digest, again, broke }))
+    Ok(Ok(Taken { digest: taken, again, broke }))
 }
 
-/// `bundle` checked as [`statement::verify`] checks it, against kiln's root `root` and
-/// `revocations` as of `at`, and, refused, who signed it as its certificate says, revocations aside:
-/// on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3). Its signature and its
-/// certificate chain are several public-key verifications, a third of a millisecond together on the
-/// lab machine, which kiln's server ran for each batch of every conversation feed on one shard: its
-/// polls that held a shard longest, calm.
-async fn verified(bundle: &Value, root: &[u8], revocations: &[Revocation], at: i64) -> anyhow::Result<(Result<Checked, statement::Refusal>, String)> {
-    let (bundle, root, revocations) = (bundle.clone(), root.to_vec(), revocations.to_vec());
+/// A statement as [`take`] reads it ([`read`]): its digest ("" when it can't be read), its envelope as kiln keeps it,
+/// and what kiln makes of it.
+struct Read {
+    digest: String,
+    envelope: String,
+    verdict: Verdict,
+}
+
+/// What kiln makes of a statement it's to take.
+enum Verdict {
+    /// It doesn't check: why, and who signed it as its certificate says, revocations aside.
+    Unsigned { why: String, signer: String },
+    /// It checks, but isn't a custody record or a delegation kiln reads: what it was taken for, why, and its signer.
+    NotCustody { act: &'static str, why: String, custodian: String },
+    /// A custody record (its kind) or a delegation (none), with the rows that keep it.
+    Custody { kind: Option<Kind>, rows: Box<Rows> },
+}
+
+/// `bundle` read for [`take`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): its digest, its
+/// envelope written, its check against kiln's root `root` and `revocations` as of `at` (its signature and certificate
+/// chain: several public-key verifications, a third of a millisecond together on the lab machine), its body read and
+/// its rows made, and the statement let go there. In g9p6's calm profile taking records held the shards' threads for
+/// 8.6% of their cycles with the check on the pool already: the digest, the envelope, the body, the rows and the hop
+/// ([`check`]), between its waits for the store.
+async fn read(bundle: &Value, root: &[u8], revocations: &[Revocation], came_from: &str, at: i64) -> anyhow::Result<Read> {
+    let (bundle, root, revocations, came_from) = (bundle.clone(), root.to_vec(), revocations.to_vec(), came_from.to_owned());
     crate::rt::compute(move || {
-        let checked = statement::verify(&bundle, &root, &revocations, at);
-        let signer = match &checked {
-            Ok(_) => String::new(),
-            Err(_) => statement::verify(&bundle, &root, &[], at).map(|c| c.custodian).unwrap_or_default(),
+        let (digest, envelope) = (digest_of(&bundle), bundle.to_string());
+        let verdict = match statement::verify(&bundle, &root, &revocations, at) {
+            Ok(c) => verdict_of(&c, envelope.clone(), came_from),
+            Err(e) => Verdict::Unsigned { why: e.to_string(), signer: statement::verify(&bundle, &root, &[], at).map(|c| c.custodian).unwrap_or_default() },
         };
-        (checked, signer)
+        Read { digest, envelope, verdict }
     })
     .await
+}
+
+/// What checked statement `c` is to kiln: a custody record or a delegation, with its rows; or not one kiln reads.
+fn verdict_of(c: &Checked, envelope: String, came_from: String) -> Verdict {
+    let not = |act: &'static str, why: String| Verdict::NotCustody { act, why, custodian: c.custodian.clone() };
+    let (kind, counterpart) = match c.payload_type.as_str() {
+        PAYLOAD_CUSTODY => match custody::body(c) {
+            Ok(b) => (Some(b.kind), if b.kind == Kind::Received { b.from } else { b.to }),
+            Err(e) => return not("a custody record", e.to_string()),
+        },
+        PAYLOAD_DELEGATION => match custody::grant(c) {
+            Ok(g) => (None, Some(g.delegate)),
+            Err(why) => return not("a delegation", why),
+        },
+        other => return not("a signed statement", format!("it's a {other} statement, not a custody record or a delegation")),
+    };
+    Verdict::Custody { kind, rows: Box::new(rows(c, kind, counterpart, envelope, came_from)) }
 }
 
 /// The records that act under delegation `digest`.
@@ -1065,12 +1083,46 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
     Ok(Ok(got.digest))
 }
 
-/// Keeps `c`: whether it's new (false: kiln had it).
-async fn keep(store: &Store, c: &Checked, kind: Option<Kind>, counterpart: Option<String>, bundle: &Value, came_from: &str) -> anyhow::Result<bool> {
-    let (digest, payload_type, kind, custodian) = (c.digest.clone(), c.payload_type.clone(), kind.map(kind_name), c.custodian.clone());
-    let (stream, seq, under, envelope, came_from, taken_at) = (c.statement.stream.clone(), c.statement.seq.and_then(|s| i64::try_from(s).ok()), c.statement.under.clone(), bundle.to_string(), came_from.to_owned(), c.at);
-    let follows = c.statement.follows.clone();
-    let things: Vec<(String, String, String)> = c.statement.subject.iter().flat_map(|s| s.digest.iter().map(|(alg, hex)| (s.name.clone(), alg.clone(), hex.clone()))).collect();
+/// A record's rows as [`keep`] writes them: made where it was checked, off the shards for what kiln takes ([`read`]).
+struct Rows {
+    digest: String,
+    payload_type: String,
+    kind: Option<String>,
+    custodian: String,
+    counterpart: Option<String>,
+    stream: Option<String>,
+    seq: Option<i64>,
+    under: Option<String>,
+    envelope: String,
+    came_from: String,
+    taken_at: i64,
+    follows: Vec<String>,
+    /// Each thing it names: its name, an algorithm and its digest by it.
+    things: Vec<(String, String, String)>,
+}
+
+/// `c`'s rows, of kind `kind` with `counterpart`, its envelope `envelope`, come over `came_from`.
+fn rows(c: &Checked, kind: Option<Kind>, counterpart: Option<String>, envelope: String, came_from: String) -> Rows {
+    Rows {
+        digest: c.digest.clone(),
+        payload_type: c.payload_type.clone(),
+        kind: kind.map(kind_name),
+        custodian: c.custodian.clone(),
+        counterpart,
+        stream: c.statement.stream.clone(),
+        seq: c.statement.seq.and_then(|s| i64::try_from(s).ok()),
+        under: c.statement.under.clone(),
+        envelope,
+        came_from,
+        taken_at: c.at,
+        follows: c.statement.follows.clone(),
+        things: c.statement.subject.iter().flat_map(|s| s.digest.iter().map(|(alg, hex)| (s.name.clone(), alg.clone(), hex.clone()))).collect(),
+    }
+}
+
+/// Keeps a record by its rows: whether it's new (false: kiln had it).
+async fn keep(store: &Store, rows: Rows) -> anyhow::Result<bool> {
+    let Rows { digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at, follows, things } = rows;
     store
         .call(move |conn| {
             let tx = crate::store::tx(conn)?;
@@ -1109,6 +1161,12 @@ async fn followers(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
 /// The records kiln has among `digests`, each checked as of when kiln took it (a revocation
 /// since doesn't undo it).
 async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation]) -> anyhow::Result<BTreeMap<String, Checked>> {
+    load_with(store, root, digests, revocations, |records| records).await
+}
+
+/// [`load`], with `then` made of the records in the same job on the compute pool, off the shards, and the records let
+/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]).
+async fn load_with<T: Send + 'static>(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation], then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
     let wanted = digests.to_vec();
     let rows: Vec<(String, String, i64)> = store
         .call(move |c| {
@@ -1122,7 +1180,7 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
             Ok(out)
         })
         .await?;
-    // Each checked again as of when kiln took it, on the compute pool, off the shards (`verified`).
+    // Each checked again as of when kiln took it, on the compute pool, off the shards (`read`).
     let (root, revocations) = (root.to_vec(), revocations.to_vec());
     crate::rt::compute(move || {
         let mut map = BTreeMap::new();
@@ -1141,34 +1199,45 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
                 Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
             }
         }
-        map
+        then(map)
     })
     .await
 }
 
 /// Checks record `digest`'s own hop, at `at`: a break, recorded, if it doesn't hold; none if it
 /// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
-/// delegation it acts under (W27-R08: another machine's, which comes in any order).
+/// delegation it acts under (W27-R08: another machine's, which comes in any order). Its records are
+/// read and its hop walked on the compute pool, with their loads ([`load_with`]).
 async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
-    let mine = load(store, root, &[digest.to_owned()], revocations).await?;
-    let Some(r) = mine.get(digest) else { return Ok(None) };
-    let follows = r.statement.follows.clone();
-    let held_for = custody::body(r).is_ok_and(|b| b.kind.takes() && b.held_for.as_deref().is_some_and(|w| !w.is_empty()));
-    let wanted: Vec<String> = follows.iter().cloned().chain(r.statement.under.clone().filter(|_| held_for)).collect();
-    let mut map = load(store, root, &wanted, revocations).await?;
-    if wanted.iter().any(|f| !map.contains_key(f)) {
-        return Ok(None);
-    }
-    map.extend(mine);
-    match custody::hop(digest, &map, &server_uri(org)) {
-        Ok(_) => Ok(None),
-        Err(b) => {
-            let mut around = follows;
-            around.insert(0, digest.to_owned());
-            record_break(store, digest, &b, &around, &relay_named(&b, digest, &map), at).await?;
-            Ok(Some(b.to_string()))
+    let d = digest.to_owned();
+    let wants = load_with(store, root, std::slice::from_ref(&d), revocations, {
+        let d = d.clone();
+        move |mine| {
+            let r = mine.get(&d)?;
+            let held_for = custody::body(r).is_ok_and(|b| b.kind.takes() && b.held_for.as_deref().is_some_and(|w| !w.is_empty()));
+            let wanted: Vec<String> = r.statement.follows.iter().cloned().chain(r.statement.under.clone().filter(|_| held_for)).collect();
+            Some((mine, wanted))
         }
-    }
+    })
+    .await?;
+    let Some((mine, wanted)) = wants else { return Ok(None) };
+    let (needed, org) = (wanted.clone(), org.to_owned());
+    let broken = load_with(store, root, &wanted, revocations, move |mut map| {
+        if needed.iter().any(|f| !map.contains_key(f)) {
+            return None;
+        }
+        let follows = mine.get(&d).map(|r| r.statement.follows.clone()).unwrap_or_default();
+        map.extend(mine);
+        let b = custody::hop(&d, &map, &server_uri(&org)).err()?;
+        let mut around = follows;
+        around.insert(0, d.clone());
+        let relay = relay_named(&b, &d, &map);
+        Some((b, around, relay))
+    })
+    .await?;
+    let Some((b, around, relay)) = broken else { return Ok(None) };
+    record_break(store, digest, &b, &around, &relay, at).await?;
+    Ok(Some(b.to_string()))
 }
 
 /// Records break `b` at record `record`, with the records around it, once; naming `relay` when
@@ -1241,12 +1310,12 @@ pub(crate) async fn refused_relayed(store: &Store, digest: &str, what: &str, rel
 /// is its own check's). Whether it's new.
 pub(crate) async fn keep_originator(store: &Store, root: &[u8], bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<bool> {
     let c = verify_off(bundle, root, Vec::new(), at).await?.map_err(|e| anyhow::anyhow!("{e}"))?;
-    keep(store, &c, None, None, bundle, came_from).await
+    keep(store, rows(&c, None, None, bundle.to_string(), came_from.to_owned())).await
 }
 
 /// [`keep_originator`], `c` its check made already (a relayed act's, `crate::relays::call`): not made again.
 pub(crate) async fn keep_originator_checked(store: &Store, c: &Checked, bundle: &Value, came_from: &str) -> anyhow::Result<bool> {
-    keep(store, c, None, None, bundle, came_from).await
+    keep(store, rows(c, None, None, bundle.to_string(), came_from.to_owned())).await
 }
 
 /// [`statement::verify`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a statement's

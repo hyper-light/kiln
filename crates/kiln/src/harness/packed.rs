@@ -28,10 +28,18 @@ const STORED_MAX: usize = u16::MAX as usize;
 /// An empty stored block that's final: what ends a stream of pieces that each end on a sync flush.
 const END: [u8; 5] = [1, 0, 0, 0xff, 0xff];
 
+#[cfg(test)]
+thread_local! {
+    /// Segments inflated on this thread (goal 10, plan 01a1a87b2dae step 5's tests: what a read inflated).
+    pub(crate) static INFLATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What a segment holds, inflated again (goal 11 reads an event's text out of its chunk's so): its
 /// raw deflate ended with [`END`], checked against the length and CRC-32 it says it holds.
 pub fn inflate(s: &Segment) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
+    #[cfg(test)]
+    INFLATED.with(|n| n.set(n.get() + 1));
     let mut out = Vec::with_capacity(usize::try_from(s.len).unwrap_or(0));
     flate2::read::DeflateDecoder::new(s.deflated.as_ref().chain(END.as_slice())).read_to_end(&mut out)?;
     if u64::try_from(out.len()).ok() != Some(s.len) || crc32fast::hash(&out) != s.crc {
@@ -148,6 +156,17 @@ impl Gzip {
             self.segment(&deflate(level, [bytes])?);
         }
         Ok(())
+    }
+
+    /// What it's made so far that hasn't been taken (its header with the first): a member sent as it's made
+    /// goes out a piece at a time (goal 11, plan 01a1a87b2e56 step 5), [`Gzip::finish`] giving the rest.
+    pub fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// The bytes it's made since what was last taken.
+    pub fn made(&self) -> usize {
+        self.out.len()
     }
 
     /// The member: an empty final stored block, then the trailer (the CRC-32 and the length of all it

@@ -33,6 +33,10 @@ struct Space {
     owner: &'static Owner,
     bound: usize,
     held: AtomicUsize,
+    /// Its subscribers now ([`Ring::receiver_count`]), counted here so that asking takes no lock: async-broadcast
+    /// answers it under its channel's lock, which every send takes too (goal 4, plan 01a1a59c2a9c step 5: every
+    /// change of an agent session's info asked, from each session's owner shard, before it sent).
+    subscribers: AtomicUsize,
 }
 
 impl Space {
@@ -120,7 +124,7 @@ impl<T: Clone + Weigh> Ring<T> {
         let made = places.saturating_mul(place::<T>());
         let bound = made.saturating_add(bytes);
         owner.bound_add(bound);
-        let space = Arc::new(Space { owner, bound, held: AtomicUsize::new(0) });
+        let space = Arc::new(Space { owner, bound, held: AtomicUsize::new(0), subscribers: AtomicUsize::new(0) });
         space.take(made);
         Self { tx, _keep_open: rx.deactivate(), space, places }
     }
@@ -160,12 +164,13 @@ impl<T: Clone + Weigh> Ring<T> {
 impl<T> Ring<T> {
     /// A subscriber from now: each message sent after this.
     pub fn subscribe(&self) -> Subscription<T> {
+        self.space.subscribers.fetch_add(1, Ordering::AcqRel);
         Subscription { rx: self.tx.new_receiver(), _space: Arc::clone(&self.space) }
     }
 
-    /// Subscribers now.
+    /// Subscribers now, counted as they come and go, so reading it takes none of the channel's lock.
     pub fn receiver_count(&self) -> usize {
-        self.tx.receiver_count()
+        self.space.subscribers.load(Ordering::Acquire)
     }
 
     /// What it holds now, in bytes: its places and its messages past them.
@@ -186,6 +191,12 @@ pub struct Subscription<T> {
     rx: async_broadcast::Receiver<Kept<T>>,
     /// The ring's places are let go with the last of its ends: its subscribers among them.
     _space: Arc<Space>,
+}
+
+impl<T> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        self._space.subscribers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl<T: Clone> Subscription<T> {
@@ -285,6 +296,25 @@ mod tests {
             anyhow::ensure!(ring.receiver_count() == 0);
             Ok(())
         })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a ring's subscribers are counted as they come and go, the count the
+    /// channel keeps under its lock, read without it.
+    #[test]
+    fn g4_s5_a_rings_subscribers_are_counted_without_its_lock() {
+        static OWNER: Owner = Owner::new("test_ring_subscribers");
+        let ring = Ring::<Item>::new(&OWNER, 4, 1 << 10);
+        let counts = |ring: &Ring<Item>| (ring.receiver_count(), ring.tx.receiver_count());
+        assert_eq!(counts(&ring), (0, 0));
+        let (a, b) = (ring.subscribe(), ring.subscribe());
+        assert_eq!(counts(&ring), (2, 2));
+        drop(a);
+        assert_eq!(counts(&ring), (1, 1));
+        let c = ring.subscribe();
+        drop(b);
+        assert_eq!(counts(&ring), (1, 1));
+        drop(c);
+        assert_eq!(counts(&ring), (0, 0));
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: past its count a ring lets its oldest go as before, its bytes

@@ -6,8 +6,12 @@
 //! actions), Normal (the API) or Background (agents' and CI's polling, catch-ups, sync, telemetry), read from
 //! its method, its path and the credentials it carries ([`class_of`]). The connection's task runs at the most
 //! urgent class it serves now ([`Connection`]: an HTTP/2 connection serves many requests in one task), so its
-//! shard gives it its class's share and urgency. The credentials are read, not checked: a forged cookie buys
-//! a request a place ahead and nothing past its own authentication, which it meets as ever.
+//! shard gives it its class's share and urgency; between requests at Critical, to read the next head. A request
+//! less urgent than that, its head read in Critical's turn, gives way before its handler runs in that task to a
+//! more urgent task waiting on the shard ([`Serving::demoted`], `crate::placement::request`,
+//! `hyper_rt::coop::give_way`): else every API call on a kept-alive connection ran on in Critical's turn, and a
+//! person's page woken behind them queued behind them. The credentials are read, not checked: a forged cookie buys a request a
+//! place ahead and nothing past its own authentication, which it meets as ever.
 //!
 //! **Shedding.** Goal 1's probe on each shard (`crate::shard_health`) ticks the shard's watches every period
 //! ([`tick`]), with no probe of this module's own: the API's (Normal) reads the shard's delay, how late the
@@ -186,30 +190,32 @@ impl Connection {
     /// A connection's, its task reading its first request (Critical: [`Connection::apply`]).
     pub fn new() -> Arc<Self> {
         let conn = Arc::new(Self::default());
-        conn.apply();
+        let _ = conn.apply();
         conn
     }
 
     /// A request begins: classed, its class put on it (an extension the API reads), and the connection's task
-    /// set to the most urgent class it now serves. The guard ends it.
+    /// set to the most urgent class it now serves. The guard ends it, and says whether the request lowered the
+    /// task's class ([`Serving::demoted`]).
     pub fn begin(self: &Arc<Self>, req: &mut Request) -> Serving {
         let class = class_of(req.method(), req.uri().path(), req.headers());
         req.extensions_mut().insert(class);
         if let Some(n) = self.serving.get(class as usize) {
             n.fetch_add(1, Ordering::Relaxed);
         }
-        self.apply();
-        Serving { conn: Arc::clone(self), class }
+        let (had, now) = self.apply();
+        Serving { conn: Arc::clone(self), class, demoted: had.is_some_and(|had| now < had) }
     }
 
-    /// The task's class: the most urgent served now; serving none, Critical, since what it does then is read its
-    /// next request's head, which costs little and must come before the request's own class is known.
-    fn apply(&self) {
+    /// Sets the task's class: the most urgent served now; serving none, Critical, since what it does then is read
+    /// its next request's head, which costs little and must come before the request's own class is known. The
+    /// class the task had (`None` off a task) and the one it has now.
+    fn apply(&self) -> (Option<Class>, Class) {
         let class = [Class::Critical, Class::Normal, Class::Background]
             .into_iter()
             .find(|class| self.serving.get(*class as usize).is_some_and(|n| n.load(Ordering::Relaxed) > 0))
             .unwrap_or(Class::Critical);
-        let _ = hyper_rt::coop::set_class(class);
+        (hyper_rt::coop::set_class(class), class)
     }
 }
 
@@ -218,12 +224,21 @@ impl Connection {
 pub struct Serving {
     conn: Arc<Connection>,
     class: Class,
+    demoted: bool,
 }
 
 impl Serving {
     /// The request's class: what its handler's task starts in where it is placed apart (goal 7, `crate::placement`).
     pub fn class(&self) -> Class {
         self.class
+    }
+
+    /// Whether the request lowered its connection's task to a less urgent class than it had (step 3): its head was
+    /// read in the turn of a more urgent class than its own (Critical, the class a connection's task reads heads
+    /// in), so its handler, where it stays in that task, should take its own class's turn before it runs rather
+    /// than go on in that one (`crate::placement::request`).
+    pub fn demoted(&self) -> bool {
+        self.demoted
     }
 }
 
@@ -262,7 +277,7 @@ impl Drop for Serving {
         if let Some(n) = self.conn.serving.get(self.class as usize) {
             n.fetch_sub(1, Ordering::Relaxed);
         }
-        self.conn.apply();
+        let _ = self.conn.apply();
     }
 }
 
@@ -1022,6 +1037,73 @@ mod tests {
         ] {
             assert_eq!(req(method.clone(), path, headers), class, "{method} {path} {headers:?}");
         }
+    }
+
+    /// One shard of hyper-rt's own, for a test that needs a task to set classes on and nothing else running beside
+    /// it: a quantum of 250 µs, the server's (`crate::rt::STEP_BUDGET_NS`).
+    fn one_shard() -> anyhow::Result<hyper_rt::runtime::LocalRuntime> {
+        hyper_rt::runtime::LocalRuntime::new(&hyper_rt::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 32,
+            timers_per_shard: 32,
+            interests_per_shard: 64,
+            ring_entries: 32,
+            step_budget_ns: crate::rt::STEP_BUDGET_NS,
+            timer_tick_ns: 50_000,
+            batch: 32,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .map_err(|e| anyhow::anyhow!("a shard: {e}"))
+    }
+
+    /// `method path` with `headers`, as a connection's task is handed it.
+    fn request(method: Method, path: &str, headers: &[(&str, &str)]) -> anyhow::Result<Request> {
+        let mut b = http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        Ok(b.body(srv::Incoming::empty())?)
+    }
+
+    /// Step 3: a connection's task reads each head as Critical; a request less urgent than that lowers the task to
+    /// its own class and says so (demoted), so its handler takes its class's turn; a Critical one doesn't. With a
+    /// Critical request in flight (HTTP/2's streams share the task) the task stays Critical, and a less urgent
+    /// request beside it is not demoted; each request's end sets the task to the most urgent still served.
+    #[test]
+    fn g6_s3_a_request_less_urgent_than_its_connections_turn_is_demoted() -> anyhow::Result<()> {
+        use Class::{Background as B, Critical as C, Normal as N};
+        let token = [("authorization", "Bearer kiln_pat_x")];
+        let (api, page, catch_up) = (request(Method::GET, "/api/runs", &token)?, request(Method::GET, "/agents/a1", &[])?, request(Method::GET, "/api/harness/sessions/s1/events", &token)?);
+        let seen = one_shard()?.block_on(async move {
+            let (mut api, mut page, mut catch_up) = (api, page, catch_up);
+            let class = hyper_rt::coop::class;
+            let conn = Connection::new();
+            let mut seen = vec![class()];
+            let call = conn.begin(&mut api);
+            seen.extend([class(), Some(call.class())]);
+            let demoted = vec![call.demoted()];
+            drop(call);
+            seen.push(class());
+            let shown = conn.begin(&mut page);
+            let beside = conn.begin(&mut catch_up);
+            seen.extend([class(), Some(beside.class())]);
+            let demoted = [demoted, vec![shown.demoted(), beside.demoted()]].concat();
+            drop(shown);
+            seen.push(class());
+            drop(beside);
+            seen.push(class());
+            (seen, demoted, api.extensions().get::<Class>().copied())
+        });
+        let (seen, demoted, put) = seen.map_err(|e| anyhow::anyhow!("the shard: {e}"))?;
+        assert_eq!(seen, [Some(C), Some(N), Some(N), Some(C), Some(C), Some(B), Some(B), Some(C)], "the task's class through the requests");
+        assert_eq!(demoted, [true, false, false], "the API call demoted the task; the page and the catch-up beside it didn't");
+        assert_eq!(put, Some(N), "the request carries its class");
+        Ok(())
     }
 
     /// A deterministic generator for the replayed traces (xorshift64*, as headroom's detector's tests'), so each
