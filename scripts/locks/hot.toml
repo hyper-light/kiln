@@ -24,6 +24,8 @@ hot = [
   "crates/kiln/src/shard_health.rs",
   "crates/kiln/src/pool_health.rs",
   "crates/kiln/src/metrics.rs",
+  # kiln's own log lines, from whatever thread logs: shards among them (goal 9, plan 01a1a87b2cec step 3).
+  "crates/kiln/src/log_lines.rs",
   # Websockets: an agent session's live feed to its viewers, and the pages' sockets.
   "crates/kiln/src/harness/live.rs",
   "crates/kiln/src/harness/broadcast.rs",
