@@ -56,8 +56,8 @@ struct Common {
     /// CI legs and agents run on bare metal (docs/priority.md; Linux with systemd's user manager).
     #[arg(long, default_value = "shared")]
     layout: String,
-    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time) or `small` (to try
-    /// the lab out).
+    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `many` (all of
+    /// production's live sessions at work at once) or `small` (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -176,7 +176,8 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
         "small" => Profile::small(),
         "realistic" => Profile::realistic(),
         "overload" => Profile::overload(),
-        p => anyhow::bail!("no profile {p}: realistic, overload or small"),
+        "many" => Profile::many(),
+        p => anyhow::bail!("no profile {p}: realistic, overload, many or small"),
     };
     if let Some(w) = c.window {
         profile.window_s = w;

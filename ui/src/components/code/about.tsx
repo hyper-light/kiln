@@ -1,18 +1,21 @@
 "use client";
 /**
- * About this code: in an agent's conversation (and its Changes panel, and the review page's diffs
- * an agent made), tap a name or a line of a diff or a code block and a card opens under the line.
+ * About this code: in an agent's conversation (and its Changes panel, the review page's diffs an
+ * agent made, and every diff in Ship's review), tap a name or a line of a diff or a code block and a
+ * card opens under the line.
  * Tap another line's number, or another line, to take in the lines between. **About** asks a
  * helper of the agent (reading only) what it is, what it does there, where else it's used and
  * what's worth knowing, and its answer streams into the card. Closing the card ends the helper:
  * an answer isn't kept (and kiln ends a helper no card reads: `crates/kiln/src/harness/about.rs`).
  * With subagents off the agent answers itself, and its answer streams into the card from its
- * conversation. The card is a band across the code, ruled above and below; it slides open and
- * shut, and nothing under it jumps while it works (its answer's room is kept from the start).
+ * conversation. Code no agent made (a person's change in Ship, a host's pull request) is asked of a
+ * helper kiln starts for the person (`start`: Ship's `ci.repos.about`), reading the repository at
+ * that commit. The card is a band across the code, ruled above and below; it slides open and shut,
+ * and nothing under it jumps while it works (its answer's room is kept from the start).
  */
 import * as React from "react";
 import { flushSync } from "react-dom";
-import { harnessApi, useSession, type AgentResult, type HEvent, type SessionStore } from "@/api/harness";
+import { harnessApi, useSession, type AboutAsk, type AgentResult, type HEvent, type SessionStore } from "@/api/harness";
 import { copyText } from "@/views/terminal/clipboard";
 import "./about.css";
 
@@ -26,7 +29,12 @@ export interface AboutAgent {
   busy: boolean;
   /** Its conversation, where it answers itself (none: the card says it went there). */
   store?: SessionStore;
+  /** Code no agent made: how asking starts the helper kiln starts for the person instead (Ship). */
+  start?: (ask: AboutAsk) => Promise<AboutStarted>;
 }
+
+/** What asking started: a helper reading (`agents`), or the agent asked itself (`itself`). */
+export type AboutStarted = Awaited<ReturnType<typeof harnessApi.about>>;
 
 /** Given only where code is an agent's: code elsewhere can't be asked about. */
 export const AboutContext = React.createContext<AboutAgent | null>(null);
@@ -381,7 +389,8 @@ export function AboutCard({ ask, onClose, closing = false, onGone }: { ask: Aske
     setQuestion(null);
     setStep({ at: "starting", question: o.question });
     try {
-      const r = await harnessApi.about(agent.id, { path: ask.path, code: ask.code, line: ask.line, end_line: ask.end, selection: ask.selection, change: ask.change, question: o.question, now: o.now });
+      const q: AboutAsk = { path: ask.path, code: ask.code, line: ask.line, end_line: ask.end, selection: ask.selection, change: ask.change, question: o.question, now: o.now };
+      const r = await (agent.start ? agent.start(q) : harnessApi.about(agent.id, q));
       const child = r.agents[0];
       setStep(
         r.itself
@@ -447,7 +456,11 @@ export function AboutCard({ ask, onClose, closing = false, onGone }: { ask: Aske
               </button>
             </div>
             <p className="hx-about-note">
-              {agent.subagents ? `A helper of ${name}'s reads the repository to answer, changing nothing.` : `Subagents are off for ${name}: it answers itself.`}
+              {agent.start
+                ? "kiln starts a helper that reads the repository to answer, changing nothing."
+                : agent.subagents
+                  ? `A helper of ${name}'s reads the repository to answer, changing nothing.`
+                  : `Subagents are off for ${name}: it answers itself.`}
               {lines && " Tap another line to take in the lines between."}
             </p>
           </Fold>
@@ -475,7 +488,7 @@ export function AboutCard({ ask, onClose, closing = false, onGone }: { ask: Aske
                   <span>
                     {step.at === "answer" ? (
                       <>
-                        <b>{step.name}</b> · a helper of {name}&apos;s
+                        <b>{step.name}</b> · {agent.start ? "a helper kiln started" : <>a helper of {name}&apos;s</>}
                       </>
                     ) : step.at === "itself" ? (
                       <>
