@@ -595,6 +595,16 @@ python3 scripts/locks.py rank census/run.json
   processes' copy changes only as processes come and go and as what they hold changes: a session's
   update from the process holding it, and a message about what one holds, read it without writing
   (`Instances::routes`).
+- **What agent sessions' updates read beside their copies** (the registry's names given here, epochs,
+  which runner process holds each, keep-offs, changesets waiting for the conversation store, what each
+  machine offers, uploads, starts under way) and **each machine's agent limit** are copies too: a
+  session's state read on its copy's shard takes no lock the shards share, and a copy is swapped in only
+  when something changes (a name taken up, a holder moved, an epoch raised). Two writers that hand work to
+  a writer of their own on the blocking pool (holders.json, changesets) read its flag past a SeqCst fence
+  that pairs with the writer's, so a change made as the writer lets go is written by it or starts the next.
+  Three registry locks are off the hot path, `hot.toml` saying why: the server's own transcripts' scanner
+  and holders.json's one writer, both on the blocking pool, and messages waiting for their inbox's answer
+  (CP-T3.2), taken twice a message.
 - **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
   cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
