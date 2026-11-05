@@ -218,7 +218,9 @@ impl Entry {
 /// discipline as the fleet coordinator's period count in `slates-server`): the loop's step count, its
 /// driver-wait count, the tasks it has admitted and completed, the admissions it has **refused** because
 /// its arena was full, and its longest single poll — stored by the owning shard from its own `Counters`
-/// (which live behind the shard's single-threaded borrow) once per step. An observer reads them to tell a
+/// (which live behind the shard's single-threaded borrow) as each moves: the steps once per step, the waits
+/// at each wait, the rest where the shard counts them (kiln's goal 9, plan 01a1a87b2cec step 5: each step stored
+/// them all, reading counters on lines a shard's turn otherwise leaves alone). An observer reads them to tell a
 /// shard that is stepping — alive, however slowly under CPU load — from one that has stopped: parked with
 /// no kick (a wedge), or held inside one long poll (`longest_step_ns` climbs); and to tell a shard whose
 /// task arena is saturating (`admission_refused` climbs, so a new operation's task cannot be spawned) from
@@ -320,6 +322,33 @@ impl Pulse {
     /// The owning shard records its driver-wait count as it enters a wait.
     pub fn record_waits(&self, waits: u64) {
         self.waits.store(waits, Ordering::Relaxed);
+    }
+
+    /// The owning shard records its step count after each step.
+    pub fn record_steps(&self, steps: u64) {
+        self.steps.store(steps, Ordering::Relaxed);
+    }
+
+    /// The owning shard records the tasks it has admitted, as it admits one.
+    pub fn record_spawns(&self, spawns: u64) {
+        self.spawns.store(spawns, Ordering::Relaxed);
+    }
+
+    /// The owning shard records the tasks whose future returned, as one does.
+    pub fn record_completed(&self, completed: u64) {
+        self.completed.store(completed, Ordering::Relaxed);
+    }
+
+    /// The owning shard records the admissions it has refused, as it refuses one.
+    pub fn record_admission_refused(&self, admission_refused: u64) {
+        self.admission_refused
+            .store(admission_refused, Ordering::Relaxed);
+    }
+
+    /// The owning shard records its longest single poll, as it grows.
+    pub fn record_longest_step_ns(&self, longest_step_ns: u64) {
+        self.longest_step_ns
+            .store(longest_step_ns, Ordering::Relaxed);
     }
 
     /// Loop iterations the shard has run.
