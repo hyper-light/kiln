@@ -173,13 +173,14 @@ fn untouched(u: &Item, items: &[Item]) -> bool {
 /// under way at once (those ready to start, with those under way here or on subagents), each one
 /// ready that the agent hasn't started, in the stack's order; `agent_first`, the first of them left
 /// to the agent when it has none of the plan's steps under way. Only the steps of the plan the
-/// stack is at: its goal under way's, else its next goal's.
+/// stack is at: the agent's own goal under way's (`goals::under_way`: not one under way beside it on
+/// subagents), else its next goal's.
 pub(super) fn to_hand<'a>(stack: &'a Stack, g: &Graph, room: usize, agent_first: bool) -> Vec<&'a Item> {
     if room == 0 || g.is_empty() {
         return Vec::new();
     }
     let items = stack.items.as_slice();
-    let first = items.iter().find(|i| i.status == "active").or_else(|| items.iter().find(|i| i.status == "pending" && i.on.is_none()));
+    let first = super::under_way(items).or_else(|| items.iter().find(|i| i.status == "pending" && i.on.is_none()));
     let Some(run) = first.and_then(|i| group_of(i, items, g)) else { return Vec::new() };
     let steps: Vec<&Item> = items.iter().filter(|i| is_step(i) && open(i) && group_of(i, items, g) == Some(run)).collect();
     let can: Vec<&Item> = steps.iter().copied().filter(|u| untouched(u, items) && ready(u, items, g)).collect();
