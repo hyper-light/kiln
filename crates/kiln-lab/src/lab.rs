@@ -729,6 +729,19 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     if let Some(rss) = after.get("process_resident_memory_bytes", &[]) {
         n.insert("server.rss_mb".into(), rss / 1e6);
     }
+    // The resident memory by kind and what each of the server's caches and buffers holds, where the build
+    // says them (`kiln_memory_*`; goal 11, plan 01a1a87b2e56 step 1): anon is what the server's own work
+    // holds, file the binary's pages read in.
+    for kind in after.values_of("kiln_memory_resident_bytes", "kind") {
+        if let Some(b) = after.get("kiln_memory_resident_bytes", &[("kind", kind.as_str())]) {
+            n.insert(format!("server.rss_{kind}_mb"), b / 1e6);
+        }
+    }
+    for owner in after.values_of("kiln_memory_bytes", "owner") {
+        if let Some(b) = after.get("kiln_memory_bytes", &[("owner", owner.as_str())]) {
+            n.insert(format!("server.memory.{owner}_mb"), b / 1e6);
+        }
+    }
     let shards = server_numbers(&mut n, "", before, after, secs);
     // The routes': how long each class took and waited at the server.
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
@@ -798,7 +811,20 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
         }
+        // The most tasks any shard held, where the build says it: what a shard's task slots are sized from
+        // (goal 11, plan 01a1a87b2e56 step 3).
+        let most = shards.iter().filter_map(|sh| after.get("kiln_shard_tasks_most", &[("shard", sh.as_str())])).reduce(f64::max);
+        put("shards.tasks_most".into(), most);
     }
+    // The bus's (goal 11, plan 01a1a87b2e56 step 3): how long a live feed's frame took from its publish to a
+    // viewer's read, the frames published and the viewers sent back to a snapshot: what a topic needs to keep.
+    put("bus.published_per_s".into(), diff("kiln_bus_published_total", &[]).map(per_s));
+    put("bus.lag_notices".into(), diff("kiln_bus_lag_notices_total", &[]));
+    let delivery = histogram("kiln_bus_delivery_seconds", &[]);
+    put("bus.delivery_p99_ms".into(), measure::histogram_quantile(0.99, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_p999_ms".into(), measure::histogram_quantile(0.999, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_top_ms".into(), measure::histogram_top(&delivery).map(|v| v * 1000.0));
+    put("bus.topics".into(), after.get("kiln_bus_topics", &[]));
     // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
     // pool thread.
     if let Some(jobs) = diff("kiln_compute_jobs_total", &[]) {

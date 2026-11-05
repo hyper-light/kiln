@@ -45,6 +45,7 @@ pub mod k8s;
 pub mod keep;
 pub mod logs;
 pub mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod net;
 pub mod observe;
