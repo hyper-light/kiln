@@ -187,7 +187,7 @@ pub struct Synced {
 /// Copy the tree at `root` to `peer` (as `key`), reporting progress to `ev`, handed on by `me`
 /// (`super::custody`). Started over (it then sends only what still differs) when a link drops in
 /// the middle.
-pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &async_channel::Sender<Ev>) -> anyhow::Result<Synced> {
+pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Synced> {
     let mut last_err = None;
     for attempt in 0..4 {
         if attempt > 0 {
@@ -224,8 +224,8 @@ fn handed_tree(tree: &sync::Tree, sent: &std::collections::HashMap<String, Strin
     Ok(digest)
 }
 
-async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &async_channel::Sender<Ev>) -> anyhow::Result<Synced> {
-    let (tx, rx) = async_channel::unbounded::<SyncSay>();
+async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Synced> {
+    let (tx, rx) = crate::memory::queue::unbounded::<SyncSay>(&crate::memory::owners::CHANNELS);
     handle.sync(peer, key, tx).await;
     let leave = || handle.leave(peer, None, Some(key.to_owned()));
     let tree = std::sync::Arc::new(
@@ -246,7 +246,7 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Opti
     for (i, c) in chunks.into_iter().enumerate() {
         handle.sync_ask(peer, SyncAsk::Plan { key: key.to_owned(), entries: c, start: i == 0, more: i + 1 < n }).await;
     }
-    let wait = |rx: &async_channel::Receiver<SyncSay>, d: Duration| {
+    let wait = |rx: &crate::memory::queue::Receiver<SyncSay>, d: Duration| {
         let rx = rx.clone();
         async move {
             match crate::rt::timeout(d, rx.recv()).await {
@@ -365,8 +365,10 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Opti
 }
 
 /// Run what `req` says, start to end: pick, sync, run, stream. Control (input, signals) comes on
-/// `ctl`; when it closes before the run ends, the run is stopped (unless `detach`).
-pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+/// `ctl`; when it closes before the run ends, the run is stopped (unless `detach`). What it says goes on
+/// `ev`. Each a lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae): every piece of a run's
+/// output passes them, a `kiln run`'s and MCP `run`'s.
+pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     if let Err(e) = run_inner(handle, me, req, &ev, ctl).await {
         let _ = ev.send(Ev::Error(format!("{e:#}"))).await;
     }
@@ -386,7 +388,7 @@ fn spec_of(req: &RunReq) -> RunSpec {
     }
 }
 
-async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
     // An agent session's run on another machine is its act: it goes only once kiln takes it as
     // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
     // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
@@ -447,7 +449,7 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     let run_digest = super::custody::run_digest(&session, &spec, &tree);
     let handed = super::custody::run_hand_on(signer.as_ref(), doer.as_deref(), &session, &spec, &tree, (!carried).then_some(peer.as_str()));
     let frames = if carried { vec![handed.frame.clone()] } else { Vec::new() };
-    let (says_tx, says) = async_channel::unbounded::<Say>();
+    let (says_tx, says) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
     let id = handle.run_with(&peer, spec, says_tx, frames).await?;
     // What came back over the link of its custody: the receipt of the run, the output's hand-on,
     // and what this side got of the output, by its SHA-256.
@@ -531,9 +533,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
 /// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
-    let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
+    let (tx, rx) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
     let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
     let mut pid = None;
@@ -646,7 +648,8 @@ fn peer_pid(_fd: &std::os::fd::OwnedFd) -> Option<u32> {
 /// One client: its first request decides what the connection is.
 #[cfg(unix)]
 async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>) {
-    let (req_tx, req_rx) = async_channel::unbounded::<Req>();
+    // What its client asks and what it's told, on lock-free queues, unbounded as the channels they were.
+    let (req_tx, req_rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
     // Requests in (the first, then a run's input and signals), until the client closes.
     let reader = std::sync::Arc::clone(&fd);
     crate::rt::spawn(async move {
@@ -670,7 +673,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         }
     });
-    let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
     // Events out, until the request is answered.
     let writer = std::sync::Arc::clone(&fd);
     let out = crate::rt::spawn(async move {
