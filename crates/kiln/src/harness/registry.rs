@@ -1904,6 +1904,15 @@ impl Registry {
         v
     }
 
+    /// [`Registry::list`], each info as its owner shares it with its view, none copied (goal 9, plan 01a1a87b2cec
+    /// step 5: `agents.list` copied every session's whole info to read a few fields of each).
+    pub fn list_shared(&self) -> Vec<Arc<Info>> {
+        let mut v: Vec<Arc<Info>> = Vec::new();
+        self.sessions.each(|_, view| v.push(Arc::clone(&view.info)));
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
     /// [`Registry::list`] as `GET /api/harness/sessions` answers it, in its order: each session's
     /// info as its owner encoded it once ([`super::copies::View::info_json`]), joined into a JSON
     /// array once for every read that finds the sessions as they were, and answered as it is (goal 10,
