@@ -1100,7 +1100,7 @@ mod tests {
         old.knee.budget = Some(164e3);
         old.knee.lag_us = Some(2.7e9);
         old.not_kiln = Some(NotKiln { write_bps: 1.0, share: None });
-        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }], old, 0);
+        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], old, 0);
         assert_eq!((e.learned.knee.budget, e.learned.cpu_knee.budget, e.learned.cpu_knee.unsafe_at), (None, None, None));
         assert_eq!((e.learned.knee.lag_us, e.learned.not_kiln.clone(), e.learned.version), (Some(2.7e9), None, LEARNED_VERSION));
         // One this build learned is kept.
