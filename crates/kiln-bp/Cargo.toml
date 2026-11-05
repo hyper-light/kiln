@@ -1,0 +1,15 @@
+[package]
+name = "kiln-bp"
+description = "kiln's browser protocol (docs/browser-protocol.md): the frames, their codec, and the sans-IO connection a carrier drives (open, requests, subscriptions, the send scheduler, compression by trust class, liveness)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flate2 = "1.1.10"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.154"

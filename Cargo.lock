@@ -2308,6 +2308,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-bp",
  "kiln-cd",
  "kiln-ci",
  "kiln-http",
@@ -2364,6 +2365,14 @@ dependencies = [
  "winapi-util",
  "x509-parser",
  "zip",
+]
+
+[[package]]
+name = "kiln-bp"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "serde_json",
 ]
 
 [[package]]

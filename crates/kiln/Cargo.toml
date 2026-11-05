@@ -28,6 +28,7 @@ name = "hostile"
 required-features = ["chaos"]
 
 [dependencies]
+kiln-bp = { path = "../kiln-bp" }
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
 # kiln's own HTTP/1.1 and HTTP/2 on hyper-rt (no tokio, no hyper).
