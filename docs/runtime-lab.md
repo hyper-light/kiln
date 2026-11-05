@@ -652,6 +652,12 @@ python3 scripts/locks.py rank census/run.json
   Three registry locks are off the hot path, `hot.toml` saying why: the server's own transcripts' scanner
   and holders.json's one writer, both on the blocking pool, and messages waiting for their inbox's answer
   (CP-T3.2), taken twice a message.
+- **Terminals** (`termsess.rs`): every session, the names given them and where those are kept are
+  copies, and what the list shows of a session (how many are attached, when it was last active, its
+  size, its title, how it ended) are atomics and copies beside it, so the list, a keystroke and a detach
+  take no lock. A session's screen keeps a lock of its own, taken by its relay for its output and by its
+  own viewers as they attach or resize it, so a replay and the live output meet with no byte twice or
+  lost; `hot.toml` says so.
 - **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
   cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
@@ -723,10 +729,16 @@ hands it each relayed frame without waiting, it forwards them in order, and the 
 each runner's announcement from a copy. A live job's files have one writer each, a task of its own that
 writes what it's sent (its runner's chunks, which the hub's loop waits for as it waited for the write; its
 steps; its end) in order, a batch at a time on the blocking pool; a read of the job, and a retry's mark,
-wait for what was sent before, and a retried job's next writer for the last one. Still on the hot path,
-listed so (`todo`): a runner's front door answering reads from its replica (`frontdoor/replica.rs`,
-`store/learner.rs`), the peer-to-peer unification's. Inside Quiver
-(vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
+wait for what was sent before, and a retried job's next writer for the last one. A runner's front
+door answering reads from its replica (the peer-to-peer unification's P2, plan 01a1a283e14c) takes
+its learner from an atomic pointer on each connection, the owners it knows from a copy, whether its
+replica is behind from an atomic, its kept connections to the server from a lock-free queue, and its
+learner's questions of the server from take-once cells; the server's side reads its learners'
+machines from a copy. The live channel's receivers (`wire/link.rs`) are the hub's loop's alone: it
+takes them for each item a runner sends and then its answer, as before, and publishes what they have
+of the stream it changed into a copy per stream, which the commands loop's have-again (every few
+seconds) and a link coming up read: what they say, and when and where acks go, are as they were.
+Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
 ## Goal 7: placement
 
