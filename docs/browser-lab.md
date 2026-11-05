@@ -287,11 +287,24 @@ a JSON string (the escapes are the carrier's cost, in its bytes). Then every fra
 both carriers, the replay's digests the catalogue's (`node check-origin.mjs`, exit 0). `kiln-lab
 browser start-stop` runs the same check through each reference server, the first of its 20 starts
 (`check-origin.mjs served`: the server's HTTP/2, gzip asked for, in a client's namespace).
-SERVED_RESULT
+On 2026-11-05 (`~/.cache/kiln-bp/g1/check5c-ss`, the final configs, h2o's binary
+`8b2d8a23…`, Caddy's `4ef1f68c…`): h2o and Caddy over HTTP/2 and HTTP/3 each came up 20 of 20 and
+stopped clean 20 of 20, served 14 of 14 static bodies byte for byte, and sent on every stream frame
+whole on both carriers, gzipped (75,583 + 23,019 + 11,981 + 6,001 frames each), each frame from its
+stamp to the reader p50 0.1 to 0.3 ms; the p99 was 95 to 141 ms for the events' and a session's
+replay (every frame of the recording sent 1 ms apart; alike in all four servers and on both
+carriers, so no one server holding frames back) and 0.3 to 1.3 ms for a log's and a terminal's.
 
 A target is a record (`crates/kiln-lab/src/browser/targets.rs`): its server, its port, whether it
 is HTTP/3, its carrier for streams, the protocol the page must have got, and the browsers it runs
-in. Each job's record says which protocol each path came over (`nextHopProtocol`).
+in. Each job's record says which protocol each path came over (`nextHopProtocol`), and, for a
+reference server, which its access log says (`server_protocols`: WebKit gives a stream the page
+holds open no timing entry, so a WebKit stream's protocol is the server's word); `check-probe`
+holds every path of every reference server's job to its target's protocol. On 2026-11-05
+(`~/.cache/kiln-bp/g1/check5c`, K = 1, streams and requests): h2o and Caddy over HTTP/2 11 of 11
+paths over h2 in Chromium and in WebKit (WebKit 27.2 in Playwright's image under podman; 3 of its
+11, the streams, by the servers' logs), h2o and Caddy over HTTP/3 11 of 11 over h3 in Chromium;
+`check-probe` exit 0.
 
 ## The baselines
 
@@ -345,7 +358,9 @@ The tuning, and why:
   the lab host to load `tcp_bbr` (f21), which is Ada's to allow; it is used nowhere until she does.
 - QUIC's congestion control: h2o's `cc` set to Cubic (h2o defaults to Reno; its choices are Reno,
   Cubic and Pico: f32); Caddy's is quic-go's Cubic (quic-go has no BBR: f33). The pilot (step 7)
-  measures h2o's Reno against Cubic at 50 kbit/s with 1% loss and keeps the lower p99.
+  measures h2o's Reno against Cubic at 50 kbit/s with 1% loss and keeps the lower median p99
+  (`run-all.sh` picks it and logs it). Pass 0's three rounds had Reno's 16.9 s against Cubic's
+  17.4 s; pass 0 is superseded, so pass 1's pilot makes the choice.
 - Flow-control windows: each server's own defaults, unchanged (h2o's HTTP/2 and quicly's, Go's
   net/http2 and quic-go's): the lab's operations are small and its rates at most half a link, so no
   window is what holds a stream back.
