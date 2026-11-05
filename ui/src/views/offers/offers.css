@@ -1,0 +1,113 @@
+/* Runners → Offers (docs/reach.md §2.1): lists, not tables, so a phone reads each runner whole. */
+.offers-section {
+  margin-top: 2rem;
+}
+.offers-aside {
+  color: var(--color-meta);
+  font-size: 0.875rem;
+}
+.offers-runners,
+.offers-groups {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--color-line);
+}
+.offer-runner,
+.offer-group {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--color-line);
+  min-width: 0;
+}
+.offer-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  min-width: 0;
+}
+.offer-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.offer-platform,
+.offer-health,
+.offer-meta,
+.offer-derived {
+  color: var(--color-meta);
+  font-size: 0.875rem;
+}
+.offer-health {
+  margin-left: auto;
+}
+.offer-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  min-width: 2ch;
+}
+.offer-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.25rem 1.5rem;
+  margin: 0.5rem 0 0;
+}
+.offer-facts > div {
+  min-width: 0;
+}
+.offer-facts dt {
+  color: var(--color-meta);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.offer-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.offer-answers {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.125rem;
+}
+.offer-answer {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) 1fr;
+  gap: 0 1rem;
+  font-size: 0.875rem;
+  min-width: 0;
+}
+.offer-answer > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.offer-answer[data-answer="now"] .offer-said {
+  color: var(--color-ok);
+}
+.offer-answer[data-answer="never"] .offer-said {
+  color: var(--color-meta);
+}
+.offer-ask {
+  font-family: var(--font-mono);
+}
+.offer-why,
+.offer-meta {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+.offers-pages {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+@media (max-width: 640px) {
+  .offer-health {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+  .offer-answer {
+    grid-template-columns: 1fr;
+  }
+}

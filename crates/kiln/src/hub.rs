@@ -548,6 +548,8 @@ pub struct Hub {
     /// The copies of runners' trees other runners keep: the rules for them, and what each runner
     /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
     pub copies: crate::reach::copies::Copies,
+    /// What each runner can take and what waits, and why (`crate::offers`, docs/reach.md §2.2).
+    pub offers: crate::offers::Offers,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
@@ -681,6 +683,7 @@ impl Hub {
             sync,
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             copies,
+            offers: crate::offers::Offers::default(),
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
@@ -1622,6 +1625,7 @@ impl Hub {
         }
         // It leaves the CI engine's fleet, and what it held is lost (W05-R35).
         self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: agent.to_owned() });
+        crate::offers::gone(self, agent);
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -1965,6 +1969,8 @@ impl Hub {
             a.lost_at = Some(Instant::now());
             a.clone()
         };
+        // What it said of its admission holds no more (docs/reach.md §2.2).
+        crate::offers::gone(self, name);
         if let Err(e) = self.store.agent_disconnected(name.to_owned()).await {
             tracing::warn!(error = %e, "agent_disconnected");
         }

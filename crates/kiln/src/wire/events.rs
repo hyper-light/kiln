@@ -124,6 +124,9 @@ pub enum ServerEvent {
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
     Conflict(Box<ConflictChange>),
+    /// What runners can take or what waits changed in a way decided by (docs/reach.md §2.2):
+    /// refetch GET /api/reach/offers, unless the page has `version` already (its ETag).
+    Offers { version: u64 },
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),

@@ -696,6 +696,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         // The copies of runners' trees other runners keep (docs/reach.md §5.1): the rules for them,
         // what each runner holds and let go, and asking runners to let go now.
+        // What each runner can take and what waits (docs/reach.md §2.2): bounded, versioned.
+        (&Method::GET, ["api", "reach", "offers"]) => Ok(reach_offers(&hub, &req)),
         (&Method::GET, ["api", "reach", "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.view(&hub)).await)),
         (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "rules"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::System, *m == Method::PUT, req)).await,
         (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "runners", name]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Runner(name), *m == Method::PUT, req)).await,
@@ -3569,6 +3571,34 @@ fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
     };
     let (ranked, passed) = crate::reach::directory::rank(&runners, &want, "");
     Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
+}
+
+/// `GET /api/reach/offers?after=<cursor>&limit=<n>` (docs/reach.md §2.2): every runner with what it
+/// can take, and a page of the waiting work, as many groups as runners at most. Its ETag is its
+/// version (and the page asked): a page that has it is answered 304, nothing more.
+fn reach_offers(hub: &Hub, req: &Request) -> Response {
+    let q = srv::query(req);
+    let page = crate::offers::view::Page { after: q.get("after").filter(|a| !a.is_empty()).cloned(), limit: q.get("limit").and_then(|l| l.parse().ok()) };
+    let etag = hub.offers.etag(hub.offers.version(), &page);
+    if let Some(r) = unchanged(req, &etag, false) {
+        return r;
+    }
+    let machines: Vec<crate::offers::view::Machine> = hub
+        .agents
+        .lock()
+        .values()
+        .filter(|a| !a.ephemeral)
+        .map(|a| crate::offers::view::Machine { name: a.name.clone(), label: a.label.clone(), platform: format!("{}/{}", a.os, a.arch), connected: a.connected, draining: a.draining })
+        .collect();
+    let view = hub.offers.view(&machines, &page, crate::util::now_ms());
+    let mut r = srv::json(StatusCode::OK, &view);
+    // The version the view was made at: what the ETag says, as it was when read.
+    let etag = hub.offers.etag(view.version, &page);
+    if let Ok(v) = header::HeaderValue::from_str(&etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("private, no-cache"));
+    r
 }
 
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is

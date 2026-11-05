@@ -122,6 +122,36 @@ read is gone, and holding all of it to feed again would hold without bound.
 its exit) only to a runner whose directory entry names `reach.sizes` (its reach announcement's
 `features`); to any other it goes as `Ask::Run`, as before, and nothing of it is kept.
 
+### 2.2 Offers: what each runner can take, and what waits
+
+Runners → Offers, and `GET /api/reach/offers` for agents, show the fleet as placement sees it
+(`crates/kiln/src/offers`). Each runner's admission decides what it takes; the view only shows
+what it last said:
+
+- **Per runner:** its platform, its budget (what kiln may place there in all), the room free for
+  an ordinary run as it was said, how many wait in its line by class, its answer for each ask size
+  in question (starts now, waits and why with when it would start, or never and why), and its
+  health: offline, draining, strained and why, or taking work. A runner says this as a hint, under
+  the named feature `offers` (docs/wire.md, "Named features"); one before that is listed as
+  saying nothing of its admission. A size it doesn't quote is answered from its room and budget
+  (`derived`).
+- **What waits:** the CI engine's legs (from the engine's own `Wait`, `Assign` and `Settled`) and
+  the runs runners hold as their owners (from their hints, as deltas), grouped by what they need
+  and the room they ask, with counts by class and by reason, and since when the longest has waited.
+  Each change moves its one group: nothing is rebuilt or sorted per message.
+
+**Bounded:** one row per runner, and a page of groups as long as the fleet (one at least; `limit`
+asks for fewer, never more); `after=<cursor>` is the next page, from the last group's `cursor`.
+The ask sizes answered are this page's groups' and those runners quote, as many as a page holds.
+
+**Told when it matters.** A hint changes the view only when, against what was last shown, the
+runner's state, budget or line counts differ, its answer for a size known (one quoted by any
+runner, or one that waits) flips, or a start moves across the unit it's shown in: the largest of
+seconds, minutes, hours and days the start's distance holds once whole, counted from when it was
+said. The room moving within every answer changes nothing. What changes in one turn of the
+server's runtime goes as one `ServerEvent::Offers { version }`; the version, with the page asked,
+is the response's ETag, and `If-None-Match` with it is answered 304.
+
 ## 3. Security
 
 ### 3.1 End to end

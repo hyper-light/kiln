@@ -2126,6 +2126,7 @@ impl Dispatch {
                         let mut g = self.hub.ci.legs.lock();
                         for id in r.keys.values() {
                             g.remove(id);
+                            crate::offers::leg_done(&self.hub, id);
                         }
                     }
                     self.hub.ci.runs.lock().remove(run);
@@ -2439,6 +2440,7 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let mut leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+        crate::offers::ci_leg(&self.hub, &leg);
         // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
         leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
         leg.finish_within = r.sup.as_ref().map(|s| s.finish_within);
@@ -2555,6 +2557,7 @@ impl Dispatch {
         self.in_commands = true;
         let mut todo: std::collections::VecDeque<Command> = cmds.into();
         while let Some(c) = todo.pop_front() {
+            crate::offers::ci(&self.hub, &c);
             let r = match c {
                 Command::StartRun { run } => {
                     let held = self.runs.get_mut(&run).and_then(|r| r.held.take()).unwrap_or_default();
@@ -3444,6 +3447,7 @@ impl Dispatch {
         self.regrant(leg, None).await;
         self.legs.remove(leg);
         self.hub.ci.legs.lock().remove(leg);
+        crate::offers::leg_done(&self.hub, leg);
         self.hub.logs.finish(leg);
         let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
         if let Some(cmds) = self.after(cmds) {
@@ -3469,6 +3473,7 @@ impl Dispatch {
                         self.legs.remove(&leg);
                         self.held.remove(&leg);
                         self.hub.ci.legs.lock().remove(&leg);
+                        crate::offers::leg_done(&self.hub, &leg);
                     }
                 }
             }
@@ -3812,6 +3817,7 @@ impl Dispatch {
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+            crate::offers::ci_leg(&self.hub, &li);
             li.paused = paused.contains(&id);
             // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
             li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
