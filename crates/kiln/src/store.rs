@@ -34,6 +34,10 @@ pub struct Store {
 struct Inner {
     /// The one connection that writes, and the watch its hook writes into, owned by their thread.
     writer: Writer,
+    /// What its committed writes have changed, a table at a time ([`Changes`]).
+    changes: Arc<Changes>,
+    /// The calls and reads it's been asked for ([`Store::asked`]).
+    asked: std::sync::atomic::AtomicU64,
     /// Read-only connections to the database's file, for [`Store::read`]; `None` for a store in
     /// memory, whose one connection is the writer's.
     reads: Option<Reads>,
@@ -295,7 +299,7 @@ impl std::ops::Deref for Tx<'_> {
 }
 
 /// Runs a write through the cluster group (see [`Store::call`]).
-fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, changes: &Changes, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
     // IMMEDIATE: the write lock now, so what `f` reads is what it writes over (a transaction that
     // read first would be refused its write had the group's thread committed meanwhile).
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -332,8 +336,69 @@ fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group
         conn.execute_batch("ROLLBACK").ok();
         return Err(e);
     }
+    // Committed: the tables its rows are in have changed (goal 10, plan 01a1a87b2dae step 2).
+    changes.touched(change.rows.iter().map(|r| match r {
+        capture::Row::Gone { table, .. } | capture::Row::Kept { table, .. } => table.as_str(),
+    }));
     group.append(seq, change);
     result
+}
+
+/// `f` with the connection that writes, past the cluster group: when it changed rows, every table's
+/// count moves ([`Changes`]), its rows not told apart.
+fn counted<R>(conn: &mut Connection, changes: &Changes, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    let before = conn.total_changes();
+    let out = f(conn);
+    if conn.total_changes() != before {
+        changes.anything();
+    }
+    out
+}
+
+/// What the store's committed writes have changed, a count for each table they touched (goal 10, plan
+/// 01a1a87b2dae step 2): what a read keeps in memory of some tables (`crate::reads::Kept`: the plans'
+/// list, the goal stacks) answers only while their count is the one it was made at, and is made again,
+/// off the request path, once it moves. A write through the cluster group says which tables it
+/// touched (its captured rows); any other that changed rows ([`Store::open`], a store in memory) moves
+/// every table's count. Moved by the writer's thread alone, after the write commits; read without a
+/// lock.
+#[derive(Default)]
+pub struct Changes {
+    /// Each table's count, swapped in whole as one moves (one thread moves them).
+    tables: arc_swap::ArcSwap<std::collections::HashMap<Arc<str>, u64>>,
+    /// Writes that didn't say which tables they touched: every table's count moves with them.
+    any: std::sync::atomic::AtomicU64,
+}
+
+impl Changes {
+    /// Where `tables` stand: a count that moves with each committed write that touched one of them.
+    pub fn of(&self, tables: &[&str]) -> u64 {
+        let counts = self.tables.load();
+        tables.iter().fold(self.any.load(std::sync::atomic::Ordering::Acquire), |n, t| n.wrapping_add(counts.get(*t).copied().unwrap_or(0)))
+    }
+
+    /// One committed write's tables (each as often as its rows name it).
+    fn touched<'a>(&self, tables: impl IntoIterator<Item = &'a str>) {
+        let mut tables = tables.into_iter().peekable();
+        if tables.peek().is_none() {
+            return;
+        }
+        let mut counts = std::collections::HashMap::clone(&self.tables.load());
+        for t in tables {
+            match counts.get_mut(t) {
+                Some(n) => *n = n.wrapping_add(1),
+                None => {
+                    counts.insert(Arc::from(t), 1);
+                }
+            }
+        }
+        self.tables.store(Arc::new(counts));
+    }
+
+    /// A committed write that changed rows without saying which tables they're in.
+    fn anything(&self) {
+        self.any.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -623,7 +688,7 @@ impl Store {
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
@@ -632,7 +697,7 @@ impl Store {
         let conn = Self::connect(path)?;
         let group = group::Group::open(path, cluster).context("the cluster group")?;
         let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self::of(Inner { writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None }))
     }
 
     /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
@@ -641,7 +706,7 @@ impl Store {
     pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None }))
     }
 
     fn of(inner: Inner) -> Self {
@@ -674,7 +739,7 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self::of(Inner { writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None }))
+        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None }))
     }
 
     /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
@@ -687,7 +752,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
         let idle = Connection::open_in_memory()?;
-        let inner = Inner { writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None };
+        let inner = Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None };
         Ok(Self { inner: Arc::new(inner), inline: Some(Arc::new(parking_lot::Mutex::new(conn))) })
     }
 
@@ -761,17 +826,29 @@ impl Store {
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
-            return f(&mut c.lock());
+            return counted(&mut c.lock(), &self.inner.changes, f);
         }
-        let group = self.inner.group.clone();
+        let (group, changes) = (self.inner.group.clone(), Arc::clone(&self.inner.changes));
         self.write(move |conn, watch| match (watch, &group) {
-            (Some(watch), Some(group)) => through_group(conn, watch, group, f),
-            _ => f(conn),
+            (Some(watch), Some(group)) => through_group(conn, watch, group, &changes, f),
+            _ => counted(conn, &changes, f),
         })
         .await
+    }
+
+    /// What its committed writes have changed, a table at a time (goal 10, plan 01a1a87b2dae step 2).
+    pub fn changes(&self) -> &Changes {
+        &self.inner.changes
+    }
+
+    /// How many calls and reads it's been asked for, ever: what shows a read answered without it
+    /// (goal 10, plan 01a1a87b2dae step 2, `api::tests::g10_s2_the_labs_reads_never_ask_the_store`).
+    pub fn asked(&self) -> u64 {
+        self.inner.asked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Runs `f` with the connection that writes, past the cluster group: for this node's own tables
@@ -781,6 +858,7 @@ impl Store {
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
@@ -799,6 +877,7 @@ impl Store {
         F: FnOnce(&Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
@@ -3081,6 +3160,38 @@ mod tests {
             assert_eq!(queued().await?, ["a", "b"]);
             assert_eq!(s.job(b.clone()).await?.map(|j| j.paused_at), Some(None));
             Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2: a committed write through the cluster group moves the counts
+    /// of the tables its rows are in and no other's; one that changed nothing (a read through `call`,
+    /// a write taken back) moves none; past the group, any write that changed rows moves them all.
+    #[test]
+    fn g10_s2_writes_move_the_counts_of_the_tables_they_touched() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let grouped = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        crate::rt::block_on(async move {
+            let c = grouped.changes();
+            let (kv, plans) = (c.of(&["kv"]), c.of(&["plans", "plan_runs"]));
+            grouped.kv_set("a".into(), "1".into()).await?;
+            assert!(c.of(&["kv"]) > kv, "kv's count moved");
+            assert_eq!(c.of(&["plans", "plan_runs"]), plans, "the plans' didn't");
+            let kv = c.of(&["kv"]);
+            grouped.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))?)).await?;
+            grouped.call(|c| Ok(c.execute("DELETE FROM kv WHERE k = 'nothing'", [])?)).await?;
+            assert_eq!(c.of(&["kv"]), kv, "nothing changed: nothing moved");
+            let asked = grouped.asked();
+            grouped.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))?)).await?;
+            assert_eq!(grouped.asked(), asked + 1, "a read is counted among what it was asked");
+            let plain = Store::open(&dir.path().join("plain.db"))?;
+            let p = plain.changes();
+            let (kv, plans) = (p.of(&["kv"]), p.of(&["plans"]));
+            plain.kv_set("a".into(), "1".into()).await?;
+            assert!(p.of(&["kv"]) > kv && p.of(&["plans"]) > plans, "past the group, every table's");
+            let plans = p.of(&["plans"]);
+            plain.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))?)).await?;
+            assert_eq!(p.of(&["plans"]), plans, "a read through call moves nothing");
+            anyhow::Ok(())
         })
     }
 
