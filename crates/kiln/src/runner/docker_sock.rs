@@ -830,8 +830,22 @@ fn name_references(v: &mut Value, names: &mut Names, name: Option<&str>) -> bool
     changed
 }
 
+/// A container a leg's step makes through its Docker socket keeps to the work CPUs, `work`, beside a
+/// server with cores of its own (docs/priority.md, "Legs and agents keep off the server's cores";
+/// goal 8, plan 01a1a59c2b29 step 7), as the leg's own containers do, unless it names CPUs of its own
+/// (`CpusetCpus`). Whether it changed `host` (a create's `HostConfig`).
+fn work_cpuset(host: &mut serde_json::Map<String, Value>, work: Option<&[usize]>) -> bool {
+    let Some(work) = work.filter(|w| !w.is_empty()) else { return false };
+    if host.get("CpusetCpus").and_then(Value::as_str).is_some_and(|c| !c.trim().is_empty()) {
+        return false;
+    }
+    host.insert("CpusetCpus".to_owned(), Value::from(super::cpus::list(work)));
+    true
+}
+
 /// A container create's bind mounts, their sources on the host, and its CPU weight a leg's
-/// (docs/priority.md) unless it asks for its own. Whether it changed.
+/// (docs/priority.md) unless it asks for its own, as its CPUs are beside a server with cores of its
+/// own ([`work_cpuset`]). Whether it changed.
 fn translate_create(v: &mut Value, paths: &Paths) -> bool {
     let Some(config) = v.get_mut("HostConfig") else { return false };
     let mut changed = false;
@@ -840,6 +854,9 @@ fn translate_create(v: &mut Value, paths: &Paths) -> bool {
     {
         o.insert("CpuShares".to_owned(), Value::from(super::docker::LEG_CPU_SHARES));
         changed = true;
+    }
+    if let Some(o) = config.as_object_mut() {
+        changed |= work_cpuset(o, crate::os::work_cpus().as_deref());
     }
     // The names the leg's own containers have for the host and kiln's server, as its job
     // container has them (BuildKit's fetches a build's git context from kiln through them), but
@@ -2453,5 +2470,21 @@ mod tests {
         let elsewhere = format!("812 36 0:91 / /run/containerd/io.containerd.runtime.v2.task/moby/{id}/rootfs rw - overlay overlay rw\n");
         assert_eq!(snapshotter_root("/var/lib/docker\toverlayfs", id, &elsewhere), Some(PathBuf::from(format!("/run/containerd/io.containerd.runtime.v2.task/moby/{id}/rootfs"))));
         assert_eq!(snapshotter_root("/var/lib/docker\toverlayfs", "", &mountinfo), None);
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): a container a leg's step makes through its socket keeps to the
+    /// work CPUs beside a server with cores of its own, unless it names CPUs of its own; with none to
+    /// keep to, it goes as it came.
+    #[test]
+    fn g8_s7_a_steps_containers_keep_to_the_work_cpus() {
+        let mut host = serde_json::Map::new();
+        assert!(work_cpuset(&mut host, Some(&[0, 1, 2, 3, 24, 25])));
+        assert_eq!(host.get("CpusetCpus"), Some(&serde_json::Value::from("0-3,24-25")));
+        let mut theirs = serde_json::Map::new();
+        theirs.insert("CpusetCpus".to_owned(), serde_json::Value::from("5"));
+        assert!(!work_cpuset(&mut theirs, Some(&[0, 1])));
+        assert_eq!(theirs.get("CpusetCpus"), Some(&serde_json::Value::from("5")), "its own CPUs win");
+        let mut none = serde_json::Map::new();
+        assert!(!work_cpuset(&mut none, None) && none.is_empty(), "no server's cores to keep off");
     }
 }

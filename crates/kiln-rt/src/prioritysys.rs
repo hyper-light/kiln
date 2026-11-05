@@ -37,6 +37,14 @@
 //!
 //! Each only ever lowers: a thread already below the target (a process started under `nice`, at background
 //! QoS, at a lower level) keeps what it has, as `nice` adds its increment to what a process runs at.
+//!
+//! One call raises, for a shard alone, where the system grants it ([`realtime_current_thread`]; kiln's goal 8,
+//! plan 01a1a59c2b29 step 7, and goal 9, plan 01a1a87b2cec step 4): Linux's round-robin real-time class at
+//! the lowest real-time priority, with the reset-on-fork flag, so nothing the shard starts inherits it. A
+//! real-time thread waking where a normal one runs preempts it at once under every preemption mode, the lazy
+//! one too, where a normal thread waking beside one busy in user space waits for the next tick (research
+//! 01a1a87b2cee f17; kiln's docs/priority.md, "The kernel's preemption"). macOS and Windows refuse it: what
+//! each has instead is in their `realtime`.
 #![allow(unsafe_code)]
 
 use crate::compute::{Priority, Rank, Refusal};
@@ -67,6 +75,12 @@ pub(crate) fn of_current_thread() -> Priority {
 /// Asks for a slice of `slice_ns` for the calling thread (a shard), keeping its policy and nice value: Linux only.
 pub(crate) fn prefer_current_thread(slice_ns: u64) -> Result<(), Refusal> {
     platform::prefer(slice_ns)
+}
+
+/// Puts the calling thread (a shard) in Linux's round-robin real-time class at `priority`, what it starts
+/// not (reset on fork): Linux only ([`crate::compute::realtime_current_thread`]).
+pub(crate) fn realtime_current_thread(priority: i32) -> Result<(), Refusal> {
+    platform::realtime(priority)
 }
 
 #[cfg(target_os = "linux")]
@@ -122,6 +136,71 @@ mod platform {
         done == 0
     }
 
+    /// The round-robin real-time policy at `priority`, with the reset-on-fork flag, so a thread or process the
+    /// calling thread starts runs at the normal policy (sched(7), "The reset-on-fork flag"): one `sched_setattr`.
+    /// The kernel refuses it (EPERM) to a thread with neither `CAP_SYS_NICE` nor `RLIMIT_RTPRIO` room for
+    /// `priority`, and to one in a cgroup given no real-time runtime where the kernel keeps real-time group
+    /// scheduling (sched(7); `CONFIG_RT_GROUP_SCHED`).
+    pub(super) fn realtime(priority: i32) -> Result<(), Refusal> {
+        let refused = || Refusal {
+            call: "sched_setattr",
+            code: std::io::Error::last_os_error().raw_os_error(),
+        };
+        let (Ok(size), Ok(policy), Ok(priority), Ok(flags)) = (
+            u32::try_from(std::mem::size_of::<libc::sched_attr>()),
+            u32::try_from(libc::SCHED_RR),
+            u32::try_from(priority),
+            u64::try_from(libc::SCHED_FLAG_RESET_ON_FORK),
+        ) else {
+            return Err(Refusal {
+                call: "sched_setattr",
+                code: Some(libc::EINVAL),
+            });
+        };
+        let attr = libc::sched_attr {
+            size,
+            sched_policy: policy,
+            sched_flags: flags,
+            sched_nice: 0,
+            sched_priority: priority,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        let pid: libc::pid_t = 0;
+        let call_flags: libc::c_uint = 0;
+        // SAFETY: `attr` is a live, initialised `sched_attr` whose `size` states its own size, which the kernel
+        // reads for the call's duration and does not keep; pid 0 names the calling thread and flags 0 asks
+        // nothing more (sched_setattr(2)). No memory of this process is written.
+        let done = unsafe { libc::syscall(libc::SYS_sched_setattr, pid, &raw const attr, call_flags) };
+        if done == 0 { Ok(()) } else { Err(refused()) }
+    }
+
+    /// The calling thread's real-time priority, by `sched_getattr`: `None` where the kernel doesn't say.
+    fn realtime_priority() -> Option<i32> {
+        let size = u32::try_from(std::mem::size_of::<libc::sched_attr>()).ok()?;
+        let mut attr = libc::sched_attr {
+            size,
+            sched_policy: 0,
+            sched_flags: 0,
+            sched_nice: 0,
+            sched_priority: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        let pid: libc::pid_t = 0;
+        let flags: libc::c_uint = 0;
+        // SAFETY: `attr` is live, writable and `size` bytes long, the most the kernel writes, for the call's
+        // duration only; pid 0 names the calling thread and flags 0 asks nothing more (sched_getattr(2)).
+        let done = unsafe { libc::syscall(libc::SYS_sched_getattr, pid, &raw mut attr, size, flags) };
+        if done == 0 {
+            i32::try_from(attr.sched_priority).ok()
+        } else {
+            None
+        }
+    }
+
     /// The normal policy at the thread's own nice value with an EEVDF slice of `slice_ns` (`sched_runtime`).
     pub(super) fn prefer(slice_ns: u64) -> Result<(), Refusal> {
         let thread = rustix::thread::gettid();
@@ -149,12 +228,16 @@ mod platform {
         }
     }
 
-    /// The calling thread's policy (`sched_getscheduler`) and nice value (`getpriority` on its id).
+    /// The calling thread's policy (`sched_getscheduler`, its reset-on-fork flag set aside) and nice value
+    /// (`getpriority` on its id), or its real-time priority in a real-time class.
     pub(super) fn of_current() -> Priority {
         let pid: libc::pid_t = 0;
         // SAFETY: no pointer passes; pid 0 names the calling thread, and the call only reads its policy
         // (sched_getscheduler(2)).
-        let policy = unsafe { libc::sched_getscheduler(pid) };
+        let policy = unsafe { libc::sched_getscheduler(pid) } & !libc::SCHED_RESET_ON_FORK;
+        if policy == libc::SCHED_RR || policy == libc::SCHED_FIFO {
+            return realtime_priority().map_or(Priority::Unknown, |priority| Priority::Realtime { priority });
+        }
         let Ok(nice) = rustix::process::getpriority_process(Some(rustix::thread::gettid())) else {
             return Priority::Unknown;
         };
@@ -206,6 +289,18 @@ mod platform {
     pub(super) fn prefer(_slice_ns: u64) -> Result<(), Refusal> {
         Err(Refusal {
             call: "no slice to ask for on macOS",
+            code: None,
+        })
+    }
+
+    /// No real-time class is asked for on macOS: its one for user threads, the time-constraint policy
+    /// (`THREAD_TIME_CONSTRAINT_POLICY`), is for periodic work of a known computation each period, as audio's
+    /// is, and demotes a thread that overruns what it declared; a shard's work has no such period. The server's
+    /// launchd job runs `Interactive` and legs and agents under background policy, which the scheduler keeps off
+    /// the performance cores (docs/priority.md).
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on macOS",
             code: None,
         })
     }
@@ -273,6 +368,19 @@ mod platform {
         })
     }
 
+    /// No real-time class is asked for on Windows: its scheduler runs a waking thread of a higher priority
+    /// level at once, "without allowing it to finish using its time slice" [B: Microsoft Learn, "Scheduling
+    /// Priorities"], and the server's process runs above normal while legs and agents run below it
+    /// (docs/priority.md), so its shards already preempt them as they wake. `REALTIME_PRIORITY_CLASS` would put
+    /// it above the system's own work: "a real-time process that executes for more than a very brief interval
+    /// can cause disk caches not to flush or cause the mouse to be unresponsive" [B: the same].
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on Windows",
+            code: None,
+        })
+    }
+
     /// The calling thread's priority level, as `GetThreadPriority` reports it.
     pub(super) fn of_current() -> Priority {
         // SAFETY: the calling thread's pseudo-handle, valid for the call; no pointer passes.
@@ -304,6 +412,13 @@ mod platform {
     pub(super) fn prefer(_slice_ns: u64) -> Result<(), Refusal> {
         Err(Refusal {
             call: "no slice to ask for on this OS",
+            code: None,
+        })
+    }
+
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on this OS",
             code: None,
         })
     }

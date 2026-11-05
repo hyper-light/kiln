@@ -25,7 +25,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -181,6 +181,120 @@ pub fn pin(cores: Vec<u32>) {
     }
 }
 
+/// The real-time priority the shards ask for ([`realtime`]): the lowest (sched(7): 1 to 99), above
+/// every thread of the normal policies whatever its nice value and below the kernel's own real-time
+/// threads; what `kiln install` gives the server's unit room for (`LimitRTPRIO=`).
+pub const REALTIME_PRIORITY: i32 = hyper_rt::compute::REALTIME_LOWEST;
+
+/// Whether the shards ask for Linux's round-robin real-time class ([`realtime`]).
+static REALTIME: AtomicBool = AtomicBool::new(false);
+
+/// The shards' answers as each took the real-time class or was refused it: those that took it
+/// counted in units of one, those refused in units of [`REFUSED_ONE`], in one atomic, so exactly one
+/// shard, the last to answer, sees every answer in.
+static REALTIME_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// A refused shard's count in [`REALTIME_ANSWERS`]: past the most shards a runtime has
+/// (`Profile::with_env_overrides`' 64), so the two counts never meet.
+const REFUSED_ONE: u32 = 1 << 16;
+
+/// How many shards asked for the real-time class: the runtime's, once it started.
+static REALTIME_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The first refusal a shard met, for why.
+static REALTIME_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
+
+/// The server's shards in Linux's round-robin real-time class (`[server] realtime`; docs/priority.md,
+/// "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9, plan 01a1a87b2cec
+/// step 4): each shard asks as it starts, at [`REALTIME_PRIORITY`], so nothing it starts inherits it
+/// (reset on fork). Under Linux's lazy preemption a shard of the normal class waking where a process
+/// is busy in user space waits up to a tick, 1 ms, for it; a real-time one takes the CPU at once.
+/// Where the system refuses it (no `CAP_SYS_NICE` or `RLIMIT_RTPRIO` room; macOS and Windows), a shard
+/// runs as before, with a slice of its step, and the log and `/healthz/server` say why
+/// ([`realtime_status`]). Call it before the runtime starts: later calls change nothing.
+pub fn realtime(on: bool) {
+    REALTIME.store(on, Ordering::Relaxed);
+}
+
+/// How the shards took the real-time class ([`realtime`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Realtime {
+    /// Whether it was asked for (`[server] realtime`).
+    pub asked: bool,
+    /// The shards that asked.
+    pub shards: u32,
+    /// Of them, those that took it.
+    pub took: u32,
+    /// And those refused it, which run at the normal class with a slice of their step.
+    pub refused: u32,
+    /// Why those refused were, for a person.
+    pub why: Option<String>,
+}
+
+impl Realtime {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        if !self.asked || self.took.saturating_add(self.refused) < self.shards {
+            return None;
+        }
+        Some(match (self.took, &self.why) {
+            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}: a shard waking takes its CPU at once, whatever runs there"),
+            (0, why) => format!("the server's {} shards run at the normal class, with a slice of their step: the real-time class was refused ({})", self.refused, why.as_deref().unwrap_or("no reason given")),
+            (took, why) => format!("{took} of the server's {} shards run in the real-time class, {} at the normal class: it was refused ({})", self.shards, self.refused, why.as_deref().unwrap_or("no reason given")),
+        })
+    }
+}
+
+/// Why the real-time class was refused, for a person, from what refused it.
+fn realtime_why(refusal: &hyper_rt::compute::Refusal) -> String {
+    match refusal.code.map(|c| io::Error::from_raw_os_error(c).kind()) {
+        Some(io::ErrorKind::PermissionDenied) => format!(
+            "{refusal}: this process has neither CAP_SYS_NICE nor RLIMIT_RTPRIO room for priority {REALTIME_PRIORITY} (`kiln install` gives the server's unit LimitRTPRIO={REALTIME_PRIORITY}, which a user's service manager grants only as far as its own limit), or its kernel schedules real-time groups and gave the server's cgroup no real-time runtime"
+        ),
+        Some(io::ErrorKind::InvalidInput) => format!("{refusal}: the kernel doesn't take the round-robin real-time class here"),
+        Some(_) => refusal.to_string(),
+        None => refusal.call.to_owned(),
+    }
+}
+
+/// How the shards took the real-time class so far ([`realtime`]).
+pub fn realtime_status() -> Realtime {
+    realtime_of(REALTIME_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Realtime`] from the shards' `answers` ([`REALTIME_ANSWERS`]).
+fn realtime_of(answers: u32) -> Realtime {
+    Realtime {
+        asked: REALTIME.load(Ordering::Relaxed),
+        shards: REALTIME_SHARDS.load(Ordering::Relaxed),
+        took: answers % REFUSED_ONE,
+        refused: answers / REFUSED_ONE,
+        why: REALTIME_REFUSAL.get().map(realtime_why),
+    }
+}
+
+/// A shard asks for the real-time class ([`realtime`]): whether it took it. The last shard to answer
+/// says how they all did, once.
+fn took_realtime() -> bool {
+    let took = hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY);
+    if let Err(refusal) = took {
+        let _ = REALTIME_REFUSAL.set(refusal);
+    }
+    let one = if took.is_ok() { 1 } else { REFUSED_ONE };
+    let answers = REALTIME_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
+    let status = realtime_of(answers);
+    if status.took.saturating_add(status.refused) == status.shards
+        && let Some(line) = status.said()
+    {
+        if status.refused == 0 {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
+    }
+    took.is_ok()
+}
+
 /// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
 /// for its threads that aren't shards (its blocking pool, its timers' helpers), as hyper-rt's
 /// placement keeps one, and each shard on the next, around again when there are more shards than
@@ -262,10 +376,19 @@ fn start() -> Result<Rt, String> {
         return Err("runtime started without shards".to_owned());
     }
     // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
-    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux).
+    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
+    // the real-time class is asked for and granted ([`realtime`]), it takes that instead: a real-time thread
+    // has no slice of the normal class's to ask for, and asking would put it back in that class.
+    let realtime = REALTIME.load(Ordering::Relaxed);
+    if realtime {
+        REALTIME_SHARDS.store(u32::try_from(holders.len()).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if realtime && took_realtime() {
+                return;
+            }
             if let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice) {
                 tracing::debug!(%refusal, "a shard kept the OS's slice");
             }
@@ -1650,6 +1773,30 @@ mod tests {
         assert_eq!(shard_cores(&[8, 9, 10], 4), vec![9, 10, 9, 10]);
         assert_eq!(shard_cores(&[5], 2), vec![5, 5]);
         assert!(shard_cores(&[], 2).is_empty());
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7), goal 9 (plan 01a1a87b2cec step 4): how the shards took the
+    /// real-time class is said once all of them answered, and never when it wasn't asked for; a refusal
+    /// says why in a person's words, naming the grant `kiln install` writes.
+    #[test]
+    fn g9_s4_the_real_time_class_is_said_as_the_shards_took_it() {
+        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned) };
+        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None }.said(), None, "not asked for: nothing to say");
+        assert_eq!(status(3, 0, None).said(), None, "not every shard has answered");
+        assert!(status(4, 0, None).said().is_some_and(|s| s.contains("4 shards run in Linux's round-robin real-time class at priority 1")));
+        assert!(status(0, 4, Some("no room")).said().is_some_and(|s| s.contains("4 shards run at the normal class") && s.contains("no room")));
+        assert!(status(1, 3, Some("no room")).said().is_some_and(|s| s.starts_with("1 of the server's 4 shards")));
+        // EPERM, as Unix numbers it.
+        if cfg!(unix) {
+            let eperm = hyper_rt::compute::Refusal { call: "sched_setattr", code: Some(1) };
+            let why = realtime_why(&eperm);
+            assert!(why.contains("RLIMIT_RTPRIO") && why.contains("LimitRTPRIO=1"), "{why}");
+        }
+        let elsewhere = hyper_rt::compute::Refusal { call: "no real-time class to ask for on macOS", code: None };
+        assert_eq!(realtime_why(&elsewhere), "no real-time class to ask for on macOS");
+        // Both kinds of answer counted in one atomic, each read back apart.
+        let answers = 3 + 2 * REFUSED_ONE;
+        assert_eq!((answers % REFUSED_ONE, answers / REFUSED_ONE), (3, 2));
     }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
