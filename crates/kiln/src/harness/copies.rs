@@ -693,6 +693,45 @@ impl Events {
         *self = Self::of(all);
     }
 
+    /// [`Events::retain`] where those `keeps` keeps are its first events (a copy's go in by number, so a
+    /// number's those through it are): the chunks before the first it lets go of stay as they are (packed,
+    /// spilled or neither, none read again), the one that falls in is made again of its events before it,
+    /// and the rest go. How many it keeps, and the ids of those it let go of. None, and nothing changed, when
+    /// `keeps` keeps one after one it doesn't: `retain`'s to do. Goal 9, plan 01a1a87b2cec step 3: an Open
+    /// going on from a number read every chunk of its copy again (inflating, reading back from its spill file
+    /// and parsing each event) on its owner's shard, at every runner's reconnect, to keep them all.
+    pub(super) fn keep_first(&mut self, keeps: impl Fn(&Meta) -> bool) -> Option<(usize, Vec<Arc<str>>)> {
+        let kept = self.metas().take_while(|m| keeps(*m)).count();
+        if self.metas().skip(kept).any(&keeps) {
+            return None;
+        }
+        // All of them kept: nothing to do.
+        let Some((c, k)) = self.place(kept) else { return Some((kept, Vec::new())) };
+        let mut gone: Vec<Arc<str>> = self.metas().skip(kept).map(|m| Arc::clone(&m.id)).collect();
+        let remade = match self.chunks.get(c) {
+            Some(chunk) if k > 0 => match chunk.evs() {
+                Ok(evs) => Some(Chunk::of(evs.iter().take(k).cloned().collect())),
+                Err(e) => {
+                    tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: let go of");
+                    gone.extend(chunk.meta.iter().take(k).map(|m| Arc::clone(&m.id)));
+                    None
+                }
+            },
+            _ => None,
+        };
+        let chunks = Arc::make_mut(&mut self.chunks);
+        chunks.truncate(c);
+        let mut len = kept.saturating_sub(k);
+        if let Some(chunk) = remade {
+            len += chunk.len();
+            chunks.push(Arc::new(chunk));
+        }
+        self.len = len;
+        self.first = chunks.first().map_or(0, |c| c.len());
+        self.page_newest();
+        Some((len, gone))
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
@@ -1465,6 +1504,28 @@ impl Mirror {
 
     pub fn reindex(&mut self) {
         self.index = self.events.metas().enumerate().filter(|(_, m)| !m.id.is_empty()).map(|(i, m)| (Arc::clone(&m.id), i)).collect();
+    }
+
+    /// Keeps its events through number `n` and lets go of those after it, and of any without a number: its
+    /// machine's runner started again and goes on from there (an Open's `since`, `Registry::apply`). Those kept
+    /// stay where they were, its chunks with them, and its index lets go of the rest alone, nothing read again
+    /// or indexed anew; where those it keeps aren't its first ones (never, as a copy takes them in by number)
+    /// its events and index are made again (goal 9, plan 01a1a87b2cec step 3).
+    pub fn keep_through(&mut self, n: u64) {
+        let keeps = |m: &Meta| m.seq.is_some_and(|q| q <= n);
+        match self.events.keep_first(keeps) {
+            Some((kept, gone)) => {
+                for id in gone {
+                    if self.index.get(&*id).is_some_and(|at| *at >= kept) {
+                        self.index.remove(&*id);
+                    }
+                }
+            }
+            None => {
+                self.events.retain(keeps);
+                self.reindex();
+            }
+        }
     }
 
     /// Lets go of every event.
@@ -2962,5 +3023,104 @@ mod tests {
             anyhow::ensure!(copies.with(&id, |v| v.rev) == Some(changes));
             Ok(())
         })
+    }
+
+    /// A copy of events numbered 1 to `n`, its sealed chunks packed and kept compact, its newest open.
+    fn compact_copy(n: u64) -> anyhow::Result<Mirror> {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        Ok(m)
+    }
+
+    fn inflated() -> u64 {
+        super::super::packed::INFLATED.with(std::cell::Cell::get)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an Open that goes on from its copy's newest (a runner's reconnect, as
+    /// it mostly is: `crate::wire::sums::delta` says the copy's newest) keeps the copy as it is, on its owner's
+    /// shard: no chunk read again (none inflated), each the one it was, its index as it was. One going on from
+    /// past its newest the same. It read every chunk again, and parsed every event, to keep them all.
+    #[test]
+    fn g9_s3_an_open_going_on_from_its_copys_newest_reads_nothing_again() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let mut m = compact_copy(n)?;
+        anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_compact()).count() == 4, "four compact chunks, the newest open");
+        let (chunks, index) = (m.events.chunks().to_vec(), m.index.clone());
+        for since in [n, n + 100] {
+            let was = inflated();
+            m.keep_through(since);
+            anyhow::ensure!(inflated() == was, "going on from {since}, a chunk was read again");
+            anyhow::ensure!(m.events.chunks().len() == chunks.len() && m.events.chunks().iter().zip(&chunks).all(|(a, b)| Arc::ptr_eq(a, b)), "going on from {since}, each chunk the one it was");
+            anyhow::ensure!(m.events.len() == CHUNK * 4 + 9 && m.index == index, "going on from {since}, its events and index as they were");
+        }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an Open that goes on from before its copy's newest keeps its events
+    /// through that number as `Events::retain` keeps them: the chunks wholly before the cut the ones they were,
+    /// the one it falls in made again of its events before it (read again only when it's compact, once), the
+    /// rest let go of; its index finds each kept event where it is and none of the others; and the copy goes on
+    /// taking events after it.
+    #[test]
+    fn g9_s3_an_open_going_on_from_before_its_newest_reads_only_the_chunk_it_cuts() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let chunk = u64::try_from(CHUNK)?;
+        let texts = |e: &Events| e.iter().map(|e| e.entry.text().to_owned()).collect::<Vec<_>>();
+        // Into the newest, open chunk; into a compact one; on a chunk's edge; before them all.
+        for (since, reads) in [(chunk * 4 + 3, 0), (chunk + 5, 1), (chunk * 2, 0), (0, 0)] {
+            let mut m = compact_copy(n)?;
+            let before = m.events.chunks().to_vec();
+            let mut want = m.events.clone();
+            want.retain(|e| e.seq.is_some_and(|q| q <= since));
+            let was = inflated();
+            m.keep_through(since);
+            let read = inflated().saturating_sub(was);
+            anyhow::ensure!(read == reads, "going on from {since}: {read} chunks read again, not {reads}");
+            let whole = usize::try_from(since / chunk)?;
+            anyhow::ensure!(m.events.chunks().iter().zip(&before).take(whole).all(|(a, b)| Arc::ptr_eq(a, b)), "going on from {since}, the chunks before the cut the ones they were");
+            anyhow::ensure!(texts(&m.events) == texts(&want) && m.events.len() == usize::try_from(since)?, "going on from {since}: as retain keeps them");
+            let index = m.index.clone();
+            m.reindex();
+            anyhow::ensure!(m.index == index && index.len() == m.events.len(), "going on from {since}, its index as one made anew: {} entries", index.len());
+            for q in since + 1..=since + 3 {
+                m.rev += 1;
+                m.upsert(entry(&format!("e{q}"), q));
+            }
+            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq).collect();
+            anyhow::ensure!(seqs == (1..=since + 3).collect::<Vec<_>>(), "going on from {since}, it goes on: {seqs:?}");
+            anyhow::ensure!(m.index.get(format!("e{}", since + 3).as_str()) == Some(&m.events.len().saturating_sub(1)), "the newest indexed where it is");
+        }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: where those an Open keeps aren't the copy's first events (one without
+    /// a number among them), its events and index are made again, as before.
+    #[test]
+    fn g9_s3_a_copy_whose_kept_events_arent_its_first_is_made_again() {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let take = |m: &mut Mirror, e: Arc<Entry>| {
+            m.rev += 1;
+            m.upsert(e);
+        };
+        for q in 1..=5 {
+            take(&mut m, entry(&format!("e{q}"), q));
+        }
+        take(&mut m, Arc::new(Entry::new(json!({"id": "loose", "kind": "notice", "text": "no number"}))));
+        for q in 6..=8 {
+            take(&mut m, entry(&format!("e{q}"), q));
+        }
+        m.keep_through(7);
+        let ids: Vec<String> = m.events.metas().map(|meta| meta.id.to_string()).collect();
+        assert_eq!(ids, ["e1", "e2", "e3", "e4", "e5", "e6", "e7"]);
+        let index = m.index.clone();
+        m.reindex();
+        assert_eq!(m.index, index, "its index made anew");
     }
 }

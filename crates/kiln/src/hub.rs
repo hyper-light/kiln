@@ -27,6 +27,8 @@ use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
 
+mod build;
+
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
@@ -2795,38 +2797,9 @@ impl Hub {
             AgentMsg::PortData { conn, data } => self.harness.ports.data(&agent, conn, data),
             AgentMsg::PortAck { conn, bytes } => self.harness.ports.ack(&agent, conn, bytes),
             AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
-            AgentMsg::Build { build, caps } => {
-                self.instances.update(|i| i.set_build(peer, build.clone(), caps));
-                // It may send its legs' events and results again after a reconnect: they're taken
-                // once (a receipt without a job says so).
-                if caps & proto::CAP_RECEIVED != 0 {
-                    self.send_peer(peer, &ServerMsg::Received { job: String::new() }).await;
-                }
-                self.updates.on_build(self, &agent, &build);
-                self.updates.fleet.wake();
-                self.emit(&ServerEvent::Updates);
-                crate::frontdoor::control::on_build(self, &agent, caps).await;
-                if caps & proto::CAP_SYNC != 0 {
-                    self.sync_announced(&agent).await;
-                }
-                if caps & proto::CAP_OBSERVE != 0 {
-                    crate::observe::hub::announced(self, &agent).await;
-                }
-                if caps & proto::CAP_CLUSTER != 0 {
-                    self.cluster_announced(&agent).await;
-                }
-                if caps & proto::CAP_CONVO != 0 {
-                    self.mirrors_seen();
-                    self.harness.restore_due(self, &agent);
-                }
-                // What it can do decides which legs it may take.
-                self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() }).await;
-                // Previews' deployments it's left to take down (docs/ci.md W15-R07).
-                if caps & proto::CAP_UNDEPLOY != 0 {
-                    let (hub, agent) = (Arc::clone(self), agent.clone());
-                    crate::rt::spawn(async move { crate::ci::previews::runner_up(&hub, &agent).await });
-                }
-            }
+            // In pieces, in their order, its shard given up between them (`build`; goal 9, plan 01a1a87b2cec
+            // step 3).
+            AgentMsg::Build { build, caps } => Box::pin(self.on_build(peer, &agent, build, caps)).await,
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
                 self.updates.fleet.wake();
