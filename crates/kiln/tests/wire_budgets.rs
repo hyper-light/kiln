@@ -8,7 +8,8 @@
 //! Four workloads, each read as the UI reads it:
 //!
 //! - an agent page's cold open: a session's socket as `ui/src/api/harness.ts` attaches
-//!   (`?z=gzip&patch=state&patch=changes`) and without gzip, to its `synced`;
+//!   (`TAKES`: `?z=gzip&patch=state&patch=changes&window=1&lean=1`), without gzip, and as a tab from
+//!   before the bounded window (no `window`, no `lean`), to its `synced`;
 //! - a tab's `/api/events` while agents work and CI runs (`ui/src/api/events.ts`);
 //! - Ship while CI is busy: the GETs Ship's list and an opened row make, reloaded on their events
 //!   at most once a second per key and on their 15 s polls, as `ui/src/lib/resource.ts` does;
@@ -314,7 +315,8 @@ fn get(port: u16, token: &str, path: &str) -> anyhow::Result<Got> {
         None | Some("identity") => body,
         Some("gzip") => read_all(flate2::read::GzDecoder::new(body.as_slice()))?,
         Some("deflate") => read_all(flate2::read::ZlibDecoder::new(body.as_slice()))?,
-        Some(other) => anyhow::bail!("{path} came {other}: this test decodes gzip and deflate; give it {other}'s decoder"),
+        Some("br") => read_all(brotli::Decompressor::new(body.as_slice(), 4096))?,
+        Some(other) => anyhow::bail!("{path} came {other}: this test decodes gzip, deflate and br; give it {other}'s decoder"),
     };
     Ok(Got { wire: raw.len(), body })
 }
@@ -603,7 +605,8 @@ fn hold(title: &str, budgets: &[Budget]) -> anyhow::Result<()> {
 // ------------------------------------------------------------------------------------ the tests
 
 /// W21-R15: an agent page's cold open, a median and a long session, as the UI attaches
-/// (`?z=gzip&patch=state&patch=changes`, `ui/src/api/harness.ts` TAKES) and without gzip.
+/// (`ui/src/api/harness.ts` TAKES: a bounded window, lean events), the same without gzip, and as a
+/// tab from before the window does (the whole session).
 #[test]
 fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -627,7 +630,7 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     println!("{:<8} {:<14} {:>12} {:>9} {:>7} {:>12} {:>12} {:>12} {:>7} {:>12} {:>12} {:>12}", "session", "query", "wire", "messages", "frames", "decoded", "deflate ctx", "deflate each", "events", "tool output", "tool input", "tool diffs");
     let mut budgets = Vec::new();
     for (shape, id, _, _) in &opened {
-        for (query, label) in [("?z=gzip&patch=state&patch=changes", "UI (z=gzip)"), ("?patch=state&patch=changes", "no gzip")] {
+        for (query, label) in [("?z=gzip&patch=state&patch=changes&window=1&lean=1", "UI (z=gzip)"), ("?patch=state&patch=changes&window=1&lean=1", "UI, no gzip"), ("?z=gzip&patch=state&patch=changes", "whole (older)")] {
             let o = cold_open(&s, id, query)?;
             println!(
                 "{:<8} {:<14} {:>12} {:>9} {:>7} {:>12} {:>12} {:>12} {:>7} {:>12} {:>12} {:>12}",
@@ -662,65 +665,135 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
 // observed"), so a run's noise passes and a regression of a tenth fails. Each says its value today
 // (the most of the four, and their spread) and the track of `~/.cache/kiln-wire/BRIEF.md` expected
 // to lower it: that track sets the budget to its own measured value by the same rule as it lands.
+// On 2026-11-05 every budget below was set so from five runs on adacachy of the five tracks together
+// (perf/wire-ship); where the rule would have raised one, it was kept as it was.
 
 /// Cold open, bytes on the wire to `synced` (the handshake's answer included): (session, query, most).
-/// Today: median 179,669 (UI, z=gzip; spread 0.17%) and 879,561 (no gzip; 0); p90 1,505,082 (0.07%)
-/// and 7,196,976 (0). Lowered by the agent track (a bounded first load) and the compress track
-/// (permessage-deflate for the no-gzip socket; the table's "deflate ctx" column is its estimate).
-const COLD_WIRE: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 192_552), ("median", "no gzip", 941_131), ("p90", "UI (z=gzip)", 1_611_468), ("p90", "no gzip", 7_700_765)];
-/// Cold open, the frames' JSON as the page parses it. Today: median 879,337, p90 7,196,512, both
-/// queries, no spread. The agent track's to lower (tool output 3.14 MiB and input 1.28 MiB of the
-/// p90's 6.86 MiB).
-const COLD_DECODED: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 940_891), ("median", "no gzip", 940_891), ("p90", "UI (z=gzip)", 7_700_268), ("p90", "no gzip", 7_700_268)];
-/// Cold open, frames to `synced` (a packed snapshot's lines counted). Today: median 9, p90 33.
-const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 10), ("median", "no gzip", 10), ("p90", "UI (z=gzip)", 36), ("p90", "no gzip", 36)];
+/// Before the tracks, the whole session: median 179,669 (z=gzip; spread 0.17%) and 879,561 (no gzip;
+/// 0); p90 1,505,082 (0.07%) and 7,196,976 (0). With the agent track's window and lean events and
+/// the compress track's permessage-deflate: median 70,453 to 70,538 (z=gzip) and 70,444 to 70,527
+/// (no gzip), p90 166,862 to 167,052 and 166,752 to 166,954 (spreads 0.1%); a tab from before the
+/// window, median 180,380 to 180,438, p90 1,496,911 to 1,498,266 (where the rule would raise its
+/// budget from before the tracks, that one stays).
+const COLD_WIRE: &[(&str, &str, usize)] = &[
+    ("median", "UI (z=gzip)", 75_561),
+    ("median", "UI, no gzip", 75_547),
+    ("median", "whole (older)", 192_552),
+    ("p90", "UI (z=gzip)", 178_936),
+    ("p90", "UI, no gzip", 178_844),
+    ("p90", "whole (older)", 1_604_501),
+];
+/// Cold open, the frames' JSON as the page parses it. Before the tracks: median 879,337, p90
+/// 7,196,512. With the window: median 307,288 to 307,289, p90 661,169 to 661,170; a tab from before
+/// it, median 883,969 and p90 7,182,436 (no spread).
+const COLD_DECODED: &[(&str, &str, usize)] = &[
+    ("median", "UI (z=gzip)", 328_801),
+    ("median", "UI, no gzip", 328_801),
+    ("median", "whole (older)", 940_891),
+    ("p90", "UI (z=gzip)", 707_453),
+    ("p90", "UI, no gzip", 707_453),
+    ("p90", "whole (older)", 7_685_208),
+];
+/// Cold open, frames to `synced` (a packed snapshot's lines counted). Before the tracks: median 9,
+/// p90 33, as a tab from before the window still gets; with the window 7.
+const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 8), ("median", "UI, no gzip", 8), ("median", "whole (older)", 10), ("p90", "UI (z=gzip)", 8), ("p90", "UI, no gzip", 8), ("p90", "whole (older)", 36)];
 
-/// Events: `run`, `job`, `run.*` and `ci_verdict` wire bytes per job of the push. Today 11,207, no
-/// spread (the first run counted only `run` and `job`: 10,250). The events and compress tracks'.
-const EVENTS_CI_PER_JOB: usize = 11_992;
+/// Events: `run`, `job`, `run.*` and `ci_verdict` wire bytes per job of the push. Before the tracks
+/// 11,207, no spread (the first run counted only `run` and `job`: 10,250); with the events and
+/// compress tracks 680 to 718 (spread 5.6%).
+const EVENTS_CI_PER_JOB: usize = 809;
 /// Events: `harness` frames per agent-hour (one an agent's record, about: [`RECORD_EVERY_MS`]).
-/// Today 1,161 (seven runs, spread 3.8%). The events track's (coalescing per entity, batching).
+/// Before the tracks 1,161 (seven runs, spread 3.8%); with them 1,101 to 1,165 (5.8%: the rule
+/// would raise it, so it stays). The events track's (coalescing per entity, batching).
 const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_286;
 /// Events: `harness` wire bytes per agent-minute (each frame the agent's whole entry, about 990 B).
-/// Today 19,177 (seven runs, spread 3.7%). The events track's (deltas) and the compress track's.
-const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 21_230;
+/// Before the tracks 19,177 (seven runs, spread 3.7%); with the compress track's permessage-deflate
+/// 1,308 to 1,647 (25.9%).
+const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_190;
 /// Events: `headroom` frames (about 65 B each) per runner-minute: a runner reports its headroom's
-/// state whenever it changes, which a loaded machine's readings do often. Today 326 to 583 over
-/// seven runs (spread 79%: it follows the host's load, so this budget is loose by need). The events
-/// track's: only a page that shows headroom needs them.
-const EVENTS_HEADROOM_FRAMES_PER_RUNNER_MIN: usize = 1_084;
-/// Events: every other frame (`sample`, `keep` ...) a minute. Today 35 to 40 (spread 14%).
+/// state whenever it changes, which a loaded machine's readings do often. Before the tracks 326 to
+/// 583 over seven runs; with them 305 to 528 over five (spread 73%: it follows the host's load, so
+/// this budget is loose by need). The events track's topics keep them from a page that shows no
+/// headroom; this tab, like the headroom page, asks for every type.
+const EVENTS_HEADROOM_FRAMES_PER_RUNNER_MIN: usize = 952;
+/// Events: every other frame (`sample`, `keep` ...) a minute. Before the tracks 35 to 40 (spread
+/// 14%); with them 35 to 43 (23%: the rule would raise it, so it stays).
 const EVENTS_REST_FRAMES_PER_MIN: usize = 49;
-/// Events: those frames' wire bytes a minute. Today 10,165 to 10,807 (spread 6.3%).
-const EVENTS_REST_WIRE_PER_MIN: usize = 12_245;
-/// Ship: wire bytes per load, by key. Today the list 1,151 (one row; spread 2.0%), the opened row
-/// 5,740 (12 jobs; 2.3%). The compress track's; the ship track's to load them less (its loads a
-/// minute are held to what `resource.ts` allows, 128 for two keys, and were 87 to 111 today).
-const SHIP_WIRE_PER_LOAD: &[(&str, usize)] = &[("Ship list", 1_256), ("opened row", 6_274)];
-/// The pages' GETs, wire bytes. Today: agents list 6,374 (6 agents; spread 7.1%, what each is
-/// doing), runs 1,965 (4 runs), a run 2,960 (5 jobs), Ship rows 1,159 (1 row), a Ship row 6,552,
-/// runners 4,334 (2), overview 6,761 (0.4%); the rest no spread. The compress track's.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 7_271), ("runs", 2_103), ("a run", 3_168), ("Ship rows", 1_241), ("Ship row", 7_011), ("runners", 4_638), ("overview", 7_264)];
+/// Events: those frames' wire bytes a minute. Before the tracks 10,165 to 10,807 (spread 6.3%); with
+/// them 2,518 to 3,010 (19.5%).
+const EVENTS_REST_WIRE_PER_MIN: usize = 3_809;
+/// Ship: wire bytes per load, by key. Before the tracks the list 1,151 (one row; spread 2.0%), the
+/// opened row 5,740 (12 jobs; 2.3%); compressed, the list 694 to 841 (21%), the row 1,223 to 1,357
+/// (11%).
+const SHIP_WIRE_PER_LOAD: &[(&str, usize)] = &[("Ship list", 1_079), ("opened row", 1_601)];
+/// Ship's loads a minute over both keys. Before `ship` frames, 87 to 111, held to what
+/// `resource.ts` allowed (128 for two keys: each once a second after its last and its 15 s polls);
+/// with them (W21-R15), 10 to 11 (spread 10%): its polls, and a frame it can't place.
+const SHIP_LOADS_PER_MIN: usize = 13;
+/// Those loads' wire bytes a minute. Before `ship` frames, 290 to 370 KiB; with them and
+/// compression, 10,510 to 11,179 (spread 6.4%).
+const SHIP_LOAD_WIRE_PER_MIN: usize = 12_674;
+/// The `ship` frames a Ship tab is sent instead, wire bytes a minute: 3,668 to 5,207 (spread 42%:
+/// how many rows a refresh finds changed follows when the legs end).
+const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
+/// The pages' GETs, wire bytes. Before the tracks: agents list 6,374 (6 agents; spread 7.1%, what
+/// each is doing), runs 1,965 (4 runs), a run 2,960 (5 jobs), Ship rows 1,159 (1 row), a Ship row
+/// 6,552, runners 4,334 (2), overview 6,761 (0.4%). Compressed: agents list 2,179 to 2,414 (10.8%),
+/// runs 640 to 653 (2.0%), a run 824 to 863 (4.7%), Ship rows 779 to 784 (0.6%), a Ship row 1,359 to
+/// 1,365 (0.4%), runners 1,521 to 1,548 (1.8%), overview 1,167 to 1,172 (0.4%).
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 1_684), ("overview", 1_260)];
 
-/// A key of Ship's that the simulated tab keeps loaded: what it GETs, the events it reloads on, how
-/// often it polls (`ui/src/views/ship/index.tsx`, `jobs.tsx`), and what its loads came to.
+/// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
+/// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.
 struct Key {
     name: &'static str,
     path: String,
-    on: &'static [&'static str],
+    /// A commit's detail (else the repositories' list).
+    detail: bool,
+    /// When its last load started and ended: a frame that comes meanwhile loads it again once it
+    /// lands (`resource.ts`: it was read before the frame).
+    started: Instant,
     settled: Instant,
     polled: Instant,
     pending: bool,
+    /// What its last load said: whom its rows are for (`viewer`, from memory) and its `dv`.
+    viewer: bool,
+    dv: Option<String>,
     loads: usize,
     wire: usize,
     decoded: usize,
     gzip: usize,
 }
 
-/// Ship's list reloads on these (`ui/src/views/ship/index.tsx`).
-const SHIP_LIST_ON: &[&str] = &["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"];
-/// An opened row's jobs pane reloads on these (`ui/src/views/ship/jobs.tsx`).
-const SHIP_ROW_ON: &[&str] = &["run", "job"];
+impl Key {
+    /// Whether the page takes `frame`, a `ship` frame, in place (`ui/src/views/ship/live.ts`), as
+    /// far as one repository's list and one commit's detail go; false: it loads again. The
+    /// repositories' list is taken as loading again on any frame that says a commit went or its
+    /// pace line moved, as live.ts does for the row it shows.
+    fn takes(&mut self, frame: &Value, sha: &str) -> bool {
+        if !self.viewer || frame.get("whole").is_some() {
+            return false;
+        }
+        let gone = frame.get("gone").and_then(Value::as_array).is_some_and(|g| !g.is_empty());
+        if !self.detail {
+            return !gone && frame.get("pace").is_none();
+        }
+        if frame.get("gone").and_then(Value::as_array).is_some_and(|g| g.iter().any(|x| x.as_str() == Some(sha))) {
+            return false;
+        }
+        let Some(row) = frame.get("rows").and_then(Value::as_array).and_then(|rows| rows.iter().find(|r| r.pointer("/row/sha").and_then(Value::as_str) == Some(sha))) else { return true };
+        let (dv, base) = (row.get("dv").and_then(Value::as_str), row.get("base").and_then(Value::as_str));
+        let held = self.dv.as_deref();
+        match dv {
+            Some(d) if Some(d) == held => true,
+            Some(d) if base.is_some() && base == held => {
+                self.dv = Some(d.to_owned());
+                true
+            }
+            _ => false,
+        }
+    }
+}
 /// `ui/src/lib/resource.ts`: a load asked for by events waits `EVENT_GAP_MS` after the last, and
 /// Ship's keys poll every 15 s (`pollMs: 15_000`).
 const EVENT_GAP: Duration = Duration::from_millis(1000);
@@ -803,7 +876,7 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
     }
 
     // A tab: its events socket read beside the test, every message with when it came.
-    let (tx, rx) = mpsc::channel::<(String, usize, usize, usize)>();
+    let (tx, rx) = mpsc::channel::<(String, usize, usize, usize, Instant, Option<Value>)>();
     let mut tab = Ws::open(s.port, &s.admin, "/api/events")?;
     std::thread::spawn(move || {
         // What permessage-deflate with context takeover would send of the same stream.
@@ -812,8 +885,11 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
             if m.op >= 8 {
                 return;
             }
-            let t = serde_json::from_slice::<Value>(&m.payload).ok().and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
-            if tx.send((t, m.wire, m.payload.len(), stream.push(&m.payload))).is_err() {
+            let v = serde_json::from_slice::<Value>(&m.payload).ok();
+            let t = v.as_ref().and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+            // Ship's frames, kept whole: the simulated Ship tab takes them.
+            let ship = v.filter(|_| t == "ship");
+            if tx.send((t, m.wire, m.payload.len(), stream.push(&m.payload), Instant::now(), ship)).is_err() {
                 return;
             }
         }
@@ -834,8 +910,11 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
 
     let now = Instant::now();
     let long_ago = now.checked_sub(EVENT_GAP + SHIP_POLL).unwrap_or(now);
-    let key = |name, path: String, on| Key { name, path, on, settled: long_ago, polled: long_ago, pending: true, loads: 0, wire: 0, decoded: 0, gzip: 0 };
-    let mut keys = [key("Ship list", "/api/ship/commits?by=repo&limit=100".to_owned(), SHIP_LIST_ON), key("opened row", format!("/api/ship/commits/acme/ship/{sha}"), SHIP_ROW_ON)];
+    let key = |name, path: String, detail| Key { name, path, detail, started: long_ago, settled: long_ago, polled: long_ago, pending: true, viewer: false, dv: None, loads: 0, wire: 0, decoded: 0, gzip: 0 };
+    let mut keys = [key("Ship list", "/api/ship/commits?by=repo&limit=100".to_owned(), false), key("opened row", format!("/api/ship/commits/acme/ship/{sha}"), true)];
+    // The Ship tab's events: only `ship` frames (W21-R15; `ui/src/views/ship/live.ts` asks for no
+    // other while the server's answers carry `viewer`).
+    let (mut ship_frames, mut ship_wire, mut ship_placed) = (0usize, 0usize, 0usize);
     let mut by_type: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
     let (mut frames, mut wire, mut decoded, mut deflated) = (0usize, 0usize, 0usize, 0usize);
     let is_ci = |t: &str| t == "run" || t == "job" || t.starts_with("run.") || t == "ci_verdict";
@@ -848,7 +927,7 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
     while ended.is_none() {
         anyhow::ensure!(Instant::now() < deadline, "the runs never finished\n{}", s.log());
         let first = rx.recv_timeout(Duration::from_millis(50)).ok();
-        for (t, w, d, z) in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+        for (t, w, d, z, at, ship) in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             frames += 1;
             wire += w;
             decoded += d;
@@ -858,8 +937,17 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
             }
             let e = by_type.entry(t.clone()).or_default();
             *e = (e.0 + 1, e.1 + w, e.2 + d);
+            let Some(frame) = ship else { continue };
+            ship_frames += 1;
+            ship_wire += w;
             for k in &mut keys {
-                k.pending |= k.on.contains(&t.as_str());
+                // A frame that came while its load was on its way: once it lands, it loads again.
+                let during = at >= k.started && at <= k.settled;
+                if during || !k.takes(&frame, &sha) {
+                    k.pending = true;
+                } else {
+                    ship_placed += 1;
+                }
             }
         }
         for k in &mut keys {
@@ -871,11 +959,15 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
                 }
                 k.pending = false;
                 // The row's commit has no Ship record until its first run does.
+                k.started = Instant::now();
                 if let Ok(got) = get(s.port, &s.admin, &k.path) {
                     k.loads += 1;
                     k.wire += got.wire;
                     k.decoded += got.body.len();
                     k.gzip += gzipped(&got.body);
+                    let v = serde_json::from_slice::<Value>(&got.body).unwrap_or(Value::Null);
+                    k.viewer = v.get("viewer").is_some();
+                    k.dv = v.get("dv").and_then(Value::as_str).map(str::to_owned);
                 }
                 k.settled = Instant::now();
             }
@@ -908,7 +1000,8 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
     let (_, ci_wire) = sum(&is_ci);
     let (harness_n, harness_wire) = sum(&|t| t == "harness");
     let (headroom_n, _) = sum(&|t| t == "headroom");
-    let (rest_n, rest_wire) = sum(&|t| !is_ci(t) && t != "harness" && t != "headroom");
+    // Ship's frames are the Ship tab's, held below.
+    let (rest_n, rest_wire) = sum(&|t| !is_ci(t) && t != "harness" && t != "headroom" && t != "ship");
     let agent_minutes = AGENTS as f64 * secs / 60.0;
     let runner_minutes = RUNNERS as f64 * secs / 60.0;
     println!("runs, legs and verdicts: {} per job of the push", kib(ci_wire / jobs.max(1)));
@@ -934,10 +1027,11 @@ fn w21_r15_events_ship_and_api_budgets() -> anyhow::Result<()> {
         let most = SHIP_WIRE_PER_LOAD.iter().find(|(n, _)| *n == k.name).map_or(0, |(_, m)| *m);
         budgets.push(Budget { what: format!("Ship {}: wire bytes per load", k.name), value: k.wire / k.loads.max(1), most, track: "ship, compress" });
     }
-    // The most the cadence allows: each key once a second after its last load, and its polls.
-    let ceiling = keys.len() * (60 / EVENT_GAP.as_secs().max(1) + 60 / SHIP_POLL.as_secs().max(1)) as usize;
     println!("Ship: {} a minute over both keys", kib(per_min(keys.iter().map(|k| k.wire).sum())));
-    budgets.push(Budget { what: "Ship (list + opened row): loads/min".into(), value: per_min(loads), most: ceiling, track: "ship" });
+    println!("Ship's frames: {ship_frames} ({:.1} a minute), {} a minute; taken in place {ship_placed} times", ship_frames as f64 * 60.0 / secs, kib(per_min(ship_wire)));
+    budgets.push(Budget { what: "Ship (list + opened row): loads/min".into(), value: per_min(loads), most: SHIP_LOADS_PER_MIN, track: "ship" });
+    budgets.push(Budget { what: "Ship (list + opened row): load wire bytes/min".into(), value: per_min(keys.iter().map(|k| k.wire).sum()), most: SHIP_LOAD_WIRE_PER_MIN, track: "ship, compress" });
+    budgets.push(Budget { what: "Ship: ship frames' wire bytes/min".into(), value: per_min(ship_wire), most: SHIP_FRAMES_WIRE_PER_MIN, track: "ship, compress" });
 
     // The main pages' largest GETs, now there's something in each.
     let run = serde_json::from_str::<Value>(&http(s.port, "GET", "/api/runs?limit=1", &s.admin, None)?.1)?;

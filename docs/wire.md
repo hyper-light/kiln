@@ -907,7 +907,8 @@ goes on as it did:
   land queue's entry), only each thing's newest goes, where the newest was, and none identical to
   what that socket was last sent of it. "Fetch it again" frames (`updates`, `places`, `front_door`
   ...) and the queue's counts go once a batch. Notices (`run.failed`, `mention` ...), samples,
-  `cd_apps` and every other frame all go, in their order.
+  `cd_apps`, `ship` (each says only what one refresh of Ship's rows changed) and every other frame
+  all go, in their order.
 - **Topics** (`?topics=run,job`, then a `topics` frame up, `EventsUp`): only frames of those
   types, and `resync`. A `topics` frame with a `since` (a batch's `at`) is also sent, of the types
   new to it, what came after `since`: the page asks as it starts to load what needs them, so what

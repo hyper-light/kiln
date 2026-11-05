@@ -105,8 +105,9 @@ impl Meta {
 
 /// What a frame is about, for coalescing (docs/wire.md, "The events socket"). Only frames that
 /// carry a thing's whole state, or say no more than "fetch this again", have one: a notice
-/// (`run.failed`, `mention` ...), a sample of a series (`sample`), a part of a list (`cd_apps`) or
-/// any frame not named here is never coalesced.
+/// (`run.failed`, `mention` ...), a sample of a series (`sample`), a part of a list (`cd_apps`), what
+/// one refresh of Ship's rows changed (`ship`: a later frame of a repository doesn't say again the
+/// rows an earlier one did) or any frame not named here is never coalesced.
 fn key_of(kind: &str, v: &Value, text: &str) -> Option<Key> {
     let state = |prefix: &str, pointer: &str| text_at(v, pointer).map(|id| Key::State(format!("{prefix}:{id}")));
     match kind {

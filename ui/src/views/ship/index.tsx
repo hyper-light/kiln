@@ -37,6 +37,7 @@ import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
 import { counted } from "./review/perf";
+import { pageOpts, shipCommits } from "./live";
 
 const LIMIT = 100;
 
@@ -72,11 +73,9 @@ function ShipList() {
   const narrow: Narrow = { host: q.host, kind: q.kind };
   const key = `ship/repos/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
-  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
-  const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
-    pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
-  });
+  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant). The
+  // server turns them into `ship` frames of the rows that changed, each taken in place (W21-R15).
+  const page = useSuspenseResource(key, (s) => shipCommits(q, s), pageOpts(q));
   const all = page.data.commits;
   // What each facet reads of a commit; every facet chosen must hold.
   const value: Record<string, (c: (typeof all)[number]) => string> = {

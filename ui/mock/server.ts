@@ -36,7 +36,7 @@ import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPage
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
-import { handleShip } from "./ship.ts";
+import { handleShip, shipFrames, shipLive } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
@@ -1045,6 +1045,12 @@ for (let i = 0; i < 25; i++) tick();
  * stand still while it's on, so a measurement sees only what it sends itself (ship-perf's keystrokes). */
 let quiet = false;
 setInterval(() => quiet || tick(), 1000);
+// The server's `ship` frames (W21-R15): what changed of Ship's rows, looked at as often as the
+// server's read model may be old (ship.rs's FRESH_MS), while a page listens.
+setInterval(() => {
+  if (quiet || !shipLive() || eventClients.size === 0) return;
+  for (const f of shipFrames({ json, liveJob, liveRun })) emit(f as unknown as ServerEvent);
+}, 250);
 setInterval(() => quiet || emitQueue(), 1000);
 setInterval(() => quiet || emitQueue(true), 5000);
 setInterval(() => quiet || sampleAll(), 5000);
