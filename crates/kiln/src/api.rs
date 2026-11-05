@@ -6769,6 +6769,8 @@ mod tests {
                     crate::rt::sleep(Duration::from_millis(5)).await;
                 }
                 let asked = hub.store.asked();
+                // What every read of an agent's page passes first (`authorized`): whether its caller sees it.
+                crate::harness::lineage::may_see(&hub, &crate::authz::Caller::owner(), "a").await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
                 let list = body_of(harness_sessions(&hub, &crate::authz::Caller::owner()).await).await?;
                 let one = hub.harness.info_json("a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
                 let events = body_of(conversation_events(&hub, "a", &q(&[("limit", "50")])).await.map_err(api)?).await?;
