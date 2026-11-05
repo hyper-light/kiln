@@ -38,18 +38,26 @@ pub static RECORDS_QUEUE: Owner = Owner::new("records_queue");
 /// batch until the server has it and sends it again.
 pub static FEED_INTAKE: Owner = Owner::new("feed_intake");
 
+/// What the server sends its conversation store's mirrors, waiting for the loop that hands it to the net
+/// thread (`crate::convo::mirror`): at most [`crate::convo::mirror::OUT_BYTES`], as much as the net
+/// thread's queue it goes into. At the bound a mirror's feed waits.
+pub static MIRRORS_OUT: Owner = Owner::new("mirrors_out");
+
 /// SQLite's page caches of kiln.db (`crate::store`'s connections: the writer, and the read connections the
-/// pool keeps), each counted after each use (`SQLITE_DBSTATUS_CACHE_USED`): bounded at each open
-/// connection's `cache_size` (SQLite's default, -2000 KiB, about 2 MB; kiln sets none) with its pages'
-/// headers, and as much again for a temp database a statement may make (`crate::store::cache_bound`, about
-/// 4.3 MB a connection); 25 connections on the server's profile (1 writer, 24 readers: the blocking pool's
-/// `store` share), about 108 MB, of which a temp database's half is reached only by statements that make
-/// one. At the bound SQLite lets a connection's least recently used page go: it's read again from the file
-/// (or the OS's cache of it) when asked.
+/// pool keeps), each counted after each use (`SQLITE_DBSTATUS_CACHE_USED`). SQLite keeps every page cache
+/// of the process in one group (pcache1's unified mode, as libsqlite3-sys builds it, with
+/// `SQLITE_ENABLE_MEMORY_MANAGEMENT`): their pages together are at most the sum of their `cache_size`s, a
+/// connection holding more than its own while others hold less. So the bound is that sum over kiln.db's
+/// open connections (`crate::store::cache_bound` each: SQLite's default `cache_size`, -2000 KiB, about 2 MB,
+/// kiln sets none, with each page's header, for its main database and as much again for a temp one a
+/// statement may make: about 4.3 MB); 25 connections on the server's profile (1 writer, 24 readers: the
+/// blocking pool's `store` share), about 108 MB, half of it reached only by statements that make temp
+/// databases. At the bound SQLite lets the group's least recently used page go: it's read again from the
+/// file (or the OS's cache of it) when asked.
 pub static SQLITE: Owner = Owner::new("sqlite");
 
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 7] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &SQLITE];
+pub(super) const ALL: [&Owner; 8] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &SQLITE];
 
 #[cfg(test)]
 mod tests {
@@ -127,25 +135,30 @@ mod tests {
         })
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: a connection's page cache read full (a table twice its
-    /// `cache_size`) holds no more than its main database's share of the bound, and SQLite's header for
-    /// each page is within what the bound allows (`crate::store::PAGE_HEADER`'s basis).
+    /// Goal 11, plan 01a1a87b2e56 step 3: what SQLite counts of each page a cache holds is the page and a
+    /// header within `crate::store::PAGE_HEADER` (its basis): a connection reading a hundred pages more of
+    /// a table holds a hundred pages and their headers more.
     #[test]
-    fn g11_s3_a_full_page_cache_stays_within_its_bound() -> anyhow::Result<()> {
+    fn g11_s3_a_cached_pages_header_is_within_the_bound() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let c = rusqlite::Connection::open(dir.path().join("full.db"))?;
-        c.execute_batch("CREATE TABLE t (b BLOB)")?;
+        let c = rusqlite::Connection::open(dir.path().join("pages.db"))?;
         let page: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        c.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) INSERT INTO t SELECT zeroblob(4000) FROM n")?;
-        let read: i64 = c.query_row("SELECT sum(length(b)) FROM t", [], |r| r.get(0))?;
-        anyhow::ensure!(read == 4_000_000);
-        let used = crate::store::capture::cache_used(&c);
-        let main = crate::store::cache_bound(&c) / 2;
-        anyhow::ensure!(used <= main, "a full cache held {used} bytes, past its database's bound of {main}");
-        let pages = i64::try_from(2000 * 1024 / page).unwrap_or(1).max(1);
-        let header = (i64::try_from(used).unwrap_or(0) - 2 * page) / pages - page;
-        eprintln!("a full cache: {used} bytes, {pages} pages of {page}: {header} bytes of header a page");
-        anyhow::ensure!(used >= main / 2, "the cache never filled: {used} of {main}");
+        let page = usize::try_from(page)?;
+        // A row a page: its blob fills a page but for the cell's and page's own few bytes.
+        let blob = page - 100;
+        c.execute_batch(&format!("CREATE TABLE t (b BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) INSERT INTO t SELECT zeroblob({blob}) FROM n"))?;
+        drop(c);
+        let c = rusqlite::Connection::open(dir.path().join("pages.db"))?;
+        let read = |upto: i64| -> anyhow::Result<usize> {
+            let n: i64 = c.query_row("SELECT count(length(b)) FROM t WHERE rowid <= ?1", [upto], |r| r.get(0))?;
+            anyhow::ensure!(n == upto);
+            Ok(crate::store::capture::cache_used(&c))
+        };
+        let (fifty, one_fifty) = (read(50)?, read(150)?);
+        let each = one_fifty.saturating_sub(fifty) / 100;
+        eprintln!("a cached page: {each} bytes counted for a page of {page}");
+        anyhow::ensure!(each >= page, "a page counted at {each}, less than its {page} bytes");
+        anyhow::ensure!(each - page <= 512, "a page's header counted at {} bytes, past crate::store::PAGE_HEADER", each - page);
         Ok(())
     }
 

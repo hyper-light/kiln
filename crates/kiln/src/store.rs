@@ -120,15 +120,16 @@ impl Writer {
 }
 
 /// What SQLite counts beside each cached page's own bytes, at most (`sqlite3PagerMemUsed`): its `PgHdr`, the
-/// btree's `MemPage` and five pointers, about 260 bytes on a 64-bit machine (what
-/// `memory::owners::tests::g11_s3_a_full_page_cache_stays_within_its_bound` measures), and room for a wider
-/// one.
+/// btree's `MemPage` and five pointers: 256 bytes on a 64-bit machine (what
+/// `memory::owners::tests::g11_s3_a_cached_pages_header_is_within_the_bound` measures), and room for a
+/// wider one.
 const PAGE_HEADER: i64 = 512;
 
-/// The most a connection's page caches hold, in bytes (goal 11, plan 01a1a87b2e56 step 3): its main
-/// database's `cache_size` pages (or, negative, that many KiB of pages: SQLite's default, -2000, about 2 MB;
-/// https://www.sqlite.org/pragma.html#pragma_cache_size), each with its header ([`PAGE_HEADER`]), and its
-/// pager's own buffer and record, a page each at most; then as much again for a temp database, which a
+/// A connection's share of the most SQLite's page caches hold, in bytes (goal 11, plan 01a1a87b2e56 step 3;
+/// the caches share one group, so a connection may hold more while others hold less, the sum bounded): its
+/// main database's `cache_size` pages (or, negative, that many KiB of pages: SQLite's default, -2000, about
+/// 2 MB; https://www.sqlite.org/pragma.html#pragma_cache_size), each with its header ([`PAGE_HEADER`]), and
+/// its pager's own buffer and record, a page each at most; then as much again for a temp database, which a
 /// statement may make (its cache as large). What `SQLITE_DBSTATUS_CACHE_USED` counts.
 pub(crate) fn cache_bound(c: &Connection) -> usize {
     let page: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0).max(1);
