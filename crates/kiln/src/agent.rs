@@ -3170,7 +3170,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::Identity(given)) => {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
                         let taken_over = (given.kind == "agent" && given.cert_pem.is_some()).then(|| (given.of.clone(), given.epoch));
-                        if let Err(e) = crate::runner::identity::given(given, &o.state_dir, &label) {
+                        // Its certificate's file written on the blocking pool, waited for here so what follows finds it
+                        // kept (goal 9, plan 01a1a87b2cec step 3: written and synced on this loop's shard).
+                        if let Err(e) = crate::runner::identity::given_off(given, o.state_dir.clone(), label).await {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                         // The runner role handed to this process, signed for once its own

@@ -75,25 +75,30 @@ impl Held {
         self.keys.keys().any(|s| is_leg(s))
     }
 
-    /// Lets go of the slots `which` picks: their keys (wiped), their certificates and the files
-    /// they were written to. Once no leg's key is left, the process's memory is as it was.
-    fn forget(&mut self, which: impl Fn(&str) -> bool) {
+    /// Lets go of the slots `which` picks: their keys (wiped) and their certificates. Once no leg's key is left, the
+    /// process's memory is as it was. The files the certificates were written to, for its caller to remove once the
+    /// lock is let go of (goal 9, plan 01a1a87b2cec step 3: removed under it, each signer waited on the disk).
+    fn forget(&mut self, which: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         let legs = self.holds_a_leg();
         self.keys.retain(|s, _| !which(s));
         self.given.retain(|s, _| !which(s));
         self.refused.retain(|s| !which(s));
         let gone: Vec<String> = self.certs.keys().filter(|s| which(s)).cloned().collect();
-        for s in gone {
-            if let Some((_, file)) = self.certs.remove(&s) {
-                let _ = std::fs::remove_file(file);
-            }
-        }
+        let files = gone.iter().filter_map(|s| self.certs.remove(s)).map(|(_, file)| file).collect();
         if legs
             && !self.holds_a_leg()
             && let Err(e) = crate::os::private_memory(false)
         {
             tracing::warn!(error = %e, "this process's memory is still kept from its user's other processes");
         }
+        files
+    }
+}
+
+/// Removes the certificates' files `files` ([`Held::forget`]'s), with no lock held.
+fn remove_files(files: Vec<PathBuf>) {
+    for file in files {
+        let _ = std::fs::remove_file(file);
     }
 }
 
@@ -148,32 +153,70 @@ pub fn request(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Resu
 /// The server's answer: the certificate kept for its slot (and written, public, under
 /// `<state>/identities/<file>.pem`, `file` named by `label`), or why there's none, logged. One for
 /// a key let go of meanwhile (a leg that ended first) is kept nowhere.
+///
+/// The certificate's file is written, and waited for on the disk, with no lock held: under `HELD`, as it was, every
+/// signature this process made waited for it, a hand-on's among them, and every look at what it holds (goal 9, plan
+/// 01a1a87b2cec step 3). Called from a task, it goes through [`given_off`].
 pub fn given(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     let slot = slot(&g.kind, g.of.as_deref(), g.epoch);
     let Some(pem) = g.cert_pem else {
         tracing::warn!(identity = %slot, error = %g.error.unwrap_or_default(), "kiln issued no identity");
         // Answered all the same: what waits for it goes on without it (a leg's first step, W27-R05).
-        let mut held = HELD.lock();
-        if held.keys.contains_key(&slot) {
-            held.refused.insert(slot);
-        }
+        refused(slot);
         return Ok(());
     };
-    let mut held = HELD.lock();
-    if !held.keys.contains_key(&slot) {
+    if !HELD.lock().keys.contains_key(&slot) {
         tracing::debug!(identity = %g.uri, "a certificate came for a key let go of");
         return Ok(());
     }
+    let path = cert_written(state_dir, label, &slot, &pem)?;
+    if keep_cert(&slot, Given { uri: g.uri.clone(), under: g.delegation }, pem, path) {
+        tracing::info!(identity = %g.uri, "identity certified");
+    } else {
+        tracing::debug!(identity = %g.uri, "a certificate came for a key let go of as it was written");
+    }
+    Ok(())
+}
+
+/// [`given`] on the blocking pool, off the caller's shard: the certificate's file is written and waited for on the
+/// disk there, as the runner's loop waits for it (goal 9, plan 01a1a87b2cec step 3: it was, on that loop's shard).
+pub async fn given_off(g: IdentityGiven, state_dir: PathBuf, label: String) -> anyhow::Result<()> {
+    crate::rt::blocking(move || given(g, &state_dir, &label)).await?
+}
+
+/// A refusal for `slot`'s key, if it's still held: answered, nothing waits for it.
+fn refused(slot: String) {
+    let mut held = HELD.lock();
+    if held.keys.contains_key(&slot) {
+        held.refused.insert(slot);
+    }
+}
+
+/// `pem`, `slot`'s certificate, written public under `<state>/identities/<label>-<slot>.pem` and waited for on the
+/// disk: where it was written. No lock is held.
+fn cert_written(state_dir: &Path, label: &str, slot: &str, pem: &str) -> anyhow::Result<PathBuf> {
     let dir = state_dir.join("identities");
     std::fs::create_dir_all(&dir)?;
     let file: String = format!("{label}-{slot}").chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') { c } else { '_' }).collect();
     let path = dir.join(format!("{file}.pem"));
     crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
-    tracing::info!(identity = %g.uri, "identity certified");
-    held.given.insert(slot.clone(), Given { uri: g.uri, under: g.delegation });
-    held.refused.remove(&slot);
-    held.certs.insert(slot, (pem, path));
-    Ok(())
+    Ok(path)
+}
+
+/// `slot`'s certificate kept, written to `path` ([`cert_written`]), if its key is still held: one let go of while
+/// it was written (a leg that ended as its certificate came) keeps nothing, and its file goes. Whether it was kept.
+fn keep_cert(slot: &str, given: Given, pem: String, path: PathBuf) -> bool {
+    {
+        let mut held = HELD.lock();
+        if held.keys.contains_key(slot) {
+            held.given.insert(slot.to_owned(), given);
+            held.refused.remove(slot);
+            held.certs.insert(slot.to_owned(), (pem, path));
+            return true;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    false
 }
 
 /// Whether a key is held under `slot` that kiln hasn't answered yet: asked for, and since neither
@@ -269,12 +312,14 @@ pub fn sign(slot: &str, message: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
 
 /// Lets go of every slot starting with `prefix` (`agent/<session>/`: a session that closed).
 pub fn forget_prefix(prefix: &str) {
-    HELD.lock().forget(|s| s.starts_with(prefix));
+    let files = HELD.lock().forget(|s| s.starts_with(prefix));
+    remove_files(files);
 }
 
 /// Lets go of a slot's key and certificate (a session that left the epoch, a leg that ended).
 pub fn forget(slot: &str) {
-    HELD.lock().forget(|s| s == slot);
+    let files = HELD.lock().forget(|s| s == slot);
+    remove_files(files);
 }
 
 #[cfg(test)]
@@ -318,6 +363,46 @@ mod tests {
         assert!(!file.exists(), "its certificate's file goes with it");
         given(serde_json::from_str(&given_json)?, dir.path(), "main")?;
         assert!(cert(&held).is_none() && !file.exists(), "a certificate for a key let go of is kept nowhere");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a certificate's file is written and synced with no lock held, so no signature
+    /// waits on the disk. One whose key is let go of while it's written is kept nowhere, its file gone; `given_off`
+    /// keeps one from a task, on the blocking pool, as `given` does.
+    #[test]
+    fn g9_s3_a_certificate_is_written_with_no_lock_held() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let given_for = |agent: &str| -> anyhow::Result<IdentityGiven> {
+            let asked = ask("agent", Some(agent), Some(1))?;
+            let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: agent.into(), epoch: 1, held_by: None });
+            Ok(serde_json::from_str(&answer(&pki, &asked, &identity)?)?)
+        };
+        // Its key let go of as its file is written: nothing kept, the file gone.
+        let gone = slot("agent", Some("g9-s3-gone"), Some(1));
+        let g = given_for("g9-s3-gone")?;
+        let pem = g.cert_pem.clone().unwrap_or_default();
+        let path = cert_written(dir.path(), "main", &gone, &pem)?;
+        anyhow::ensure!(path.exists(), "written");
+        forget(&gone);
+        anyhow::ensure!(!keep_cert(&gone, Given { uri: g.uri.clone(), under: None }, pem, path.clone()), "its key let go of: not kept");
+        anyhow::ensure!(!path.exists() && cert(&gone).is_none(), "nothing kept, its file gone");
+        // From a task, on the blocking pool: kept as `given` keeps it, its file written.
+        let off = slot("agent", Some("g9-s3-off"), Some(1));
+        let g = given_for("g9-s3-off")?;
+        let state = dir.path().to_path_buf();
+        crate::rt::block_on(async move { given_off(g, state, "main".into()).await })?;
+        anyhow::ensure!(cert(&off).is_some() && uri(&off).is_some(), "kept");
+        anyhow::ensure!(dir.path().join("identities/main-agent_g9-s3-off_1.pem").exists(), "its file written");
+        // `given` holds `HELD` only to look; `keep_cert` only to keep, writing nothing under it.
+        let code = include_str!("identity.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default();
+        let body = |head: &str| code.split(head).nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default().to_owned();
+        let given_body = body("pub fn given(");
+        anyhow::ensure!(given_body.contains("cert_written(") && !given_body.contains("let mut held") && !given_body.contains("let held"), "{given_body}");
+        let keep_body = body("fn keep_cert(");
+        anyhow::ensure!(!keep_body.is_empty() && !keep_body.contains("write_secret") && !keep_body.contains("create_dir"), "{keep_body}");
+        forget(&off);
+        anyhow::ensure!(!dir.path().join("identities/main-agent_g9-s3-off_1.pem").exists(), "let go of, its file removed after the lock");
         Ok(())
     }
 

@@ -1344,6 +1344,17 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
     they were.
   - goal-stacks: the sessions are copied on the compute pool, its loops take turns, and keep-going's lookups are
     sets.
+- **And what was left of those:**
+  - An event under an older number than its copy's newest: the owner makes the copy's events again with it in on
+    the blocking pool (`Shard::want_insert`), as it reads a compact chunk back for a change.
+  - `Entry::from_text` reads an event's head from its text without making its JSON tree (`Head::of_text`).
+  - The fleet finds a machine's sessions by id (`Registry::ids_on`), not in a copy of every session's info.
+  - The told and elsewhere ticks look agents up by id and in sets, not by scans.
+  - A CI verdict's event is written on the compute pool (`Hub::emit_written`).
+  - The runner writes a certificate's file with no lock held, on the blocking pool (`given_off`).
+  - The rarer signatures and checks run on the compute or blocking pool: kiln's own hand-ons, receipts, passes and
+    carries; a person's receipt or hand-on; review verdicts; a leg's records and kiln's receipt of them; KilnCD's
+    records and promotions; the store of bytes; a commit kiln signs.
 
 ### Step 3's check
 

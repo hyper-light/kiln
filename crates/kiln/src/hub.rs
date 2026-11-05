@@ -1034,6 +1034,15 @@ impl Hub {
         }
     }
 
+    /// [`Hub::emit`] of an event its caller wrote out already ([`ServerEvent::text`]), off the shards: a CI verdict's,
+    /// the whole verdict in it, written on the compute pool (goal 9, plan 01a1a87b2cec step 3). Never an agent
+    /// session's own ([`ServerEvent::Harness`], [`ServerEvent::HarnessClosed`]), which go on their lanes.
+    pub fn emit_written(&self, text: Arc<str>) {
+        if self.events.receiver_count() > 0 {
+            self.events.send(0, text);
+        }
+    }
+
     /// A listener of the hub's events ([`Hub::events`]) from now, holding as many as the hub's ring held for
     /// its slowest ([`EVENTS`]): past them it's told how many it lost. Refused when the runtime has no channel
     /// to give it (its cells all in use).
@@ -3723,7 +3732,8 @@ impl Hub {
         use crate::instances::Owned;
         let target = format!("agent:{name}");
         let terms: Vec<Owned> = self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
-        let agents: Vec<Owned> = self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)).collect();
+        // Its agent sessions by id, none of their infos copied (goal 9, plan 01a1a87b2cec step 3).
+        let agents: Vec<Owned> = self.harness.ids_on(&target).into_iter().map(Owned::Agent).collect();
         let jobs: Vec<Owned> = self.agents.load().get(name).map(|a| a.running.iter().cloned().map(Owned::Job).collect()).unwrap_or_default();
         let inst = self.instances.load();
         inst.views(name, |p| {
@@ -3747,7 +3757,9 @@ impl Hub {
             let target = format!("agent:{name}");
             let mut held: Vec<Owned> =
                 self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
-            held.extend(self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)));
+            // Its agent sessions by id, none of their infos copied: every session's whole info was, for each machine
+            // with an older process (goal 9, plan 01a1a87b2cec step 3).
+            held.extend(self.harness.ids_on(&target).into_iter().map(Owned::Agent));
             held.extend(self.agents.load().get(&name).into_iter().flat_map(|a| a.running.iter().cloned().map(Owned::Job)));
             let now = Instant::now();
             let send = self.instances.update(|inst| {
