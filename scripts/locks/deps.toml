@@ -27,7 +27,7 @@
 [[crate]]
 name = "event-listener"
 locks = "each Event's list of listeners (a std Mutex, its `std` feature): taken to add a listener, to take one out, to notify and as a listener is polled"
-reached = "every wait and wake of an async-channel (the hub's terminals' outputs and relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own rt::Notify (reads.rs's reads made ahead) and rt::Shutdown (the server's and the hub's loops), on the shards; memory::queue (sessions' inboxes, the net thread's queues) left it for a lock-free list of its own in goal 4 step 5"
+reached = "every wait and wake of an async-channel (the hub's terminals' outputs and relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own rt::Notify (reads.rs's reads made ahead; each events socket's wake, wire/events/feed.rs) and rt::Shutdown (the server's and the hub's loops), on the shards; memory::queue (sessions' inboxes, the net thread's queues) left it for a lock-free list of its own in goal 4 step 5"
 track_caller = ["src/intrusive.rs:with_inner"]
 
 [[crate]]

@@ -1,6 +1,8 @@
 //! WebSockets: upgrades on top of kiln-http's server (the RFC 6455 handshake is answered here) and
 //! client connections over kiln's own TCP / TLS setup (agents' HTTP tunnel, `crate::tunnel`). Both
-//! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt).
+//! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt). A server socket whose client
+//! offers permessage-deflate (RFC 7692; every browser does) has it, under tungstenite
+//! (`super::deflate`); kiln's own client offers none, so a runner's tunnel is as it was.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,11 +18,11 @@ use super::tls::{ClientTls, TlsStream};
 pub use tungstenite::Message;
 use tungstenite::protocol::WebSocketConfig;
 
-/// A server-side WebSocket over an upgraded connection.
-pub type WebSocket = async_tungstenite::WebSocketStream<Upgraded>;
+/// A server-side WebSocket over an upgraded connection (compressed, when its client offered it).
+pub type WebSocket = async_tungstenite::WebSocketStream<super::deflate::Socket<Upgraded>>;
 
 /// Its sending half (`WebSocket::split`).
-pub type Sender = async_tungstenite::WebSocketSender<Upgraded>;
+pub type Sender = async_tungstenite::WebSocketSender<super::deflate::Socket<Upgraded>>;
 
 /// Is this a WebSocket upgrade request?
 pub fn is_upgrade(req: &Request) -> bool {
@@ -98,10 +100,22 @@ fn accept_with(
     if let Ok(v) = http::HeaderValue::from_str(&accept) {
         h.insert(header::SEC_WEBSOCKET_ACCEPT, v);
     }
+    // permessage-deflate, when the client offers it (W21-R15): what a browser's socket carries most
+    // is JSON much like the message before it.
+    let deflate = super::deflate::negotiate(req.headers());
+    // What an inflated message may come to: the socket's own bound (none, none).
+    let max_message = config.max_message_size.unwrap_or(usize::MAX);
+    if let Some(agreed) = deflate {
+        h.insert(header::SEC_WEBSOCKET_EXTENSIONS, agreed.header());
+    }
     let upgrade = async move {
         let upgraded = kiln_http::upgrade::on(req).await.map_err(|e| anyhow::anyhow!("upgrade: {e}"))?;
+        let socket = match deflate {
+            Some(agreed) => super::deflate::Socket::deflating(upgraded, agreed, max_message),
+            None => super::deflate::Socket::plain(upgraded),
+        };
         let ws = async_tungstenite::WebSocketStream::from_raw_socket(
-            upgraded,
+            socket,
             tungstenite::protocol::Role::Server,
             Some(config),
         )

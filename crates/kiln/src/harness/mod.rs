@@ -79,4 +79,5 @@ pub mod wait;
 pub mod webrtc;
 pub mod weigh;
 pub mod whose;
+pub mod window;
 pub mod worktree;

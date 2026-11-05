@@ -3,11 +3,15 @@
 //!
 //! * [`server`] — accept loop glue (HTTP/1.1 and HTTP/2, TLS or not), request/response helpers.
 //! * [`ws`] — WebSocket upgrades (events, live logs, terminals).
+//! * [`compress`] — the API's answers compressed and validated (gzip, brotli, ETags).
+//! * [`deflate`] — WebSocket compression (permessage-deflate) under the server's sockets.
 //! * [`client`] — outbound HTTP(S): GitHub, the Kubernetes API, agent⇄server HTTP.
 //! * [`io`] — hyper-rt TCP streams as futures-io, and connections out.
 //! * [`tls`] — hyper-tls client/server configuration and the TLS stream adapter.
 
 pub mod client;
+pub mod compress;
+pub mod deflate;
 pub mod io;
 pub mod proxy;
 pub mod roots;

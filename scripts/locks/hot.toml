@@ -31,6 +31,9 @@ hot = [
   # Agent sessions' events (every change of a session's info) out of each owner shard to their readers:
   # the events sockets, push and agents.wait (goal 4, plan 01a1a59c2a9c step 5).
   "crates/kiln/src/memory/lanes.rs",
+  # The events sockets' feed (W21-R15): every frame the hub emits, pushed from the shard that emits it (an
+  # agent session's change from its owner's) and read by every page's socket, numbered so a page resumes.
+  "crates/kiln/src/wire/events/feed.rs",
   # Queues bounded in bytes: each session owner's inbox (every runner's update), the net thread's queues to
   # and from the hub, and the rest of kiln's that runners' messages pass through (goal 4, plan 01a1a59c2a9c
   # step 5).
