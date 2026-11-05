@@ -692,15 +692,7 @@ impl View {
     /// What this copy has of its events, said in digests (`crate::wire::sums`): each event's
     /// digest is of its text, written out once, however many ask.
     pub fn kept(&self, session: &str) -> crate::proto::KeptSession {
-        let mut events: Vec<(u64, u64)> = Vec::new();
-        for c in self.events.chunks() {
-            // A compact chunk's events read again from its segment; one that can't be is passed over, said
-            // in the log, as `Events::iter` passes it over.
-            match c.evs() {
-                Ok(evs) => events.extend(c.metas().iter().zip(evs.iter()).filter(|(m, _)| !m.id.is_empty()).filter_map(|(m, e)| Some((m.seq?, m.sum(e))))),
-                Err(e) => tracing::warn!(session, error = %e, "a session copy's packed events couldn't be read again for its digests: passed over"),
-            }
-        }
+        let mut events: Vec<(u64, u64)> = self.events.chunks().iter().flat_map(|c| c.metas().iter().zip(c.evs())).filter(|(m, _)| !m.id.is_empty()).filter_map(|(m, e)| Some((m.seq?, m.sum(e)))).collect();
         events.sort_unstable_by_key(|(seq, _)| *seq);
         crate::wire::sums::kept(session.to_owned(), self.info.epoch, &events)
     }
@@ -1631,7 +1623,7 @@ mod tests {
             }
             for c in m.events.chunks().iter().take(3) {
                 assert!(c.metas().iter().all(|meta| meta.sum_made().is_some()), "a packed chunk's digests are all there");
-                for (meta, e) in c.metas().iter().zip(c.evs()?.iter()) {
+                for (meta, e) in c.metas().iter().zip(c.evs()) {
                     assert_eq!(meta.sum(e), e.entry.sum());
                 }
             }
