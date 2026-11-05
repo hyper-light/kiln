@@ -52,9 +52,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::ask::{self, Amounts, Ask, Peer, Sample};
+use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
-use super::msg::{Estimate, Place, Reason, ToOwner, shortfall};
+use super::msg::{Estimate, Place, Reason, ToOwner, Up, shortfall};
 use crate::facts::RunnerFacts;
 use crate::sched::routing::Constraint;
 use crate::sched::state::{self as engine, Class, ClassConfig, Due, FairBy, Fence, LEVELS, PerMille, Resources};
@@ -110,8 +111,20 @@ impl Default for Settings {
     }
 }
 
-/// A message for an owner: whose (its node's name), and what.
+/// A message for an owner, as the wire has it: whose (its node's name), and what.
 pub type Said = (String, ToOwner);
+
+/// A message for an owner by handle, as the in-process path carries it (docs/needs.md §11, AUDIT
+/// P6): to which of its owners' processes ([`Admission::owner_name`]), the owner's own handle of
+/// the run (0 when it gave none), the run, and what. No names copied: [`Admission::said`] makes
+/// the wire's [`Said`] of it at the edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    pub owner: u32,
+    pub token: u64,
+    pub run: Arc<str>,
+    pub msg: Up,
+}
 
 /// A run started here, as the record the shell keeps on disk has it: under which claim, and how
 /// it ended (`None` while it runs; `Some(true)` its process exited, `Some(false)` it was lost).
@@ -210,7 +223,9 @@ struct Charge {
 #[derive(Debug, Clone)]
 struct Probe {
     owner: u32,
-    run: String,
+    /// The owner's own handle of it, said back with every word (0: none given).
+    token: u64,
+    run: Arc<str>,
     /// The ask as its owner's probe shares it: never copied.
     ask: Arc<Ask>,
     amounts: Amounts,
@@ -219,9 +234,11 @@ struct Probe {
     /// Its place in the line, from when it came in: it keeps its own order and arrival while aside,
     /// its standing taken as it goes back in.
     key: Option<Key>,
-    /// Its tenant's leaf in the tenant tree (`repo`, `repo\0actor`, `repo\0actor\0lane`) and its
-    /// nodes' weights, top down.
-    leaf: String,
+    /// Its tenant's leaf in the tenant tree (`repo`, `repo\0actor`, `repo\0actor\0lane`): its
+    /// nodes top down, interned (the first `depth` of `path`; the leaf the last), and their
+    /// weights.
+    path: [u32; LEVELS],
+    depth: u8,
     weights: [PerMille; LEVELS],
     /// Its class now: the one it came with, or the one its wait brought it to (W05-R31).
     class: Class,
@@ -253,7 +270,7 @@ struct OwnerAt {
     name: String,
     epoch: u64,
     away: bool,
-    runs: BTreeMap<String, u32>,
+    runs: FxMap<Arc<str>, u32>,
     rtt: Option<Rtt>,
 }
 
@@ -261,16 +278,46 @@ struct OwnerAt {
 /// each node's finish tag (the runner's own set of dimensions alone), what its running runs hold,
 /// when its floor's pace lets it go over its floor again, when it last started a run here, and the
 /// runs waiting in it, by leaf, with the standing their keys hold.
+/// Nodes are the runner's interned tenant-tree nodes (`Admission::nodes`; 0 the root, the parent of
+/// every repository): virtual times and finish tags by node, in vectors.
 #[derive(Debug, Clone, Default)]
 struct Fair {
-    vtimes: BTreeMap<String, u128>,
-    finish: BTreeMap<String, u128>,
+    vtimes: Vec<u128>,
+    finish: Vec<Option<u128>>,
     held: [u128; FAIR],
     paced: Option<i64>,
     served: Option<i64>,
-    leaves: BTreeMap<String, ([u128; LEVELS], BTreeSet<u32>)>,
+    leaves: BTreeMap<u32, ([u128; LEVELS], BTreeSet<u32>)>,
     /// Its tags moved since its runs' keys were last put right.
     moved: bool,
+}
+
+impl Fair {
+    fn vtime(&self, n: u32) -> u128 {
+        self.vtimes.get(ix(n)).copied().unwrap_or(0)
+    }
+
+    fn set_vtime(&mut self, n: u32, v: u128) {
+        if self.vtimes.len() <= ix(n) {
+            self.vtimes.resize(ix(n).saturating_add(1), 0);
+        }
+        if let Some(x) = self.vtimes.get_mut(ix(n)) {
+            *x = v;
+        }
+    }
+
+    fn finish_of(&self, n: u32) -> Option<u128> {
+        self.finish.get(ix(n)).copied().flatten()
+    }
+
+    fn set_finish(&mut self, n: u32, v: u128) {
+        if self.finish.len() <= ix(n) {
+            self.finish.resize(ix(n).saturating_add(1), None);
+        }
+        if let Some(x) = self.finish.get_mut(ix(n)) {
+            *x = Some(v);
+        }
+    }
 }
 
 /// The runner's admission of probed runs: pure, its inputs the probes and their owners' words, the
@@ -301,7 +348,11 @@ pub struct Admission {
     spare: Vec<u32>,
     owners: Vec<OwnerAt>,
     /// Each owner's processes by name: (epoch, index), the last the current one.
-    owner_ix: BTreeMap<String, Vec<(u64, u32)>>,
+    owner_ix: FxMap<String, Vec<(u64, u32)>>,
+    /// The tenant tree's nodes by name (`""`, the root, is 0), for fair share's tags by handle.
+    nodes: Interner,
+    /// Each leaf's nodes top down, and how many.
+    paths: FxMap<u32, ([u32; LEVELS], u8)>,
     line: Line,
     seq: u64,
     came: u64,
@@ -333,6 +384,8 @@ pub struct Admission {
     /// offered at once is told only the offer (an owner choosing between offers takes a word that
     /// it waits for its answer, docs/needs.md §11, AUDIT P6), and a message is saved.
     hush: Option<u32>,
+    /// A buffer of replies, reused by the wire's inputs.
+    replies: Vec<Reply>,
 }
 
 fn ix(s: u32) -> usize {
@@ -350,6 +403,16 @@ fn less_sums(all: &super::line::Sums, before: &super::line::Sums) -> [u128; ask:
         *o = o.saturating_sub(*b);
     }
     out
+}
+
+/// A probe's tenant's nodes, top down.
+fn path_of(p: &Probe) -> &[u32] {
+    p.path.get(..usize::from(p.depth)).unwrap_or(&[])
+}
+
+/// A probe's tenant's leaf: its last node.
+fn leaf_of(p: &Probe) -> u32 {
+    path_of(p).last().copied().unwrap_or(0)
 }
 
 /// A claim's place among the claims by predicted end.
@@ -391,7 +454,9 @@ impl Admission {
             slots: Vec::new(),
             spare: Vec::new(),
             owners: Vec::new(),
-            owner_ix: BTreeMap::new(),
+            owner_ix: FxMap::default(),
+            nodes: Interner::default(),
+            paths: FxMap::default(),
             line: Line::default(),
             seq: 0,
             came: 0,
@@ -408,7 +473,9 @@ impl Admission {
             land_claims: BTreeSet::new(),
             watchers: BTreeSet::new(),
             hush: None,
+            replies: Vec::new(),
         };
+        a.nodes.intern("");
         a.remeasure();
         let _ = now;
         a
@@ -528,14 +595,14 @@ impl Admission {
             None => {}
         }
         let o = u32::try_from(self.owners.len()).unwrap_or(u32::MAX);
-        self.owners.push(OwnerAt { name: from.name.to_owned(), epoch: from.epoch, away: false, runs: BTreeMap::new(), rtt: None });
+        self.owners.push(OwnerAt { name: from.name.to_owned(), epoch: from.epoch, away: false, runs: FxMap::default(), rtt: None });
         self.owner_ix.entry(from.name.to_owned()).or_default().push((from.epoch, o));
         Some(o)
     }
 
     /// The owner process a word comes from ([`Self::owner_for`]); if that retired an earlier one,
     /// every waiting run is told where it stands now.
-    fn speaker(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) -> Option<u32> {
+    fn speaker(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) -> Option<u32> {
         let o = self.owner_for(from);
         if self.stale {
             self.boundaries(now, out);
@@ -658,11 +725,11 @@ impl Admission {
             self.watchers.remove(&(came, s));
             // The slot and the class's leaves borrowed apart, so the leaf's name isn't copied.
             if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index()))
-                && let Some((_, set)) = f.leaves.get_mut(p.leaf.as_str())
+                && let Some((_, set)) = f.leaves.get_mut(&leaf_of(p))
             {
                 set.remove(&s);
                 if set.is_empty() {
-                    f.leaves.remove(p.leaf.as_str());
+                    f.leaves.remove(&leaf_of(p));
                 }
             }
         }
@@ -681,22 +748,20 @@ impl Admission {
         self.release(s);
         let Some(p) = self.slots.get_mut(ix(s)).and_then(Option::take) else { return };
         if let Some(w) = self.owners.get_mut(ix(p.owner)) {
-            w.runs.remove(&p.run);
+            w.runs.remove(p.run.as_ref());
         }
         self.spare.push(s);
     }
 
     /// A leaf's standing in `class`'s tree (the engine's `standing_of`, for this runner's set of
     /// dimensions): at each node from its repository down, `max(V[parent], finish[node])`.
-    fn standing_of(&self, class: Class, leaf: &str) -> [u128; LEVELS] {
+    fn standing_of(&self, class: Class, path: &[u32]) -> [u128; LEVELS] {
         let mut out = [0; LEVELS];
         let Some(f) = self.fair_of(class) else { return out };
-        let mut parent = "";
-        for (slot, node) in out.iter_mut().zip(engine::nodes(leaf)) {
-            let v = f.vtimes.get(parent).copied().unwrap_or(0);
-            let fin = f.finish.get(node).copied().unwrap_or(0);
-            *slot = v.max(fin);
-            parent = node;
+        let mut parent = 0;
+        for (slot, node) in out.iter_mut().zip(path) {
+            *slot = f.vtime(parent).max(f.finish_of(*node).unwrap_or(0));
+            parent = *node;
         }
         out
     }
@@ -706,14 +771,12 @@ impl Admission {
     fn enter(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
         let (class, came, land_due) = (p.class, p.came, p.land_due);
-        let standing = self.standing_of(class, &p.leaf);
+        let standing = self.standing_of(class, path_of(p));
         let key = Key { class: class_ix(class), standing, own: p.own, seq: p.seq };
         let item = Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout };
         self.line.insert(key, item);
-        // The slot and the class's leaves borrowed apart: the leaf's name copied only the first
-        // time it waits here.
         if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) {
-            match f.leaves.get_mut(p.leaf.as_str()) {
+            match f.leaves.get_mut(&leaf_of(p)) {
                 Some((had, set)) => {
                     set.insert(s);
                     if *had != standing {
@@ -721,7 +784,7 @@ impl Admission {
                     }
                 }
                 None => {
-                    f.leaves.insert(p.leaf.clone(), (standing, BTreeSet::from([s])));
+                    f.leaves.insert(leaf_of(p), (standing, BTreeSet::from([s])));
                 }
             }
         }
@@ -740,18 +803,19 @@ impl Admission {
 
     /// Each class whose tags moved has its waiting runs put in again where their tenants stand
     /// now, each told if its place or reason changed.
-    fn restand(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn restand(&mut self, now: i64, out: &mut Vec<Reply>) {
         for c in Class::ALL {
             if !self.fair.get(c.index()).is_some_and(|f| f.moved) {
                 continue;
             }
-            let leaves: Vec<(String, [u128; LEVELS])> = self.fair.get(c.index()).map(|f| f.leaves.iter().map(|(l, (st, _))| (l.clone(), *st)).collect()).unwrap_or_default();
+            let leaves: Vec<(u32, [u128; LEVELS])> = self.fair.get(c.index()).map(|f| f.leaves.iter().map(|(l, (st, _))| (*l, *st)).collect()).unwrap_or_default();
             if let Some(f) = self.fair.get_mut(c.index()) {
                 f.moved = false;
             }
             let mut moves: Vec<(u32, [u128; LEVELS])> = Vec::new();
             for (leaf, had) in leaves {
-                let standing = self.standing_of(c, &leaf);
+                let (path, depth) = self.paths.get(&leaf).copied().unwrap_or(([0; LEVELS], 0));
+                let standing = self.standing_of(c, path.get(..usize::from(depth)).unwrap_or(&[]));
                 if standing == had {
                     continue;
                 }
@@ -814,30 +878,18 @@ impl Admission {
         }
         let ms = p.ask.median.or(self.settings.default_cost).unwrap_or(0);
         let class = p.class;
-        // The slot and the class's tags borrowed apart, so the leaf's names aren't copied but the
-        // first time a node is charged.
         let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) else { return };
-        let mut parent = "";
-        for (node, weight) in engine::nodes(&p.leaf).zip(p.weights) {
+        let mut parent = 0;
+        for (node, weight) in path_of(p).iter().zip(p.weights) {
             let c = engine::charges(&fair, ms, weight).into_iter().max().unwrap_or(0);
             if c > 0 {
-                let v = f.vtimes.get(parent).copied().unwrap_or(0);
-                let start = v.max(f.finish.get(node).copied().unwrap_or(0));
-                match f.finish.get_mut(node) {
-                    Some(x) => *x = start.saturating_add(c),
-                    None => {
-                        f.finish.insert(node.to_owned(), start.saturating_add(c));
-                    }
-                }
-                match f.vtimes.get_mut(parent) {
-                    Some(x) => *x = v.max(start),
-                    None => {
-                        f.vtimes.insert(parent.to_owned(), v.max(start));
-                    }
-                }
+                let v = f.vtime(parent);
+                let start = v.max(f.finish_of(*node).unwrap_or(0));
+                f.set_finish(*node, start.saturating_add(c));
+                f.set_vtime(parent, v.max(start));
                 f.moved = true;
             }
-            parent = node;
+            parent = *node;
         }
         for (h, a) in f.held.iter_mut().zip(holds) {
             *h = h.saturating_add(u128::from(a));
@@ -860,15 +912,19 @@ impl Admission {
         if let (Some((took, left)), Some(at)) = (c.paced, f.paced.as_mut()) {
             *at = at.saturating_sub(took).saturating_add(engine::pace_ms(&c.shares, ran, left));
         }
-        for (node, weight) in engine::nodes(&p.leaf).zip(p.weights) {
+        for (node, weight) in path_of(p).iter().zip(p.weights) {
             let charged = engine::charges(&c.fair, c.ms, weight).into_iter().max().unwrap_or(0);
             let used = engine::charges(&c.fair, ran, weight).into_iter().max().unwrap_or(0);
-            if let Some(x) = f.finish.get_mut(node) {
-                *x = x.saturating_sub(charged).saturating_add(used);
-                f.moved = true;
-            } else if used > 0 {
-                f.finish.insert(node.to_owned(), used);
-                f.moved = true;
+            match f.finish_of(*node) {
+                Some(x) => {
+                    f.set_finish(*node, x.saturating_sub(charged).saturating_add(used));
+                    f.moved = true;
+                }
+                None if used > 0 => {
+                    f.set_finish(*node, used);
+                    f.moved = true;
+                }
+                None => {}
             }
         }
     }
@@ -922,6 +978,24 @@ impl Admission {
         }
     }
 
+    /// Run `s`'s look from `class`, which it reached at `since`, kept on it but not filed.
+    fn plan_look(&mut self, s: u32, since: i64, class: Class) {
+        if let (Some(bound), Some(_)) = (self.class_config(class).bound, class.up())
+            && let Some(p) = self.get_mut(s)
+        {
+            p.look = Some((later(since, bound), class));
+        }
+    }
+
+    /// Run `s`'s look filed in `promotions`, if it has one not filed.
+    fn file_look(&mut self, s: u32) {
+        let Some((seq, Some((at, class)))) = self.get(s).map(|p| (p.seq, p.look)) else { return };
+        let v = self.promotions.entry(at).or_default();
+        if !v.contains(&(s, seq, class)) {
+            v.push((s, seq, class));
+        }
+    }
+
     fn look_at(&mut self, s: u32, seq: u64, at: i64, class: Class) {
         self.promotions.entry(at).or_default().push((s, seq, class));
         if let Some(p) = self.get_mut(s) {
@@ -956,7 +1030,7 @@ impl Admission {
     /// it's looked at again a bound after that start); an `interactive` run whose `land` work ahead
     /// is due done goes up into `land`. A promoted run keeps its own order and arrival, and
     /// preempts nothing.
-    fn promote_due(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn promote_due(&mut self, now: i64, out: &mut Vec<Reply>) {
         while let Some(at) = self.promotions.first_key_value().map(|(at, _)| *at).filter(|at| *at <= now) {
             for (s, seq, from) in self.promotions.remove(&at).unwrap_or_default() {
                 if let Some(p) = self.get_mut(s).filter(|p| p.seq == seq && p.look == Some((at, from))) {
@@ -979,7 +1053,7 @@ impl Admission {
 
     /// Run `s` comes to class `to` at `at`: in the line at its place there, looked at for its
     /// promotion from there, and if that's `interactive`, behind the `land` work there now.
-    fn reclass(&mut self, s: u32, to: Class, at: i64, now: i64, out: &mut Vec<Said>) {
+    fn reclass(&mut self, s: u32, to: Class, at: i64, now: i64, out: &mut Vec<Reply>) {
         let waiting = self.get(s).is_some_and(|p| p.state == State::Waiting);
         if waiting {
             self.leave(s);
@@ -1022,7 +1096,7 @@ impl Admission {
 
     /// What every input does first (as the engine's `handle` does): the looks due by now, and the
     /// runs whose tenants' standing moved put where they stand.
-    fn begin(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn begin(&mut self, now: i64, out: &mut Vec<Reply>) {
         self.promote_due(now, out);
         self.restand(now, out);
     }
@@ -1080,7 +1154,7 @@ impl Admission {
     /// first in order that has room; the first class's, unless a class after it is short of its
     /// floor and may go ahead. With `backfill` declared, the first in line that has no room keeps
     /// room (W05-R39). Each offer is one decision, O(log n) in the line.
-    fn admit(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn admit(&mut self, now: i64, out: &mut Vec<Reply>) {
         loop {
             self.restand(now, out);
             if self.draining {
@@ -1152,7 +1226,7 @@ impl Admission {
 
     /// Gives a waiting probe room: offered to its owner under a new claim, held for the owner's
     /// link's retransmission timeout, its tenant charged for it.
-    fn offer(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
+    fn offer(&mut self, s: u32, now: i64, out: &mut Vec<Reply>) {
         let free = self.free_now();
         let fence = self.next_fence();
         let Some(p) = self.get(s) else { return };
@@ -1170,18 +1244,20 @@ impl Admission {
         self.boundaries(now, out);
     }
 
-    fn say_offer(&self, s: u32, free: Option<Amounts>, out: &mut Vec<Said>) {
+    fn say_offer(&self, s: u32, free: Option<Amounts>, out: &mut Vec<Reply>) {
         let Some(p) = self.get(s) else { return };
         let State::Offered { fence, .. } = p.state else { return };
-        let Some(w) = self.owner(p.owner).filter(|w| !w.away) else { return };
+        if self.owner(p.owner).is_none_or(|w| w.away) {
+            return;
+        }
         let free = ask::resources(&free.unwrap_or_else(|| self.free_now()));
-        out.push((w.name.clone(), ToOwner::Offer { run: p.run.clone(), fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk }));
+        out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk } });
     }
 
     /// The runs at the boundaries between powers of two in the line, and the first: each told its
     /// place and reason if either changed. After one arrival or departure, only these can have
     /// changed their place's range (docs/needs.md §11: O(log n) of them, each O(log n) to find).
-    fn boundaries(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn boundaries(&mut self, now: i64, out: &mut Vec<Reply>) {
         if self.stale {
             self.stale = false;
             self.tell_all(now, out);
@@ -1204,20 +1280,20 @@ impl Admission {
     }
 
     /// Tells every waiting probe whose place or reason changed (a drain, an owner back): O(n).
-    fn tell_all(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn tell_all(&mut self, now: i64, out: &mut Vec<Reply>) {
         // In order: each one's place is where it comes, no search for it.
         for (rank, (_, s)) in self.line.entries().into_iter().enumerate() {
             self.tell_at(s, u32::try_from(rank).unwrap_or(u32::MAX), now, out);
         }
     }
 
-    fn tell_if_changed(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
+    fn tell_if_changed(&mut self, s: u32, now: i64, out: &mut Vec<Reply>) {
         let Some(rank) = self.rank_of(s) else { return };
         self.tell_at(s, rank, now, out);
     }
 
     /// Tells waiting probe `s`, at place `rank` (the first 0), where it stands, if that changed.
-    fn tell_at(&mut self, s: u32, rank: u32, now: i64, out: &mut Vec<Said>) {
+    fn tell_at(&mut self, s: u32, rank: u32, now: i64, out: &mut Vec<Reply>) {
         if self.hush == Some(s) {
             return;
         }
@@ -1231,12 +1307,12 @@ impl Admission {
             return;
         }
         let msg = self.waiting_msg(s, rank, now);
-        let to = self.owner(p.owner).filter(|w| !w.away).map(|w| w.name.clone());
+        let to = self.owner(p.owner).filter(|w| !w.away).map(|_| (p.owner, p.token, Arc::clone(&p.run)));
         if let Some(p) = self.get_mut(s) {
             p.told = Some(told);
         }
-        if let (Some(to), Some(msg)) = (to, msg) {
-            out.push((to, msg));
+        if let (Some((owner, token, run)), Some(msg)) = (to, msg) {
+            out.push(Reply { owner, token, run, msg });
         }
     }
 
@@ -1280,11 +1356,10 @@ impl Admission {
     }
 
     /// What a waiting probe's owner is told of where it stands.
-    fn waiting_msg(&self, s: u32, rank: u32, now: i64) -> Option<ToOwner> {
+    fn waiting_msg(&self, s: u32, rank: u32, now: i64) -> Option<Up> {
         let p = self.get(s)?;
         let k = p.key?;
-        Some(ToOwner::Waiting {
-            run: p.run.clone(),
+        Some(Up::Waiting {
             reason: self.reason(s, rank),
             place: Place::of(rank.saturating_add(1)),
             start: self.estimate(&k, now),
@@ -1333,15 +1408,18 @@ impl Admission {
     }
 
     /// What a probe's owner is told of it as it stands now (a probe said again, an owner back).
-    fn standing(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
+    fn standing(&mut self, s: u32, now: i64, out: &mut Vec<Reply>) {
         let Some(p) = self.get(s) else { return };
-        let Some(to) = self.owner(p.owner).filter(|w| !w.away).map(|w| w.name.clone()) else { return };
-        let (state, predicted, run) = (p.state, p.predicted, p.run.clone());
+        if self.owner(p.owner).is_none_or(|w| w.away) {
+            return;
+        }
+        let (state, predicted, owner, token, run) = (p.state, p.predicted, p.owner, p.token, Arc::clone(&p.run));
+        let reply = |msg| Reply { owner, token, run: Arc::clone(&run), msg };
         match state {
             State::Offered { .. } => self.say_offer(s, None, out),
-            State::Taken { fence } => out.push((to, ToOwner::Held { run, fence })),
-            State::Running { .. } => out.push((to, ToOwner::Ran { run })),
-            State::Aside => out.push((to, ToOwner::Waiting { run, reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()) })),
+            State::Taken { fence } => out.push(reply(Up::Held { fence })),
+            State::Running { .. } => out.push(reply(Up::Ran)),
+            State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()) })),
             State::Waiting => {
                 if let Some(p) = self.get_mut(s) {
                     p.told = None;
@@ -1349,6 +1427,89 @@ impl Admission {
                 self.tell_if_changed(s, now, out);
             }
         }
+    }
+}
+
+/// The wire's inputs and outputs: each input as its `_r` twin has it, its words made [`Said`]s.
+impl Admission {
+    /// The name of its owners' process `o`, as a [`Reply`] names it.
+    pub fn owner_name(&self, o: u32) -> &str {
+        self.owner(o).map_or("", |w| w.name.as_str())
+    }
+
+    /// A [`Reply`] as the wire has it.
+    pub fn said(&self, r: Reply) -> Said {
+        (self.owner_name(r.owner).to_owned(), r.msg.wire(&r.run))
+    }
+
+    fn wire(&mut self, out: &mut Vec<Said>, f: impl FnOnce(&mut Admission, &mut Vec<Reply>)) {
+        let mut r = std::mem::take(&mut self.replies);
+        f(self, &mut r);
+        for x in r.drain(..) {
+            let said = self.said(x);
+            out.push(said);
+        }
+        self.replies = r;
+    }
+
+    /// [`Self::probe_r`], with no handle of the owner's.
+    pub fn probe(&mut self, from: Peer<'_>, ask: impl Into<Arc<Ask>>, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+        let ask = ask.into();
+        self.wire(out, |a, r| a.probe_r(from, ask, 0, predicted, now, r));
+    }
+
+    pub fn withdraw(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.withdraw_r(from, run, now, r));
+    }
+
+    pub fn take(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.take_r(from, run, fence, now, r));
+    }
+
+    pub fn decline(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.decline_r(from, run, fence, now, r));
+    }
+
+    pub fn start(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) -> Option<Start> {
+        let mut started = None;
+        self.wire(out, |a, r| started = a.start_r(from, run, fence, now, r));
+        started
+    }
+
+    pub fn spawned(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.spawned_r(from, run, r));
+    }
+
+    pub fn ended(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.ended_r(from, run, ok, now, r));
+    }
+
+    pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.measured_r(sample, now, r));
+    }
+
+    pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.drain_r(draining, now, r));
+    }
+
+    pub fn away(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.away_r(name, now, r));
+    }
+
+    pub fn back(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.back_r(from, now, r));
+    }
+
+    pub fn forget(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.forget_r(name, now, r));
+    }
+
+    pub fn predict(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.predict_r(from, run, predicted, now, r));
+    }
+
+    pub fn tick(&mut self, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.tick_r(now, r));
     }
 }
 
@@ -1412,13 +1573,13 @@ impl Admission {
     }
 
     /// If the record has the run, tells its owner it ran (or how it ended): true.
-    fn recorded(&self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) -> bool {
+    fn recorded(&self, from: Peer<'_>, o: u32, token: u64, run: &str, out: &mut Vec<Reply>) -> bool {
         let Some(r) = self.record(from.name, from.epoch, run) else { return false };
-        let run = run.to_owned();
-        out.push((from.name.to_owned(), match r.ended {
-            None => ToOwner::Ran { run },
-            Some(ok) => ToOwner::Ended { run, fence: r.fence, ok },
-        }));
+        let msg = match r.ended {
+            None => Up::Ran,
+            Some(ok) => Up::Ended { fence: r.fence, ok },
+        };
+        out.push(Reply { owner: o, token, run: Arc::from(run), msg });
         true
     }
 
@@ -1468,34 +1629,41 @@ impl Admission {
     /// prediction from history, with this runner's disk among what it knows; `None`: unknown):
     /// answered with an offer, where it waits, that it never could, or that it ran it already; a
     /// probe again is answered as it stands.
-    pub fn probe(&mut self, from: Peer<'_>, ask: impl Into<Arc<Ask>>, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    pub fn probe_r(&mut self, from: Peer<'_>, ask: impl Into<Arc<Ask>>, token: u64, predicted: Option<Ms>, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
-        self.probe_in(from, ask.into(), predicted, now, out);
+        self.probe_in(from, ask.into(), token, predicted, now, out);
         self.close(now);
     }
 
-    fn probe_in(&mut self, from: Peer<'_>, ask: Arc<Ask>, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    fn probe_in(&mut self, from: Peer<'_>, ask: Arc<Ask>, token: u64, predicted: Option<Ms>, now: i64, out: &mut Vec<Reply>) {
         let Some(o) = self.speaker(from, now, out) else { return };
-        if self.recorded(from, &ask.run, out) {
+        if self.recorded(from, o, token, &ask.run, out) {
             return;
         }
-        if let Some(s) = self.owner(o).and_then(|w| w.runs.get(&ask.run)).copied() {
+        if let Some(s) = self.owner(o).and_then(|w| w.runs.get(ask.run.as_str())).copied() {
             self.standing(s, now, out);
             return;
         }
         if let Some(why) = self.never(&ask) {
-            out.push((from.name.to_owned(), ToOwner::Never { run: ask.run.clone(), why }));
+            out.push(Reply { owner: o, token, run: Arc::from(ask.run.as_str()), msg: Up::Never { why } });
             return;
         }
         let amounts = ask::amounts(&ask.needs.request);
         let leaf = engine::leaf_of(&self.settings.fair_by, &ask.repo, &ask.actor, &ask.lane);
+        let (mut path, mut depth) = ([0u32; LEVELS], 0u8);
+        for (slot, node) in path.iter_mut().zip(engine::nodes(&leaf)) {
+            *slot = self.nodes.intern(node);
+            depth = depth.saturating_add(1);
+        }
+        let leaf_id = path.get(usize::from(depth).saturating_sub(1)).copied().unwrap_or(0);
+        self.paths.entry(leaf_id).or_insert((path, depth));
         let weights = [self.weight(&ask.repo), 1000, 1000];
         let own = engine::own_order(ask.priority, self.settings.aging_per_minute, now);
         self.seq = self.seq.saturating_add(1);
         self.came = self.came.saturating_add(1);
         let (seq, came, class) = (self.seq, self.came, ask.class);
-        let run = ask.run.clone();
-        let p = Probe { owner: o, run: run.clone(), ask, amounts, predicted, state: State::Aside, key: None, leaf, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None, look: None };
+        let run: Arc<str> = Arc::from(ask.run.as_str());
+        let p = Probe { owner: o, token, run: Arc::clone(&run), ask, amounts, predicted, state: State::Aside, key: None, path, depth, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None, look: None };
         let s = match self.spare.pop() {
             Some(s) => {
                 if let Some(slot) = self.slots.get_mut(ix(s)) {
@@ -1515,8 +1683,19 @@ impl Admission {
             }
             None => true,
         };
-        self.promote_at(s, now, class);
+        // Its promotion's look, filed once it's known to wait (one offered in this input would only
+        // take it out again; it's kept on the run, filed if it ever waits).
+        self.plan_look(s, now, class);
         if away {
+            self.file_look(s);
+            return;
+        }
+        // Nobody waits here and it has room: it's offered as it comes, which is what entering the
+        // line, admitting and leaving it again come to with no one else in it (docs/needs.md §11,
+        // AUDIT P6: an arrival at an empty line touches no line).
+        if self.line.is_empty() && !self.draining && self.can_start(s) {
+            self.kept = None;
+            self.offer(s, now, out);
             return;
         }
         // One change to the line at a time, each looked at: its arrival, then what admitting does;
@@ -1527,6 +1706,9 @@ impl Admission {
         self.admit(now, out);
         self.hush = None;
         self.boundaries(now, out);
+        if self.get(s).is_some_and(|p| matches!(p.state, State::Waiting | State::Aside)) {
+            self.file_look(s);
+        }
         if self.get(s).is_some_and(|p| p.state == State::Waiting && p.told.is_none()) {
             self.tell_if_changed(s, now, out);
         }
@@ -1534,13 +1716,13 @@ impl Admission {
 
     /// The owner withdraws a run (placed elsewhere, ended, not wanted): its place or claim goes,
     /// its room free in the same input. A running run isn't stopped by it: that's its own signal's.
-    pub fn withdraw(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Said>) {
+    pub fn withdraw_r(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.withdraw_in(from, run, now, out);
         self.close(now);
     }
 
-    fn withdraw_in(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Said>) {
+    fn withdraw_in(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Reply>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let Some(s) = self.owner(o).and_then(|w| w.runs.get(run)).copied() else { return };
         if matches!(self.state(s), Some(State::Running { .. })) {
@@ -1554,7 +1736,7 @@ impl Admission {
     }
 
     /// The owner takes offer `fence`: held until it starts the run, if that's still its live claim.
-    pub fn take(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+    pub fn take_r(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.take_in(from, run, fence, now, out);
         // Offers that lapsed by now went back to their places: what they free is offered.
@@ -1563,37 +1745,38 @@ impl Admission {
         self.close(now);
     }
 
-    fn take_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+    fn take_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
         self.lapse_due(now, out);
         let Some(o) = self.speaker(from, now, out) else { return };
-        if self.recorded(from, run, out) {
+        if self.recorded(from, o, 0, run, out) {
             return;
         }
         let s = self.owner(o).and_then(|w| w.runs.get(run)).copied();
-        let to = from.name.to_owned();
+        let (token, name) = self.handles(s, run);
+        let reply = |msg| Reply { owner: o, token, run: Arc::clone(&name), msg };
         match s.and_then(|s| self.state(s).map(|st| (s, st))) {
             Some((s, State::Offered { fence: f, until })) if f == fence => {
                 self.deadlines.remove(&(until, s));
                 if let Some(p) = self.get_mut(s) {
                     p.state = State::Taken { fence };
                 }
-                out.push((to, ToOwner::Held { run: run.to_owned(), fence }));
+                out.push(reply(Up::Held { fence }));
             }
-            Some((_, State::Taken { fence: f })) if f == fence => out.push((to, ToOwner::Held { run: run.to_owned(), fence })),
-            Some((_, State::Running { .. })) => out.push((to, ToOwner::Ran { run: run.to_owned() })),
-            _ => out.push((to, ToOwner::Lapsed { run: run.to_owned(), fence, why: "its offer isn't held for it any more".into() })),
+            Some((_, State::Taken { fence: f })) if f == fence => out.push(reply(Up::Held { fence })),
+            Some((_, State::Running { .. })) => out.push(reply(Up::Ran)),
+            _ => out.push(reply(Up::Lapsed { fence, why: "its offer isn't held for it any more" })),
         }
     }
 
     /// The owner declines offer `fence` (it took another's): its room is free in the same input,
     /// and the run leaves the line.
-    pub fn decline(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+    pub fn decline_r(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.decline_in(from, run, fence, now, out);
         self.close(now);
     }
 
-    fn decline_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+    fn decline_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let Some(s) = self.owner(o).and_then(|w| w.runs.get(run)).copied() else { return };
         // An offered or taken claim isn't in the line: dropping it moves no run's place.
@@ -1610,7 +1793,7 @@ impl Admission {
     /// has); [`Start::Already`] if it runs or ran here (its owner told so: a start said again starts
     /// nothing, and is never told as a lapse); `None`, its owner told the claim lapsed: the one word
     /// on which it may place the run elsewhere.
-    pub fn start(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) -> Option<Start> {
+    pub fn start_r(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) -> Option<Start> {
         self.begin(now, out);
         let started = self.start_in(from, run, fence, now, out);
         // Offers that lapsed by now went back to their places: what they free is offered.
@@ -1620,23 +1803,24 @@ impl Admission {
         started
     }
 
-    fn start_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) -> Option<Start> {
+    fn start_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) -> Option<Start> {
         self.lapse_due(now, out);
         let o = self.speaker(from, now, out)?;
-        if self.recorded(from, run, out) {
+        if self.recorded(from, o, 0, run, out) {
             return Some(Start::Already);
         }
         let s = self.owner(o).and_then(|w| w.runs.get(run)).copied();
         let state = s.and_then(|s| self.state(s));
+        let (token, name) = self.handles(s, run);
         if let (Some(_), Some(State::Running { .. })) = (s, state) {
-            out.push((from.name.to_owned(), ToOwner::Ran { run: run.to_owned() }));
+            out.push(Reply { owner: o, token, run: name, msg: Up::Ran });
             return Some(Start::Already);
         }
         let live = matches!(state, Some(State::Offered { fence: f, until }) if f == fence && until > now) || matches!(state, Some(State::Taken { fence: f }) if f == fence);
         #[cfg(test)]
         let live = live || (s.is_some() && super::mutant() == Some(super::Mutant::StartLapsed));
         let Some(s) = s.filter(|_| live) else {
-            out.push((from.name.to_owned(), ToOwner::Lapsed { run: run.to_owned(), fence, why: "its claim isn't live here".into() }));
+            out.push(Reply { owner: o, token, run: name, msg: Up::Lapsed { fence, why: "its claim isn't live here" } });
             return None;
         };
         match state {
@@ -1657,16 +1841,24 @@ impl Admission {
         if let Some(p) = self.get_mut(s) {
             p.state = State::Running { fence, from: now };
         }
-        self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_owned(), Record { fence, ended: None });
+        let record = Record { fence, ended: None };
+        match self.records.get_mut(from.name) {
+            Some(by_epoch) => {
+                by_epoch.entry(from.epoch).or_default().insert(run.to_owned(), record);
+            }
+            None => {
+                self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_owned(), record);
+            }
+        }
         Some(Start::New)
     }
 
     /// Its shell started the run's process: its owner is told it started (the runner's word).
-    pub fn spawned(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) {
+    pub fn spawned_r(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
-        if let Some(to) = self.told_owner(s) {
-            out.push((to, ToOwner::Started { run: run.to_owned(), fence }));
+        if let Some((owner, token, run)) = self.told_owner(s) {
+            out.push(Reply { owner, token, run, msg: Up::Started { fence } });
         }
     }
 
@@ -1674,21 +1866,29 @@ impl Admission {
     /// that asked. A run of an owner's earlier epoch runs on to its end, but its words would reach
     /// the owner's new process by its name alone, which may have reused the id for another run
     /// (kiln-sim place, seed 88): it's told nothing.
-    fn told_owner(&self, s: u32) -> Option<String> {
+    fn told_owner(&self, s: u32) -> Option<(u32, u64, Arc<str>)> {
         let p = self.get(s)?;
         let w = self.owner(p.owner).filter(|w| !w.away)?;
-        (self.current(&w.name) == Some(p.owner)).then(|| w.name.clone())
+        (self.current(&w.name) == Some(p.owner)).then(|| (p.owner, p.token, Arc::clone(&p.run)))
+    }
+
+    /// A probe's token and run, or, with none, no token and `run` itself.
+    fn handles(&self, s: Option<u32>, run: &str) -> (u64, Arc<str>) {
+        match s.and_then(|s| self.get(s)) {
+            Some(p) => (p.token, Arc::clone(&p.run)),
+            None => (0, Arc::from(run)),
+        }
     }
 
     /// A run it started ended (`ok`: its process exited; not: it couldn't start, or was lost): its
     /// room is free in the same input, its tenant charged what it ran, and its owner told.
-    pub fn ended(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Said>) {
+    pub fn ended_r(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.ended_in(from, run, ok, now, out);
         self.close(now);
     }
 
-    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Said>) {
+    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
         // From its dispatch, as the engine settles a grant.
@@ -1699,8 +1899,8 @@ impl Admission {
         }
         let to = self.told_owner(s);
         self.drop_probe(s);
-        if let Some(to) = to {
-            out.push((to, ToOwner::Ended { run: run.to_owned(), fence, ok }));
+        if let Some((owner, token, run)) = to {
+            out.push(Reply { owner, token, run, msg: Up::Ended { fence, ok } });
         }
         self.admit(now, out);
         self.boundaries(now, out);
@@ -1725,7 +1925,7 @@ impl Admission {
     }
 
     /// A new sample: the room is worked out again, and what now fits is offered.
-    pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
+    pub fn measured_r(&mut self, sample: Sample, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.sample = sample;
         let mut own = [0; ask::DIMS];
@@ -1745,7 +1945,7 @@ impl Admission {
     }
 
     /// Draining (an upgrade pending) or not: draining, it offers nothing new.
-    pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
+    pub fn drain_r(&mut self, draining: bool, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.draining = draining;
         self.admit(now, out);
@@ -1756,13 +1956,13 @@ impl Admission {
     /// An owner's link went down: its probes leave the line, offered nothing, an offer it hadn't
     /// taken lapses at once; a claim it took stays held, as does what runs: only its absence
     /// ([`Self::forget`]) or its epoch changing ends them.
-    pub fn away(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+    pub fn away_r(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.away_in(name, now, out);
         self.close(now);
     }
 
-    fn away_in(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+    fn away_in(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
         let Some(o) = self.current(name) else { return };
         let slots: Vec<u32> = match self.owners.get_mut(ix(o)) {
             Some(w) => {
@@ -1793,13 +1993,13 @@ impl Admission {
 
     /// An owner's link is back: its probes are in the line again at the places they had, and it's
     /// told where each stands, and how each run that ended meanwhile ended.
-    pub fn back(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
+    pub fn back_r(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.back_in(from, now, out);
         self.close(now);
     }
 
-    fn back_in(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
+    fn back_in(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let slots: Vec<u32> = match self.owners.get_mut(ix(o)) {
             Some(w) => {
@@ -1823,14 +2023,14 @@ impl Admission {
         }
         let ended: Vec<(String, Record)> = self.records.get(from.name).and_then(|m| m.get(&from.epoch)).map(|runs| runs.iter().filter(|(_, r)| r.ended.is_some()).map(|(run, r)| (run.clone(), *r)).collect()).unwrap_or_default();
         for (run, r) in ended {
-            out.push((from.name.to_owned(), ToOwner::Ended { run, fence: r.fence, ok: r.ended == Some(true) }));
+            out.push(Reply { owner: o, token: 0, run: Arc::from(run.as_str()), msg: Up::Ended { fence: r.fence, ok: r.ended == Some(true) } });
         }
     }
 
     /// An owner is gone (its lease ended, or the directory no longer has its node): what it left
     /// waiting or claimed goes, its room free; what runs runs on to its end. Its record stays, so
     /// that if it comes back in the same epoch nothing of its starts twice.
-    pub fn forget(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+    pub fn forget_r(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         let incarnations: Vec<u32> = self.owner_ix.get(name).map(|v| v.iter().map(|(_, o)| *o).collect()).unwrap_or_default();
         for o in incarnations {
@@ -1858,13 +2058,13 @@ impl Admission {
 
     /// A run's predicted time here, predicted again by the shell (a run past its prediction, given
     /// how long it has run; history learned more): its place in line stays, its claim's end moves.
-    pub fn predict(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    pub fn predict_r(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.predict_in(from, run, predicted, now, out);
         self.close(now);
     }
 
-    fn predict_in(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    fn predict_in(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(p) = self.get_mut(s) else { return };
         p.predicted = predicted;
@@ -1882,7 +2082,7 @@ impl Admission {
         self.boundaries(now, out);
     }
 
-    fn lapse_due(&mut self, now: i64, out: &mut Vec<Said>) {
+    fn lapse_due(&mut self, now: i64, out: &mut Vec<Reply>) {
         while let Some(&(until, s)) = self.deadlines.first() {
             if until > now {
                 break;
@@ -1891,11 +2091,11 @@ impl Admission {
             let Some(State::Offered { fence, .. }) = self.state(s) else { continue };
             self.release(s);
             let Some(p) = self.get(s) else { continue };
-            let (run, to) = (p.run.clone(), self.owner(p.owner).filter(|w| !w.away).map(|w| w.name.clone()));
+            let to = self.owner(p.owner).filter(|w| !w.away).map(|_| (p.owner, p.token, Arc::clone(&p.run)));
             self.enter(s);
             self.relook(s, now);
-            if let Some(to) = to {
-                out.push((to, ToOwner::Lapsed { run, fence, why: "its offer wasn't taken in time".into() }));
+            if let Some((owner, token, run)) = to {
+                out.push(Reply { owner, token, run, msg: Up::Lapsed { fence, why: "its offer wasn't taken in time" } });
             }
             self.boundaries(now, out);
             self.tell_if_changed(s, now, out);
@@ -1905,7 +2105,7 @@ impl Admission {
     /// The time: promotion's looks due by now are taken, offers not taken within their link's
     /// timeout lapse (each run waits again at its place, its owner told), and what that frees is
     /// offered.
-    pub fn tick(&mut self, now: i64, out: &mut Vec<Said>) {
+    pub fn tick_r(&mut self, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.lapse_due(now, out);
         self.admit(now, out);
@@ -1965,7 +2165,7 @@ impl Admission {
                 State::Running { fence, .. } => ("running", Some(fence)),
             };
             let (owner, epoch) = self.owner(p.owner).map_or((String::new(), 0), |w| (w.name.clone(), w.epoch));
-            out.push(View { owner, epoch, run: p.run.clone(), state, fence, ask: p.amounts, class: p.class });
+            out.push(View { owner, epoch, run: p.run.to_string(), state, fence, ask: p.amounts, class: p.class });
         }
         out
     }
@@ -1995,7 +2195,7 @@ impl Admission {
                 }
                 State::Waiting => {
                     waiting = waiting.saturating_add(1);
-                    let standing = self.standing_of(p.class, &p.leaf);
+                    let standing = self.standing_of(p.class, path_of(p));
                     if p.key.is_none_or(|k| k.standing != standing || k.class != class_ix(p.class)) && !self.fair_of(p.class).is_some_and(|f| f.moved) {
                         return Err(format!("{}: {} (slot {s}) waits at {:?}, its tenant standing at {standing:?} in {}", self.me, p.run, p.key, p.class.as_str()));
                     }

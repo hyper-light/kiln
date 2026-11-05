@@ -97,6 +97,6 @@ pub(crate) fn planted<T>(m: Option<Mutant>, f: impl FnOnce() -> T) -> T {
 pub use answer::Answer;
 pub use ask::{Ask, Peer, Sample};
 pub use link::{Offset, Rtt};
-pub use msg::{Estimate, Place, Reason, Short, ToOwner, ToRunner};
-pub use owner::{Act, Link, Machine, Owner, Size};
-pub use runner::{Admission, Init, Record, Records, Settings, Start};
+pub use msg::{Down, Estimate, Place, Reason, Short, ToOwner, ToRunner, Up};
+pub use owner::{Act, Cmd, Link, Machine, Owner, Size};
+pub use runner::{Admission, Init, Record, Records, Reply, Settings, Start};

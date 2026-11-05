@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use super::ask::{Ask, Peer, Sample};
-use super::msg::{ToOwner, ToRunner};
-use super::owner::{Act, Machine, Owner, Size};
-use super::runner::{Admission, Init, Records, Said, Settings};
+use super::msg::{Down, ToOwner, ToRunner};
+use super::owner::{Act, Cmd, Machine, Owner, Size};
+use super::runner::{Admission, Init, Records, Reply, Said, Settings};
 use crate::facts::RunnerFacts;
 use crate::sched::needs::Needs;
 use crate::sched::state::{Cpus, Resources};
@@ -56,6 +56,9 @@ struct Fleet {
     names: Vec<String>,
     net: u64,
     starts: Vec<(usize, String)>,
+    /// The in-process path (words by handle), else the wire's.
+    fast: bool,
+    rids: Vec<u32>,
 }
 
 impl Fleet {
@@ -68,7 +71,62 @@ impl Fleet {
         let mut owner = Owner::seeded(OWNER, 1, seed);
         let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None }).collect());
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
-        Fleet { owner, runners, index, names, net: seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new() }
+        let rids = names.iter().map(|n| owner.runner_id(n)).collect();
+        Fleet { owner, runners, index, names, net: seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new(), fast: false, rids }
+    }
+
+    fn index_of(&self, rid: u32) -> Option<usize> {
+        self.rids.iter().position(|r| *r == rid)
+    }
+
+    /// The in-process path: commands by handle, replies by token.
+    fn carry_fast(&mut self, mut cmds: Vec<Cmd>, now: i64) {
+        let peer = Peer { name: OWNER, epoch: 1 };
+        loop {
+            let mut replies: Vec<(usize, Reply)> = Vec::new();
+            for c in cmds.drain(..) {
+                let mut out: Vec<Reply> = Vec::new();
+                match c {
+                    Cmd::Tell { to, run, msg } => {
+                        let Some(i) = self.index_of(to) else { continue };
+                        let Some(r) = self.runners.get_mut(i) else { continue };
+                        match msg {
+                            Down::Probe { ask, token } => r.probe_r(peer, ask, token, None, now, &mut out),
+                            Down::Withdraw => r.withdraw_r(peer, &run, now, &mut out),
+                            Down::Take { fence } => r.take_r(peer, &run, fence, now, &mut out),
+                            Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut out),
+                            Down::Start { fence } => {
+                                let _ = r.start_r(peer, &run, fence, now, &mut out);
+                            }
+                            Down::Ack => r.ack(peer, &run),
+                        }
+                        replies.extend(out.into_iter().map(|m| (i, m)));
+                    }
+                    Cmd::Go { run, to, fence } => {
+                        let Some(i) = self.index_of(to) else { continue };
+                        if self.owner.starting_c(&run, to, fence)
+                            && let Some(r) = self.runners.get_mut(i)
+                        {
+                            let _ = r.start_r(peer, &run, fence, now, &mut out);
+                            self.starts.push((i, run.to_string()));
+                            replies.extend(out.into_iter().map(|m| (i, m)));
+                        }
+                    }
+                    Cmd::Answer { .. } | Cmd::Fallback { .. } | Cmd::Restart { .. } => {}
+                }
+            }
+            if replies.is_empty() {
+                return;
+            }
+            for j in (1..replies.len()).rev() {
+                let k = usize::try_from(splitmix(&mut self.net) % (j as u64 + 1)).unwrap_or(0);
+                replies.swap(j, k);
+            }
+            for (i, m) in replies {
+                let rid = self.rids.get(i).copied().unwrap_or(0);
+                self.owner.heard_c(rid, m.token, &m.run, m.msg, now, &mut cmds);
+            }
+        }
     }
 
     fn carry(&mut self, mut acts: Vec<Act>, now: i64) {
@@ -123,15 +181,24 @@ impl Fleet {
 
 /// kiln's cv and oversubscriptions on the trace, and round robin's cv on the same trace.
 fn trace(n: u32, c: u64, rho: f64, steps: u32, seed: u64) -> (f64, u64, f64) {
+    let (cv, over, rr, _) = trace_on(n, c, rho, steps, seed, false);
+    (cv, over, rr)
+}
+
+/// The trace on the wire's words or the in-process ones; and every start, in order.
+fn trace_on(n: u32, c: u64, rho: f64, steps: u32, seed: u64, fast: bool) -> (f64, u64, f64, Vec<(usize, String)>) {
     let k = (rho * f64::from(n) * c as f64).round() as usize;
     let mut f = Fleet::new(n, c, seed);
+    f.fast = fast;
+    let mut all_starts: Vec<(usize, String)> = Vec::new();
     let mut load = vec![0u32; n as usize];
     let mut live: Vec<(usize, String)> = Vec::new();
     let (mut dep, mut next, mut now, mut over) = (seed, 0u64, 0i64, 0u64);
     let (mut cv, mut rr_cv) = (Cv::default(), Cv::default());
     let peer = Peer { name: OWNER, epoch: 1 };
-    let take_starts = |f: &mut Fleet, load: &mut Vec<u32>, live: &mut Vec<(usize, String)>, over: &mut u64| {
+    let take_starts = |f: &mut Fleet, load: &mut Vec<u32>, live: &mut Vec<(usize, String)>, over: &mut u64, all: &mut Vec<(usize, String)>| {
         for (i, run) in std::mem::take(&mut f.starts) {
+            all.push((i, run.clone()));
             if let Some(l) = load.get_mut(i) {
                 if u64::from(*l) >= c {
                     *over += 1;
@@ -149,22 +216,41 @@ fn trace(n: u32, c: u64, rho: f64, steps: u32, seed: u64) -> (f64, u64, f64) {
             if let Some(l) = load.get_mut(i) {
                 *l = l.saturating_sub(1);
             }
-            let mut said = Vec::new();
-            if let Some(r) = f.runners.get_mut(i) {
-                r.ended(peer, &run, true, now, &mut said);
+            if f.fast {
+                let mut out = Vec::new();
+                if let Some(r) = f.runners.get_mut(i) {
+                    r.ended_r(peer, &run, true, now, &mut out);
+                }
+                let rid = f.rids.get(i).copied().unwrap_or(0);
+                for m in out {
+                    let mut cmds = Vec::new();
+                    f.owner.heard_c(rid, m.token, &m.run, m.msg, now, &mut cmds);
+                    f.carry_fast(cmds, now);
+                }
+            } else {
+                let mut said = Vec::new();
+                if let Some(r) = f.runners.get_mut(i) {
+                    r.ended(peer, &run, true, now, &mut said);
+                }
+                let name = f.names.get(i).cloned().unwrap_or_default();
+                for (_, m) in said {
+                    let acts = f.owner.heard(&name, m, now);
+                    f.carry(acts, now);
+                }
             }
-            let name = f.names.get(i).cloned().unwrap_or_default();
-            for (_, m) in said {
-                let acts = f.owner.heard(&name, m, now);
-                f.carry(acts, now);
-            }
-            take_starts(&mut f, &mut load, &mut live, &mut over);
+            take_starts(&mut f, &mut load, &mut live, &mut over, &mut all_starts);
         }
         next += 1;
         let ask = Ask { run: format!("b{next}"), needs: Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Needs::default() }, repo: "repo".into(), actor: OWNER.into(), ..Ask::default() };
-        let acts = f.owner.ask(ask, now);
-        f.carry(acts, now);
-        take_starts(&mut f, &mut load, &mut live, &mut over);
+        if f.fast {
+            let mut cmds = Vec::new();
+            f.owner.ask_c(ask, now, &mut cmds);
+            f.carry_fast(cmds, now);
+        } else {
+            let acts = f.owner.ask(ask, now);
+            f.carry(acts, now);
+        }
+        take_starts(&mut f, &mut load, &mut live, &mut over, &mut all_starts);
         if step >= k as u32 {
             cv.sample(&load);
         }
@@ -190,7 +276,20 @@ fn trace(n: u32, c: u64, rho: f64, steps: u32, seed: u64) -> (f64, u64, f64) {
             rr_cv.sample(&load);
         }
     }
-    (cv.mean(), over, rr_cv.mean())
+    (cv.mean(), over, rr_cv.mean(), all_starts)
+}
+
+/// docs/needs.md §11, AUDIT P6: the in-process path (words by handle, replies by token, no names
+/// copied) decides as the wire's does: the same runs start on the same runners, in the same order,
+/// at half load and at 0.9 (where runs queue, and hints aren't given: both full, they wait).
+#[test]
+fn p6_the_in_process_path_places_as_the_wire_s_does() {
+    for rho in [0.5, 0.9] {
+        let (_, _, _, wire) = trace_on(40, 8, rho, 2_000, 7, false);
+        let (_, _, _, fast) = trace_on(40, 8, rho, 2_000, 7, true);
+        assert!(!wire.is_empty());
+        assert_eq!(wire, fast, "rho {rho}");
+    }
 }
 
 /// The power of two choices as its paper has it on the same trace (the least loaded of two drawn

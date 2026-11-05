@@ -99,6 +99,83 @@ impl ToOwner {
     }
 }
 
+/// An owner's word to a runner without its names, as the in-process path carries it (docs/needs.md
+/// §11, AUDIT P6): the run by its shared id, its owner by the link it comes on. The wire carries
+/// [`ToRunner`], made from it at the edge ([`Down::wire`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Down {
+    /// `token`: the owner's own handle of the run, said back with every word about it ([`Up`]).
+    Probe { ask: Arc<Ask>, token: u64 },
+    Withdraw,
+    Take { fence: Fence },
+    Decline { fence: Fence },
+    Start { fence: Fence },
+    Ack,
+}
+
+impl Down {
+    /// The word on the wire, about `run`.
+    pub fn wire(self, run: &str) -> ToRunner {
+        let run = run.to_owned();
+        match self {
+            Down::Probe { ask, .. } => ToRunner::Probe { ask },
+            Down::Withdraw => ToRunner::Withdraw { run },
+            Down::Take { fence } => ToRunner::Take { run, fence },
+            Down::Decline { fence } => ToRunner::Decline { run, fence },
+            Down::Start { fence } => ToRunner::Start { run, fence },
+            Down::Ack => ToRunner::Ack { run },
+        }
+    }
+}
+
+/// A runner's word to an owner without its names, as the in-process path carries it: the wire's
+/// [`ToOwner`] less its run ([`Up::wire`], [`ToOwner::split`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Up {
+    Offer { fence: Fence, got: Resources, free: Resources, predicted: Option<Ms>, disk: DiskFacts },
+    Waiting { reason: Reason, place: Place, start: Estimate, predicted: Option<Ms>, free: Resources },
+    Never { why: String },
+    Held { fence: Fence },
+    Lapsed { fence: Fence, why: &'static str },
+    Started { fence: Fence },
+    Ran,
+    Ended { fence: Fence, ok: bool },
+}
+
+impl Up {
+    /// The word on the wire, about `run`.
+    pub fn wire(self, run: &str) -> ToOwner {
+        let run = run.to_owned();
+        match self {
+            Up::Offer { fence, got, free, predicted, disk } => ToOwner::Offer { run, fence, got, free, predicted, disk },
+            Up::Waiting { reason, place, start, predicted, free } => ToOwner::Waiting { run, reason, place, start, predicted, free },
+            Up::Never { why } => ToOwner::Never { run, why },
+            Up::Held { fence } => ToOwner::Held { run, fence },
+            Up::Lapsed { fence, why } => ToOwner::Lapsed { run, fence, why: why.to_owned() },
+            Up::Started { fence } => ToOwner::Started { run, fence },
+            Up::Ran => ToOwner::Ran { run },
+            Up::Ended { fence, ok } => ToOwner::Ended { run, fence, ok },
+        }
+    }
+}
+
+impl ToOwner {
+    /// Its run, and the word without it. A lapse's words aren't kept: the owner reads only that it
+    /// lapsed.
+    pub fn split(self) -> (String, Up) {
+        match self {
+            ToOwner::Offer { run, fence, got, free, predicted, disk } => (run, Up::Offer { fence, got, free, predicted, disk }),
+            ToOwner::Waiting { run, reason, place, start, predicted, free } => (run, Up::Waiting { reason, place, start, predicted, free }),
+            ToOwner::Never { run, why } => (run, Up::Never { why }),
+            ToOwner::Held { run, fence } => (run, Up::Held { fence }),
+            ToOwner::Lapsed { run, fence, .. } => (run, Up::Lapsed { fence, why: "lapsed" }),
+            ToOwner::Started { run, fence } => (run, Up::Started { fence }),
+            ToOwner::Ran { run } => (run, Up::Ran),
+            ToOwner::Ended { run, fence, ok } => (run, Up::Ended { fence, ok }),
+        }
+    }
+}
+
 /// A run's place in a runner's line, to within a power of two: from `lo` to `hi`, both included
 /// (`1`, `2..=3`, `4..=7`, ...). An exact place changes for every run behind one that starts,
 /// so telling each would cost a message per waiting run per start; to within a power of two (the
