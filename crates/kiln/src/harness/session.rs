@@ -3263,6 +3263,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
                                 }
                             }
+                            // Off the cores of a server beside it, and so is everything it starts
+                            // (docs/priority.md, "Legs and agents keep off the server's cores").
+                            crate::os::onto_work_cpus(&mut p);
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
