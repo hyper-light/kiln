@@ -74,13 +74,16 @@ telemetry). Goal 1's probe on each shard ticks a watch for each of the shard's q
 for Normal, its Background tasks' waits for Background. The first shard's probe also ticks one for the
 compute pool's line, each of the blocking pool's shares' and kiln.db's writer's, on the mean wait of the
 jobs whose waits the pool told over the period, since what a request waits on off its shard waits there,
-where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of the periods it came
-back to) and sheds only on a queue that *stands*, CoDel's test (research f14): every period for a whole
-tolerance (1 s, Kubernetes' default probe timeout) past its calm and past the shard's quantum, a pool's
-line never emptying, and a pool's line kept standing by work that came after it formed (it stood a
-tolerance longer than its jobs' longest wait), not one request's batch worked off. A queue that stood a
-tolerance sheds Background requests; one that stood another with Background shed, Normal ones too (a
-shard's: its API queue's); Critical never; shedding stops the period it comes back. A shed request is
+where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of its periods outside
+its standing) and sheds only on a queue that *stands*, as CoDel bounds queues (research f14), over a
+tolerance (1 s, Kubernetes' default probe timeout), a wait counting past its calm when past the calm and
+the shard's quantum. A shard's queue stands while most of the last tolerance's periods were past its calm
+and, where the OS keeps a thread's CPU time, the shard ran most of it (a mostly idle shard's late wakes are
+the host's). A pool's line stands once every period for a tolerance was past its calm, the line never
+emptying, and work that came after it formed kept it standing (it stood a tolerance longer than its jobs'
+longest wait), not one request's batch worked off. A queue that stands sheds Background requests; one that
+stood another tolerance with Background shed, Normal ones too (a shard's: its API queue's); Critical never;
+shedding stops once it no longer stands. A shed request is
 answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
 seconds) and `x-kiln-shed` (its class); kiln's client sends it again after that (a file's upload read
 again from its start, a WebSocket's opening too). Shedding is off until `[server] shed = true` or
@@ -92,14 +95,15 @@ other while the share held under one of its 24 places on average) and every roun
 250 ms late; the CUSUM on each period's mean wait that this replaced (headroom's, with nothing it
 learned of calm's excursions) read those as shifts and shed 6.5 Background requests a calm round. Its
 unit tests replay those waits (`overload::tests`, `g6_s4_*`): the lab's calm store share, fan-outs whose
-reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a scheduler's tick of jitter
-shed nothing; work outrunning a pool, a closed loop past its places and a saturated shard shed
-Background a tolerance in and Normal a tolerance later.
+reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a mostly idle shard's tick of
+jitter shed nothing; work outrunning a pool and a closed loop past its places shed Background a tolerance
+in and Normal a tolerance later; the lab's flood and a saturated shard, half a tolerance in and a
+tolerance later.
 
 | series | what it says |
 | --- | --- |
 | `kiln_shard_queue_delay_seconds{shard,class}` | Each class's mean wait from ready to run on the shard, over the probe's last period. |
-| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stayed past its calm (0 once back): it sheds at a tolerance. |
+| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stood (most of the last tolerance past its calm, the shard running most of it), 0 once it no longer does. |
 | `kiln_shard_shedding{shard,class}` | 1 while the shard's own queue, standing, sheds the class's requests. |
 | `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its watch read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares), `store_write` (kiln.db's writer). |
 | `kiln_pool_queue_standing_seconds{pool}` | How long the pool's line has stood past its calm, never emptying (0 once back). |
@@ -569,6 +573,15 @@ with the blocking pool's `fs` share's threads (9 places busy, the attaches'), wh
 the overloaded run now uses `--profile flood`, the overload profile with 64 readers and 8 agents calling
 MCP, none thinking, more work than one shard runs, its readers' event catch-ups Background, its other
 reads and MCP calls Normal, its pages and `/api/me` Critical.
+
+The standing rule's first runs (fedora, 2026-11-05 10:44 to 11:17 UTC, d46ceb48d67, 6 interleaved rounds
+each): calm, every shed-on round shed nothing (pages p99 0.48 to 0.66 ms). Flooded, the one shard ran 81 to
+82% of the time, its probes 4.2 to 6.4 ms late at the median and 24 ms at p99 and pages 16 ms at the median
+(25 ms at p99), served throughout, yet one shed-on round of six shed (68 Background requests, 27 Normal):
+the rule then asked every period of a tolerance to be past its calm, and the few probes each second that
+found the shard idle kept it from standing (3 windows in 12 rounds). A shard's queue now stands while most of
+the last tolerance's periods were past its calm and the shard ran most of it; replayed, that flood sheds
+Background half a tolerance in and Normal a tolerance later in every round (`overload::tests`).
 
 `scripts/overload_lab/overload.sh` runs a profile shedding off against on, interleaved (`kiln-lab ab`, the
 server in its scope as above): one shard and `PROFILE=flood` overloads it on purpose; with
