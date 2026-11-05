@@ -85,7 +85,11 @@ async function visit(ctx, url, def, engine, loaded = null) {
   page.on("request", () => (last = Date.now()));
   page.on("requestfinished", () => (last = Date.now()));
   const t0 = Date.now();
-  if (loaded) await page.click(`a[href="${new URL(url).pathname}"]`);
+  if (loaded)
+    await page
+      .locator(`a[href="${new URL(url).pathname}"]`)
+      .first()
+      .click({ timeout: 60_000 });
   else await page.goto(url, { waitUntil: "commit" });
   const at = async (sel) => {
     try {
@@ -105,7 +109,7 @@ async function visit(ctx, url, def, engine, loaded = null) {
       resources: performance
         .getEntriesByType("resource")
         .filter((r) => r.startTime >= since)
-        .map((r) => ({ url: r.name, bytes: r.transferSize, body: r.encodedBodySize, type: r.initiatorType })),
+        .map((r) => ({ url: r.name, bytes: r.transferSize, body: r.encodedBodySize, type: r.initiatorType, start: r.startTime })),
       nav: (() => {
         const n = performance.getEntriesByType("navigation")[0];
         return n && since === 0 ? { url: n.name, bytes: n.transferSize, body: n.encodedBodySize } : null;
@@ -115,8 +119,9 @@ async function visit(ctx, url, def, engine, loaded = null) {
   );
   const list = engine === "chromium" ? reqs : [...(timing.nav ? [{ ...timing.nav, type: "document" }] : []), ...timing.resources];
   const bodies = new Map();
+  // The same content under two URLs: the page's own files (not its API data, goal 9's), 1 KiB and up.
   if (engine === "chromium")
-    for (const r of list.filter((x) => !x.cached && x.bytes > 0)) {
+    for (const r of list.filter((x) => !x.cached && x.bytes > 1024 && kindOf(x.url, x.type) !== "data")) {
       try {
         const res = await page.request.get(r.url, { headers: { "accept-encoding": "identity" } });
         bodies.set(
@@ -136,16 +141,36 @@ async function visit(ctx, url, def, engine, loaded = null) {
     by[k] = (by[k] ?? 0) + (r.bytes ?? 0);
   }
   const seen = new Map();
-  let dupUrl = 0;
+  const twice = [];
   for (const r of list.filter((x) => (x.bytes ?? 0) > 0)) {
     seen.set(r.url, (seen.get(r.url) ?? 0) + 1);
-    if (seen.get(r.url) === 2) dupUrl++;
+    if (seen.get(r.url) === 2) twice.push(new URL(r.url).pathname);
   }
   const byBody = new Map();
   for (const [u, h] of bodies) byBody.set(h, [...(byBody.get(h) ?? []), u]);
-  const dupContent = [...byBody.values()].filter((us) => new Set(us).size > 1).length;
+  const sameContent = [...byBody.values()].filter((us) => new Set(us).size > 1).map((us) => [...new Set(us)].map((u) => new URL(u).pathname).join(" = "));
+  // A file of the page's downloaded twice counts; its API data asked twice is said apart (goal 9's to cut).
+  const dataTwice = twice.filter((p) => p.startsWith("/api/"));
+  const dupUrl = twice.length - dataTwice.length;
+  const dupContent = sameContent.length;
+  // The heavy parts (the editor, xterm, uPlot, tree-sitter and its grammars) asked before the page was ready (step 6: none, unless its first view shows them).
+  const HEAVY = /xterm|codemirror|editor|uplot|tree-sitter|\.wasm/i;
+  const heavyBeforeReady = ready === null ? null : timing.resources.filter((r) => HEAVY.test(r.url) && r.start < ready).reduce((a, r) => a + (r.bytes || r.body || 0), 0);
   const assetsDown = list.filter((r) => /\/assets\//.test(r.url) && (r.bytes ?? 0) > 300).reduce((a, r) => a + r.bytes, 0);
-  return { requests: list.length, bytes: by, assets_down: assetsDown, duplicates: dupUrl + dupContent, paint: timing.paint, readable, ready, settled };
+  return {
+    requests: list.length,
+    bytes: by,
+    assets_down: assetsDown,
+    duplicates: dupUrl + dupContent,
+    twice: twice.filter((p) => !p.startsWith("/api/")),
+    same_content: sameContent,
+    data_twice: dataTwice,
+    heavy_before_ready: heavyBeforeReady,
+    paint: timing.paint,
+    readable,
+    ready,
+    settled,
+  };
 }
 
 function linkBytes(cmd) {

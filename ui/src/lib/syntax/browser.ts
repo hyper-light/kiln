@@ -54,14 +54,23 @@ const subscribe = (fn: () => void) => {
 };
 const asked = new Set<string>();
 
+/**
+ * Once the page has loaded what it started with (its load event): the highlighter's WebAssembly is
+ * hundreds of KB, and on a slow link the page's own code mustn't wait behind it (goal 8, plan
+ * 01a1a832ebfd step 6). Code shows plain until then, as it does until its grammar is here.
+ */
+const pageLoaded = (): Promise<void> => (document.readyState === "complete" ? Promise.resolve() : new Promise((done) => window.addEventListener("load", () => done(), { once: true })));
+
 /** Starts loading a language, once. */
 function want(id: string) {
   if (asked.has(id) || typeof window === "undefined") return;
   asked.add(id);
-  void highlighter.load(id).then(() => {
-    loads++;
-    for (const l of listeners) l();
-  });
+  void pageLoaded()
+    .then(() => highlighter.load(id))
+    .then(() => {
+      loads++;
+      for (const l of listeners) l();
+    });
 }
 
 /** What a highlight of `l` depends on: whether it's here, and, for code that holds other languages, every load since. */
