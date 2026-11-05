@@ -94,8 +94,15 @@ pub static LOG_FEEDS: Owner = Owner::new("log_feeds");
 /// is repainted from the session's backlog and screen.
 pub static TERMINAL_FEEDS: Owner = Owner::new("terminal_feeds");
 
+/// Each viewer's queue of a browser stream's chunks and events (`crate::harness::streams`), every viewer's
+/// together: each at most [`crate::harness::streams::VIEWER_BYTES`], the time a viewer may be behind (240
+/// pictures at the stream's 60 a second: 4 s) at its encoder's top rate (25 Mb/s): 12.5 MB. At the bound
+/// the chunk isn't sent to that viewer, as one past 240 chunks wasn't: its next key frame mends the
+/// picture.
+pub static STREAM_VIEWERS: Owner = Owner::new("stream_viewers");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 14] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS];
+pub(super) const ALL: [&Owner; 15] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS];
 
 #[cfg(test)]
 mod tests {
