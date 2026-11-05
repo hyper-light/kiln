@@ -1375,6 +1375,11 @@ impl Shard {
                 }
             }
             Msg::Run(job) => job(self),
+            Msg::Runner(r) => {
+                if let Some(h) = hub {
+                    h.runner_update(self, *r);
+                }
+            }
         }));
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
@@ -1395,6 +1400,24 @@ pub struct Ingest {
     pub reported: String,
 }
 
+/// An agent session's update as one of its machine's runner processes sent it, for the shard that owns
+/// the session's copy to judge (whether it counts, which of the machine's processes holds the session)
+/// and take, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4; `Hub::runner_update`).
+/// Every runner's updates were judged on the hub's one loop, on the HTTP listener's shard, behind every
+/// runner's other messages (the lab's runner wait at p99, 155 to 195 ms).
+pub struct RunnerUpdate {
+    /// The runner process it came from, and its machine.
+    pub peer: hyper_transport::PeerId,
+    pub agent: String,
+    pub session: String,
+    pub update: Update,
+    /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`), as its
+    /// process's caps said when it came.
+    pub shipped: bool,
+    /// When its frame came off the wire: what its wait to be taken is measured from (`crate::route_latency`).
+    pub arrived: Option<std::time::Instant>,
+}
+
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 
 /// What an owner takes from its inbox.
@@ -1402,6 +1425,8 @@ pub enum Msg {
     Update(Box<Ingest>),
     /// Work on its copies (people's commands, a machine lost, a session opened or closed…).
     Run(Job),
+    /// An update from a session's runner, to judge and take ([`RunnerUpdate`]).
+    Runner(Box<RunnerUpdate>),
 }
 
 /// The shard that owns session `id` among `shards`: FNV-1a over its id, so every process with as

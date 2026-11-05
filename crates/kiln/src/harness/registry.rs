@@ -1880,11 +1880,39 @@ impl Registry {
     /// machine keeps it in a store it sends the server's (`crate::convo::feed`), which keeps it from
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
+        let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
+            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update from a session's runner, handed to the shard that owns its copy to judge and take
+    /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
+    /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
+    pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
+        let id = r.session.clone();
+        if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
+            tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update of session `id` from `from`, taken by the shard that owns its copy, `s` (goal 10, plan
+    /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop).
+    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool) {
+        if let Some(ingest) = self.prepare(hub, from, id, u, shipped) {
+            self.apply(s, hub, ingest);
+        }
+    }
+
+    /// An update of session `id` from `from` as its copy takes it ([`Registry::apply`]): an inbox's
+    /// answer is told whoever waits for it, and leaves nothing to take; an Open takes where it runs
+    /// and the name given here, and raises its epoch.
+    fn prepare(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) -> Option<Ingest> {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
             Update::Inbox { said } => {
                 self.answered(id, *said);
-                return;
+                return None;
             }
             other => other,
         };
@@ -1918,10 +1946,7 @@ impl Registry {
             }
             self.raise_epoch(id, info.epoch);
         }
-        let ingest = Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported };
-        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
-            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
-        }
+        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported })
     }
 
     /// An update of a session from the machine it runs on, as the shard that owns the session's copy
