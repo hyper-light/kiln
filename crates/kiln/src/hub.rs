@@ -2179,7 +2179,7 @@ impl Hub {
     // ------------------------------------------------------------ network
 
     /// Consume transport events forever (supervised).
-    pub async fn net_loop(self: Arc<Self>, rx: async_channel::Receiver<NetEvent>) -> anyhow::Result<()> {
+    pub async fn net_loop(self: Arc<Self>, rx: crate::memory::queue::Receiver<NetEvent>) -> anyhow::Result<()> {
         // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
         // listener's) for as long as they send.
         let mut turns = crate::rt::Turns::new();
