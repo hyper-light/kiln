@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn g4_s5_only_a_runs_event_is_read_for_its_run() -> anyhow::Result<()> {
         anyhow::ensure!(run_of_event(r#"{"type":"run","run":{"id":"r1","status":"running"}}"#).as_deref() == Some("r1"));
-        anyhow::ensure!(run_of_event(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string()).is_none() && run_of_event(r#"{"type":"run.failed","run":{"id":"r1"}}"#).is_none());
+        anyhow::ensure!(run_of_event(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).as_ref()).is_none() && run_of_event(r#"{"type":"run.failed","run":{"id":"r1"}}"#).is_none());
         anyhow::ensure!(run_of_event(r#"{ "type": "run", "run": {"id": "r2"} }"#).as_deref() == Some("r2"), "a frame whose kind isn't at its front, read whole");
         Ok(())
     }
