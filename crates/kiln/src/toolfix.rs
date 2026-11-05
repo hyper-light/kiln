@@ -248,7 +248,7 @@ pub async fn missing(hub: &Hub, job: &Job) -> Missing {
             m.no_agent = if job.executor.as_deref() == Some("k8s") {
                 Some(format!("it ran in a pod: add {} to the job's image or toolchain", m.tools.join(", ")))
             } else {
-                agent_cannot(hub.agents.load().get(&runner), &runner)
+                agent_cannot(hub.agents.load().get(&runner).map(|a| &**a), &runner)
             };
             m.on = Some(runner);
         }

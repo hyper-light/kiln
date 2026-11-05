@@ -141,7 +141,7 @@ struct Candidate {
 /// labels and `requires`), a leg as routing decides (its requirements, rules and capabilities,
 /// W05-R20). Those able first.
 async fn candidates(hub: &Hub, id: &str, j: &Job) -> Result<Vec<Candidate>, Fail> {
-    let agents: Vec<crate::hub::AgentLive> = hub.agents.load().values().filter(|a| !a.ephemeral && !a.outpost).cloned().collect();
+    let agents: Vec<crate::hub::AgentLive> = hub.agents.load().values().filter(|a| !a.ephemeral && !a.outpost).map(|a| crate::hub::AgentLive::clone(a)).collect();
     let candidate = |a: &crate::hub::AgentLive, why: Vec<String>| Candidate { name: a.name.clone(), connected: a.connected, draining: a.draining, busy: a.busy, slots: a.slots, why };
     let mut out: Vec<Candidate> = match j.kind() {
         "pipeline" => agents.iter().map(|a| candidate(a, crate::hub::cannot_take(&j.labels, &j.requires, a))).collect(),

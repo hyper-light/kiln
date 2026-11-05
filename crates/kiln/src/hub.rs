@@ -1999,7 +1999,7 @@ impl Hub {
         // Those connected, or gone less than the grace ago: they may come back for their jobs.
         let keep: Vec<String> = self
             .agents
-            .lock()
+            .load()
             .values()
             .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= AGENT_GRACE)))
             .map(|a| a.name.clone())
@@ -3019,7 +3019,7 @@ impl Hub {
                             }
                         }
                     };
-                    let (holder, older, change) = decide(&**self.instances.load());
+                    let (holder, older, change) = decide(&self.instances.load());
                     let (holder, older) = if change {
                         self.instances.update(|inst| {
                             let (holder, older, change) = decide(inst);

@@ -2563,7 +2563,7 @@ impl Dispatch {
         self.hub.change_agent(runner, |ag| {
             ag.running.push(leg.to_owned());
             ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
-            crate::hub::hold_on(ag, leg, incoming.clone());
+            crate::hub::hold_on(ag, leg, incoming);
         });
         if let Some(l) = self.legs.get_mut(leg) {
             l.agent = Some(runner.to_owned());
