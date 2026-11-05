@@ -70,8 +70,13 @@ pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 /// events, its newest chunk alone kept as text), for as many copies as there are sessions.
 pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
 
+/// The rows the conversation store's writer hasn't committed yet (`crate::convo::store::Queue`): its bound
+/// is what the writer commits in the most a row waits to share a commit (`COMMIT_MS`), at the rate it has
+/// committed.
+pub static CONVO_QUEUE: Owner = Owner::new("convo_queue");
+
 /// The owners counted here, in the order the exposition says them.
-const OWNERS: [&Owner; 2] = [&UI_ASSETS, &SESSION_ENTRIES];
+const OWNERS: [&Owner; 3] = [&UI_ASSETS, &SESSION_ENTRIES, &CONVO_QUEUE];
 
 /// The process's resident memory by kind, in bytes: `anon`, `file` and `shmem` (Linux; elsewhere none).
 pub fn resident() -> Option<[(&'static str, u64); 3]> {
