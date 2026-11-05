@@ -865,18 +865,21 @@ fn fresh_config(cfg: &crate::config::Config, realtime: Option<&Grant>) -> String
 
 /// `RLIMIT_RTPRIO`'s hard limit as `/proc/<pid>/limits` gives it (`Max realtime priority  0  0`, its
 /// soft and hard limits): `u64::MAX` for unlimited.
+#[cfg(any(target_os = "linux", test))]
 fn rtprio_hard(limits: &str) -> Option<u64> {
     crate::os::rtprio_limits(limits).map(|(_, hard)| hard)
 }
 
 /// A service manager's own cgroup from its `/proc/<pid>/cgroup` (`0::/user.slice/…/user@1000.service/init.scope`):
 /// the unit's, above the leaf systemd starts it in (`DelegateSubgroup=init.scope`).
+#[cfg(any(target_os = "linux", test))]
 fn manager_cgroup(proc_cgroup: &str) -> Option<String> {
     let path = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
     Some(path.strip_suffix("/init.scope").unwrap_or(path).to_owned())
 }
 
 /// Whether a `cgroup.controllers` file names `controller`.
+#[cfg(any(target_os = "linux", test))]
 fn has_controller(controllers: &str, controller: &str) -> bool {
     controllers.split_whitespace().any(|c| c == controller)
 }
