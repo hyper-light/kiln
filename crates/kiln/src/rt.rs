@@ -1784,49 +1784,62 @@ impl Notify {
 
 // ---------------------------------------------------------------------------------- broadcast
 
-/// Fan-out to every current subscriber; slow subscribers lose the oldest messages (they see
-/// `RecvError::Overflowed`) instead of holding up the sender.
+/// Fan-out to every current subscriber, with no lock on any path (goal 4, plan 01a1a59c2a9c step 5; goal 5's
+/// rule): one lane of `crate::memory::lanes`, each subscriber its own channel. async-broadcast's one channel,
+/// which it was, took its `Mutex` for every send and every subscriber's receive. A subscriber that falls
+/// behind loses what it has no room for (it sees `RecvError::Overflowed`, and goes on from after what it
+/// missed) instead of holding up the sender or the others.
 pub struct Broadcast<T: Clone> {
-    tx: async_broadcast::Sender<T>,
-    _keep_open: async_broadcast::InactiveReceiver<T>,
+    lanes: crate::memory::lanes::Lanes<Plain<T>>,
+    capacity: usize,
 }
 
-impl<T: Clone> Broadcast<T> {
+/// A broadcast's message, counted at its place alone: what a broadcast carries is small (CD's changes, an id
+/// each), and none of it is on `/metrics` (`crate::memory::owners::BROADCASTS`).
+#[derive(Clone)]
+struct Plain<T>(T);
+
+impl<T> crate::memory::queue::Weigh for Plain<T> {
+    fn weight(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Broadcast<T> {
+    /// A broadcast each of whose subscribers holds `capacity` messages (one at the least).
     pub fn new(capacity: usize) -> Self {
-        let (mut tx, rx) = async_broadcast::broadcast(capacity.max(1));
-        tx.set_overflow(true);
-        tx.set_await_active(false);
-        Self { tx, _keep_open: rx.deactivate() }
+        Self { lanes: crate::memory::lanes::Lanes::new(&crate::memory::owners::BROADCASTS, 1, 0), capacity: capacity.max(1) }
     }
 
     /// Deliver to the current subscribers (dropped when there are none).
     pub fn send(&self, value: T) {
-        let _ = self.tx.try_broadcast(value);
+        self.lanes.send(0, Plain(value));
     }
 
+    /// A subscriber from now. When the runtime has no channel to give it (said in the log), one that has ended.
     pub fn subscribe(&self) -> Subscription<T> {
-        Subscription(self.tx.new_receiver())
+        Subscription(self.lanes.subscribe_or_ended(self.capacity))
     }
 
     pub fn receiver_count(&self) -> usize {
-        self.tx.receiver_count()
+        self.lanes.receiver_count()
     }
 }
 
-/// A subscriber of a [`Broadcast`]: async-broadcast's receiver, whose receive charges the task's turn on
-/// its shard (`hyper_rt::coop`, kiln's goal 6), so a subscriber whose channel is always full yields at
-/// its share. Everything else is the receiver's own.
-pub struct Subscription<T>(async_broadcast::Receiver<T>);
+/// A subscriber of a [`Broadcast`]: its own channel, whose receive charges the task's turn on its shard
+/// (`hyper_rt::coop`, kiln's goal 6), so a subscriber whose channel is always full yields at its share.
+pub struct Subscription<T>(crate::memory::lanes::Reader<Plain<T>>);
 
 impl<T: Clone> Subscription<T> {
-    /// The next message (as async-broadcast's `recv`), after a charge of the task's turn.
+    /// The next message, after a charge of the task's turn: `Overflowed` with how many it missed, `Closed` once
+    /// the broadcast is gone and nothing waits.
     pub async fn recv(&mut self) -> Result<T, async_broadcast::RecvError> {
-        hyper_rt::coop::consume_budget().await;
-        self.0.recv().await
+        self.0.recv().await.map(|p| p.0)
     }
 }
 
-/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too.
+/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too;
+/// what was missed is passed over.
 impl<T: Clone> futures::Stream for Subscription<T> {
     type Item = T;
 
@@ -1834,20 +1847,14 @@ impl<T: Clone> futures::Stream for Subscription<T> {
         if hyper_rt::coop::poll_proceed(cx).is_pending() {
             return Poll::Pending;
         }
-        futures::StreamExt::poll_next_unpin(&mut self.0, cx)
-    }
-}
-
-impl<T> std::ops::Deref for Subscription<T> {
-    type Target = async_broadcast::Receiver<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> std::ops::DerefMut for Subscription<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        loop {
+            match self.0.poll_recv(cx) {
+                Poll::Ready(Ok(p)) => return Poll::Ready(Some(p.0)),
+                Poll::Ready(Err(async_broadcast::RecvError::Overflowed(_))) => {}
+                Poll::Ready(Err(async_broadcast::RecvError::Closed)) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 

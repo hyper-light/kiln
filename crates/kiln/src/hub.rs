@@ -528,8 +528,8 @@ pub struct Hub {
     /// (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5, and goal 5's rule): no send or receive takes
     /// a lock two shards share, as a ring's did (async-broadcast's `Mutex`), and every listener has the events
     /// in the order they were sent, as that lock made it. Each listener holds at most [`EVENTS`] of them
-    /// ([`Hub::subscribe_events`]), their texts one receive window of bytes, each counted once (goal 11, plan
-    /// 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
+    /// ([`Hub::subscribe_events`]) and one receive window of their texts, a listener that falls behind starting
+    /// over on its own (goal 11, plan 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
     pub events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Agent sessions' own events (`harness`: an info changed, `harness_closed`: a session gone), apart from
     /// [`Hub::events`] (goal 4, plan 01a1a59c2a9c step 5). Every change of a session's info is one, sent from
@@ -538,8 +538,8 @@ pub struct Hub {
     /// rest of kiln's listeners aren't woken for each. A session's go on its owner shard's own lane (the lane
     /// its id hashes to, `crate::harness::copies::owner_of`), to each reader's own channel for that lane, so
     /// no send or receive of them takes a lock two shards share (`crate::memory::lanes`; goal 5's rule): a
-    /// session's reach every reader in the order they're sent. Their bytes held are the hub's events' too
-    /// (`UI_EVENTS`): one receive window of them, each counted once.
+    /// session's reach every reader in the order they're sent. Each reader holds one receive window of their
+    /// texts at the most, counted as the hub's events' are (`UI_EVENTS`).
     pub harness_events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`).

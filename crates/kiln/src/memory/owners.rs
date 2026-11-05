@@ -75,12 +75,12 @@ pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 /// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets and
 /// kiln's own listeners hear, on one lane; and its `harness_events`, agent sessions' own, on each owner shard's
 /// lane), each listener's own channels (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5): their texts,
-/// each counted once until its last listener takes it, within [`crate::net::EVENTS_BYTES`] for each of the two
-/// (as much as the hub's queue of runners' messages most of them are made from), and each listener's places,
-/// made as it subscribes (`crate::hub::EVENTS` in all its lanes, as many as the hub's ring held for its
-/// slowest; push's sessions' `EVENTS` a lane). Past either, what comes is let go of for that listener and it's
-/// told how many: a page's socket fetches what it shows again (`Resync`), and kiln's own listeners are told how
-/// many they missed.
+/// each counted once until its last listener takes it, and each listener's places, made as it subscribes
+/// (`crate::hub::EVENTS` in all its lanes, as many as the hub's ring held for its slowest; push's sessions'
+/// `EVENTS` a lane). Each listener's bound is its places and [`crate::net::EVENTS_BYTES`] of the texts (as much
+/// as the hub's queue of runners' messages most of them are made from). Past either, what comes is let go of
+/// for that listener alone and it starts over, told how many it missed: a page's socket fetches what it shows
+/// again (`Resync`), and kiln's own listeners are told how many they missed.
 pub static UI_EVENTS: Owner = Owner::new("ui_events");
 
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
@@ -168,6 +168,11 @@ pub static CD_INPUTS: Owner = Owner::new("cd_inputs");
 /// object is a render's). At the bound the engine's thread waits (its own, not the runtime's), and its
 /// inputs behind it.
 pub static CD_ACTIONS: Owner = Owner::new("cd_actions");
+
+/// What `crate::rt::Broadcast`'s subscribers hold (goal 4, plan 01a1a59c2a9c step 5: each its own channel): their
+/// places, made as each subscribes, and nothing past them (a broadcast carries CD's changes, an id each). Not
+/// among [`ALL`]: there's nothing on `/metrics` to see of it.
+pub static BROADCASTS: Owner = Owner::new("broadcasts");
 
 /// The owners counted here, in the order the exposition says them.
 /// kiln's log lines waiting for the thread that writes them to stdout (`crate::log_lines`; goal 9, plan 01a1a87b2cec
