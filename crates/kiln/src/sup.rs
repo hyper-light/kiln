@@ -71,7 +71,9 @@ pub fn jitter(d: Duration) -> Duration {
 }
 
 /// Run `make()` forever (until `cancel`), restarting on `Err` or panic. Returning `Ok(())` means the
-/// child finished on purpose and is not restarted.
+/// child finished on purpose and is not restarted. The caller's place is the task's spawn site, which
+/// the shards' table of what held them names (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2).
+#[track_caller]
 pub fn spawn<F, Fut>(
     reg: &Registry,
     name: &str,
@@ -128,7 +130,9 @@ where
     })
 }
 
-/// Spawn a one-shot task whose panic is logged instead of silently lost.
+/// Spawn a one-shot task whose panic is logged instead of silently lost. The caller's place is the
+/// task's spawn site, as [`spawn`]'s.
+#[track_caller]
 pub fn spawn_guarded<Fut>(name: &'static str, fut: Fut) -> JoinHandle<()>
 where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
