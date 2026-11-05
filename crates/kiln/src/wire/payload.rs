@@ -174,10 +174,17 @@ struct Check {
     find: fn(&str) -> Vec<String>,
 }
 
-/// The most payloads waiting for [`checker`]'s thread: as many messages as the hub's loop keeps waiting
-/// from runners (`crate::net::EVENTS`), so it falls no further behind than the hub may. Past it, one is let
-/// go unlooked at, counted, and said at each power of two.
-const CHECKS_MOST: usize = crate::net::EVENTS;
+/// The most bytes of payloads waiting for [`checker`]'s thread: as many as the hub's loop keeps waiting
+/// from runners (`crate::net::EVENTS_BYTES`), so it falls no further behind than the hub may. Past it, one
+/// is let go unlooked at, counted, and said at each power of two.
+const CHECKS_MOST: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Check {
+    /// Its place and its payload's text.
+    fn weight(&self) -> usize {
+        size_of::<Check>().saturating_add(self.json.len())
+    }
+}
 
 /// The payloads let go unlooked at for want of room ([`CHECKS_MOST`]).
 static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -204,10 +211,10 @@ fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<S
 
 /// The thread that looks for the unknown fields of payloads read on the shards, started the first time
 /// one is; none where it couldn't start (said so).
-fn checker() -> Option<&'static async_channel::Sender<Check>> {
-    static TX: OnceLock<Option<async_channel::Sender<Check>>> = OnceLock::new();
+fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
+    static TX: OnceLock<Option<crate::memory::queue::Sender<Check>>> = OnceLock::new();
     TX.get_or_init(|| {
-        let (tx, rx) = async_channel::bounded::<Check>(CHECKS_MOST);
+        let (tx, rx) = crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST);
         let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
             while let Ok(c) = rx.recv_blocking() {
                 say_unknown(c.wire, c.of, &(c.find)(&c.json));

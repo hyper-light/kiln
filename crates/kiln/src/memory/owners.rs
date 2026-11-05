@@ -56,8 +56,14 @@ pub static MIRRORS_OUT: Owner = Owner::new("mirrors_out");
 /// file (or the OS's cache of it) when asked.
 pub static SQLITE: Owner = Owner::new("sqlite");
 
+/// Runners' payloads read on a shard, waiting for the thread that looks for fields this build doesn't know
+/// in them (`crate::wire::payload`'s checker; goal 9, plan 01a1a87b2cec step 5): at most
+/// [`crate::net::EVENTS_BYTES`], as much as the hub's loop keeps waiting from runners. At the bound a
+/// payload is let go unlooked at, counted and said: the message itself was taken whole already.
+pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 8] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &SQLITE];
+pub(super) const ALL: [&Owner; 9] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &SQLITE];
 
 #[cfg(test)]
 mod tests {

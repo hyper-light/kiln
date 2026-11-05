@@ -1438,6 +1438,7 @@ impl crate::memory::queue::Weigh for Msg {
         size_of::<Msg>().saturating_add(match self {
             Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
             Msg::Run(job) => size_of_val(&**job),
+            Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
         })
     }
 }
@@ -1883,7 +1884,7 @@ mod tests {
         }
         let [oldest, middle, newest] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
         let want = newest.deflate(Compression::default())?;
-        let (owner, told) = async_channel::bounded::<Msg>(8);
+        let (owner, told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, crate::net::EVENTS_BYTES);
         let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
         let (tx, rx) = async_channel::unbounded();
         for c in [&oldest, &middle, &newest] {
