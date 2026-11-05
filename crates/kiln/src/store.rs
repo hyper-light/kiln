@@ -152,13 +152,15 @@ struct Counted {
     conn: Connection,
     held: usize,
     bound: usize,
+    /// When it was last given back for the next read ([`Reads::give`]): made, for one never used.
+    given: Instant,
 }
 
 impl Counted {
     fn new(conn: Connection) -> Self {
         let bound = cache_bound(&conn);
         crate::memory::owners::SQLITE.bound_add(bound);
-        let mut c = Self { conn, held: 0, bound };
+        let mut c = Self { conn, held: 0, bound, given: Instant::now() };
         c.look();
         c
     }
@@ -189,21 +191,66 @@ impl Drop for Counted {
     }
 }
 
+/// How long a read connection is kept open with no read taking it (goal 11, plan 01a1a87b2e56 step 5): the wait
+/// after which a pool's worker gives its caches back ([`crate::os::alloc::COLD_AFTER`]). A read takes a few
+/// milliseconds, so a connection none took in that long is one past the reads' recent peak.
+const READ_IDLE: std::time::Duration = crate::os::alloc::COLD_AFTER;
+
+/// One of [`Reads`]' places: a connection not in use, if any (a lock-free queue of one), and when the one it
+/// holds was given back, in milliseconds since the places were made (a hint for the sweep, which reads the
+/// connection's own time before it closes one).
+struct Place {
+    conn: concurrent_queue::ConcurrentQueue<Counted>,
+    given_ms: std::sync::atomic::AtomicU64,
+}
+
 /// Read-only connections to the database's file ([`Store::read`]), each taken by one read at a time
-/// and given back as it ends: a lock-free queue of those not in use, as many as the blocking pool's
+/// and given back as it ends: a place each for those not in use, as many as the blocking pool's
 /// `store` share runs reads at once. One taken when none is free (a read past them) is opened then.
+///
+/// A read takes the connection of the lowest place that has one, and one given back takes the lowest
+/// place free, so the reads at once use the low places and the high ones wait idle. Each connection
+/// holds kiln.db's whole schema parsed besides its page cache (604 KB for its 202 tables and 283
+/// indexes, and 62 KB more opened: SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), so
+/// keeping every connection a burst once opened kept as many schemas. As reads give connections back,
+/// at most once each [`READ_IDLE`], the highest place whose connection no read took in that long has it
+/// closed (goal 11, plan 01a1a87b2e56 step 5); the lowest place's, a lone read's, is kept. A read past the reads'
+/// recent peak opens one and parses the schema again: 2.0 ms at the median of 30 on fedora.
 struct Reads {
     path: std::path::PathBuf,
-    idle: concurrent_queue::ConcurrentQueue<Counted>,
+    places: Box<[Place]>,
+    /// How long a connection is kept with no read taking it: [`READ_IDLE`].
+    idle: std::time::Duration,
+    /// When the places were made: what their times count from.
+    made: Instant,
+    /// When the next sweep is due, in milliseconds since `made`.
+    sweep_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Reads {
     fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), idle: concurrent_queue::ConcurrentQueue::bounded(crate::rt::profile().pool.1.max(1)) }
+        Self::with_places(path, crate::rt::profile().pool.1.max(1), READ_IDLE)
+    }
+
+    fn with_places(path: &Path, places: usize, idle: std::time::Duration) -> Self {
+        let places = (0..places.max(1)).map(|_| Place { conn: concurrent_queue::ConcurrentQueue::bounded(1), given_ms: std::sync::atomic::AtomicU64::new(0) }).collect();
+        let reads = Self { path: path.to_path_buf(), places, idle, made: Instant::now(), sweep_ms: std::sync::atomic::AtomicU64::new(0) };
+        reads.sweep_ms.store(reads.idle_ms(), std::sync::atomic::Ordering::Relaxed);
+        reads
+    }
+
+    /// How long a connection is kept with no read taking it, in milliseconds.
+    fn idle_ms(&self) -> u64 {
+        u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Milliseconds from the places' making to `at`.
+    fn ms(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.made).as_millis()).unwrap_or(u64::MAX)
     }
 
     fn take(&self) -> anyhow::Result<Counted> {
-        if let Ok(c) = self.idle.pop() {
+        if let Some(c) = self.places.iter().find_map(|place| place.conn.pop().ok()) {
             return Ok(c);
         }
         let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
@@ -211,10 +258,62 @@ impl Reads {
         Ok(Counted::new(c))
     }
 
-    /// Back for the next read, its cache counted as the read left it (closed, past as many as are kept).
+    /// Back for the next read, its cache counted as the read left it, in the lowest place free (closed, past as
+    /// many as are kept); then the sweep, where it's due.
     fn give(&self, mut c: Counted) {
         c.look();
-        let _ = self.idle.push(c);
+        c.given = Instant::now();
+        let at = self.ms(c.given);
+        self.put(c, Some(at));
+        self.sweep(at);
+    }
+
+    /// `c` into the lowest place free, saying when it was given back where `at` says (a connection the sweep
+    /// puts back keeps its place's time); closed where every place is taken.
+    fn put(&self, mut c: Counted, at: Option<u64>) {
+        for place in self.places.iter() {
+            match place.conn.push(c) {
+                Ok(()) => {
+                    if let Some(at) = at {
+                        place.given_ms.store(at, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Err(full) => c = full.into_inner(),
+            }
+        }
+    }
+
+    /// Where a sweep is due at `now_ms` (and this read is the one to make it), closes the connection of the
+    /// highest place (not the lowest) that no read took for [`READ_IDLE`]: one a sweep, a close's cost (SQLite
+    /// freeing a schema and a cache) on one read in each `READ_IDLE`. Whether it closed one.
+    fn sweep(&self, now_ms: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let idle = self.idle_ms();
+        let due = self.sweep_ms.load(Relaxed);
+        if now_ms < due || self.sweep_ms.compare_exchange(due, now_ms.saturating_add(idle), Relaxed, Relaxed).is_err() {
+            return false;
+        }
+        for place in self.places.iter().skip(1).rev() {
+            if place.conn.is_empty() || now_ms.saturating_sub(place.given_ms.load(Relaxed)) < idle {
+                continue;
+            }
+            let Ok(c) = place.conn.pop() else { continue };
+            if c.given.elapsed() >= self.idle {
+                drop(c);
+                return true;
+            }
+            // Given back since the hint was read: kept, in the lowest place free.
+            self.put(c, None);
+            return false;
+        }
+        false
+    }
+
+    /// The connections open and not in use.
+    #[cfg(test)]
+    fn kept(&self) -> usize {
+        self.places.iter().filter(|place| !place.conn.is_empty()).count()
     }
 }
 
@@ -2621,6 +2720,58 @@ pub fn stats_now(c: &Connection) -> anyhow::Result<Stats> {
 mod tests {
     use super::*;
     use crate::pipeline;
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: reads take the lowest place's connection and give it back to the lowest
+    /// place free, so the places past the reads at once wait idle; a read giving one back once a sweep is due closes
+    /// the highest place's connection idle that long, one a sweep, never the lowest place's; one given back since
+    /// is kept, and none is closed before a sweep is due. A connection holds kiln.db's whole schema (the measured
+    /// basis, [`Reads`]), so this is what's kept. The sweeps' due times are set here, not waited for.
+    #[test]
+    fn g11_s5_reads_reuse_the_lowest_places_and_close_the_idle_ones() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        drop(Store::open(&path)?);
+        let reads = Reads::with_places(&path, 4, IDLE);
+        reads.sweep_ms.store(u64::MAX, Relaxed);
+        // A burst of three reads at once opens three, given back to places 0, 1 and 2.
+        let burst: Vec<Counted> = (0..3).map(|_| reads.take()).collect::<anyhow::Result<_>>()?;
+        for c in burst {
+            reads.give(c);
+        }
+        anyhow::ensure!(reads.kept() == 3, "{} kept", reads.kept());
+        // A read at a time takes and gives back place 0's.
+        let lone = |reads: &Reads| -> anyhow::Result<()> {
+            let c = reads.take()?;
+            let n: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+            anyhow::ensure!(n > 0, "kiln.db's schema read");
+            reads.give(c);
+            Ok(())
+        };
+        std::thread::sleep(IDLE * 2);
+        // Each sweep due closes one, the highest idle: place 2's, then place 1's; place 0's, the lone read's, stays.
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 2 && reads.places.get(2).is_some_and(|p| p.conn.is_empty()), "the highest idle one closed: {} kept", reads.kept());
+        anyhow::ensure!(reads.sweep_ms.load(Relaxed) >= reads.idle_ms(), "the next sweep due a wait later");
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 1 && reads.places.first().is_some_and(|p| !p.conn.is_empty()), "{} kept", reads.kept());
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 1, "the lowest place's is kept: {} kept", reads.kept());
+        // Two at once again: the second given back just now is kept by a sweep due, and none closes before one is.
+        let (a, b) = (reads.take()?, reads.take()?);
+        reads.give(a);
+        reads.give(b);
+        reads.sweep_ms.store(0, Relaxed);
+        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "given back just now: kept");
+        reads.sweep_ms.store(u64::MAX, Relaxed);
+        std::thread::sleep(IDLE * 2);
+        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "no sweep before it's due");
+        Ok(())
+    }
 
     /// Goal 5, plan 01a1a59c2aae step 2: a store's reads take read-only connections of their own,
     /// alongside its writer: a read sees each write committed before it, many run at once while a
