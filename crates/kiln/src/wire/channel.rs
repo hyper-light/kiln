@@ -77,8 +77,16 @@ pub struct Has {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frame {
     /// Item `seq` of `stream`. `low`: its sender has every answer through it. `body`: the message
-    /// it carries, encoded as its wire encodes it.
-    Item { stream: String, seq: Seq, low: Seq, body: Vec<u8> },
+    /// it carries, encoded as its wire encodes it: read whole as postcard's bytes, the same bytes on the
+    /// wire as a sequence of `u8` (`crate::proto::wire_bytes`; goal 9, plan 01a1a87b2cec step 5: rt7's
+    /// shards read every runner's channel item a byte a call).
+    Item {
+        stream: String,
+        seq: Seq,
+        low: Seq,
+        #[serde(with = "crate::proto::wire_bytes")]
+        body: Vec<u8>,
+    },
     /// Every item of the stream through `upto` is answered; those of them refused are in `nacks`.
     Ack(Has),
     /// Send `stream` again from item `from`: the receiver saw a gap.
