@@ -22,11 +22,13 @@
 //!   share (its running runs' holds, at their largest dimension over what the runner offers) goes
 //!   ahead with a run that keeps it within its floor, or with one that takes it over once the
 //!   floor's pace allows (`sched::state::pace_ms`). A run that waited its class's bound while its
-//!   class started nothing here goes up a class (never into `critical`, never preempting); an
-//!   `interactive` run goes up into `land` once the `land` and `critical` work ahead of it when it
-//!   came is no longer waiting, at the latest expected end of that work still running (its p90,
-//!   else its median, else its timeout, GitHub's 360 minutes unsaid: `sched::state::Due`). Each
-//!   look is a timer ([`Self::timer`]), and every input takes those due by its time first.
+//!   class started nothing here goes up a class (never into `critical`, never preempting). Its
+//!   bound, in every class with one above (`background`, `batch`, `interactive`), is the work of
+//!   the classes before its own here when its wait began: once none of that waits any more, the
+//!   time from then to the latest expected end of that work still running (its p90,
+//!   else its median, else its timeout, GitHub's 360 minutes unsaid: `sched::state::Due`); with
+//!   none of it here, none until some comes; a person's bound for its class besides, whichever
+//!   comes first (docs/needs.md E5: as the engine and its reference decide). Each look is a timer ([`Self::timer`]), and every input takes those due by its time first.
 //! - **Admission**: of each class, the first in order that has room starts (work-conserving first
 //!   fit, as the engine's pick); room is the engine's rule (W05-R03): an `exclusive` run asking no
 //!   CPUs takes the runner whole and waits for it empty (its CI legs too), one asking CPUs holds
@@ -247,11 +249,12 @@ struct Probe {
     /// Its place in its tenant's own order, its arrival here, and when it came.
     own: i128,
     seq: u64,
-    /// When it came to its class, counted over this runner: the `land` and `critical` work that
-    /// came to theirs before an `interactive` run came to its own is what it waits behind.
-    came: u64,
-    /// For an `interactive` run: when it goes up into `land`, once that work no longer waits.
-    land_due: Option<i64>,
+    /// When it came to each class it's been in, counted over this runner as runs come to classes
+    /// (`u64::MAX`: never there): the work of the classes before a run's that came there before
+    /// its wait began is what it waits behind (W05-R31, the engine's `Behind`).
+    stamps: [u64; 5],
+    /// Its wait behind that work, in a class with one above.
+    watch: Watch,
     charge: Option<Charge>,
     /// A claim's predicted end and hard end (its timeout), by the shell's prediction, when it has
     /// them; and its ends as the engine reckons them (p90, else median, else timeout).
@@ -264,6 +267,38 @@ struct Probe {
     /// it offered or holding room does nothing), so looks for runs long started don't pile up
     /// for a class's bound (docs/needs.md §11, AUDIT P6).
     look: Option<(i64, Class)>,
+}
+
+/// A run's wait behind the work of the classes before its own (W05-R31, docs/needs.md E5: the
+/// engine's `Behind`, the reference's `Ahead`), in a class with one above: the runs of those
+/// classes here (waiting or holding room) when it began (`at`, counted as [`Probe::stamps`] are;
+/// `since`, the time) are ahead of it. With none here then (`armed` false) it waits unbounded until
+/// some comes, and its wait is from then. Once none of them waits any more, its bound is due at the
+/// latest expected end of those still holding room, or then (`due`), and that bound is looked at
+/// (`next`, moved a bound after a start of its class, as a person's bound's look is).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Watch {
+    at: u64,
+    since: i64,
+    armed: bool,
+    due: Option<i64>,
+    next: Option<i64>,
+}
+
+/// Whether runs of `class` wait behind the classes before theirs: those with a class above.
+fn watched(class: Class) -> bool {
+    class.up().is_some()
+}
+
+/// When run `p` first came to a class before `c`, if it's in one now: where it stands among the
+/// work ahead of `c`'s runs.
+fn below(p: &Probe, c: Class) -> Option<u64> {
+    (p.class < c).then(|| p.stamps.iter().take(c.index()).copied().min().unwrap_or(u64::MAX))
+}
+
+/// Where run `p` stands among the work ahead of each class with one above, by the class's index.
+fn marks(p: &Probe) -> [Option<u64>; 5] {
+    Class::ALL.map(|c| below(p, c).filter(|_| watched(c)))
 }
 
 /// An owner's process, as this runner hears it.
@@ -377,11 +412,16 @@ pub struct Admission {
     /// Promotion's looks (W05-R31), by when: the run's slot, its arrival (so a look kept for a
     /// run gone does nothing) and the class it's looked at in, in the order they were made.
     promotions: BTreeMap<i64, Vec<(u32, u64, Class)>>,
-    /// The `land` and `critical` runs in the line, and those holding claims, by when they came to
-    /// their class; the `interactive` runs in the line whose time to go up isn't set yet.
-    land_waiting: BTreeSet<(u64, u32)>,
-    land_claims: BTreeSet<(u64, u32)>,
-    watchers: BTreeSet<(u64, u32)>,
+    /// For each class with one above (by its index): the runs of the classes before it in the
+    /// line, and those holding claims, by when they first came to one of those classes
+    /// ([`below`]); its runs in the line whose time to go up isn't set yet, by when their wait
+    /// began, and those with nothing ahead yet ([`Watch`]).
+    ahead_waiting: [BTreeSet<(u64, u32)>; 5],
+    ahead_claims: [BTreeSet<(u64, u32)>; 5],
+    watching: [BTreeSet<(u64, u32)>; 5],
+    unarmed: [BTreeSet<u32>; 5],
+    /// The looks the work ahead's bounds make ([`Watch::next`]), by when, as `promotions`.
+    behinds: BTreeMap<i64, Vec<(u32, u64, Class)>>,
     /// A probe just come, not told it waits until admitting has had its say in the same input: one
     /// offered at once is told only the offer (an owner choosing between offers takes a word that
     /// it waits for its answer, docs/needs.md §11, AUDIT P6), and a message is saved.
@@ -472,9 +512,11 @@ impl Admission {
             kept: None,
             stale: false,
             promotions: BTreeMap::new(),
-            land_waiting: BTreeSet::new(),
-            land_claims: BTreeSet::new(),
-            watchers: BTreeSet::new(),
+            ahead_waiting: Default::default(),
+            ahead_claims: Default::default(),
+            watching: Default::default(),
+            unarmed: Default::default(),
+            behinds: BTreeMap::new(),
             hush: None,
             replies: Vec::new(),
             order: Vec::new(),
@@ -648,7 +690,7 @@ impl Admission {
     /// A probe's claim starts holding room, from `from`.
     fn claim(&mut self, s: u32, from: i64) {
         let Some(p) = self.get(s) else { return };
-        let (amounts, kind, came, class) = (p.amounts, kind_of(&p.ask), p.came, p.class);
+        let (amounts, kind, marks) = (p.amounts, kind_of(&p.ask), marks(p));
         let end = p.predicted.map(|ms| later(from, ms));
         let hard = p.ask.timeout.map(|ms| later(from, ms));
         let due = Due::of_parts(p.ask.p90, p.ask.median, p.ask.timeout, from);
@@ -669,8 +711,10 @@ impl Admission {
             }
             None => self.untimed_claims = self.untimed_claims.saturating_add(1),
         }
-        if class <= Class::Land {
-            self.land_claims.insert((came, s));
+        for (set, mark) in self.ahead_claims.iter_mut().zip(marks) {
+            if let Some(b) = mark {
+                set.insert((b, s));
+            }
         }
         if let Some(p) = self.get_mut(s) {
             p.end = end;
@@ -683,7 +727,7 @@ impl Admission {
     /// never ran (one that ran is settled as it ends, [`Self::ended`]).
     fn release(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
-        let (state, amounts, kind, end, hard, came) = (p.state, p.amounts, kind_of(&p.ask), p.end, p.hard, p.came);
+        let (state, amounts, kind, end, hard, marks) = (p.state, p.amounts, kind_of(&p.ask), p.end, p.hard, marks(p));
         if let State::Offered { until, .. } = state {
             self.deadlines.remove(&(until, s));
         }
@@ -708,7 +752,11 @@ impl Admission {
             }
             None => self.untimed_claims = self.untimed_claims.saturating_sub(1),
         }
-        self.land_claims.remove(&(came, s));
+        for (set, mark) in self.ahead_claims.iter_mut().zip(marks) {
+            if let Some(b) = mark {
+                set.remove(&(b, s));
+            }
+        }
         if let Some(p) = self.get_mut(s) {
             p.end = None;
             p.hard = None;
@@ -730,13 +778,17 @@ impl Admission {
     fn leave(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
         if let (State::Waiting, Some(k)) = (p.state, self.key_of(s)) {
-            let (came, class) = (p.came, p.class);
+            let (marks, class) = (marks(p), p.class);
             self.line.remove(&k);
             if self.kept.is_some_and(|(k, _)| k == s) {
                 self.kept = None;
             }
-            self.land_waiting.remove(&(came, s));
-            self.watchers.remove(&(came, s));
+            for (set, mark) in self.ahead_waiting.iter_mut().zip(marks) {
+                if let Some(b) = mark {
+                    set.remove(&(b, s));
+                }
+            }
+            self.unwatch(s);
             // The slot and the class's leaves borrowed apart, so the leaf's name isn't copied.
             if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index()))
                 && let Some((_, set)) = f.leaves.get_mut(&leaf_of(p))
@@ -797,7 +849,7 @@ impl Admission {
     /// tenant's standing as it is now.
     fn enter(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
-        let (class, came, land_due) = (p.class, p.came, p.land_due);
+        let (class, marks) = (p.class, marks(p));
         // At its tenant's standing as its other runs here hold it, so they all stand alike; if
         // that's moved, restand moves them all.
         let now_standing = self.standing_of(class, path_of(p));
@@ -819,16 +871,61 @@ impl Admission {
                 }
             }
         }
-        if class <= Class::Land {
-            self.land_waiting.insert((came, s));
-        }
-        if class == Class::Interactive && land_due.is_none() {
-            self.watchers.insert((came, s));
+        for (set, mark) in self.ahead_waiting.iter_mut().zip(marks) {
+            if let Some(b) = mark {
+                set.insert((b, s));
+            }
         }
         if let Some(p) = self.get_mut(s) {
             p.key = Some(key);
             p.state = State::Waiting;
             p.told = None;
+        }
+        self.rewatch(s);
+    }
+
+    /// Run `s`'s wait behind the work of the classes before its own begins (it came to its class
+    /// at `since`), from `at` ([`Watch`]): what of that work is here now is ahead of it.
+    fn start_watch(&mut self, s: u32, at: u64, since: i64) {
+        let Some(class) = self.get(s).map(|p| p.class) else { return };
+        self.unwatch(s);
+        let i = class.index();
+        let armed = watched(class) && (self.ahead_waiting.get(i).is_some_and(|w| !w.is_empty()) || self.ahead_claims.get(i).is_some_and(|c| !c.is_empty()));
+        let waiting = match self.get_mut(s) {
+            Some(p) => {
+                p.watch = Watch { at, since, armed, due: None, next: None };
+                p.state == State::Waiting
+            }
+            None => false,
+        };
+        if waiting {
+            self.rewatch(s);
+        }
+    }
+
+    /// Takes run `s` out of its class's watches.
+    fn unwatch(&mut self, s: u32) {
+        let Some((i, at)) = self.get(s).map(|p| (p.class.index(), p.watch.at)) else { return };
+        if let Some(w) = self.watching.get_mut(i) {
+            w.remove(&(at, s));
+        }
+        if let Some(u) = self.unarmed.get_mut(i) {
+            u.remove(&s);
+        }
+    }
+
+    /// Puts waiting run `s` in its class's watches, if its time to go up isn't set yet.
+    fn rewatch(&mut self, s: u32) {
+        let Some((class, w)) = self.get(s).map(|p| (p.class, p.watch)) else { return };
+        if !watched(class) || w.due.is_some() {
+            return;
+        }
+        if w.armed {
+            if let Some(set) = self.watching.get_mut(class.index()) {
+                set.insert((w.at, s));
+            }
+        } else if let Some(set) = self.unarmed.get_mut(class.index()) {
+            set.insert(s);
         }
     }
 
@@ -1097,68 +1194,127 @@ impl Admission {
         }
     }
 
-    /// A run leaves the line (offered, or gone): its look is taken out, kept on the run.
+    /// A run leaves the line (offered, or gone): its looks are taken out, kept on the run.
     fn unlook(&mut self, s: u32) {
-        let Some((seq, Some((at, class)))) = self.get(s).map(|p| (p.seq, p.look)) else { return };
-        if let Some(v) = self.promotions.get_mut(&at) {
-            if let Some(i) = v.iter().position(|e| *e == (s, seq, class)) {
-                v.swap_remove(i);
-            }
-            if v.is_empty() {
-                self.promotions.remove(&at);
-            }
-        }
-    }
-
-    /// A run waits again (its offer lapsed, or its owner's link went): its look is put back if
-    /// it's still to come.
-    fn relook(&mut self, s: u32, now: i64) {
-        let Some((seq, Some((at, class)))) = self.get(s).map(|p| (p.seq, p.look)) else { return };
-        if at > now && !self.promotions.get(&at).is_some_and(|v| v.contains(&(s, seq, class))) {
-            self.promotions.entry(at).or_default().push((s, seq, class));
-        }
-    }
-
-    /// Each look due by `now`, in turn (the engine's `promote_due`): a run that has been in its
-    /// class its bound goes up a class if its class started nothing here in the bound before (else
-    /// it's looked at again a bound after that start); an `interactive` run whose `land` work ahead
-    /// is due done goes up into `land`. A promoted run keeps its own order and arrival, and
-    /// preempts nothing.
-    fn promote_due(&mut self, now: i64, out: &mut Vec<Reply>) {
-        while let Some(at) = self.promotions.first_key_value().map(|(at, _)| *at).filter(|at| *at <= now) {
-            for (s, seq, from) in self.promotions.remove(&at).unwrap_or_default() {
-                if let Some(p) = self.get_mut(s).filter(|p| p.seq == seq && p.look == Some((at, from))) {
-                    p.look = None;
+        let Some((seq, look, next, class)) = self.get(s).map(|p| (p.seq, p.look, p.watch.next, p.class)) else { return };
+        let drop = |m: &mut BTreeMap<i64, Vec<(u32, u64, Class)>>, at: i64, e: (u32, u64, Class)| {
+            if let Some(v) = m.get_mut(&at) {
+                if let Some(i) = v.iter().position(|x| *x == e) {
+                    v.swap_remove(i);
                 }
-                let Some(to) = from.up() else { continue };
-                let Some(p) = self.get(s).filter(|p| p.seq == seq && p.class == from && matches!(p.state, State::Waiting | State::Aside)) else { continue };
-                let behind_done = from == Class::Interactive && p.land_due.is_some_and(|d| d <= at);
-                if !behind_done {
-                    let Some(bound) = self.class_config(from).bound.map(|b| i64::try_from(b).unwrap_or(i64::MAX)) else { continue };
-                    if let Some(last) = self.fair_of(from).and_then(|f| f.served).filter(|t| *t > at.saturating_sub(bound)) {
-                        self.look_at(s, seq, last.saturating_add(bound), from);
-                        continue;
+                if v.is_empty() {
+                    m.remove(&at);
+                }
+            }
+        };
+        if let Some((at, from)) = look {
+            drop(&mut self.promotions, at, (s, seq, from));
+        }
+        if let Some(at) = next {
+            drop(&mut self.behinds, at, (s, seq, class));
+        }
+    }
+
+    /// A run waits again (its offer lapsed, or its owner's link went): its looks are put back if
+    /// they're still to come.
+    fn relook(&mut self, s: u32, now: i64) {
+        let Some((seq, look, next, class)) = self.get(s).map(|p| (p.seq, p.look, p.watch.next, p.class)) else { return };
+        let file = |m: &mut BTreeMap<i64, Vec<(u32, u64, Class)>>, at: i64, e: (u32, u64, Class)| {
+            if at > now && !m.get(&at).is_some_and(|v| v.contains(&e)) {
+                m.entry(at).or_default().push(e);
+            }
+        };
+        if let Some((at, from)) = look {
+            file(&mut self.promotions, at, (s, seq, from));
+        }
+        if let Some(at) = next {
+            file(&mut self.behinds, at, (s, seq, class));
+        }
+    }
+
+    /// Each look due by `now`, the earliest first (the engine's `promote_due`, the reference's
+    /// `promote`): a run's bound is, once the work ahead of it is due done ([`Watch`]), the time
+    /// from its wait's start to then; else its class's, if a person set one. A run that has been in
+    /// its class its bound goes up a class if its class started nothing here in the bound before
+    /// (else that look is taken again a bound after that start). A promoted run keeps its own order
+    /// and arrival, and preempts nothing. The runs that go up at one time all go up before any
+    /// begins its wait in its new class, so what's ahead of each there doesn't depend on the order
+    /// they were looked at in.
+    fn promote_due(&mut self, now: i64, out: &mut Vec<Reply>) {
+        loop {
+            let first = [self.promotions.first_key_value(), self.behinds.first_key_value()].into_iter().flatten().map(|(at, _)| *at).min();
+            let Some(at) = first.filter(|at| *at <= now) else { return };
+            let mut due = self.promotions.remove(&at).unwrap_or_default();
+            due.extend(self.behinds.remove(&at).unwrap_or_default());
+            let mut up: Vec<u32> = Vec::new();
+            for (s, seq, from) in due {
+                let Some(p) = self.get(s).filter(|p| p.seq == seq && p.class == from) else { continue };
+                let (is_look, is_next) = (p.look == Some((at, from)), p.watch.next == Some(at));
+                if !is_look && !is_next {
+                    continue;
+                }
+                let waits = matches!(p.state, State::Waiting | State::Aside);
+                let derived = p.watch.due.filter(|d| *d <= at).map(|d| d.saturating_sub(p.watch.since).max(0));
+                let bound = derived.or_else(|| self.class_config(from).bound.map(|b| i64::try_from(b).unwrap_or(i64::MAX)));
+                let (Some(bound), Some(to), true) = (bound, from.up(), waits) else {
+                    if let Some(p) = self.get_mut(s) {
+                        if is_look {
+                            p.look = None;
+                        }
+                        if is_next {
+                            p.watch.next = None;
+                        }
                     }
+                    continue;
+                };
+                if let Some(last) = self.fair_of(from).and_then(|f| f.served).filter(|t| *t > at.saturating_sub(bound)) {
+                    let again = last.saturating_add(bound);
+                    if is_look {
+                        self.look_at(s, seq, again, from);
+                    }
+                    if is_next {
+                        if let Some(p) = self.get_mut(s) {
+                            p.watch.next = Some(again);
+                        }
+                        self.behinds.entry(again).or_default().push((s, seq, from));
+                    }
+                    continue;
                 }
                 self.reclass(s, to, at, now, out);
+                up.push(s);
+            }
+            // Each come to its class at the look, all of them in it: what's ahead of it then, and
+            // what of that is due already is due from then.
+            if !up.is_empty() {
+                self.came = self.came.saturating_add(1);
+                let stamp = self.came;
+                for s in up {
+                    self.start_watch(s, stamp, at);
+                }
+                self.dues(at);
             }
         }
     }
 
-    /// Run `s` comes to class `to` at `at`: in the line at its place there, looked at for its
-    /// promotion from there, and if that's `interactive`, behind the `land` work there now.
+    /// Run `s` comes to class `to` at `at`: in the line at its place there, and looked at for its
+    /// promotion from there by its class's bound (its wait there begins once every run going up
+    /// at `at` has, [`Self::promote_due`]).
     fn reclass(&mut self, s: u32, to: Class, at: i64, now: i64, out: &mut Vec<Reply>) {
         let waiting = self.get(s).is_some_and(|p| p.state == State::Waiting);
         if waiting {
             self.leave(s);
             self.boundaries(now, out);
         }
+        self.unlook(s);
         self.came = self.came.saturating_add(1);
         let came = self.came;
         if let Some(p) = self.get_mut(s) {
             p.class = to;
-            p.came = came;
-            p.land_due = None;
+            if let Some(stamp) = p.stamps.get_mut(to.index()) {
+                *stamp = came;
+            }
+            p.look = None;
+            p.watch = Watch::default();
         }
         if waiting {
             self.enter(s);
@@ -1166,26 +1322,51 @@ impl Admission {
             self.tell_if_changed(s, now, out);
         }
         self.promote_at(s, at, to);
-        if to == Class::Interactive {
-            self.land_due(s, at);
+    }
+
+    /// Each run in the line none of whose work ahead waits any more (each that was waiting when
+    /// its wait began has started since, or left, and none waits now, as one put back would), its
+    /// time to go up not set yet: its bound is due at the latest expected end of that work still
+    /// holding room here, or `now` (the engine's `ahead_due`).
+    fn dues(&mut self, now: i64) {
+        for c in Class::ALL.into_iter().filter(|c| watched(*c)) {
+            let i = c.index();
+            let bound = self.ahead_waiting.get(i).and_then(|w| w.first()).map_or(u64::MAX, |(b, _)| *b);
+            while let Some((at, s)) = self.watching.get(i).and_then(|w| w.first()).copied().filter(|(at, _)| *at <= bound) {
+                if let Some(w) = self.watching.get_mut(i) {
+                    w.remove(&(at, s));
+                }
+                let Some(seq) = self.get(s).map(|p| p.seq) else { continue };
+                let due = self.ahead_claims.get(i).map_or(now, |claims| claims.range(..(at, 0)).filter_map(|(_, c)| self.get(*c)).filter_map(|c| c.due.map(|d| d.at(now).expected)).fold(now, i64::max));
+                if let Some(p) = self.get_mut(s) {
+                    p.watch.due = Some(due);
+                    p.watch.next = Some(due);
+                }
+                self.behinds.entry(due).or_default().push((s, seq, c));
+            }
         }
     }
 
-    /// An `interactive` run none of whose `land` work ahead waits any more (each `land` or
-    /// `critical` run that came to its class before it has started, or left): when it goes up, the
-    /// latest expected end of that work still holding room here, or `now` (the engine's `land_due`).
-    fn land_due(&mut self, s: u32, now: i64) {
-        let Some(p) = self.get(s) else { return };
-        let (came, seq) = (p.came, p.seq);
-        if !self.watchers.contains(&(came, s)) || self.land_waiting.first().is_some_and(|(c, _)| *c < came) {
-            return;
+    /// The runs in the line with nothing of the classes before theirs ahead of them yet, now that
+    /// some of that work is here: their wait behind it begins now ([`Watch`]).
+    fn arm(&mut self, now: i64) {
+        for c in Class::ALL.into_iter().filter(|c| watched(*c)) {
+            let i = c.index();
+            let here = self.ahead_waiting.get(i).is_some_and(|w| !w.is_empty()) || self.ahead_claims.get(i).is_some_and(|w| !w.is_empty());
+            if !here || self.unarmed.get(i).is_none_or(BTreeSet::is_empty) {
+                continue;
+            }
+            self.came = self.came.saturating_add(1);
+            let at = self.came;
+            for s in self.unarmed.get_mut(i).map(std::mem::take).unwrap_or_default() {
+                if let Some(p) = self.get_mut(s) {
+                    p.watch = Watch { at, since: now, armed: true, due: None, next: None };
+                }
+                if let Some(w) = self.watching.get_mut(i) {
+                    w.insert((at, s));
+                }
+            }
         }
-        let due = self.land_claims.range(..(came, 0)).filter_map(|(_, c)| self.get(*c)).filter_map(|c| c.due.map(|d| d.at(now).expected)).fold(now, i64::max);
-        self.watchers.remove(&(came, s));
-        if let Some(p) = self.get_mut(s) {
-            p.land_due = Some(due);
-        }
-        self.promotions.entry(due).or_default().push((s, seq, Class::Interactive));
     }
 
     /// What every input does first (as the engine's `handle` does): the looks due by now, and the
@@ -1195,18 +1376,12 @@ impl Admission {
         self.restand(now, out);
     }
 
-    /// What every input does last: the `interactive` runs whose `land` work ahead no longer waits
-    /// have their time to go up set, worked out once the input is done.
+    /// What every input does last, once it's done, so the order its runs were handled in doesn't
+    /// matter: the waits behind the work of the classes before theirs that begin now, then the
+    /// times to go up of those whose work ahead no longer waits.
     fn close(&mut self, now: i64) {
-        let bound = self.land_waiting.first().map_or(u64::MAX, |(c, _)| *c);
-        while let Some(&(c, s)) = self.watchers.first() {
-            if c >= bound {
-                break;
-            }
-            self.land_due(s, now);
-            // A run that isn't one any more is let go of.
-            self.watchers.remove(&(c, s));
-        }
+        self.arm(now);
+        self.dues(now);
     }
 }
 
@@ -1763,8 +1938,12 @@ impl Admission {
         self.seq = self.seq.saturating_add(1);
         self.came = self.came.saturating_add(1);
         let (seq, came, class) = (self.seq, self.came, ask.class);
+        let mut stamps = [u64::MAX; 5];
+        if let Some(stamp) = stamps.get_mut(class.index()) {
+            *stamp = came;
+        }
         let run: Arc<str> = Arc::from(ask.run.as_str());
-        let p = Probe { owner: o, token, run: Arc::clone(&run), ask, amounts, predicted, state: State::Aside, key: None, path, depth, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None, look: None };
+        let p = Probe { owner: o, token, run: Arc::clone(&run), ask, amounts, predicted, state: State::Aside, key: None, path, depth, weights, class, own, seq, stamps, watch: Watch::default(), charge: None, end: None, hard: None, due: None, told: None, look: None };
         let s = match self.spare.pop() {
             Some(s) => {
                 if let Some(slot) = self.slots.get_mut(ix(s)) {
@@ -1784,6 +1963,8 @@ impl Admission {
             }
             None => true,
         };
+        // Its wait behind the work of the classes before its own begins as it comes (W05-R31).
+        self.start_watch(s, came, now);
         // Its promotion's look, filed once it's known to wait (one offered in this input would only
         // take it out again; it's kept on the run, filed if it ever waits).
         self.plan_look(s, now, class);
@@ -2218,7 +2399,7 @@ impl Admission {
     /// When it's to be told the time again ([`Self::tick`]): the soonest offer to lapse or
     /// promotion's look to take, whichever is first.
     pub fn timer(&self) -> Option<i64> {
-        [self.deadlines.first().map(|(at, _)| *at), self.promotions.first_key_value().map(|(at, _)| *at)].into_iter().flatten().min()
+        [self.deadlines.first().map(|(at, _)| *at), self.promotions.first_key_value().map(|(at, _)| *at), self.behinds.first_key_value().map(|(at, _)| *at)].into_iter().flatten().min()
     }
 
     /// The record of runs started here, as the shell keeps it on disk.
