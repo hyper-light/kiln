@@ -4711,6 +4711,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if connected {
                     let s = sampler.sample();
+                    // Placement's room (docs/needs.md E5): this machine as it measures itself now,
+                    // admitted against as it comes, until lb/sense reads its counters when it decides.
+                    if let Some(r) = &reach {
+                        r.feed(crate::reach::node::In::Sampled(s.clone())).await;
+                    }
                     uplink.msg(AgentMsg::Sample(s)).await;
                     // What its QUIC layer let go below the channel, for its page: once it changed.
                     let dropped = crate::metrics::net().counts();

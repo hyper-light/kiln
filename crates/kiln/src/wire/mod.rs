@@ -214,6 +214,7 @@ classes! {
         AgentMsg::Refused { .. } => Class::Answer,
         AgentMsg::Fenced { .. } => Class::Stream,
         AgentMsg::Features { .. } => Class::Handshake,
+        AgentMsg::Offers { .. } => Class::State,
     }
 }
 

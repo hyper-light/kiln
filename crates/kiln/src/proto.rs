@@ -316,6 +316,12 @@ pub enum AgentMsg {
     /// here, not a bit. Only to a server announcing [`CAP_FEATURES`]. Appended last, after
     /// needs-engine's `Fenced`: postcard encodes variants by index.
     Features { names: Vec<String> },
+    /// What this runner's admission holds, as a hint for the server's offers view (docs/needs.md
+    /// E5; JSON `crate::offers::Hint`, lb/offers-ui): its budget and room, its line by class, its
+    /// quotes, and its own runs that wait. Sent only when a decision-relevant value changes, never
+    /// per sample; only to a server that named [`feature::OFFERS`]. Appended last: postcard encodes
+    /// variants by index.
+    Offers { json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -671,9 +677,18 @@ pub mod feature {
     /// runner whose announce lists this may be sent `Ask::Features` on a link.
     pub const LINK_FEATURES: &str = "link-features";
 
-    /// Every name this build speaks, in the order it says them. [`PLACE`] joins once its runners
-    /// admit by link: until then nobody is told it.
-    pub const ALL: &[&str] = &[LINK_FEATURES];
+    /// Hints of runners' admission state for the server's offers view (lb/offers-ui): a runner
+    /// that says it sends [`super::AgentMsg::Offers`], a server that says it reads them. Said once
+    /// both sides are built (runner: lb/core; server: lb/offers-ui).
+    pub const OFFERS: &str = "offers";
+    /// News of queued and started runs to the asking agent (lb/told; it replaces the bit 58 its
+    /// branch had).
+    pub const TOLD: &str = "told";
+    /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 14).
+    pub const SIZES: &str = "reach.sizes";
+
+    /// Every name this build speaks, in the order it says them.
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1507,8 +1522,8 @@ mod tests {
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
         // and W27 its legs' signing and custody (58 to 60, 65 and 66); needs-engine its leases
         // (`Renew`, `Refused`, `Fenced` 61 to 63; `Renewed`, `Stop` 67 and 68); named features
-        // their own (64 and 69; docs/wire.md's registry).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (65, 70), "each table has every variant once");
+        // their own (64 and 69; docs/wire.md's registry); the offers hint 65.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (66, 70), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1665,6 +1680,7 @@ mod tests {
             ("Refused", AgentMsg::Refused { grant: grant.clone(), reason: String::new() }),
             ("Fenced", AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(AgentMsg::Custody { json: String::new() }) }),
             ("Features", AgentMsg::Features { names: names.clone() }),
+            ("Offers", AgentMsg::Offers { json: "{}".into() }),
         ];
         let mut last = 60u8;
         for (name, m) in agent {

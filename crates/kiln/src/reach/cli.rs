@@ -237,6 +237,12 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
                 }
                 Ev::Error(e) => anyhow::bail!("{e}"),
                 Ev::Note(line) => say(line),
+                // Placement's answer, at once and as it changes (docs/needs.md E5).
+                Ev::Placed { json } => {
+                    if let Ok(a) = serde_json::from_str::<kiln_ci::place::Answer>(&json) {
+                        say(a.words(crate::util::now_ms()));
+                    }
+                }
                 Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) | Ev::Answer(_) => {}
             }
         }

@@ -418,7 +418,9 @@ impl Carries for AgentMsg {
             | AgentMsg::Renew { .. }
             | AgentMsg::Refused { .. }
             | AgentMsg::Fenced { .. }
-            | AgentMsg::Features { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Features { .. }
+            // The offers hint's JSON is read by its view (lb/offers-ui), which keeps what it can.
+            | AgentMsg::Offers { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

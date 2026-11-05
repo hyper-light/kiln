@@ -90,6 +90,11 @@ pub enum Ev {
     /// A line about how a run went that isn't its output: whether it was reused, or recorded
     /// (`super::reuse`). Appended last: postcard encodes variants by index.
     Note(String),
+    /// Placement's answer for the run (docs/needs.md E5; JSON `kiln_ci::place::Answer`): at once
+    /// (starting, queued with its place, expected start and reasons, or never with why), then each
+    /// change as it happens, pushed, never polled. Appended last: postcard encodes variants by
+    /// index; a client from before skips it.
+    Placed { json: String },
 }
 
 static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -326,14 +331,26 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     if elsewhere {
         taken(req.target.clone()).await?;
     }
-    let choice = pick(handle, me, &req.target).await?;
-    let peer = choice.runner.name.clone();
-    let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
+    // Placed where the room is (docs/needs.md E5): this node owns the run, and the runner with room
+    // admits it. A runner named, or placement not ready, picks as before.
+    let placed = place(handle, me, &req, ev).await?;
+    let (peer, claim) = match placed {
+        Some(p) => {
+            let _ = ev.send(Ev::Picked { runner: p.runner.clone(), why: "its room was first".to_owned() }).await;
+            (p.runner, Some((p.run, p.fence)))
+        }
+        None => {
+            let choice = pick(handle, me, &req.target).await?;
+            let _ = ev.send(Ev::Picked { runner: choice.runner.name.clone(), why: choice.why.clone() }).await;
+            (choice.runner.name.clone(), None)
+        }
+    };
     let mut spec = spec_of(&req);
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, req.detach, ev, ctl).await;
+        let local = claim.map(|(run, _)| (handle.clone(), run));
+        return run_here(spec, req.detach, ev, ctl, local).await;
     }
     if !elsewhere {
         taken(peer.clone()).await?;
@@ -353,7 +370,10 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         spec.cwd = req.remote_cwd.clone();
     }
     let (says_tx, says) = async_channel::unbounded::<Say>();
-    let id = handle.run(&peer, spec, says_tx).await?;
+    let id = match &claim {
+        Some((run, fence)) => handle.place_run(&peer, run, *fence, spec, says_tx).await?,
+        None => handle.run(&peer, spec, says_tx).await?,
+    };
     // Set once the client went away: by then the run should have ended, else it is killed.
     let mut stop_by: Option<Instant> = None;
     loop {
@@ -411,9 +431,69 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     }
 }
 
+/// A run placement gave a runner: which, and its claim there.
+struct Placing {
+    runner: String,
+    run: String,
+    fence: kiln_ci::sched::Fence,
+}
+
+/// Places a run (docs/needs.md E5) when its target is what it needs (no runner named) and this
+/// node's placement is ready: its asker is told each answer as it comes, at once and on every
+/// change, until it's to start somewhere (the runner's room first), and after, as it starts and
+/// ends. `None`: placed as before (a runner named, placement not ready, or only older runners
+/// could take it).
+async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
+    use super::place::Placed;
+    let Ok(needs) = kiln_ci::sched::needs::parse(&req.target) else { return Ok(None) };
+    let run = format!("{me}-{}", crate::util::new_id());
+    let repo = req.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A person at a terminal, or an agent's turn, waits on it (docs/needs.md §7).
+    let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, ..kiln_ci::place::Ask::default() };
+    let (tx, rx) = async_channel::unbounded::<Placed>();
+    if !handle.place(ask, tx).await? {
+        return Ok(None);
+    }
+    let tell = |a: &kiln_ci::place::Answer| Ev::Placed { json: serde_json::to_string(a).unwrap_or_default() };
+    loop {
+        match rx.recv().await {
+            Ok(Placed::Answer(a)) => {
+                let _ = ev.send(tell(&a)).await;
+                if let kiln_ci::place::Answer::Never { .. } = a {
+                    anyhow::bail!("{}", a.words(crate::util::now_ms()));
+                }
+            }
+            Ok(Placed::Go { runner, fence }) => {
+                // Its claim may have lapsed meanwhile: then it waits on, at the runners probed.
+                if !handle.place_starting(&run, &runner, fence).await? {
+                    continue;
+                }
+                // What it hears after (started, ended) goes on to its asker.
+                let ev = ev.clone();
+                crate::rt::spawn(async move {
+                    while let Ok(p) = rx.recv().await {
+                        if let Placed::Answer(a) = p
+                            && ev.send(tell(&a)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                return Ok(Some(Placing { runner, run, fence }));
+            }
+            Ok(Placed::Fallback { .. }) => {
+                handle.place_cancel(&run).await;
+                return Ok(None);
+            }
+            Err(_) => anyhow::bail!("placement went away before the run started"),
+        }
+    }
+}
+
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
-/// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+/// its client, its events read to its end so that its output never makes it wait. A run placement
+/// started here (`placed`) says when it's up and when it ended, so its room is free at once.
+async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, placed: Option<(Handle, String)>) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
@@ -425,10 +505,16 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
             e = rx.recv().fuse() => match e {
                 Ok(super::serve::Event::Started { pid: p, cwd }) => {
                     pid = Some(p);
+                    if let Some((h, run)) = &placed {
+                        h.place_local(run, None).await;
+                    }
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;
                 }
                 Ok(super::serve::Event::Output { stream, data }) => { let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
                 Ok(super::serve::Event::Exit { code, error }) => {
+                    if let Some((h, run)) = &placed {
+                        h.place_local(run, Some(error.is_none())).await;
+                    }
                     let _ = ev.send(Ev::Exit { code, error, lost: 0 }).await;
                     return Ok(());
                 }
@@ -453,7 +539,10 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
     drop(stdin);
     crate::rt::spawn(async move {
         while let Ok(e) = rx.recv().await {
-            if matches!(e, super::serve::Event::Exit { .. }) {
+            if let super::serve::Event::Exit { error, .. } = e {
+                if let Some((h, run)) = &placed {
+                    h.place_local(run, Some(error.is_none())).await;
+                }
                 return;
             }
         }

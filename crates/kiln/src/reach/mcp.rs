@@ -329,6 +329,8 @@ struct Run {
     exit: Option<Value>,
     error: Option<String>,
     signal: Option<std::os::unix::net::UnixStream>,
+    /// Placement's latest answer (docs/needs.md E5): queued, its place and expected start, and why.
+    placed: Option<Value>,
 }
 
 type Cell = Arc<(Mutex<Run>, std::sync::Condvar)>;
@@ -367,6 +369,11 @@ fn follow(mut client: Client, cell: Cell) {
                     r.error = Some(e);
                     cv.notify_all();
                     return;
+                }
+                // Placement's answer, the latest kept for each read (docs/needs.md E5).
+                Ok(Some(Ev::Placed { json })) => {
+                    r.placed = serde_json::from_str(&json).ok();
+                    cv.notify_all();
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
@@ -427,6 +434,9 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
         }
         if !r.why.is_empty() && !fresh {
             o.insert("why".into(), json!(r.why));
+        }
+        if let Some(p) = &r.placed {
+            o.insert("placement".into(), p.clone());
         }
         if let Some(s) = &r.synced
             && !fresh

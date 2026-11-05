@@ -502,7 +502,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   can't be read"); the asker's next link reads the directory again, which by then has the older
   build's announce.
 - **Names.** `link-features`: the runner takes `Ask::Features`. `place`: the runner admits runs owners
-  probe it with over links (docs/needs.md E5), and an owner places by probing. A name keeps its
+  probe it with over links (docs/needs.md E5), and an owner places by probing. `offers`: a runner sends
+  its admission hint (`AgentMsg::Offers`), a server reads it (lb/offers-ui). `told`: news of queued and
+  started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 14). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
 
 ## Registry
@@ -537,6 +540,7 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 | `AgentMsg` | 62 | `Refused` | | lb/integrate (63 then) |
 | `AgentMsg` | 63 | `Fenced` | | lb/integrate (64 then) |
 | `AgentMsg` | 64 | `Features` | | lb/core (65 then) |
+| `AgentMsg` | 65 | `Offers` | | lb/core for lb/offers-ui: the admission hint, JSON, to a server that named `offers` (66 then) |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -547,9 +551,11 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Features` | reach links | lb/core |
 | `reach::wire::Ask` | 13 | `Place` | reach links | lb/core |
+| `reach::wire::Ask` | 14 | `RunWith` | reach links | lb/history: a run with its sizes from history, only where `reach.sizes` was named on the link (it had 12) |
 | `reach::wire::Say` | 0–11 | `Welcome` … `Unread` | reach links | main |
 | `reach::wire::Say` | 12 | `Features` | reach links | lb/core |
 | `reach::wire::Say` | 13 | `Place` | reach links | lb/core |
+| `reach::wire::Say` | 14 | `Used` | reach links | lb/history: what a run used, before its `Exit` (it had 12) |
 
 A line that lands takes the indexes after the last on main then, and moves its rows here in the same
 change. No released build has `AgentMsg` 61 to 64 or `ServerMsg` 67 to 69 yet, so renumbering them when
@@ -701,6 +707,7 @@ Four edges are left, and the lab steers clear of each:
 | `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
 | `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
 | `Features` | handshake | The features the runner speaks, by name (docs/wire.md, "Named features"): every name it says, superseding the last list. | New: to a server announcing `CAP_FEATURES`, once its `Caps` said so, and again when they change. |
+| `Offers` | state | What the runner's admission holds, as a hint for the offers view (docs/needs.md E5): budget, room, its line by class, quotes, its own runs waiting. Sent when a decision-relevant value changes, never per sample. | New: to a server that named `offers`. |
 
 ## Server to runner: `ServerMsg`
 

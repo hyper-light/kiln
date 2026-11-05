@@ -2349,6 +2349,9 @@ impl Hub {
             }
             // The features it speaks by name: each says them all, superseding the last.
             AgentMsg::Features { names } => self.instances.lock().set_features(peer, names),
+            // TODO(lb/offers-ui): `crate::offers::heard(self, &agent, &json)`, its one line; until it
+            // lands no server names `offers`, so no runner sends one.
+            AgentMsg::Offers { json } => tracing::debug!(%agent, bytes = json.len(), "an offers hint, with no view to take it yet"),
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.

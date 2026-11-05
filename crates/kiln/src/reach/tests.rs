@@ -65,6 +65,16 @@ async fn lab() -> anyhow::Result<Lab> {
 
 /// [`lab`], mac and linux serving their peers from these caches (docs/ci.md W24-R27).
 async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) -> anyhow::Result<Lab> {
+    lab_full(objects, false).await
+}
+
+/// [`lab`] with both runners saying they place (docs/needs.md E5): the directory lists the features
+/// each announces.
+async fn lab_placing() -> anyhow::Result<Lab> {
+    lab_full([None, None], true).await
+}
+
+async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], place: bool) -> anyhow::Result<Lab> {
     let [mac_objects, linux_objects] = objects;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
@@ -81,7 +91,8 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
     let (linux, linux_out) = node::start(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
-    let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
+    let features = if place { crate::proto::feature::all() } else { Vec::new() };
+    let directory = Arc::new(Mutex::new(vec![RunnerInfo { features: features.clone(), ..info("mac", mac.fingerprint()) }, RunnerInfo { features, ..info("linux", linux.fingerprint()) }]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
     let (ctl_tx, ctl_rx) = async_channel::unbounded::<Ctl>();
@@ -1070,5 +1081,104 @@ fn a_detached_run_on_its_own_machine_goes_on_after_its_client() -> anyhow::Resul
         std::fs::write(&go, b"")?;
         anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the detached run stopped with its client");
         Ok(())
+    })
+}
+
+
+// ------------------------------------------------------------------ placement (docs/needs.md E5)
+
+/// A machine of 8 CPUs and 16 GiB as its sampler reads it, `busy` percent of its CPUs in use.
+fn reading(busy: f32) -> crate::metrics::HostSample {
+    crate::metrics::HostSample { cpus: 8, cpu_pct: busy, mem_total: 16 << 30, mem_used: 2 << 30, disk_total: 100 << 30, disk_used: 10 << 30, ..crate::metrics::HostSample::default() }
+}
+
+/// What placement told the asker, in order, in words.
+fn answers(evs: &[Ev]) -> Vec<String> {
+    evs.iter().filter_map(|e| if let Ev::Placed { json } = e { serde_json::from_str::<kiln_ci::place::Answer>(json).ok().map(|a| a.words(0)) } else { None }).collect()
+}
+
+/// docs/needs.md E5, M3 of the balancer's core: a command asked of mac while both runners are full
+/// is answered queued at once, with its place and reasons; when linux's next reading shows room,
+/// linux's own admission offers it (a measurement, not a timer or a poll), mac's owner takes it,
+/// and it starts there, once. The asker hears each change pushed over its socket.
+#[cfg(unix)]
+#[test]
+fn e5_w05_r39_a_queued_command_starts_once_when_room_frees_without_polling() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        // Both full: 100 % of their CPUs busy with work kiln didn't place.
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        // The directory, so each knows the other places.
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo placed on $(hostname -s 2>/dev/null || echo it); echo $KILN_REACH_FROM".into(), ..RunReq::default() };
+        let linux = lab.linux.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let evs = run_from_mac(&lab, req, move |e| {
+            // Once mac's asker hears it's queued, linux measures room: nothing else is told it.
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let l = linux.clone();
+                crate::rt::spawn(async move {
+                    l.feed(In::Sampled(reading(0.0))).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let said = answers(&evs);
+        assert!(said.first().is_some_and(|a| a.starts_with("queued")), "first answered queued: {said:?} {evs:?}");
+        assert!(said.iter().any(|a| a.contains("linux")), "it started on linux, the runner with room: {said:?}");
+        let started: Vec<&Ev> = evs.iter().filter(|e| matches!(e, Ev::Started { .. })).collect();
+        assert_eq!(started.len(), 1, "started once: {evs:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        assert!(output(&evs, false).contains("mac"), "it ran on linux for mac: {}", output(&evs, false));
+        // Its room is free again on linux, and nothing waits there.
+        let v = lab.linux.place_view().await?;
+        assert_eq!(v.get("held").cloned(), Some(serde_json::json!([0, 0, 0, 0])), "{v}");
+        anyhow::Ok(())
+    })
+}
+
+/// docs/needs.md E5, M3: a run queued on a full runner waits through its owner's connection
+/// dropping and coming back, and starts when room frees: the disconnect loses nothing.
+#[cfg(unix)]
+#[test]
+fn e5_a_queued_command_waits_through_a_disconnect_and_starts_after() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo after".into(), ..RunReq::default() };
+        let (linux, ctl) = (lab.linux.clone(), lab.ctl.clone());
+        // Once: the drop and the return make answers of their own.
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, c) = (linux.clone(), ctl.clone());
+                crate::rt::spawn(async move {
+                    // mac's connection drops and comes back, then linux has room.
+                    let _ = c.send(Ctl::Drop("mac")).await;
+                    crate::rt::sleep(Duration::from_millis(300)).await;
+                    let _ = c.send(Ctl::Back("mac")).await;
+                    crate::rt::sleep(Duration::from_millis(300)).await;
+                    l.feed(In::Sampled(reading(0.0))).await;
+                });
+            }
+            None
+        })
+        .await?;
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        assert!(output(&evs, false).contains("after"), "{evs:?}");
+        anyhow::Ok(())
     })
 }
