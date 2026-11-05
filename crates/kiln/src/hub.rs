@@ -1034,6 +1034,15 @@ impl Hub {
         }
     }
 
+    /// [`Hub::emit`] of an event its caller wrote out already ([`ServerEvent::text`]), off the shards: a CI verdict's,
+    /// the whole verdict in it, written on the compute pool (goal 9, plan 01a1a87b2cec step 3). Never an agent
+    /// session's own ([`ServerEvent::Harness`], [`ServerEvent::HarnessClosed`]), which go on their lanes.
+    pub fn emit_written(&self, text: Arc<str>) {
+        if self.events.receiver_count() > 0 {
+            self.events.send(0, text);
+        }
+    }
+
     /// A listener of the hub's events ([`Hub::events`]) from now, holding as many as the hub's ring held for
     /// its slowest ([`EVENTS`]): past them it's told how many it lost. Refused when the runtime has no channel
     /// to give it (its cells all in use).
@@ -2928,14 +2937,23 @@ impl Hub {
     /// back, for the owner to take first at its next turn.
     pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
-        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed } = r;
+        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken } = r;
         // Its third leg: from the hub's loop handing it over to its owner taking it (goal 10, plan 01a1a87b2dae
         // step 4).
         if let Some(h) = handed {
             crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToOwner, began.saturating_duration_since(h));
         }
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
-        crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), began.elapsed());
+        let done = Instant::now();
+        crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
+        // Its runner's hold of it, as its runner said it, and the server's time with it, from its frame's arrival
+        // to its owner done with it: each read on one clock, its own side's (goal 10, plan 01a1a87b2dae step 5).
+        if let Some(t) = taken {
+            crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Runner, t);
+            if let Some(at) = arrived {
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Server, done.saturating_duration_since(at));
+            }
+        }
         rest
     }
 
@@ -3257,7 +3275,7 @@ impl Hub {
             }
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
-            FromRunner::Harness { session, update } => match *update {
+            FromRunner::Harness { session, update, taken } => match *update {
                 // An inbox's answer counts wherever it came from (it's for the message sent there),
                 // and says nothing of where the session runs: whoever waits for it is told, and
                 // the session's messages still go where it runs.
@@ -3280,7 +3298,7 @@ impl Hub {
                     if let Some(a) = arrival {
                         crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::InLoop, handed.saturating_duration_since(a.taken));
                     }
-                    let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session: session.clone(), update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed) };
+                    let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session: session.clone(), update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
                     self.harness.from_runner(r).await;
                     // An Open says where the session runs now, a Closed lets it go: what this loop reads
                     // of it next (the runner's next word, its inventory, a hand-over) waits for its owner
@@ -3714,7 +3732,8 @@ impl Hub {
         use crate::instances::Owned;
         let target = format!("agent:{name}");
         let terms: Vec<Owned> = self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
-        let agents: Vec<Owned> = self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)).collect();
+        // Its agent sessions by id, none of their infos copied (goal 9, plan 01a1a87b2cec step 3).
+        let agents: Vec<Owned> = self.harness.ids_on(&target).into_iter().map(Owned::Agent).collect();
         let jobs: Vec<Owned> = self.agents.load().get(name).map(|a| a.running.iter().cloned().map(Owned::Job).collect()).unwrap_or_default();
         let inst = self.instances.load();
         inst.views(name, |p| {
@@ -3738,7 +3757,9 @@ impl Hub {
             let target = format!("agent:{name}");
             let mut held: Vec<Owned> =
                 self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
-            held.extend(self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)));
+            // Its agent sessions by id, none of their infos copied: every session's whole info was, for each machine
+            // with an older process (goal 9, plan 01a1a87b2cec step 3).
+            held.extend(self.harness.ids_on(&target).into_iter().map(Owned::Agent));
             held.extend(self.agents.load().get(&name).into_iter().flat_map(|a| a.running.iter().cloned().map(Owned::Job)));
             let now = Instant::now();
             let send = self.instances.update(|inst| {

@@ -2129,8 +2129,10 @@ fn sync_machine(hub: &Hub, req: &Request) -> String {
     srv::query(req).get("machine").filter(|m| !m.is_empty()).map(|m| hub.machine_of(m)).unwrap_or_default()
 }
 
-/// Copies of kiln.db for learners are made one at a time (each reads the whole database).
-static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
+/// Copies of kiln.db for learners are made one at a time (each reads the whole database), in the order asked for:
+/// a gate with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where async-lock's semaphore waited
+/// on event-listener's `Mutex`.
+static CLUSTER_COPIES: crate::turn::Gate = crate::turn::Gate::one();
 
 /// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
 /// machine (`?machine=`), or the admin token. The copy goes once sent. kiln hands it on by its
@@ -2145,7 +2147,7 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
     }
     let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.acquire().await;
+    let _one = CLUSTER_COPIES.turn().await;
     // Copies a stop left behind.
     if let Ok(old) = std::fs::read_dir(&dir) {
         for e in old.flatten() {
@@ -2774,8 +2776,10 @@ fn otp_problem(hub: &Hub, code: &str) -> &'static str {
 }
 
 static PASSWORD_THROTTLE: std::sync::LazyLock<crate::password::Throttle> = std::sync::LazyLock::new(Default::default);
-/// One password check at a time, so the throttle cannot be outrun by parallel guesses.
-static PASSWORD_GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One password check at a time, so the throttle cannot be outrun by parallel guesses: in the order they came, with
+/// no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where async-lock's mutex waited on
+/// event-listener's `Mutex`.
+static PASSWORD_GATE: crate::turn::Gate = crate::turn::Gate::one();
 
 /// Which sign-in methods the login page should offer (public).
 async fn auth_methods(hub: &Hub) -> Response {
@@ -2802,7 +2806,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
         let (id, _, epoch) = crate::authz::passwords::sign_in(hub, name, &l.password).await.map_err(|(c, m)| err(c, m))?;
         return Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)));
     }
-    let gate = PASSWORD_GATE.lock().await;
+    let gate = PASSWORD_GATE.turn().await;
     if let Err(wait) = PASSWORD_THROTTLE.check() {
         let secs = wait.as_secs().max(1);
         let r = srv::json(
@@ -6847,9 +6851,17 @@ async fn readyz(hub: &Hub) -> Response {
         let v = o.view();
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
     }
-    match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => srv::text(StatusCode::OK, &format!("ready{note}")),
-        Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
+    // The store, from what the server knows of it (goal 6, plan 01a1a59c2abe step 3): readiness is Critical, and the
+    // `SELECT 1` it sent through kiln.db's one writer waited behind every write before it (the lab's writer line, 0.7 s
+    // at p99; a deploy rolled back on it, 2026-10-30). Ready while its writer runs and keeps up; not once its thread has
+    // stopped, or while calls wait and it has finished none for as long as kiln's longest prober waits
+    // (`crate::pool_health::WRITER_STUCK`), so no prober sees it unready where the call would have answered in time.
+    if !hub.store.writer_running() {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "store: its writer has stopped");
+    }
+    match crate::pool_health::store_writer_stuck() {
+        Some((waiting, still)) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {waiting} calls wait for its writer, which has finished none for {} s", still.as_secs())),
+        None => srv::text(StatusCode::OK, &format!("ready{note}")),
     }
 }
 

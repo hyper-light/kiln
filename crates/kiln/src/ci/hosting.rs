@@ -19,7 +19,7 @@
 //! mirror, polling and events of upstream repositories serve it too; a push wakes the poller at
 //! once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -452,10 +452,12 @@ async fn more(head: &mut Vec<u8>, body: &mut kiln_http::Incoming) -> Result<(), 
 }
 
 /// One push at a time per repository takes `refs/for/*` (the ref is the push's way in, cleared
-/// before and after).
-fn lock_of(repo: &str) -> Arc<async_lock::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = std::sync::OnceLock::new();
-    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+/// before and after), in the order they came: a gate per repository while one is under way, with no lock
+/// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where a map behind a `Mutex` handed out
+/// async-lock's mutexes.
+fn lock_of(repo: &str) -> crate::turn::Entry<'static, String, crate::turn::Gate> {
+    static LOCKS: std::sync::LazyLock<crate::turn::Keyed<String, crate::turn::Gate>> = std::sync::LazyLock::new(crate::turn::Keyed::new);
+    LOCKS.of(&repo.to_owned())
 }
 
 /// Removes `refs/for/*` left by a push that didn't finish.
@@ -507,7 +509,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         // A push's advertisement never shows a `refs/for/*` (a client would take it for a branch).
         let lock = lock_of(&repo.id);
-        let _held = lock.lock().await;
+        let _held = lock.turn().await;
         clear_for_refs(hub, &p).await;
         return super::facade::backend(&cgi, body.to_vec(), None).await;
     }
@@ -568,7 +570,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let lock = lock_of(&repo.id);
     let _held = match target {
         Some(_) => {
-            let g = lock.lock().await;
+            let g = lock.turn().await;
             clear_for_refs(hub, &p).await;
             Some(g)
         }

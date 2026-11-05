@@ -231,7 +231,8 @@ pub struct Taken {
 pub async fn take(hub: &Hub, caller: &Caller, asked: &Asked<'_>, bundle: &Value) -> Result<Taken, Fail> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await.map_err(fail)?;
-    let c = statement::verify(bundle, &hub.pki.ca_der, &revocations, at).map_err(|e| bad(format!("its signature isn't taken: {e}")))?;
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = crate::custody::verify_off(bundle, &hub.pki.ca_der, revocations, at).await.map_err(fail)?.map_err(|e| bad(format!("its signature isn't taken: {e}")))?;
     let body = verdict::read(&c.payload_type, &c.statement).map_err(|e| bad(format!("what's signed isn't a {}: {e}", asked.kind)))?;
     if !crate::identities::is_caller(hub, caller, &c.signer.identity).await {
         return Err((StatusCode::FORBIDDEN, format!("it's signed by {}, and {} gives it: a verdict or comment is signed by whoever gives it", c.custodian, caller.name)));
@@ -365,16 +366,28 @@ pub async fn holding(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<HashMa
     let revocations = crate::identities::revocations(&hub.store).await.map_err(fail)?;
     let latest_patch = verbatim(hub, &path, &latest.commit).await;
     let kept: Vec<Kept> = versions.iter().map(|v| Kept { n: v.n, commit: v.commit.clone(), patch_id: (v.n == latest.n).then(|| latest_patch.clone()).flatten() }).collect();
-    let mut out = HashMap::new();
-    for (review, bundle, at) in rows {
-        let checked = serde_json::from_str::<Value>(&bundle).map_err(|e| e.to_string()).and_then(|b| statement::verify(&b, &hub.pki.ca_der, &revocations, at).map_err(|e| e.to_string()));
-        let holds = match checked.and_then(|c| verdict::read(&c.payload_type, &c.statement)) {
-            Ok(b) => verdict::holds_on(&b.revision, &kept, latest.n),
-            Err(why) => Holds::Not(format!("its signature doesn't verify: {why}")),
-        };
-        out.insert(review, holds);
+    // Each checked on the compute pool, a verdict at a time, in their order, off the shards (goal 9, plan 01a1a87b2cec
+    // step 3): a signature and its certificate chain apiece, one after another on the shard of each page and land that
+    // asked.
+    let (pki, n) = (std::sync::Arc::clone(&hub.pki), latest.n);
+    let held = crate::rt::compute_map(rows, move |(review, bundle, at)| {
+        let holds = holds_now(&bundle, &pki.ca_der, &revocations, at, &kept, n);
+        (review, holds)
+    })
+    .await
+    .map_err(fail)?;
+    Ok(held.into_iter().collect())
+}
+
+/// Where signed verdict `bundle`, which kiln took at `at`, stands on version `latest` of its diff, `kept` its versions
+/// ([`holding`]): checked again as of then against kiln's root `root` and `revocations`, then held to that version. On
+/// the thread it's called on: a compute job's.
+fn holds_now(bundle: &str, root: &[u8], revocations: &[kiln_ci::identity::chain::Revocation], at: i64, kept: &[Kept], latest: u32) -> Holds {
+    let checked = serde_json::from_str::<Value>(bundle).map_err(|e| e.to_string()).and_then(|b| statement::verify(&b, root, revocations, at).map_err(|e| e.to_string()));
+    match checked.and_then(|c| verdict::read(&c.payload_type, &c.statement)) {
+        Ok(b) => verdict::holds_on(&b.revision, kept, latest),
+        Err(why) => Holds::Not(format!("its signature doesn't verify: {why}")),
     }
-    Ok(out)
 }
 
 #[cfg(test)]

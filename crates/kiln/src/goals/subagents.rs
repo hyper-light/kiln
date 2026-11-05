@@ -361,7 +361,7 @@ async fn paced(hub: &Hub, stack: &Stack, theirs: &Stack, child: &str, mark: &mut
 /// Goal `goal` of `agent`'s stack met by its subagent `sub` (`why`: how it was met there): met here,
 /// with its parts still to go, and what's next goes to the agent.
 async fn met_here(hub: &Hub, metrics: &crate::metrics::AgentMetrics, agent: &str, goal: &str, sub: &Info, why: Option<String>) -> anyhow::Result<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = super::get(hub, agent).await?;
     if !stack.items.iter().any(|i| i.id == goal && open(i) && i.subagent.as_deref() == Some(sub.id.as_str())) {
         return Ok(());
@@ -398,7 +398,7 @@ async fn met_here(hub: &Hub, metrics: &crate::metrics::AgentMetrics, agent: &str
 /// Goal `goal` of `agent`'s stack back from its subagent `child` unmet (`why`), with its parts: the
 /// agent takes it itself (at once, when it's free).
 async fn back(hub: &Hub, agent: &str, goal: &str, child: &str, why: &str) -> anyhow::Result<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (a, g, c, now) = (agent.to_owned(), goal.to_owned(), child.to_owned(), super::now_ms(hub));
     let reason = format!("Back from its subagent: {why}.");
     let running = hub
@@ -541,7 +541,7 @@ fn to_words(stack: &Stack, g: &Graph, u: &Item) -> String {
 /// Marks goal `goal` of `agent`'s stack, and its parts, under way on subagent `child`, if it's still
 /// the agent's to hand ([`untouched`]): whether it was.
 async fn mark_out(hub: &Hub, agent: &str, goal: &str, child: &str) -> anyhow::Result<bool> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = super::get(hub, agent).await?;
     if !stack.items.iter().find(|i| i.id == goal).is_some_and(|u| untouched(u, &stack.items)) {
         return Ok(false);

@@ -77,6 +77,8 @@ hot = [
   "crates/kiln/src/store.rs",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
+  # Turns with no lock: gates, batons, reads and writes, keyed and once (goal 5, plan 01a1a59c2aae, its top goal).
+  "crates/kiln/src/turn.rs",
   # CI (goal 5 step 2): the engine's legs, runs and kept legs, which the hub reads on its runners' job
   # messages; the caches the API's calls and the runs planned read; the modules the API's runs, legs,
   # pools and insights are read through.
@@ -106,6 +108,19 @@ hot = [
   "crates/kiln/src/terminal.rs",
   "crates/kiln/src/os/pty_unix.rs",
   "crates/kiln/src/os/pty_windows.rs",
+]
+
+# What waits on event-listener (goal 5 of the API runtime program, plan 01a1a59c2aae, its top goal): its list of
+# listeners sits behind a std Mutex every wait, every wait given up and every wake with a listener takes, and the
+# census of train 8's tree found it the one lock the shards still shared (1.8 ms a second waited with hogs, 2.4 ms
+# at the longest; docs/runtime-lab.md). async-lock's locks, semaphores and cells wait on it, and so do the Events
+# kiln held itself. None is named in these folders' code, outside a test build's, but those `waiting` lists, each
+# with why; `crate::turn` (a gate, a baton, a read-write, keyed, once) and `crate::rt::Changed` wait with no lock.
+# Async-channels still on the shards wait on it too: the census counts them (scripts/locks/deps.toml).
+waits = [
+  "crates/kiln/src",
+  "crates/kiln-http/src",
+  "crates/kiln-rt/src",
 ]
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.
@@ -161,11 +176,6 @@ name = "closed"
 why = "an outgoing HTTP/2 connection's: kiln as a client, no request or runner path of the server's"
 
 # Signing in: once per sign-in, not per request.
-
-[[allowed]]
-at = "crates/kiln/src/api.rs"
-name = "PASSWORD_GATE"
-why = "a password sign-in's hashing, one at a time (argon2 takes a CPU's worth of memory): taken as a person signs in with a password, never by another route"
 
 [[allowed]]
 at = "crates/kiln/src/authz/passkeys.rs"
@@ -284,3 +294,11 @@ why = "W27-R08's custody of the cluster group (docs/ci.md, step 12, path f), in 
 at = "crates/kiln/src/store/learner.rs"
 name = "changes_after"
 why = "a test build's fault (entry_changed) only, taken when the chaos config sets it; nothing in a release takes it"
+
+# Waits on event-listener still in kiln's code (`waits`, above).
+
+[[waiting]]
+at = "crates/kiln/src/reach/node.rs"
+name = "room"
+why = "a reach run's room: the task forwarding the run's events into its node waits while the run's asker holds BUFFER bytes of its output unread, and the node's loop notifies it as they're read or the run goes; on a runner's shards, one forwarder a run"
+todo = "reach's side of the runner path is the g5-runner-side item's (goal 5, plan 01a1a59c2aae, its top goal): crate::rt::Changed, as crate::convo::store's room"

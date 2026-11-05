@@ -1066,7 +1066,7 @@ async fn ready(hub: &Arc<Hub>, d: &Diff) -> bool {
 async fn waiting(hub: &Arc<Hub>) {
     let ids: Vec<String> = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT diff_id FROM land_when_ready ORDER BY enabled_at")?;
             let rows = st.query_map([], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)

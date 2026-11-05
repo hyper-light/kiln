@@ -144,7 +144,9 @@ enum Job {
 pub struct TursoRecords {
     jobs: crate::memory::queue::Sender<Job>,
     seen: Arc<Mutex<Seen>>,
-    changed: Arc<event_listener::Event>,
+    /// Told by the store's thread as what it serves changes (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae,
+    /// its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: Arc<crate::rt::Changed>,
     stats: Arc<Stats>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -162,7 +164,7 @@ impl TursoRecords {
         let seen = Arc::new(Mutex::new(Seen::default()));
         db.publish(&seen);
         let (jobs, rx) = crate::memory::queue::bounded(&crate::memory::owners::RECORDS_QUEUE, QUEUE_BYTES);
-        let changed = Arc::new(event_listener::Event::new());
+        let changed = Arc::new(crate::rt::Changed::new());
         let stats = Arc::new(Stats::default());
         let (s, c, st) = (Arc::clone(&seen), Arc::clone(&changed), Arc::clone(&stats));
         let thread = std::thread::Builder::new().name("kiln-records".into()).spawn(move || {
@@ -275,7 +277,7 @@ impl Records for TursoRecords {
 
 /// The thread's work: what's given, a batch at a time, until the store is dropped. Commits that
 /// came together are written together; the reads that came with them are answered after.
-fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Seen>, changed: &event_listener::Event, stats: &Stats) {
+fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Seen>, changed: &crate::rt::Changed, stats: &Stats) {
     let why = loop {
         // A compaction under way goes on a step at a time whenever nothing waits.
         let first = if db.compacting.is_some() {
@@ -325,7 +327,7 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
             for (reply, answer) in replies.into_iter().zip(answers) {
                 let _ = reply.send(answer);
             }
-            changed.notify(usize::MAX);
+            changed.notify();
         }
         for j in rest {
             match j {
@@ -350,7 +352,7 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
                         }
                     }
                     db.publish(seen);
-                    changed.notify(usize::MAX);
+                    changed.notify();
                     let _ = reply.send(());
                 }
                 #[cfg(test)]
@@ -364,11 +366,11 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
             db.start_compaction(db.head.saturating_sub(db.limits.keep));
             db.publish(seen);
             // Waits from before the new horizon are refused now, not left waiting.
-            changed.notify(usize::MAX);
+            changed.notify();
         }
     };
     seen.lock().stopped = Some(why);
-    changed.notify(usize::MAX);
+    changed.notify();
 }
 
 /// About how many bytes `job` writes.

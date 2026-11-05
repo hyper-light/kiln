@@ -616,16 +616,50 @@ impl Info {
 pub enum Sink {
     Bounded(crate::memory::queue::Sender<(String, Update)>),
     Channel(async_channel::Sender<(String, Update)>),
+    /// A runner's: each update with when it was handed on ([`Taken`]; goal 10, plan 01a1a87b2dae step 5).
+    Stamped(crate::memory::queue::Sender<Taken>),
+}
+
+/// An update of session `session` on a runner's way to the server, with when its session handed it on: when
+/// the runner took it in, which its frame says how long before it was made (`crate::wire::stamp`; goal 10, plan
+/// 01a1a87b2dae step 5). What waits between (a tee's store, the runner's loop) is the runner's.
+#[derive(Debug)]
+pub struct Taken {
+    pub session: String,
+    pub update: Update,
+    pub at: std::time::Instant,
 }
 
 impl Sink {
     /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
-    /// updates any more.
+    /// updates any more. A runner's sink notes when ([`Sink::Stamped`]).
     pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
         match self {
             Sink::Bounded(q) => q.send(update).await,
             Sink::Channel(c) => c.send(update).await,
+            Sink::Stamped(q) => {
+                let (session, update) = update;
+                q.send(Taken { session, update, at: std::time::Instant::now() }).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
+            }
         }
+    }
+
+    /// Hands on an update taken in before (a tee passing a runner's updates on): when it was taken in goes with
+    /// it where this sink keeps that ([`Sink::Stamped`]), never noted again here.
+    pub async fn send_taken(&self, t: Taken) -> Result<(), async_channel::SendError<Taken>> {
+        let Taken { session, update, at } = t;
+        let back = |(session, update): (String, Update)| async_channel::SendError(Taken { session, update, at });
+        match self {
+            Sink::Stamped(q) => q.send(Taken { session, update, at }).await,
+            Sink::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
+            Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
+        }
+    }
+}
+
+impl From<crate::memory::queue::Sender<Taken>> for Sink {
+    fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
+        Sink::Stamped(q)
     }
 }
 
@@ -2561,7 +2595,8 @@ async fn their_tips(to: &str, there: &str) -> Option<Vec<String>> {
         timeout_ms: Some(30_000),
         ..RunSpec::default()
     };
-    let (tx, rx) = async_channel::unbounded();
+    // What the run says, on a lock-free queue (`reach::node::Says`; goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     reach.run(to, spec, tx).await.ok()?;
     let mut out = Vec::new();
     let until = Instant::now() + Duration::from_secs(40);
