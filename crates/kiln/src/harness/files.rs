@@ -559,13 +559,12 @@ pub fn mentioned(text: &str) -> Vec<String> {
             add(p);
         }
     }
-    // Paths among the words.
+    // Paths among the words: a word of a kind people show (most have no dot, which ends that at once) that's no
+    // link or address. The same words as when links and addresses were looked for first in every word (goal 9,
+    // plan 01a1a87b2cec step 5: two searches a word of every event's text, on its copy's shard).
     for word in text.split(char::is_whitespace) {
         let w = word.trim_start_matches(['(', '[', '{', '"', '\'', '<', '*', '_', '`']).trim_end_matches([')', ']', '}', '"', '\'', '>', ',', '.', ';', ':', '!', '?', '*', '_', '`']);
-        if w.contains("](") || w.contains("://") {
-            continue;
-        }
-        if shown_kind(w) && let Some(p) = bare_path(w) {
+        if shown_kind(w) && !w.contains("](") && !w.contains("://") && let Some(p) = bare_path(w) {
             add(p);
         }
     }
