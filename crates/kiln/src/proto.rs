@@ -1708,10 +1708,11 @@ mod tests {
         let links: [(&str, &str, u8, Vec<u8>); 6] = [
             ("Ask", "Features", 12, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
             ("Ask", "Place", 13, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
-            ("Ask", "RunWith", 14, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
             ("Say", "Features", 12, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
             ("Say", "Place", 13, postcard::to_allocvec(&Say::Place { json: String::new() })?),
-            ("Say", "Used", 14, postcard::to_allocvec(&Say::Used { id: 1, used: String::new() })?),
+            // lb/history's, after Place: a run with its sizes, and what a run used.
+            ("Ask", "RunWith", 14, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
+            ("Say", "Used", 14, postcard::to_allocvec(&Say::Used { id: 0, used: String::new() })?),
         ];
         for (side, name, idx, b) in links {
             assert_eq!(b.first(), Some(&idx), "{side}::{name}");
