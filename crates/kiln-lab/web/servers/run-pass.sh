@@ -39,6 +39,13 @@ part() { # one line: name [after=part] run's arguments
     local deps=${1#after=}; shift
     for dep in ${deps//,/ }; do until [ -f $OUT/$dep/done ]; do sleep 60; done; done
   fi
+  # On a shared machine (KILN_LAB_MIN_AVAIL_GB), no part starts while less memory than that is
+  # available: it waits, and says so once.
+  local said=0
+  while [ -n "${KILN_LAB_MIN_AVAIL_GB:-}" ] && [ $(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo) -lt $KILN_LAB_MIN_AVAIL_GB ]; do
+    [ $said = 0 ] && echo "$(date -u +%FT%TZ) $name: waits for ${KILN_LAB_MIN_AVAIL_GB} GB available" && said=1
+    sleep 60
+  done
   local args="$*"
   if [[ $args == *'$H3'* ]]; then local c; c=$(h3); args=${args//'$H3'/$c}; echo "$(date -u +%FT%TZ) $name: h2o's QUIC controller $c"; fi
   mkdir -p $out
