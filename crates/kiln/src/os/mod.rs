@@ -82,6 +82,15 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// This binary's own pages in resident memory, taken out once they're done with: [`crate::resident`]'s
+/// implementation (Linux; elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
+#[cfg(target_os = "linux")]
+#[path = "pages_linux.rs"]
+pub mod pages;
+#[cfg(not(target_os = "linux"))]
+#[path = "pages_none.rs"]
+pub mod pages;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";
