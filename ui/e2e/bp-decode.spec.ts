@@ -13,6 +13,9 @@ test("decode cost per frame, protocol against JSON.parse", async ({ page, browse
   await page.goto("about:blank");
   await page.addScriptTag({ content: bundle.outputFiles[0]!.text });
   const rows = await page.evaluate(([f]) => (globalThis as unknown as { bpb: { bench: (f: unknown) => { seq: string; frames: number; bp: number[]; json: number[] }[] } }).bpb.bench(f), [m.frames]);
-  for (const r of rows) console.log(`decode ${info.project.name} ${browserName} | ${r.seq} | ${r.frames} | bp ${r.bp.map((x) => x.toFixed(2)).join(" / ")} µs | JSON.parse ${r.json.map((x) => x.toFixed(2)).join(" / ")} µs`);
+  for (const r of rows)
+    console.log(
+      `decode ${info.project.name} ${browserName} | ${r.seq} | ${r.frames} | bp ${r.bp.map((x) => x.toFixed(2)).join(" / ")} µs | JSON.parse ${r.json.map((x) => x.toFixed(2)).join(" / ")} µs`,
+    );
   expect(rows.length).toBeGreaterThan(2);
 });

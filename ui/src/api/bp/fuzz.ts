@@ -7,11 +7,11 @@ import { arbFrame, KIND_INDEX, VERSION } from "./gen";
 import { encodeFrame, Frames, decodeBody } from "./frames";
 import { fnv64, Gen, Writer } from "./runtime";
 
-export type Made = "random" | "valid" | "truncated" | "extended" | "flipped";
-const MADE: Made[] = ["random", "valid", "truncated", "extended", "flipped"];
+export type InputMade = "random" | "valid" | "truncated" | "extended" | "flipped";
+const MADE: InputMade[] = ["random", "valid", "truncated", "extended", "flipped"];
 
 /** Input `i` of the run seeded `seed`. */
-export function input(seed: bigint, i: number): { made: Made; msg: Uint8Array } {
+export function input(seed: bigint, i: number): { made: InputMade; msg: Uint8Array } {
   const g = Gen.forInput(seed, i);
   const made = MADE[Math.min(g.below(5), 4)]!;
   if (made === "random") {

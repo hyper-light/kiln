@@ -182,10 +182,10 @@ fn trace(seed: u32, blackhole: bool, page: Page) -> Outcome {
         if page == Page::Hidden {
             t = (t + 59_999) / 60_000 * 60_000;
         }
-        if !running(t) {
-            if let Some(to) = frozen_to {
-                t = to;
-            }
+        if !running(t)
+            && let Some(to) = frozen_to
+        {
+            t = to;
         }
         t
     };
@@ -278,10 +278,10 @@ fn trace(seed: u32, blackhole: bool, page: Page) -> Outcome {
                 let mut got = false;
                 let mut answered = None;
                 while let Some(d) = held.remove(&delivered) {
-                    if let Some(a) = s.pkts.get(d).and_then(|p| p.answers) {
-                        if a == probe_n {
-                            answered = Some(a);
-                        }
+                    if let Some(a) = s.pkts.get(d).and_then(|p| p.answers)
+                        && a == probe_n
+                    {
+                        answered = Some(a);
                     }
                     delivered += 1;
                     got = true;

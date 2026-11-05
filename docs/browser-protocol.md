@@ -490,6 +490,108 @@ included, before the carrier's own bytes. Step 10 measures them all on recorded 
 | A resume after a reconnect | every key fetched again (`resync`, `onReopen`) | the missed changes + ≤ 64 B | `Subscribe` with its cursor, `Resumed`, the changes since, `Ready`; no snapshot while the log holds them |
 | An idle link | nothing (a dead link goes unseen for minutes) | 3 B per idle period each way | `Idle` |
 
+## Measured (offline, no carrier)
+
+Five sequences built from kiln's real types (goal 1 recorded operations' sizes, not event
+traces, so these are made from `store::Run`, `store::Job`, `hub::AgentLive`, a session's
+`SessionFrame`s and a build's log lines): each through the protocol and as today's endpoints send
+it. Bytes are above the carrier (no WebSocket, TLS or TCP bytes on either side), per operation as
+it happens on a quiet link, and deterministic (`bp_g2_s10_measure` asserts a second run gives the
+same counts). `cargo test -p kiln --lib bp::measure -- --nocapture` (2026-11-05, bp-g2 on
+adacachy).
+
+| Sequence (operations) | Form | p50 B | p99 B | p99.9 B | total B |
+|---|---|---|---|---|---|
+| a leg's life (15) | protocol | 23 | 325 | 325 | 679 |
+| | protocol, compressed | 21 | 185 | 185 | 582 |
+| | today, JSON | 991 | 1,023 | 1,023 | 13,663 |
+| | today, gzip each | 317 | 325 | 325 | 4,547 |
+| | today, kept deflate | 35 | 229 | 229 | 897 |
+| | protocol on a busy link (merged, packed, compressed) | | | | 305 |
+| a busy runners page (1,200) | protocol | 61 | 204 | 204 | 75,756 |
+| | protocol, compressed | 43 | 77 | 83 | 53,180 |
+| | today, JSON | 577 | 577 | 577 | 692,400 |
+| | today, gzip each | 356 | 359 | 359 | 427,336 |
+| | today, kept deflate | 35 | 42 | 47 | 42,314 |
+| | protocol on a busy link | | | | 1,691 |
+| an agent session streaming (303) | protocol | 10 | 15 | 92 | 2,996 |
+| | protocol, compressed | 13 | 25 | 107 | 4,185 |
+| | today, JSON | 58 | 61 | 114 | 17,447 |
+| | today, gzip each | 81 | 84 | 117 | 24,396 |
+| | today, kept deflate | 24 | 43 | 98 | 7,538 |
+| | protocol on a busy link | | | | 260 |
+| a log flood (2,000) | protocol | 91 | 92 | 92 | 182,464 |
+| | protocol, compressed | 31 | 35 | 39 | 63,128 |
+| | today, JSON (raw lines) | 87 | 88 | 88 | 174,460 |
+| | today, gzip each | 103 | 103 | 104 | 205,005 |
+| | today, kept deflate | 26 | 29 | 31 | 52,693 |
+| | protocol on a busy link | | | | 10,543 |
+| a reconnect (40 changes missed) | protocol: resume from the cursors | | | | 1,337 |
+| | today: every key fetched again (goal 1's recorded bodies) | | | | 9,206 |
+
+Server CPU per operation, release, publish and fan out to N subscribers with every frame made,
+against today's work for the same event (its JSON made once and parsed per socket, as the events
+socket's `Narrow` does): `cargo test -p kiln-bp --release --test bench -- --nocapture`, µs at
+p50 / p99 / p99.9.
+
+| Sequence | N | protocol | today |
+|---|---|---|---|
+| a leg's life | 1 | 0.78 / 9.40 / 9.40 | 5.69 / 8.90 / 8.90 |
+| | 10 | 3.51 / 39.16 / 39.16 | 33.66 / 39.09 / 39.09 |
+| | 100 | 31.96 / 402.54 / 402.54 | 312.90 / 317.19 / 317.19 |
+| a busy runners page | 1 | 1.44 / 3.51 / 4.37 | 2.81 / 4.22 / 7.19 |
+| | 10 | 8.69 / 15.11 / 19.67 | 16.75 / 19.50 / 23.98 |
+| | 100 | 77.54 / 142.73 / 195.22 | 159.67 / 181.73 / 188.35 |
+| an agent session streaming | 1 | 0.53 / 1.39 / 2.05 | 0.45 / 0.76 / 1.62 |
+| | 10 | 2.26 / 3.38 / 4.84 | 2.80 / 3.40 / 4.51 |
+| | 100 | 18.79 / 24.03 / 39.45 | 18.80 / 26.70 / 29.72 |
+| a log flood | 1 | 0.46 / 0.80 / 1.63 | 0.09 / 0.23 / 0.26 |
+| | 10 | 2.62 / 3.22 / 4.01 | 0.15 / 0.18 / 0.21 |
+| | 100 | 24.57 / 41.08 / 43.06 | 1.11 / 1.95 / 2.10 |
+
+Compression by class (step 8), the same sequences: compression saves 13% of a leg's life and 30% of
+a runners page (records), 65% of a log flood (text), and costs 40% on a streaming session, whose
+frames are tokens too short for deflate's sync flush to pay. A trained dictionary (the first half
+of each sequence's frames, primed into the context) would save a further 0 to 13% on the second
+half (leg 141 → 122 B, runners 3,809 → 3,638, session 870 → 800, log 2,932 → 2,639); the browser's
+DecompressionStream takes no dictionary, so it isn't shipped (Discord found the same, f22).
+
+Where the protocol is not at 1/10 or better of the best JSON form (goal 10 makes the bar's call):
+- **A leg's life, per operation:** 23 B against kept deflate's 35 B at p50; the whole leg 679 B
+  against 897. A kept deflate context already strips the repetition the delta strips; the 1/10 is
+  against today's API as it is (13,663 B, no compression), not against a tuned baseline. On a busy
+  link, merged and packed, the leg is 305 B (1/3 of kept deflate).
+- **A busy runners page:** 43 B compressed against kept deflate's 35 B per sample: samples change
+  in many fields at once, so the delta isn't small; packed on a busy link the minute is 1,691 B
+  (1/25 of kept deflate's 42,314), because waiting samples merge to the newest.
+- **A session streaming:** 10 B a token against kept deflate's 24 B (1/2.4); joined while the link
+  is busy, 260 B for the turn (1/29).
+- **A log flood:** the text itself dominates; compressed 31 B a line against kept deflate's 26 B
+  (the protocol's frame per append and its separate contexts per class cost a few bytes). Packed on
+  a busy link, appends join and the flood is 10,543 B (1/5).
+- **Server CPU:** at 1 to 10 subscribers the protocol is as fast as or faster than today's
+  per-socket parse, but on the log flood today's path (raw bytes, no parse) is cheaper: the
+  protocol makes each subscriber's frame (sub id, revision, aliases, tails) per connection. At
+  100 subscribers of a leg's life the p99 is 403 µs against 317. Sharing the encoded delta across
+  subscribers (only the sub id differs) is the next thing to measure.
+- Browser decode timings (`ui/e2e/bp-decode.spec.ts`, Chromium and WebKit) are below.
+
+The browser's decode cost per frame against `JSON.parse` of today's frame for the same operation,
+over each sequence's first 200 operations, 200 repetitions each (`npx playwright test -c
+playwright.bp.config.ts bp-decode`, adacachy, Chromium 1248 and WebKit 2370), µs at p50 / p99 /
+p99.9. The browsers' clocks are coarse (WebKit's to 5 µs over the 200 repetitions), so these say
+the two are within a few microseconds of each other at every percentile, not which is faster:
+
+| Sequence | Chromium: protocol | Chromium: JSON.parse | WebKit: protocol | WebKit: JSON.parse | WebKit, phone: protocol | WebKit, phone: JSON.parse |
+|---|---|---|---|---|---|---|
+| a leg's life | 0.5 / 9.0 / 9.0 | 1.0 / 1.5 / 1.5 | 0 / 5 / 5 | 0 / 5 / 5 | 0 / 10 / 10 | 0 / 5 / 5 |
+| a busy runners page | 0.5 / 1.5 / 1.5 | 1.0 / 1.5 / 5.5 | 0 / 5 / 5 | 0 / 5 / 5 | 0 / 5 / 15 | 0 / 5 / 5 |
+| an agent session streaming | 0 / 0.5 / 0.5 | 0 / 0.5 / 0.5 | 0 / 5 / 5 | 0 / 0 / 5 | 0 / 5 / 5 | 0 / 5 / 5 |
+| a log flood | 0.5 / 1.0 / 1.0 | 0 / 0 / 0 | 0 / 5 / 5 | 0 / 0 / 5 | 0 / 5 / 5 | 0 / 0 / 5 |
+
+So TypeScript decoding costs nothing a page would notice, and WASM isn't called for (Ada's call
+stays at its default).
+
 ## Where it lives and how it's held
 
 | Part | Where |
