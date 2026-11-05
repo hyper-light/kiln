@@ -634,8 +634,11 @@ thread_local! {
 /// The route waits goal 1 counts (`crate::route_latency`) are no signal here: they run from a request's head read
 /// off its socket, which its connection's task reads at Critical (`Connection`) and serves at once, so they do not
 /// carry the waits a class makes.
-pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>) {
-    let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else {
+///
+/// `counters`: the shard's counts as the probe's wake read them, the copy it noted (goal 9, plan 01a1a87b2cec step 5:
+/// the tick read a copy of its own); none off a shard.
+pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>, counters: Option<&hyper_rt::shard_loop::Counters>) {
+    let (Some(state), Some(&now)) = (shards().get(index), counters) else {
         return;
     };
     let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);

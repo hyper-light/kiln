@@ -414,6 +414,9 @@ pub struct Feed {
     shared: Arc<Shared>,
     /// The generation whose topic it made: what it publishes to while that generation lasts.
     made: Option<u32>,
+    /// That generation's topic, named once as it was made (goal 9, plan 01a1a87b2cec step 5: each frame named it
+    /// again, a string made and let go for every publish).
+    made_topic: String,
     /// A frame was refused: the next publish goes after [`RESYNC`]. Set too while the topic
     /// couldn't be made (it's asked again at the next publish).
     broken: bool,
@@ -435,7 +438,7 @@ impl Feed {
             ended: AtomicBool::new(false),
             deleted: AtomicBool::new(false),
         };
-        Self { shared: Arc::new(shared), made: None, broken: false, kept: Kept::default() }
+        Self { shared: Arc::new(shared), made: None, made_topic: String::new(), broken: false, kept: Kept::default() }
     }
 
     /// What its readers hold of it: viewers join through it.
@@ -540,31 +543,37 @@ impl Feed {
                 return Published::Refused;
             }
             self.made = Some(generation);
+            self.made_topic = self.shared.topic(generation);
             // A topic of its own: none of the last one's frames.
             self.kept = Kept::new(retain());
         }
-        let topic = self.shared.topic(generation);
         let m = crate::metrics::bus();
         if self.broken {
             let resync = encode(&Frame::resync());
             let n = resync.len();
-            match at_once(self.shared.bus.publish(&topic, None, resync)) {
+            match at_once(self.shared.bus.publish(&self.made_topic, None, resync)) {
                 Ok(_) => {
                     self.broken = false;
                     m.published.inc();
                     self.kept_frame(n);
                 }
-                Err(e) => return self.refused(&topic, &e),
+                Err(e) => {
+                    let topic = self.made_topic.clone();
+                    return self.refused(&topic, &e);
+                }
             }
         }
         let n = payload.len();
-        match at_once(self.shared.bus.publish(&topic, None, payload)) {
+        match at_once(self.shared.bus.publish(&self.made_topic, None, payload)) {
             Ok(_) => {
                 m.published.inc();
                 self.kept_frame(n);
                 Published::Sent
             }
-            Err(e) => self.refused(&topic, &e),
+            Err(e) => {
+                let topic = self.made_topic.clone();
+                self.refused(&topic, &e)
+            }
         }
     }
 
