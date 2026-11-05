@@ -653,6 +653,16 @@ impl Events {
         *self = Self::of(all);
     }
 
+    /// These with `ev` in at `i` ([`Events::insert`]), and their index (`Mirror::reindex`'s), made apart from them: on
+    /// the blocking pool, where every chunk is read again, a compact one inflated and each of its events parsed, as the
+    /// one that takes the place of each is made (goal 9, plan 01a1a87b2cec step 3: [`Shard::want_insert`]).
+    pub(super) fn inserted(&self, i: usize, ev: Ev) -> (Events, HashMap<Arc<str>, usize>) {
+        let mut made = self.clone();
+        made.insert(i, ev);
+        let index = made.metas().enumerate().filter(|(_, m)| !m.id.is_empty()).map(|(i, m)| (Arc::clone(&m.id), i)).collect();
+        (made, index)
+    }
+
     /// Lets go of the first `n` (a long session's oldest, every thousand events or so): their ids,
     /// and the chunk made again of what's left of the one the cut fell in, when that one sealed. The
     /// chunks past it stay as they were, packed.
@@ -1652,6 +1662,24 @@ impl Mirror {
         self.events.chunks.get(c).filter(|c| c.is_compact()).cloned()
     }
 
+    /// Where taking event `id` numbered `seq` would put it in among the copy's events (`upsert`: one it has under
+    /// neither that id nor that number, numbered before its newest), if it would: a place every event after which
+    /// moves along, each chunk made again ([`Events::insert`]).
+    pub(super) fn insert_at(&self, id: &str, seq: u64) -> Option<usize> {
+        if self.index.get(id).is_some_and(|at| *at < self.events.len()) {
+            return None;
+        }
+        let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+        if seq > top {
+            return None;
+        }
+        let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
+        if self.events.meta(at).is_some_and(|m| m.seq == Some(seq)) {
+            return None;
+        }
+        Some(at)
+    }
+
     /// Lets go of every event.
     pub fn clear_events(&mut self) {
         self.events.clear();
@@ -1778,6 +1806,13 @@ pub struct Shard {
     /// The chunk last read back so (or tried): one that's still compact as an update comes back to it is changed where it
     /// is, as before, so an update always goes on.
     thawed: Weak<Chunk>,
+    /// An event an update takes in under an older number than a session's copy's newest, with where it goes and the
+    /// copy's number then: the copy's events are made again with it in, off the shard, before the update goes on
+    /// ([`Shard::want_insert`]; goal 9, plan 01a1a87b2cec step 3).
+    insert: Option<(String, usize, super::model::Event, u64)>,
+    /// The session and event last put in so (or tried): one still to be put in as an update comes back to it is put in
+    /// where it is, as before, so an update always goes on.
+    inserted: Option<(String, String)>,
 }
 
 impl Shard {
@@ -1803,6 +1838,32 @@ impl Shard {
     fn take_thawed(&mut self, id: &str, was: &Arc<Chunk>, made: Chunk) -> bool {
         self.thawed = Arc::downgrade(was);
         self.mirrors.get_mut(id).is_some_and(|m| m.events.swap_chunk(was, made))
+    }
+
+    /// Session `id`'s update stopped before event `e`, which goes in at `at` among its copy's events, numbered before its
+    /// newest (`Registry::apply`): its owner makes the copy's events again with it in, on the blocking pool, before it
+    /// takes the rest ([`own`]), where they were made again on this shard, every chunk read again (goal 9, plan
+    /// 01a1a87b2cec step 3). `rev`: the copy's number as it's put in.
+    pub(super) fn want_insert(&mut self, id: &str, at: usize, e: super::model::Event, rev: u64) {
+        self.insert = Some((id.to_owned(), at, e, rev));
+    }
+
+    /// The event of session `id` last put in off the shard ([`Shard::want_insert`]), or tried: one still to be put in as
+    /// an update comes back to it is put in where it is.
+    pub(super) fn tried_insert(&self, id: &str) -> Option<String> {
+        self.inserted.as_ref().filter(|(s, _)| s == id).map(|(_, e)| e.clone())
+    }
+
+    /// Session `id`'s copy's events made again with an event put in (`made`, from `was`, and their index): taken where
+    /// its events are still `was`'s. Whether they were.
+    fn take_inserted(&mut self, id: &str, was: &Events, made: Events, index: HashMap<Arc<str>, usize>) -> bool {
+        let Some(m) = self.mirrors.get_mut(id) else { return false };
+        if !Arc::ptr_eq(&m.events.chunks, &was.chunks) || m.events.len != was.len {
+            return false;
+        }
+        m.events = made;
+        m.index = index;
+        true
     }
 
     pub fn get(&self, id: &str) -> Option<&Mirror> {
@@ -2108,7 +2169,7 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new() };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
@@ -2354,6 +2415,21 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 Err(e) => {
                     tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's packed events couldn't be read back off its shard: changed where they are");
                     shard.thawed = Arc::downgrade(&chunk);
+                }
+            }
+        }
+        // An event under an older number than the copy's newest: the copy's events made again with it in on the blocking
+        // pool, the shard given up meanwhile, before the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3).
+        // Its update, taken then, finds it in and changes it where it is.
+        if let Some((id, at, e, rev)) = shard.insert.take() {
+            shard.inserted = Some((id.clone(), e.id.clone()));
+            if let Some(was) = shard.get(&id).map(|m| m.events.clone()) {
+                let from = was.clone();
+                match crate::rt::blocking(move || from.inserted(at, Ev { entry: Arc::new(Entry::of_event(&e, None)), at: rev })).await {
+                    Ok((made, index)) => {
+                        shard.take_inserted(&id, &was, made, index);
+                    }
+                    Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's events couldn't be made again off its shard: the event goes in where they are"),
                 }
             }
         }
@@ -3453,7 +3529,8 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 3: an update that changes an event of a long copy's compact chunk, taken by its owner,
     /// reads nothing back on the owner's shard: the chunk is read back on the blocking pool first, the shard given up
-    /// meanwhile, and the event then changes where it is, as it did, the rest of the copy as it was.
+    /// meanwhile (the owner marks the chunk it read back so), and the event then changes where it is, as it did, the rest
+    /// of the copy as it was. (A count of inflations on the owner's thread would count other tests' on that shard too.)
     #[test]
     fn g9_s3_a_change_to_an_old_event_reads_its_chunk_back_off_the_owners_shard() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
@@ -3464,10 +3541,61 @@ mod tests {
             let id = "old".to_owned();
             let n = u64::try_from(CHUNK * 3 + 9)?;
             let i = id.clone();
-            let compact = copies
+            let first = copies
                 .on(&id, move |s| {
                     let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
                     for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.events.chunks().first().filter(|c| c.is_compact()).cloned()
+                })
+                .await
+                .flatten();
+            let Some(first) = first else { anyhow::bail!("its first chunk compact") };
+            // e5, in the first chunk, said again in other words.
+            let said = Event { id: "e5".into(), seq: 5, at: 1, parent: None, by: None, body: Body::Assistant { text: "said again".into(), streaming: false } };
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new() }))).await, "sent");
+            copies.settled().await;
+            let (i, was) = (id.clone(), Arc::clone(&first));
+            let read_back = copies.on(&id, move |s| (s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was)), s.get(&i).and_then(|m| m.events.chunks().first().map(|c| !Arc::ptr_eq(c, &was) && !c.is_compact())))).await;
+            anyhow::ensure!(read_back == Some((true, Some(true))), "its chunk read back by its owner off the shard, and in its place: {read_back:?}");
+            let i = id.clone();
+            let now = copies
+                .on(&id, move |s| s.get(&i).map(|m| (m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.get(5).map(|e| e.entry.text().to_owned()))))
+                .await
+                .flatten();
+            let Some((len, Some(changed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
+            anyhow::ensure!(len == CHUNK * 3 + 9 && changed.contains("said again") && next == entry("e6", 6).text(), "{len} {changed} {next}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an event taken under an older number than a long copy's newest, one it doesn't
+    /// have (a runner that started again sends it), goes in where its number says with nothing read again on its owner's
+    /// shard: the copy's events are made again with it in on the blocking pool, the shard given up meanwhile (the owner
+    /// marks the event it put in so), and its update goes on from there. Every chunk was read again on the owner's
+    /// shard, a compact one inflated, each event parsed.
+    #[test]
+    fn g9_s3_an_event_under_an_older_number_goes_in_off_the_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "older".to_owned();
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            let i = id.clone();
+            // Every event but the fifth, its first chunks compact.
+            let compact = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in (1..=n).filter(|q| *q != 5) {
                         m.rev = q;
                         m.upsert(entry(&format!("e{q}"), q));
                     }
@@ -3480,20 +3608,31 @@ mod tests {
                 })
                 .await;
             anyhow::ensure!(compact == Some(true), "its first chunk compact");
-            let before = copies.on(&id, |_| inflated()).await;
-            // e5, in the first chunk, said again in other words.
-            let said = Event { id: "e5".into(), seq: 5, at: 1, parent: None, by: None, body: Body::Assistant { text: "said again".into(), streaming: false } };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new() }))).await, "sent");
+            // The fifth, and the newest after it, in one update.
+            let event = |q: u64, text: &str| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
+            let update = Update::Events { events: vec![event(5, "the fifth, late"), event(n + 1, "the newest")] };
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: update, shipped: true, reported: String::new() }))).await, "sent");
             copies.settled().await;
-            let after = copies.on(&id, |_| inflated()).await;
-            anyhow::ensure!(before.is_some() && after == before, "read back on the owner's shard: {before:?} then {after:?}");
+            // Put in by its owner off the shard, as it marks it. (A count of inflations on the owner's thread would count
+            // other tests' on that shard too.)
+            let i = id.clone();
+            let put_in = copies.on(&id, move |s| s.tried_insert(&i)).await.flatten();
+            anyhow::ensure!(put_in.as_deref() == Some("e5"), "put in by its owner off the shard: {put_in:?}");
             let i = id.clone();
             let now = copies
-                .on(&id, move |s| s.get(&i).map(|m| (m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.get(5).map(|e| e.entry.text().to_owned()))))
+                .on(&id, move |s| {
+                    s.get(&i).map(|m| {
+                        let at = |e: &str| m.index.get(e).copied();
+                        let text = |k: usize| m.events.get(k).map(|e| e.entry.text().to_owned());
+                        (m.events.len(), at("e4"), at("e5"), at("e6"), text(4), m.events.last().map(|e| e.entry.text().to_owned()))
+                    })
+                })
                 .await
                 .flatten();
-            let Some((len, Some(changed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
-            anyhow::ensure!(len == CHUNK * 3 + 9 && changed.contains("said again") && next == entry("e6", 6).text(), "{len} {changed} {next}");
+            let total = usize::try_from(n + 1)?;
+            let Some((len, e4, e5, e6, fifth, newest)) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(e4 == Some(3) && e5 == Some(4) && e6 == Some(5), "in where its number says: e4 {e4:?}, e5 {e5:?}, e6 {e6:?}");
+            anyhow::ensure!(len == total && fifth.as_deref().is_some_and(|t| t.contains("the fifth, late")) && newest.as_deref().is_some_and(|t| t.contains("the newest")), "{len} {fifth:?} {newest:?}");
             Ok(())
         })
     }

@@ -18,6 +18,9 @@
 #                rest (rt::pin); no hogs.
 #   cores:       that, and N busy loops at cpu.weight 1 on CORES_HOGS, the CPUs past the server's.
 #   q<µs>-<cfg>: <cfg> with the shards' step quantum at <µs> (KILN_RT_QUANTUM_US): step 3's A/B of quanta on one build.
+#   nudge-<mode>-<cfg>: <cfg> with `[server] nudge` at <mode>, off, on or auto (KILN_RT_NUDGE; goal 8 step 7 and goal 6
+#                step 3's A/B on one build). Without it a configuration runs the build's default, off (off until
+#                declared: docs/ci.md §0.3).
 #   rt-<cfg>:    <cfg> with the server's shards in Linux's real-time class (goal 9 step 4: KILN_RT_REALTIME=1, the lab's
 #                unit given LimitRTPRIO=1 as kiln install's unit has, the server's soft limit raised to it). Run only
 #                where this user's service manager grants a unit that room (the most it gives is its own hard
@@ -28,9 +31,10 @@
 #                wherever it spins, so it's the busy-share-safe spin.
 #   spin<µs>-<cfg>: <cfg> with each shard spinning <µs> before every park whatever it costs (KILN_RT_SPIN_US): what a
 #                longer spin buys in delay, and costs in busy share (goal 9 step 5's bar).
-#   nudge-<cfg>: <cfg> with each shard nudging its CPU while it waits, at the period kiln derives (the step quantum less
-#                the timers' tick, 166.7 µs: KILN_RT_NUDGE=1); nudge<µs>-<cfg> at <µs> (KILN_RT_NUDGE_US).
-#                Prefixes combine, spin and nudge before rt, as in spin-nudge-hogs or spin16-rt-hogs.
+#   nudge<µs>-<cfg>: <cfg> with the nudge's period at <µs> (KILN_RT_NUDGE_US) where kiln derives the step quantum less
+#                the timers' tick, 166.7 µs (goal 9 step 4); with no nudge-<mode>- after it, the nudge on.
+#                Prefixes combine in the order spin, nudge<µs>, nudge-<mode>, rt: spin-nudge-on-hogs, nudge100-hogs,
+#                spin16-rt-hogs.
 # Each round's kiln-lab run goes to <out>/runs/<configuration>/<round>; a round measured before is kept, so the driver
 # started again goes on where it stopped. With PROF=1, each configuration then gets one round more (runs/prof-<cfg>)
 # with PROF_KILN (an unstripped build of the same commit) and perf recording its server over the window (hook.sh),
@@ -89,10 +93,13 @@ one() {
   case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS" -E PERF_CALL_GRAPH="$PERF_CALL_GRAPH" -E PERF_FROM="$PERF_FROM") ;; esac
   local quantum=""
   case "$base" in q[0-9]*-*) quantum=${base%%-*}; quantum=${quantum#q}; base=${base#*-} ;; esac
-  # The spin before each park and the nudge (goal 9 step 4), each a prefix before rt-.
-  local spin="" nudge=""
+  # The spin before each park (goal 9 step 4), the nudge's period and its mode (goal 9 step 4; goal 8 step 7 and goal
+  # 6 step 3), each a prefix before rt-; a period with no mode is the nudge on at it.
+  local spin="" nudge_us="" nudge=""
   case "$base" in spin[0-9]*-*) spin=${base%%-*}; spin=${spin#spin}; base=${base#*-} ;; spin-*) spin=sized; base=${base#spin-} ;; esac
-  case "$base" in nudge[0-9]*-*) nudge=${base%%-*}; nudge=${nudge#nudge}; base=${base#*-} ;; nudge-*) nudge=derived; base=${base#nudge-} ;; esac
+  case "$base" in nudge[0-9]*-*) nudge_us=${base%%-*}; nudge_us=${nudge_us#nudge}; base=${base#*-} ;; esac
+  case "$base" in nudge-off-* | nudge-on-* | nudge-auto-*) nudge=${base#nudge-}; nudge=${nudge%%-*}; base=${base#nudge-"$nudge"-} ;; esac
+  [ -n "$nudge_us" ] && [ -z "$nudge" ] && nudge=on
   local rt=""
   case "$base" in rt-*) rt=1; base=${base#rt-} ;; esac
   case "$base" in
@@ -103,7 +110,8 @@ one() {
   [ -n "$SHARDS" ] && senv+=(--env "KILN_RT_SHARDS=$SHARDS")
   [ -n "$quantum" ] && senv+=(--env "KILN_RT_QUANTUM_US=$quantum")
   case "$spin" in "") ;; sized) senv+=(--env KILN_RT_SPIN=1) ;; *) senv+=(--env "KILN_RT_SPIN_US=$spin") ;; esac
-  case "$nudge" in "") ;; derived) senv+=(--env KILN_RT_NUDGE=1) ;; *) senv+=(--env KILN_RT_NUDGE=1 --env "KILN_RT_NUDGE_US=$nudge") ;; esac
+  [ -n "$nudge" ] && senv+=(--env "KILN_RT_NUDGE=$nudge")
+  [ -n "$nudge_us" ] && senv+=(--env "KILN_RT_NUDGE_US=$nudge_us")
   if [ -n "$rt" ]; then
     senv+=(--env KILN_RT_REALTIME=1 --env LAB_SERVER_RTPRIO=1)
     unit=(-p LimitRTPRIO=1)

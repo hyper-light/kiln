@@ -591,7 +591,12 @@ kiln-lab table calm=~/.cache/kiln-lab/g6-priorities/runs/calm/run.json hogs=~/.c
 kiln-lab compare ~/.cache/kiln-lab/g6-priorities/runs/calm/run.json ~/.cache/kiln-lab/g6-priorities/runs/hogs/run.json
 ```
 
-The step holds when `page.p99_ms` with hogs is within noise of calm in production's layout.
+The step holds when `page.p99_ms` with hogs is within noise of calm in production's layout. g9p7 (train 7's tree,
+fedora, 8 rounds each, 2026-11-05) didn't hold it honestly: pages 0.46 to 1.65 ms at p99 and every p50 worse beyond
+noise, the p99s "the same" only because calm's stalls widened the noise. On fedora's lazy kernel a shard woken behind
+a hog waits up to a tick; what holds Critical's p99 there is the nudge, on its own where a config declares it
+(`auto`, from branch `g6-critical-hogs`; off until declared: "The A/B to run: the nudge on its own", below), and what
+else Critical waits for besides its shard is in docs/priority.md, "Critical's own path".
 
 ### Shedding by priority, overloaded on purpose (step 4)
 
@@ -1344,6 +1349,17 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
     they were.
   - goal-stacks: the sessions are copied on the compute pool, its loops take turns, and keep-going's lookups are
     sets.
+- **And what was left of those:**
+  - An event under an older number than its copy's newest: the owner makes the copy's events again with it in on
+    the blocking pool (`Shard::want_insert`), as it reads a compact chunk back for a change.
+  - `Entry::from_text` reads an event's head from its text without making its JSON tree (`Head::of_text`).
+  - The fleet finds a machine's sessions by id (`Registry::ids_on`), not in a copy of every session's info.
+  - The told and elsewhere ticks look agents up by id and in sets, not by scans.
+  - A CI verdict's event is written on the compute pool (`Hub::emit_written`).
+  - The runner writes a certificate's file with no lock held, on the blocking pool (`given_off`).
+  - The rarer signatures and checks run on the compute or blocking pool: kiln's own hand-ons, receipts, passes and
+    carries; a person's receipt or hand-on; review verdicts; a leg's records and kiln's receipt of them; KilnCD's
+    records and promotions; the store of bytes; a commit kiln signs.
 
 ### Step 3's check
 
@@ -1999,8 +2015,9 @@ So for each means a thread has without root:
 
 ### What kiln does: a nudge for the shards (goal 8 step 7)
 
-`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its
-period for a lab's A/B) holds each of a shard's waits in its driver to its period
+`[server] nudge` (off until declared: `"on"` nudges every wait, `"auto"` only while the host holds the shard's wakes;
+`KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its period for a lab's A/B) holds each of a nudged shard's waits
+in its driver to its period
 (`hyper_rt::compute::nudge_current_thread`: a thread-local the epoll driver's `wait` reads): the step quantum
 less the timers' tick, 166.7 µs (`crate::rt::nudge_period_ns`, goal 9 step 4; until then the timers' tick,
 100 µs, which the A/B below ran at). With the shard's timer slack, which is that tick (hyper-rt's
@@ -2020,7 +2037,15 @@ mark, so a shard woken behind a hog waits at most a quantum instead of the kerne
   timers' tick): a park and a turn of its loop each, CPU the shard spends (its busy share rises with it) and
   the threads beside it lose; and a calm machine's CPUs can't reach their deeper idle states while a shard
   waits (fedora's C3 takes up to 1,048 µs to leave, which a calm wake pays too). That cost is measurable, so
-  the nudge is a setting, not the default. The A/B and the microbench below measure it.
+  `on` nudges only where declared. The A/Bs and the microbench below measure it.
+- **On its own, where declared** (goal 6, plan `01a1a59c2abe` step 3; `crate::nudge`; docs/priority.md, "A nudge for
+  the shards"): `[server] nudge = "auto"`, the mode a config declares (off until then: docs/ci.md §0.3, "Opt-in
+  automation"), nudges a shard only while its host holds its wakes, as the shard reads each probe period from the
+  kernel's count of its thread's wait for a CPU (`/proc/thread-self/schedstat`): held past 17.2 µs a wake on average, the geometric
+  mean of what wake-2 measured of runs whose wakes nothing held (at most 4.4 µs) and of held ones (at least
+  67.4 µs), it nudges, and goes on for a tolerance (1 s) past its last held period. A calm shard's wakes wait
+  1.2 µs (wake-2), so it pays a file's read a period. "The A/B to run: the nudge on its own" (below) says what it
+  costs a calm server and buys beside hogs.
 
 ### The nudge's A/B (goal 8 step 7)
 
@@ -2125,16 +2150,16 @@ files behind a shard's kick (`kernel/sched/fair.c`, `fs/eventfd.c`, `fs/eventpol
 
 ### The A/B of the wake path (goal 9 step 4)
 
-Weights alone against the sized spin, a fixed 16 µs spin, the nudge at its derived period and at the timers' tick, and
-the sized spin with the nudge, beside the same hogs in production's layout; and calm against the sized spin calm, for
+Weights alone against the sized spin, a fixed 16 µs spin, the nudge (`on`) at its derived period and at the timers'
+tick, and the sized spin with the nudge, beside the same hogs in production's layout; and calm against the sized spin calm, for
 its cost there. Eight rounds each, interleaved, with `scripts/shard_lab/driver.sh` on fedora (the coordinator's), its
 `kiln` and `kiln-lab` built from a tree with this change (`g9s4-wake`) as for step 7's lab:
 
 ```sh
 systemd-run --user --unit=g9s4-wake --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
   env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 SHARDS=4 \
-  CONFIGS="calm hogs spin-calm spin-hogs spin16-hogs nudge-hogs nudge100-hogs spin-nudge-hogs" \
-  COMPARE="calm:hogs hogs:spin-hogs hogs:spin16-hogs hogs:nudge-hogs hogs:nudge100-hogs nudge100-hogs:nudge-hogs nudge-hogs:spin-nudge-hogs calm:spin-calm" \
+  CONFIGS="calm hogs spin-calm spin-hogs spin16-hogs nudge-on-hogs nudge100-hogs spin-nudge-on-hogs" \
+  COMPARE="calm:hogs hogs:spin-hogs hogs:spin16-hogs hogs:nudge-on-hogs hogs:nudge100-hogs nudge100-hogs:nudge-on-hogs nudge-on-hogs:spin-nudge-on-hogs calm:spin-calm" \
   bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g9s4-wake
 ```
 
@@ -2148,14 +2173,56 @@ About 2.5 minutes a round, 64 rounds: two hours and three quarters. What to read
 - **The fixed spin** (`spin16-hogs`): the most a 16 µs spin buys, and its price: `shards.spin_seconds_per_request` and
   `shards.busy_share` against step 5's bar (0.0056 with hogs), `shards.parks_per_request` and
   `shards.kicks_saved_per_request` against `hogs`'s.
-- **The nudge's period** (`nudge-hogs`, 166.7 µs, against `nudge100-hogs`, 100 µs): fewer parks and timer wakeups
+- **The nudge's period** (`nudge-on-hogs`, 166.7 µs, against `nudge100-hogs`, `on` at 100 µs): fewer parks and timer wakeups
   (`shards.wakeups_timer_per_request`) and a lower busy share, with no API read or shards' delay number worse beyond
   noise, keeps the derived period; a number worse beyond noise sends it back to the timers' tick.
-- **The spin with the nudge** (`spin-nudge-hogs` against `nudge-hogs`): whether the spin's catches take parks off the
+- **The spin with the nudge** (`spin-nudge-on-hogs` against `nudge-on-hogs`): whether the spin's catches take parks off the
   nudge's.
 - **Step 4's bar** (`shards.delay_p999_us` under 1,000 with hogs): none of these is expected to make it ("The nudge's
   A/B": the probe's own wake is prompt already); the real-time class's A/B ("The A/B to run", above) is the one that
   can, where Ada has given the room.
+
+### The A/B to run: the nudge on its own (goal 6 step 3 and goal 8 step 7)
+
+`scripts/shard_lab/driver.sh` (goal 9's lab) runs a configuration with `[server] nudge` set by a prefix,
+`nudge-<off|on|auto>-<cfg>` (`KILN_RT_NUDGE`); a configuration without one runs the build's default, `off`. In
+production's layout (the server alone at `CPUWeight=1000` on 16-31, 16 spinning hogs at `cpu.weight` 1 there),
+eight rounds each, interleaved, this branch's `kiln` and `kiln-lab` built as for goal 9's lab:
+
+```sh
+systemd-run --user --unit=g6-auto --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+  env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 SHARDS=4 \
+  CONFIGS="calm nudge-auto-calm hogs nudge-auto-hogs nudge-on-hogs nudge-on-calm" \
+  COMPARE="calm:nudge-auto-calm hogs:nudge-auto-hogs nudge-auto-calm:nudge-auto-hogs calm:hogs nudge-on-hogs:nudge-auto-hogs nudge-on-calm:calm" \
+  bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g6auto
+```
+
+About 2.5 to 3 minutes a round, 48 rounds: two to two and a half hours. What to read (`report.md`, each pair by
+`kiln-lab compare`; kiln-lab reports each shard's `nudged_share` of the window and the shards' `held_wake_us`, how
+long their host held each wake another thread or their I/O made them, as `auto` judges it):
+
+- **What `auto` costs a calm server: `calm` (off, the default) against `nudge-auto-calm`.** `shards.nudged_share` says how much of the
+  window the shards nudged: about 0 where nothing else of fedora's runs on 16-31, more where other sessions'
+  work does (then `shards.held_wake_us` shows it held them, as wake-2's "none, another CPU" did). It passes with no
+  number of `nudge-auto-calm` worse beyond noise: every class's p50, p99 and p99.9 (`page`, `api_read`, `api_write`,
+  `websocket`, `attach`), `shards.delay_p99_us` and `p999_us`, and `server.cpu_share` and `shards.busy_share`, the
+  CPU it would cost.
+- **What it buys with hogs: `hogs` against `nudge-auto-hogs`.** `shards.nudged_share` near 1 in `nudge-auto-hogs`, and
+  `shards.held_wake_us` down from hundreds of µs to about 130 or less (half the nudge's bound at its period). The gain: `page`, `api_read` and
+  `websocket` p50 and p99, `api_write` p50, and `shards.delay_p99_us` and `p999_us` better beyond noise.
+- **The steps' bars: `nudge-auto-calm` against `nudge-auto-hogs`.** Goal 6 step 3 holds where `page.p99_ms` with hogs is
+  within noise of calm; goal 8 step 7 where pages', API reads' and writes' and the live feed's (`websocket`) p99
+  are. Read the noise as the report gives it; g9p7's calm rounds had stalls that widened it (`page.p99_ms` 0.296
+  to 1.916 ms calm), so the medians matter too (`*.p50_ms`, which g9p7 had worse beyond noise in every class).
+- **Whether `auto` nudges whenever `on` helps: `nudge-on-hogs` against `nudge-auto-hogs`**, every number the same within
+  noise; and **what `on` costs calm: `nudge-on-calm` against `calm`**, for the record.
+- **What's left with hogs** shows in `shards.held_wake_us` under `nudge-auto-hogs`: the shards aren't fixed to cores in this
+  layout, so a wake the scheduler moves to another busy CPU isn't bounded by the shard's timer on the one it
+  parked on. If that's most of what's left, `cores` (goal 9 step 4) is the A/B to add, as `cores nudge-auto-cores`.
+
+`auto` stays off until declared either way (docs/ci.md §0.3, "Opt-in automation"; `crate::config`'s
+`Server::default`, `nudge`): where `calm` against `nudge-auto-calm` shows no cost beyond noise and `hogs` against
+`nudge-auto-hogs` a gain, a config may declare it with the lab behind it, and `KILN_RT_NUDGE=auto` serves labs.
 
 ### The wake microbench (goal 8 step 7)
 

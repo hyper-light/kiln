@@ -1193,6 +1193,23 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
         }
+        // Their nudge (kiln's goal 8 step 7 and goal 6 step 3, `crate::nudge`), where the build says it: the share of the
+        // window each shard's waits were nudged, and, all shards together, how long their host held each wake another
+        // thread or their I/O made them, as each shard judges it (`held_wake_us`).
+        let mut nudged = None::<f64>;
+        let mut held = HeldWakes::default();
+        for sh in &shards {
+            let want = [("shard", sh.as_str())];
+            let share = diff("kiln_shard_nudged_seconds_total", &want).map(per_s);
+            put(format!("shard{sh}.nudged_share"), share);
+            if let Some(share) = share {
+                nudged = Some(nudged.unwrap_or(0.0) + share / count);
+            }
+            let wakes = |by: &str| diff("kiln_shard_wakeups_total", &[("shard", sh.as_str()), ("by", by)]);
+            held.add(diff("kiln_shard_run_wait_seconds_total", &want), wakes("kick"), wakes("io"), wakes("timer"));
+        }
+        put("shards.nudged_share".into(), nudged);
+        put("shards.held_wake_us".into(), held.per_wake_us());
         // How long their parks lasted, all shards together (goal 9, plan 01a1a87b2cec step 5), where the build says it:
         // the median and p99, and the share of parks under 16 µs, the first of hyper-rt's bounds (`PARK_BOUNDS_NS`) past
         // the cheapest wake measured on fedora (a socket's on the waiting thread's own CPU, 12.6 µs at its median:
@@ -1249,6 +1266,36 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         put(format!("blocking.{share}.little_p99"), run_p99.map(|w| per_s(jobs) * w));
     }
     shards.len()
+}
+
+/// What a wake by a shard's own timer makes it wait for its CPU on a calm machine, at the most, seconds: kiln's
+/// `crate::nudge::TIMER_WAKE_NS` (the wake-2 lab, no hog: 0.4 to 0.7 µs a run).
+const TIMER_WAKE_S: f64 = 0.7e-6;
+
+/// The shards' waits for a CPU over a window and the wakes they took, summed (kiln's goal 8 step 7, `crate::nudge`):
+/// how long their host held each wake another thread or their I/O made them, as each shard judges its own periods,
+/// over the whole window: their run wait past [`TIMER_WAKE_S`] for each wake of their own timers, over their wakes by
+/// a kick or I/O.
+#[derive(Debug, Default)]
+struct HeldWakes {
+    waited_s: f64,
+    others: f64,
+    seen: bool,
+}
+
+impl HeldWakes {
+    /// One shard's growth over the window: its run wait (seconds), and its wakes by a kick, by I/O and by its timers.
+    fn add(&mut self, waited_s: Option<f64>, kick: Option<f64>, io: Option<f64>, timer: Option<f64>) {
+        let (Some(waited_s), Some(kick), Some(io), Some(timer)) = (waited_s, kick, io, timer) else { return };
+        self.seen = true;
+        self.waited_s += (waited_s - timer * TIMER_WAKE_S).max(0.0);
+        self.others += kick + io;
+    }
+
+    /// Microseconds a wake, where any shard said its wait and any took a wake by another thread or I/O.
+    fn per_wake_us(&self) -> Option<f64> {
+        (self.seen && self.others > 0.0).then(|| self.waited_s / self.others * 1e6)
+    }
 }
 
 /// What each of the window's `requests` cost the shards in loop steps, polls, parks, wakes and system calls (goal
@@ -1371,6 +1418,36 @@ pub fn better(name: &str) -> crate::stats::Better {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 8, plan 01a1a59c2b29 step 7 (and goal 6 step 3): each shard's nudged share of the window, their mean, and how
+    /// long their host held each wake another thread or I/O made them over the window, its own timers' calm wait set
+    /// aside; none where the build says none of it.
+    #[test]
+    fn g8_s7_the_shards_nudge_and_held_wakes_are_reported() {
+        // Shard 0 nudged 30 s of the 60 s window, its run wait 15 ms over 100 kicks, 50 I/O wakes and 6,000 timer
+        // wakes; shard 1 never nudged and waited 0.3 ms over 150 wakes by others and 100 by its timers.
+        let scrape = |at: f64| {
+            let mut t = String::new();
+            for (sh, nudged, waited, kick, io, timer) in [(0, 30.0, 0.015, 100.0, 50.0, 6000.0), (1, 0.0, 0.0003, 100.0, 50.0, 100.0)] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", at * 1000.0));
+                t.push_str(&format!("kiln_shard_nudged_seconds_total{{shard=\"{sh}\"}} {}\n", at * nudged));
+                t.push_str(&format!("kiln_shard_run_wait_seconds_total{{shard=\"{sh}\"}} {}\n", at * waited));
+                for (by, n) in [("kick", kick), ("io", io), ("timer", timer)] {
+                    t.push_str(&format!("kiln_shard_wakeups_total{{shard=\"{sh}\",by=\"{by}\"}} {}\n", at * n));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0.0), &scrape(1.0), 60.0);
+        let near = |name: &str, want: f64| n.get(name).is_some_and(|v| (v - want).abs() < 1e-9);
+        assert!(near("shard0.nudged_share", 0.5) && near("shard1.nudged_share", 0.0) && near("shards.nudged_share", 0.25), "{n:?}");
+        // (15 ms − 6,000 × 0.7 µs) + (0.3 ms − 100 × 0.7 µs) over 300 wakes by others: 36.8 µs a wake.
+        assert!(near("shards.held_wake_us", (0.015 - 6000.0 * 0.7e-6 + 0.0003 - 100.0 * 0.7e-6) / 300.0 * 1e6), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
+        assert!(!none.contains_key("shards.nudged_share") && !none.contains_key("shards.held_wake_us"), "{none:?}");
+    }
 
     /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
     #[test]

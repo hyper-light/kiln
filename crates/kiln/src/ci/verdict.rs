@@ -605,19 +605,19 @@ async fn refresh_with(hub: &Arc<Hub>, repo: &crate::store::Repo, mirror: &str, (
             Some(_) => true,
             None => (after..=at).contains(&c),
         };
-        // The verdict as JSON, and its message where it's news, made on the compute pool too: a verdict that changed is
-        // serialized whole.
-        let (book, name, wf, br) = (Arc::clone(l), repo.name.clone(), workflow.to_owned(), branch.to_owned());
-        let Ok(Some((verdict, text))) = crate::rt::compute(move || told(&book, c, news, (&name, &wf, &br))).await else { continue };
-        hub.emit(&crate::wire::events::ServerEvent::CiVerdict(Box::new(crate::wire::events::CiVerdict {
-            repo: repo.name.clone(),
-            workflow: workflow.to_owned(),
-            branch: branch.to_owned(),
-            sha: commit.clone(),
-            kind,
-            why,
-            verdict,
-        })));
+        // The verdict as JSON, its event written out and its message where it's news, made on the compute pool too: a
+        // verdict that changed is serialized whole, and its event, the verdict in it, was written again on this shard by
+        // `Hub::emit` (goal 9, plan 01a1a87b2cec step 3).
+        let (book, lane, sha) = (Arc::clone(l), (repo.name.clone(), workflow.to_owned(), branch.to_owned()), commit.clone());
+        let Ok(Some((event, text))) = crate::rt::compute(move || {
+            let (name, wf, br) = &lane;
+            told(&book, c, news, (name, wf, br)).map(|(verdict, text)| (event_written(&lane, sha, kind, why, verdict), text))
+        })
+        .await
+        else {
+            continue;
+        };
+        hub.emit_written(event);
         // The push that brought it: the lane's first run at or after it (a culprit-finding try's
         // passed over).
         let pushed: Vec<&str> = l.runs.range(c..).take(8).filter_map(|p| l.shas.get(*p)).map(String::as_str).collect();
@@ -643,6 +643,13 @@ fn to_bisect(l: &LaneBook, started: &[Bisect]) -> Vec<(String, Check)> {
         out.push((bad, f.check));
     }
     out
+}
+
+/// Commit `sha`'s verdict event (`verdict`, its kind and why) on lane `lane` (repository, workflow, branch), written out
+/// as [`crate::hub::Hub::emit`] writes it: on the thread it's called on, a compute job's.
+fn event_written(lane: &(String, String, String), sha: String, kind: Kind, why: String, verdict: Value) -> Arc<str> {
+    let (repo, workflow, branch) = lane.clone();
+    Arc::from(crate::wire::events::ServerEvent::CiVerdict(Box::new(crate::wire::events::CiVerdict { repo, workflow, branch, sha, kind, why, verdict })).text())
 }
 
 /// Commit `c`'s verdict's kind and why, which say whether it changed: on the thread it's called on, a compute job's.
@@ -1003,6 +1010,31 @@ mod tests {
             let book = Arc::clone(&l);
             let to_find = crate::rt::compute(move || to_bisect(&book, &started)).await?;
             anyhow::ensure!(to_find.is_empty(), "{to_find:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a changed verdict's event is written out on the compute pool, as `Hub::emit`
+    /// wrote it on its caller's shard, and goes to the hub's listeners as it would have: `refresh` writes none on its
+    /// shard.
+    #[test]
+    fn g9_s3_a_verdicts_event_is_written_off_the_shard_as_emit_wrote_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut events = hub.subscribe_events()?;
+            let verdict = json!({"commit": sha(1), "kind": "culprit", "checks": [{"check": {"workflow": "ci", "unit": "app", "test": "app::tests main"}, "why": "it fails here first"}]});
+            let event = crate::wire::events::ServerEvent::CiVerdict(Box::new(crate::wire::events::CiVerdict { repo: "kiln".into(), workflow: "ci".into(), branch: "main".into(), sha: sha(1), kind: Kind::Culprit, why: "app::tests main fails here first".into(), verdict: verdict.clone() }));
+            let lane = ("kiln".to_owned(), "ci".to_owned(), "main".to_owned());
+            let written = crate::rt::compute(move || event_written(&lane, sha(1), Kind::Culprit, "app::tests main fails here first".into(), verdict)).await?;
+            anyhow::ensure!(*written == *event.text(), "{written}");
+            hub.emit_written(Arc::clone(&written));
+            hub.emit(&event);
+            let off = crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??;
+            let on = crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??;
+            anyhow::ensure!(off == written && on == written, "the same to its listeners: {off} / {on}");
+            let code = include_str!("verdict.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            let body = code.split("async fn refresh_with(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+            anyhow::ensure!(!body.is_empty() && body.contains("hub.emit_written(") && !body.contains("hub.emit(&"), "refresh writes its verdicts' events off its shard");
             Ok(())
         })
     }

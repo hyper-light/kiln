@@ -1314,6 +1314,7 @@ pub fn render() -> String {
     render_wire(&mut o);
     render_tls(&mut o);
     crate::shard_health::render(&mut o);
+    crate::nudge::render(&mut o);
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
