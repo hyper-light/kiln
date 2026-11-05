@@ -32,6 +32,10 @@ pub struct RunnerInfo {
     /// Its reach identity's fingerprint ([`super::e2e::fingerprint_of_spki`]).
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// The features it speaks on reach links, as it announced them (docs/wire.md, "Named
+    /// features"): none from a runner or a server before them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     #[serde(default)]
     pub cpus: u32,
     /// Busy share of all cores, 0–100, at the last sample.

@@ -434,7 +434,7 @@ impl Handle {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: crate::proto::feature::all() };
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
@@ -576,6 +576,9 @@ struct Peer {
     waiters: Vec<oneshot::Sender<anyhow::Result<Host>>>,
     last_used: Instant,
     error: Option<String>,
+    /// The features it speaks on this link ([`Say::Features`], docs/wire.md): none until it
+    /// answers, and for a runner from before them, none ever.
+    features: Vec<String>,
 }
 
 impl Peer {
@@ -593,6 +596,7 @@ impl Peer {
             waiters: Vec::new(),
             last_used: Instant::now(),
             error: None,
+            features: Vec::new(),
         }
     }
 
@@ -657,6 +661,9 @@ struct Session {
     /// Hand-overs arriving, by id: the bytes so far.
     adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
+    /// The features its asker speaks on links ([`Ask::Features`], docs/wire.md): none until it
+    /// says, and then a link variant past the first twelve goes to it only if it named it.
+    features: Vec<String>,
 }
 
 enum Waiting {
@@ -1134,10 +1141,18 @@ impl Node {
                     let _ = w.send(Ok(host.clone()));
                 }
                 tracing::debug!(peer = %name, resumed = resumed.len(), lost = lost.len(), "reach link ready");
+                // A runner whose announce lists `link-features` is told this one's, and answers
+                // with its own (docs/wire.md, "Named features"); one from before is never sent a
+                // link variant it doesn't know.
+                p.features.clear();
+                let negotiates = self.directory.as_ref().and_then(|(_, d)| d.iter().find(|r| r.name == name)).is_some_and(|r| crate::proto::feature::speaks(&r.features, crate::proto::feature::LINK_FEATURES));
                 for id in lost {
                     if let Some(f) = p.follows.remove(&id) {
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
+                }
+                if negotiates {
+                    self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await;
                 }
                 self.flush_queue(&name).await;
             }
@@ -1209,6 +1224,18 @@ impl Node {
                 }
             }
             Say::Pong { .. } => {}
+            // The features it speaks on this link (docs/wire.md, "Named features").
+            Say::Features { names } => {
+                if let Some(p) = self.peers.get_mut(&name) {
+                    tracing::debug!(peer = %name, ?names, "the other runner speaks these link features");
+                    p.features = names;
+                }
+            }
+            // Placement's word from a runner this node probed (docs/needs.md E5): this build sends
+            // no probe on a link yet, so none comes, and one that does is noted.
+            Say::Place { json } => {
+                tracing::debug!(peer = %name, link, bytes = json.len(), "a placement word this node didn't ask for");
+            }
             // The other end couldn't read a message of this one's: it ends the link.
             Say::Unread { what, code, why } => {
                 tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
@@ -1254,7 +1281,7 @@ impl Node {
             if let Some(l) = self.links.get_mut(link) {
                 l.session = Some(session.clone());
             }
-            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None });
+            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None, features: Vec::new() });
             let old = s.link.replace(link.to_owned());
             s.detached = None;
             let mut resumed = Vec::new();
@@ -1354,6 +1381,19 @@ impl Node {
                         self.say_on(link, &Say::ObjectMissing { id }).await;
                     }
                 }
+            }
+            // The features its asker speaks on links: kept for this session, and this runner's
+            // said back (docs/wire.md, "Named features").
+            Ask::Features { names } => {
+                if let Some(s) = self.served.get_mut(&key) {
+                    s.features = names;
+                }
+                self.say_on(link, &Say::Features { names: crate::proto::feature::all() }).await;
+            }
+            // A probe from a run's owner (docs/needs.md E5): this build admits none by link yet,
+            // and says `place` to nobody, so none comes; one that does is noted.
+            Ask::Place { json } => {
+                tracing::debug!(peer = %key.0, link, bytes = json.len(), "a placement word this runner doesn't take on links yet");
             }
             // The asker couldn't read a message of this one's: it ends the link.
             Ask::Unread { what, code, why } => {

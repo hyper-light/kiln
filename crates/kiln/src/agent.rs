@@ -1822,6 +1822,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // grants (`Renew`, numbered) and fences what it sends about their legs by them. Each leg's grant,
     // as its assignment named it, is kept while the leg runs and until the server has its result.
     let mut server_leases = false;
+    // The features the server speaks by name (docs/wire.md, "Named features"), said on this
+    // connection after its caps say `CAP_FEATURES`: none from a server before them.
+    let mut server_features: Vec<String> = Vec::new();
     let mut grants: HashMap<String, proto::Grant> = HashMap::new();
     let mut renew_seq = 0u64;
     // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
@@ -2775,7 +2778,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Running agents, it answers what their branches' commits are and compares two points
                     // of their repositories (the Changes tab's Commits and Compare).
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits  | proto::CAP_LEASES}) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | proto::CAP_LEASES | proto::CAP_FEATURES }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2872,6 +2875,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_limit = false;
                 limit_said = None;
                 server_leases = false;
+                server_features.clear();
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -3576,6 +3580,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Unread(server_unread)).await;
                         }
                         server_leases = caps & proto::CAP_LEASES != 0;
+                        // It speaks named features: it's told this runner's (docs/wire.md, "Named
+                        // features"), and says its own.
+                        if caps & proto::CAP_FEATURES != 0 {
+                            uplink.0.send(Up::Term(AgentMsg::Features { names: proto::feature::all() })).await.ok();
+                        }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
@@ -3841,6 +3850,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         },
                     },
+                    // The features the server speaks by name (docs/wire.md): each says them all.
+                    ServerMsg::Features { names } => {
+                        tracing::debug!(?names, "the server speaks these features");
+                        server_features = names;
+                    }
                     // From an epoch older than the newest this runner has seen (W05-R37): not applied.
                     ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
                         refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("a Stop from epoch {}, older than this runner has seen", grant.epoch));

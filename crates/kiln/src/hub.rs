@@ -1693,6 +1693,7 @@ impl Hub {
                     connected: a.connected,
                     reach: a.connected && ann.is_some_and(|x| x.accept),
                     fingerprint: ann.map(|x| x.fingerprint.clone()),
+                    features: ann.map(|x| x.features.clone()).unwrap_or_default(),
                     cpus: s.map_or(0, |s| s.cpus),
                     cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
                     load1: s.map_or(0.0, |s| s.load1),
@@ -2340,7 +2341,14 @@ impl Hub {
                 }
                 // One that takes its agent limit from here is sent what's set for its machine.
                 crate::harness::limit::on_caps(self, &agent, peer, caps).await;
+                // One that speaks named features is told the server's (docs/wire.md, "Named
+                // features"); it says its own.
+                if caps & proto::CAP_FEATURES != 0 {
+                    self.send_peer(peer, &ServerMsg::Features { names: proto::feature::all() }).await;
+                }
             }
+            // The features it speaks by name: each says them all, superseding the last.
+            AgentMsg::Features { names } => self.instances.lock().set_features(peer, names),
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
@@ -2938,7 +2946,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_LEASES }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_LEASES | proto::CAP_FEATURES }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
