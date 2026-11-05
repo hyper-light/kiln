@@ -26,11 +26,12 @@ pub fn install(hub: &Arc<Hub>) {
         let (tx, rx) = async_channel::bounded::<Receipt>(RECEIPTS_MAX);
         let w = Arc::downgrade(hub);
         crate::rt::spawn(async move {
-            while let Ok(r) = rx.recv().await {
+            while let Ok(Receipt { given, receipt, came_from }) = rx.recv().await {
                 let Some(hub) = w.upgrade() else { return };
-                // The runner's hand-on as the batch carried it, then kiln's receipt of what came.
-                kept(&hub, &r.given, &r.came_from).await;
-                match super::server_signed(&hub.pki, &r.receipt) {
+                // The runner's hand-on as the batch carried it, then kiln's receipt of what came,
+                // signed off the shards (goal 9, plan 01a1a87b2cec step 3).
+                kept(&hub, &given, &came_from).await;
+                match super::server_signed_off(&hub.pki, receipt).await {
                     Ok(b) => kept(&hub, &b, "kiln").await,
                     Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
                 }
@@ -106,7 +107,8 @@ impl Custodian for ToMirror {
             let to = crate::identities::runner_identity(&hub, &self.machine, &instance).await.ok()?.uri().ok()?;
             let server = super::server_uri(&hub.pki.organization());
             let body = Body { to: Some(to), why: "a batch of kiln's conversation store, for the copy this runner keeps".into(), ..Body::new(Kind::HandedOn, &server) };
-            let bundle = match super::server_signed(&hub.pki, &Statement { subject: vec![thing], ..Statement::new(to_value(&body)) }) {
+            // Signed off the shards (goal 9, plan 01a1a87b2cec step 3).
+            let bundle = match super::server_signed_off(&hub.pki, Statement { subject: vec![thing], ..Statement::new(to_value(&body)) }).await {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(target: "kiln.custody", machine = %self.machine, error = %format!("{e:#}"), "kiln's hand-on of a batch to a mirror couldn't be signed");
