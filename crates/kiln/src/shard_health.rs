@@ -516,6 +516,8 @@ async fn wake_every(me: &Shard, i: usize, period: Duration, wakes: u64) {
         me.note(late, now, counters.as_ref(), cpu);
         // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4).
         crate::overload::tick(i, late, cpu, counters.as_ref());
+        // Whether its host holds its wakes, and so whether it nudges its CPU (goal 8, plan 01a1a59c2b29 step 7).
+        crate::nudge::tick(i, now, counters.as_ref());
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;

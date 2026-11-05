@@ -372,25 +372,90 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 
 ## A nudge for the shards
 
-`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its period
-for a lab's A/B) is what a shard has in the real-time class's place where that's refused, needing no privilege
-(goal 8, plan `01a1a59c2b29` step 7; `hyper_rt::compute::nudge_current_thread`):
+`[server] nudge` is what a shard has in the real-time class's place where that's refused, needing no privilege
+(goal 8, plan `01a1a59c2b29` step 7; goal 6, plan `01a1a59c2abe` step 3; `hyper_rt::compute::nudge_current_thread`,
+`crate::nudge`). `"auto"` is the server's default; `"on"` (or `true`, as it was before it had a mode) and `"off"`
+(or `false`) are the others. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any other value is on, as the flag
+read it), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 
-- Each of a shard's waits in its driver ends by the timers' tick (100 µs), so with its timer slack (the tick
-  too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under `lazy` a wake
-  marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to user space
-  from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in user space
-  then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next tick (up to
-  1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once (docs/runtime-lab.md,
-  "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- **What a nudge is.** A nudged shard's waits in its driver end by the timers' tick (100 µs), so with its timer
+  slack (the tick too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under
+  `lazy` a wake marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to
+  user space from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in
+  user space then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next
+  tick (up to 1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once
+  (docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- **Its period, from what wake-2 measured.** A held wake waits at most the period and the lateness of the shard's
+  own timer. wake-2 measured that lateness behind each kind of hog: a thread's timer woke it within 57.8 µs of
+  due at p99 behind spinning hogs (its slack 50 µs), and within 80 to 129 µs behind compilers and hogs that enter
+  the kernel, where it asked for a slice of its own as kiln's shards do (without one, 394 to 641 µs). So at the
+  tick a held wake waits about 160 to 230 µs at the most, the floor every ready timer of a shard pays by design
+  (two ticks, `DELAY_FLOOR_NS`), against up to the 1 ms tick unnudged (wake-2: p99 1.00 ms with every kind of
+  hog). A longer period buys fewer wakes at a later bound; a shorter one, a bound under a floor no ready work
+  of the shard is held to anyway.
+- **`on`'s cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
+  threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. A calm server
+  pays that for nothing.
+- **`auto`: only while the host holds the shard's wakes.** Once a period of its health probe (10 ms), on its own
+  thread, each shard reads the kernel's count of how long its thread waited, runnable, for a CPU (Linux's run
+  delay, `/proc/thread-self/schedstat`, a file kept open: one read), and its parks by what ended them. The
+  period's wait, less what a calm CPU makes a wake by the shard's own timer wait (0.7 µs, wake-2's most with no
+  hog), over the wakes another thread or its I/O made, is how long its host held each of them. A period at
+  17.2 µs or more was held: the geometric mean of the most a run whose wake nothing held waited in wake-2 (4.4 µs,
+  compilers beside a socket's wake on its own CPU; 1.2 µs with no hog) and the least a held one did (67.4 µs,
+  hogs entering the kernel, a wake from another CPU; spinning hogs 368 to 436 µs, compilers 294 to 352, other
+  sessions' work alone 200 to 223), a factor of 3.9 from each. A shard nudges while a held period was within the
+  last tolerance (1 s, the interval `crate::overload` judges a queue over), so one held now and then nudges
+  between; it stops a tolerance after its host lets it run, and a shard nothing but its own timers woke for a
+  tolerance is idle and stops too. Nudging, its held wakes still read held (they wait about 100 µs on average,
+  and its own timers' wakes on a busy CPU wait past 0.7 µs each), so it goes on as long as its host holds it.
+- **A calm server pays nothing for it** but the reading, a file read each period on each shard: a calm shard's
+  wakes waited 1.2 µs each in wake-2, well under 17.2 µs, as do those of a kernel that preempts fully
+  (production's), where a wake interrupts the busy CPU at once and a nudge would buy nothing. On fedora, where
+  other sessions' work runs on the lab's CPUs, a "calm" shard may well be held (wake-2: 200 to 223 µs a run with
+  none of the lab's hogs), and nudges then.
 - A shard that took the real-time class doesn't nudge: its wake preempts at once. The others ask for their
-  slice, then the nudge.
-- **Its cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
-  threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. So it's off
-  until declared.
-- The log says how the shards took it once every shard has answered, and `/healthz/server` too
-  (`priority.nudge`: asked, period, shards, nudged, those in the real-time class, refused, why).
-- **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound.
+  slice, then the nudge (where it's `auto`, leave to nudge on their own).
+- **It says what it did.** The log says how the shards took it once every shard has answered, and each shard's
+  first nudge, with what its wakes waited; `/healthz/server` too (`priority.nudge`: asked, mode, period, shards,
+  nudged, those in the real-time class, refused, why, `armed`: the shards nudging now, `starts`: the times they
+  began); `/metrics` each shard's time nudged (`kiln_shard_nudged_seconds_total`), its starts
+  (`kiln_shard_nudge_starts_total`), whether it nudges now (`kiln_shard_nudging`), its thread's wait for a CPU
+  (`kiln_shard_run_wait_seconds_total`) and its last period's held wait a wake (`kiln_shard_held_wake_seconds`).
+- **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound. A Linux kernel that keeps no
+  thread's wait for a CPU (no `CONFIG_SCHED_INFO`) refuses `auto`, saying why; `on` works there. `auto` judges
+  at its shards' probes, so a server whose probes are off (`KILN_SHARD_PROBE_MS=0`) never nudges on its own.
+- **If the lab shows `auto` costs a calm server beyond noise** (docs/runtime-lab.md, "Goal 6 step 3 and goal 8
+  step 7: the nudge on its own"), the default goes back to `off` (`Config::default`'s `nudge`).
+
+## Critical's own path
+
+What a person's page, sign-in or action and a health check wait for besides their shard's turn (goal 6, plan
+`01a1a59c2abe` step 3), and what each does now:
+
+- **Their shard's wakes.** A request on a kept-alive connection (a browser's, the lab's pages) wakes its
+  connection's shard as its bytes arrive; a new connection wakes the shard its listener's task runs on, then the
+  one it's placed on (`crate::rt::spawn_connection`, round-robin as goal 7's A/B chose). On a lazy kernel beside
+  a busy thread each such wake waits up to a tick; nudging (`auto`, above), each waits at most the nudge's bound.
+  Placing a new connection on the shard that accepts it would take one of the two wakes off it, but changes goal
+  7's placement, and is for its A/B to decide.
+- **The answer's write.** A response is written in its connection's task as its handler returns (HTTP/1.1 and
+  HTTP/2 alike, round-robin placement), no wake between; a page's bytes come from memory (`crate::ui`).
+- **Health.** `/readyz` answers from what the server knows (`crate::pool_health::store_writer_stuck`,
+  `Store::writer_running`), no longer a `SELECT 1` through kiln.db's one writer, which waited behind every write
+  before it (the lab's writer line: 0.7 s at p99; on 2026-10-30 production's readiness failed on it under the
+  host's load and a deploy was rolled back). The store is unready only once its writer's thread has stopped, or
+  while calls wait for it and it has finished none for 30 s: as long as the longest any prober kiln configures
+  waits for `/readyz` (KilnCD's checks, 30 s where they name no timeout; the Kubernetes probe kiln installs, 3 s),
+  so no prober sees it unready where the `SELECT 1` would have answered within its wait.
+- **The pools' lines.** A job a Critical task submits to the blocking pool (a sign-in's password file, a
+  person's session and rights read from kiln.db on the `store` share) waits ahead of the rest of its share's
+  line, as the shard's run queue takes that class first, its share's places bounding it as they bound the rest
+  (`hyper_rt::blocking`). Before, a person's read waited behind every read before it: custody's held the `store`
+  share's line at about 14 jobs, 80 ms each (the census, train 8).
+- **Not yet:** the compute pool's line is first come, first served (a sign-in's Argon2 check waited there with
+  the rest: 37 ms at p99 with hogs in g9p7); and a sign-in, like a person's action that writes, waits for
+  kiln.db's writer, whose line is the store's group commit's to shorten.
 
 ## Step 7's lab
 
