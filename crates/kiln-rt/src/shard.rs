@@ -431,6 +431,8 @@ pub struct ShardContext {
     pub(crate) frames: crate::frames::Frames,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
     pub(crate) sim: Option<crate::sim::SimSockets>,
+    /// The shard's movable queues and carriers, once its runtime installs them (`crate::movable`, kiln's goal 7).
+    pub(crate) movable: crate::movable::Local,
 }
 
 impl std::fmt::Debug for ShardContext {
@@ -548,6 +550,7 @@ impl ShardContext {
             generation_high: Cell::new(shape.generation_base),
             live: crate::shard_loop::LiveCounters::default(),
             sim: None,
+            movable: crate::movable::Local::default(),
         }
     }
 

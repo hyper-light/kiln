@@ -22,6 +22,19 @@ pub type RtFuturesIo = TcpIo;
 /// Time allowed for each address's TCP connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One TCP connect, under its task's own waker however the caller is polled (a movable task's poll: goal 7,
+/// `crate::rt::native`).
+async fn connect_to(addr: SocketAddr) -> Result<TcpStream, hyper_rt::RtError> {
+    crate::rt::native(TcpStream::connect(addr)).await.and_then(|connected| connected)
+}
+
+/// A proxy's tunnel to `host:port` over `tcp`, under its task's own waker however the caller is polled (as
+/// [`connect_to`]): the connection back once the proxy has opened it.
+async fn tunnel_through(tcp: TcpStream, proxy: &super::proxy::Proxy, host: &str, port: u16) -> anyhow::Result<TcpStream> {
+    let (proxy, host) = (proxy.clone(), host.to_owned());
+    crate::rt::native(async move { super::proxy::tunnel(&tcp, &proxy, &host, port).await.map(|()| tcp) }).await.map_err(|e| anyhow::anyhow!("the proxy's tunnel: {}", to_io(e)))?
+}
+
 /// A TCP connection to `host:port` (a name or an address), trying each address in turn.
 pub(crate) async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
     let mut addrs = crate::rt::resolve_host(host, port).await?;
@@ -29,7 +42,7 @@ pub(crate) async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> 
     addrs.sort_by_key(|a| !a.is_ipv4());
     let mut last = None;
     for addr in addrs {
-        match crate::rt::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        match crate::rt::timeout(CONNECT_TIMEOUT, connect_to(addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last = Some(format!("connect {addr}: {}", to_io(e))),
             Err(_) => last = Some(format!("connect {addr}: timed out")),
@@ -95,8 +108,7 @@ pub(crate) async fn connect_reaching(host: &str, port: u16, https: bool, reach: 
         // Where it goes is checked all the same.
         reach.addresses(host, port).await?;
         let tcp = connect(&proxy.host, proxy.port).await.with_context(|| format!("the proxy {}:{} (for {host}:{port})", proxy.host, proxy.port))?;
-        super::proxy::tunnel(&tcp, proxy, host, port).await?;
-        return Ok(tcp);
+        return tunnel_through(tcp, proxy, host, port).await;
     }
     connect_direct_reaching(host, port, reach).await
 }
@@ -107,7 +119,7 @@ pub(crate) async fn connect_direct_reaching(host: &str, port: u16, reach: &Reach
     addrs.sort_by_key(|a| !a.is_ipv4());
     let mut last = None;
     for addr in addrs {
-        match crate::rt::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        match crate::rt::timeout(CONNECT_TIMEOUT, connect_to(addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last = Some(format!("connect {addr}: {}", to_io(e))),
             Err(_) => last = Some(format!("connect {addr}: timed out")),
@@ -122,8 +134,7 @@ pub(crate) async fn connect_out(host: &str, port: u16, https: bool) -> anyhow::R
     use anyhow::Context as _;
     let Some(proxy) = super::proxy::settings().choose(https, host, port) else { return connect(host, port).await };
     let tcp = connect(&proxy.host, proxy.port).await.with_context(|| format!("the proxy {}:{} (for {host}:{port})", proxy.host, proxy.port))?;
-    super::proxy::tunnel(&tcp, proxy, host, port).await?;
-    Ok(tcp)
+    tunnel_through(tcp, proxy, host, port).await
 }
 
 /// One request on a fresh connection (HTTP/1.1; TLS when `https`). The connection is driven by a

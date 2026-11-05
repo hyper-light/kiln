@@ -169,16 +169,19 @@ impl Entry {
 
     /// Called inside the existing parking fence protocol, after payload publication.
     fn kick_parked(&self) {
-        self.parking.kick_if_parked(|| {
-            if self.cleanup_mode.load(Ordering::Acquire) {
-                // An unpark retains one permit even before its owner enters park.
-                if let Some(owner) = self.cleanup_thread.get() {
-                    owner.unpark();
-                }
-            } else {
-                self.kick.kick();
+        self.parking.kick_if_parked(|| self.kick_now());
+    }
+
+    /// The kick of a park claimed: the driver's, or the owner's thread in driverless cleanup.
+    fn kick_now(&self) {
+        if self.cleanup_mode.load(Ordering::Acquire) {
+            // An unpark retains one permit even before its owner enters park.
+            if let Some(owner) = self.cleanup_thread.get() {
+                owner.unpark();
             }
-        });
+        } else {
+            self.kick.kick();
+        }
     }
 
     /// Marks the wait in `slot` at `generation` abandoned and asks the shard to sweep, as a control message
@@ -741,6 +744,21 @@ fn push_movable_onto(
         // Taken as one queued before a close is: the shard ran it, or its drop answered its receipt.
         Pushed::Dropped => Ok(()),
     }
+}
+
+/// Kicks the shard `holder` names when it is parked (the parking protocol's sender side, after the payload is
+/// published, `crate::parking`): whether it was. Movable tasks queued where a parked shard should look for them
+/// (`crate::movable`, kiln's goal 7).
+pub(crate) fn kick_if_parked(holder: SlotHolder) -> bool {
+    with_holder(holder, |entry| {
+        let mut kicked = false;
+        entry.parking.kick_if_parked(|| {
+            kicked = true;
+            entry.kick_now();
+        });
+        kicked
+    })
+    .unwrap_or(false)
 }
 
 /// A spawn site as a slot recorded it: the `&'static Location` a pointer names, or `None` for null.

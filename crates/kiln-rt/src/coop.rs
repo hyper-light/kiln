@@ -72,9 +72,12 @@ pub(crate) fn proceed_in(here: &ShardContext, cx: &mut Context<'_>) -> Poll<()> 
 }
 
 /// The charge, and whether the leaf goes on: it does within the task's share, at the poll's first charge, and
-/// under a waker other than the polling task's own, which no refusal would make yield.
+/// under a waker other than the polling task's own, which no refusal would make yield. A movable task's own waker
+/// is its own (`crate::movable`, kiln's goal 7): it yields at its share as a pinned task does.
 fn proceeds(here: &ShardContext, cx: &Context<'_>) -> bool {
-    here.charge(crate::waker::polling_task_in(here, cx.waker()).is_some())
+    let own = crate::waker::polling_task_in(here, cx.waker()).is_some()
+        || here.movable.polling(cx.waker());
+    here.charge(own)
 }
 
 /// The yield point of a long computation: one charge with no other operation (Tokio's `consume_budget`).
@@ -136,9 +139,13 @@ impl Class {
 }
 
 /// Sets the class of the task being polled: from its next listing it waits in that class's list, and its polls
-/// count to that class's share; tasks it spawns later take it. The class it had; `None` off a task.
+/// count to that class's share; tasks it spawns later take it. A movable task (`crate::movable`) waits in its
+/// class's queue from its next wake. The class it had; `None` off a task.
 pub fn set_class(class: Class) -> Option<Class> {
     registry::with_current(|here| {
+        if let Some(had) = here.movable.set_current_class(class) {
+            return Some(had);
+        }
         let slot = here.current_slot()?;
         Some(here.local.set_class(slot, class))
     })
@@ -147,5 +154,10 @@ pub fn set_class(class: Class) -> Option<Class> {
 
 /// The class of the task being polled; `None` off a task.
 pub fn class() -> Option<Class> {
-    registry::with_current(|here| here.current_slot().map(|slot| here.local.class_of(slot))).flatten()
+    registry::with_current(|here| {
+        here.movable
+            .current_class()
+            .or_else(|| here.current_slot().map(|slot| here.local.class_of(slot)))
+    })
+    .flatten()
 }

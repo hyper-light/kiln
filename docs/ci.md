@@ -139,10 +139,11 @@ These hold for every line written under this spec.
   "routed to X because…", "retried because…", "skipped because…". One exception, decided by the
   user (2026-10-27): headroom (docs/headroom.md) is on by default, since its decisions keep a
   machine from harming what runs on it; each of them says why, and Runners → Headroom turns it off.
-- **Tests and checks before handing over:**
-  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and in `ui/`
-  `npm run typecheck && npm run lint && npm run build`. A workstream adds its own scenario suites
-  (W22). UI files are formatted with `npx prettier --print-width 200 --write <changed files>`
+- **Tests and checks before handing over:** the tests relevant to the change must pass before it's
+  pushed. Decided by the user (2026-11-04): full runs (`cargo clippy --workspace --all-targets --
+  -D warnings`, `cargo test --workspace`, a workstream's scenario suites (W22), the gate and the
+  pipelines started by hand) wait for the person's explicit word. In `ui/`, `npm run typecheck &&
+  npm run lint && npm run build` for a change there. UI files are formatted with `npx prettier --print-width 200 --write <changed files>`
   (there is no prettier config file; a bare `prettier` rewraps whole files to 80 columns, so
   format only the files you changed).
 - **Merging and deploying.** Work happens in a worktree per workstream. When it passes the checks,
@@ -8583,7 +8584,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R07 Files.** The open comments by kind (icons with counts) and Approve, on one row; a search
   across the change backed by vorpal; per-file diffs that fold like the agent chat's Changes, each
   with an icon opening the whole file in a full-screen view; a diff over 100 lines folded to its
-  first lines and the lines with comments.
+  first lines and the lines with comments. A name or a line tapped opens the card asking about it
+  right under that line, as the agent chat's diffs do (components/code/about.tsx): the change's
+  agent answers where an agent made it; anywhere else (a person's change, a lone commit, a host's
+  pull request) a helper kiln starts for the person, reading the repository at that commit
+  (`ci.repos.about`).
 - **W26-R08 Threads.** Comments sit inline on the lines they're about, flat like the agent chat's
   turns: a lighter band, top and bottom borders, no inset cards. Each comment's line: who, the
   signature seal, its kind's icon, when, and ⋯ (edit, delete, copy, quote, change the kind); a long

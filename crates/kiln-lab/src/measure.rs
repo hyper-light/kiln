@@ -35,14 +35,16 @@ impl Class {
     }
 }
 
-/// One timed thing: its class, when it began (µs since the epoch), how long it took (µs), and
-/// whether it went as it should (an answer under 400; a socket that opened).
+/// One timed thing: its class, when it began (µs since the epoch), how long it took (µs), whether it
+/// went as it should (an answer under 400; a socket that opened), and what it was, finer than its
+/// class (an API read's route: `sessions`, `events`…; empty where its class says it all).
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub class: Class,
     pub at_us: u64,
     pub took_us: u64,
     pub ok: bool,
+    pub what: &'static str,
 }
 
 /// `q` of sorted `v` by the nearest rank (the smallest value with at least `q` of them at or under
@@ -72,26 +74,43 @@ fn ms(us: u64) -> f64 {
     us as f64 / 1000.0
 }
 
+/// The figures of `took` (µs each, in any order), `errors` beside them: each to the microsecond.
+pub fn seen_of(mut took: Vec<u64>, errors: u64) -> Seen {
+    took.sort_unstable();
+    Seen {
+        n: took.len() as u64,
+        errors,
+        p50_ms: quantile(&took, 0.5).map(ms),
+        p99_ms: quantile(&took, 0.99).map(ms),
+        p999_ms: quantile(&took, 0.999).map(ms),
+        max_ms: took.last().copied().map(ms),
+    }
+}
+
 /// Each class's figures from the window's samples.
 pub fn seen(samples: &[Sample]) -> BTreeMap<Class, Seen> {
     let mut out = BTreeMap::new();
     for c in Class::ALL {
-        let mut took: Vec<u64> = samples.iter().filter(|s| s.class == c && s.ok).map(|s| s.took_us).collect();
-        took.sort_unstable();
+        let took: Vec<u64> = samples.iter().filter(|s| s.class == c && s.ok).map(|s| s.took_us).collect();
         let errors = samples.iter().filter(|s| s.class == c && !s.ok).count() as u64;
-        out.insert(
-            c,
-            Seen {
-                n: took.len() as u64,
-                errors,
-                p50_ms: quantile(&took, 0.5).map(ms),
-                p99_ms: quantile(&took, 0.99).map(ms),
-                p999_ms: quantile(&took, 0.999).map(ms),
-                max_ms: took.last().copied().map(ms),
-            },
-        );
+        out.insert(c, seen_of(took, errors));
     }
     out
+}
+
+/// The figures of each kind of sample finer than its class (`api_read.sessions`, `api_read.events`…):
+/// where a class's tail is. Kept beside the numbers an A/B compares, not among them.
+pub fn seen_by_what(samples: &[Sample]) -> BTreeMap<String, Seen> {
+    let mut by: BTreeMap<String, (Vec<u64>, u64)> = BTreeMap::new();
+    for s in samples.iter().filter(|s| !s.what.is_empty()) {
+        let e = by.entry(format!("{}.{}", s.class.name(), s.what)).or_default();
+        if s.ok {
+            e.0.push(s.took_us);
+        } else {
+            e.1 += 1;
+        }
+    }
+    by.into_iter().map(|(k, (took, errors))| (k, seen_of(took, errors))).collect()
 }
 
 // ------------------------------------------------------------------------------- the server's
@@ -257,6 +276,18 @@ pub fn histogram_top(buckets: &[(f64, f64)]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 1: each route's figures, to the microsecond, apart from its
+    /// class's.
+    #[test]
+    fn g10_s1_each_route_is_seen_to_the_microsecond() {
+        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what };
+        let by = seen_by_what(&[s("sessions", 1_234, true), s("sessions", 17, true), s("events", 999, true), s("events", 5, false), s("", 3, true)]);
+        assert_eq!(by.keys().cloned().collect::<Vec<_>>(), vec!["api_read.events".to_owned(), "api_read.sessions".to_owned()]);
+        let sessions = by.get("api_read.sessions").cloned().unwrap_or_default();
+        assert_eq!((sessions.n, sessions.p50_ms, sessions.max_ms), (2, Some(0.017), Some(1.234)));
+        assert_eq!(by.get("api_read.events").map(|e| (e.n, e.errors)), Some((1, 1)));
+    }
 
     #[test]
     fn quantiles_by_the_nearest_rank() {
