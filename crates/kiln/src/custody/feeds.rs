@@ -25,7 +25,8 @@ pub fn install(hub: &Arc<Hub>) {
     if let Some(intake) = &hub.harness.feed {
         let (tx, rx) = async_channel::bounded::<Receipt>(RECEIPTS_MAX);
         let w = Arc::downgrade(hub);
-        crate::rt::spawn(async move {
+        // On the next shard round-robin, not the one the server starts on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(async move {
             while let Ok(Receipt { given, receipt, came_from }) = rx.recv().await {
                 let Some(hub) = w.upgrade() else { return };
                 // The runner's hand-on as the batch carried it, then kiln's receipt of what came,

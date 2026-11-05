@@ -71,8 +71,9 @@ pub fn jitter(d: Duration) -> Duration {
 }
 
 /// Run `make()` forever (until `cancel`), restarting on `Err` or panic. Returning `Ok(())` means the
-/// child finished on purpose and is not restarted. The caller's place is the task's spawn site, which
-/// the shards' table of what held them names (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2).
+/// child finished on purpose and is not restarted. Placed on the next shard round-robin
+/// ([`crate::rt::spawn_spread_joined`]). The caller's place is the task's spawn site, which the
+/// shards' table of what held them names (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2).
 #[track_caller]
 pub fn spawn<F, Fut>(
     reg: &Registry,
@@ -86,7 +87,9 @@ where
 {
     let reg = reg.clone();
     let name = name.to_owned();
-    crate::rt::spawn(async move {
+    // A service the process keeps, placed round-robin over the shards rather than on the one that
+    // starts it (goal 9, plan 01a1a87b2cec step 3).
+    crate::rt::spawn_spread_joined(async move {
         let mut backoff = MIN_BACKOFF;
         loop {
             reg.update(&name, |c| {
@@ -130,14 +133,15 @@ where
     })
 }
 
-/// Spawn a one-shot task whose panic is logged instead of silently lost. The caller's place is the
-/// task's spawn site, as [`spawn`]'s.
+/// Spawn a one-shot task whose panic is logged instead of silently lost, placed and named as [`spawn`]'s
+/// are.
 #[track_caller]
 pub fn spawn_guarded<Fut>(name: &'static str, fut: Fut) -> JoinHandle<()>
 where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    crate::rt::spawn(async move {
+    // Placed round-robin over the shards, as [`spawn`]'s are.
+    crate::rt::spawn_spread_joined(async move {
         match AssertUnwindSafe(fut).catch_unwind().await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(task = name, error = %format!("{e:#}"), "task failed"),

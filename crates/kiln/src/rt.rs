@@ -511,6 +511,44 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
+/// [`spawn`], placed as [`spawn_spread`] places a task: on the next shard round-robin wherever the
+/// caller is, passing over one the watchdog sees held. For a service the process starts and keeps (a
+/// supervised child, a feed's loop): started from a task on one shard, as a server's are by its
+/// start-up on the shard that runs it, [`spawn`] would keep every one of them on that shard (goal 9,
+/// plan 01a1a87b2cec step 3: the lab's calm baseline found the server's shard 0 busy 0.24 of the time
+/// against 0.016 on each of the others, and its delay p99.9 94 ms against about 1 ms).
+#[track_caller]
+pub fn spawn_spread_joined<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let (fut, abort) = futures::future::abortable(fut);
+    let slot = handoff(Box::pin(async move {
+        if let Ok(v) = fut.await {
+            let _ = tx.send(v);
+        }
+    }));
+    let mut placed = submit_spread(&slot) || submit(&slot);
+    // Off the runtime (start-up, tests), a burst that filled the control queues is waited out, as
+    // `spawn_boxed` waits it out (a loop, not a closure, so the caller's place stays the spawn site).
+    if !placed && !on_shard() {
+        for _ in 0..2000 {
+            std::thread::sleep(Duration::from_millis(2));
+            if submit_spread(&slot) {
+                placed = true;
+                break;
+            }
+        }
+    }
+    if !placed {
+        crate::metrics::global().panics_caught.inc();
+        tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+    }
+    JoinHandle { rx, abort }
+}
+
 /// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, its task starting
 /// Critical: its first request's head must be read before the request's class is known, and reading a
 /// head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
