@@ -166,7 +166,9 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
-        let resp = match route(hub, req).await {
+        // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2).
+        let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
+        let resp = match crate::rt::labeled(label, route(hub, req)).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
@@ -6186,16 +6188,23 @@ fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
 /// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
+    // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
+    // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
+    // buffer), frames as each goes.
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
+        let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
         }
         return Ok(());
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
+    let mut held = crate::memory::SNAPSHOTS.hold(frames.iter().map(String::capacity).sum());
     for f in frames {
+        let n = f.capacity();
         tx.send(ws::text(f)).await?;
+        held.release(n);
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
@@ -6693,6 +6702,8 @@ mod tests {
             slow: crate::shard_health::Slow::default(),
             longest_poll: Duration::ZERO,
             overrun: Duration::ZERO,
+            tasks: 0,
+            most_tasks: 0,
         };
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
         // Held now: 1.5 s since its probe, past its 10 ms period.

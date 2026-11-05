@@ -145,7 +145,12 @@ paused is the pause's alone: the pacer neither stops it nor lets it go on.
   root): nothing outside it runs on those cores (f21). A user's install can confine the server
   there, not keep others off.
 - The server fixes its shards to them, one each, keeping the first core for its threads that
-  aren't shards, as hyper-rt's placement does (f11).
+  aren't shards, as hyper-rt's placement does (f11), and keeps its other threads off the shards'
+  cores (goal 9, plan `01a1a87b2cec` step 4): a thread or process starts with the CPUs of the thread
+  that started it, so the threads it starts after fixing them start on the rest, a thread a task on
+  a shard starts is moved off within the shards' probe period (`crate::rt::keep_apart`), and a child
+  a shard starts is moved as it starts. Linux alone: macOS and Windows have no cores of the server's
+  own (`[server] cores` is refused there), so nothing changes on them.
 
 In the lab, cores of its own held every page and API number within noise of the server alone, which
 weights didn't ("The lab", below). It stays off all the same: cores held for the server sit idle

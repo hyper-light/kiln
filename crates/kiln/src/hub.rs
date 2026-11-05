@@ -2210,20 +2210,21 @@ impl Hub {
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
             },
-            NetEvent::Frame { peer, lane, data, .. } => match proto::read_agent(&data) {
+            // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
+            // goal 9, plan 01a1a87b2cec step 3).
+            NetEvent::Frame { peer, lane, data, .. } => match crate::wire::payload::read_frame(data, self.agent_of(peer).is_some()).await {
                 // Anything on its control lane before its Hello is out of order: Hello comes first
                 // there. On its other lanes a frame may come before its Hello is read (it sends them
                 // once it's connected): it's let go, as it was.
-                Ok(msg) if self.agent_of(peer).is_none() && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => {
-                    let what = crate::wire::agent_name(&msg).to_owned();
+                crate::wire::payload::Frame::BeforeHello { what } => {
                     if lane == proto::LANE_CONTROL {
                         self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
                     } else {
                         tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
                     }
                 }
-                Ok(msg) => self.on_runner_msg(peer, msg).await?,
-                Err(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                crate::wire::payload::Frame::Read(carried) => self.on_carried(peer, carried).await?,
+                crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
             },
         }
         Ok(())
@@ -2231,9 +2232,16 @@ impl Hub {
 
     /// A runner's message read whole off one of its lanes: what it carries read too
     /// (`crate::wire::payload_of`), then applied; or, when that can't be read, refused to it
-    /// (`Unread`) and noted.
+    /// (`Unread`) and noted. The tests' way in: a frame comes through `on_net` (`read_frame`).
+    #[cfg(test)]
     async fn on_runner_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
-        match crate::wire::payload_of(msg) {
+        self.on_carried(peer, crate::wire::payload_of(msg)).await
+    }
+
+    /// A runner's message with what it carries read ([`Hub::on_runner_msg`]), applied; or, when that
+    /// couldn't be read, refused to it (`Unread`) and noted.
+    async fn on_carried(self: &Arc<Self>, peer: PeerId, carried: Result<Carried<AgentMsg, FromRunner>, Box<crate::wire::payload::Unreadable>>) -> anyhow::Result<()> {
+        match carried {
             Ok(m) => self.on_agent_msg(peer, m).await,
             Err(e) => {
                 self.unreadable_payload(peer, e, true).await;
@@ -4159,15 +4167,31 @@ impl Hub {
 
     /// Sample the server host itself for the UI ("server" series).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut sampler = crate::host::Sampler::new(Some(&self.cfg.server.data_dir));
+        let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
         let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
             }
-            let s = sampler.sample();
-            self.record_sample("server", s);
+            // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
+            // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
+            // this loop about 2 s every minute (found by the Bare Metal Migration agent, 01a195ef; goal 9,
+            // plan 01a1a87b2cec step 3). The sampler goes with it and comes back, so each sample is the
+            // difference from the one before, as it was.
+            let mut s = sampler.take().unwrap_or_else(|| crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
+            match crate::rt::blocking(move || {
+                let sample = s.sample();
+                (s, sample)
+            })
+            .await
+            {
+                Ok((back, sample)) => {
+                    sampler = Some(back);
+                    self.record_sample("server", sample);
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+            }
         }
     }
 

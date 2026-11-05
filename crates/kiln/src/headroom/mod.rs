@@ -426,6 +426,10 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut disks = Disks::default();
     let mut groups: Vec<pace::Group> = Vec::new();
     let mut loads: Vec<pace::Load> = Vec::new();
+    // The machine's CPU, all its processes counted: how much of it sat idle since the last look.
+    let mut machine_cpu = sysinfo::System::new();
+    machine_cpu.refresh_cpu_usage();
+    let mut cpu_idle: Option<f64> = None;
     let mut measured_at: Option<std::time::Instant> = None;
     let mut delivered: Option<f64> = None;
     // What each group was let run of the stretch it was measured over, and how long the pacer had
@@ -467,6 +471,9 @@ fn run(ctx: Ctx, mut settings: Settings) {
             let last = measured_at.replace(at);
             groups = pace::groups(settings.escapes);
             loads = meter.load(&groups);
+            machine_cpu.refresh_cpu_usage();
+            let used = f64::from(machine_cpu.global_cpu_usage());
+            cpu_idle = std::thread::available_parallelism().ok().filter(|_| used.is_finite()).map(|n| n.get() as f64 * (1.0 - used / 100.0).clamp(0.0, 1.0));
             delivered = disks.rate();
             let held = pacer.stopped();
             let span = last.map(|l| at.duration_since(l));
@@ -507,7 +514,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
         // they waited and run under.
         let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores };
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
         let plan = engine.step(&obs);
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);

@@ -128,6 +128,8 @@ async fn kill_and_reap(child: &mut Child) {
 pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let out = child.stdout.take().map(OwnedFd::from);
     let err = child.stderr.take().map(OwnedFd::from);
     let collected = crate::rt::timeout(timeout, async {
@@ -149,6 +151,8 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     nonblocking(&out)?;
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
@@ -197,6 +201,8 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let pgid = i32::try_from(child.id()).unwrap_or(0);
     let pipes = [child.stdout.take().map(OwnedFd::from), child.stderr.take().map(OwnedFd::from)];
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
@@ -402,6 +408,8 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let pid = child.id();
     let input = OwnedFd::from(child.stdin.take().context("no stdin pipe")?);
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);

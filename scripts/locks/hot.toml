@@ -32,6 +32,11 @@ hot = [
   "crates/kiln/src/hub.rs",
   "crates/kiln/src/net.rs",
   "crates/kiln/src/instances.rs",
+  # Agent sessions: the registry every session's update from its runner, every viewer's read and
+  # every command to one runs through (each session's copy its shard's, goal 4).
+  "crates/kiln/src/harness/registry.rs",
+  # Each machine's agent limit: read as sessions start and as runners say what they hold.
+  "crates/kiln/src/harness/limit.rs",
   # The bus the live feeds ride, and the logs.
   "crates/kiln/src/bus.rs",
   "crates/kiln/src/logs.rs",
@@ -158,3 +163,27 @@ at = "crates/kiln/src/logs.rs"
 name = "files"
 why = "one per live job, held by what writes that job's log alone (its runner's chunks, in order through the hub's loop; its steps; its end); no viewer takes it (a job's feed is its entry's, in the live jobs' copy), nor another job's writer"
 todo = "an owner per job's files, its chunks, steps and end its messages"
+
+# Agent sessions' registry: what a session's updates read beside its copy (names, epochs, holders,
+# keep-offs, changesets, what machines offer) are copies swapped in whole (crate::rcu); these three
+# are off the hot path.
+
+[[allowed]]
+at = "crates/kiln/src/harness/registry.rs"
+name = "use"
+why = "imports the registry's locks listed below"
+
+[[allowed]]
+at = "crates/kiln/src/harness/registry.rs"
+name = "scanner"
+why = "the server machine's own transcripts' scanner, for the history of its past sessions: one scan at a time, on the blocking pool, as a person opens that history; no session's update, viewer or command takes it"
+
+[[allowed]]
+at = "crates/kiln/src/harness/registry.rs"
+name = "holders_writing"
+why = "one write of holders.json at a time, on the blocking pool, as a session changes hands; no shard takes it"
+
+[[allowed]]
+at = "crates/kiln/src/harness/registry.rs"
+name = "waiting"
+why = "messages waiting for their session's inbox to answer (CP-T3.2): taken twice a message, as it's sent to a session and as its inbox's answer comes (an Inbox update, in the hub's loop); never on any other update, a viewer's read or a command"
