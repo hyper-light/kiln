@@ -376,21 +376,55 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 for a lab's A/B) is what a shard has in the real-time class's place where that's refused, needing no privilege
 (goal 8, plan `01a1a59c2b29` step 7; `hyper_rt::compute::nudge_current_thread`):
 
-- Each of a shard's waits in its driver ends by the timers' tick (100 µs), so with its timer slack (the tick
-  too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under `lazy` a wake
-  marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to user space
-  from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in user space
-  then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next tick (up to
-  1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once (docs/runtime-lab.md,
-  "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- Each of a shard's waits in its driver ends by its period, the step quantum less the timers' tick (166.7 µs;
+  goal 9, plan `01a1a87b2cec` step 4: `crate::rt::nudge_period_ns`), so with its timer slack (that tick) its CPU
+  takes an interrupt of the shard's own at least every quantum, 266.7 µs, while it waits: the host's share of a
+  ready task's delay in the quantum's derivation. Under `lazy` a wake marks the busy thread and sends no
+  interrupt, and the CPU switches as that thread next returns to user space from the kernel: the shard's own
+  timer is such a return. A shard woken behind a thread spinning in user space then runs within a quantum,
+  instead of at the kernel's next tick (up to 1 ms at 1000 Hz). Nothing a normal thread may set makes the wake
+  itself preempt at once (docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+  Until goal 9 step 4 the period was the timers' tick (100 µs), an interrupt every 200 µs: a third again as many
+  wakes for no bar they held.
 - A shard that took the real-time class doesn't nudge: its wake preempts at once. The others ask for their
   slice, then the nudge.
 - **Its cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
   threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. So it's off
   until declared.
+- **What the lab found** (docs/runtime-lab.md, "The nudge's A/B"; 2026-11-05, at the timers' tick): with hogs it
+  gave back most of what a lazy wake costs a request (API reads' wait for their shard at p99.9 from 1.53 to
+  0.60 ms, their median from 0.63 to 0.24 ms), but not goal 9 step 4's bar (the shards' delay p99.9 2.98 to
+  2.19 ms, the same within noise), at a busy share 27% higher. So it isn't the bare-metal default: it needs no
+  grant, but it doesn't make the bar, it costs what goal 9 step 5 cuts, and production's kernel preempts
+  fully, where it would only cost.
 - The log says how the shards took it once every shard has answered, and `/healthz/server` too
   (`priority.nudge`: asked, period, shards, nudged, those in the real-time class, refused, why).
 - **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound.
+
+## A spin before the park
+
+`KILN_RT_SPIN=1` (the lab's to ask for, off otherwise; goal 9, plan `01a1a87b2cec` step 4; `hyper_rt::park_spin`)
+has each of the server's shards spin before each park as long as its own idle gaps make cheapest in CPU, up to
+16 µs; `KILN_RT_SPIN_US` has it spin a fixed time whatever it costs, the lab's measure of what a longer spin buys:
+
+- A shard still spinning when its work comes is never woken: its senders find it running and skip their kicks, and
+  the work runs at once, where a park's wake would wait, on a kernel that preempts lazily, for its CPU's next
+  interrupt behind a thread busy there (up to a tick).
+- Each window of 385 idle moments, the spin becomes the one of 0, 1, 2, 4, 8 and 16 µs that would have spent the
+  least of the shard's CPU on them: a gap the spin catches costs the spin to it, one it misses the whole spin and
+  the park after it, whose CPU the shard learns from its own parks (its task clock, no system call) and its
+  senders' kicks. A gap a kick ended runs to the kick's stamp, not to the park's return, which adds the wake's own
+  latency. So it spins only where, on the last window's gaps, spinning cost less CPU than parking at once: the busy
+  share goal 9 step 5 holds the shards to can only fall by it.
+- Its spins, their hits, the time they spun and the spin in force are on `/metrics` (`kiln_shard_spins_total`,
+  `kiln_shard_spin_hits_total`, `kiln_shard_spin_seconds_total`, `kiln_shard_spin_window_seconds`), and what was
+  asked in `/healthz/server` (`priority.spin`); the log says it once every shard has taken it.
+- **What it can't do.** It catches only gaps under 16 µs: work a shard waits on longer (a request from another
+  CPU, most jobs on the pools) still wakes it, and that wait is the nudge's to bound. At the lab's rate of parks a
+  16 µs spin that missed every gap would cost 1.9% of a CPU a shard, three times goal 9 step 5's bar with hogs on
+  its own (docs/runtime-lab.md, "The shard's own wake path"), so only the sized spin is a candidate default, and
+  only where the lab's A/B finds it buys a number for no busy share. macOS and Windows take it as Linux does; only
+  Linux's shards learn a park's CPU on a task clock, so elsewhere a sized spin stays at none.
 
 ## Step 7's lab
 
@@ -726,3 +760,14 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   gives a partition's cores back. `os::tests::g9_s4_legs_and_agents_in_a_partition_keep_off_the_shards_cores`,
   `os::tests::g9_s4_the_real_time_room_is_given_up_whole` (Linux: a process's `RLIMIT_RTPRIO` to 0, soft and
   hard, read back from `/proc`), `os::cgroup::tests::g9_s4_the_partition_a_server_runs_in`.
+- Goal 9, plan `01a1a87b2cec` step 4, the shard's own wake path: kiln-rt's `park_spin::tests` (the cap a park
+  bound past the cheapest wake, the window's share to five points; long gaps or free parks never spin; the spin the
+  cheapest in CPU on the window's gaps, worked by hand; the chosen spin never costing more than parking, over a
+  spread of gaps and park costs; a sized spin sizing itself from hits and parks, a kicked park's gap to its stamp;
+  stale stamps, withdrawn parks and an unmeasured park cost; fixed and off spins, a new ask; only a shard may ask)
+  and `shard_loop::park_spin_loop` (in the loop: no spin asked, none made; a fixed spin running out and the park
+  after it, or finding a wake at once with no park; a sized spin counting each park's gap and learning a park's
+  CPU where the shard has a task clock). `rt::tests::g9_s4_the_nudge_s_period_is_the_quantum_less_the_timers_slack`,
+  `g9_s4_the_spin_before_a_park_is_the_labs_to_ask_for`, `g9_s4_the_spin_is_said_as_the_shards_took_it`;
+  `shard_health::tests::g9_s4_each_shards_spins_before_its_parks_are_on_metrics`; kiln-lab's
+  `lab::tests::g9_s4_the_shards_spins_before_their_parks_are_reported_per_request`.
