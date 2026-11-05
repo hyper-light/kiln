@@ -16,7 +16,7 @@ pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChildStatus {
     pub name: String,
     pub state: &'static str,
