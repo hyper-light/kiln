@@ -31,6 +31,14 @@ pub struct Ask {
     pub class: Class,
     pub repo: String,
     pub actor: String,
+    /// Its lane (a repository's workflow on a branch, W28-R66): fair share's third level, where
+    /// `fair_by` goes that deep. Appended: optional, empty from an owner before it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lane: String,
+    /// Its priority in its tenant's own order (W05-R09: higher first, aged as it waits). Appended:
+    /// optional, 0 from an owner before it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub priority: u8,
     /// Its median and 90th-percentile durations, from history (docs/needs.md E6), when it has any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub median: Option<Ms>,
@@ -39,6 +47,10 @@ pub struct Ask {
     /// Its own limit (`--timeout`): its runner stops it then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Ms>,
+}
+
+fn is_zero(p: &u8) -> bool {
+    *p == 0
 }
 
 /// An owner as a runner hears it: its node's name and its epoch, one past the last it took, kept

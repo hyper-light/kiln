@@ -36,7 +36,7 @@ fn machine(cpus: u64, mem_gib: u64, busy: u64, used_gib: u64) -> Sample {
 }
 
 fn settings(backfill: bool) -> Settings {
-    Settings { budget: None, overcommit_cpu: 1000, backfill, weights: BTreeMap::new() }
+    Settings { budget: None, overcommit_cpu: 1000, backfill, weights: BTreeMap::new(), ..Settings::default() }
 }
 
 fn runner(sample: Sample, backfill: bool) -> Admission {

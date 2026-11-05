@@ -416,7 +416,7 @@ impl Sim {
         if !r.places {
             return;
         }
-        let settings = Settings { budget: None, overcommit_cpu: 1000, backfill: true, weights: BTreeMap::new() };
+        let settings = Settings { budget: None, overcommit_cpu: 1000, backfill: true, weights: BTreeMap::new(), ..Settings::default() };
         let init = Init { me: rname(j), epoch: r.epoch, facts: linux(), labels: Vec::new(), sample, records: r.records.clone(), settings };
         r.core = Some(Admission::new(init, now));
     }

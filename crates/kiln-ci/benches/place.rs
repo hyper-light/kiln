@@ -99,7 +99,7 @@ fn admission(n: u32, d: usize, steps: u32) {
         labels: Vec::new(),
         sample: Sample { size, ..Sample::default() },
         records: Records::new(),
-        settings: Settings { budget: None, overcommit_cpu: 1000, backfill: true, weights: Default::default() },
+        settings: Settings { budget: None, overcommit_cpu: 1000, backfill: true, weights: Default::default(), ..Settings::default() },
     };
     let mut a = Admission::new(init, 0);
     let cap = a.cap();

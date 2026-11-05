@@ -275,7 +275,7 @@ pub fn shares(asks: &[u64; DIMS], fleet: &[u64; DIMS]) -> [u128; DIMS] {
 
 /// What `held` (in each dimension) is of the fleet, in millionths of its dominant share: the
 /// largest over the dimensions the fleet has of `held` there over the fleet's, rounded down.
-fn held_share(held: &[u128; DIMS], fleet: &[u64; DIMS]) -> u128 {
+pub fn held_share(held: &[u128; DIMS], fleet: &[u64; DIMS]) -> u128 {
     held.iter().zip(fleet).filter(|(_, f)| **f > 0).map(|(h, f)| h.saturating_mul(MILLION) / u128::from(*f)).max().unwrap_or(0)
 }
 
@@ -313,8 +313,35 @@ pub const LEVELS: usize = 3;
 
 /// A leaf of the tenant tree and the nodes above it, from its repository down: `repo`,
 /// `repo\0actor`, `repo\0actor\0lane`.
-fn nodes(leaf: &str) -> impl Iterator<Item = &str> {
+pub fn nodes(leaf: &str) -> impl Iterator<Item = &str> {
     leaf.match_indices('\0').map(|(i, _)| i).chain(std::iter::once(leaf.len())).filter_map(|i| leaf.get(..i))
+}
+
+/// The leaf of the tenant tree an item of `repo`, `actor` and `lane` waits in, as fair share's
+/// levels go (`fair_by`, W28-R66): its repository, then inside it its actor, then its lane, each
+/// level below the repository joined by `\0` ([`nodes`] splits it again). The engine's queues and
+/// a runner's own admission (`crate::place::runner`) both key fair share by it.
+pub fn leaf_of(fair_by: &[FairBy], repo: &str, actor: &str, lane: &str) -> String {
+    let mut leaf = repo.to_owned();
+    for level in fair_by.iter().skip_while(|f| **f == FairBy::Repo) {
+        let member = match level {
+            FairBy::Actor => actor,
+            FairBy::Lane => lane,
+            FairBy::Repo => continue,
+        };
+        leaf.push('\0');
+        leaf.push_str(member);
+    }
+    leaf
+}
+
+/// The milliseconds of its floor's pace an item going over its class's floor takes (W05-R31): its
+/// dominant share × `ms` over what was left of the floor (`left`, millionths), rounded up. Taking
+/// room again no sooner, the class holds, on average, what was left of its floor with it: on one
+/// slot, a 15 % floor is a slot 15 % of the time, not every time it frees.
+pub fn pace_ms(shares: &[u128; DIMS], ms: Ms, left: u128) -> i64 {
+    let dominant = shares.iter().copied().max().unwrap_or(0);
+    i64::try_from(dominant.saturating_mul(u128::from(ms)).div_ceil(left.max(1))).unwrap_or(i64::MAX)
 }
 
 /// What a leg's dispatch charged fair share (W05-R32), settled when its attempt ends:
@@ -1101,20 +1128,27 @@ struct Leg {
 /// reservations go by, and when it ends at the latest. Its median-based end, which ranks
 /// runners (W24-R18), is [`Leg::ends`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Due {
+pub struct Due {
     /// When it started.
-    from: i64,
+    pub from: i64,
     /// Its start plus its p90, else its cost, else its timeout; never past `hard`.
-    expected: i64,
+    pub expected: i64,
     /// Its start plus its timeout: its runner stops it then.
-    hard: i64,
+    pub hard: i64,
 }
 
 impl Due {
     /// The ends of a grant of `l` started at `from`.
     fn of(l: &LegIn, from: i64) -> Due {
-        let hard = later(from, l.timeout.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let expected = l.p90.or(l.cost).map_or(hard, |ms| later(from, ms).min(hard));
+        Due::of_parts(l.p90, l.cost, l.timeout, from)
+    }
+
+    /// The ends of a grant started at `from` of an item whose history says `p90` and `median`
+    /// (its cost), and whose own limit is `timeout` (GitHub's 360 minutes when it says none): a
+    /// runner's admission reckons its claims' ends by this too (`crate::place::runner`).
+    pub fn of_parts(p90: Option<Ms>, median: Option<Ms>, timeout: Option<Ms>, from: i64) -> Due {
+        let hard = later(from, timeout.unwrap_or(DEFAULT_TIMEOUT_MS));
+        let expected = p90.or(median).map_or(hard, |ms| later(from, ms).min(hard));
         Due { from, expected, hard }
     }
 
@@ -1122,7 +1156,7 @@ impl Due {
     /// moves on to its start plus twice the time it has run, never past its hard end. The
     /// prediction is corrected once it's proved wrong, its kill-time kept apart (Tsafrir, Etsion
     /// and Feitelson, EASY++).
-    fn at(self, now: i64) -> Due {
+    pub fn at(self, now: i64) -> Due {
         if self.expected > now {
             return self;
         }
@@ -2492,21 +2526,13 @@ impl Scheduler {
         self.paced.get(&class).is_none_or(|at| now >= *at).then_some((id, Some(left)))
     }
 
-    /// The milliseconds of its floor's pace a leg going over its class's floor takes (W05-R31): its
-    /// dominant share of the fleet × `ms` over what was left of the floor (`left`, millionths),
-    /// rounded up. Taking room again no sooner, the class holds, on average, what was left of its
-    /// floor with it: on one slot, a 15 % floor is a slot 15 % of the time, not every time it
-    /// frees.
-    fn pace_ms(shares: &[u128; DIMS], ms: Ms, left: u128) -> i64 {
-        let dominant = shares.iter().copied().max().unwrap_or(0);
-        i64::try_from(dominant.saturating_mul(u128::from(ms)).div_ceil(left.max(1))).unwrap_or(i64::MAX)
-    }
+
 
     /// A leg went over its class's floor ([`Self::ahead_of`]): its class may next do so once the
     /// pace it takes has passed, kept with its charge to settle to the time it ran.
     fn pace(&mut self, id: &str, left: u128, now: i64) {
         let Some(c) = self.legs.get_mut(id).and_then(|l| l.charge.as_mut()) else { return };
-        let took = Self::pace_ms(&c.shares, c.ms, left);
+        let took = pace_ms(&c.shares, c.ms, left);
         c.paced = Some((took, left));
         let class = c.class;
         self.paced.insert(class, now.saturating_add(took));
@@ -2580,17 +2606,7 @@ impl Scheduler {
     /// A leg's tenant: the tenant tree's leaf it waits in, its repository, then its actor and its
     /// lane as `fair_by` goes (W05-R10, W28-R66, docs/needs.md E2.2): `repo\0actor\0lane`.
     fn leaf(&self, l: &LegIn) -> String {
-        let mut leaf = l.repo.clone();
-        for level in self.config().fair_by.iter().skip_while(|f| **f == FairBy::Repo) {
-            let member = match level {
-                FairBy::Actor => l.actor.as_str(),
-                FairBy::Lane => l.lane.as_str(),
-                FairBy::Repo => continue,
-            };
-            leaf.push('\0');
-            leaf.push_str(member);
-        }
-        leaf
+        leaf_of(&self.config().fair_by, &l.repo, &l.actor, &l.lane)
     }
 
     /// The weights of a leg's tenant's nodes, top down, in thousandths: its repository's from
@@ -3029,7 +3045,7 @@ impl Scheduler {
         }
         let ran = Ms::try_from(now.saturating_sub(c.at).max(0)).unwrap_or(0);
         if let Some((took, left)) = c.paced {
-            let used = Self::pace_ms(&c.shares, ran, left);
+            let used = pace_ms(&c.shares, ran, left);
             if let Some(at) = self.paced.get_mut(&c.class) {
                 *at = at.saturating_sub(took).saturating_add(used);
             }

@@ -112,6 +112,9 @@ use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Gan
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
+/// A runner's own admission held to this reference (docs/needs.md E5, one engine).
+mod one_runner;
+
 const CASES: u64 = 10_000;
 const MINUTE: i64 = 60_000;
 const GIB: u64 = 1 << 30;

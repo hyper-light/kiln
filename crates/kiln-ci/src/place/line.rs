@@ -4,29 +4,37 @@
 //! randomized search tree, its priorities a hash of each entry's arrival so that every replay
 //! builds the same tree, docs/needs.md §9's "replay is exact"), each node summing its subtree.
 //!
-//! - **Order**: by [`Key`]: class first (W05-R30), then the run's start tag in its class's fair
-//!   share (start-time fair queuing, [`super::runner`]), then arrival.
+//! - **Order**: by [`Key`], the engine's own order (`crate::sched::state`'s pick key, docs/needs.md
+//!   §5): class first (W05-R30), then its tenant's standing in its class's tree, level by level
+//!   (hierarchical start-time fair queuing, W05-R32), then its place in its tenant's own order
+//!   (W05-R09's priority, aged), then arrival.
 //! - **Place**: how many come before a key ([`Line::rank`]), and the one at a place
 //!   ([`Line::select`]).
 //! - **What's ahead**: the sums of what comes before a key ([`Line::ahead`]): how many, the work
 //!   each dimension holds (amount times predicted time), how many have no prediction, and their
 //!   timeouts; what an estimate of the start is made from.
-//! - **The first that fits**: the first in order that fits what's free, predicted to end within a
-//!   time, and that the caller accepts ([`Line::find`]), each subtree passed over at once when the
-//!   least it asks in each dimension doesn't fit, or its shortest predicted run is too long.
+//! - **The first that fits**: the first in order (of one class, or of all) that fits what's free,
+//!   predicted to end within a time, and that the caller accepts ([`Line::find`]), each subtree
+//!   passed over at once when the least it asks in each dimension doesn't fit, or its shortest
+//!   predicted run is too long; a class is found by the key's order, O(log n).
 
 use super::ask::{Amounts, DIMS, fits};
+use crate::sched::state::LEVELS;
 use crate::sched::units::Ms;
 
 /// No node.
 const NIL: u32 = u32::MAX;
 
-/// Where an entry stands in a line: its class's place in [`crate::sched::state::Class::ALL`], its
-/// start tag, and its arrival (unique, so no two keys are alike).
+/// Where an entry stands in a line, as the engine orders its queue (`sched::state`'s pick key):
+/// its class's place in [`crate::sched::state::Class::ALL`], its tenant's standing in that class's
+/// tree from its repository down (each level `max(V[parent], finish[node])`, W05-R32), its place
+/// in its tenant's own order (`sched::state::own_order`, W05-R09), and its arrival (unique, so no
+/// two keys are alike).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key {
     pub class: u8,
-    pub tag: u128,
+    pub standing: [u128; LEVELS],
+    pub own: i128,
     pub seq: u64,
 }
 
@@ -118,6 +126,8 @@ struct Node {
 /// What [`Line::find`] looks for.
 #[derive(Debug, Clone, Copy)]
 pub struct Query<'a> {
+    /// Only entries of this class ([`Key::class`]); any when `None`.
+    pub class: Option<u8>,
     /// Only entries after this key.
     pub after: Option<&'a Key>,
     /// Only what fits this.
@@ -327,10 +337,16 @@ impl Line {
 
     fn find_in(&self, t: u32, q: &Query<'_>, ok: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
         let n = self.nodes.get(ix(t))?;
+        // One class: its entries are a run of the order, found as a key is.
+        match q.class.map(|c| n.key.class.cmp(&c)) {
+            Some(std::cmp::Ordering::Less) => return self.find_in(n.right, q, ok),
+            Some(std::cmp::Ordering::Greater) => return self.find_in(n.left, q, ok),
+            _ => {}
+        }
         if !fits(&n.all.least, q.free) || n.all.shortest > q.within {
             return None;
         }
-        if q.after.is_none_or(|a| n.key > *a) {
+        if q.after.is_none_or(|a| n.key > *a) && q.class.is_none_or(|c| n.key.class == c) {
             if let Some(found) = self.find_in(n.left, q, ok) {
                 return Some(found);
             }
@@ -339,6 +355,15 @@ impl Line {
             }
         }
         self.find_in(n.right, q, ok)
+    }
+
+    /// How many of class `class` wait in it: O(log n), from the places where its run of the order
+    /// begins and ends.
+    pub fn count_of(&self, class: u8) -> u32 {
+        let from = Key { class, standing: [0; LEVELS], own: i128::MIN, seq: 0 };
+        let to = class.checked_add(1).map(|c| Key { class: c, standing: [0; LEVELS], own: i128::MIN, seq: 0 });
+        let end = to.map_or_else(|| self.len(), |k| self.rank(&k));
+        end.saturating_sub(self.rank(&from))
     }
 
     /// Every entry in order: its key and slot (for views and tests; O(n)).
@@ -365,7 +390,7 @@ mod tests {
     use super::*;
 
     fn key(class: u8, tag: u128, seq: u64) -> Key {
-        Key { class, tag, seq }
+        Key { class, standing: [tag, 0, 0], own: 0, seq }
     }
 
     fn item(slot: u32, cpu: u64, predicted: Option<Ms>) -> Item {
@@ -387,9 +412,13 @@ mod tests {
         assert_eq!((a.count, a.unpredicted, work, least), (2, 1, 160_000, 1000));
         assert_eq!(l.select(1).map(|(_, s)| s), Some(2));
         let free = [4000, 0, 0, 0];
-        assert_eq!(l.find(&Query { after: None, free: &free, within: u64::MAX }, &mut |_| true).map(|(_, s)| s), Some(2));
-        assert_eq!(l.find(&Query { after: None, free: &free, within: 15 }, &mut |_| true).map(|(_, s)| s), Some(1), "only what ends in time");
-        assert_eq!(l.find(&Query { after: None, free: &free, within: u64::MAX }, &mut |s| s != 2).map(|(_, s)| s), Some(1));
+        assert_eq!(l.find(&Query { class: None, after: None, free: &free, within: u64::MAX }, &mut |_| true).map(|(_, s)| s), Some(2));
+        assert_eq!(l.find(&Query { class: None, after: None, free: &free, within: 15 }, &mut |_| true).map(|(_, s)| s), Some(1), "only what ends in time");
+        assert_eq!(l.find(&Query { class: None, after: None, free: &free, within: u64::MAX }, &mut |s| s != 2).map(|(_, s)| s), Some(1));
+        // One class: the first that fits of class 2 is 3, which doesn't fit in 4 CPUs.
+        assert_eq!(l.find(&Query { class: Some(2), after: None, free: &free, within: u64::MAX }, &mut |_| true), None);
+        assert_eq!(l.find(&Query { class: Some(3), after: None, free: &[9000, 0, 0, 0], within: u64::MAX }, &mut |_| true).map(|(_, s)| s), Some(2));
+        assert_eq!((l.count_of(2), l.count_of(3), l.count_of(4)), (1, 2, 0));
         assert!(l.remove(&key(3, 2, 2)) && !l.remove(&key(3, 2, 2)));
         assert_eq!(l.len(), 2);
         // A slot freed is used again.
@@ -402,14 +431,14 @@ mod tests {
     enum Op {
         Insert { class: u8, tag: u8, cpu: u8, predicted: Option<u8> },
         Remove { pick: u8 },
-        Find { cpu: u8, within: Option<u8>, after: Option<u8> },
+        Find { cpu: u8, within: Option<u8>, after: Option<u8>, class: Option<u8> },
     }
 
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             (0..3u8, 0..6u8, 0..8u8, proptest::option::of(0..9u8)).prop_map(|(class, tag, cpu, predicted)| Op::Insert { class, tag, cpu, predicted }),
             any::<u8>().prop_map(|pick| Op::Remove { pick }),
-            (0..9u8, proptest::option::of(0..9u8), proptest::option::of(any::<u8>())).prop_map(|(cpu, within, after)| Op::Find { cpu, within, after }),
+            (0..9u8, proptest::option::of(0..9u8), proptest::option::of(any::<u8>()), proptest::option::of(0..3u8)).prop_map(|(cpu, within, after, class)| Op::Find { cpu, within, after, class }),
         ]
     }
 
@@ -439,18 +468,21 @@ mod tests {
                             prop_assert!(l.remove(&k));
                         }
                     }
-                    Op::Find { cpu, within, after } => {
+                    Op::Find { cpu, within, after, class } => {
                         let free = [u64::from(cpu), 0, 0, 0];
                         let within = within.map_or(u64::MAX, u64::from);
                         let after = after.and_then(|a| m.keys().nth(usize::from(a) % m.len().max(1)).copied());
-                        let want = m.iter().find(|(k, i)| after.is_none_or(|a| **k > a) && fits(&i.ask, &free) && i.predicted.unwrap_or(u64::MAX) <= within).map(|(k, i)| (*k, i.slot));
-                        let got = l.find(&Query { after: after.as_ref(), free: &free, within }, &mut |_| true);
+                        let want = m.iter().find(|(k, i)| after.is_none_or(|a| **k > a) && class.is_none_or(|c| k.class == c) && fits(&i.ask, &free) && i.predicted.unwrap_or(u64::MAX) <= within).map(|(k, i)| (*k, i.slot));
+                        let got = l.find(&Query { class, after: after.as_ref(), free: &free, within }, &mut |_| true);
                         prop_assert_eq!(got, want);
                     }
                 }
                 prop_assert_eq!(l.len(), u32::try_from(m.len()).unwrap_or(0));
                 let entries: Vec<(Key, u32)> = m.iter().map(|(k, i)| (*k, i.slot)).collect();
                 prop_assert_eq!(l.entries(), entries.clone());
+                for c in 0..3u8 {
+                    prop_assert_eq!(l.count_of(c), u32::try_from(m.keys().filter(|k| k.class == c).count()).unwrap_or(0));
+                }
                 for (n, (k, _)) in entries.iter().enumerate() {
                     prop_assert_eq!(l.rank(k), u32::try_from(n).unwrap_or(0));
                     prop_assert_eq!(l.select(u32::try_from(n).unwrap_or(0)).map(|(k2, _)| k2), Some(*k));

@@ -910,3 +910,22 @@ for its attempt, and waits for another if that was the only one that could take 
 (`other-runner`): only a gang's refusals are forgiven. The end-to-end tests of a refused member and
 of a store that can't write a gang's grants need kiln's `chaos` feature, which the gate doesn't
 build. W05-AC14's limit wasn't measured again with backfilling on.
+
+**E5, begun (branch `lb/core`, 2026-11-04): one engine, decided where the room is.** A runner's own
+admission (`kiln_ci::place::runner`) decides by the engine's policy, with the engine's own pure
+functions (`sched::state`'s `own_order`, `shares`, `charges`, `held_share`, `pace_ms`, `leaf_of`,
+`nodes`, `Due`), over its own line (`place::line`, a treap O(log n) for every change and question,
+now keyed as the engine's queue is: class, the tenant's standing level by level, its own aged order,
+arrival). Classes go in order with their floors and pace; a run waited past its bound while its class
+started nothing here goes up a class; an `interactive` run goes up into `land` once the `land` and
+`critical` work that came before it no longer waits, at that work's latest expected end (§5's
+integration call); fair share is DRF over the tenant tree, charged as a run is offered and settled to
+what it ran. Room is the engine's rule (W05-R03: `exclusive` whole or a share), against what the
+runner measures, never past its budget. Each look at a promotion is a timer the runner asks for. Held
+to the reference as the engine is: `sched::reference::one_runner`, 10,000 one-runner cases (every
+class, floors and bounds drawn, aging, two and three levels of fair share, whole runs and shares,
+draining), zero disagreements. What a runner's admission doesn't do of the engine's: room kept is for
+its first in line (the engine keeps it for each class's first across the fleet), gangs, leases, and
+where a run goes (the owner's, `place::owner`). A tenant's standing moving re-keys its waiting runs,
+O(k log n) for the k of the class charged whose tenants moved, with fair share deeper than repositories
+re-keying a repository's leaves whose parent moved: the line's one cost above O(log n).

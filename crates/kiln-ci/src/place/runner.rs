@@ -1,21 +1,42 @@
-//! The runner's side of placement (docs/reach.md §2; docs/needs.md §5, §6, §8, §9 and E5): it
+//! The runner's side of placement (docs/reach.md §2; docs/needs.md §5, §6, §7, §8, §9 and E5): it
 //! admits what owners probe it with against its own measured room, and its ledger is the last word
-//! on that room (G1). Every event is O(log n) in the runs waiting here, but for news to an owner
-//! whose link went down or came back, which is a message for each of its runs.
+//! on that room (G1). It decides by the engine's policy (`crate::sched::state`, docs/needs.md §5
+//! and §7), the same pure functions, over its own line: one engine, decided where the room is.
+//! Every event is O(log n) in the runs waiting here, but for news to an owner whose link went down
+//! or came back, which is a message for each of its runs, and fair share's standing moving (below).
 //!
-//! - **Its line** ([`super::line::Line`]): class first (W05-R30), then fair share within the class,
-//!   start-time fair queuing (Goyal, Vin and Cheng, SIGCOMM 1996) over the runs' tenants (repository
-//!   and actor), each run's start tag set as it comes: the later of the class's virtual time and its
-//!   tenant's last finish tag, its finish tag that plus its cost, its dominant share of this runner
-//!   times its predicted run time over its repository's weight (DRF's dominant share, Ghodsi et al.,
-//!   NSDI 2011; docs/needs.md §5). A run with no prediction costs nothing until it ends, when what it
-//!   ran is charged to its tenant: start-time fair queuing needs no time beforehand.
-//! - **Admission**: the first in line starts if it fits what's free (its room never more than the
-//!   budget, memory, disk and GPUs never overcommitted, docs/needs.md §3). If it doesn't and
-//!   `backfill` is declared, room is kept for it (EASY backfilling, Lifka 1995; W05-R39): from when
-//!   the claims here are predicted to have left it room; only what fits beside that room, or is
-//!   predicted to end by then, starts ahead of it. A run that takes the runner whole is kept room
-//!   the same way, so a stream of small runs never starves it.
+//! - **Its line** ([`super::line::Line`]), in the engine's order: class first (W05-R30), then the
+//!   run's tenant's standing in its class's tree (hierarchical start-time fair queuing over the
+//!   tenant tree, Goyal, Vin and Cheng, SIGCOMM 1996; W05-R32: repository, then actor, then lane as
+//!   `fair_by` goes, each level `max(V[parent], finish[node])`), then its place in its tenant's own
+//!   order (W05-R09's priority, aged as it waits, `sched::state::own_order`), then arrival.
+//! - **Fair share's charge** (W05-R32, R33, as the engine charges it): a run is charged as it's
+//!   offered (dispatched, Kueue's entry penalty), at every node from its repository down, its
+//!   dominant share of this runner (DRF, Ghodsi et al., NSDI 2011: the largest of its slot, CPUs,
+//!   memory and GPUs over what the runner offers) times its median time over the node's weight; and
+//!   settled to the time it ran when it ends (DRFQ: start-time fair queuing needs no time
+//!   beforehand). With no median and no `default_cost` set, it costs nothing until it ends.
+//!   A tenant's standing moves as it's charged or settled, and so do its runs' keys: each is put
+//!   in again at its new place, O(log n) each, over the leaves of the class charged.
+//! - **Classes** (W05-R30, R31, docs/needs.md §7): strictly in order, but a class short of its floor
+//!   share (its running runs' holds, at their largest dimension over what the runner offers) goes
+//!   ahead with a run that keeps it within its floor, or with one that takes it over once the
+//!   floor's pace allows (`sched::state::pace_ms`). A run that waited its class's bound while its
+//!   class started nothing here goes up a class (never into `critical`, never preempting); an
+//!   `interactive` run goes up into `land` once the `land` and `critical` work ahead of it when it
+//!   came is no longer waiting, at the latest expected end of that work still running (its p90,
+//!   else its median, else its timeout, GitHub's 360 minutes unsaid: `sched::state::Due`). Each
+//!   look is a timer ([`Self::timer`]), and every input takes those due by its time first.
+//! - **Admission**: of each class, the first in order that has room starts (work-conserving first
+//!   fit, as the engine's pick); room is the engine's rule (W05-R03): an `exclusive` run asking no
+//!   CPUs takes the runner whole and waits for it empty (its CI legs too), one asking CPUs holds
+//!   them and its memory alone, never overcommitted, and any other fits beside what's held, its
+//!   CPUs overcommitted as the person's `overcommit_cpu` says. Memory, disk and GPUs are never
+//!   overcommitted (docs/needs.md §3), and nothing passes the budget (G1).
+//! - **Kept room** (`backfill` declared, EASY backfilling, Lifka 1995; W05-R39): the first in line
+//!   that has no room keeps room from when the claims here are predicted to have left it room; only
+//!   what fits beside that room, or is predicted to end by then, starts ahead of it. A run that
+//!   takes the runner whole is kept room the same way, so a stream of small runs never starves it.
 //! - **Offers**: a run given room is offered to its owner as a claim fenced by this runner's epoch
 //!   and its number in it (W05-R34), held for the link's retransmission timeout (RFC 6298, measured
 //!   by the shell, [`super::link::Rtt`]); taken, its room is held until the owner starts it or is
@@ -35,11 +56,16 @@ use super::link::Rtt;
 use super::msg::{Estimate, Place, Reason, ToOwner, shortfall};
 use crate::facts::RunnerFacts;
 use crate::sched::routing::Constraint;
-use crate::sched::state::{Fence, PerMille, Resources};
+use crate::sched::state::{self as engine, Class, ClassConfig, Due, FairBy, Fence, LEVELS, PerMille, Resources};
 use crate::sched::units::Ms;
 
-/// What a runner admits by: each a setting the person decides.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Fair share's dimensions, as the engine counts them (W05-R33): slots, milli-CPUs, memory bytes
+/// and GPUs.
+const FAIR: usize = engine::DIMS;
+
+/// What a runner admits by: each a setting the person decides, as the engine's are (`[ci.scheduler]`,
+/// `[sched.classes]`, `[ci.fairness]`), defaulting as the engine's do.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// What kiln may place here (`[runner] budget`, docs/needs.md §6): the machine when `None`.
     pub budget: Option<Resources>,
@@ -50,6 +76,37 @@ pub struct Settings {
     /// Fair share's weights by repository, in thousandths (`[ci.fairness] weights`, W05-R10); a
     /// repository not named weighs 1, as every other not named does.
     pub weights: BTreeMap<String, PerMille>,
+    /// Each class's floor and bound (`[sched.classes]`, W05-R31): the engine's defaults
+    /// ([`engine::default_classes`]) unless set.
+    pub classes: BTreeMap<Class, ClassConfig>,
+    /// Priority a waiting run gains a minute in its tenant's own order (W05-R09), in thousandths.
+    pub aging_per_minute: PerMille,
+    /// What fair share is between (W05-R10, W28-R66): repositories, then their actors, then lanes.
+    pub fair_by: Vec<FairBy>,
+    /// The runner's slots (`[runner] slots`): one of fair share's dimensions, each run holding one;
+    /// none counted when 0.
+    pub slots: u32,
+    /// What a run with no median is charged as it starts (`[ci.scheduler] default_cost`): `None`,
+    /// nothing until it ends, when it's charged what it ran (start-time fair queuing needs no time
+    /// beforehand).
+    pub default_cost: Option<Ms>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        let engine = engine::Config::default();
+        Settings {
+            budget: None,
+            overcommit_cpu: 1000,
+            backfill: false,
+            weights: BTreeMap::new(),
+            classes: engine.classes,
+            aging_per_minute: engine.aging_per_minute,
+            fair_by: engine.fair_by,
+            slots: 0,
+            default_cost: None,
+        }
+    }
 }
 
 /// A message for an owner: whose (its node's name), and what.
@@ -106,11 +163,47 @@ enum State {
     Running { fence: Fence, from: i64 },
 }
 
+/// What a run holds of the runner while it holds room (W05-R03, the engine's `Claim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Room beside what's held, its CPUs overcommitted as the setting says.
+    Ordinary,
+    /// `exclusive`, asking CPUs: those and its memory, held alone, never overcommitted.
+    Share,
+    /// `exclusive`, asking no CPUs: the runner whole, empty.
+    Whole,
+}
+
+fn kind_of(a: &Ask) -> Kind {
+    match (a.needs.exclusive, a.needs.request.cpu.is_zero()) {
+        (false, _) => Kind::Ordinary,
+        (true, false) => Kind::Share,
+        (true, true) => Kind::Whole,
+    }
+}
+
 /// What a waiting run's owner was last told, as news counts it: its place and its reason's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Told {
     place: Place,
     reason: (u8, Option<i64>),
+}
+
+/// What a run's dispatch charged fair share and its class's floor (the engine's `Charge`), settled
+/// when its claim ends.
+#[derive(Debug, Clone, Copy)]
+struct Charge {
+    class: Class,
+    /// Its shares of what the runner offers (millionths), and what fair share's tags take of them.
+    shares: [u128; FAIR],
+    fair: [u128; FAIR],
+    /// The milliseconds it was charged for, and when.
+    ms: Ms,
+    at: i64,
+    /// What it holds in each of fair share's dimensions, against its class's floor.
+    holds: [u64; FAIR],
+    /// Over its class's floor: the pace it took and what was left of the floor.
+    paced: Option<(i64, u128)>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,14 +214,29 @@ struct Probe {
     amounts: Amounts,
     predicted: Option<Ms>,
     state: State,
-    /// Its place in the line, from when it first came in: it keeps it while aside.
+    /// Its place in the line, from when it came in: it keeps its own order and arrival while aside,
+    /// its standing taken as it goes back in.
     key: Option<Key>,
-    tenant: String,
-    /// What fair share charged it as it came in.
-    charged: u128,
-    /// A claim's predicted end and hard end (its timeout), when it has them.
+    /// Its tenant's leaf in the tenant tree (`repo`, `repo\0actor`, `repo\0actor\0lane`) and its
+    /// nodes' weights, top down.
+    leaf: String,
+    weights: [PerMille; LEVELS],
+    /// Its class now: the one it came with, or the one its wait brought it to (W05-R31).
+    class: Class,
+    /// Its place in its tenant's own order, its arrival here, and when it came.
+    own: i128,
+    seq: u64,
+    /// When it came to its class, counted over this runner: the `land` and `critical` work that
+    /// came to theirs before an `interactive` run came to its own is what it waits behind.
+    came: u64,
+    /// For an `interactive` run: when it goes up into `land`, once that work no longer waits.
+    land_due: Option<i64>,
+    charge: Option<Charge>,
+    /// A claim's predicted end and hard end (its timeout), by the shell's prediction, when it has
+    /// them; and its ends as the engine reckons them (p90, else median, else timeout).
     end: Option<i64>,
     hard: Option<i64>,
+    due: Option<Due>,
     told: Option<Told>,
 }
 
@@ -142,11 +250,20 @@ struct OwnerAt {
     rtt: Option<Rtt>,
 }
 
-/// One class's fair share: its virtual time, and each tenant's last finish tag.
+/// One class's fair share and floor, as the engine keeps them: each parent node's virtual time and
+/// each node's finish tag (the runner's own set of dimensions alone), what its running runs hold,
+/// when its floor's pace lets it go over its floor again, when it last started a run here, and the
+/// runs waiting in it, by leaf, with the standing their keys hold.
 #[derive(Debug, Clone, Default)]
 struct Fair {
-    vtime: u128,
+    vtimes: BTreeMap<String, u128>,
     finish: BTreeMap<String, u128>,
+    held: [u128; FAIR],
+    paced: Option<i64>,
+    served: Option<i64>,
+    leaves: BTreeMap<String, ([u128; LEVELS], BTreeSet<u32>)>,
+    /// Its tags moved since its runs' keys were last put right.
+    moved: bool,
 }
 
 /// The runner's admission of probed runs: pure, its inputs the probes and their owners' words, the
@@ -160,13 +277,16 @@ pub struct Admission {
     facts: RunnerFacts,
     labels: Vec<String>,
     sample: Sample,
-    /// What it may admit against, from the last sample, and what its claims hold of it.
+    /// What it may admit against, from the last sample: CPUs overcommitted (`avail`) and not
+    /// (`base`); what its claims hold of it, and of that what shares hold.
     avail: Amounts,
+    base: Amounts,
     held: Amounts,
+    held_share: Amounts,
     /// What its running claims use within what they asked, from the last sample.
     own: Amounts,
     claims: u32,
-    exclusive_claims: u32,
+    whole_claims: u32,
     unpredicted_claims: u32,
     untimed_claims: u32,
     draining: bool,
@@ -177,6 +297,7 @@ pub struct Admission {
     owner_ix: BTreeMap<String, Vec<(u64, u32)>>,
     line: Line,
     seq: u64,
+    came: u64,
     fair: [Fair; 5],
     /// Offers by when they lapse; claims by predicted end and by hard end.
     deadlines: BTreeSet<(i64, u32)>,
@@ -188,6 +309,14 @@ pub struct Admission {
     /// Many left the line at once (an owner gone or started again): every waiting run's place is
     /// looked at again, not only the boundaries'.
     stale: bool,
+    /// Promotion's looks (W05-R31), by when: the run's slot, its arrival (so a look kept for a
+    /// run gone does nothing) and the class it's looked at in, in the order they were made.
+    promotions: BTreeMap<i64, Vec<(u32, u64, Class)>>,
+    /// The `land` and `critical` runs in the line, and those holding claims, by when they came to
+    /// their class; the `interactive` runs in the line whose time to go up isn't set yet.
+    land_waiting: BTreeSet<(u64, u32)>,
+    land_claims: BTreeSet<(u64, u32)>,
+    watchers: BTreeSet<(u64, u32)>,
 }
 
 fn ix(s: u32) -> usize {
@@ -196,6 +325,10 @@ fn ix(s: u32) -> usize {
 
 fn later(now: i64, ms: Ms) -> i64 {
     now.saturating_add(i64::try_from(ms).unwrap_or(i64::MAX))
+}
+
+fn class_ix(c: Class) -> u8 {
+    u8::try_from(c.index()).unwrap_or(u8::MAX)
 }
 
 impl Admission {
@@ -211,10 +344,12 @@ impl Admission {
             labels,
             sample,
             avail: [0; ask::DIMS],
+            base: [0; ask::DIMS],
             held: [0; ask::DIMS],
+            held_share: [0; ask::DIMS],
             own: [0; ask::DIMS],
             claims: 0,
-            exclusive_claims: 0,
+            whole_claims: 0,
             unpredicted_claims: 0,
             untimed_claims: 0,
             draining: false,
@@ -224,6 +359,7 @@ impl Admission {
             owner_ix: BTreeMap::new(),
             line: Line::default(),
             seq: 0,
+            came: 0,
             fair: Default::default(),
             deadlines: BTreeSet::new(),
             ends: BTreeSet::new(),
@@ -231,8 +367,12 @@ impl Admission {
             records,
             kept: None,
             stale: false,
+            promotions: BTreeMap::new(),
+            land_waiting: BTreeSet::new(),
+            land_claims: BTreeSet::new(),
+            watchers: BTreeSet::new(),
         };
-        a.avail = a.room_now();
+        a.remeasure();
         let _ = now;
         a
     }
@@ -254,6 +394,10 @@ impl Admission {
         self.owners.get(ix(o))
     }
 
+    fn fair_of(&self, c: Class) -> Option<&Fair> {
+        self.fair.get(c.index())
+    }
+
     /// What kiln may place here in all: the budget, else the machine (CPUs as overcommitted).
     pub fn cap(&self) -> Amounts {
         let size = self.settings.budget.as_ref().map_or_else(|| ask::amounts(&self.sample.size), ask::amounts);
@@ -262,13 +406,20 @@ impl Admission {
         [cpu, mem, disk, gpu]
     }
 
-    fn room_now(&self) -> Amounts {
-        ask::avail(&self.sample, self.settings.budget.as_ref(), &self.own, self.settings.overcommit_cpu)
+    /// The room worked out again from the last sample: as overcommitted and not.
+    fn remeasure(&mut self) {
+        self.avail = ask::avail(&self.sample, self.settings.budget.as_ref(), &self.own, self.settings.overcommit_cpu);
+        self.base = ask::avail(&self.sample, self.settings.budget.as_ref(), &self.own, 1000);
     }
 
-    /// What's free for another run now: the room less what's held.
+    /// What's free for an ordinary run now (W05-R03, as the engine's `fits_beside`): its CPUs
+    /// overcommitted beside what shares hold, the rest never.
     fn free_now(&self) -> Amounts {
-        let free = ask::less(&self.avail, &self.held);
+        let [bc, bm, bd, bg] = self.base;
+        let [hc, hm, hd, hg] = self.held;
+        let [sc, sm, _, _] = self.held_share;
+        let cpus = u64::try_from(u128::from(bc.saturating_sub(sc)).saturating_mul(u128::from(self.settings.overcommit_cpu.max(1000))) / 1000).unwrap_or(u64::MAX);
+        let free = [cpus.saturating_sub(hc.saturating_sub(sc)), bm.saturating_sub(sm).saturating_sub(hm.saturating_sub(sm)), bd.saturating_sub(hd), bg.saturating_sub(hg)];
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::OfferPastRoom) {
             let [cpu, mem, disk, gpu] = free;
@@ -277,8 +428,34 @@ impl Admission {
         free
     }
 
+    /// What the runner offers in each of fair share's dimensions (the engine's `offers` in resource
+    /// mode): its slots, and its CPUs, memory and GPUs, of the budget or else the machine.
+    fn offers(&self) -> [u64; FAIR] {
+        let size = self.settings.budget.unwrap_or(self.sample.size);
+        [u64::from(self.settings.slots), size.cpu.get(), size.mem, u64::from(size.gpu)]
+    }
+
+    /// What a run holds of the runner in each of fair share's dimensions (the engine's `asks`): a
+    /// slot and its request, or all the runner offers when it holds it whole; nothing in a
+    /// dimension the runner doesn't offer.
+    fn holds(&self, p: &Probe) -> [u64; FAIR] {
+        let offers = self.offers();
+        let q = &p.ask.needs.request;
+        let mut holds = if kind_of(&p.ask) == Kind::Whole { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+        for (h, o) in holds.iter_mut().zip(offers) {
+            if o == 0 {
+                *h = 0;
+            }
+        }
+        holds
+    }
+
     fn weight(&self, repo: &str) -> PerMille {
-        self.settings.weights.get(repo).copied().unwrap_or(1000).max(1)
+        self.settings.weights.get(repo).copied().filter(|w| *w > 0).unwrap_or(1000)
+    }
+
+    fn class_config(&self, class: Class) -> ClassConfig {
+        self.settings.classes.get(&class).copied().unwrap_or_default()
     }
 
     fn rto(&self, o: u32) -> Ms {
@@ -350,13 +527,16 @@ impl Admission {
     /// A probe's claim starts holding room, from `from`.
     fn claim(&mut self, s: u32, from: i64) {
         let Some(p) = self.get(s) else { return };
-        let (amounts, exclusive) = (p.amounts, p.ask.needs.exclusive);
+        let (amounts, kind, came, class) = (p.amounts, kind_of(&p.ask), p.came, p.class);
         let end = p.predicted.map(|ms| later(from, ms));
         let hard = p.ask.timeout.map(|ms| later(from, ms));
+        let due = Due::of_parts(p.ask.p90, p.ask.median, p.ask.timeout, from);
         self.held = ask::plus(&self.held, &amounts);
         self.claims = self.claims.saturating_add(1);
-        if exclusive {
-            self.exclusive_claims = self.exclusive_claims.saturating_add(1);
+        match kind {
+            Kind::Share => self.held_share = ask::plus(&self.held_share, &amounts),
+            Kind::Whole => self.whole_claims = self.whole_claims.saturating_add(1),
+            Kind::Ordinary => {}
         }
         match end {
             Some(at) => {
@@ -370,26 +550,34 @@ impl Admission {
             }
             None => self.untimed_claims = self.untimed_claims.saturating_add(1),
         }
+        if class <= Class::Land {
+            self.land_claims.insert((came, s));
+        }
         if let Some(p) = self.get_mut(s) {
             p.end = end;
             p.hard = hard;
+            p.due = Some(due);
         }
     }
 
-    /// A probe's claim stops holding room.
+    /// A probe's claim stops holding room; what its dispatch charged is settled to nothing, as it
+    /// never ran (one that ran is settled as it ends, [`Self::ended`]).
     fn release(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
-        let (state, amounts, exclusive, end, hard) = (p.state, p.amounts, p.ask.needs.exclusive, p.end, p.hard);
+        let (state, amounts, kind, end, hard, came) = (p.state, p.amounts, kind_of(&p.ask), p.end, p.hard, p.came);
         if let State::Offered { until, .. } = state {
             self.deadlines.remove(&(until, s));
         }
         if !matches!(state, State::Offered { .. } | State::Taken { .. } | State::Running { .. }) {
             return;
         }
+        self.settle(s, 0);
         self.held = ask::less(&self.held, &amounts);
         self.claims = self.claims.saturating_sub(1);
-        if exclusive {
-            self.exclusive_claims = self.exclusive_claims.saturating_sub(1);
+        match kind {
+            Kind::Share => self.held_share = ask::less(&self.held_share, &amounts),
+            Kind::Whole => self.whole_claims = self.whole_claims.saturating_sub(1),
+            Kind::Ordinary => {}
         }
         match end {
             Some(at) => {
@@ -403,9 +591,11 @@ impl Admission {
             }
             None => self.untimed_claims = self.untimed_claims.saturating_sub(1),
         }
+        self.land_claims.remove(&(came, s));
         if let Some(p) = self.get_mut(s) {
             p.end = None;
             p.hard = None;
+            p.due = None;
         }
     }
 
@@ -413,9 +603,21 @@ impl Admission {
     fn leave(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
         if let (State::Waiting, Some(k)) = (p.state, p.key) {
+            let (came, class) = (p.came, p.class);
             self.line.remove(&k);
             if self.kept.is_some_and(|(k, _)| k == s) {
                 self.kept = None;
+            }
+            self.land_waiting.remove(&(came, s));
+            self.watchers.remove(&(came, s));
+            // The slot and the class's leaves borrowed apart, so the leaf's name isn't copied.
+            if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index()))
+                && let Some((_, set)) = f.leaves.get_mut(p.leaf.as_str())
+            {
+                set.remove(&s);
+                if set.is_empty() {
+                    f.leaves.remove(p.leaf.as_str());
+                }
             }
         }
         if let Some(p) = self.get_mut(s) {
@@ -437,129 +639,391 @@ impl Admission {
         self.spare.push(s);
     }
 
-    /// Puts a probe in the line: at the place it had, or, coming in for the first time, at its
-    /// start tag in its class's fair share.
-    fn enter(&mut self, s: u32) {
-        let cap = self.cap();
-        let Some(p) = self.get(s) else { return };
-        let (class, had) = (p.ask.class, p.key);
-        let key = match had {
-            Some(k) => k,
-            None => {
-                let cost = u128::from(ask::dominant_ppm(&p.amounts, &cap)).saturating_mul(u128::from(p.predicted.unwrap_or(0))).saturating_mul(1000) / u128::from(self.weight(&p.ask.repo));
-                self.seq = self.seq.saturating_add(1);
-                let seq = self.seq;
-                // The slot and the fair share borrowed apart, so the tenant's name is copied only
-                // the first time it's seen.
-                let Some(Some(p)) = self.slots.get(ix(s)) else { return };
-                let Some(f) = self.fair.get_mut(class.index()) else { return };
-                let tag = match f.finish.get_mut(p.tenant.as_str()) {
-                    Some(last) => {
-                        let tag = f.vtime.max(*last);
-                        *last = tag.saturating_add(cost);
-                        tag
-                    }
-                    None => {
-                        let tag = f.vtime;
-                        f.finish.insert(p.tenant.clone(), tag.saturating_add(cost));
-                        tag
-                    }
-                };
-                if let Some(p) = self.get_mut(s) {
-                    p.charged = cost;
-                }
-                Key { class: u8::try_from(class.index()).unwrap_or(u8::MAX), tag, seq }
-            }
-        };
-        let Some(p) = self.get_mut(s) else { return };
-        p.key = Some(key);
-        p.state = State::Waiting;
-        p.told = None;
-        let item = Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout };
-        self.line.insert(key, item);
+    /// A leaf's standing in `class`'s tree (the engine's `standing_of`, for this runner's set of
+    /// dimensions): at each node from its repository down, `max(V[parent], finish[node])`.
+    fn standing_of(&self, class: Class, leaf: &str) -> [u128; LEVELS] {
+        let mut out = [0; LEVELS];
+        let Some(f) = self.fair_of(class) else { return out };
+        let mut parent = "";
+        for (slot, node) in out.iter_mut().zip(engine::nodes(leaf)) {
+            let v = f.vtimes.get(parent).copied().unwrap_or(0);
+            let fin = f.finish.get(node).copied().unwrap_or(0);
+            *slot = v.max(fin);
+            parent = node;
+        }
+        out
     }
 
-    /// What a run that ended charges its tenant: what it ran, at its dominant share of this
-    /// runner, less what it was charged as it came (start-time fair queuing settles at the end).
-    fn settle(&mut self, s: u32, ran: Ms) {
-        let cap = self.cap();
+    /// Puts a probe in the line, in its class now: its own order and arrival as it came, its
+    /// tenant's standing as it is now.
+    fn enter(&mut self, s: u32) {
         let Some(p) = self.get(s) else { return };
-        let cost = u128::from(ask::dominant_ppm(&p.amounts, &cap)).saturating_mul(u128::from(ran)).saturating_mul(1000) / u128::from(self.weight(&p.ask.repo));
-        let (charged, class) = (p.charged, p.ask.class);
-        // The slot and the fair share borrowed apart, so the tenant's name isn't copied.
-        let Some(Some(p)) = self.slots.get(ix(s)) else { return };
-        let Some(f) = self.fair.get_mut(class.index()) else { return };
-        let vtime = f.vtime;
-        let caught_up = match f.finish.get_mut(p.tenant.as_str()) {
-            Some(last) => {
-                *last = last.saturating_add(cost).saturating_sub(charged);
-                *last <= vtime
+        let (class, came, land_due) = (p.class, p.came, p.land_due);
+        let standing = self.standing_of(class, &p.leaf);
+        let key = Key { class: class_ix(class), standing, own: p.own, seq: p.seq };
+        let item = Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout };
+        self.line.insert(key, item);
+        // The slot and the class's leaves borrowed apart: the leaf's name copied only the first
+        // time it waits here.
+        if let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) {
+            match f.leaves.get_mut(p.leaf.as_str()) {
+                Some((had, set)) => {
+                    set.insert(s);
+                    if *had != standing {
+                        f.moved = true;
+                    }
+                }
+                None => {
+                    f.leaves.insert(p.leaf.clone(), (standing, BTreeSet::from([s])));
+                }
             }
-            None => false,
-        };
-        if caught_up {
-            f.finish.remove(p.tenant.as_str());
+        }
+        if class <= Class::Land {
+            self.land_waiting.insert((came, s));
+        }
+        if class == Class::Interactive && land_due.is_none() {
+            self.watchers.insert((came, s));
+        }
+        if let Some(p) = self.get_mut(s) {
+            p.key = Some(key);
+            p.state = State::Waiting;
+            p.told = None;
+        }
+    }
+
+    /// Each class whose tags moved has its waiting runs put in again where their tenants stand
+    /// now, each told if its place or reason changed.
+    fn restand(&mut self, now: i64, out: &mut Vec<Said>) {
+        for c in Class::ALL {
+            if !self.fair.get(c.index()).is_some_and(|f| f.moved) {
+                continue;
+            }
+            let leaves: Vec<(String, [u128; LEVELS])> = self.fair.get(c.index()).map(|f| f.leaves.iter().map(|(l, (st, _))| (l.clone(), *st)).collect()).unwrap_or_default();
+            if let Some(f) = self.fair.get_mut(c.index()) {
+                f.moved = false;
+            }
+            for (leaf, had) in leaves {
+                let standing = self.standing_of(c, &leaf);
+                if standing == had {
+                    continue;
+                }
+                let slots: Vec<u32> = match self.fair.get_mut(c.index()).and_then(|f| f.leaves.get_mut(&leaf)) {
+                    Some((st, set)) => {
+                        *st = standing;
+                        set.iter().copied().collect()
+                    }
+                    None => continue,
+                };
+                for s in slots {
+                    let Some(p) = self.get(s) else { continue };
+                    let (Some(old), item) = (p.key, Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout }) else { continue };
+                    let key = Key { standing, ..old };
+                    self.line.remove(&old);
+                    self.boundaries(now, out);
+                    self.line.insert(key, item);
+                    if let Some(p) = self.get_mut(s) {
+                        p.key = Some(key);
+                    }
+                    // The others moved a place at most, at the boundaries; this one may have moved
+                    // many, and is told itself.
+                    self.boundaries(now, out);
+                    self.tell_if_changed(s, now, out);
+                }
+            }
+        }
+    }
+
+    /// Charges a run's tenant for its dispatch here (the engine's `charge`, W05-R32, R33): at every
+    /// node from its repository down, its dominant share of what the runner offers times its median
+    /// (else `default_cost`) over the node's weight, from where start-time fair queuing starts it
+    /// under its parent; the parent's virtual time moves up to that start. Its class holds what it
+    /// holds, and started a run here now.
+    fn charge(&mut self, s: u32, now: i64) {
+        let offers = self.offers();
+        let Some(p) = self.get(s) else { return };
+        let holds = self.holds(p);
+        let shares = engine::shares(&holds, &offers);
+        let mut fair = shares;
+        // Where the runner offers no CPUs to count, the slot counts the CPUs the run asks, one at
+        // the least (main's 8305d5c80, as the engine's `fair_shares`).
+        if offers.get(1).copied().unwrap_or(0) == 0
+            && kind_of(&p.ask) != Kind::Whole
+            && let Some(slot) = fair.first_mut()
+        {
+            *slot = slot.saturating_mul(u128::from(p.ask.needs.request.cpu.get().max(1000))).div_ceil(1000);
+        }
+        let ms = p.ask.median.or(self.settings.default_cost).unwrap_or(0);
+        let class = p.class;
+        // The slot and the class's tags borrowed apart, so the leaf's names aren't copied but the
+        // first time a node is charged.
+        let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) else { return };
+        let mut parent = "";
+        for (node, weight) in engine::nodes(&p.leaf).zip(p.weights) {
+            let c = engine::charges(&fair, ms, weight).into_iter().max().unwrap_or(0);
+            if c > 0 {
+                let v = f.vtimes.get(parent).copied().unwrap_or(0);
+                let start = v.max(f.finish.get(node).copied().unwrap_or(0));
+                match f.finish.get_mut(node) {
+                    Some(x) => *x = start.saturating_add(c),
+                    None => {
+                        f.finish.insert(node.to_owned(), start.saturating_add(c));
+                    }
+                }
+                match f.vtimes.get_mut(parent) {
+                    Some(x) => *x = v.max(start),
+                    None => {
+                        f.vtimes.insert(parent.to_owned(), v.max(start));
+                    }
+                }
+                f.moved = true;
+            }
+            parent = node;
+        }
+        for (h, a) in f.held.iter_mut().zip(holds) {
+            *h = h.saturating_add(u128::from(a));
+        }
+        f.served = Some(now);
+        if let Some(p) = self.get_mut(s) {
+            p.charge = Some(Charge { class, shares, fair, ms, at: now, holds, paced: None });
+        }
+    }
+
+    /// Settles what a run's dispatch charged to the time it ran (`ran`; the engine's
+    /// `settle_charge`): each node gives back the charge for its median and takes one for the time
+    /// it ran; its class holds what it held no more, and a pace it set is settled alike.
+    fn settle(&mut self, s: u32, ran: Ms) {
+        let Some(c) = self.get_mut(s).and_then(|p| p.charge.take()) else { return };
+        let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(c.class.index())) else { return };
+        for (h, a) in f.held.iter_mut().zip(c.holds) {
+            *h = h.saturating_sub(u128::from(a));
+        }
+        if let (Some((took, left)), Some(at)) = (c.paced, f.paced.as_mut()) {
+            *at = at.saturating_sub(took).saturating_add(engine::pace_ms(&c.shares, ran, left));
+        }
+        for (node, weight) in engine::nodes(&p.leaf).zip(p.weights) {
+            let charged = engine::charges(&c.fair, c.ms, weight).into_iter().max().unwrap_or(0);
+            let used = engine::charges(&c.fair, ran, weight).into_iter().max().unwrap_or(0);
+            if let Some(x) = f.finish.get_mut(node) {
+                *x = x.saturating_sub(charged).saturating_add(used);
+                f.moved = true;
+            } else if used > 0 {
+                f.finish.insert(node.to_owned(), used);
+                f.moved = true;
+            }
+        }
+    }
+}
+
+// Classes: floors and promotion (W05-R31).
+impl Admission {
+    /// Whether a class is short of its floor (the engine's `short`): it has one, and its running
+    /// runs hold less of the runner than that.
+    fn short(&self, class: Class) -> bool {
+        let floor = self.class_config(class).floor;
+        floor > 0 && self.fair_of(class).map_or(0, |f| engine::held_share(&f.held, &self.offers())) < u128::from(floor) * 1000
+    }
+
+    /// A class short of its floor takes room ahead of the classes before it with run `s` (the
+    /// engine's `ahead_of`): when the run keeps it within its floor (`Some(None)`), or else as the
+    /// floor's pace allows, with what's left of its floor (`Some(Some(left))`).
+    fn ahead_of(&self, class: Class, s: u32, now: i64) -> Option<Option<u128>> {
+        let p = self.get(s)?;
+        let f = self.fair_of(class)?;
+        let (offers, floor) = (self.offers(), u128::from(self.class_config(class).floor) * 1000);
+        let mut with = f.held;
+        for (h, a) in with.iter_mut().zip(self.holds(p)) {
+            *h = h.saturating_add(u128::from(a));
+        }
+        if engine::held_share(&with, &offers) <= floor {
+            return Some(None);
+        }
+        let left = floor.saturating_sub(engine::held_share(&f.held, &offers)).max(1);
+        f.paced.is_none_or(|at| now >= at).then_some(Some(left))
+    }
+
+    /// Run `s` went over its class's floor: the class may next do so once the pace it took has
+    /// passed (the engine's `pace`).
+    fn pace(&mut self, s: u32, left: u128, now: i64) {
+        let Some(c) = self.get_mut(s).and_then(|p| p.charge.as_mut()) else { return };
+        let took = engine::pace_ms(&c.shares, c.ms, left);
+        c.paced = Some((took, left));
+        let class = c.class;
+        if let Some(f) = self.fair.get_mut(class.index()) {
+            f.paced = Some(now.saturating_add(took));
+        }
+    }
+
+    /// When to look at run `s`'s promotion from `class`, which it reached at `since`, if the class
+    /// has a bound and one above it: a bound after.
+    fn promote_at(&mut self, s: u32, since: i64, class: Class) {
+        let Some(seq) = self.get(s).map(|p| p.seq) else { return };
+        if let (Some(bound), Some(_)) = (self.class_config(class).bound, class.up()) {
+            self.promotions.entry(later(since, bound)).or_default().push((s, seq, class));
+        }
+    }
+
+    /// Each look due by `now`, in turn (the engine's `promote_due`): a run that has been in its
+    /// class its bound goes up a class if its class started nothing here in the bound before (else
+    /// it's looked at again a bound after that start); an `interactive` run whose `land` work ahead
+    /// is due done goes up into `land`. A promoted run keeps its own order and arrival, and
+    /// preempts nothing.
+    fn promote_due(&mut self, now: i64, out: &mut Vec<Said>) {
+        while let Some(at) = self.promotions.first_key_value().map(|(at, _)| *at).filter(|at| *at <= now) {
+            for (s, seq, from) in self.promotions.remove(&at).unwrap_or_default() {
+                let Some(to) = from.up() else { continue };
+                let Some(p) = self.get(s).filter(|p| p.seq == seq && p.class == from && matches!(p.state, State::Waiting | State::Aside)) else { continue };
+                let behind_done = from == Class::Interactive && p.land_due.is_some_and(|d| d <= at);
+                if !behind_done {
+                    let Some(bound) = self.class_config(from).bound.map(|b| i64::try_from(b).unwrap_or(i64::MAX)) else { continue };
+                    if let Some(last) = self.fair_of(from).and_then(|f| f.served).filter(|t| *t > at.saturating_sub(bound)) {
+                        self.promotions.entry(last.saturating_add(bound)).or_default().push((s, seq, from));
+                        continue;
+                    }
+                }
+                self.reclass(s, to, at, now, out);
+            }
+        }
+    }
+
+    /// Run `s` comes to class `to` at `at`: in the line at its place there, looked at for its
+    /// promotion from there, and if that's `interactive`, behind the `land` work there now.
+    fn reclass(&mut self, s: u32, to: Class, at: i64, now: i64, out: &mut Vec<Said>) {
+        let waiting = self.get(s).is_some_and(|p| p.state == State::Waiting);
+        if waiting {
+            self.leave(s);
+            self.boundaries(now, out);
+        }
+        self.came = self.came.saturating_add(1);
+        let came = self.came;
+        if let Some(p) = self.get_mut(s) {
+            p.class = to;
+            p.came = came;
+            p.land_due = None;
+        }
+        if waiting {
+            self.enter(s);
+            self.boundaries(now, out);
+            self.tell_if_changed(s, now, out);
+        }
+        self.promote_at(s, at, to);
+        if to == Class::Interactive {
+            self.land_due(s, at);
+        }
+    }
+
+    /// An `interactive` run none of whose `land` work ahead waits any more (each `land` or
+    /// `critical` run that came to its class before it has started, or left): when it goes up, the
+    /// latest expected end of that work still holding room here, or `now` (the engine's `land_due`).
+    fn land_due(&mut self, s: u32, now: i64) {
+        let Some(p) = self.get(s) else { return };
+        let (came, seq) = (p.came, p.seq);
+        if !self.watchers.contains(&(came, s)) || self.land_waiting.first().is_some_and(|(c, _)| *c < came) {
+            return;
+        }
+        let due = self.land_claims.range(..(came, 0)).filter_map(|(_, c)| self.get(*c)).filter_map(|c| c.due.map(|d| d.at(now).expected)).fold(now, i64::max);
+        self.watchers.remove(&(came, s));
+        if let Some(p) = self.get_mut(s) {
+            p.land_due = Some(due);
+        }
+        self.promotions.entry(due).or_default().push((s, seq, Class::Interactive));
+    }
+
+    /// What every input does first (as the engine's `handle` does): the looks due by now, and the
+    /// runs whose tenants' standing moved put where they stand.
+    fn begin(&mut self, now: i64, out: &mut Vec<Said>) {
+        self.promote_due(now, out);
+        self.restand(now, out);
+    }
+
+    /// What every input does last: the `interactive` runs whose `land` work ahead no longer waits
+    /// have their time to go up set, worked out once the input is done.
+    fn close(&mut self, now: i64) {
+        let bound = self.land_waiting.first().map_or(u64::MAX, |(c, _)| *c);
+        while let Some(&(c, s)) = self.watchers.first() {
+            if c >= bound {
+                break;
+            }
+            self.land_due(s, now);
+            // A run that isn't one any more is let go of.
+            self.watchers.remove(&(c, s));
         }
     }
 }
 
 // Admission, kept room and news.
 impl Admission {
-    /// Whether a probe could start now in `free`: it fits, nothing kiln placed holds the runner
-    /// whole, and one that takes it whole finds nothing else of kiln's here (no claim, no CI leg).
-    fn can_start(&self, s: u32, free: &Amounts) -> bool {
+    /// Whether a probe could start now (W05-R03, the engine's `room_in`): nothing kiln placed holds
+    /// the runner whole; one that takes it whole finds nothing else of kiln's here (no claim, no CI
+    /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
+    fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
-        if self.exclusive_claims > 0 || (p.ask.needs.exclusive && (self.claims > 0 || self.sample.ci_jobs > 0)) {
+        if self.whole_claims > 0 {
             return false;
         }
-        ask::fits(&p.amounts, free)
+        match kind_of(&p.ask) {
+            // Empty, and what it asks within what's measured free: the engine's runner is its
+            // declared size, this one's room is measured, and memory is never overcommitted.
+            Kind::Whole => self.claims == 0 && self.sample.ci_jobs == 0 && ask::fits(&p.amounts, &self.free_now()),
+            Kind::Share => ask::fits(&ask::plus(&self.held, &p.amounts), &self.base),
+            Kind::Ordinary => ask::fits(&p.amounts, &self.free_now()),
+        }
     }
 
-    /// Offers what can start, first in line first, keeping room for the first that can't when
-    /// `backfill` is declared (W05-R39): each offer is one decision, O(log n).
+    /// Whether room kept for the first in line (`kept`) lets run `s` start ahead of it (W05-R39):
+    /// it's that run, or it fits beside the room kept (nothing beside a run that takes it whole), or
+    /// it's predicted to end by the room's time.
+    fn respects(&self, s: u32, kept: Option<(u32, Option<i64>)>, now: i64) -> bool {
+        let Some((k, at)) = kept else { return true };
+        if s == k {
+            return true;
+        }
+        let (Some(h), Some(p)) = (self.get(k), self.get(s)) else { return true };
+        let beside = ask::less(&self.free_now(), &h.amounts);
+        let fits_beside = kind_of(&h.ask) != Kind::Whole && ask::fits(&p.amounts, &beside);
+        let ends_by = at.is_some_and(|at| p.predicted.is_some_and(|ms| later(now, ms) <= at));
+        fits_beside || ends_by
+    }
+
+    /// Offers what can start, as the engine's pick takes it (W05-R04, R30, R31): of each class, the
+    /// first in order that has room; the first class's, unless a class after it is short of its
+    /// floor and may go ahead. With `backfill` declared, the first in line that has no room keeps
+    /// room (W05-R39). Each offer is one decision, O(log n) in the line.
     fn admit(&mut self, now: i64, out: &mut Vec<Said>) {
         loop {
+            self.restand(now, out);
             if self.draining {
                 self.kept = None;
                 return;
             }
-            let Some((hk, hs)) = self.line.first() else {
+            let Some((_, hs)) = self.line.first() else {
                 self.kept = None;
                 return;
             };
-            let free = self.free_now();
-            if self.can_start(hs, &free) {
-                self.offer(hs, now, out);
-                continue;
-            }
-            let head_whole = self.get(hs).is_some_and(|p| p.ask.needs.exclusive);
+            let head_whole = self.get(hs).is_some_and(|p| kind_of(&p.ask) == Kind::Whole);
             #[cfg(test)]
             let starve = head_whole && super::mutant() == Some(super::Mutant::ExclusiveStarves);
             #[cfg(not(test))]
-            let starve = false;
-            let found = if self.settings.backfill && !starve {
+            let starve = { let _ = head_whole; false };
+            let kept = if self.settings.backfill && !starve && !self.can_start(hs) {
                 let at = self.kept_time(hs, now);
-                self.kept = Some((hs, at));
-                let need = self.get(hs).map(|p| p.amounts).unwrap_or_default();
-                let beside = ask::less(&free, &need);
-                // What fits beside the room kept (nothing beside a run that takes it whole).
-                let a = if head_whole { None } else { self.line.find(&Query { after: Some(&hk), free: &beside, within: u64::MAX }, &mut |s| self.can_start(s, &beside)) };
-                // What's predicted to end by the time the room is kept from.
-                let b = at.and_then(|at| {
-                    let within = u64::try_from(at.saturating_sub(now)).unwrap_or(0);
-                    self.line.find(&Query { after: Some(&hk), free: &free, within }, &mut |s| self.can_start(s, &free))
-                });
-                match (a, b) {
-                    (Some(x), Some(y)) => Some(if x.0 <= y.0 { x } else { y }),
-                    (x, y) => x.or(y),
-                }
+                Some((hs, at))
             } else {
-                self.kept = None;
-                self.line.find(&Query { after: Some(&hk), free: &free, within: u64::MAX }, &mut |s| self.can_start(s, &free))
+                None
             };
-            match found {
-                Some((_, s)) => self.offer(s, now, out),
-                None => return,
+            self.kept = kept;
+            let free = self.free_now();
+            let mut bests: [Option<u32>; 5] = [None; 5];
+            for (c, best) in bests.iter_mut().enumerate() {
+                let class = u8::try_from(c).ok();
+                *best = self.line.find(&Query { class, after: None, free: &free, within: u64::MAX }, &mut |s| self.can_start(s) && self.respects(s, kept, now)).map(|(_, s)| s);
+            }
+            let mut found = Class::ALL.into_iter().zip(bests).filter_map(|(c, b)| b.map(|s| (c, s)));
+            let Some((_, first)) = found.next() else { return };
+            let ahead = found.filter(|(c, _)| self.short(*c)).find_map(|(c, s)| self.ahead_of(c, s, now).map(|over| (s, over)));
+            let (s, over) = ahead.unwrap_or((first, None));
+            self.offer(s, now, out);
+            if let Some(left) = over {
+                self.pace(s, left, now);
             }
         }
     }
@@ -569,12 +1033,12 @@ impl Admission {
     /// CI leg holds a runner it would take whole).
     fn kept_time(&self, s: u32, now: i64) -> Option<i64> {
         let p = self.get(s)?;
-        let (need, whole) = (p.amounts, p.ask.needs.exclusive);
+        let (need, whole) = (p.amounts, kind_of(&p.ask) == Kind::Whole);
         if whole && self.sample.ci_jobs > 0 {
             return None;
         }
         let mut free = self.free_now();
-        let (mut left, mut whole_left) = (self.claims, self.exclusive_claims);
+        let (mut left, mut whole_left) = (self.claims, self.whole_claims);
         for (end, c) in &self.ends {
             if *end < now {
                 // Past its predicted end: when it ends isn't known.
@@ -583,7 +1047,7 @@ impl Admission {
             let Some(claim) = self.get(*c) else { continue };
             free = ask::plus(&free, &claim.amounts);
             left = left.saturating_sub(1);
-            if claim.ask.needs.exclusive {
+            if kind_of(&claim.ask) == Kind::Whole {
                 whole_left = whole_left.saturating_sub(1);
             }
             let room = if whole { left == 0 } else { whole_left == 0 && ask::fits(&need, &free) };
@@ -595,24 +1059,20 @@ impl Admission {
     }
 
     /// Gives a waiting probe room: offered to its owner under a new claim, held for the owner's
-    /// link's retransmission timeout.
+    /// link's retransmission timeout, its tenant charged for it.
     fn offer(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
         let free = self.free_now();
         let fence = self.next_fence();
         let Some(p) = self.get(s) else { return };
-        let (o, key) = (p.owner, p.key);
+        let o = p.owner;
         let until = later(now, self.rto(o));
         self.leave(s);
         if let Some(p) = self.get_mut(s) {
             p.state = State::Offered { fence, until };
         }
         self.claim(s, now);
+        self.charge(s, now);
         self.deadlines.insert((until, s));
-        if let Some(k) = key
-            && let Some(f) = self.fair.get_mut(usize::from(k.class))
-        {
-            f.vtime = f.vtime.max(k.tag);
-        }
         self.say_offer(s, Some(free), out);
         self.boundaries(now, out);
     }
@@ -708,7 +1168,7 @@ impl Admission {
         if let Some(Some(at)) = kept {
             return Reason::Kept { at: Some(at) };
         }
-        if ask::fits(&p.amounts, &free) && (self.exclusive_claims > 0 || p.ask.needs.exclusive) {
+        if ask::fits(&p.amounts, &free) && (self.whole_claims > 0 || kind_of(&p.ask) == Kind::Whole) {
             return Reason::Whole { jobs: self.claims.saturating_add(self.sample.ci_jobs) };
         }
         match kept {
@@ -799,6 +1259,8 @@ pub struct View {
     pub state: &'static str,
     pub fence: Option<Fence>,
     pub ask: Amounts,
+    /// Its class now (W05-R31: as it came, or as its wait raised it).
+    pub class: Class,
 }
 
 // The inputs: owners' words, the runner's own samples and ends, and the time.
@@ -908,6 +1370,12 @@ impl Admission {
     /// answered with an offer, where it waits, that it never could, or that it ran it already; a
     /// probe again is answered as it stands.
     pub fn probe(&mut self, from: Peer<'_>, ask: Ask, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.probe_in(from, ask, predicted, now, out);
+        self.close(now);
+    }
+
+    fn probe_in(&mut self, from: Peer<'_>, ask: Ask, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         if self.recorded(from, &ask.run, out) {
             return;
@@ -921,9 +1389,14 @@ impl Admission {
             return;
         }
         let amounts = ask::amounts(&ask.needs.request);
-        let tenant = format!("{}\0{}", ask.repo, ask.actor);
+        let leaf = engine::leaf_of(&self.settings.fair_by, &ask.repo, &ask.actor, &ask.lane);
+        let weights = [self.weight(&ask.repo), 1000, 1000];
+        let own = engine::own_order(ask.priority, self.settings.aging_per_minute, now);
+        self.seq = self.seq.saturating_add(1);
+        self.came = self.came.saturating_add(1);
+        let (seq, came, class) = (self.seq, self.came, ask.class);
         let run = ask.run.clone();
-        let p = Probe { owner: o, run: run.clone(), ask, amounts, predicted, state: State::Aside, key: None, tenant, charged: 0, end: None, hard: None, told: None };
+        let p = Probe { owner: o, run: run.clone(), ask, amounts, predicted, state: State::Aside, key: None, leaf, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None };
         let s = match self.spare.pop() {
             Some(s) => {
                 if let Some(slot) = self.slots.get_mut(ix(s)) {
@@ -943,10 +1416,13 @@ impl Admission {
             }
             None => true,
         };
+        self.promote_at(s, now, class);
         if away {
             return;
         }
+        // One change to the line at a time, each looked at: its arrival, then what admitting does.
         self.enter(s);
+        self.boundaries(now, out);
         self.admit(now, out);
         self.boundaries(now, out);
         if self.get(s).is_some_and(|p| p.state == State::Waiting && p.told.is_none()) {
@@ -957,6 +1433,12 @@ impl Admission {
     /// The owner withdraws a run (placed elsewhere, ended, not wanted): its place or claim goes,
     /// its room free in the same input. A running run isn't stopped by it: that's its own signal's.
     pub fn withdraw(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.withdraw_in(from, run, now, out);
+        self.close(now);
+    }
+
+    fn withdraw_in(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let Some(s) = self.owner(o).and_then(|w| w.runs.get(run)).copied() else { return };
         if matches!(self.state(s), Some(State::Running { .. })) {
@@ -971,10 +1453,12 @@ impl Admission {
 
     /// The owner takes offer `fence`: held until it starts the run, if that's still its live claim.
     pub fn take(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
         self.take_in(from, run, fence, now, out);
         // Offers that lapsed by now went back to their places: what they free is offered.
         self.admit(now, out);
         self.boundaries(now, out);
+        self.close(now);
     }
 
     fn take_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
@@ -1002,6 +1486,12 @@ impl Admission {
     /// The owner declines offer `fence` (it took another's): its room is free in the same input,
     /// and the run leaves the line.
     pub fn decline(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.decline_in(from, run, fence, now, out);
+        self.close(now);
+    }
+
+    fn decline_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let Some(s) = self.owner(o).and_then(|w| w.runs.get(run)).copied() else { return };
         // An offered or taken claim isn't in the line: dropping it moves no run's place.
@@ -1019,10 +1509,12 @@ impl Admission {
     /// nothing, and is never told as a lapse); `None`, its owner told the claim lapsed: the one word
     /// on which it may place the run elsewhere.
     pub fn start(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Said>) -> Option<Start> {
+        self.begin(now, out);
         let started = self.start_in(from, run, fence, now, out);
         // Offers that lapsed by now went back to their places: what they free is offered.
         self.admit(now, out);
         self.boundaries(now, out);
+        self.close(now);
         started
     }
 
@@ -1071,25 +1563,42 @@ impl Admission {
     pub fn spawned(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
-        let to = self.get(s).and_then(|p| self.owner(p.owner)).filter(|w| !w.away).map(|w| w.name.clone());
-        if let Some(to) = to {
+        if let Some(to) = self.told_owner(s) {
             out.push((to, ToOwner::Started { run: run.to_owned(), fence }));
         }
+    }
+
+    /// Whom to tell of probe `s`'s run: its owner, if its link is up and it's still the process
+    /// that asked. A run of an owner's earlier epoch runs on to its end, but its words would reach
+    /// the owner's new process by its name alone, which may have reused the id for another run
+    /// (kiln-sim place, seed 88): it's told nothing.
+    fn told_owner(&self, s: u32) -> Option<String> {
+        let p = self.get(s)?;
+        let w = self.owner(p.owner).filter(|w| !w.away)?;
+        (self.current(&w.name) == Some(p.owner)).then(|| w.name.clone())
     }
 
     /// A run it started ended (`ok`: its process exited; not: it couldn't start, or was lost): its
     /// room is free in the same input, its tenant charged what it ran, and its owner told.
     pub fn ended(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.ended_in(from, run, ok, now, out);
+        self.close(now);
+    }
+
+    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Said>) {
         let Some(s) = self.find(from, run) else { return };
-        let Some(State::Running { fence, from: t0 }) = self.state(s) else { return };
-        self.settle(s, u64::try_from(now.saturating_sub(t0)).unwrap_or(0));
+        let Some(State::Running { fence, .. }) = self.state(s) else { return };
+        // From its dispatch, as the engine settles a grant.
+        let at = self.get(s).and_then(|p| p.charge.map(|c| c.at)).unwrap_or(now);
+        self.settle(s, u64::try_from(now.saturating_sub(at)).unwrap_or(0));
         if let Some(r) = self.record_mut(from.name, from.epoch, run) {
             r.ended = Some(ok);
         }
-        let away = self.get(s).and_then(|p| self.owner(p.owner)).is_none_or(|w| w.away);
+        let to = self.told_owner(s);
         self.drop_probe(s);
-        if !away {
-            out.push((from.name.to_owned(), ToOwner::Ended { run: run.to_owned(), fence, ok }));
+        if let Some(to) = to {
+            out.push((to, ToOwner::Ended { run: run.to_owned(), fence, ok }));
         }
         self.admit(now, out);
         self.boundaries(now, out);
@@ -1115,6 +1624,7 @@ impl Admission {
 
     /// A new sample: the room is worked out again, and what now fits is offered.
     pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
         self.sample = sample;
         let mut own = [0; ask::DIMS];
         for u in &self.sample.runs {
@@ -1126,22 +1636,31 @@ impl Admission {
             }
         }
         self.own = own;
-        self.avail = self.room_now();
+        self.remeasure();
         self.admit(now, out);
         self.boundaries(now, out);
+        self.close(now);
     }
 
     /// Draining (an upgrade pending) or not: draining, it offers nothing new.
     pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
         self.draining = draining;
         self.admit(now, out);
         self.tell_all(now, out);
+        self.close(now);
     }
 
     /// An owner's link went down: its probes leave the line, offered nothing, an offer it hadn't
     /// taken lapses at once; a claim it took stays held, as does what runs: only its absence
     /// ([`Self::forget`]) or its epoch changing ends them.
     pub fn away(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.away_in(name, now, out);
+        self.close(now);
+    }
+
+    fn away_in(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.current(name) else { return };
         let slots: Vec<u32> = match self.owners.get_mut(ix(o)) {
             Some(w) => {
@@ -1172,6 +1691,12 @@ impl Admission {
     /// An owner's link is back: its probes are in the line again at the places they had, and it's
     /// told where each stands, and how each run that ended meanwhile ended.
     pub fn back(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.back_in(from, now, out);
+        self.close(now);
+    }
+
+    fn back_in(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         let slots: Vec<u32> = match self.owners.get_mut(ix(o)) {
             Some(w) => {
@@ -1203,6 +1728,7 @@ impl Admission {
     /// waiting or claimed goes, its room free; what runs runs on to its end. Its record stays, so
     /// that if it comes back in the same epoch nothing of its starts twice.
     pub fn forget(&mut self, name: &str, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
         let incarnations: Vec<u32> = self.owner_ix.get(name).map(|v| v.iter().map(|(_, o)| *o).collect()).unwrap_or_default();
         for o in incarnations {
             let slots: Vec<u32> = self.owner(o).map(|w| w.runs.values().copied().collect()).unwrap_or_default();
@@ -1215,6 +1741,7 @@ impl Admission {
         }
         self.admit(now, out);
         self.boundaries(now, out);
+        self.close(now);
     }
 
     /// The link to an owner measured again (its round trip, RFC 6298): what its offers are held by.
@@ -1229,6 +1756,12 @@ impl Admission {
     /// A run's predicted time here, predicted again by the shell (a run past its prediction, given
     /// how long it has run; history learned more): its place in line stays, its claim's end moves.
     pub fn predict(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
+        self.predict_in(from, run, predicted, now, out);
+        self.close(now);
+    }
+
+    fn predict_in(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(p) = self.get_mut(s) else { return };
         p.predicted = predicted;
@@ -1265,17 +1798,21 @@ impl Admission {
         }
     }
 
-    /// The time: offers not taken within their link's timeout lapse (each run waits again at its
-    /// place, its owner told), and what that frees is offered.
+    /// The time: promotion's looks due by now are taken, offers not taken within their link's
+    /// timeout lapse (each run waits again at its place, its owner told), and what that frees is
+    /// offered.
     pub fn tick(&mut self, now: i64, out: &mut Vec<Said>) {
+        self.begin(now, out);
         self.lapse_due(now, out);
         self.admit(now, out);
         self.boundaries(now, out);
+        self.close(now);
     }
 
-    /// When it's to be told the time again ([`Self::tick`]): the soonest offer to lapse.
+    /// When it's to be told the time again ([`Self::tick`]): the soonest offer to lapse or
+    /// promotion's look to take, whichever is first.
     pub fn timer(&self) -> Option<i64> {
-        self.deadlines.first().map(|(at, _)| *at)
+        [self.deadlines.first().map(|(at, _)| *at), self.promotions.first_key_value().map(|(at, _)| *at)].into_iter().flatten().min()
     }
 
     /// The record of runs started here, as the shell keeps it on disk.
@@ -1293,6 +1830,15 @@ impl Admission {
         self.line.len()
     }
 
+    /// How many wait in its line of each class, in [`Class::ALL`]'s order: O(log n) each.
+    pub fn queued_by_class(&self) -> [u32; 5] {
+        let mut out = [0u32; 5];
+        for (o, c) in out.iter_mut().zip(Class::ALL) {
+            *o = self.line.count_of(class_ix(c));
+        }
+        out
+    }
+
     /// Each probe here, for a view and the checks.
     pub fn probes(&self) -> Vec<View> {
         let mut out = Vec::new();
@@ -1305,7 +1851,7 @@ impl Admission {
                 State::Running { fence, .. } => ("running", Some(fence)),
             };
             let (owner, epoch) = self.owner(p.owner).map_or((String::new(), 0), |w| (w.name.clone(), w.epoch));
-            out.push(View { owner, epoch, run: p.run.clone(), state, fence, ask: p.amounts });
+            out.push(View { owner, epoch, run: p.run.clone(), state, fence, ask: p.amounts, class: p.class });
         }
         out
     }
@@ -1321,18 +1867,25 @@ impl Admission {
 
     /// Its own books against what it holds: what's held is the sum of its claims, within what kiln
     /// may place here in every dimension (G1); one claim that takes the runner whole holds it alone;
-    /// the line holds exactly the runs waiting. O(n): for tests and the model.
+    /// the line holds exactly the runs waiting, each where its tenant stands. O(n): for tests and
+    /// the model.
     pub fn check(&self) -> Result<(), String> {
         let mut held = [0u64; ask::DIMS];
         let (mut claims, mut whole, mut waiting) = (0u32, 0u32, 0u32);
-        for p in self.slots.iter().flatten() {
+        for (s, p) in self.slots.iter().enumerate().filter_map(|(s, p)| p.as_ref().map(|p| (s, p))) {
             match p.state {
                 State::Offered { .. } | State::Taken { .. } | State::Running { .. } => {
                     held = ask::plus(&held, &p.amounts);
                     claims = claims.saturating_add(1);
-                    whole = whole.saturating_add(u32::from(p.ask.needs.exclusive));
+                    whole = whole.saturating_add(u32::from(kind_of(&p.ask) == Kind::Whole));
                 }
-                State::Waiting => waiting = waiting.saturating_add(1),
+                State::Waiting => {
+                    waiting = waiting.saturating_add(1);
+                    let standing = self.standing_of(p.class, &p.leaf);
+                    if p.key.is_none_or(|k| k.standing != standing || k.class != class_ix(p.class)) && !self.fair_of(p.class).is_some_and(|f| f.moved) {
+                        return Err(format!("{}: {} (slot {s}) waits at {:?}, its tenant standing at {standing:?} in {}", self.me, p.run, p.key, p.class.as_str()));
+                    }
+                }
                 State::Aside => {}
             }
         }
@@ -1351,7 +1904,7 @@ impl Admission {
         // Work-conserving: what can start is offered in the input that let it, nobody polling.
         if !self.draining
             && let Some((_, h)) = self.line.first()
-            && self.can_start(h, &self.free_now())
+            && self.can_start(h)
         {
             return Err(format!("{}: the first in line could start, and wasn't offered", self.me));
         }
