@@ -1,0 +1,62 @@
+# Trial only, never on main (goal 10, plan 01a1a87b2dae): the Chunk commit's landing checks the Macs'
+# runners pace too far to finish: clippy of kiln for macOS, then the UI's checks and the packed
+# snapshot's e2e spec in Chromium and WebKit (ui/e2e/packed-snapshot.spec.ts).
+name: g10-chunk-try
+
+on:
+  push:
+    branches: [g10-chunk-try]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g10-chunk-try
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  clippy-macos:
+    name: clippy (macOS, kiln, all targets)
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          sysctl -n hw.ncpu hw.memsize; df -h /
+      - name: Clippy
+        run: cargo clippy --locked -p kiln --all-targets -j 2 -- -D warnings
+  ui:
+    name: UI checks and the packed snapshot's e2e spec
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --no-audit --no-fund --loglevel=error
+      - name: Prettier (the spec this change added)
+        run: npx prettier --print-width 200 --check e2e/packed-snapshot.spec.ts
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install chromium webkit
+      - name: The packed snapshot in Chromium and WebKit
+        env:
+          E2E_CHANNEL: chromium
+          E2E_WEBKIT: "1"
+        run: npx playwright test e2e/packed-snapshot.spec.ts
