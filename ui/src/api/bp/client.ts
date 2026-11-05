@@ -184,6 +184,12 @@ export class Client {
     this.subscribeFrom(sub, topic, null, credit, new TopicState());
   }
 
+  /** Subscribes from a cursor a page already has (another tab's, the shared socket's owner having
+   * changed: goal 3's `shared.ts`): resumed, no snapshot, while the server's log still holds it. */
+  subscribeAt(sub: number, topic: Topic, cursor: Cursor, credit = 0): void {
+    this.subscribeFrom(sub, topic, cursor, credit, new TopicState());
+  }
+
   private subscribeFrom(sub: number, topic: Topic, cursor: Cursor | null, credit: number, state: TopicState): void {
     this.subs.set(sub, { topic, cursor, rev: cursor?.rev ?? 0, born: cursor?.born ?? 0, starting: false, waiting: true, aliases: [], tail: null, credit, received: 0, state, ended: false });
     this.queue({ kind: "Subscribe", body: { sub, topic, cursor, credit } });

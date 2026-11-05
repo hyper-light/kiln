@@ -188,8 +188,9 @@ fn bp_g3_s2_a_subscription_a_request_and_a_malformed_frame() -> anyhow::Result<(
     }
     assert_eq!(kinds.last().map(String::as_str), Some("queue"), "today's events socket heard the queue as before: {kinds:?}");
 
-    // A request, answered by the API's own route as the caller.
-    page.client.request(7, Call::Http { method: Method::Get, path: "/api/me".into(), body: kiln_bp::Bytes::default() });
+    // A request, answered by the API's own route as the caller (its authenticated routes: the open ones,
+    // `/api/me` and sign-in, stay HTTP's).
+    page.client.request(7, Call::Http { method: Method::Get, path: "/api/system".into(), body: kiln_bp::Bytes::default() });
     page.until("an answer", |e| e.iter().any(|e| matches!(e, ClientEvent::Answer { id: 7, .. })))?;
     let reply = page.events.iter().find_map(|e| match e {
         ClientEvent::Answer { id: 7, outcome: Outcome::Reply { status, body }, .. } => Some((*status, body.0.clone())),
@@ -197,8 +198,8 @@ fn bp_g3_s2_a_subscription_a_request_and_a_malformed_frame() -> anyhow::Result<(
     });
     let (code, body) = reply.ok_or_else(|| anyhow::anyhow!("a reply: {:?}", page.events))?;
     assert_eq!(code, 200);
-    let me: Value = serde_json::from_slice(&body)?;
-    assert_eq!(me.get("authenticated"), Some(&Value::Bool(true)));
+    let system: Value = serde_json::from_slice(&body)?;
+    assert_eq!(system.pointer("/live/path").and_then(Value::as_str), Some("/api/live"), "the server's own answer");
 
     // A malformed frame: answered typed, and the socket stays open for the next request.
     send_binary(&mut page.s, &[0xff; 12])?;

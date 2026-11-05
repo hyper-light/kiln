@@ -304,6 +304,28 @@ pub fn origin_ok(hub: &Hub, req: &Request) -> bool {
     ours.into_iter().any(|o| o.trim_end_matches('/').eq_ignore_ascii_case(origin))
 }
 
+/// The lab's page (`KILN_LIVE_LAB`, a folder): served at `/__live/<file>` on the server's own origin, as
+/// the shared socket's worker must be, for the lab and the browser tests (`ui/e2e/bp-shared.spec.ts`).
+/// Unset (every server but a lab's), there is no such path.
+pub fn lab_dir() -> Option<std::path::PathBuf> {
+    static D: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    D.get_or_init(|| std::env::var_os("KILN_LIVE_LAB").map(std::path::PathBuf::from).filter(|p| p.is_dir())).clone()
+}
+
+/// `GET /__live/<file>`: one of the lab's files, by a plain name (letters, digits, `.`, `-`, `_`).
+pub async fn lab_file(name: &str) -> Response {
+    let Some(dir) = lab_dir() else { return srv::text(StatusCode::NOT_FOUND, "not found") };
+    if name.is_empty() || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
+        return srv::text(StatusCode::NOT_FOUND, "not found");
+    }
+    let path = dir.join(name);
+    let kind = if name.ends_with(".html") { "text/html; charset=utf-8" } else if name.ends_with(".js") { "text/javascript" } else { "application/octet-stream" };
+    match crate::rt::blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) => srv::with_header(srv::response(StatusCode::OK, kind, srv::full(bytes)), header::CACHE_CONTROL, "no-store"),
+        _ => srv::text(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
 /// A refusal of the handshake, as JSON naming why (and, for a version, those this server speaks).
 fn refuse(status: StatusCode, why: &str, with_versions: bool) -> Response {
     metrics().refused.inc();

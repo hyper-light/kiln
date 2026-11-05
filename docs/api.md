@@ -152,6 +152,13 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
   `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
   changed: refetch `/api/runners/:name/front-door`).
+* `GET /api/live` — the browser protocol over one WebSocket per browser (docs/browser-protocol.md,
+  "The WebSocket carrier"), served when `[server] live` is set (else 404): binary messages of goal
+  2's frames both ways, opened with a single-use ticket from `POST /api/live/ticket`. The upgrade
+  needs the session's credentials (401), an `Origin` of the server's own (403) and a
+  `Sec-WebSocket-Protocol` naming a version it speaks (`kiln-bp.<n>`; else 400 naming them); the 101
+  names the version and no extension. `GET /api/live/sockets`: the caller's own protocol sockets
+  and their numbers.
 * `GET /api/jobs/:id/logs/ws?step=N` — server sends the backlog then live output as **binary**
   frames (raw bytes, ANSI). Text frames: `{type:"step", idx, status}`, `{type:"end"}`.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.

@@ -729,8 +729,8 @@ mod tests {
     /// front door's pipe, while the server floods. What the front door holds (its pipe, its upstream
     /// socket's receive buffer, its browser-side unsent bytes) stays within their bounds, so what the
     /// server got written before it stalled is those, the server's own send buffer and the browser's
-    /// receive buffer: hundreds of KiB, where the front door's kernel alone would take 4 MiB unbounded
-    /// (`tcp_wmem`'s most) and its upstream socket up to `tcp_rmem`'s (research f22).
+    /// receive buffer: hundreds of KiB (the bound below), where the front door's kernel alone would take
+    /// 4 MiB unbounded (`tcp_wmem`'s most) and its upstream socket up to `tcp_rmem`'s (research f22).
     #[cfg(target_os = "linux")]
     #[test]
     fn bp_g3_s5_a_slow_browser_leaves_the_flood_at_the_server() -> anyhow::Result<()> {
@@ -772,8 +772,12 @@ mod tests {
             let browser = hyper_rt::tcp::TcpStream::connect(front_addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             let _ = browser.set_recv_buffer(ENDS);
             let written = flood.await.map_err(|_| anyhow::anyhow!("flood task"))??;
-            // Linux doubles each buffer set; in flight to the browser is at most its receive buffer.
-            let bound = 2 * ENDS as usize + 2 * RELAY_RCVBUF as usize + BUFFER + RELAY_LOWAT as usize + (16 << 10) + 2 * ENDS as usize;
+            // Linux doubles each buffer set. Held between the server's writes and the browser: the
+            // server's send buffer, the front door's upstream receive buffer, its pipe, its browser-side
+            // unsent bytes (the mark, and the one segment, up to 64 KiB on loopback, a write may fill
+            // past it), and in flight to the browser at most its receive buffer and the window it
+            // advertised before that buffer was set (set after connecting, here).
+            let bound = 2 * ENDS as usize + 2 * RELAY_RCVBUF as usize + BUFFER + RELAY_LOWAT as usize + (64 << 10) + 2 * ENDS as usize + 2 * ENDS as usize;
             eprintln!("bp_g3_s5: the server wrote {written} B before it stalled; bound {bound} B");
             assert!(written > 0 && written <= bound, "written {written}, bound {bound}");
             drop(browser);
