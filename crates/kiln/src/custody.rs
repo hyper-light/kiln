@@ -1304,17 +1304,19 @@ fn followers_on(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<Vec<
 
 /// The records kiln has among `digests`, each checked as of when kiln took it (a revocation
 /// since doesn't undo it).
-async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation]) -> anyhow::Result<BTreeMap<String, Checked>> {
+async fn load(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>) -> anyhow::Result<BTreeMap<String, Checked>> {
     load_with(store, root, digests, revocations, |records| records).await
 }
 
 /// [`load`], with `then` made of the records in the same job on the compute pool, off the shards, and the records let
-/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]).
-async fn load_with<T: Send + 'static>(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation], then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
+/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]). The root and
+/// the revocations go to it shared, not copied: each of a waiting record's two loads copied every revocation on its
+/// shard (goal 9, plan 01a1a87b2cec step 3).
+async fn load_with<T: Send + 'static>(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>, then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
     let wanted = digests.to_vec();
     let rows = store.call(move |c| Ok(rows_on(c, &wanted)?)).await?;
     // Each checked again as of when kiln took it, on the compute pool, off the shards (`read`).
-    let (root, revocations) = (root.to_vec(), revocations.to_vec());
+    let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
     crate::rt::compute(move || then(checked_rows(rows, &root, &revocations))).await
 }
 
@@ -1380,7 +1382,7 @@ fn broken(d: &str, mine: Checked, mut map: BTreeMap<String, Checked>, needed: &[
 /// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
 /// delegation it acts under (W27-R08: another machine's, which comes in any order). Its records are
 /// read and its hop walked on the compute pool, with their loads ([`load_with`]).
-async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
+async fn check(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, digest: &str, revocations: &std::sync::Arc<[Revocation]>, at: i64) -> anyhow::Result<Option<String>> {
     let d = digest.to_owned();
     let wants = load_with(store, root, std::slice::from_ref(&d), revocations, {
         let d = d.clone();
@@ -1682,7 +1684,8 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
 /// [`chain`], and the digests of the records it read.
 async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) -> anyhow::Result<Option<(Value, Vec<String>)>> {
     let Some(from) = start(store, digest).await? else { return Ok(None) };
-    let revocations = crate::identities::revocations(store).await?;
+    let (root, revocations): (std::sync::Arc<[u8]>, std::sync::Arc<[Revocation]>) = (root.into(), crate::identities::revocations(store).await?.into());
+    let root = &root;
     let mut map: BTreeMap<String, Checked> = BTreeMap::new();
     let mut frontier = vec![from.clone()];
     while !frontier.is_empty() && map.len() < WALK_MAX {
@@ -2095,6 +2098,17 @@ mod tests {
     use rcgen::SigningKey as _;
 
     const ORG: &str = "hyper-light";
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a record that waited for this one is checked with kiln's root and every
+    /// revocation handed to its loads' compute jobs as they're shared, not copied on its shard for each of its two
+    /// loads (a list that grows by one with each certificate kiln supersedes). What the check finds is the W27 tests'.
+    #[test]
+    fn g9_s3_a_checks_loads_share_the_root_and_revocations() {
+        let code: String = include_str!("custody.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let load_with = code.split("async fn load_with<").nth(1).and_then(|rest| rest.split("\nfn rows_on(").next()).unwrap_or_default();
+        assert!(load_with.contains("Arc::clone(root)") && load_with.contains("Arc::clone(revocations)"), "{load_with}");
+        assert!(!load_with.contains("root.to_vec()") && !load_with.contains("revocations.to_vec()"), "{load_with}");
+    }
     const FEDORA: &str = "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed";
     const JUPITER: &str = "kiln://hyper-light/person/ada/machine/jupiter/instance/01a18b00";
     const LEFT: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/0/machine/fedora/instance/01a14c4f";

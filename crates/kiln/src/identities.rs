@@ -113,13 +113,20 @@ pub fn sign_as(pki: &crate::pki::Pki, kind: &str, payload_type: &str, payload: &
 /// (`signs`, as its runner said). Its digest, for the leg's records to name in `under`.
 async fn delegate_leg(hub: &Hub, job: &str, attempt: u32, uri: &str, cert_pem: &str, facts: &[(u64, String)], signs: bool) -> anyhow::Result<String> {
     use kiln_ci::identity::{chain::fulcio, statement};
-    let commit = facts.iter().find(|(m, _)| *m == fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.as_str());
+    let commit = facts.iter().find(|(m, _)| *m == fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.clone());
     let assignment = crate::ci::signed::handed_digest(&hub.store, job, attempt).await?;
-    let until = crate::pki::cert_info(cert_pem)?.not_after;
     let server = Identity::new(hub.pki.organization(), Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let payload = statement::payload(&kiln_ci::attest::leg::delegation(&server, uri, commit, assignment.as_deref(), until))?;
-    let bundle = sign_as(&hub.pki, "server", statement::PAYLOAD_DELEGATION, &payload)?.to_string();
-    let digest = statement::digest(statement::PAYLOAD_DELEGATION, &payload);
+    // Read, made and signed on the blocking pool: the server's key and certificate are files, read for each
+    // signature, and the certificate's parse and the signature were CPU on the hub's loop, which waits for this
+    // answer (goal 9, plan 01a1a87b2cec step 3).
+    let (pki, uri, cert) = (Arc::clone(&hub.pki), uri.to_owned(), cert_pem.to_owned());
+    let (bundle, digest) = crate::rt::blocking(move || -> anyhow::Result<(String, String)> {
+        let until = crate::pki::cert_info(&cert)?.not_after;
+        let payload = statement::payload(&kiln_ci::attest::leg::delegation(&server, &uri, commit.as_deref(), assignment.as_deref(), until))?;
+        let bundle = sign_as(&pki, "server", statement::PAYLOAD_DELEGATION, &payload)?.to_string();
+        Ok((bundle, statement::digest(statement::PAYLOAD_DELEGATION, &payload)))
+    })
+    .await??;
     let (j, d, at) = (job.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
@@ -740,7 +747,11 @@ pub enum Target {
 
 /// Records a certificate kiln just issued.
 pub async fn record(store: &Store, kind: &str, subject: &str, cert_pem: &str) -> anyhow::Result<()> {
-    let f = crate::pki::fingerprints(cert_pem)?;
+    record_fingerprinted(store, kind, subject, cert_pem, crate::pki::fingerprints(cert_pem)?).await
+}
+
+/// [`record`], `cert_pem` fingerprinted already (`f`, where it was made: [`certify`]).
+async fn record_fingerprinted(store: &Store, kind: &str, subject: &str, cert_pem: &str, f: crate::pki::Fingerprints) -> anyhow::Result<()> {
     let (kind, subject, pem, now) = (kind.to_owned(), subject.to_owned(), cert_pem.to_owned(), crate::util::now_unix());
     store
         .call(move |c| {
@@ -896,8 +907,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let named: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
-    let pem = hub.pki.issue_identity(&ask.csr, &identity, &named, lifetime)?;
+    let (pem, fingerprints) = certify(&hub.pki, &ask.csr, &identity, &facts, lifetime).await?;
     let delegation = match (&identity.actor, ask.of.as_deref()) {
         (Actor::Leg { attempt, .. }, Some(job)) => Some(delegate_leg(hub, job, *attempt, &uri, &pem, &facts, ask.signs).await.map_err(|e| e.context("the server's delegation of the leg wasn't signed"))?),
         _ => None,
@@ -966,9 +976,24 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
             }
         }
     }
-    record(&hub.store, &ask.kind, &uri, &pem).await?;
+    record_fingerprinted(&hub.store, &ask.kind, &uri, &pem, fingerprints).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");
     Ok((uri, pem, delegation, inputs))
+}
+
+/// The certificate for the key of `csr` as `identity`, with `facts` and for `lifetime`, and its fingerprints:
+/// made on the compute pool. The CSR's signature checked and the CA's made, then the certificate read back,
+/// were each runner's Identity's work on the hub's loop, which waits for its answer: every ask held its
+/// shard, 0.2 ms at the median and up to 3 ms with hogs in g9p7's fill (goal 9, plan 01a1a87b2cec step 3).
+async fn certify(pki: &Arc<crate::pki::Pki>, csr: &str, identity: &Identity, facts: &[(u64, String)], lifetime: time::Duration) -> anyhow::Result<(String, crate::pki::Fingerprints)> {
+    let (pki, csr, identity, facts) = (Arc::clone(pki), csr.to_owned(), identity.clone(), facts.to_vec());
+    crate::rt::compute(move || -> anyhow::Result<_> {
+        let named: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
+        let pem = pki.issue_identity(&csr, &identity, &named, lifetime)?;
+        let fingerprints = crate::pki::fingerprints(&pem)?;
+        Ok((pem, fingerprints))
+    })
+    .await?
 }
 
 /// An agent session's identity at `epoch`, for the runner process of `machine` holding it
@@ -1696,6 +1721,37 @@ mod tests {
             // None at all.
             let none = check(&results(None)?, &[(&kilns, &by_kiln)])?;
             assert!(leg::under_kilns_delegation(&none, &server).is_err_and(|e| e.contains("acts under no delegation")));
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a runner process's identity is certified on the compute pool, its
+    /// certificate fingerprinted there, and recorded with those fingerprints: the certificate is the identity's,
+    /// for the CSR's key, and its row in `identities` says what the certificate says. Its shard is the hub's
+    /// loop's, which waited through the CSR's check and the CA's signature for every ask. And `issue` makes no
+    /// certificate of its own: `certify`'s alone.
+    #[test]
+    fn g9_s3_an_identity_is_certified_off_the_shard_and_recorded_as_made() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+            let identity = Identity::new(pki.organization(), Actor::Runner { enrolled_by: "admin".into(), machine: "box".into(), instance: "main".into() });
+            let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (pem, made) = certify(&pki, &csr, &identity, &[], time::Duration::hours(RUNNER_HOURS)).await?;
+            anyhow::ensure!(made == crate::pki::fingerprints(&pem)?, "its fingerprints are its certificate's");
+            anyhow::ensure!(pki.issued(&crate::pki::der_of(&pem)?), "the CA's");
+            anyhow::ensure!(made.key == crate::pki::fingerprints(&pki.issue_identity(&csr, &identity, &[], time::Duration::hours(1))?)?.key, "for the CSR's key");
+            record_fingerprinted(&store, "runner", &uri, &pem, made.clone()).await?;
+            let row: (String, String, String, i64, i64, String) = store
+                .call(|c| Ok(c.query_row("SELECT serial, subject, key_sha256, not_before, not_after, cert_pem FROM identities WHERE kind = 'runner'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?))
+                .await?;
+            anyhow::ensure!(row == (made.serial, uri, made.key, made.not_before, made.not_after, pem), "{row:?}");
+            let code: String = include_str!("identities.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            let issue = code.split("async fn issue(").nth(1).and_then(|rest| rest.split("\nasync fn certify(").next()).unwrap_or_default();
+            anyhow::ensure!(!issue.is_empty() && !issue.contains("issue_identity(") && !issue.contains("fingerprints("), "issue makes or reads a certificate on its caller's shard");
             Ok(())
         })
     }

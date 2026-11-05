@@ -580,7 +580,7 @@ pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::
         }
     };
     match answer(hub, caller, &bytes).await {
-        Some(a) => srv::json(StatusCode::OK, &a),
+        Some(a) => json_answer(StatusCode::OK, a).await,
         None => srv::status(StatusCode::ACCEPTED),
     }
 }
@@ -805,7 +805,7 @@ impl Server {
                 // holding every file place while their calls waited for one stalled the share).
                 let result = crate::rt::on_thread("kiln-code", move || code::run(cx, mode, &program, code::Limits::default())).await;
                 match result {
-                    Ok(Ok(out)) => tool_ok(out),
+                    Ok(Ok(out)) => tool_ok(out).await,
                     Ok(Err(e)) => tool_error_value(json!({"error": e.message, "code": e.code, "calls": e.calls})),
                     Err(e) => tool_error(&format!("the sandbox could not run: {e:#}")),
                 }
@@ -820,7 +820,7 @@ impl Server {
                     return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
                 }
                 match crate::ops::call(cx, op.name, args).await {
-                    Ok(v) => tool_ok(v),
+                    Ok(v) => tool_ok(v).await,
                     Err((_, e)) => tool_error(&e),
                 }
             }
@@ -828,9 +828,25 @@ impl Server {
     }
 }
 
-fn tool_ok(v: Value) -> Value {
-    let text = serde_json::to_string(&v).unwrap_or_default();
-    json!({"content": [{"type": "text", "text": text}], "structuredContent": if v.is_object() { v } else { json!({"result": v}) }, "isError": false})
+/// A tool's result: its JSON as the text clients read, written on the compute pool (a list of every agent's
+/// brief was written on its request's shard, then again in the answer; goal 9, plan 01a1a87b2cec step 3), and
+/// as it is for those that take it structured.
+async fn tool_ok(v: Value) -> Value {
+    match crate::rt::compute(move || (serde_json::to_string(&v).unwrap_or_default(), v)).await {
+        Ok((text, v)) => json!({"content": [{"type": "text", "text": text}], "structuredContent": if v.is_object() { v } else { json!({"result": v}) }, "isError": false}),
+        Err(e) => tool_error(&format!("the result couldn't be written: {e:#}")),
+    }
+}
+
+/// `answer` as an HTTP answer's JSON, written on the compute pool: a tool's result is in it twice, as its
+/// text and as it is (goal 9, plan 01a1a87b2cec step 3).
+async fn json_answer(status: StatusCode, answer: Value) -> Response {
+    crate::reads::trace::encoded();
+    match crate::rt::compute(move || serde_json::to_vec(&answer)).await {
+        Ok(Ok(b)) => srv::response(status, "application/json", srv::full(b)),
+        Ok(Err(e)) => srv::text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e}")),
+        Err(e) => srv::text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e:#}")),
+    }
 }
 
 fn tool_error(msg: &str) -> Value {
@@ -1315,5 +1331,34 @@ mod tests {
         assert!(told.starts_with(INSTRUCTIONS) && told.contains("You are kiln agent 01a14ab9693976deb6ff6825f7da1c42") && told.contains("goals_add") && told.contains("plans_run"), "{told}");
         assert_eq!(instructions(&Caller::owner()), INSTRUCTIONS);
         assert!(skills::list().iter().any(|s| s.get("name").and_then(Value::as_str) == Some("kiln-plans")), "the skill the instructions name is there");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `agents_list` through `/api/mcp`, its briefs, its text and its answer's
+    /// JSON written on the compute pool, answers as it did: its text is its structured result's JSON, which lists
+    /// every agent the caller sees, in the registry's order, each one's brief; and the answer is that, whole.
+    #[test]
+    fn g9_s3_agents_list_is_answered_whole_its_json_written_off_the_shard() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for id in ["s1", "s2", "s3"] {
+                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+            }
+            let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}"#);
+            let r = respond(&hub, Caller::owner(), Ok(body)).await;
+            anyhow::ensure!(r.status() == StatusCode::OK && r.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) == Some("application/json"), "{:?}", r.headers());
+            let answer: Value = serde_json::from_slice(&r.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default())?;
+            anyhow::ensure!(answer.get("id") == Some(&json!(7)) && answer.pointer("/result/isError") == Some(&json!(false)), "{answer}");
+            let structured = answer.pointer("/result/structuredContent").cloned().unwrap_or_default();
+            let text: Value = serde_json::from_str(answer.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default())?;
+            anyhow::ensure!(text == structured, "its text is its result's JSON: {text} against {structured}");
+            let want: Vec<Value> = hub.harness.list().iter().filter(|i| i.helper.is_none()).map(crate::harness::wait::brief).collect();
+            anyhow::ensure!(structured.get("agents") == Some(&Value::Array(want)) && want_len(&structured) == 3, "{structured}");
+            Ok(())
+        })
+    }
+
+    fn want_len(v: &Value) -> usize {
+        v.get("agents").and_then(Value::as_array).map_or(0, Vec::len)
     }
 }
