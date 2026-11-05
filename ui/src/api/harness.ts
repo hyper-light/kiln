@@ -1252,8 +1252,8 @@ export class SessionStore {
       events.onReopen(() => this.kick("fresh")),
       // The session is on the server again (its machine came back): no need to wait for the next try.
       // And what of its messages couldn't be read, which only the server says, as it changes.
-      events.on((ev) => {
-        if (ev.type !== "harness" || ev.info.id !== this.id) return;
+      events.on(["harness"], (ev) => {
+        if (ev.info.id !== this.id) return;
         this.refused(ev.info.refused);
         this.kick("event");
       }),

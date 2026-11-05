@@ -437,6 +437,9 @@ pub struct Hub {
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
     pub events: Broadcast<Arc<str>>,
+    /// The same frames, numbered and kept for the events socket's pages, which resume from them
+    /// (`crate::wire::events::feed`).
+    pub feed: crate::wire::events::feed::Feed,
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
     pub terminals: crate::termsess::Sessions,
@@ -626,6 +629,9 @@ impl Hub {
             pending_peers: Mutex::new(HashMap::new()),
             tunnels: Arc::default(),
             events: Broadcast::new(4096),
+            // This server process's: a page's place in another's feed isn't taken (53 bits, as JSON
+            // carries a number exactly).
+            feed: crate::wire::events::feed::Feed::new(rand::random::<u64>() >> 11),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
             harness,
@@ -875,10 +881,13 @@ impl Hub {
         self.emit(&ServerEvent::Terminals);
     }
 
-    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
+    /// Sends `e` down every events socket (`GET /api/events`), numbered in the feed they resume
+    /// from, and to kiln's own listeners.
     pub fn emit(&self, e: &ServerEvent) {
+        let text: Arc<str> = Arc::from(e.text());
+        self.feed.push(Arc::clone(&text));
         if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(e.text()));
+            self.events.send(text);
         }
     }
 

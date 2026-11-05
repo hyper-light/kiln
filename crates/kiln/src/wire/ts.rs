@@ -75,6 +75,8 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::ui::HeldBack>();
     c.visit::<super::ui::HeldLines>();
     c.visit::<super::events::ServerEvent>();
+    c.visit::<super::events::EventsDown>();
+    c.visit::<super::events::EventsUp>();
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();
     c.visit::<crate::workspace::git::Picked>();

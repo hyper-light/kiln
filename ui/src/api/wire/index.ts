@@ -49,6 +49,8 @@ export type { DeployRelease } from "./DeployRelease";
 export type { DiffRunEvent } from "./DiffRunEvent";
 export type { Disk } from "./Disk";
 export type { Event } from "./Event";
+export type { EventsDown } from "./EventsDown";
+export type { EventsUp } from "./EventsUp";
 export type { EventsWindow } from "./EventsWindow";
 export type { ExecutorFacts } from "./ExecutorFacts";
 export type { ExitInfo } from "./ExitInfo";
