@@ -1272,6 +1272,8 @@ pub fn render() -> String {
     scalar!("kiln_ws_clients", "gauge", "Connected UI websocket clients.", m.ws_clients.get());
     scalar!("kiln_supervisor_restarts_total", "counter", "Supervised subsystem restarts.", m.supervisor_restarts.get());
     scalar!("kiln_panics_caught_total", "counter", "Panics contained at task boundaries.", m.panics_caught.get());
+    // Goal 9, plan 01a1a87b2cec step 3: kiln's own log lines let go at their queue's bound (`crate::log_lines`).
+    scalar!("kiln_log_lines_dropped_total", "counter", "kiln's own log lines let go at their writer's queue's bound, each said in the log as the writer next writes.", crate::log_lines::dropped_total());
     scalar!("kiln_quic_streams_total", "counter", "QUIC streams accepted.", m.quic_streams.get());
 
     help(&mut o, "kiln_jobs_finished_total", "counter", "Finished jobs.");
