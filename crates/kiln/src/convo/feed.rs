@@ -230,7 +230,9 @@ impl Shipper {
         // Each commit, as a nudge in the same queue.
         let watch = store.watch();
         let nudge = tx.clone();
-        crate::rt::spawn(async move {
+        // The feed's two tasks on the next shards round-robin, not the one that starts it: a server
+        // starts every feed on the shard its start-up runs on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(async move {
             while watch.recv().await.is_ok() {
                 if nudge.send(Link::Wrote).await.is_err() {
                     break;
@@ -239,7 +241,7 @@ impl Shipper {
         });
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
         let signs = Signs::default();
-        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
+        crate::rt::spawn_spread(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
         (Self { tx, stats, signs }, out_rx)
     }
 

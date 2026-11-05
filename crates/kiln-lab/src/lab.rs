@@ -291,6 +291,12 @@ pub struct Round {
     pub shards: usize,
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
+    /// What held the shards past 100 µs in the window, and over the fill (`kiln_shard_held_*`, goal 9, plan
+    /// 01a1a87b2cec step 2), each the most first: a build without the series has none.
+    #[serde(default)]
+    pub held: Vec<measure::Held>,
+    #[serde(default)]
+    pub fill_held: Vec<measure::Held>,
     /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
     /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
     /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
@@ -731,6 +737,34 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
 }
 
+/// A command the lab runs as each part of a round begins and ends, from `KILN_LAB_HOOK` (goal 9, plan
+/// 01a1a87b2cec step 2: a profiler of the round's server over its window): `<hook> <event> <server's pid>
+/// <folder>`, the event `fill-start`, `fill-end`, `window-start` or `window-end`, the folder one of the
+/// round's own beside its kiln's (`<round>.hook`, kept when the kiln's is removed). The lab waits for it, so
+/// it starts what lasts in the background; one that fails is said and the round goes on.
+struct Hook {
+    command: Option<PathBuf>,
+    pid: u32,
+    dir: PathBuf,
+}
+
+impl Hook {
+    fn from_env(fleet: &Fleet, dir: &Path) -> Self {
+        let command = std::env::var_os("KILN_LAB_HOOK").filter(|c| !c.is_empty()).map(PathBuf::from);
+        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook") }
+    }
+
+    fn run(&self, event: &str) {
+        let Some(command) = &self.command else { return };
+        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| Ok(Command::new(command).arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null()).status()?));
+        match ran {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Err(e) => eprintln!("kiln-lab: the hook's {event} didn't run: {e:#}"),
+        }
+    }
+}
+
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
@@ -745,7 +779,9 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     // server's /metrics either side of it too: the conversation feed at its busiest, every session's
     // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
     let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
+    let hook = Hook::from_env(&fleet, dir);
     let fill_before = scrape(&fleet)?;
+    hook.run("fill-start");
     let filled = Instant::now();
     let mut opened: Vec<(String, u64)> = Vec::new();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -789,6 +825,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         std::thread::sleep(Duration::from_millis(250));
     }
     let fill_s = filled.elapsed().as_secs_f64();
+    hook.run("fill-end");
     let fill_after = scrape(&fleet)?;
 
     // The MCP tools agents call, where this build has them.
@@ -844,9 +881,11 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
         m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
         let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        hook.run("window-start");
         let start = now_us();
         std::thread::sleep(Duration::from_secs(p.window_s));
         let end = now_us();
+        hook.run("window-end");
         let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
@@ -872,12 +911,13 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
     let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, locks })
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, locks })
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
@@ -988,15 +1028,20 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         }
     };
     put("server.cpu_share".into(), diff("process_cpu_seconds_total", &[]).map(per_s));
-    // The shards': their delays together, their busy share on average, their slow polls.
+    // The shards': their delays together and each shard's, to the microsecond (median, p99, p99.9 and the top
+    // bucket reached: goal 9, plan 01a1a87b2cec step 1), their busy share on average and each one's, the
+    // worst shard's p99.9 and busy share, and their slow polls.
     let shards = after.values_of("kiln_shard_polls_total", "shard");
     if !shards.is_empty() {
         let mut delay: Vec<(f64, f64)> = Vec::new();
         let mut busy = 0.0;
+        let (mut worst_p999, mut worst_busy) = (None::<f64>, None::<f64>);
         let mut slow = [("task", 0.0), ("blocking", 0.0), ("host", 0.0), ("unknown", 0.0)];
         for sh in &shards {
             let want = [("shard", sh.as_str())];
             let d = histogram("kiln_shard_delay_seconds", &want);
+            let p999 = delay_us(&mut put, &format!("shard{sh}."), &d);
+            worst_p999 = most(worst_p999, p999);
             if delay.is_empty() {
                 delay = d;
             } else {
@@ -1004,17 +1049,20 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
                     *total += add;
                 }
             }
-            busy += diff("kiln_shard_busy_seconds_total", &want).unwrap_or(0.0);
+            let own = diff("kiln_shard_busy_seconds_total", &want).map(per_s);
+            put(format!("shard{sh}.busy_share"), own);
+            worst_busy = most(worst_busy, own);
+            busy += own.unwrap_or(0.0);
             for (cause, total) in &mut slow {
                 *total += diff("kiln_shard_slow_polls_total", &[("shard", sh.as_str()), ("cause", *cause)]).unwrap_or(0.0);
             }
         }
-        put("shards.delay_p99_ms".into(), measure::histogram_quantile(0.99, &delay).map(|v| v * 1000.0));
-        put("shards.delay_p999_ms".into(), measure::histogram_quantile(0.999, &delay).map(|v| v * 1000.0));
-        put("shards.delay_top_ms".into(), measure::histogram_top(&delay).map(|v| v * 1000.0));
+        delay_us(&mut put, "shards.", &delay);
+        put("shards.worst_delay_p999_us".into(), worst_p999);
+        put("shards.worst_busy_share".into(), worst_busy);
         #[allow(clippy::cast_precision_loss)]
         let count = shards.len() as f64;
-        put("shards.busy_share".into(), Some(per_s(busy) / count));
+        put("shards.busy_share".into(), Some(busy / count));
         put("shards.slow_polls_per_s".into(), Some(per_s(slow.iter().map(|(_, v)| v).sum())));
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
@@ -1056,6 +1104,27 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         put(format!("blocking.{share}.little_p99"), run_p99.map(|w| per_s(jobs) * w));
     }
     shards.len()
+}
+
+/// The larger of two numbers either may lack.
+fn most(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// A shard delay histogram's numbers, each `prefix` then its name, in microseconds: its median, p99, p99.9 and
+/// the top bucket reached (an observation's bound from above: `+Inf` past the last). Its p99.9, if it has one.
+fn delay_us(put: &mut impl FnMut(String, Option<f64>), prefix: &str, buckets: &[(f64, f64)]) -> Option<f64> {
+    let us = |v: f64| v * 1e6;
+    let p999 = measure::histogram_quantile(0.999, buckets).map(us);
+    put(format!("{prefix}delay_p50_us"), measure::histogram_quantile(0.5, buckets).map(us));
+    put(format!("{prefix}delay_p99_us"), measure::histogram_quantile(0.99, buckets).map(us));
+    put(format!("{prefix}delay_p999_us"), p999);
+    put(format!("{prefix}delay_max_us"), measure::histogram_top(buckets).filter(|v| v.is_finite()).map(us));
+    p999
 }
 
 /// Which way each number is better: each class's throughput up, everything else (latency, CPU, delay,

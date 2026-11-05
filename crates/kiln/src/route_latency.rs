@@ -119,6 +119,57 @@ pub fn class_of(method: &Method, path: &str, upgrade: bool) -> Option<Class> {
     Some(if kiln_s_own || !read { api } else { Class::Page })
 }
 
+/// What a request's polls are labeled with for the shards' table of slow polls (`hyper_rt::slow`; goal 9,
+/// plan 01a1a87b2cec step 2): whether it reads or changes, and which of the API's resources it is
+/// (`/api/<resource>`, and the harness's own under `/api/harness/<resource>`), from a fixed set of labels, so
+/// a label costs a match and nothing is kept per request; a WebSocket's opening, a page, kiln's own routes at
+/// the root, and what matches none of them by their kind alone.
+pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt::slow::Label {
+    use hyper_rt::slow::Label;
+    static OPEN: Label = Label { name: "websocket open" };
+    static PAGE: Label = Label { name: "page" };
+    static ROOT: Label = Label { name: "read /<kiln's own>" };
+    static OTHER_READ: Label = Label { name: "read /api/<other>" };
+    static OTHER_WRITE: Label = Label { name: "write /api/<other>" };
+    static ROOT_WRITE: Label = Label { name: "write /<other>" };
+    /// Each name's read and write labels, as statics of a `match` arm's own.
+    macro_rules! resources {
+        ($prefix:literal, $of:expr, $read:expr; $($name:literal),* $(,)?) => {
+            match $of {
+                $(Some($name) => {
+                    static READ: Label = Label { name: concat!("read /api/", $prefix, $name) };
+                    static WRITE: Label = Label { name: concat!("write /api/", $prefix, $name) };
+                    Some(if $read { &READ } else { &WRITE })
+                })*
+                _ => None,
+            }
+        };
+    }
+    if upgrade {
+        return &OPEN;
+    }
+    let read = *method == Method::GET || *method == Method::HEAD;
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let (first, second, third) = (segs.next(), segs.next(), segs.next());
+    if first != Some("api") {
+        return match (read, class_of(method, path, false)) {
+            (true, Some(Class::Page)) => &PAGE,
+            (true, _) => &ROOT,
+            (false, _) => &ROOT_WRITE,
+        };
+    }
+    let label = if second == Some("harness") && third.is_some() {
+        resources!("harness/", third, read; "agents", "broadcast", "changes", "command", "conversations", "files", "history", "kinds", "machines", "sessions", "workspaces")
+    } else {
+        resources!("", second, read;
+            "accounts", "agents", "ai-sessions", "attachments", "audit", "auth", "blobs", "cd", "chaos", "ci", "cluster", "conversations", "custody", "deploy", "diffs",
+            "discovery", "events", "experiments", "front-doors", "harness", "headroom", "hooks", "identities", "incidents", "join", "join-requests", "jobs", "machines", "mcp",
+            "me", "metrics", "observe", "ops", "outposts", "overview", "peers", "places", "plans", "programs", "push", "reach", "repos", "research", "runners", "runs",
+            "settings", "shared", "ship", "sync", "system", "tailscale", "terminal", "trail", "transfers", "updates", "verify", "voice")
+    };
+    label.unwrap_or(if read { &OTHER_READ } else { &OTHER_WRITE })
+}
+
 /// Routes runners and their jobs call: enrolling and their link's tunnel, a job's source and
 /// artifacts, sync's contents and bundles, a learner's copy of the store, Observe's snapshots, a
 /// fleet build's own routes, the binaries runners fetch, and CI's runtime services (the cache and
@@ -193,6 +244,27 @@ mod tests {
         assert_eq!(class(&get, "/dl/kiln/linux-x86_64"), Some(Class::Runner));
         // A WebSocket's opening is none: its frames are timed.
         assert_eq!(class_of(&get, "/api/harness/sessions/s1/ws", true), None);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 2: a request's polls are labeled by whether it reads or changes and
+    /// which of the API's resources it is; a page, kiln's own reads at the root, a WebSocket's opening and the
+    /// API's other paths by their kind; the same route is the same label each time.
+    #[test]
+    fn g9_s2_a_request_is_labeled_by_its_route() {
+        let (get, post) = (Method::GET, Method::POST);
+        let name = |m: &Method, p: &str| label_of(m, p, false).name;
+        assert_eq!(name(&get, "/api/harness/sessions/s1/events"), "read /api/harness/sessions");
+        assert_eq!(name(&post, "/api/harness/sessions/s1/command"), "write /api/harness/sessions");
+        assert_eq!(name(&get, "/api/harness"), "read /api/harness");
+        assert_eq!(name(&get, "/api/runners"), "read /api/runners");
+        assert_eq!(name(&post, "/api/mcp"), "write /api/mcp");
+        assert_eq!(name(&get, "/api/nothing-here/x"), "read /api/<other>");
+        assert_eq!(name(&Method::DELETE, "/api/nothing-here"), "write /api/<other>");
+        assert_eq!(name(&get, "/agents/01a19ff6"), "page");
+        assert_eq!(name(&get, "/metrics"), "read /<kiln's own>");
+        assert_eq!(name(&post, "/agents"), "write /<other>");
+        assert_eq!(label_of(&get, "/api/harness/sessions/s1/ws", true).name, "websocket open");
+        assert!(std::ptr::eq(label_of(&get, "/api/runs", false), label_of(&Method::HEAD, "/api/runs/7", false)));
     }
 
     /// Goal 1, plan 01a1a59c2a68 step 2: what's observed moves its own class's histograms alone.
