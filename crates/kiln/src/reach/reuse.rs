@@ -225,12 +225,12 @@ impl Kept {
 
 /// `kiln run --reuse`, start to end: keyed and looked up first; a hit replayed, a miss run as
 /// [`super::local::run`] runs it and recorded if it succeeds.
-pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     run_with(crate::runner::work::service::ensure().await, handle, me, req, ev, ctl).await;
 }
 
 /// [`run`] against `svc`, this runner's cache service.
-pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me: &str, mut req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me: &str, mut req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     let Some(svc) = svc else {
         let _ = ev.send(Ev::Note("not reused: this runner serves no cache".to_owned())).await;
         return super::local::run(handle, me, req, ev, ctl).await;
@@ -267,7 +267,8 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
     }
     // Where it was keyed for, by name: the run goes there.
     req.target = keyed.runner.name.clone();
-    let (tee, seen) = async_channel::unbounded::<Ev>();
+    // What the run says, seen on its way out: unbounded, as the channel it was (goal 5, plan 01a1a59c2aae).
+    let (tee, seen) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
     let started = Instant::now();
     let running = super::local::run(handle, me, req, tee, ctl);
     let forwarding = async {
