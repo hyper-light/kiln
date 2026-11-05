@@ -14,15 +14,22 @@
 //!   `kiln_memory_bound_bytes{owner}`): an owner of many queues (one a shard, one a viewer) shows their
 //!   sum.
 //!
-//! Lockless: an atomic count of what's held, and an event its receivers tell as they take, as the
-//! channel itself is.
+//! No lock on any path (goal 4, plan 01a1a59c2a9c step 5; goal 5's rule: no lock two shards share on a
+//! request's, a websocket's or a runner's path): an atomic count of what's held, the items in a lock-free
+//! queue (`concurrent_queue`'s unbounded one, its blocks made as it fills), and whoever waits (a receiver for
+//! an item, a sender for room) in a lock-free list of its own ([`Waiters`]). The queue was async-channel's and
+//! the room's wait event-listener's, whose waiters sit behind a std `Mutex` that every wait and every notify
+//! finding a waiter took: each runner's update handed to its session's owner (`crate::harness::copies`, its
+//! owner mostly waiting) took it on the hub's shard, and the owner took it again on its own as it waited.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Weak};
+use std::task::{Poll, Waker};
 use std::time::Instant;
 
 use async_channel::{RecvError, SendError, TryRecvError, TrySendError};
-use event_listener::{Event, Listener as _};
+use concurrent_queue::{ConcurrentQueue, PopError};
+use futures::task::AtomicWaker;
 
 use super::Owner;
 
@@ -122,6 +129,85 @@ impl<A: Weigh, B: Weigh> Weigh for (A, B) {
     }
 }
 
+/// One wait's place among a queue's waiters: what wakes it (its task, or its thread parked in a blocking
+/// call), and whether it's in the list now (listed once a wait, however often the wait is polled).
+struct Place {
+    waker: AtomicWaker,
+    listed: AtomicBool,
+}
+
+impl Place {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { waker: AtomicWaker::new(), listed: AtomicBool::new(false) })
+    }
+}
+
+/// Whoever waits on a queue for one thing (an item, or room), with no lock: a waiter lists its place and
+/// looks again; whoever makes what it waits for (an item in, room let go) wakes every place listed then. A
+/// fence on each side (a Dekker handshake) means one of the two sees the other, so no wake is lost. A place
+/// listed by a wait that found what it waited for at its look again stays until the next wake, which polls
+/// its task for nothing: each wait lists one place at a time, and every wake takes them all.
+struct Waiters {
+    list: ConcurrentQueue<Arc<Place>>,
+}
+
+impl Waiters {
+    fn new() -> Self {
+        Self { list: ConcurrentQueue::unbounded() }
+    }
+
+    /// `place` waits, woken by `waker`; what the waiter looks at next is looked at after this.
+    fn wait(&self, place: &Arc<Place>, waker: &Waker) {
+        place.waker.register(waker);
+        if !place.listed.swap(true, Ordering::AcqRel) {
+            // Unbounded and never closed: the push always goes.
+            let _ = self.list.push(Arc::clone(place));
+        }
+        fence(Ordering::SeqCst);
+    }
+
+    /// Wakes every place listed now: what the waker made (an item in, room let go) is seen by each.
+    fn wake(&self) {
+        fence(Ordering::SeqCst);
+        for _ in 0..self.list.len() {
+            let Ok(place) = self.list.pop() else { break };
+            place.listed.store(false, Ordering::Release);
+            place.waker.wake();
+        }
+    }
+}
+
+/// A waker that unparks the thread that made it: a blocking call's wait, on a thread of its own (never the
+/// runtime's).
+fn thread_waker() -> Waker {
+    struct Unpark(std::thread::Thread);
+    impl futures::task::ArcWake for Unpark {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.unpark();
+        }
+    }
+    futures::task::waker(Arc::new(Unpark(std::thread::current())))
+}
+
+/// Parks the calling thread until it's unparked or `until` (none: for as long as it takes): false once
+/// `until` has passed.
+fn park(until: Option<Instant>) -> bool {
+    match until {
+        Some(t) => {
+            let now = Instant::now();
+            if now >= t {
+                return false;
+            }
+            std::thread::park_timeout(t.saturating_duration_since(now));
+            true
+        }
+        None => {
+            std::thread::park();
+            true
+        }
+    }
+}
+
 /// A queue's room: the bytes it holds, the most it may, and a wait for room. Counted into its owner's
 /// figures as it changes; its bound joins the owner's as it's made and leaves it as it goes.
 pub struct Room {
@@ -130,15 +216,15 @@ pub struct Room {
     held: AtomicUsize,
     /// No receiver any more: whoever waits for room stops waiting (what it sends is refused).
     closed: AtomicBool,
-    /// Told as bytes are let go, and as the queue closes.
-    freed: Event,
+    /// Whoever waits for room: woken as bytes are let go, and as the queue closes.
+    freed: Waiters,
 }
 
 impl Room {
     /// A room of `bound` bytes, counted as `owner`'s.
     pub fn new(owner: &'static Owner, bound: usize) -> Self {
         owner.bound_add(bound);
-        Self { owner, bound, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Event::new() }
+        Self { owner, bound, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
     }
 
     /// The most it may hold, in bytes.
@@ -170,51 +256,46 @@ impl Room {
         }
     }
 
+    /// What a wait for `n` bytes finds now: true once they're taken, false once the queue closed, none
+    /// while it waits on.
+    fn look(&self, n: usize) -> Option<bool> {
+        if self.is_closed() {
+            return Some(false);
+        }
+        self.try_take(n).then_some(true)
+    }
+
     /// Takes `n` bytes, waiting (a task's wait: its thread goes on with others) until they fit; false when
     /// the queue closed first.
     pub async fn take(&self, n: usize) -> bool {
-        loop {
-            if self.is_closed() {
-                return false;
+        let place = Place::new();
+        std::future::poll_fn(|cx| {
+            if let Some(done) = self.look(n) {
+                return Poll::Ready(done);
             }
-            if self.try_take(n) {
-                return true;
+            self.freed.wait(&place, cx.waker());
+            match self.look(n) {
+                Some(done) => Poll::Ready(done),
+                None => Poll::Pending,
             }
-            let freed = self.freed.listen();
-            if self.is_closed() {
-                return false;
-            }
-            if self.try_take(n) {
-                return true;
-            }
-            freed.await;
-        }
+        })
+        .await
     }
 
     /// [`Room::take`], blocking its thread: for a thread of its own, never the runtime's. Waits until
     /// `until` at most (none: as long as it takes); false when it closed or the time ran out first.
     pub fn take_blocking(&self, n: usize, until: Option<Instant>) -> bool {
+        let (place, waker) = (Place::new(), thread_waker());
         loop {
-            if self.is_closed() {
+            if let Some(done) = self.look(n) {
+                return done;
+            }
+            self.freed.wait(&place, &waker);
+            if let Some(done) = self.look(n) {
+                return done;
+            }
+            if !park(until) {
                 return false;
-            }
-            if self.try_take(n) {
-                return true;
-            }
-            let freed = self.freed.listen();
-            if self.is_closed() {
-                return false;
-            }
-            if self.try_take(n) {
-                return true;
-            }
-            match until {
-                Some(t) => {
-                    if freed.wait_deadline(t).is_none() && Instant::now() >= t {
-                        return false;
-                    }
-                }
-                None => freed.wait(),
             }
         }
     }
@@ -232,13 +313,13 @@ impl Room {
             now = seen;
         }
         self.owner.sub(n.min(now));
-        self.freed.notify(usize::MAX);
+        self.freed.wake();
     }
 
     /// No one takes from it any more: whoever waits for room stops.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.freed.notify(usize::MAX);
+        self.freed.wake();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -248,13 +329,13 @@ impl Room {
 
 impl Drop for Room {
     fn drop(&mut self) {
-        // What it still held goes with it (its items are dropped with their channel), and so does its bound.
+        // What it still held goes with it (its items are dropped with their queue), and so does its bound.
         self.owner.sub(*self.held.get_mut());
         self.owner.bound_sub(self.bound);
     }
 }
 
-/// What a place in the queue takes beside its item: the channel's word of state for the place, and the
+/// What a place in the queue takes beside its item: the queue's word of state for the place, and the
 /// count kept beside the item ([`Weighed`]). Counted with each item, so a queue of many small items is
 /// bounded too.
 pub const PLACE: usize = 2 * size_of::<usize>();
@@ -270,22 +351,50 @@ struct Weighed<T> {
     item: T,
 }
 
+/// What a queue's ends share: its items in order, whoever waits for one, and how many senders live (the
+/// last to go closes it, so its receivers end once they've taken what's in it).
+struct Chan<T> {
+    items: ConcurrentQueue<Weighed<T>>,
+    takers: Waiters,
+    senders: AtomicUsize,
+}
+
+impl<T> Chan<T> {
+    /// Closes it: what's in it can still be taken, nothing more goes in, and whoever waits to take looks
+    /// again. Whether this call closed it.
+    fn close(&self) -> bool {
+        let closed = self.items.close();
+        self.takers.wake();
+        closed
+    }
+}
+
 /// A queue of `bound` bytes, counted as `owner`'s. Its places are made as it fills.
 pub fn bounded<T: Weigh>(owner: &'static Owner, bound: usize) -> (Sender<T>, Receiver<T>) {
-    let (tx, rx) = async_channel::unbounded();
+    let chan = Arc::new(Chan { items: ConcurrentQueue::unbounded(), takers: Waiters::new(), senders: AtomicUsize::new(1) });
     let room = Arc::new(Room::new(owner, bound));
-    (Sender { tx, room: Arc::clone(&room) }, Receiver { inner: Arc::new(Taking { rx, room }) })
+    (Sender { chan: Arc::clone(&chan), room: Arc::clone(&room) }, Receiver { inner: Arc::new(Taking { chan, room }) })
 }
 
 /// A queue's sending end: cheap to clone, usable from any thread.
 pub struct Sender<T> {
-    tx: async_channel::Sender<Weighed<T>>,
+    chan: Arc<Chan<T>>,
     room: Arc<Room>,
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), room: Arc::clone(&self.room) }
+        self.chan.senders.fetch_add(1, Ordering::AcqRel);
+        Self { chan: Arc::clone(&self.chan), room: Arc::clone(&self.room) }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        // The last sender closes it for its receivers, once they've taken what's in it.
+        if self.chan.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.chan.close();
+        }
     }
 }
 
@@ -300,7 +409,7 @@ impl<T: Weigh> Sender<T> {
     /// one takes from the queue any more.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         let bytes = counted(&item);
-        if self.tx.is_closed() || !self.room.take(bytes).await {
+        if self.is_closed() || !self.room.take(bytes).await {
             return Err(SendError(item));
         }
         self.put(bytes, item).map_err(SendError)
@@ -310,7 +419,7 @@ impl<T: Weigh> Sender<T> {
     /// from it any more.
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         let bytes = counted(&item);
-        if self.tx.is_closed() {
+        if self.is_closed() {
             return Err(TrySendError::Closed(item));
         }
         if !self.room.try_take(bytes) {
@@ -322,7 +431,7 @@ impl<T: Weigh> Sender<T> {
     /// [`Sender::send`], blocking its thread: for a thread of its own, never the runtime's.
     pub fn send_blocking(&self, item: T) -> Result<(), SendError<T>> {
         let bytes = counted(&item);
-        if self.tx.is_closed() || !self.room.take_blocking(bytes, None) {
+        if self.is_closed() || !self.room.take_blocking(bytes, None) {
             return Err(SendError(item));
         }
         self.put(bytes, item).map_err(SendError)
@@ -332,43 +441,50 @@ impl<T: Weigh> Sender<T> {
     /// same (each use says why it can't wait).
     pub fn force_send(&self, item: T) -> Result<(), SendError<T>> {
         let bytes = counted(&item);
-        if self.tx.is_closed() {
+        if self.is_closed() {
             return Err(SendError(item));
         }
         self.room.force(bytes);
         self.put(bytes, item).map_err(SendError)
     }
 
-    /// Into the channel, its bytes already taken: given back if the channel closed meanwhile.
+    /// Into the queue, its bytes already taken, and whoever waits to take woken: given back if the queue
+    /// closed meanwhile.
     fn put(&self, bytes: usize, item: T) -> Result<(), T> {
-        self.tx.try_send(Weighed { bytes, item }).map_err(|e| {
-            self.room.give(bytes);
-            e.into_inner().item
-        })
+        match self.chan.items.push(Weighed { bytes, item }) {
+            Ok(()) => {
+                self.chan.takers.wake();
+                Ok(())
+            }
+            Err(refused) => {
+                self.room.give(bytes);
+                Err(refused.into_inner().item)
+            }
+        }
     }
 }
 
 impl<T> Sender<T> {
     /// Whether no one takes from the queue any more.
     pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.chan.items.is_closed()
     }
 
     /// Closes the queue: what waits in it can still be taken, nothing more goes in, and whoever waits for
     /// room stops waiting.
     pub fn close(&self) -> bool {
-        let closed = self.tx.close();
+        let closed = self.chan.close();
         self.room.close();
         closed
     }
 
     /// Items waiting now.
     pub fn len(&self) -> usize {
-        self.tx.len()
+        self.chan.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tx.is_empty()
+        self.chan.items.is_empty()
     }
 
     /// Bytes waiting now.
@@ -383,24 +499,24 @@ impl<T> Sender<T> {
 
     /// Whether `other` sends into the same queue.
     pub fn same_channel(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+        Arc::ptr_eq(&self.chan, &other.chan)
     }
 
     /// A handle that doesn't keep the queue open ([`WeakSender::upgrade`]).
     pub fn downgrade(&self) -> WeakSender<T> {
-        WeakSender { tx: self.tx.downgrade(), room: Arc::downgrade(&self.room) }
+        WeakSender { chan: Arc::downgrade(&self.chan), room: Arc::downgrade(&self.room) }
     }
 }
 
 /// A sending end that doesn't keep the queue open: upgraded while a [`Sender`] still is.
 pub struct WeakSender<T> {
-    tx: async_channel::WeakSender<Weighed<T>>,
+    chan: Weak<Chan<T>>,
     room: Weak<Room>,
 }
 
 impl<T> Clone for WeakSender<T> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), room: Weak::clone(&self.room) }
+        Self { chan: Weak::clone(&self.chan), room: Weak::clone(&self.room) }
     }
 }
 
@@ -411,8 +527,22 @@ impl<T> std::fmt::Debug for WeakSender<T> {
 }
 
 impl<T> WeakSender<T> {
+    /// A sender, while the queue is open and a sender still lives.
     pub fn upgrade(&self) -> Option<Sender<T>> {
-        Some(Sender { tx: self.tx.upgrade()?, room: self.room.upgrade()? })
+        let (chan, room) = (self.chan.upgrade()?, self.room.upgrade()?);
+        if chan.items.is_closed() {
+            return None;
+        }
+        let mut now = chan.senders.load(Ordering::Acquire);
+        loop {
+            if now == 0 {
+                return None;
+            }
+            match chan.senders.compare_exchange_weak(now, now + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Sender { chan, room }),
+                Err(seen) => now = seen,
+            }
+        }
     }
 }
 
@@ -425,13 +555,13 @@ pub struct Receiver<T> {
 /// The receiving end itself, one for all of a queue's [`Receiver`]s: dropped with the last, it closes the
 /// queue, so a sender waiting for room it would never get stops waiting.
 struct Taking<T> {
-    rx: async_channel::Receiver<Weighed<T>>,
+    chan: Arc<Chan<T>>,
     room: Arc<Room>,
 }
 
 impl<T> Drop for Taking<T> {
     fn drop(&mut self) {
-        self.rx.close();
+        self.chan.close();
         self.room.close();
     }
 }
@@ -452,18 +582,52 @@ impl<T> Receiver<T> {
     /// The next item, waiting for one: an error once the queue is empty and no one sends to it any more.
     /// Cancel-safe: an item is taken and its bytes let go in the same poll.
     pub async fn recv(&self) -> Result<T, RecvError> {
-        let w = self.inner.rx.recv().await?;
-        Ok(self.taken(w))
+        let place = Place::new();
+        std::future::poll_fn(|cx| {
+            if let Some(taken) = self.look() {
+                return Poll::Ready(taken);
+            }
+            self.inner.chan.takers.wait(&place, cx.waker());
+            match self.look() {
+                Some(taken) => Poll::Ready(taken),
+                None => Poll::Pending,
+            }
+        })
+        .await
     }
 
     /// The next item if one waits.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.inner.rx.try_recv().map(|w| self.taken(w))
+        match self.inner.chan.items.pop() {
+            Ok(w) => Ok(self.taken(w)),
+            Err(PopError::Empty) => Err(TryRecvError::Empty),
+            Err(PopError::Closed) => Err(TryRecvError::Closed),
+        }
     }
 
     /// [`Receiver::recv`], blocking its thread: for a thread of its own, never the runtime's.
     pub fn recv_blocking(&self) -> Result<T, RecvError> {
-        self.inner.rx.recv_blocking().map(|w| self.taken(w))
+        let (place, waker) = (Place::new(), thread_waker());
+        loop {
+            if let Some(taken) = self.look() {
+                return taken;
+            }
+            self.inner.chan.takers.wait(&place, &waker);
+            if let Some(taken) = self.look() {
+                return taken;
+            }
+            park(None);
+        }
+    }
+
+    /// What a wait for an item finds now: an item, or the end once the queue is closed and empty; none while
+    /// it waits on.
+    fn look(&self) -> Option<Result<T, RecvError>> {
+        match self.inner.chan.items.pop() {
+            Ok(w) => Some(Ok(self.taken(w))),
+            Err(PopError::Closed) => Some(Err(RecvError)),
+            Err(PopError::Empty) => None,
+        }
     }
 
     fn taken(&self, w: Weighed<T>) -> T {
@@ -473,11 +637,11 @@ impl<T> Receiver<T> {
 
     /// Items waiting now.
     pub fn len(&self) -> usize {
-        self.inner.rx.len()
+        self.inner.chan.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.rx.is_empty()
+        self.inner.chan.items.is_empty()
     }
 
     /// Bytes waiting now.
@@ -492,12 +656,12 @@ impl<T> Receiver<T> {
 
     /// Whether the queue is closed (no sender, or [`Receiver::close`]).
     pub fn is_closed(&self) -> bool {
-        self.inner.rx.is_closed()
+        self.inner.chan.items.is_closed()
     }
 
     /// Closes the queue: what waits in it can still be taken; whoever waits for room stops waiting.
     pub fn close(&self) -> bool {
-        let closed = self.inner.rx.close();
+        let closed = self.inner.chan.close();
         self.inner.room.close();
         closed
     }
@@ -514,6 +678,124 @@ mod tests {
         fn weight(&self) -> usize {
             self.0.saturating_sub(PLACE)
         }
+    }
+
+    /// What a source file's code says outside its tests, its comments left out (CRLF read as LF).
+    fn code_of(src: &str) -> String {
+        let src = src.replace("\r\n", "\n");
+        let code = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default();
+        code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5 (goal 5's rule), run by kiln's CI with every test: the queue takes no
+    /// lock, and waits on nothing that takes one (event-listener's waiters sit behind a `Mutex`, and so do
+    /// an async-channel's).
+    #[test]
+    fn g4_s5_the_queue_takes_no_lock() {
+        let code = code_of(include_str!("queue.rs"));
+        for lock in ["Mutex", "RwLock", "Condvar", "parking_lot", "async_lock", "event_listener", "Event::new", "async_channel::unbounded", "async_channel::bounded"] {
+            assert!(!code.contains(lock), "memory/queue.rs takes a lock, or waits on something that does: {lock}");
+        }
+    }
+
+    /// An item of a test's: its sender, its number, and `n` bytes counted.
+    struct Tagged(usize, usize, usize);
+
+    impl Weigh for Tagged {
+        fn weight(&self) -> usize {
+            self.2
+        }
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: senders on every shard at once, a bound that holds a few of their
+    /// items so they wait for room, and two receivers taking on theirs: every item is taken once, each
+    /// sender's in the order it sent them, and the queue never holds past its bound (an item past it alone).
+    #[test]
+    fn g4_s5_senders_on_every_shard_keep_their_order_and_none_is_lost_while_they_wait_for_room() -> anyhow::Result<()> {
+        static OWNER: Owner = Owner::new("test_queue_shards");
+        crate::rt::block_on(async {
+            let (senders, per, each) = (8usize, 300usize, 100usize);
+            let bound = 4 * (each + PLACE);
+            let (tx, rx) = bounded::<Tagged>(&OWNER, bound);
+            let most = Arc::new(AtomicUsize::new(0));
+            let mut takers = Vec::new();
+            for _ in 0..2 {
+                let (rx, most) = (rx.clone(), Arc::clone(&most));
+                takers.push(crate::rt::spawn_spread_joined(async move {
+                    let mut got: Vec<(usize, usize)> = Vec::new();
+                    while let Ok(item) = rx.recv().await {
+                        most.fetch_max(rx.held(), Ordering::AcqRel);
+                        got.push((item.0, item.1));
+                    }
+                    got
+                }));
+            }
+            drop(rx);
+            let mut sent = Vec::new();
+            for s in 0..senders {
+                let tx = tx.clone();
+                sent.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        if tx.send(Tagged(s, n, each)).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }));
+            }
+            drop(tx);
+            for s in sent {
+                anyhow::ensure!(s.await.unwrap_or(false), "a sender was refused");
+            }
+            let mut all: Vec<(usize, usize)> = Vec::new();
+            for t in takers {
+                let got = crate::rt::timeout(std::time::Duration::from_secs(30), t).await.map_err(|_| anyhow::anyhow!("a receiver never saw the end"))?.map_err(|_| anyhow::anyhow!("a receiver ended"))?;
+                // Each receiver has each sender's in order, among what it took.
+                for s in 0..senders {
+                    let theirs: Vec<usize> = got.iter().filter(|(g, _)| *g == s).map(|(_, n)| *n).collect();
+                    anyhow::ensure!(theirs.windows(2).all(|w| w.first() < w.get(1)), "sender {s}'s out of order: {theirs:?}");
+                }
+                all.extend(got);
+            }
+            all.sort_unstable();
+            let want: Vec<(usize, usize)> = (0..senders).flat_map(|s| (0..per).map(move |n| (s, n))).collect();
+            anyhow::ensure!(all == want, "{} items taken of {}: some lost or doubled", all.len(), want.len());
+            anyhow::ensure!(most.load(Ordering::Acquire) <= bound, "held {} past its bound {bound}", most.load(Ordering::Acquire));
+            anyhow::ensure!(OWNER.bytes() == 0, "{} bytes still counted", OWNER.bytes());
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a receiver waiting on a thread of its own is woken by a send from a
+    /// task, a weak sender upgrades while a sender lives and the queue is open (not after), and the queue ends
+    /// for its receiver once its last sender goes.
+    #[test]
+    fn g4_s5_waits_are_woken_and_the_queue_ends_with_its_senders() -> anyhow::Result<()> {
+        static OWNER: Owner = Owner::new("test_queue_wake");
+        let (tx, rx) = bounded::<Item>(&OWNER, 1 << 10);
+        let taker = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Ok(item) = rx.recv_blocking() {
+                got.push(item.0);
+            }
+            got
+        });
+        let weak = tx.downgrade();
+        crate::rt::block_on(async move {
+            crate::rt::sleep(std::time::Duration::from_millis(30)).await;
+            for n in 0..3 {
+                tx.send(Item(PLACE + n)).await.map_err(|_| anyhow::anyhow!("refused"))?;
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(weak.upgrade().is_some(), "a sender lives");
+            drop(tx);
+            anyhow::ensure!(weak.upgrade().is_none(), "the last sender went");
+            Ok(())
+        })?;
+        let got = taker.join().map_err(|_| anyhow::anyhow!("the taker panicked"))?;
+        anyhow::ensure!(got == vec![PLACE, PLACE + 1, PLACE + 2], "{got:?}");
+        anyhow::ensure!(OWNER.bytes() == 0);
+        Ok(())
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a queue counts bytes, not items; past its bound a sender is told
