@@ -80,8 +80,8 @@ function closeShown(tags: readonly string[]) {
 
 function start() {
   void load();
-  const offEvents = events.on((ev) => {
-    if (ev.type !== "notices" || !you || ev.principal !== you) return;
+  const offEvents = events.on(["notices"], (ev) => {
+    if (!you || ev.principal !== you) return;
     take(ev.keys.map((key) => ({ key, how: ev.how, at: ev.at })));
     closeShown(ev.tags ?? []);
   });

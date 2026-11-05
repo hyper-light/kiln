@@ -15,6 +15,7 @@ import { sessionStore, type FileChange, type FilePlace, type HEvent } from "@/ap
 import { usePref } from "@/lib/prefs";
 import { relativeTime } from "@/lib/format";
 import { DiffStat, FileDiffView } from "./diff";
+import { Whole } from "./whole";
 import { diffStats, relPath, type ChangedFile } from "./derive";
 import { CommitsMode, CommitsView, type CommitsSource } from "./commits";
 import { CompareMode, CompareView, type CompareSource } from "./compare";
@@ -349,7 +350,16 @@ export function FileList({
                       {e.call?.status === "error" ? " · failed" : ""}
                     </div>
                   )}
-                  <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                  {e.call ? (
+                    // A lean call's lines come once it shows (whole.tsx).
+                    <Whole e={e.call} fallback={<FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={false} />}>
+                      {(w) => (
+                        <FileDiffView diff={w.diffs?.[(e.call?.diffs ?? []).indexOf(e.diff)] ?? e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                      )}
+                    </Whole>
+                  ) : (
+                    <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                  )}
                   {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
                 </div>
               ))}

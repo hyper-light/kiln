@@ -75,7 +75,7 @@ async function read() {
 }
 
 function start() {
-  const offEvents = events.on((ev) => {
+  const offEvents = events.on(["harness", "harness_closed"], (ev) => {
     if (ev.type === "harness" && listed(ev.info)) {
       agents.set(ev.info.id, ev.info);
       if (changed(ev.info, ev.info.id)) publish();

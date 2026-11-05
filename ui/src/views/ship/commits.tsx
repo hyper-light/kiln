@@ -10,7 +10,7 @@
  */
 import * as React from "react";
 import { whoSaid } from "@/api/review";
-import { shipApi, type ShipCommit, type ShipQuery } from "@/api/ship";
+import type { ShipCommit, ShipQuery } from "@/api/ship";
 import { Loading } from "@/components/ui/loading";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { STATES, type GlyphState } from "@/components/ui/status-glyph-spec";
@@ -20,6 +20,7 @@ import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
 import { SectionHead } from "./head";
+import { pageOpts, shipCommits } from "./live";
 
 /** The facets the server narrows a repository's commits by: the list's own (host, kind). */
 export type Narrow = Pick<ShipQuery, "host" | "kind">;
@@ -73,8 +74,8 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
   const cursor = seen === facets ? before.at(-1) : undefined;
   const q: ShipQuery = cursor === undefined ? { repo, ...narrow, limit: per } : { repo, ...narrow, limit: per, cursor };
   const key = `ship/commits/${JSON.stringify(q)}`;
-  // A line says its checks, run time and machines: runs' and jobs' events move them, not a review's.
-  const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), { pollMs: 15_000, on: ["run", "job"] });
+  // A line says its checks, run time and machines: its row in a `ship` frame (W21-R15).
+  const page = useSuspenseResource(key, (s) => shipCommits(q, s), pageOpts(q));
   const fetched = page.data.commits;
   // A page keeps the commits it showed first, each with its latest data, as the list keeps its rows:
   // a commit that arrives meanwhile waits for Newer, so no line moves under the one you're reading.

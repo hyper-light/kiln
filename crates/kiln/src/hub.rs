@@ -534,6 +534,9 @@ pub struct Hub {
     /// and `agents.wait` read them, so the rest of kiln's listeners aren't woken for each, nor is their
     /// ring's lock taken for them across the owners' shards.
     pub harness_events: crate::memory::ring::Ring<Arc<str>>,
+    /// Every frame of both, numbered and kept for the events socket's pages, which resume from them
+    /// (`crate::wire::events::feed`, W21-R15): the sockets read this, kiln's own listeners the rings.
+    pub feed: crate::wire::events::feed::Feed,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`).
     pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
@@ -733,6 +736,9 @@ impl Hub {
             tunnels: Arc::default(),
             events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
             harness_events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
+            // This server process's: a page's place in another's feed isn't taken (53 bits, as JSON
+            // carries a number exactly).
+            feed: crate::wire::events::feed::Feed::new(rand::random::<u64>() >> 11),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,
@@ -991,24 +997,30 @@ impl Hub {
         self.emit(&ServerEvent::Terminals);
     }
 
-    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners: an agent
-    /// session's own (its info, its end) on [`Hub::harness_events`], the rest on [`Hub::events`].
+    /// Sends `e` down every events socket (`GET /api/events`), numbered in the feed they resume
+    /// from, and to kiln's own listeners: an agent session's own (its info, its end) on
+    /// [`Hub::harness_events`], the rest on [`Hub::events`].
     pub fn emit(&self, e: &ServerEvent) {
         let ring = match e {
             ServerEvent::Harness { .. } | ServerEvent::HarnessClosed { .. } => &self.harness_events,
             _ => &self.events,
         };
+        let text: Arc<str> = Arc::from(e.text());
+        self.feed.push(Arc::clone(&text));
         if ring.receiver_count() > 0 {
-            ring.send(Arc::from(e.text()));
+            ring.send(text);
         }
     }
 
     /// An agent session's info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
     /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5), on the
     /// sessions' own ring ([`Hub::harness_events`]; goal 4, plan 01a1a59c2a9c step 5).
+    /// Made always: the feed keeps it for the pages that resume (W21-R15).
     pub fn emit_harness(&self, info_json: &[u8]) {
+        let frame = crate::wire::events::harness_frame(info_json);
+        self.feed.push(Arc::clone(&frame));
         if self.harness_events.receiver_count() > 0 {
-            self.harness_events.send(crate::wire::events::harness_frame(info_json));
+            self.harness_events.send(frame);
         }
     }
 

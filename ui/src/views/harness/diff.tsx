@@ -10,7 +10,7 @@
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
-import type { FileDiff, Hunk } from "@/api/harness";
+import type { FileDiff, HeldLines, Hunk } from "@/api/harness";
 import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
@@ -621,13 +621,15 @@ export function FileDiffView({
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
   const hunks = diff.hunks;
+  // A lean call's diff says its counts, its lines held back (docs/wire.md, "Windows").
+  const { add: heldAdd, del: heldDel } = diff as Partial<HeldLines>;
   const model = React.useMemo(() => {
     let last = 1;
     for (const h of hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
-    const stats = diffStats([{ hunks }]);
+    const stats = diffStats([{ hunks, add: heldAdd, del: heldDel }]);
     const only = stats.del > 0 && stats.add === 0 ? "del" : stats.add > 0 && stats.del === 0 ? "add" : undefined;
     return { hunks: open ? hunks.map(hunkOf) : [], digits: Math.max(2, String(last).length), only, stats };
-  }, [hunks, open]);
+  }, [hunks, open, heldAdd, heldDel]);
   // Its language by what the caller says, else its path, else a `#!` the file starts with.
   const top = hunks[0]?.new_start === 1 ? (hunks[0].lines.find((l) => l.startsWith("+") || l.startsWith(" "))?.slice(1) ?? "") : "";
   const hl = useHighlighter(resolveLanguage(language, diff.path, top));
