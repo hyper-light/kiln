@@ -139,6 +139,18 @@ struct Table {
     alias: Option<usize>,
 }
 
+/// What a connection's page cache holds now, in bytes (`SQLITE_DBSTATUS_CACHE_USED`): its pages, with its
+/// pager's own buffer and record (goal 11, plan 01a1a87b2e56 step 3: `kiln_memory_bytes{owner="sqlite"}`).
+/// Asked of the connection itself: kiln builds SQLite without its process-wide memory statistics
+/// (`SQLITE_DEFAULT_MEMSTATUS=0`, .cargo/config.toml), which this needs none of.
+pub fn cache_used(conn: &Connection) -> usize {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: `conn.handle()` is the connection's open handle, alive for this borrow; `sqlite3_db_status`
+    // only reads its pagers' counts (under the connection's own mutex) into the two ints it's given.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_CACHE_USED, &mut now, &mut most, 0) };
+    if rc == ffi::SQLITE_OK { usize::try_from(now).unwrap_or(0) } else { 0 }
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

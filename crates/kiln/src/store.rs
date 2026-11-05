@@ -80,11 +80,12 @@ impl Writer {
         let thread = std::thread::Builder::new()
             .name("kiln-store".to_owned())
             .spawn(move || {
-                let mut conn = conn;
+                let mut conn = Counted::new(conn);
                 while let Ok((job, sent)) = rx.recv() {
                     crate::pool_health::store_write_queued(-1);
                     let began = Instant::now();
-                    job(&mut conn, watch.as_ref());
+                    job(&mut conn.conn, watch.as_ref());
+                    conn.look();
                     crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
                 }
                 // The connection before the watch its hook writes into.
@@ -118,12 +119,74 @@ impl Writer {
     }
 }
 
+/// What SQLite counts beside each cached page's own bytes, at most (`sqlite3PagerMemUsed`): its `PgHdr`, the
+/// btree's `MemPage` and five pointers, about 260 bytes on a 64-bit machine (what
+/// `memory::owners::tests::g11_s3_a_full_page_cache_stays_within_its_bound` measures), and room for a wider
+/// one.
+const PAGE_HEADER: i64 = 512;
+
+/// The most a connection's page caches hold, in bytes (goal 11, plan 01a1a87b2e56 step 3): its main
+/// database's `cache_size` pages (or, negative, that many KiB of pages: SQLite's default, -2000, about 2 MB;
+/// https://www.sqlite.org/pragma.html#pragma_cache_size), each with its header ([`PAGE_HEADER`]), and its
+/// pager's own buffer and record, a page each at most; then as much again for a temp database, which a
+/// statement may make (its cache as large). What `SQLITE_DBSTATUS_CACHE_USED` counts.
+pub(crate) fn cache_bound(c: &Connection) -> usize {
+    let page: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0).max(1);
+    let size: i64 = c.query_row("PRAGMA cache_size", [], |r| r.get(0)).unwrap_or(0);
+    let pages = if size < 0 { size.saturating_neg().saturating_mul(1024) / page } else { size };
+    let one = pages.saturating_mul(page.saturating_add(PAGE_HEADER)).saturating_add(page.saturating_mul(2));
+    usize::try_from(one.saturating_mul(2)).unwrap_or(0)
+}
+
+/// A connection, its page cache counted on `/metrics` (`crate::memory::owners::SQLITE`): what it held when
+/// last looked at, after each use, and its bound ([`cache_bound`]), both given back as it closes.
+struct Counted {
+    conn: Connection,
+    held: usize,
+    bound: usize,
+}
+
+impl Counted {
+    fn new(conn: Connection) -> Self {
+        let bound = cache_bound(&conn);
+        crate::memory::owners::SQLITE.bound_add(bound);
+        let mut c = Self { conn, held: 0, bound };
+        c.look();
+        c
+    }
+
+    /// Its cache counted as it is now.
+    fn look(&mut self) {
+        let now = capture::cache_used(&self.conn);
+        if now >= self.held {
+            crate::memory::owners::SQLITE.add(now - self.held);
+        } else {
+            crate::memory::owners::SQLITE.sub(self.held - now);
+        }
+        self.held = now;
+    }
+}
+
+impl std::ops::Deref for Counted {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        crate::memory::owners::SQLITE.sub(self.held);
+        crate::memory::owners::SQLITE.bound_sub(self.bound);
+    }
+}
+
 /// Read-only connections to the database's file ([`Store::read`]), each taken by one read at a time
 /// and given back as it ends: a lock-free queue of those not in use, as many as the blocking pool's
 /// `store` share runs reads at once. One taken when none is free (a read past them) is opened then.
 struct Reads {
     path: std::path::PathBuf,
-    idle: concurrent_queue::ConcurrentQueue<Connection>,
+    idle: concurrent_queue::ConcurrentQueue<Counted>,
 }
 
 impl Reads {
@@ -131,17 +194,18 @@ impl Reads {
         Self { path: path.to_path_buf(), idle: concurrent_queue::ConcurrentQueue::bounded(crate::rt::profile().pool.1.max(1)) }
     }
 
-    fn take(&self) -> anyhow::Result<Connection> {
+    fn take(&self) -> anyhow::Result<Counted> {
         if let Ok(c) = self.idle.pop() {
             return Ok(c);
         }
         let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
         c.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(c)
+        Ok(Counted::new(c))
     }
 
-    /// Back for the next read (closed, past as many as are kept).
-    fn give(&self, c: Connection) {
+    /// Back for the next read, its cache counted as the read left it (closed, past as many as are kept).
+    fn give(&self, mut c: Counted) {
+        c.look();
         let _ = self.idle.push(c);
     }
 }
