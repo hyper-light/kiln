@@ -608,6 +608,7 @@ fn main() -> ExitCode {
             }
         }
         kiln::rt::realtime(cfg.server.realtime);
+        kiln::rt::nudge(cfg.server.nudge);
     }
     // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
     // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").

@@ -1302,6 +1302,99 @@ What it says:
   partition; on fedora that needs root, as does the real-time class (`RLIMIT_RTPRIO` 0 there), so
   neither ran here.
 
+### Why: fedora's kernel, read
+
+fedora runs Linux 6.19.10 (`6.19.10-300.fc44`, read 2026-11-05): `CONFIG_PREEMPT_DYNAMIC` booted lazy
+(`CONFIG_PREEMPT_LAZY=y`, no `preempt=` on its command line), `CONFIG_HZ=1000`, `CONFIG_SCHED_CLASS_EXT=y`
+with no scheduler loaded, on an i9-14900HX whose 32 CPUs share one L3. Its scheduler, read in the stable
+tree's v6.19.10 (`kernel/sched/core.c`, `fair.c`, `syscalls.c`, `kernel/entry/common.c`; lines as there):
+
+- **Every wakeup preemption of the fair class is lazy.** `check_preempt_wakeup_fair` ends in
+  `resched_curr_lazy` (fair.c:8981) whatever led there: a shorter slice (`PREEMPT_SHORT`, fair.c:8927), an
+  idle entity beside it (fair.c:8903), the pick. Under lazy preemption that sets `TIF_NEED_RESCHED_LAZY`
+  on the running thread and sends no interrupt: `__resched_curr` sends one only for the full mark
+  (core.c:1131-1132), and makes the lazy one full only for the idle task (core.c:1114).
+- **The busy CPU switches at its next return to user space, or its tick.** `exit_to_user_mode_loop` takes
+  either mark (common.c:31), so a system call's end, a fault's or any interrupt's runs the woken thread;
+  `sched_tick` makes the lazy mark full (core.c:5539). A return to kernel code takes only the full one
+  (common.c:172). Behind a thread spinning in user space, as the lab's hogs do, that is the tick: up to
+  1 ms at 1000 Hz, half of it on average. Real legs enter the kernel often (wake-look1 in docs/priority.md:
+  hogs entering it every 20 µs held a wake 31.6 µs at p99.9), so the lab's hogs are the worst case.
+- **What preempts at once:** a wake of a higher class (`wakeup_preempt` calls `resched_curr`, core.c:2183):
+  a real-time or deadline thread over a normal one, a normal one over a sched_ext one; a wake onto an idle
+  CPU; and a wake that goes through the target's wakelist and its interrupt, which a wake from another
+  last-level cache does (core.c:3854), as does one onto an idle CPU (core.c:3871) or one that finds the task
+  still switching out (core.c:4196).
+
+So for each means a thread has without root:
+
+| means | needs | a wake behind a spinning hog | its cost |
+| --- | --- | --- | --- |
+| a slice of its own (`sched_attr.sched_runtime`, 0.1 to 100 ms, fair.c:5198) | nothing: `user_check_sched_setscheduler` doesn't check it | still lazy; but the wake decides at once, past the hog's slice protection (`RUN_TO_PARITY`, fair.c:1037; the kernel's slice here is 2.8 ms, 0.7 ms × (1 + log2 8), fair.c:79, :206) | turns taken sooner beside threads of its own weight; kiln's shards ask for their step, 250 µs, already |
+| the hogs at the idle policy (`SCHED_IDLE`, or `cpu.idle` on their cgroup) | nothing, for kiln's own legs and agents | still lazy: an idle entity is preempted without the pick (fair.c:8903), lazily | the hogs at a weight of 3 |
+| sched_ext | root: loading a scheduler takes `CAP_BPF` and `CAP_SYS_ADMIN` (fedora: `unprivileged_bpf_disabled` 2); without one a `SCHED_EXT` task is fair (ext.c:3734) | at once, with the hogs in the loaded class (core.c:2183) | a BPF scheduler to keep |
+| the wakelist across caches | two last-level caches | at once | not on fedora: one L3 for all 32 CPUs; adacachy has two and preempts fully anyway |
+| spinning before it parks (hyper-rt's `spin_ns`) | nothing | none for a wake within the spin; one after it waits as before | the spin's CPU at every idle gap, taken from the hogs |
+| the real-time class | `RLIMIT_RTPRIO` room (fedora: 0) | at once | "What needs Ada" |
+| a nudge: a timer of its own on its CPU while it waits | nothing | at most the nudge's period: the timer's interrupt returns to the hog's user space and takes the mark | a wake of the waiting shard every period |
+
+### What kiln does: a nudge for the shards
+
+`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its
+period for a lab's A/B) holds each of a shard's waits in its driver to the timers' tick, 100 µs
+(`hyper_rt::compute::nudge_current_thread`: a thread-local the epoll driver's `wait` reads). With the
+shard's timer slack, which is that tick too (hyper-rt's `Shard::build`), its CPU takes an interrupt of the
+shard's own at least every 200 µs while it waits. The wait's timer is armed on the CPU the shard parks on,
+busy with the shard as it arms (`get_nohz_timer_target`, core.c:1202), and its interrupt's return to the
+hog's user space takes the lazy mark, so a shard woken behind a hog waits at most two ticks, no longer than
+a timer of its own may be late, instead of the kernel's tick.
+
+- **In the real-time class's place.** A shard that took the real-time class (`[server] realtime`, granted)
+  asks for nothing more: its wake preempts at once. Refused, or not asked for, it asks for its slice and,
+  with `[server] nudge`, nudges (`crate::rt::shard_asks`). macOS and Windows refuse the nudge: they have no
+  lazy preemption to bound.
+- **It says so**, in the log once every shard has answered and in `/healthz/server` (`priority.nudge`:
+  asked, period, shards, nudged, those in the real-time class, refused, why).
+- **What it costs.** A waiting shard wakes once a period, up to 10,000 times a second at the tick: a park and
+  a turn of its loop each, CPU the shard spends (its busy share rises with it) and the threads beside it
+  lose; and a calm machine's CPUs can't reach their deeper idle states while a shard waits (fedora's C3
+  takes up to 1,048 µs to leave, which a calm wake pays too). That cost is measurable, so the nudge is a
+  setting, not the default. The microbench below measures it.
+
+### The wake microbench
+
+`crates/kiln-rt/benches/lazy_wake.rs` times a cross-thread wake of a hyper-rt shard (a task sent from off the
+runtime, `submit_to_holder`: the control queue and the kick) at exponential gaps, 1 ms on average, with
+spinning hogs at `cpu.weight` 1 on the shard's CPUs and the bench at `CPUWeight=1000`, for each means above:
+`calm`, `calm-tick:100`, `plain` (the kernel's slice), `slice` (kiln's), `slice-min`, `idle-hogs`, `rr`
+(where granted), `spin:10`, `spin:100`, `tick:100`, `tick:50`, `unpinned` (the lab's `hogs` layout) and `llc`
+(where there are two caches). Each arm gives its wakes' p50 to max, the shard's CPU, its driver waits a
+second, its run-queue wait, the hogs' CPU, and the CPU other work took on the shard's CPUs. On fedora, the
+lab's queue between its runs:
+
+```text
+cargo bench -p hyper-rt --bench lazy_wake --no-run
+systemd-run --user --scope --quiet --collect -p CPUWeight=1000 -- \
+  cargo bench -p hyper-rt --bench lazy_wake -- --cpus 16-19 --waker 24 --secs 10 --rounds 3
+```
+
+Its results go here when it has run.
+
+### What needs Ada
+
+- **`preempt=full`** on fedora's kernel command line (root, and a reboot): every fair wake then interrupts at
+  once, as on production's adacachy, and the lab measures production's kernel.
+- **`RLIMIT_RTPRIO` 1** for her user on fedora (a `limits.d` entry, root): `[server] realtime` then works
+  there, and the shards need no nudge.
+- **A cpuset partition** for the server's cores (root, once: goal 9 step 4's installer): nothing else runs on
+  them.
+- **Whether kiln should ask rtkit.** fedora runs `rtkit-daemon`, which grants `SCHED_RR` up to priority 20,
+  without root, to a thread of a local session's process whose `RLIMIT_RTTIME` hard limit is at most 200 ms;
+  kiln would ask over D-Bus. But a shard that ran 200 ms without sleeping would get the server killed (the
+  kernel's `RLIMIT_RTTIME`; goal 9 step 2 found polls of 76 ms), and whenever rtkit's watchdog thread, a
+  normal one, starves for 10 s it demotes every thread it granted and refuses for 5 minutes: its journal shows
+  it did on 2026-11-04 under load. Not built; hers to weigh.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;

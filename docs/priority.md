@@ -278,6 +278,28 @@ It stays off until an A/B where it's granted picks it ("Step 7's lab", below). W
 installer can grant (a system install), the winner becomes the bare-metal default; on a user's install it
 needs the machine owner's grant, theirs to give.
 
+## A nudge for the shards
+
+`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its period
+for a lab's A/B) is what a shard has in the real-time class's place where that's refused, needing no privilege
+(goal 8, plan `01a1a59c2b29` step 7; `hyper_rt::compute::nudge_current_thread`):
+
+- Each of a shard's waits in its driver ends by the timers' tick (100 µs), so with its timer slack (the tick
+  too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under `lazy` a wake
+  marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to user space
+  from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in user space
+  then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next tick (up to
+  1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once (docs/runtime-lab.md,
+  "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- A shard that took the real-time class doesn't nudge: its wake preempts at once. The others ask for their
+  slice, then the nudge.
+- **Its cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
+  threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. So it's off
+  until declared.
+- The log says how the shards took it once every shard has answered, and `/healthz/server` too
+  (`priority.nudge`: asked, period, shards, nudged, those in the real-time class, refused, why).
+- **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound.
+
 ## Step 7's lab
 
 `scripts/priority_lab/s7c.sh` runs the A/B of the three ways to keep the host off the shards, in production's
@@ -294,6 +316,8 @@ p99.9 under 1 ms with hogs):
   round notes the CPUs each hog thread may run on;
 - `rt`, `rt-cc`: weights alone with the shards in the real-time class (`KILN_RT_REALTIME=1`, the scope given
   `LimitRTPRIO=1` as the installer's unit is); run only where the machine grants it, else skipped and said so.
+- `nudge`, `nudge-cc`, `calm-nudge`: weights alone with the shards nudging their CPUs (`KILN_RT_NUDGE=1`, "A
+  nudge for the shards"), beside the hogs or the compilers, and with none: what the nudge buys and costs.
 
 Each round notes `/healthz/server` (the real-time class as the shards took it, the work CPUs) and how busy
 other processes kept the server's cores (`foreign.py`): on a lazy kernel, work that isn't the lab's on those
