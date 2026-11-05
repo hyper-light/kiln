@@ -139,6 +139,20 @@ pub enum ServerEvent {
     AgentNotice(Box<AgentNotice>),
 }
 
+/// [`ServerEvent::Harness`]'s frame of an info encoded already (`info_json`: `serde_json`'s compact form of
+/// it, as an agent session's view keeps it): the bytes `ServerEvent::text` writes, the info's as they are
+/// (goal 10, plan 01a1a87b2dae step 5).
+pub fn harness_frame(info_json: &[u8]) -> std::sync::Arc<str> {
+    const HEAD: &str = r#"{"type":"harness","info":"#;
+    // `serde_json` writes UTF-8; anything else isn't an info, and is said as none.
+    let info = std::str::from_utf8(info_json).unwrap_or("null");
+    let mut frame = String::with_capacity(HEAD.len() + info.len() + 1);
+    frame.push_str(HEAD);
+    frame.push_str(info);
+    frame.push('}');
+    std::sync::Arc::from(frame)
+}
+
 impl ServerEvent {
     /// The frame as its socket sends it.
     pub fn text(&self) -> String {
@@ -733,6 +747,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 5: an agent session's info frame made of its info encoded already is
+    /// the frame `ServerEvent::Harness` writes, byte for byte, whatever the info holds.
+    #[test]
+    fn g10_s5_an_info_frame_made_of_its_encoding_is_the_one_serde_writes() -> anyhow::Result<()> {
+        let plain = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() };
+        let mut odd = plain.clone();
+        odd.title = "\"quoted\", a tab\t, a line\nbreak, ünïcode and \\ a backslash".into();
+        odd.summary = "</script> and \u{2028}".into();
+        odd.last_activity = 1_793_900_000_123;
+        for info in [plain, odd] {
+            let made = harness_frame(&serde_json::to_vec(&info)?);
+            assert_eq!(&*made, ServerEvent::Harness { info: Box::new(info.clone()) }.text(), "{}", info.title);
+        }
+        assert_eq!(&*harness_frame(b"\xff"), r#"{"type":"harness","info":null}"#, "what isn't UTF-8 is said as none");
+        Ok(())
+    }
 
     /// The frames serialize to what their `json!`s did before they were typed.
     #[test]

@@ -846,7 +846,8 @@ pub struct View {
     pub info: Arc<Info>,
     /// Its info as the API answers with it (`GET /api/harness/sessions` and `.../{id}`): encoded by
     /// its owner once per change of it, shared by every view until the next, so no read encodes it
-    /// (goal 10, plan 01a1a87b2dae step 2).
+    /// (goal 10, plan 01a1a87b2dae step 2); the events socket's frame of the change is made of it too
+    /// (`crate::wire::events::harness_frame`, step 5).
     pub info_json: Bytes,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
@@ -1034,6 +1035,8 @@ pub struct Mirror {
     slot: Arc<Slot>,
     /// Its info's encoding ([`View::info_json`]), and the info it's of: made again when that changes.
     info_json: (Arc<Info>, Bytes),
+    /// How often its info and meta were encoded.
+    pub(super) encodings: Encodings,
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
     owner: Option<crate::memory::queue::WeakSender<Msg>>,
@@ -1058,6 +1061,15 @@ impl Drop for Mirror {
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
 fn info_json(info: &Info) -> Bytes {
     serde_json::to_vec(info).map_or_else(|_| Bytes::from_static(b"null"), Bytes::from)
+}
+
+/// How many times a copy encoded its info (for its view, which the API's reads of it and the events
+/// socket's frame of it take as it is) and its meta (for its viewers' frame): once a change of each (goal
+/// 10, plan 01a1a87b2dae step 5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Encodings {
+    pub info: u64,
+    pub meta: u64,
 }
 
 /// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
@@ -1110,6 +1122,7 @@ impl Mirror {
             opened_at: None,
             slot,
             info_json: encoding,
+            encodings: Encodings::default(),
             owner: None,
             spill: None,
             spill_file: None,
@@ -1179,8 +1192,16 @@ impl Mirror {
     pub fn publish(&mut self) {
         if !Arc::ptr_eq(&self.info_json.0, &self.info) {
             self.info_json = (Arc::clone(&self.info), info_json(&self.info));
+            self.encodings.info += 1;
         }
         self.slot.view.store(Arc::new(self.view()));
+    }
+
+    /// Its info as it was last published, encoded ([`View::info_json`]): what the events socket's frame
+    /// of a change of it is made of, rather than encoded again (`crate::wire::events::harness_frame`;
+    /// goal 10, plan 01a1a87b2dae step 5).
+    pub fn info_encoded(&self) -> &Bytes {
+        &self.info_json.1
     }
 
     /// After a change: the copy goes out to its readers, then, if anyone watches, its viewers are
@@ -1211,6 +1232,11 @@ impl Mirror {
         let rev = Some(self.rev);
         let (mut p, whole, patched) = {
             let patch = state_patch_of(&self.sent, &self.state);
+            // A state that changed nothing its viewers were last sent goes as nothing: no field to patch,
+            // and those that take it whole have it (goal 10, plan 01a1a87b2dae step 5).
+            if patch.as_ref().is_some_and(|(set, gone)| set.is_empty() && gone.is_empty()) {
+                return None;
+            }
             let whole = patch.is_none() || self.feed.wants_whole(PatchOf::State);
             let room = if whole { self.state_bytes } else { 0 } + if patch.is_some() { self.patch_bytes } else { 0 };
             let mut p = Payload::new(self.rev, room);
@@ -1282,6 +1308,7 @@ impl Mirror {
                 let start = p.text().len();
                 let _ = write::value(p.text(), "meta", "meta", &self.meta, rev);
                 self.meta_bytes = p.text().len() - start;
+                self.encodings.meta += 1;
                 p
             }
             other => {
