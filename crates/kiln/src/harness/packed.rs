@@ -150,6 +150,17 @@ impl Gzip {
         Ok(())
     }
 
+    /// What it's made so far that hasn't been taken (its header with the first): a member sent as it's made
+    /// goes out a piece at a time (goal 11, plan 01a1a87b2e56 step 5), [`Gzip::finish`] giving the rest.
+    pub fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// The bytes it's made since what was last taken.
+    pub fn made(&self) -> usize {
+        self.out.len()
+    }
+
     /// The member: an empty final stored block, then the trailer (the CRC-32 and the length of all it
     /// holds, modulo 2^32).
     pub fn finish(mut self) -> Vec<u8> {
