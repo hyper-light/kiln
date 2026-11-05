@@ -17,6 +17,8 @@
 //! - `fact==value`, `fact!=value`, `fact>=n`, `fact<=n`, `fact>n`, `fact<n`: any fact routing knows
 //!   (`disk.free>=50Gi`, `os.distro==fedora`, `custom.rack==a3`).
 //! - `exclusive`: the runner whole, with nothing else beside the work.
+//! - `together:sim/3`: one of three items named `sim` that start together or not at all (a gang,
+//!   W05-R40), from 2 to 64 of them.
 //!
 //! Anything else is an error that names the word: `memm=4g: no such need`.
 
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::pools::{self, ResourceSpec};
 use super::routing::{self, Constraint};
-use super::state::Resources;
+use super::state::{Cpus, Gang, Resources};
 use crate::expr;
 use crate::wf::ir::{JobKiln, YVal};
 
@@ -38,7 +40,13 @@ pub struct Needs {
     pub requires: Vec<String>,
     /// The runner whole: nothing else runs beside the work.
     pub exclusive: bool,
+    /// Its gang (W05-R40): it starts with the rest of its gang or not at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub together: Option<Gang>,
 }
+
+/// The most items a gang has (W05-R40): enough for a cluster's nodes, few enough to place in one go.
+pub const GANG_MOST: u32 = 64;
 
 /// Reads the spelling (the module's docs). An error names the first word that isn't a need.
 pub fn parse(spec: &str) -> Result<Needs, String> {
@@ -56,7 +64,7 @@ pub fn of_job(k: &JobKiln) -> Result<Needs, String> {
         Some(v) => resource_spec(v).resources()?,
         None => Resources::default(),
     };
-    Ok(Needs { request, requires: k.requires.iter().map(|t| t.src.clone()).collect(), exclusive: k.exclusive })
+    Ok(Needs { request, requires: k.requires.iter().map(|t| t.src.clone()).collect(), exclusive: k.exclusive, ..Needs::default() })
 }
 
 /// A job's `resources:` (`{ cpu, memory, disk, gpu }`) as written.
@@ -82,6 +90,9 @@ impl Needs {
         if self.exclusive {
             parts.push("the runner whole".into());
         }
+        if let Some(g) = &self.together {
+            parts.push(format!("one of {} starting together ({})", g.size, g.id));
+        }
         if parts.is_empty() { "nothing in particular".into() } else { parts.join(", ") }
     }
 
@@ -101,14 +112,17 @@ impl Needs {
         if let Some(label) = w.strip_prefix('+') {
             return self.require(format!("label {}", quote(label)?));
         }
-        // Before `/`: `binfmt:linux/arm64` is one.
+        // Before `/`: `binfmt:linux/arm64` and `together:sim/3` are one.
         if let Some((kind, item)) = w.split_once(':') {
+            if kind.eq_ignore_ascii_case("together") {
+                return self.join(item);
+            }
             let fact = match kind.to_ascii_lowercase().as_str() {
                 "tool" => "tools",
                 "executor" => "executors",
                 "flag" => "cpu.flags",
                 "binfmt" => "binfmt",
-                _ => return Err("no such need (tool:, executor:, flag: or binfmt:)".into()),
+                _ => return Err("no such need (tool:, executor:, flag:, binfmt: or together:)".into()),
             };
             return self.require(format!("{fact} has {}", quote(item)?));
         }
@@ -130,7 +144,7 @@ impl Needs {
     /// `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`, `label=gpu`.
     fn ask(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key.to_ascii_lowercase().as_str() {
-            "cpus" | "cpu" => self.request.cpu = pools::cpus(value).ok_or("not a number of CPUs (8, 0.5, 500m)")?,
+            "cpus" | "cpu" => self.request.cpu = pools::cpus(value)?,
             "mem" | "memory" => self.request.mem = size(value).ok_or("not a size (32g, 512m)")?,
             "disk" => self.request.disk = size(value).ok_or("not a size (50g, 512m)")?,
             "gpus" | "gpu" => self.request.gpu = value.trim().parse().map_err(|_| "not a number of GPUs")?,
@@ -150,6 +164,21 @@ impl Needs {
             _ => return Err("no such fact (os, arch, cpu.cores, mem.total, disk.free, tools, …, custom.<name>)".into()),
         };
         self.require(format!("{fact} {op} {}", quote(&value)?))
+    }
+
+    /// `together:<name>/<n>`: one of `n` items named `name` that start together or not at all
+    /// (W05-R40).
+    fn join(&mut self, item: &str) -> Result<(), String> {
+        let Some((name, size)) = item.split_once('/') else { return Err("a gang is its name and its size (together:sim/3)".into()) };
+        if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == ',') {
+            return Err("a gang needs a name (together:sim/3)".into());
+        }
+        let size: u32 = size.trim().parse().map_err(|_| "a gang's size is a number (together:sim/3)")?;
+        if !(2..=GANG_MOST).contains(&size) {
+            return Err(format!("a gang is 2 to {GANG_MOST} items"));
+        }
+        self.together = Some(Gang { id: name.to_owned(), size });
+        Ok(())
     }
 
     /// Adds a constraint once, as routing reads it.
@@ -183,7 +212,9 @@ fn quote(v: &str) -> Result<String, String> {
 }
 
 /// Bytes as the spelling writes them: `32g`, `32G`, `32GB`, `32Gi` and `512m` are binary, and a
-/// plain number is bytes.
+/// plain number is bytes. An edge of the engine's integers (`super::units`): what people write,
+/// read as the bytes it says.
+#[allow(clippy::float_arithmetic)]
 pub fn size(s: &str) -> Option<u64> {
     let s = s.trim().to_ascii_lowercase();
     let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
@@ -212,7 +243,7 @@ fn binary(n: u64) -> String {
 /// memory`, `50 GiB of disk`, `1 GPU`.
 pub fn request_words(r: &Resources) -> Vec<String> {
     let mut parts = Vec::new();
-    if r.cpu > 0.0 {
+    if !r.cpu.is_zero() {
         parts.push(cpus(r.cpu));
     }
     if r.mem > 0 {
@@ -228,8 +259,8 @@ pub fn request_words(r: &Resources) -> Vec<String> {
 }
 
 /// `8 CPUs`, `1 CPU`, `0.5 CPUs`.
-pub fn cpus(n: f64) -> String {
-    format!("{} CPU{}", expr::js_number_to_string(n), if (n - 1.0).abs() < f64::EPSILON { "" } else { "s" })
+pub fn cpus(n: Cpus) -> String {
+    format!("{n} CPU{}", if n == Cpus::whole(1) { "" } else { "s" })
 }
 
 /// `1 GPU`, `2 GPUs`, `no GPU`.
@@ -241,7 +272,8 @@ pub fn gpus(n: u32) -> String {
     }
 }
 
-/// `32 GiB`, `512 MiB`, `1.5 TiB`.
+/// `32 GiB`, `512 MiB`, `1.5 TiB`: for people, to a tenth.
+#[allow(clippy::float_arithmetic)]
 pub fn show_size(n: u64) -> String {
     let units = [(1u64 << 40, "TiB"), (1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
     units
@@ -282,7 +314,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn needs(request: Resources, requires: &[&str], exclusive: bool) -> Needs {
-        Needs { request, requires: requires.iter().map(|s| (*s).to_owned()).collect(), exclusive }
+        Needs { request, requires: requires.iter().map(|s| (*s).to_owned()).collect(), exclusive, ..Needs::default() }
     }
 
     #[test]
@@ -290,9 +322,9 @@ mod tests {
         let cases: &[(&str, Needs)] = &[
             (
                 "cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive",
-                needs(Resources { cpu: 8.0, mem: 32 * GIB, ..Resources::default() }, &["os == linux", "arch == x86_64", "label gpu", "tools has cargo"], true),
+                needs(Resources { cpu: Cpus::whole(8), mem: 32 * GIB, ..Resources::default() }, &["os == linux", "arch == x86_64", "label gpu", "tools has cargo"], true),
             ),
-            ("cpu=500m memory=512Mi disk=50GB gpus=2", needs(Resources { cpu: 0.5, mem: 512 << 20, disk: 50 * GIB, gpu: 2 }, &[], false)),
+            ("cpu=500m memory=512Mi disk=50GB gpus=2", needs(Resources { cpu: Cpus::milli(500), mem: 512 << 20, disk: 50 * GIB, gpu: 2 }, &[], false)),
             ("macos, arm64", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
             ("darwin/apple-silicon", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
             ("cpus>=16,mem>=32g", needs(Resources::default(), &["cpu.threads >= 16", "mem.free >= 32Gi"], false)),
@@ -321,7 +353,7 @@ mod tests {
             ("linux/sparc", "linux/sparc: no such architecture (amd64, arm64, x86, arm, riscv64)"),
             ("fedora", "fedora: no such need"),
             ("cpu.coress>=8", "cpu.coress>=8: no such fact (os, arch, cpu.cores, mem.total, disk.free, tools, …, custom.<name>)"),
-            ("tol:cargo", "tol:cargo: no such need (tool:, executor:, flag: or binfmt:)"),
+            ("tol:cargo", "tol:cargo: no such need (tool:, executor:, flag:, binfmt: or together:)"),
             ("disk.free>=", "disk.free>=: a value is missing"),
             ("+", "+: a value is missing"),
         ];
@@ -354,6 +386,30 @@ mod tests {
         assert_eq!(parse("cpus=8,mem=32g,linux/amd64,exclusive")?.describe(), "8 CPUs, 32 GiB of memory, os == linux, arch == x86_64, the runner whole");
         assert_eq!(parse("cpus=1,disk=1536m,gpus=1")?.describe(), "1 CPU, 1.5 GiB of disk, 1 GPU");
         assert_eq!(Needs::default().describe(), "nothing in particular");
+        Ok(())
+    }
+
+    /// E1 (docs/needs.md), W05-R03: CPUs are read exactly, digit by digit, into thousandths, as
+    /// Kubernetes counts them, and a spelling finer than a thousandth is refused, naming its word.
+    #[test]
+    fn e1_1_cpus_read_exactly_in_thousandths() -> Result<(), String> {
+        for (spelling, milli) in [("cpus=8", 8000), ("cpus=0.5", 500), ("cpu=500m", 500), ("cpus=0.25", 250), ("cpus=.5", 500), ("cpus=+2", 2000), ("cpus=2.000", 2000), ("cpus=0.0010", 1), ("cpus=1m", 1), ("cpus=0", 0)] {
+            assert_eq!(parse(spelling)?.request.cpu, Cpus::milli(milli), "{spelling}");
+        }
+        for (spelling, why) in [
+            ("cpus=0.0005", "cpus=0.0005: finer than 1m (0.001 CPU)"),
+            ("cpus=1.5m", "cpus=1.5m: finer than 1m (0.001 CPU)"),
+            ("cpus=-1", "cpus=-1: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=1e3", "cpus=1e3: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=.", "cpus=.: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=99999999999999999999", "cpus=99999999999999999999: not a number of CPUs (8, 0.5, 500m)"),
+        ] {
+            assert_eq!(parse(spelling), Err(why.to_owned()), "{spelling}");
+        }
+        assert_eq!(ResourceSpec { cpu: Some("0.0005".into()), ..ResourceSpec::default() }.resources(), Err("`resources.cpu` is finer than a thousandth of a CPU (`1m`): `0.0005`".to_owned()));
+        for (spelling, words) in [("cpus=0.5", "0.5 CPUs"), ("cpus=1", "1 CPU"), ("cpus=1.25", "1.25 CPUs"), ("cpus=0.001", "0.001 CPUs"), ("cpus=16", "16 CPUs")] {
+            assert_eq!(parse(spelling)?.describe(), words, "{spelling}");
+        }
         Ok(())
     }
 
@@ -405,5 +461,19 @@ mod tests {
         for (s, want) in [("32g", Some(32 * GIB)), ("32G", Some(32 * GIB)), ("32GB", Some(32 * GIB)), ("32Gi", Some(32 * GIB)), ("512m", Some(512 << 20)), ("1.5t", Some(3 << 39)), ("1024", Some(1024)), ("4h", None), ("lots", None), ("-1g", None)] {
             assert_eq!(size(s), want, "{s}");
         }
+    }
+
+    /// W05-R40, docs/needs.md E4.3: `together:<name>/<n>` is one of n items that start together
+    /// or not at all, 2 to 64 of them; any other spelling of it is an error naming the word.
+    #[test]
+    fn w05_r40_together_in_the_needs_grammar() -> Result<(), String> {
+        let n = parse("together:sim/3,cpus=4")?;
+        assert_eq!(n.together, Some(Gang { id: "sim".into(), size: 3 }));
+        assert_eq!(n.describe(), "4 CPUs, one of 3 starting together (sim)");
+        for bad in ["together:g/1", "together:g", "together:/3", "together:g/x", "together:g/65"] {
+            let why = parse(bad).err().unwrap_or_default();
+            assert!(why.starts_with(&format!("{bad}: ")), "{bad}: {why}");
+        }
+        Ok(())
     }
 }

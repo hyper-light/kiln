@@ -91,6 +91,11 @@ fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::ru
 /// Why an outpost turns a job down (an older server may still hand it one).
 const OUTPOST_TAKES_NO_JOBS: &str = "an outpost takes no jobs";
 
+/// Why a runner draining, or about to upgrade, turns a job down: the server takes either as the
+/// runner draining on its own (docs/ci.md W05-R35). Older runners say the same words.
+pub(crate) const REFUSED_DRAINING: &str = "draining";
+pub(crate) const REFUSED_UPGRADING: &str = "upgrading";
+
 #[derive(Serialize, Deserialize)]
 pub struct EnrollRequest {
     pub token: String,
@@ -319,6 +324,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
     cancel: Shutdown,
+    /// Its lease lost, it's killed (docs/ci.md W05-R37): no cancel's grace, nothing more run.
+    kill: Shutdown,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
     /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
@@ -331,7 +338,7 @@ struct Running {
 /// Linux), it still holds its room in placement, and the log says so.
 fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
     let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
-    let threads = q.cpu.ceil().max(1.0) as usize;
+    let threads = usize::try_from(q.cpu.ceil().max(1)).unwrap_or(usize::MAX);
     match crate::runner::cpus::pins().hold(job, threads) {
         Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
         None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
@@ -341,14 +348,14 @@ fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
 /// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
 /// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
 /// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
-fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
+pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
     use kiln_ci::sched::state::{Incoming, Resources, room};
     let (mut held, mut whole, mut ordinary, mut running) = (Resources::default(), false, 0, 0);
     for (p, h) in jobs {
         match h {
             Incoming::Whole => whole = true,
             Incoming::Share(q) => {
-                held.cpu += q.cpu;
+                held.cpu = held.cpu.saturating_add(q.cpu);
                 held.mem = held.mem.saturating_add(q.mem);
             }
             Incoming::Ordinary => {}
@@ -367,7 +374,7 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
     Err(match incoming {
         Incoming::Whole => "an exclusive job waits for this runner to be empty",
         Incoming::Share(_) => "no room for the share it holds",
-        Incoming::Ordinary if held.cpu > 0.0 => "no free slot beside what's held",
+        Incoming::Ordinary if !held.cpu.is_zero() => "no free slot beside what's held",
         Incoming::Ordinary => "no free slot",
     })
 }
@@ -383,12 +390,69 @@ const HAVE_SOON: Duration = Duration::from_secs(1);
 /// How many times a runner says what it has again so ([`HAVE_SOON`]), beside its samples'.
 const HAVES_SOON: u32 = 2;
 
+/// A lease runner renews what it holds at most this far apart: its heartbeat's period.
+const RENEW_MOST: Duration = Duration::from_secs(10);
+
+/// How often a lease runner renews what it holds (docs/ci.md W05-R34): three times a lease of
+/// `lease_ms`, so a `Renew` lost leaves the grant two more before it runs out; at most every 10 s,
+/// and not more often than twice a second.
+fn renew_every(lease_ms: u64) -> Duration {
+    Duration::from_millis(lease_ms / 3).clamp(Duration::from_millis(500), RENEW_MOST)
+}
+
+/// What a job stopped for its lease ends with (docs/ci.md W05-R37).
+const LEASE_LOST: &str = "lease lost: this runner's lease on it ended unrenewed, and it stops on losing it";
+
+/// A frame as the server takes it (docs/ci.md W05-R34): to a server that takes leases, what this
+/// runner sends about a leg it holds a grant for goes fenced by that grant (its steps, events and
+/// result carried whole, a refusal naming it, its output on [`proto::LANE_FENCED_LOGS`]); the rest,
+/// and everything to an older server, as it is. What's kept to send again after a reconnect is kept
+/// as it is, and goes this way then, to whichever server that is.
+fn wire_form(lane: u32, kind: Kind, data: Vec<u8>, grants: &HashMap<String, proto::Grant>, leases: bool) -> (u32, Kind, Vec<u8>) {
+    if !leases || grants.is_empty() {
+        return (lane, kind, data);
+    }
+    if lane == LANE_LOGS
+        && let Ok(c) = proto::read_whole::<proto::LogChunk>(&data)
+        && let Some(grant) = grants.get(&c.job)
+        && let Ok(b) = proto::encode(&proto::FencedLog { grant: grant.clone(), idx: c.idx, data: c.data })
+    {
+        return (proto::LANE_FENCED_LOGS, kind, b);
+    }
+    if lane == LANE_CONTROL
+        && let Ok(m) = proto::read_agent(&data)
+        && let Some(f) = proto::fenced(m, grants)
+        && let Ok(b) = proto::encode(&f)
+    {
+        return (lane, kind, b);
+    }
+    (lane, kind, data)
+}
+
+/// The grants this runner holds (docs/ci.md W05-R34): each leg it runs, or whose result the server
+/// hasn't said it has, that its assignment gave a grant; in the order of their legs.
+fn held_grants(grants: &HashMap<String, proto::Grant>, jobs: &HashMap<String, Running>, unreceived: &HashMap<String, (Instant, Vec<u8>)>) -> Vec<proto::Grant> {
+    let mut held: Vec<proto::Grant> = grants.iter().filter(|(job, _)| jobs.contains_key(*job) || unreceived.contains_key(*job)).map(|(_, g)| g.clone()).collect();
+    held.sort_by(|a, b| a.leg.cmp(&b.leg));
+    held
+}
+
+/// The grants `held` names, by leg and fence, as [`crate::runner::lease::Leases`] keeps them.
+fn named(held: &[proto::Grant]) -> Vec<(String, kiln_ci::sched::Fence)> {
+    held.iter().map(|g| (g.leg.clone(), g.fence())).collect()
+}
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
     Net(Option<NetEvent>),
     Done(JobResult),
     Heartbeat,
+    /// A lease runner's renewal of what it holds: three times a lease, at most every 10 s.
+    Renew,
+    /// The leases' check, every half second: a grant is stopped within a second of its lease's
+    /// end, the loop's own delays besides (docs/ci.md W05-R37).
+    Lease,
     Sample,
     Watchdog,
     Redial,
@@ -1754,6 +1818,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server was told this machine holds, on this connection; and whether it takes that.
     let mut limit_said: Option<crate::harness::limit::Held> = None;
     let mut server_limit = false;
+    // The server takes leases (docs/ci.md W05-R34), said on this connection: this runner renews its
+    // grants (`Renew`, numbered) and fences what it sends about their legs by them. Each leg's grant,
+    // as its assignment named it, is kept while the leg runs and until the server has its result.
+    let mut server_leases = false;
+    let mut grants: HashMap<String, proto::Grant> = HashMap::new();
+    let mut renew_seq = 0u64;
+    // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
+    // stop once it has (W05-R37); the jobs stopped so, whose results say it.
+    let mut leases = crate::runner::lease::Leases::default();
+    let mut lease_lost: std::collections::HashSet<String> = std::collections::HashSet::new();
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
@@ -1850,6 +1924,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
+    // Paced by the lease its grants and the server's answers carry (W05-R34).
+    let (mut renew, mut renew_period) = (Interval::new(RENEW_MOST), RENEW_MOST);
+    let mut lease_check = Interval::new(Duration::from_millis(500));
     let mut watchdog = Interval::new(Duration::from_secs(5));
     let mut served_dedicated = false;
     let started = Instant::now();
@@ -1923,6 +2000,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             e = next_taken(&mut taken).fuse() => e,
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
+            () = renew.tick().fuse() => Ev::Renew,
+            () = lease_check.tick().fuse() => Ev::Lease,
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
@@ -2652,6 +2731,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
                 running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
+                // What's granted on this connection is granted after the server has this hello
+                // (W05-R37).
+                leases.connected(crate::runner::lease::now_ms());
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -2693,7 +2775,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Running agents, it answers what their branches' commits are and compares two points
                     // of their repositories (the Changes tab's Commits and Compare).
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits  | proto::CAP_LEASES}) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2772,6 +2854,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                leases.away();
                 // The channel's items in flight go again once the server says what it has, and
                 // the server's from what this side says it has.
                 updates.down();
@@ -2788,6 +2871,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_signs = false;
                 server_limit = false;
                 limit_said = None;
+                server_leases = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -3265,13 +3349,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::AssignV2(a)) => {
                         let mut a = *a;
                         let id = a.job_id.clone();
+                        // From an epoch older than the newest this runner has seen (W05-R37): not taken.
+                        if let Some(f) = a.fence.filter(|f| leases.stale(f.epoch)) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("an assignment from epoch {}, older than this runner has seen", f.epoch));
+                            continue;
+                        }
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        // A test build's `refuse=<job>`: refused as one with no room would refuse it.
+                        let room = room.and_then(|()| if crate::runner::chaos::refuses(&a.leg.job_id) { Err("no free slot") } else { Ok(()) });
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
-                            uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
+                            // To a server that takes leases, naming the grant refused (W05-R34).
+                            let refusal = match a.fence {
+                                Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: reason.into() },
+                                _ => AgentMsg::Reject { job: id, reason: reason.into() },
+                            };
+                            uplink.msg(refusal).await;
                             continue;
                         }
                         // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
@@ -3287,10 +3383,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
                             }
                         }
-                        // A new attempt: its events count from one.
+                        // A new attempt: its events count from one, and it runs under its own grant
+                        // (W05-R34), none from an older server.
                         journal.remove(&id);
                         unreceived.remove(&id);
                         signed_unreceived.remove(&id);
+                        match a.fence {
+                            Some(fence) => grants.insert(id.clone(), proto::Grant::of(&id, a.attempt, fence)),
+                            None => grants.remove(&id),
+                        };
+                        // Its lease, by this machine's clock (W05-R37).
+                        match (a.fence, a.lease_ms) {
+                            (Some(fence), Some(ms)) if server_leases => {
+                                leases.granted(&id, fence, ms, a.on_lease_loss == kiln_ci::sched::LeaseLoss::Stop);
+                                if renew_every(ms) != renew_period {
+                                    renew_period = renew_every(ms);
+                                    renew = Interval::new(renew_period);
+                                }
+                            }
+                            _ => leases.ended(&id),
+                        }
                         crate::runner::signed::forget(&id);
                         // What it was given, as it came: its receipt's (docs/ci.md W27-R05).
                         if server_identity && let Some(json) = raw.as_deref() {
@@ -3323,9 +3435,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 act.url = format!("{base}{}", act.url);
                             }
                         }
-                        let cancel = Shutdown::new();
+                        let (cancel, kill) = (Shutdown::new(), Shutdown::new());
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: kill.clone(), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.
@@ -3338,7 +3450,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             None => None,
                         };
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, kill, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
@@ -3463,6 +3575,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Unread(server_unread)).await;
                         }
+                        server_leases = caps & proto::CAP_LEASES != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
@@ -3511,14 +3624,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // What waited for the connection, in order: what was held while it was
                         // down, the jobs' events again, then their results not yet received.
                         welcomed = true;
+                        // Its grants first, renewed before anything else (W05-R34).
+                        if server_leases {
+                            renew_seq += 1;
+                            let held = held_grants(&grants, &jobs, &unreceived);
+                            leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                            if let Ok(b) = proto::encode(&AgentMsg::Renew { seq: renew_seq, held }) {
+                                net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                            }
+                        }
                         while let Some((lane, kind, data)) = buffer.pop_front() {
                             buffered = buffered.saturating_sub(data.len());
+                            let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         if receipts {
                             for (_, _, events) in journal.values() {
                                 for data in events {
-                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                    let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                                    net.send(SERVER_PEER, lane, kind, data).await;
                                 }
                             }
                         }
@@ -3526,7 +3650,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
                         }
                         for (_, data) in unreceived.values() {
-                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                            let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                            net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
@@ -3640,7 +3765,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -3659,7 +3784,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         crate::runner::signed::forget(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: Shutdown::new(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -3716,6 +3841,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         },
                     },
+                    // From an epoch older than the newest this runner has seen (W05-R37): not applied.
+                    ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("a Stop from epoch {}, older than this runner has seen", grant.epoch));
+                    }
+                    // Its grant to stop (W05-R34): another of the leg's grants it runs since is let be.
+                    ServerMsg::Stop { grant, reason } => match jobs.get(&grant.leg).filter(|_| grants.get(&grant.leg) == Some(&grant)) {
+                        Some(r) => {
+                            tracing::info!(job = %grant.leg, attempt = grant.attempt, %reason, "stopping job");
+                            r.cancel.cancel();
+                            let (tx, j) = (done_tx.clone(), grant.leg.clone());
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(CANCEL_GRACE).await;
+                                let error = format!("stopped; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                                let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            });
+                        }
+                        None => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no grant {}.{} of {} runs here", grant.epoch, grant.n, grant.leg)),
+                    },
+                    // What the server renewed (W05-R34): each grant it named lives its lease from
+                    // when its Renew was sent, less a tenth; one it says isn't this runner's any more
+                    // ends now, and if it stops on losing its lease it's stopped at the next check
+                    // (W05-R37). An answer from an older epoch changes nothing.
+                    ServerMsg::Renewed { seq, lease_ms, epoch, lost } => {
+                        for g in &lost {
+                            tracing::warn!(job = %g.leg, attempt = g.attempt, "the server says this runner's grant for the leg isn't its own any more");
+                        }
+                        if lease_ms > 0 && !leases.stale(epoch) && renew_every(lease_ms) != renew_period {
+                            renew_period = renew_every(lease_ms);
+                            renew = Interval::new(renew_period);
+                        }
+                        leases.renewed(seq, lease_ms, epoch, &named(&lost));
+                    }
                     ServerMsg::Drain => draining = true,
                     ServerMsg::Retire { instance } => {
                         // An older runner process of this machine holds nothing any more: stop
@@ -4144,6 +4301,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Received { job } => {
                         unreceived.remove(&job);
                         signed_unreceived.remove(&job);
+                        if !jobs.contains_key(&job) {
+                            grants.remove(&job);
+                        }
                         if let Some((_, _, events)) = journal.get_mut(&job) {
                             events.clear();
                         }
@@ -4287,6 +4447,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
                 // Logs and jobs' messages wait for the Welcome too, and come after what waited.
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                     match &delay_line {
                         Some(d) => d.send(lane, kind, data, again),
                         None => {
@@ -4381,7 +4542,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Done(r) => {
+            Ev::Done(mut r) => {
                 // What its job sent before it ended (its log's last chunks, its last step's end)
                 // may still wait on their own channel, this loop behind its jobs: they go first, so
                 // the leg signs all it sent (docs/ci.md W27-R05), then its end.
@@ -4397,6 +4558,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    leases.ended(&r.job);
+                    // Stopped for its lease: it ends so, whatever it said, as a runner's loss, so
+                    // that a server that takes it before its own lease ran out tries the leg again
+                    // (W05-R37, R16).
+                    if lease_lost.remove(&r.job) {
+                        r.status = Status::Failed;
+                        if !r.error.as_deref().is_some_and(|e| e.starts_with(LEASE_LOST)) {
+                            r.error = Some(LEASE_LOST.to_owned());
+                        }
+                        if let Ok(json) = serde_json::to_string(&kiln_ci::wire::JobEventV2::FailureClass { class: kiln_ci::sched::retry::FailureClass::RunnerLost.as_str().to_owned() }) {
+                            uplink.msg(AgentMsg::JobEvent { job: r.job.clone(), json }).await;
+                        }
+                    }
                     crate::runner::cpus::pins().release(&r.job);
                     // The leg signs what it received and hands on while it still holds its key
                     // (docs/ci.md W27-R05): its records go before its result, and again with it.
@@ -4425,6 +4599,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Reported over already: a cancelled job let go of after its grace that ended
                     // after all (or the grace's report, after the job's own).
                     tracing::info!(job = %r.job, "a job already reported over has ended");
+                }
+            }
+            // A grant whose lease ended unrenewed, and that stops on losing it, is stopped now, as a
+            // Cancel stops it; a finish grant runs on (W05-R37). By this machine's clock, which
+            // counts sleep: one waking past its lease end stops them within a second.
+            Ev::Lease => {
+                let now = crate::runner::lease::now_ms();
+                for job in leases.due(now) {
+                    let Some(r) = jobs.get(&job) else { continue };
+                    let end = leases.end(&job).unwrap_or_default();
+                    tracing::warn!(%job, "its lease ended unrenewed (at {end} ms by this machine's clock, now {now} ms), and it stops on losing it: stopping it");
+                    // Killed, not cancelled: no grace past its lease, nothing more run.
+                    r.kill.cancel();
+                    r.cancel.cancel();
+                    lease_lost.insert(job.clone());
+                    let tx = done_tx.clone();
+                    crate::rt::spawn(async move {
+                        crate::rt::sleep(CANCEL_GRACE).await;
+                        let error = format!("{LEASE_LOST}; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                        let _ = tx.send(JobResult { job, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                    });
+                }
+            }
+            // A lease runner renews the grants it holds (W05-R34), each lease counted from now
+            // (W05-R37): three times a lease, at most every 10 s, in place of its heartbeat.
+            Ev::Renew => {
+                grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
+                if connected && server_leases {
+                    renew_seq += 1;
+                    let held = held_grants(&grants, &jobs, &unreceived);
+                    leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held }).await;
                 }
             }
             Ev::Heartbeat => {
@@ -4463,9 +4669,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
                     }
                 }
-                if connected {
+                // A lease runner's heartbeat is its `Renew` (`Ev::Renew`).
+                if connected && !server_leases {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
+                }
+                if connected {
                     // Its machine's say on upgrades, read again: a change goes to the server at once.
                     if !o.ephemeral && !o.outpost {
                         let accept = takes_updates(&o);
@@ -5416,14 +5625,24 @@ mod tests {
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
 
+    /// W05-R34: a lease runner renews three times a lease, at most every 10 s (its heartbeat), and
+    /// no more than twice a second: 10 s for kiln's 60 s lease, a third of a test's 5 s.
+    #[test]
+    fn w05_r34_a_lease_runner_renews_three_times_a_lease() {
+        assert_eq!(renew_every(60_000), Duration::from_secs(10));
+        assert_eq!(renew_every(15_000), Duration::from_secs(5));
+        assert_eq!(renew_every(5_000), Duration::from_millis(1_666));
+        assert_eq!(renew_every(600), Duration::from_millis(500));
+    }
+
     /// The runner admits by the rule its dispatchers use, counting what jobs from either hold: on
     /// a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs leaves two slots, refusals say
     /// why, and a pool's leg runs in its executor beside them.
     #[test]
     fn a_runner_admits_work_beside_what_a_bench_holds() {
         use kiln_ci::sched::state::{Incoming, Resources};
-        let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
-        let bench = Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() });
+        let size = Some(Resources { cpu: kiln_ci::sched::state::Cpus::whole(32), mem: 64 << 30, ..Resources::default() });
+        let bench = Incoming::Share(Resources { cpu: kiln_ci::sched::state::Cpus::whole(16), mem: 16 << 30, ..Resources::default() });
         let o = Incoming::Ordinary;
         assert_eq!(admits(4, size, std::iter::empty(), false, bench), Ok(()));
         assert_eq!(admits(4, size, [(false, bench), (false, o)].into_iter(), false, o), Ok(()));
@@ -5435,6 +5654,9 @@ mod tests {
         assert_eq!(admits(4, size, [(false, Incoming::Whole)].into_iter(), true, o), Err("an exclusive job has this runner to itself"));
         // Without exclusive jobs, slots as ever.
         assert_eq!(admits(2, size, [(false, o), (false, o)].into_iter(), false, o), Err("no free slot"));
+        // On a runner whose size isn't known a share holds it whole (W05-R03, docs/sim.md's bug 12).
+        assert_eq!(admits(4, None, std::iter::empty(), false, bench), Ok(()));
+        assert_eq!(admits(4, None, [(false, bench)].into_iter(), false, o), Err("no free slot beside what's held"));
     }
 
     /// A stream that starts again sends a server whose copy has part of a session only what the

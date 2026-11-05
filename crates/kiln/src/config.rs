@@ -33,6 +33,8 @@ pub struct Config {
     pub ci: ci::Ci,
     /// kiln's own metrics, logs and events (docs/observe.md).
     pub observe: Observe,
+    /// The engine that places work (docs/needs.md §21): `[sched.classes.<class>]`.
+    pub sched: Sched,
     /// Signing in with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
     pub sso: sso::Sso,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
@@ -230,6 +232,84 @@ pub struct Conversations {
     /// does it for a whole process). Never read from a config file.
     #[serde(skip)]
     pub off: bool,
+}
+
+/// `[sched]`: the engine that places work (docs/needs.md §21).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sched {
+    /// Each class's floor and bound (docs/needs.md §7, docs/ci.md W05-R31), by its name:
+    /// `critical`, `land`, `interactive`, `batch` or `background`. What a class leaves out stays
+    /// as kiln has it: a 15 % floor and a 30-minute bound for `batch`, 5 % and an hour for
+    /// `background`, neither for the rest.
+    ///
+    /// ```toml
+    /// [sched.classes.batch]
+    /// floor = 20      # percent of the fleet, at its largest dimension
+    /// bound = "45m"   # promoted a class after waiting this long, its class passed over
+    /// ```
+    pub classes: BTreeMap<kiln_ci::sched::Class, ClassSettings>,
+    /// How long a grant lives unless its runner renews it (docs/needs.md §8, docs/ci.md W05-R34):
+    /// one not renewed by then is lost, and its item's next attempt queued. Runners renew three
+    /// times a lease, at most every 10 s. 60 s by default (`90s`, `2m`), at least 3 s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
+    /// How long past a lost grant's expiry an item that stops on losing its lease waits before its
+    /// next attempt (W05-R34): its runner has stopped it by then. 15 s by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_delay: Option<String>,
+    /// Reservations for big items (docs/needs.md §5, docs/ci.md W05-R39): the first of each class
+    /// that fits no runner keeps room on the runner where it frees first, from its grants' expected
+    /// ends, and only what ends before then, or fits beside it, is granted there. Without it a big
+    /// item may wait as long as smaller ones keep coming. Off until declared (docs/ci.md §0.3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub backfill: bool,
+}
+
+/// `[sched.classes.<class>]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassSettings {
+    /// Its floor share of the fleet, in percent (0 to 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor: Option<f64>,
+    /// How long one of its items waits, its class starting nothing where it would run, before it's
+    /// promoted a class (`90s`, `30m`, `6h`), or `never`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound: Option<String>,
+}
+
+impl Sched {
+    /// The classes' floors and bounds as the engine takes them: kiln's defaults, with what's set
+    /// here over them.
+    pub fn classes(&self) -> anyhow::Result<BTreeMap<kiln_ci::sched::Class, kiln_ci::sched::ClassConfig>> {
+        let mut out = kiln_ci::sched::state::default_classes();
+        for (class, set) in &self.classes {
+            let c = out.entry(*class).or_default();
+            if let Some(floor) = set.floor {
+                anyhow::ensure!((0.0..=100.0).contains(&floor), "[sched.classes.{}] floor = {floor}: a percent, 0 to 100", class.as_str());
+                c.floor = kiln_ci::sched::units::thousandths_of(floor / 100.0);
+            }
+            if let Some(bound) = set.bound.as_deref() {
+                c.bound = match bound.trim() {
+                    "never" => None,
+                    b => Some(kiln_ci::work::reap::parse_duration(b).map_err(|e| anyhow::anyhow!("[sched.classes.{}] bound: {e}", class.as_str()))?.saturating_mul(1000)),
+                };
+            }
+        }
+        Ok(out)
+    }
+
+    /// The lease and the lock-delay, in milliseconds, as the engine takes them (W05-R34): kiln's
+    /// 60 s and 15 s, or what's set here.
+    pub fn leases(&self) -> anyhow::Result<(u64, u64)> {
+        let read = |name: &str, set: Option<&str>, default: u64| -> anyhow::Result<u64> {
+            set.map_or(Ok(default), |v| Ok(kiln_ci::work::reap::parse_duration(v).map_err(|e| anyhow::anyhow!("[sched] {name}: {e}"))?.saturating_mul(1000)))
+        };
+        let lease = read("lease", self.lease.as_deref(), 60_000)?;
+        anyhow::ensure!(lease >= 3_000, "[sched] lease: at least 3s, as runners renew three times a lease");
+        Ok((lease, read("lock_delay", self.lock_delay.as_deref(), 15_000)?))
+    }
 }
 
 /// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").

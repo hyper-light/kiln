@@ -41,7 +41,9 @@ pub fn before(needs: &Resources, a: Option<&Headroom>, b: Option<&Headroom>) -> 
 
 /// Where work needing `needs` goes, of `nodes` (W05): of those it leaves within `target`
 /// ([`fits`]), the one it leaves the most headroom ([`before`]), a tie going to the one given
-/// first. None within the target: why, what each would have in use with it.
+/// first. None within the target: why, what each would have in use with it. In floats, as
+/// [`Headroom`] is (docs/ci.md W05-R29 names it).
+#[allow(clippy::float_arithmetic)]
 pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&'a str, Unplaceable> {
     if let Some(n) = nodes.iter().filter(|n| fits(needs, n.headroom.as_ref(), target)).min_by(|a, b| before(needs, a.headroom.as_ref(), b.headroom.as_ref())) {
         return Ok(n.name);
@@ -66,7 +68,7 @@ pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sched::state::Sample;
+    use crate::sched::state::{Cpus, Sample};
 
     const GIB: u64 = 1 << 30;
 
@@ -80,7 +82,7 @@ mod tests {
     /// each would pass it by.
     #[test]
     fn needs_and_nodes_in_a_node_or_why_not_out() {
-        let four = Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() };
+        let four = Resources { cpu: Cpus::whole(4), mem: 2 * GIB, ..Resources::default() };
         let (a, b, c) = (node("a", 0.8, 16, 0.0), node("b", 0.3, 16, 0.0), node("c", 0.3, 16, 30.0));
         // a would pass the target; c's disk counts against it, whichever comes first.
         assert_eq!(place(&four, &[a, b, c], 0.85), Ok("b"));
@@ -91,7 +93,7 @@ mod tests {
         assert_eq!(place(&four, &[unknown, a, b], 0.85), Ok("b"));
         assert_eq!(place(&four, &[unknown, a], 0.85), Ok("e"));
         // None within the target: why, a short of CPUs, b of memory.
-        let big = Resources { cpu: 5.0, mem: 42 * GIB, ..Resources::default() };
+        let big = Resources { cpu: Cpus::whole(5), mem: 42 * GIB, ..Resources::default() };
         assert_eq!(
             place(&big, &[b, a], 0.85),
             Err(Unplaceable { why: "no node stays within 85% with it: a's CPUs would be at 96%, b's memory would be at 91%".into(), past: vec!["a".into(), "b".into()] })

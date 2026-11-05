@@ -618,6 +618,8 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
         runner_name: start.runner_name,
         up: crate::exec::Uplink(up_tx),
         cancel,
+        // A leg in a microVM is stopped as a cancel stops it: no kill reaches the guest.
+        kill: crate::rt::Shutdown::new(),
         http,
         warm: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         cache_max: start.cache_max,

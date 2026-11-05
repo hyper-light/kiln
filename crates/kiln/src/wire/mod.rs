@@ -210,6 +210,9 @@ classes! {
         AgentMsg::LegResults { .. } => Class::Stream,
         AgentMsg::LegSignature { .. } => Class::Answer,
         AgentMsg::Custody { .. } => Class::Stream,
+        AgentMsg::Renew { .. } => Class::Telemetry,
+        AgentMsg::Refused { .. } => Class::Answer,
+        AgentMsg::Fenced { .. } => Class::Stream,
     }
 }
 
@@ -283,6 +286,8 @@ classes! {
         ServerMsg::Freeze { .. } => REFUSED,
         ServerMsg::SignAsLeg { .. } => Class::Ask,
         ServerMsg::Custody { .. } => Class::Ask,
+        ServerMsg::Renewed { .. } => Class::Telemetry,
+        ServerMsg::Stop { .. } => PARKED,
     }
 }
 

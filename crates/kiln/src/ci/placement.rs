@@ -23,7 +23,7 @@ fn used(placed: &BTreeMap<String, (String, Resources)>, node: &str) -> Resources
 
 /// The seam's resources as the engine counts them.
 fn engine(r: Resources) -> kiln_ci::sched::state::Resources {
-    kiln_ci::sched::state::Resources { cpu: r.cpu_milli as f64 / 1000.0, mem: r.memory_bytes, ..Default::default() }
+    kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::milli(r.cpu_milli), mem: r.memory_bytes, ..Default::default() }
 }
 
 impl Placement for Headroomed {
@@ -47,7 +47,7 @@ impl Placement for Headroomed {
                 .map(|n| {
                     let u = used(&placed, &n.name);
                     let free = Resources { cpu_milli: n.capacity.cpu_milli.saturating_sub(u.cpu_milli), memory_bytes: n.capacity.memory_bytes.saturating_sub(u.memory_bytes) };
-                    let headroom = Headroom { cpus: engine(free).cpu, mem: free.memory_bytes, io_full: None, of: engine(n.capacity) };
+                    let headroom = Headroom { cpus: engine(free).cpu.as_f64(), mem: free.memory_bytes, io_full: None, of: engine(n.capacity) };
                     kiln_ci::sched::place::Node { name: &n.name, headroom: Some(headroom) }
                 })
                 .collect();

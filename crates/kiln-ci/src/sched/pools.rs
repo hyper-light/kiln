@@ -16,7 +16,7 @@
 use serde::Serialize;
 
 use super::routing::{self, Constraint};
-use super::state::Resources;
+use super::state::{Cpus, Resources};
 
 /// The longest a host that failed to start a pool's executor is left alone.
 pub const MAX_BACKOFF_MS: i64 = 5 * 60_000;
@@ -202,21 +202,44 @@ impl ResourceSpec {
             }
         };
         let cpu = match self.cpu.as_deref().map(str::trim) {
-            Some(s) => cpus(s).ok_or_else(|| format!("`resources.cpu` isn't a number of CPUs (`2`, `0.5`, `500m`): `{s}`"))?,
-            None => 0.0,
+            Some(s) => cpus(s).map_err(|why| match why {
+                FINER => format!("`resources.cpu` is finer than a thousandth of a CPU (`1m`): `{s}`"),
+                _ => format!("`resources.cpu` isn't a number of CPUs (`2`, `0.5`, `500m`): `{s}`"),
+            })?,
+            None => Cpus::ZERO,
         };
         Ok(Resources { cpu, mem: bytes("memory", &self.memory)?, disk: bytes("disk", &self.disk)?, gpu: self.gpu.unwrap_or(0) })
     }
 }
 
-/// CPUs as Kubernetes writes them: `2`, `0.5`, or thousandths (`500m`).
-pub fn cpus(s: &str) -> Option<f64> {
+/// Why a spelling of CPUs isn't one.
+pub const NOT_CPUS: &str = "not a number of CPUs (8, 0.5, 500m)";
+/// Why a spelling of CPUs finer than a thousandth isn't one: Kubernetes takes nothing finer either.
+pub const FINER: &str = "finer than 1m (0.001 CPU)";
+
+/// CPUs as Kubernetes writes them, `2`, `0.5`, or thousandths (`500m`), read exactly, digit by
+/// digit, into thousandths: no float between the text and the amount.
+pub fn cpus(s: &str) -> Result<Cpus, &'static str> {
     let s = s.trim();
-    let n = match s.strip_suffix('m') {
-        Some(milli) => milli.parse::<f64>().ok()? / 1000.0,
-        None => s.parse::<f64>().ok()?,
+    let (number, per_unit) = match s.strip_suffix('m') {
+        Some(milli) => (milli, 1),
+        None => (s, 1000),
     };
-    (n >= 0.0 && n.is_finite()).then_some(n)
+    let number = number.strip_prefix('+').unwrap_or(number);
+    let (whole, part) = number.split_once('.').unwrap_or((number, ""));
+    let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && part.is_empty()) || !digits(whole) || !digits(part) {
+        return Err(NOT_CPUS);
+    }
+    // The digits a thousandth can say (three of a CPU, none of a milli-CPU); the rest must be 0.
+    let kept = if per_unit == 1000 { part.len().min(3) } else { 0 };
+    let (said, rest) = (part.get(..kept).unwrap_or(""), part.get(kept..).unwrap_or(""));
+    if rest.bytes().any(|b| b != b'0') {
+        return Err(FINER);
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| NOT_CPUS)? };
+    let said: u64 = if said.is_empty() { 0 } else { format!("{said:0<3}").parse().map_err(|_| NOT_CPUS)? };
+    whole.checked_mul(per_unit).and_then(|w| w.checked_add(said)).map(Cpus::milli).ok_or(NOT_CPUS)
 }
 
 /// The executor kinds a pool may have.
@@ -270,7 +293,8 @@ impl PoolSpec {
                 }
                 let hosts = vec![(src.to_owned(), Constraint::parse(src).map_err(|e| format!("pool `{name}`: `overflow.hosts`: {e}"))?)];
                 let after_ms = match o.after.as_deref() {
-                    Some(t) => (routing::number(t.trim()).filter(|s| *s >= 0.0 && s.is_finite()).ok_or_else(|| format!("pool `{name}`: `overflow.after` is a duration (`90s`, `5m`), not `{t}`"))? * 1000.0) as i64,
+                    // To the nearest millisecond, through the engine's units (docs/needs.md E1.2).
+                    Some(t) => routing::number(t.trim()).filter(|s| *s >= 0.0).and_then(super::units::ms_of_secs).and_then(|ms| i64::try_from(ms).ok()).ok_or_else(|| format!("pool `{name}`: `overflow.after` is a duration (`90s`, `5m`), not `{t}`"))?,
                     None => OVERFLOW_AFTER_MS,
                 };
                 Some(Overflow { hosts, after_ms })
@@ -299,7 +323,7 @@ impl PoolSpec {
             min_idle: self.min_idle,
             max,
             per_host_max: self.per_host_max.unwrap_or(max).max(1),
-            idle_timeout_ms: (idle * 1000.0) as i64,
+            idle_timeout_ms: i64::try_from(super::units::ms_of_secs(idle).unwrap_or(600_000)).unwrap_or(i64::MAX),
             request,
             caps: 0,
             hosted: self.executor == "k8s",

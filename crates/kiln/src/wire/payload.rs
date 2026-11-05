@@ -413,7 +413,11 @@ impl Carries for AgentMsg {
             | AgentMsg::HarnessHandOver { .. }
             | AgentMsg::HarnessAdopted { .. }
             | AgentMsg::Unread { .. }
-            | AgentMsg::LinkUnread { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::LinkUnread { .. }
+            // A fenced message's own is read as it's taken (`crate::hub`), under its grant.
+            | AgentMsg::Renew { .. }
+            | AgentMsg::Refused { .. }
+            | AgentMsg::Fenced { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -558,7 +562,9 @@ impl Carries for ServerMsg {
             | ServerMsg::Unread { .. }
             | ServerMsg::ReachRefused { .. }
             | ServerMsg::Freeze { .. }
-            | ServerMsg::SignAsLeg { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::SignAsLeg { .. }
+            | ServerMsg::Renewed { .. }
+            | ServerMsg::Stop { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

@@ -910,7 +910,7 @@ mod tests {
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/tags/v1", ZERO, &b), false).is_some());
         assert!(refused(&dev, "acme/other", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some(), "another repository's grant");
         // A leg's token: `contents: write`.
-        let job = |level| Pusher::Job(crate::ci::token::Job { leg: "L1".into(), run: "R1".into(), repo: "r1".into(), permissions: [("contents".to_owned(), level)].into() });
+        let job = |level| Pusher::Job(crate::ci::token::Job { leg: "L1".into(), run: "R1".into(), repo: "r1".into(), permissions: [("contents".to_owned(), level)].into(), grant: None });
         assert!(refused(&job(kiln_ci::plan::perms::Level::Write), "acme/app", &review, &trunks, &up("refs/tags/v1", ZERO, &b), false).is_none());
         assert!(refused(&job(kiln_ci::plan::perms::Level::Read), "acme/app", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some());
         assert!(refused(&job(kiln_ci::plan::perms::Level::Write), "acme/app", &review, &trunks, &up("refs/heads/main", &a, &b), false).is_some(), "a leg doesn't write trunk");

@@ -41,6 +41,7 @@ kiln says back, in placement's messages):
 | `disk.free>=50Gi` | `disk.free >= 50Gi` | any fact (§4), with `==`, `!=`, `>=`, `<=`, `>` or `<` |
 | `custom.rack==a3` | `custom.rack == a3` | a fact of your own (W13-R02) |
 | `exclusive` | `the runner whole` | nothing else beside it |
+| `together:sim/3` | `one of 3 starting together (sim)` | one of a gang of 3 (2 to 64) that start together or not at all (W05-R40) |
 
 A word that isn't a need is an error that names it: `memm=4g: no such need`, `cpu.coress>=8: no
 such fact (…)`, `linx/amd64: no such OS (…)`. Some whole spellings:
@@ -58,12 +59,13 @@ exclusive,cpus=16,mem=48g
 ```
 
 `kiln run` and the MCP tools take the spelling as `--needs` (`needs`); `--on` (`on`) names a
-runner and takes the same words too, with `harness=codex` and `-name` (not that one).
+runner and takes the same words too, with `harness=codex` and `-name` (not that one). They refuse
+`together:` until commands are placed by the engine (docs/needs.md E5).
 
 ## 3. In a workflow
 
-A job's `resources:`, `requires:` and `exclusive:` are its needs (kiln's keys: `needs:` is
-GitHub's, for the jobs a job waits for). A GitHub workflow takes them from its overlay,
+A job's `resources:`, `requires:`, `exclusive:` and `together:` are its needs (kiln's keys:
+`needs:` is GitHub's, for the jobs a job waits for). A GitHub workflow takes them from its overlay,
 `.kiln/overlays/<stem>.yaml`. This job needs `cpus=8,mem=32g,linux/amd64,exclusive`:
 
 ```yaml
@@ -77,6 +79,22 @@ jobs:
 `requires:` takes routing's whole language (W05-R22: `in [..]`, `matches`, `&&`, `||`, `!`), of
 which the spelling's constraints are the common part. `kiln validate` reports a bad `resources:`
 or `requires:` at its line.
+
+A job's `together: true` makes its legs, its matrix, one gang (W05-R40): they start together or
+not at all, as `together:<name>/<n>` says, the gang named by the run and the job and as big as the
+job has legs. Its members may share a runner. This job's three legs start at once, once there's
+room for all three:
+
+```yaml
+jobs:
+  sim:
+    strategy: { matrix: { node: [a, b, c] } }
+    together: true
+```
+
+A gang is two legs at least and 64 at most, and starts them all at once, which `max-parallel` would
+hold back: `kiln validate` reports a job it can't make one at the key's line (KCI1022), and lets be
+a matrix it can't count until the run is planned. Rerunning one of its legs reruns them all.
 
 ## 4. Facts
 

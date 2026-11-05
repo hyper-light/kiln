@@ -29,3 +29,5 @@ jobs:
         run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=20000 cargo test --release --locked -p kiln --lib sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied -- --exact --nocapture
       - name: the goal driver, 2,000 seeds
         run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=2000 cargo test --release --locked -p kiln --lib goals::sim::tests::goal_stacks_run_in_order_to_their_end_under_the_nemesis -- --exact --nocapture
+      - name: the scheduler, 100,000 seeds
+        run: KILN_SIM_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_SIM_SEEDS=100000 cargo test --release --locked -p kiln --lib sim::sched::tests::the_engine_and_runners_hold_their_capacity_and_settle_every_leg_under_the_nemesis -- --exact --nocapture

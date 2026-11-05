@@ -470,10 +470,35 @@ takes a new bit, never one that means something already, even in the other direc
 | 45 | `CAP_LEG_SIGNS` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg signs as itself what it hands on: its results at its end, and the provenance kiln writes of what it built (`LegResults`, `SignAsLeg`, `LegSignature`; ci.md W27-R05, R06) |
 | 46 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
+| 62 | `CAP_LEASES` | `AgentMsg::Caps`, `ServerMsg::Caps` | grants are leases (ci.md W05-R34): the runner renews the grants it holds (`Renew`) and names a leg's grant in what it sends about the leg (`Fenced`, `Refused`, and its output on the `fenced-logs` lane, 10); the server answers renewals (`Renewed`) and stops a leg by its grant (`Stop`) |
 
 Bits 47 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
-branches before the Changes tab took 42 and 43, and W27's relays. Bits from 54 are free. Take the next
-one, and add its row here in the same change.
+branches before the Changes tab took 42 and 43, and W27's relays. Bit 62 is `CAP_LEASES` (needs-engine
+had 38 before main gave it to `CAP_IDENTITY`), and bit 63 is kept for a later change. Bits 54 to 61 are
+free. Take the next one, and add its row here in the same change.
+
+## Grants on the wire
+
+A runner and a server that both announce `CAP_LEASES` (bit 62) treat each CI leg as a grant
+(ci.md W05-R34, docs/needs.md §8), and name the grant in everything about the leg:
+
+- **The grant** (`proto::Grant`): its leg, its attempt, and its fence: the epoch it was made in,
+  then `n`, its number among that epoch's grants. `AssignV2` carries it (`fence`, `lease_ms`,
+  `on_lease_loss`); `Stop` and `Refused` name one; `Renew` names each the runner holds, and
+  `Renewed` the ones of those that aren't the runner's any more.
+- **What the runner sends about a leg it holds a grant for**: its steps, events and result go whole
+  inside `Fenced`, named by the grant; its output goes on a lane of its own, `fenced-logs` (lane
+  10), as `FencedLog` frames (the grant, the step's index, the bytes), bulk as `logs`' frames are.
+  The server tells fenced output from a `LogChunk` by its lane. What's kept to send again after a
+  reconnect goes so too, to whichever server that is.
+- **The server** takes what a grant sends only while it's the leg's live grant, that runner's
+  (W05-R36), and the grant's tokens only then (W10-R03); the rest it refuses, counts
+  (`kiln_ci_refused_writes_total`), and tells the runner once to `Stop` that grant. A runner
+  without `CAP_LEASES` is fenced by runner: what it sends about a leg is taken while the leg is
+  its own.
+- **Epochs**: a runner doesn't apply an `AssignV2` or a `Stop` whose grant's epoch is older than
+  the newest it has seen (it answers `StaleEpoch`), and doesn't take a `Renewed` from one
+  (W05-R37).
 
 ## The lab
 
@@ -594,6 +619,9 @@ Four edges are left, and the lab steers clear of each:
 | `LegResults` | stream | A leg's records, signed as the leg on its runner at its end under the server's delegation of it: a JSON array of Sigstore bundles, its results (kiln's statement of each step's end, each log by its chunks' chain, each report it uploaded, and its conclusion) and its custody records (a receipt of each thing it received, then its hand-on of what it made; ci.md W27-R05). | New: before its `JobFinished`, and again with it until `Received`, to a server announcing `CAP_LEG_SIGNS`. |
 | `LegSignature` | answer | Answers `SignAsLeg`: the provenance kiln wrote of what the leg built, signed as the leg, or why it isn't (ci.md W27-R06). | New: to a server announcing `CAP_LEG_SIGNS`. |
 | `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; a hand-over's word it refused, not being the process it was for; or an act of one of its sessions it didn't do, the server out of reach (`refused_act`). The server records both. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. |
+| `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and three times a lease, at most every 10 s (the lease its grants and `Renewed` say), in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
+| `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
+| `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
 
 ## Server to runner: `ServerMsg`
 
@@ -623,7 +651,7 @@ Four edges are left, and the lab steers clear of each:
 | `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
 | `FrontDoor` | state | The front door's settings and certificate. | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent on connect and change. |
 | `Headroom` | state | The machine's headroom settings (docs/headroom.md). | Sent on connect and on change; the runner keeps them. |
-| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
+| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. To a runner announcing `CAP_LEASES`, with its grant (ci.md W05-R34) in JSON fields an older runner doesn't read: `fence` (`epoch`, `n`), `lease_ms`, `on_lease_loss` (`finish`, a CI leg's, or `stop`). | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
 | `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
 | `JobTerminalOpen` | command, refused while away | A terminal into a leg. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `KeepRelease` | command, parked | A kept leg may be cleaned up. | On the channel ("Commands"): answered once applied. |
@@ -666,6 +694,8 @@ Four edges are left, and the lab steers clear of each:
 | `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
 | `SignAsLeg` | ask | The provenance kiln wrote of what a leg built, for the leg to sign as itself once it's of what its attest step reported (ci.md W27-R06). Answered by `LegSignature`. | New: to runners that say `CAP_LEG_SIGNS`. |
 | `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. |
+| `Renewed` | telemetry | The answer to a `Renew` (ci.md W05-R34): the lease each grant it named lives from when the server took it, the server's epoch, and the grants it named that aren't the runner's any more (lost, or granted again). The next stands in for a lost one. | New: to runners announcing `CAP_LEASES`. |
+| `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
 
 ## Commands to a session: `Command`
 

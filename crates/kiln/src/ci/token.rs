@@ -1,12 +1,18 @@
 //! A leg's token (docs/ci.md W08-R04, W10's precursor). `ACTIONS_RUNTIME_TOKEN` and
 //! `GITHUB_TOKEN` carry it, and so do action downloads and git fetches.
 //!
-//! It is a JWT signed by the server (HS256), so it is checked without any state. Its `scp`
+//! It is a JWT signed by the server (HS256), checked without the store. Its `scp`
 //! claim has the scopes GitHub's toolkit parses for its backend ids:
 //! `Actions.Results:<run>:<leg>`. Its `ac` claim lists the cache scopes the leg may read and
 //! write, in lookup order, as GitHub's does (W08-R06, W08-R14): a string holding their JSON, which
 //! is how BuildKit's cache client reads it (W08-R11). W10's job tokens, with permissions and
 //! principals, replace it.
+//!
+//! Both are an attempt's (W10-R03, docs/ci.md W05-R34): each names its leg's attempt and that
+//! attempt's grant (its fence), and is taken only while that grant is the leg's live one (the
+//! dispatcher's table, one lookup in memory), or while the leg is kept to look into under it
+//! (W17-R02); so it dies with its grant, ended or lost. One minted by an older build names no
+//! grant, and lives as before.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -48,6 +54,14 @@ pub struct Claims {
     pub iat: i64,
     pub nbf: i64,
     pub exp: i64,
+    /// The leg's attempt, and its grant's fence (W10-R03, W05-R34): the token is taken only while
+    /// that grant is the leg's. None from an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub att: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ep: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gn: Option<u64>,
 }
 
 /// `ac` as GitHub writes it, a string holding the scopes' JSON: BuildKit's cache client
@@ -86,6 +100,18 @@ impl Claims {
     pub fn write_scope(&self) -> Option<String> {
         self.ac.iter().find(|a| a.permission & WRITE != 0).map(|a| a.scope.clone())
     }
+
+    /// The attempt and grant it was minted for (W10-R03); none from an older build.
+    pub fn grant(&self) -> Option<(u32, kiln_ci::sched::Fence)> {
+        Some((self.att?, kiln_ci::sched::Fence { epoch: self.ep?, n: self.gn? }))
+    }
+}
+
+/// Whether a token of `leg`'s, minted for `grant` (its attempt and fence), is taken now (W10-R03):
+/// while that grant is the leg's live one (`ci`, the dispatcher's), or while the leg is kept to
+/// look into under it (W17-R02). One that names no grant (an older build's) is, as before.
+pub fn live(ci: &crate::ci::dispatch::Handle, leg: &str, grant: Option<(u32, kiln_ci::sched::Fence)>) -> bool {
+    grant.is_none_or(|(attempt, fence)| ci.holds(leg, attempt, fence) || ci.kept_under(leg, attempt, fence))
 }
 
 /// What a token is minted for.
@@ -97,6 +123,8 @@ pub struct Leg<'a> {
     pub cache_mode: &'a str,
     /// How long the token lives, in seconds.
     pub ttl: i64,
+    /// The attempt and grant it's for (W10-R03): it dies with that grant.
+    pub grant: Option<(u32, kiln_ci::sched::Fence)>,
 }
 
 fn key(hub: &Hub) -> Vec<u8> {
@@ -132,6 +160,9 @@ fn mint_at(key: &[u8], l: &Leg<'_>, now: i64) -> String {
         iat: now,
         nbf: now - 60,
         exp: now + l.ttl,
+        att: l.grant.map(|(a, _)| a),
+        ep: l.grant.map(|(_, f)| f.epoch),
+        gn: l.grant.map(|(_, f)| f.n),
     };
     let head = B64.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let body = B64.encode(serde_json::to_vec(&claims).unwrap_or_default());
@@ -140,12 +171,13 @@ fn mint_at(key: &[u8], l: &Leg<'_>, now: i64) -> String {
     format!("{signing}.{sig}")
 }
 
-/// The claims of a genuine token that is valid now. Its leg doesn't age while it's paused
-/// (docs/ci.md W26-R22): the token lives that while longer.
+/// The claims of a genuine token that is valid now: unexpired, its leg not aging while it's paused
+/// (docs/ci.md W26-R22: the token lives that while longer), and its grant its leg's live one
+/// (W10-R03).
 pub fn verify(hub: &Hub, token: &str) -> Option<Claims> {
     let now = crate::util::now_unix();
     let c = claims_of(&key(hub), token)?;
-    live_at(&c, now, hub.paused_for(&c.sub, now)).then_some(c)
+    (live_at(&c, now, hub.paused_for(&c.sub, now)) && live(&hub.ci, &c.sub, c.grant())).then_some(c)
 }
 
 #[cfg(test)]
@@ -209,6 +241,8 @@ pub struct Job {
     pub repo: String,
     /// The job's resolved `permissions` (W04-R06).
     pub permissions: std::collections::BTreeMap<String, kiln_ci::plan::perms::Level>,
+    /// The attempt and grant it's for (W10-R03); none from an older build.
+    pub grant: Option<(u32, kiln_ci::sched::Fence)>,
 }
 
 impl Job {
@@ -218,20 +252,27 @@ impl Job {
     }
 }
 
+/// A fence's numbers as SQLite keeps them.
+fn sql(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 /// A leg attempt's `GITHUB_TOKEN`: `kiln_job_<leg>_<random>`, stored as its hash, with the job's
-/// permissions; it lives `ttl` seconds unless revoked first.
-pub async fn mint_job(hub: &Hub, leg: &str, run: &str, repo: &str, permissions: &kiln_ci::plan::perms::Resolved, ttl: i64) -> anyhow::Result<String> {
+/// permissions and the attempt's grant (W10-R03); it lives `ttl` seconds unless revoked first, and
+/// is taken only while that grant is the leg's.
+pub async fn mint_job(hub: &Hub, leg: &str, run: &str, repo: &str, permissions: &kiln_ci::plan::perms::Resolved, ttl: i64, grant: Option<(u32, kiln_ci::sched::Fence)>) -> anyhow::Result<String> {
     let secret = crate::util::random_token();
     let token = format!("{JOB_PREFIX}{leg}_{secret}");
     let hash = crate::util::sha256_hex(token.as_bytes());
     let scopes = serde_json::json!({ "permissions": permissions, "repo": repo }).to_string();
     let (leg, run) = (leg.to_owned(), run.to_owned());
+    let (attempt, epoch, n) = (grant.map(|(a, _)| a), grant.map(|(_, f)| sql(f.epoch)), grant.map(|(_, f)| sql(f.n)));
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
             c.execute(
-                "INSERT INTO tokens (id, kind, principal, on_behalf_of, hash, scopes, created_at, expires_at) VALUES (?1, 'job', ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![crate::util::new_id(), leg, run, hash, scopes, now, now + ttl],
+                "INSERT INTO tokens (id, kind, principal, on_behalf_of, hash, scopes, created_at, expires_at, attempt, grant_epoch, grant_n) VALUES (?1, 'job', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![crate::util::new_id(), leg, run, hash, scopes, now, now + ttl, attempt, epoch, n],
             )?;
             Ok(())
         })
@@ -239,8 +280,14 @@ pub async fn mint_job(hub: &Hub, leg: &str, run: &str, repo: &str, permissions: 
     Ok(token)
 }
 
-/// The job a token is, while it is live (not expired, not revoked).
+/// The job a token is, while it is live: not expired, not revoked, and its grant its leg's live
+/// one (W10-R03).
 pub async fn job_of(hub: &Hub, token: &str) -> Option<Job> {
+    let job = stored_job(hub, token).await?;
+    live(&hub.ci, &job.leg, job.grant).then_some(job)
+}
+
+async fn stored_job(hub: &Hub, token: &str) -> Option<Job> {
     if !token.starts_with(JOB_PREFIX) {
         return None;
     }
@@ -249,19 +296,24 @@ pub async fn job_of(hub: &Hub, token: &str) -> Option<Job> {
         .call(move |c| {
             use rusqlite::OptionalExtension as _;
             let now = crate::util::now_unix();
-            let row: Option<(String, String, String, String)> = c
+            type Row = (String, String, String, String, Option<u32>, Option<i64>, Option<i64>);
+            let row: Option<Row> = c
                 .query_row(
-                    "SELECT id, principal, COALESCE(on_behalf_of, ''), scopes FROM tokens WHERE hash = ?1 AND kind = 'job' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
+                    "SELECT id, principal, COALESCE(on_behalf_of, ''), scopes, attempt, grant_epoch, grant_n FROM tokens WHERE hash = ?1 AND kind = 'job' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
                     rusqlite::params![hash, now],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
                 )
                 .optional()?;
-            let Some((id, leg, run, scopes)) = row else { return Ok(None) };
+            let Some((id, leg, run, scopes, attempt, epoch, n)) = row else { return Ok(None) };
+            let grant = match (attempt, epoch.and_then(|e| u64::try_from(e).ok()), n.and_then(|n| u64::try_from(n).ok())) {
+                (Some(a), Some(epoch), Some(n)) => Some((a, kiln_ci::sched::Fence { epoch, n })),
+                _ => None,
+            };
             c.execute("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?;
             let v: serde_json::Value = serde_json::from_str(&scopes).unwrap_or_default();
             let permissions = v.get("permissions").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
             let repo = v.get("repo").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-            Ok(Some(Job { leg, run, repo, permissions }))
+            Ok(Some(Job { leg, run, repo, permissions, grant }))
         })
         .await
         .ok()
@@ -274,7 +326,8 @@ pub async fn job_of_request(hub: &Hub, headers: &http::HeaderMap) -> Option<Job>
     job_of(hub, &t).await
 }
 
-/// Revokes a leg's job tokens: its attempt ended (W10-R03).
+/// Revokes a leg's job tokens: its grant ended, or the leg's next replaced it (W10-R03). The next
+/// grant's is minted after.
 pub async fn revoke_leg(hub: &Hub, leg: &str) -> anyhow::Result<()> {
     let leg = leg.to_owned();
     hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE kind = 'job' AND principal = ?1 AND revoked_at IS NULL", rusqlite::params![leg, crate::util::now_unix()]).map(|_| ())?)).await
@@ -302,6 +355,7 @@ mod tests {
             cache: vec![Access { scope: "refs/pull/7/merge".into(), permission: READ | WRITE }, Access { scope: "refs/heads/main".into(), permission: READ }],
             cache_mode: "write",
             ttl: 3600,
+            grant: None,
         }
     }
 
@@ -316,6 +370,38 @@ mod tests {
         assert!(live_at(&c, 1000 + 3600, 120) && live_at(&c, 1000 + 3600 + 119, 120), "paused two minutes: two minutes more");
         assert!(!live_at(&c, 1000 + 3600 + 120, 120), "and no more");
         assert!(claims_of(b"other", &t).is_none(), "another key's isn't genuine, paused or not");
+        Ok(())
+    }
+
+    /// W10-R03: a token names its leg's attempt and that attempt's grant, and is taken only while
+    /// that grant is the leg's live one: attempt 1's not once attempt 2 is granted, attempt 2's
+    /// then, neither once its grant is over; kept to look into under attempt 2's grant (W17-R02),
+    /// attempt 2's again and attempt 1's still not; one an older build minted, naming none, as
+    /// before.
+    #[test]
+    fn w10_r03_tokens_name_their_attempt() -> Result<(), String> {
+        use kiln_ci::sched::Fence;
+        let k = b"key";
+        let (f1, f2) = (Fence { epoch: 0, n: 1 }, Fence { epoch: 0, n: 2 });
+        let first = verify_at(k, &mint_at(k, &Leg { grant: Some((1, f1)), ..leg() }, 1000), 1500).ok_or("attempt 1's verifies")?;
+        let second = verify_at(k, &mint_at(k, &Leg { grant: Some((2, f2)), ..leg() }, 1000), 1500).ok_or("attempt 2's verifies")?;
+        assert_eq!((first.grant(), second.grant()), (Some((1, f1)), Some((2, f2))));
+        let ci = crate::ci::dispatch::Handle::default();
+        ci.grant("01leg", Some(("a".into(), 1, f1)));
+        assert!(live(&ci, "01leg", first.grant()) && !live(&ci, "01leg", second.grant()));
+        ci.grant("01leg", Some(("a".into(), 2, f2)));
+        assert!(!live(&ci, "01leg", first.grant()), "attempt 1's, attempt 2 granted");
+        assert!(live(&ci, "01leg", second.grant()));
+        ci.grant("01leg", None);
+        assert!(!live(&ci, "01leg", second.grant()), "its grant over");
+        ci.grant("01leg", Some(("a".into(), 2, f2)));
+        ci.keep("01leg", Some(("a".into(), crate::util::now_unix() + 600)));
+        ci.grant("01leg", None);
+        assert!(live(&ci, "01leg", second.grant()) && !live(&ci, "01leg", first.grant()), "kept under attempt 2's grant");
+        ci.keep("01leg", None);
+        assert!(!live(&ci, "01leg", second.grant()), "let go");
+        let old = verify_at(k, &mint_at(k, &leg(), 1000), 1500).ok_or("an older build's verifies")?;
+        assert!(old.grant().is_none() && live(&ci, "01leg", old.grant()), "an older build's, as before");
         Ok(())
     }
 

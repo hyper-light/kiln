@@ -54,6 +54,8 @@ impl Owned {
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
             ServerMsg::Cancel { job, .. } | ServerMsg::Freeze { job, .. } => Some(Self::Job(job.clone())),
+            // A leg's grant to stop goes where the leg runs (docs/ci.md W05-R34).
+            ServerMsg::Stop { grant, .. } => Some(Self::Job(grant.leg.clone())),
             _ => None,
         }
     }

@@ -253,7 +253,7 @@ pub(crate) fn size() -> Option<kiln_ci::sched::state::Resources> {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    (threads > 0 && sys.total_memory() > 0).then(|| kiln_ci::sched::state::Resources { cpu: threads as f64, mem: sys.total_memory(), ..Default::default() })
+    (threads > 0 && sys.total_memory() > 0).then(|| kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(u64::try_from(threads).unwrap_or(u64::MAX)), mem: sys.total_memory(), ..Default::default() })
 }
 
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.

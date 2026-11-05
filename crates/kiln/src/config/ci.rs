@@ -424,7 +424,8 @@ impl Ci {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Scheduler {
-    /// Effective priority a waiting leg gains per minute, so nothing starves.
+    /// Priority a waiting leg gains per minute in its tenant's own order (W05-R09), so a tenant's
+    /// own high-priority stream doesn't starve its low-priority legs.
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
@@ -435,7 +436,9 @@ pub struct Scheduler {
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
     /// `event` (W05-R09's defaults by event) or `intent` (W28-R64): gate 90, someone waiting 80,
-    /// trunk 60, work in progress 40, a job's own `priority:` still first.
+    /// trunk 60, work in progress 40, a job's own `priority:` still first. Each also sets a leg's
+    /// class (W05-R30): a manual run `interactive`, a land `land`, a schedule `background`, the
+    /// rest `batch`; or a gate `land`, someone waiting `interactive`, the rest `batch`.
     pub priority: String,
     /// What fair share is between, outermost first (W05-R10, W28-R66): `repo`, then `actor` (the
     /// agent or person a commit is attributed to), then `lane` (a workflow on a branch).
@@ -484,8 +487,8 @@ impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
         Scheduler {
-            aging_per_minute: d.aging_per_minute,
-            default_cost_seconds: d.default_cost,
+            aging_per_minute: f64::from(d.aging_per_minute) / 1000.0,
+            default_cost_seconds: kiln_ci::sched::units::secs(d.default_cost),
             mode: "slots".into(),
             overcommit: Overcommit::default(),
             default_request: Default::default(),
@@ -533,7 +536,10 @@ impl Admission {
         if let Some(h) = self.heavy_after.filter(|h| !h.is_finite() || *h < 0.0) {
             return Err(format!("`[ci.scheduler.admission] heavy_after` is seconds, not {h}"));
         }
-        Ok(kiln_ci::sched::load::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
+        // In the engine's integers (docs/needs.md, E1): hundredths of a percent, milliseconds.
+        let io_full = kiln_ci::sched::units::hundredths_of_percent(self.io_full).unwrap_or(10_000);
+        let heavy_after = self.heavy_after.and_then(kiln_ci::sched::units::ms_of_secs);
+        Ok(kiln_ci::sched::load::Admission { io_full, disk_free: disk_free as u64, heavy_after })
     }
 }
 
@@ -549,8 +555,10 @@ pub struct Overcommit {
 
 impl Default for Overcommit {
     fn default() -> Self {
+        // The engine's, in thousandths, as people write them (`1.5`).
         let d = kiln_ci::sched::state::Config::default();
-        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
+        let factor = |m: u32| f64::from(m) / 1000.0;
+        Overcommit { cpu: factor(d.overcommit_cpu), memory: factor(d.overcommit_mem), disk: factor(d.overcommit_disk) }
     }
 }
 
@@ -808,10 +816,10 @@ mod tests {
     fn w24_r19_admission_config() -> anyhow::Result<()> {
         let s: Scheduler = toml::from_str("[admission]\nio_full = 35\ndisk_free = \"50Gi\"\nheavy_after = 900\n")?;
         let a = s.admission.as_ref().map(Admission::admission).transpose().map_err(|e| anyhow::anyhow!(e))?;
-        anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
+        anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 3_500, disk_free: 50 << 30, heavy_after: Some(900_000) }), "{a:?}");
         anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
         let defaults: Scheduler = toml::from_str("[admission]\n")?;
-        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 4_000, disk_free: 20 << 30, heavy_after: None })));
         for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
             anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
         }

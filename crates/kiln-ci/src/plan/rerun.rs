@@ -2,7 +2,8 @@
 //! failed or were cancelled, with the jobs that need them; one job, with the jobs that need it; or
 //! one leg (W05-R28), with the jobs that need its job, as GitHub reruns one combination of a
 //! matrix (each is a job of its own there). The rest keep the last attempt's results. A called
-//! workflow's jobs go with the job that calls them (`call/inner` is `call`'s).
+//! workflow's jobs go with the job that calls them (`call/inner` is `call`'s), and a gang's leg
+//! with its job's others (W05-R40).
 
 use std::collections::BTreeSet;
 
@@ -71,6 +72,9 @@ pub fn jobs(wf: &Workflow, mode: &Mode, failed: &BTreeSet<String>) -> Result<Aga
             }
             (std::iter::once(top(job).to_owned()).collect(), None)
         }
+        // A gang's leg goes with its job's others (W05-R40): they start together or not at all, and
+        // one alone would wait for them forever.
+        Mode::Leg { job, .. } if wf.job(job).is_some_and(|j| j.kiln.together) => (std::iter::once(job.clone()).collect(), None),
         Mode::Leg { job, key } => {
             if !known(job) {
                 return Err(unknown(job));
@@ -156,5 +160,17 @@ mod tests {
         // A called workflow's leg reruns the job that calls it, whole.
         assert_eq!(jobs(&w, &Mode::Leg { job: "call/inner".into(), key: "call / inner".into() }, &set(&[])), Ok(Again { jobs: set(&["call"]), legs: set(&[]) }));
         assert!(jobs(&w, &Mode::Leg { job: "nope".into(), key: "nope".into() }, &set(&[])).is_err_and(|e| e.contains("no job `nope`")));
+    }
+
+    /// W05-R40, docs/needs.md E4.4: a gang's leg reruns its whole job, with the jobs that need it:
+    /// its legs start together or not at all.
+    #[test]
+    fn w05_r40_a_gang_s_leg_reruns_its_whole_job() {
+        let src = "name: ci\non: push\njobs:\n  sim:\n    strategy: { matrix: { node: [a, b, c] } }\n    together: true\n    steps:\n      - run: ./node\n  report:\n    needs: sim\n    steps:\n      - run: ./report\n";
+        let (w, d) = crate::wf::parse_workflow(".kiln/sim.yaml", src, Dialect::Kiln);
+        assert!(d.iter().all(|x| x.severity != crate::wf::Severity::Error), "{d:?}");
+        let w = w.unwrap_or_default();
+        assert!(w.job("sim").is_some_and(|j| j.kiln.together));
+        assert_eq!(jobs(&w, &Mode::Leg { job: "sim".into(), key: "sim (b)".into() }, &set(&[])), Ok(Again { jobs: set(&["sim", "report"]), legs: set(&[]) }));
     }
 }

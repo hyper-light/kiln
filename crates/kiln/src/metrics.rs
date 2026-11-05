@@ -296,6 +296,9 @@ pub struct Metrics {
     /// behind the rollups are.
     pub ci_cache: CounterVec,
     pub ci_attempts: CounterVec,
+    /// A runner's writes refused for naming a grant that isn't their leg's live one (docs/ci.md
+    /// W05-R36), by what they were: `result`, `event`, `step`, `log`.
+    pub ci_refused_writes: CounterVec,
     pub ci_wait_seconds: CounterVec,
     pub ci_rollup_lag: Gauge,
     /// W24's (docs/ci.md W24-R28): lookups of recorded work by layer (`leg`, …) and outcome
@@ -339,6 +342,7 @@ pub fn global() -> &'static Metrics {
         runner_net_dropped: GaugeVec::of_machines(&["runner", "lane", "reason"], 0),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
+        ci_refused_writes: CounterVec::new(&["what"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
         ci_rollup_lag: Gauge::default(),
         work_lookups: CounterVec::new(&["layer", "outcome"]),
@@ -1161,6 +1165,8 @@ pub fn render() -> String {
     m.ci_cache.render(&mut o, "kiln_ci_cache_total");
     help(&mut o, "kiln_ci_attempts_total", "counter", "CI leg attempts by conclusion and failure class.");
     m.ci_attempts.render(&mut o, "kiln_ci_attempts_total");
+    help(&mut o, "kiln_ci_refused_writes_total", "counter", "Runners' writes refused for naming a grant that isn't their leg's live one, by what they were.");
+    m.ci_refused_writes.render(&mut o, "kiln_ci_refused_writes_total");
     help(&mut o, "kiln_ci_wait_seconds_total", "counter", "Seconds CI legs waited, by wait reason.");
     m.ci_wait_seconds.render(&mut o, "kiln_ci_wait_seconds_total");
     scalar!("kiln_ci_rollup_lag_seconds", "gauge", "How far behind the CI insights rollups are.", m.ci_rollup_lag.get());
