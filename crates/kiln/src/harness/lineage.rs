@@ -293,6 +293,12 @@ fn manages(caller: &crate::authz::Caller) -> bool {
 
 /// How far `caller` reaches agent session `id`, as [`access_of`] has it.
 pub async fn access(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Access {
+    // Whoever sees every session acts on each, whoever's it is: the store isn't asked whose. Asked
+    // before every read of an agent's page, its waits were those reads' tail (goal 10, plan
+    // 01a1a87b2dae step 2: an agent's events, goals and info at p99 100 to 400 ms, its list 1 ms).
+    if sees_all(caller) {
+        return Access::Act;
+    }
     let mine = match caller.agent.as_deref() {
         Some(me) => crate::mcp::acts_for(hub, me).await,
         None => None,
