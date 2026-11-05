@@ -130,8 +130,10 @@ pub fn init() {
     let _ = PROFILE.set(profile::start());
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     let _ = hyper_rt::idle::when_cold(COLD_AFTER, give_back_thread_cache);
-    // Before anything opens a database: SQLite takes its allocator only before it's first used.
-    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    // Before anything opens a database: SQLite takes its allocator only before it's first used, and while no other
+    // thread uses it (sqlite3_config(3)), as at main's first line. Not in this crate's unit tests, which call this
+    // beside other tests' databases: g11_s5_sqlite_allocates_through_jemalloc gives it in a process of its own.
+    #[cfg(all(feature = "jemalloc", target_os = "linux", not(test)))]
     let _ = SQLITE.set(sqlite::through_jemalloc());
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
