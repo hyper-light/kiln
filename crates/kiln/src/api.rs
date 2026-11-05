@@ -6050,16 +6050,23 @@ fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
 /// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
+    // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
+    // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
+    // buffer), frames as each goes.
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
+        let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
         }
         return Ok(());
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
+    let mut held = crate::memory::SNAPSHOTS.hold(frames.iter().map(String::capacity).sum());
     for f in frames {
+        let n = f.capacity();
         tx.send(ws::text(f)).await?;
+        held.release(n);
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
