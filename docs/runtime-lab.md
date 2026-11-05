@@ -1335,6 +1335,11 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   - The scheduler takes its turns between the jobs it walks, and reads `file:` secrets on the blocking pool.
   - Conversation stores: the board's sample and `/metrics` on the compute pool. Host statuses: the runs a host
     hasn't taken picked out on the store's side, and their catch-up every minute however many events come.
+  - ci-verdicts: a lane's book is made on the compute pool in pieces, and its runs' results and marks and the
+    workspace's units there too; `refresh` works out its verdicts there, its reads, writes and messages where
+    they were.
+  - goal-stacks: the sessions are copied on the compute pool, its loops take turns, and keep-going's lookups are
+    sets.
 
 ### Step 3's check
 
