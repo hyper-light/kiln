@@ -48,7 +48,7 @@ pub struct Target {
 }
 
 /// The version of what's learned that this build reads as its own ([`Learned::version`]).
-pub const LEARNED_VERSION: u32 = 2;
+pub const LEARNED_VERSION: u32 = 3;
 
 /// What the engine learned, kept between runs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -60,6 +60,9 @@ pub struct Learned {
     /// kiln's budgets for good, and the Macs' had come down to 0.03 cores and 164 kB/s for all their
     /// agents together (2026-11-05), which stopped them. Before version 2, trouble with almost
     /// nothing of kiln's in use cut its budgets to almost nothing, and from zero they never rose.
+    /// Before version 3, kiln's CPU was cut for trouble whatever the CPU was doing (a Mac's agents
+    /// held to 1 core of 18, with 8 idle), and how long a cut takes to show was kept from trouble
+    /// that wasn't kiln's (45 minutes), which every raise of a budget waits out: both let go of.
     #[serde(default)]
     pub version: u32,
     pub detectors: BTreeMap<String, detect::Detector>,
@@ -103,6 +106,8 @@ struct Episode {
     write_bps: f64,
     /// kiln's CPU cores when it began.
     cpu_cores: f64,
+    /// Whether kiln's CPU was cut for it (the CPU was short).
+    cpu_cut: bool,
     share: Option<f64>,
     held: bool,
 }
@@ -118,8 +123,9 @@ impl Episode {
     /// kiln's. Its write budget at zero is that too: nothing of kiln's writes at all.
     fn cut_far(&self, write_bps: f64, cpu_cores: f64, write_budget: Option<f64>) -> bool {
         // Each cut to a quarter, or to the least a cut goes to.
+        // A CPU never cut for it (it wasn't short) is no part of the question.
         let far = |now: f64, then: f64, unit: knee::Unit| now * NOT_KILN_CUT <= then || now <= unit.least();
-        write_budget == Some(0.0) || (far(write_bps, self.write_bps, knee::Unit::Writes) && far(cpu_cores, self.cpu_cores, knee::Unit::Cpu))
+        write_budget == Some(0.0) || (far(write_bps, self.write_bps, knee::Unit::Writes) && (!self.cpu_cut || far(cpu_cores, self.cpu_cores, knee::Unit::Cpu)))
     }
 }
 
@@ -179,6 +185,10 @@ pub struct Observation {
     /// are held to them.
     #[serde(default)]
     pub cores: Option<f64>,
+    /// The machine's cores idle since the last look, all processes counted, where the system says:
+    /// with any idle, the CPU isn't short, and cutting kiln's CPU can't speed a target up.
+    #[serde(default)]
+    pub cpu_idle: Option<f64>,
 }
 
 /// What to do now.
@@ -259,9 +269,10 @@ impl Engine {
         let mut learned = learned;
         if learned.version < LEARNED_VERSION {
             // Budgets an older engine learned, which may have been cut for trouble that wasn't
-            // kiln's ([`Learned::version`]): let go of, and learned again. What runs take is kept.
-            learned.knee.regime();
-            learned.cpu_knee.regime();
+            // kiln's, and how long its cuts took to show ([`Learned::version`]): let go of, and
+            // learned again. What runs take is kept.
+            learned.knee = knee::Knee::default();
+            learned.cpu_knee = knee::Knee::default();
             learned.not_kiln = None;
             learned.version = LEARNED_VERSION;
         }
@@ -301,6 +312,16 @@ impl Engine {
 
     fn alarmed(&self) -> bool {
         self.learned.detectors.values().any(|d| d.alarm.is_some())
+    }
+
+    /// Whether the CPU is short now, so cutting kiln's CPU could speed a target up: no core of the
+    /// machine idle to within the pacer's step (a hundredth of its cores), all its processes
+    /// counted, or the system doesn't say; or a target in trouble measures how late work is
+    /// scheduled itself (one with a window of its own: the server's delay), which kiln's CPU
+    /// slows with cores to spare (docs/priority.md).
+    fn cpu_short(&self, o: &Observation) -> bool {
+        let scheduling = self.targets.iter().any(|t| t.window_us.is_some() && self.learned.detectors.get(&t.name).is_some_and(|d| d.alarm.is_some()));
+        scheduling || o.cpu_idle.zip(o.cores).is_none_or(|(idle, cores)| idle < cores / pace::SHARE_STEPS)
     }
 
     /// How long a level must hold calm to count as held: the slowest target's detection delay
@@ -474,13 +495,16 @@ impl Engine {
             // cutting it again can't help either: it isn't cut.
             let share = o.delivered_bps.filter(|d| *d > 0.0).map(|d| (ours_w / d).min(1.0));
             let held = self.learned.not_kiln.as_ref().is_some_and(|n| n.covers(ours_w, share));
-            self.episode = Some(Episode { before: (self.learned.knee.clone(), self.learned.cpu_knee.clone()), write_bps: ours_w, cpu_cores: ours_c, share, held });
+            let cpu_cut = !held && !disks_full && self.cpu_short(o);
+            self.episode = Some(Episode { before: (self.learned.knee.clone(), self.learned.cpu_knee.clone()), write_bps: ours_w, cpu_cores: ours_c, cpu_cut, share, held });
             if held {
                 events.push(format!("kiln's writes not cut: it writes {}{}, no more than when stopping its writers last didn't speed the probes up", Unit::Writes.fmt(ours_w), of_disks(share)));
             } else {
                 events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
-                if !disks_full {
+                if cpu_cut {
                     events.push(self.learned.cpu_knee.alarm(now, ours_c, None, Unit::Cpu));
+                } else if !disks_full && let Some(idle) = o.cpu_idle {
+                    events.push(format!("kiln's CPU not cut: {} idle, so the CPU isn't what's short", Unit::Cpu.fmt(idle)));
                 }
                 self.cut = Some((now, None));
             }
@@ -509,7 +533,7 @@ impl Engine {
             self.cut = None;
         } else if now_alarmed {
             let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes);
-            let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, None, worse, Unit::Cpu) };
+            let cut_c = if disks_full || !self.cpu_short(o) { None } else { self.learned.cpu_knee.persisting(now, ours_c, None, worse, Unit::Cpu) };
             if cut_w.is_some() || cut_c.is_some() {
                 self.cut = Some((now, None));
             }
@@ -654,7 +678,7 @@ mod tests {
     fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
         let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None }];
         let run = |lag: Option<f64>| {
-            let mut learned = Learned::default();
+            let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
             learned.knee.lag_us = lag;
             let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, targets.clone(), learned, 0);
             let mut every = BTreeMap::new();
@@ -996,8 +1020,42 @@ mod tests {
         Ok(())
     }
 
+    /// The Mac at 06:01 on 2026-11-05: its disk's probe slowed while its agents used 1 core and 8 of
+    /// its 18 sat idle, and kiln's CPU was cut to 1 core, which held five agents' builds, harnesses
+    /// and all, stopped most of the time. With the CPU idle, cutting kiln's can't speed the probe
+    /// up: the CPU isn't cut (its writes still are). With no core idle, it is.
+    #[test]
+    fn kilns_cpu_is_cut_only_when_the_cpu_is_short() -> anyhow::Result<()> {
+        let run = |idle: f64| {
+            let mut e = engine();
+            let at = |t: u64, us: f64| Observation {
+                now_us: t,
+                answers: vec![("disk".into(), Answer::Took(us))],
+                mem_free: 1e11,
+                running: vec![Group { cpu_cores: 6.0, ..group("a", 20e6, 1.0) }],
+                cores: Some(18.0),
+                cpu_idle: Some(idle),
+                ..Observation::default()
+            };
+            let mut t = 0;
+            for _ in 0..100 {
+                t += 1_000_000;
+                e.step(&at(t, 4_000.0));
+            }
+            t += 1_000_000;
+            e.step(&at(t, 1e6))
+        };
+        let p = run(8.0);
+        anyhow::ensure!(p.status.cpu_budget.is_none() && p.events.iter().any(|e| e.contains("CPU not cut")), "the CPU was cut with 8 cores idle: {:?}", p.events);
+        anyhow::ensure!(p.status.budget_bps.is_some(), "its writes are still cut: {:?}", p.events);
+        let p = run(0.0);
+        anyhow::ensure!(p.status.cpu_budget.is_some(), "with no core idle, kiln's CPU is cut: {:?}", p.events);
+        Ok(())
+    }
+
     /// Budgets an engine before [`LEARNED_VERSION`] learned are let go of as they're read (the
-    /// Macs' 0.03 cores and 164 kB/s), and how long a cut takes to show is kept.
+    /// Macs' 0.03 cores and 164 kB/s), and so is how long its cuts took to show (45 minutes, from
+    /// trouble that wasn't kiln's, which every raise waited out).
     #[test]
     fn budgets_an_older_engine_learned_are_let_go_of() {
         let mut old = Learned::default();
@@ -1008,7 +1066,7 @@ mod tests {
         old.not_kiln = Some(NotKiln { write_bps: 1.0, share: None });
         let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }], old, 0);
         assert_eq!((e.learned.knee.budget, e.learned.cpu_knee.budget, e.learned.cpu_knee.unsafe_at), (None, None, None));
-        assert_eq!((e.learned.knee.lag_us, e.learned.not_kiln.clone(), e.learned.version), (Some(2.7e9), None, LEARNED_VERSION));
+        assert_eq!((e.learned.knee.lag_us, e.learned.not_kiln.clone(), e.learned.version), (None, None, LEARNED_VERSION));
         // One this build learned is kept.
         let mut mine = Learned { version: LEARNED_VERSION, ..Learned::default() };
         mine.cpu_knee.budget = Some(3.0);
