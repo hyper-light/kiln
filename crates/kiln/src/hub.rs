@@ -2200,7 +2200,8 @@ impl Hub {
 
     /// A runner's message read whole off one of its lanes: what it carries read too
     /// (`crate::wire::payload_of`), then applied; or, when that can't be read, refused to it
-    /// (`Unread`) and noted.
+    /// (`Unread`) and noted. The tests' way in: a frame comes through `on_net` (`read_frame`).
+    #[cfg(test)]
     async fn on_runner_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
         self.on_carried(peer, crate::wire::payload_of(msg)).await
     }

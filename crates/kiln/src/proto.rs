@@ -1129,7 +1129,7 @@ mod tests {
         let index = encode(&AgentMsg::Convo { json: json.clone(), data: data.clone() })?;
         let tail = frame.split_off(1);
         anyhow::ensure!(index.ends_with(&tail), "the fields differ on the wire");
-        match read_agent(&index)? {
+        match read_agent(&index).map_err(|e| anyhow::anyhow!("{}", e.why("AgentMsg")))? {
             AgentMsg::Convo { json: j, data: d } => anyhow::ensure!(j == json && d == data, "read back as {j:?} {d:?}"),
             _ => anyhow::bail!("read back as another message"),
         }
