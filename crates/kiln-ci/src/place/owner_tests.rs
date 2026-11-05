@@ -452,6 +452,57 @@ fn p6_an_offer_is_held_its_timeout_less_its_round_trip() -> Result<(), String> {
     Ok(())
 }
 
+/// docs/needs.md §11, P6 at high load: a run every probed runner holds full is probed further,
+/// by data: at the runners whose latest published room fits it, and only those (d of them drawn
+/// when more do); none does, and it waits where it is.
+#[test]
+fn p6_both_full_widens_only_to_runners_hinting_room() -> Result<(), String> {
+    let full = |o: &mut Owner, run: &str| -> Result<(Vec<String>, Vec<Act>), String> {
+        let p = probes(&o.ask(ask(run, "linux,cpus=4")?, 0));
+        let mut acts = Vec::new();
+        for r in &p {
+            acts.extend(o.heard(r, waiting(run, short(Dim::Cpu, 0, 4000), 1, soon(10), res(0, 8)), 1));
+        }
+        Ok((p, acts))
+    };
+    // No hints: it waits at both, nothing more said to runners.
+    let mut o = Owner::seeded("me", 1, 3);
+    let _ = o.machines(linux_fleet(10));
+    let (_, acts) = full(&mut o, "a")?;
+    assert!(probes(&acts).is_empty(), "{acts:?}");
+    assert!(matches!(answer(&acts), Some(Answer::Queued { .. })));
+    // One runner hints room for 4 CPUs, one room for 2 only, one an older hint of room it has
+    // since said is gone: only the first is probed.
+    let mut o = Owner::seeded("me", 1, 3);
+    let _ = o.machines(linux_fleet(10));
+    let p = probes(&o.ask(ask("b", "linux,cpus=4")?, 0));
+    let others: Vec<String> = (0..10).map(|j| format!("r{j}")).filter(|r| !p.contains(r)).collect();
+    let (Some(roomy), Some(small), Some(stale)) = (others.first(), others.get(1), others.get(2)) else { return Err(format!("{others:?}")) };
+    o.hint(roomy, res(6, 16), 1);
+    o.hint(small, res(2, 16), 1);
+    o.hint(stale, res(0, 16), 2);
+    o.hint(stale, res(8, 16), 1);
+    let mut acts = Vec::new();
+    for r in &p {
+        acts.extend(o.heard(r, waiting("b", short(Dim::Cpu, 0, 4000), 1, soon(10), res(0, 8)), 1));
+    }
+    assert_eq!(probes_of(&acts, "b"), vec![roomy.clone()], "{acts:?}");
+    // It says it waits too: no runner left hinting room, it waits at the three.
+    let acts = o.heard(roomy, waiting("b", short(Dim::Cpu, 0, 4000), 1, soon(10), res(0, 8)), 2);
+    assert!(probes(&acts).is_empty(), "{acts:?}");
+    // Many hint room: two drawn among them, none of the rest.
+    let mut o = Owner::seeded("me", 1, 3);
+    let _ = o.machines(linux_fleet(10));
+    for j in 0..10 {
+        o.hint(&format!("r{j}"), res(8, 16), 1);
+    }
+    let (p, acts) = full(&mut o, "c")?;
+    let more = probes_of(&acts, "c");
+    assert_eq!(more.len(), 2, "{acts:?}");
+    assert!(more.iter().all(|r| !p.contains(r)));
+    Ok(())
+}
+
 mod props {
     use proptest::prelude::*;
 

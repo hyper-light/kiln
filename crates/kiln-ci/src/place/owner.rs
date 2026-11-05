@@ -14,7 +14,9 @@
 //!   of its own. Which runners suit an ask is worked out once per kind of ask while the directory
 //!   stands (Borg's equivalence classes, Verma et al., EuroSys 2015), so an ask costs O(d), not
 //!   O(N). A run is probed further, d more, only when every runner probed said never or its link
-//!   went down: one that says it waits keeps the run in its line, with news.
+//!   went down: one that says it waits keeps the run in its line, with news. When every runner
+//!   probed says it waits, d more are drawn among the runners whose published room ([`Owner::hint`],
+//!   the `offers` named feature) shows room for it, and only those: by data, not a count picked.
 //! - **Offered**: the first offer is held while the other runners probed answer, for at most the
 //!   offering link's retransmission timeout less its round trip (RFC 6298: the runner holds its
 //!   offer one RTO from when it sent it, so a take sent later than that, less the round trip,
@@ -54,7 +56,7 @@ use super::answer::{self, Answer, At, Count, Nearest};
 use super::ask::{Ask, Peer};
 use super::keys::{Fx, FxMap, Interner, SplitMix};
 use super::link::{Offset, Rtt};
-use super::msg::{Dim, Estimate, Place, Reason, ToOwner, ToRunner};
+use super::msg::{Dim, Down, Estimate, Place, Reason, ToOwner, ToRunner, Up};
 use crate::facts::RunnerFacts;
 use crate::sched::needs;
 use crate::sched::routing::{Constraint, Op};
@@ -126,6 +128,18 @@ pub enum Act {
     /// back, or it started again): it starts nothing twice, and answers that it ran, how it ended,
     /// or that the claim lapsed.
     Restart { run: String, runner: String, fence: Fence },
+}
+
+/// What the owner's shell is to do, by handle (docs/needs.md §11, AUDIT P6): runners by their
+/// handle here ([`Owner::runner_id`], [`Owner::runner_name`]), runs by their shared id, words to
+/// runners as [`Down`]. No names copied: [`Owner::act`] makes the wire's [`Act`] of it at the edge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cmd {
+    Tell { to: u32, run: Arc<str>, msg: Down },
+    Answer { run: Arc<str>, answer: Answer },
+    Go { run: Arc<str>, to: u32, fence: Fence },
+    Fallback { run: Arc<str>, runners: Vec<String> },
+    Restart { run: Arc<str>, to: u32, fence: Fence },
 }
 
 /// A runner's handle: its name interned.
@@ -220,7 +234,7 @@ fn suit_key(ask: &Ask) -> u64 {
 
 #[derive(Debug, Clone)]
 struct Ticket {
-    run: String,
+    run: Arc<str>,
     /// Shared by every probe of it.
     ask: Arc<Ask>,
     /// The runners it suits, as its answer counts them.
@@ -260,6 +274,15 @@ impl Ticket {
         self.stage == Stage::Waiting && !self.words.iter().any(|(_, w)| w.live())
     }
 
+    /// Every runner probed said it waits there, or can't take it: none offered, none passed, none
+    /// still to answer, one at least waiting.
+    fn full(&self) -> bool {
+        self.stage == Stage::Waiting
+            && self.offers.is_empty()
+            && self.words.iter().any(|(_, w)| matches!(w, Word::Waiting { .. }))
+            && self.words.iter().all(|(_, w)| matches!(w, Word::Waiting { .. } | Word::Never(_) | Word::Away))
+    }
+
     /// Waiting at fewer than [`PROBES`] runners that may yet start it (some were away as it was
     /// drawn).
     fn short(&self) -> bool {
@@ -271,6 +294,10 @@ impl Ticket {
 /// tickets with a word or a claim there.
 #[derive(Debug, Clone, Default)]
 struct Slot {
+    /// Its latest published room (the `offers` named feature): by its count, and what was free.
+    hint: Option<(u64, Resources)>,
+    /// Its place in `roomy`, while its hint shows room.
+    roomy_at: Option<u32>,
     machine: Option<Machine>,
     link: Link,
     at: BTreeSet<Tid>,
@@ -290,11 +317,15 @@ pub struct Owner {
     suits: FxMap<u64, Vec<Arc<Suit>>>,
     tickets: Vec<Option<Ticket>>,
     spare: Vec<Tid>,
-    by_run: FxMap<String, Tid>,
+    by_run: FxMap<Arc<str>, Tid>,
+    /// Each ticket slot's generation: a token names a ticket in one ([`Owner::token`]).
+    gens: Vec<u32>,
     /// First answers due, and choices due, by when.
     due: BTreeSet<(i64, Tid)>,
     choose: BTreeSet<(i64, Tid)>,
     draw: Vec<u32>,
+    /// The runners whose latest hint shows any room, in no order (each knows its place).
+    roomy: Vec<Rid>,
 }
 
 /// Why `m` could never run `ask` as asked, if that's known: a constraint it doesn't meet (in the
@@ -444,6 +475,19 @@ impl Owner {
         self.tickets.get_mut(ix(t)).and_then(Option::as_mut)
     }
 
+    /// Ticket `t`'s token: its slot and that slot's generation, never 0 (0 is no token).
+    fn token(&self, t: Tid) -> u64 {
+        let generation = self.gens.get(ix(t)).copied().unwrap_or(0);
+        (u64::from(generation).saturating_add(1) << 32) | u64::from(t)
+    }
+
+    /// The ticket a token names, if it still does.
+    fn by_token(&self, token: u64) -> Option<Tid> {
+        let t = u32::try_from(token & u64::from(u32::MAX)).ok()?;
+        let generation = u64::from(self.gens.get(ix(t)).copied().unwrap_or(0)).saturating_add(1);
+        (token >> 32 == generation && self.t(t).is_some()).then_some(t)
+    }
+
     /// What the link to `runner` measures now (its round trip, RFC 6298; its clock's offset,
     /// RFC 5905).
     pub fn link(&mut self, runner: &str, link: Link) {
@@ -461,9 +505,15 @@ impl Owner {
         Rtt::rto_of(self.rtt(r))
     }
 
-    /// How long an offer from `r` is held while the others probed answer: its link's timeout less
-    /// its round trip, so a take sent by then reaches the runner within the timeout it holds the
-    /// offer for (RFC 6298's variation term, `max(G, 4·RTTVAR)`; the initial second, unmeasured).
+    /// How long an offer from `r` is held while the others probed answer: its link's RTO less its
+    /// SRTT (RFC 6298 §2), which follows from both ends' clocks, not a number picked. The runner
+    /// holds an offer one RTO from when it sends it (`runner::Admission::offer`), by its own clock.
+    /// The offer reaches this node one way later, and a take sent at `hold` after that reaches the
+    /// runner a second way later: the take is in time when `one way + hold + one way <= RTO`, that
+    /// is `hold <= RTO − RTT`. The round trip's best estimate is SRTT, so `hold = RTO − SRTT =
+    /// max(G, 4·RTTVAR)`: the variation term RFC 6298 adds for a late answer is the time left to
+    /// wait. Unmeasured, SRTT is unknown and taken as 0, leaving the initial RTO (§2.1, 1 s) at both
+    /// ends.
     fn hold(&self, r: Rid) -> Ms {
         self.rto(r).saturating_sub(self.rtt(r).map_or(0, |x| x.srtt))
     }
@@ -550,6 +600,9 @@ impl Owner {
             self.choose.remove(&(c, t));
         }
         self.by_run.remove(&tk.run);
+        if let Some(g) = self.gens.get_mut(ix(t)) {
+            *g = g.wrapping_add(1);
+        }
         self.spare.push(t);
         Some(tk)
     }
@@ -588,15 +641,16 @@ impl Owner {
     }
 
     /// Probes the ticket at `r`, its ask shared.
-    fn probe_at(&mut self, t: Tid, r: Rid, out: &mut Vec<Act>) {
-        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return };
+    fn probe_at(&mut self, t: Tid, r: Rid, out: &mut Vec<Cmd>) {
+        let Some((ask, run)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.run))) else { return };
         self.set_word(t, r, Word::Asked);
-        out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Probe { ask } });
+        let token = self.token(t);
+        out.push(Cmd::Tell { to: r, run, msg: Down::Probe { ask, token } });
     }
 
     /// Probes `t` at up to [`PROBES`] more runners, drawn at random among those that suit it now,
     /// are linked and haven't been probed: how many.
-    fn widen(&mut self, t: Tid, out: &mut Vec<Act>) -> usize {
+    fn widen(&mut self, t: Tid, out: &mut Vec<Cmd>) -> usize {
         let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return 0 };
         let suit = self.suit(&ask);
         let Some(tk) = self.t(t) else { return 0 };
@@ -614,23 +668,23 @@ impl Owner {
 
     /// Withdraws every probe of `t` but at `keep` and the runners that said never; an offer held
     /// is declined.
-    fn withdraw_others(&mut self, t: Tid, keep: Option<Rid>, out: &mut Vec<Act>) {
+    fn withdraw_others(&mut self, t: Tid, keep: Option<Rid>, out: &mut Vec<Cmd>) {
         let Some(tk) = self.t(t) else { return };
         let run = tk.run.clone();
         let others: Vec<(Rid, Option<Fence>)> = tk.words.iter().filter(|(r, w)| Some(*r) != keep && !matches!(w, Word::Never(_))).map(|(r, _)| (*r, tk.offer_of(*r))).collect();
         for (r, offer) in others {
             self.drop_word(t, r);
             let msg = match offer {
-                Some(fence) => ToRunner::Decline { run: run.clone(), fence },
-                None => ToRunner::Withdraw { run: run.clone() },
+                Some(fence) => Down::Decline { fence },
+                None => Down::Withdraw,
             };
-            out.push(Act::Tell { runner: self.name(r), msg });
+            out.push(Cmd::Tell { to: r, run: Arc::clone(&run), msg });
         }
     }
 
     /// Probes a ticket afresh (after a claim lapsed or its runner went): its words but the nevers
     /// dropped, then [`PROBES`] runners drawn again.
-    fn probe_afresh(&mut self, t: Tid, out: &mut Vec<Act>) {
+    fn probe_afresh(&mut self, t: Tid, out: &mut Vec<Cmd>) {
         let Some(tk) = self.t(t) else { return };
         let stale: Vec<Rid> = tk.words.iter().filter(|(_, w)| !matches!(w, Word::Never(_))).map(|(r, _)| *r).collect();
         for r in stale {
@@ -641,7 +695,7 @@ impl Owner {
 
     /// Probes again each runner passed over for one sure to finish sooner (what's known of the
     /// others changed): news, never a timer, decides when.
-    fn unpass(&mut self, t: Tid, out: &mut Vec<Act>) {
+    fn unpass(&mut self, t: Tid, out: &mut Vec<Cmd>) {
         let passed: Vec<Rid> = self.t(t).map(|tk| tk.words.iter().filter(|(_, w)| *w == Word::Passed).map(|(r, _)| *r).collect()).unwrap_or_default();
         for r in passed {
             if self.connected(r) {
@@ -705,7 +759,7 @@ impl Owner {
     }
 
     /// Tells the asker `answer`, if it isn't what it was told last (only real changes are news).
-    fn tell(&mut self, t: Tid, answer: Answer, out: &mut Vec<Act>) {
+    fn tell(&mut self, t: Tid, answer: Answer, out: &mut Vec<Cmd>) {
         let Some(tk) = self.t_mut(t) else { return };
         if tk.told.as_ref() == Some(&answer) {
             return;
@@ -716,12 +770,12 @@ impl Owner {
         }
         tk.told = Some(answer.clone());
         let run = tk.run.clone();
-        out.push(Act::Answer { run, answer });
+        out.push(Cmd::Answer { run, answer });
     }
 
     /// Tells a waiting ticket's asker where it stands now: its first answer, or news. Not while
     /// it holds offers: it's choosing, and its next answer is where it starts.
-    fn answer(&mut self, t: Tid, out: &mut Vec<Act>) {
+    fn answer(&mut self, t: Tid, out: &mut Vec<Cmd>) {
         let Some(tk) = self.t(t) else { return };
         if tk.stage != Stage::Waiting || !tk.offers.is_empty() {
             return;
@@ -742,7 +796,7 @@ impl Owner {
 
     /// A ticket's runner's word changed what's known of it: its first answer once every runner
     /// probed has answered, news after.
-    fn heard_of(&mut self, t: Tid, out: &mut Vec<Act>) {
+    fn heard_of(&mut self, t: Tid, out: &mut Vec<Cmd>) {
         let pending = self.t(t).is_some_and(|tk| tk.due.is_some());
         if !pending || self.all_answered(t) {
             self.answer(t, out);
@@ -752,7 +806,7 @@ impl Owner {
     /// What follows a word on a waiting ticket: the choice, once every runner probed has answered
     /// and an offer is held; more runners probed, once none probed may yet start it; and the
     /// asker told.
-    fn settle(&mut self, t: Tid, now: i64, out: &mut Vec<Act>) {
+    fn settle(&mut self, t: Tid, now: i64, out: &mut Vec<Cmd>) {
         let Some(tk) = self.t(t) else { return };
         if tk.stage == Stage::Waiting && !tk.offers.is_empty() && self.all_answered(t) {
             self.choose_now(t, now, out);
@@ -760,8 +814,45 @@ impl Owner {
         }
         if tk.hungry() {
             self.widen(t, out);
+        } else if tk.full() {
+            self.widen_by_hints(t, out);
         }
         self.heard_of(t, out);
+    }
+
+    /// Every runner probed for `t` said it waits there (and none offered or is still to answer):
+    /// it's probed at up to [`PROBES`] more, drawn at random among the runners whose latest hint
+    /// shows room for it, and only those; none does, it waits where it is. Drawn at random, not the
+    /// emptiest by hint: hints are old by the time they're read, and owners reading the same ones
+    /// would all go to the same runner (Mitzenmacher, "How useful is old information?", IEEE TPDS
+    /// 2000: with stale load information, choices at random among the few do better than the least
+    /// loaded).
+    fn widen_by_hints(&mut self, t: Tid, out: &mut Vec<Cmd>) -> usize {
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return 0 };
+        let suit = self.suit(&ask);
+        let q = super::ask::amounts(&ask.needs.request);
+        // A partial Fisher–Yates over the runners hinting room: each drawn at random, looked at
+        // once, until d fit (O(d / the share that fits): O(d) when most do, all of them only when
+        // few do).
+        let mut picked: Vec<Rid> = Vec::new();
+        let n = self.roomy.len();
+        let mut i = 0;
+        while i < n && picked.len() < PROBES as usize {
+            let left = u32::try_from(n.saturating_sub(i)).unwrap_or(u32::MAX);
+            let j = i.saturating_add(ix(self.rng.below(left)));
+            self.roomy_swap(i, j);
+            if let Some(&r) = self.roomy.get(i) {
+                let fits = self.slots.get(ix(r)).and_then(|s| s.hint).is_some_and(|(_, free)| super::ask::fits(&q, &super::ask::amounts(&free)));
+                if fits && suit.live.binary_search(&r).is_ok() && self.t(t).is_some_and(|tk| tk.word(r).is_none()) {
+                    picked.push(r);
+                }
+            }
+            i += 1;
+        }
+        for r in &picked {
+            self.probe_at(t, *r, out);
+        }
+        picked.len()
     }
 
     /// The older runners the shell's pick could start `ask` on now: suited to it, linked, and idle
@@ -775,7 +866,7 @@ impl Owner {
 
     /// A waiting ticket that no runner that places offered goes to an older runner idle enough for
     /// it, if there's one (a rolling upgrade: placed as before placement rather than waiting).
-    fn try_older_for(&mut self, t: Tid, out: &mut Vec<Act>) {
+    fn try_older_for(&mut self, t: Tid, out: &mut Vec<Cmd>) {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::SkipOlder) {
             return;
@@ -788,14 +879,14 @@ impl Owner {
         self.fallback(t, older, out);
     }
 
-    fn fallback(&mut self, t: Tid, runners: Vec<String>, out: &mut Vec<Act>) {
+    fn fallback(&mut self, t: Tid, runners: Vec<String>, out: &mut Vec<Cmd>) {
         if runners.is_empty() {
             return;
         }
         let Some(tk) = self.t_mut(t) else { return };
         tk.stage = Stage::Fallback;
         let run = tk.run.clone();
-        out.push(Act::Fallback { run, runners });
+        out.push(Cmd::Fallback { run, runners });
     }
 
     /// Never: what no runner meets, and the runner nearest to it.
@@ -854,7 +945,7 @@ impl Owner {
 
     /// Takes the best offer held and declines the others (one each, at most d − 1); the probes
     /// still out are withdrawn.
-    fn choose_now(&mut self, t: Tid, now: i64, out: &mut Vec<Act>) {
+    fn choose_now(&mut self, t: Tid, now: i64, out: &mut Vec<Cmd>) {
         let _ = now;
         let Some(best) = self.t(t).and_then(|tk| self.best(tk)) else { return };
         let Some(tk) = self.t_mut(t) else { return };
@@ -863,7 +954,7 @@ impl Owner {
         tk.got = Some((best.got, best.free));
         tk.offers.retain(|o| o.runner != best.runner);
         let run = tk.run.clone();
-        out.push(Act::Tell { runner: self.name(best.runner), msg: ToRunner::Take { run, fence: best.fence } });
+        out.push(Cmd::Tell { to: best.runner, run, msg: Down::Take { fence: best.fence } });
         self.withdraw_others(t, Some(best.runner), out);
         if let Some(tk) = self.t_mut(t) {
             tk.offers.clear();
@@ -882,8 +973,7 @@ impl Owner {
     /// link went down is waited for; back, what it may have missed is said again. One new, or newly
     /// placing, is probed with each waiting run it could take (idle runners take waiting work), and
     /// an older one newly idle is tried for waiting runs no runner that places offered.
-    pub fn machines(&mut self, ms: Vec<Machine>) -> Vec<Act> {
-        let mut out = Vec::new();
+    pub fn machines_c(&mut self, ms: Vec<Machine>, out: &mut Vec<Cmd>) {
         let old: BTreeMap<String, (Rid, Machine)> = self.present.iter().filter_map(|r| self.slots.get_mut(ix(*r)).and_then(|s| s.machine.take()).map(|m| (m.name.clone(), (*r, m)))).collect();
         let mut new: BTreeMap<String, Rid> = BTreeMap::new();
         for m in ms {
@@ -904,10 +994,16 @@ impl Owner {
                 Some(_) => Change::Same,
             };
             match change {
-                Change::Gone => self.gone(*r, &mut out),
-                Change::Restarted => self.restarted(*r, &mut out),
-                Change::Away => self.went_away(*r, &mut out),
-                Change::Back => self.came_back(*r, &mut out),
+                Change::Gone => {
+                    self.unhint(*r);
+                    self.gone(*r, out);
+                }
+                Change::Restarted => {
+                    self.unhint(*r);
+                    self.restarted(*r, out);
+                }
+                Change::Away => self.went_away(*r, out),
+                Change::Back => self.came_back(*r, out),
                 Change::Same => {}
             }
         }
@@ -927,11 +1023,11 @@ impl Owner {
                             tk.gone.retain(|(g, _)| g != r);
                         }
                         if *connected {
-                            self.probe_at(t, *r, &mut out);
+                            self.probe_at(t, *r, out);
                         } else {
                             self.set_word(t, *r, Word::Away);
                         }
-                        self.heard_of(t, &mut out);
+                        self.heard_of(t, out);
                     }
                 }
             }
@@ -939,9 +1035,8 @@ impl Owner {
         // An older runner new, back, or idle otherwise than it was: waiting runs are tried there.
         let older = self.present.iter().filter_map(|r| self.machine(*r)).any(|m| !m.places && old.get(&m.name).is_none_or(|(_, o)| o.places || o.idle != m.idle || o.connected != m.connected));
         if older {
-            self.retry_older(&mut out);
+            self.retry_older(out);
         }
-        out
     }
 
     /// The tickets waiting, in order.
@@ -950,7 +1045,7 @@ impl Owner {
     }
 
     /// Each waiting run no runner that places has offered, tried on the older runners again.
-    fn retry_older(&mut self, out: &mut Vec<Act>) {
+    fn retry_older(&mut self, out: &mut Vec<Cmd>) {
         let waiting: Vec<Tid> = self.waiting().into_iter().filter(|t| self.t(*t).is_some_and(|tk| tk.due.is_none())).collect();
         for t in waiting {
             self.try_older_for(t, out);
@@ -972,13 +1067,13 @@ impl Owner {
     }
 
     /// `r` is gone from the directory: what it held ends.
-    fn gone(&mut self, r: Rid, out: &mut Vec<Act>) {
+    fn gone(&mut self, r: Rid, out: &mut Vec<Cmd>) {
         for t in self.runs_at(r) {
             let Some((stage, here, _)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Starting { .. } | Stage::Running { .. } if here => {
                     if let Some(tk) = self.remove(t) {
-                        out.push(Act::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() } });
+                        out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() } });
                     }
                 }
                 Stage::Taking { .. } | Stage::Held { .. } if here => {
@@ -1003,19 +1098,19 @@ impl Owner {
     /// `r` started again under a new epoch: its claims of the old one end; a start sent to it is
     /// said again, for the record on its disk to answer (it ran, how it ended, or the claim
     /// lapsed); a run there under the old epoch is lost; its probes are made again.
-    fn restarted(&mut self, r: Rid, out: &mut Vec<Act>) {
+    fn restarted(&mut self, r: Rid, out: &mut Vec<Cmd>) {
         let connected = self.connected(r);
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Running { .. } if here => {
                     if let Some(tk) = self.remove(t) {
-                        out.push(Act::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "started again under a new epoch as the run ran there: it isn't started again".into() } });
+                        out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "started again under a new epoch as the run ran there: it isn't started again".into() } });
                     }
                 }
                 Stage::Starting { fence } if here => {
                     if connected && let Some(run) = self.t(t).map(|tk| tk.run.clone()) {
-                        out.push(Act::Restart { run, runner: self.name(r), fence });
+                        out.push(Cmd::Restart { run, to: r, fence });
                     }
                 }
                 Stage::Taking { .. } | Stage::Held { .. } if here => {
@@ -1041,7 +1136,7 @@ impl Owner {
 
     /// The link to `r` went down: it's still there, and what it holds waits for it. An offer held
     /// from it lapses there.
-    fn went_away(&mut self, r: Rid, out: &mut Vec<Act>) {
+    fn went_away(&mut self, r: Rid, out: &mut Vec<Cmd>) {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::LostOnDisconnect) {
             self.gone(r, out);
@@ -1073,7 +1168,7 @@ impl Owner {
     /// (answered as it stands), a take not yet held, and a start (said again, it starts nothing
     /// twice). A waiting ticket probed at fewer than [`PROBES`] runners that may yet start it (they
     /// were away, or said never) is probed there.
-    fn came_back(&mut self, r: Rid, out: &mut Vec<Act>) {
+    fn came_back(&mut self, r: Rid, out: &mut Vec<Cmd>) {
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             let Some(run) = self.t(t).map(|tk| tk.run.clone()) else { continue };
@@ -1082,8 +1177,8 @@ impl Owner {
                     self.probe_at(t, r, out);
                     self.heard_of(t, out);
                 }
-                Stage::Taking { fence } if here => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Take { run, fence } }),
-                Stage::Starting { fence } if here => out.push(Act::Restart { run, runner: self.name(r), fence }),
+                Stage::Taking { fence } if here => out.push(Cmd::Tell { to: r, run, msg: Down::Take { fence } }),
+                Stage::Starting { fence } if here => out.push(Cmd::Restart { run, to: r, fence }),
                 _ => {}
             }
         }
@@ -1095,56 +1190,111 @@ impl Owner {
         }
     }
 
+    /// `runner`'s published room (the `offers` named feature, docs/needs.md §11): what it had
+    /// free as it said so, `seq` its own count of what it published (one not later than the last
+    /// is ignored). A hint, never a claim: only an offer holds room. Read when a run's probed
+    /// runners all say it waits ([`PROBES`] more are drawn among those hinting room for it).
+    pub fn hint(&mut self, runner: &str, free: Resources, seq: u64) {
+        let r = self.rid(runner);
+        self.hint_c(r, free, seq);
+    }
+
+    /// [`Self::hint`], by handle.
+    pub fn hint_c(&mut self, r: u32, free: Resources, seq: u64) {
+        while self.slots.len() <= ix(r) {
+            self.slots.push(Slot::default());
+        }
+        let Some(s) = self.slots.get_mut(ix(r)) else { return };
+        if s.hint.is_some_and(|(last, _)| last >= seq) {
+            return;
+        }
+        s.hint = Some((seq, free));
+        let room = super::ask::amounts(&free).iter().any(|a| *a > 0);
+        match (room, s.roomy_at) {
+            (true, None) => {
+                s.roomy_at = u32::try_from(self.roomy.len()).ok();
+                self.roomy.push(r);
+            }
+            (false, Some(_)) => self.unroomy(r),
+            _ => {}
+        }
+    }
+
+    /// `r` no longer hints room: out of `roomy`, the last in its place (O(1)).
+    fn unroomy(&mut self, r: Rid) {
+        let Some(at) = self.slots.get_mut(ix(r)).and_then(|s| s.roomy_at.take()) else { return };
+        self.roomy.swap_remove(ix(at));
+        if let Some(&moved) = self.roomy.get(ix(at))
+            && let Some(s) = self.slots.get_mut(ix(moved))
+        {
+            s.roomy_at = Some(at);
+        }
+    }
+
+    fn roomy_swap(&mut self, i: usize, j: usize) {
+        self.roomy.swap(i, j);
+        for k in [i, j] {
+            if let Some(&r) = self.roomy.get(k)
+                && let Some(s) = self.slots.get_mut(ix(r))
+            {
+                s.roomy_at = u32::try_from(k).ok();
+            }
+        }
+    }
+
+    /// A runner's hint is no longer its own (it's gone, or started again).
+    fn unhint(&mut self, r: Rid) {
+        if let Some(s) = self.slots.get_mut(ix(r)) {
+            s.hint = None;
+        }
+        self.unroomy(r);
+    }
+
     /// The link to `runner` went down (the shell's word, between directories).
-    pub fn away(&mut self, runner: &str) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(r) = self.names.get(runner) else { return out };
+    pub fn away_c(&mut self, runner: &str, out: &mut Vec<Cmd>) {
+        let Some(r) = self.names.get(runner) else { return };
         if let Some(m) = self.slots.get_mut(ix(r)).and_then(|s| s.machine.as_mut())
             && m.connected
         {
             m.connected = false;
             self.redraw();
-            self.went_away(r, &mut out);
+            self.went_away(r, out);
         }
-        out
     }
 
     /// The link to `runner` is back (the shell's word, between directories).
-    pub fn back(&mut self, runner: &str) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(r) = self.names.get(runner) else { return out };
+    pub fn back_c(&mut self, runner: &str, out: &mut Vec<Cmd>) {
+        let Some(r) = self.names.get(runner) else { return };
         if let Some(m) = self.slots.get_mut(ix(r)).and_then(|s| s.machine.as_mut())
             && !m.connected
         {
             m.connected = true;
             let older = !m.places;
             self.redraw();
-            self.came_back(r, &mut out);
+            self.came_back(r, out);
             if older {
-                self.retry_older(&mut out);
+                self.retry_older(out);
             }
         }
-        out
     }
 
     /// A run is asked of this node: answered never at once if no runner could run it even idle,
     /// handed to the older pick if only older runners could, else probed at [`PROBES`] runners
     /// drawn among those that could, are linked and place; its first answer comes once each has
     /// answered, or by the last of their links' timeouts.
-    pub fn ask(&mut self, ask: Ask, now: i64) -> Vec<Act> {
-        let mut out = Vec::new();
-        if self.by_run.contains_key(&ask.run) {
-            return out;
+    pub fn ask_c(&mut self, ask: Ask, now: i64, out: &mut Vec<Cmd>) {
+        if self.by_run.contains_key(ask.run.as_str()) {
+            return;
         }
         let suit = self.suit(&ask);
         if suit.live.is_empty() && suit.away.is_empty() && suit.older.is_empty() {
             let run = ask.run.clone();
-            out.push(Act::Answer { run, answer: self.never(&ask) });
-            return out;
+            out.push(Cmd::Answer { run: Arc::from(run.as_str()), answer: self.never(&ask) });
+            return;
         }
-        let run = ask.run.clone();
+        let run: Arc<str> = Arc::from(ask.run.as_str());
         let tk = Ticket {
-            run: run.clone(),
+            run: Arc::clone(&run),
             ask: Arc::new(ask),
             suit: Arc::clone(&suit),
             stage: Stage::Waiting,
@@ -1174,8 +1324,8 @@ impl Owner {
         self.by_run.insert(run, t);
         if suit.live.is_empty() && suit.away.is_empty() {
             let older = suit.older.iter().map(|r| self.name(*r)).collect();
-            self.fallback(t, older, &mut out);
-            return out;
+            self.fallback(t, older, out);
+            return;
         }
         let n = u32::try_from(suit.live.len()).unwrap_or(u32::MAX);
         let mut draw = std::mem::take(&mut self.draw);
@@ -1183,7 +1333,7 @@ impl Owner {
         let mut due: Option<i64> = None;
         for i in &draw {
             let Some(r) = suit.live.get(ix(*i)).copied() else { continue };
-            self.probe_at(t, r, &mut out);
+            self.probe_at(t, r, out);
             let at = later(now, self.rto(r));
             due = Some(due.map_or(at, |d| d.max(at)));
         }
@@ -1196,28 +1346,30 @@ impl Owner {
                 self.due.insert((d, t));
             }
             // Only runners whose link is down could take it: answered so now.
-            None => self.answer(t, &mut out),
+            None => self.answer(t, out),
         }
-        out
     }
 
-    /// A runner's word about a run.
-    pub fn heard(&mut self, runner: &str, msg: ToOwner, now: i64) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(t) = self.by_run.get(msg.run()).copied() else {
+    /// Runner `r`'s word about a run, by handle: the run by the token this owner gave it (0: none,
+    /// found by its id), as the in-process path carries it ([`super::runner::Reply`]).
+    pub fn heard_c(&mut self, r: u32, token: u64, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
+        let found = if token == 0 { None } else { self.by_token(token) };
+        let Some(t) = found.or_else(|| self.by_run.get(run_id.as_ref()).copied()) else {
             // Its ticket is gone (ended, cancelled, answered never): an offer's room goes back, a
             // probe still waiting there is withdrawn, and an end is acknowledged. O(1).
-            let runner = runner.to_owned();
+            let run = Arc::clone(run_id);
             match msg {
-                ToOwner::Offer { run, fence, .. } | ToOwner::Held { run, fence } => out.push(Act::Tell { runner, msg: ToRunner::Decline { run, fence } }),
-                ToOwner::Waiting { run, .. } => out.push(Act::Tell { runner, msg: ToRunner::Withdraw { run } }),
-                ToOwner::Ended { run, .. } => out.push(Act::Tell { runner, msg: ToRunner::Ack { run } }),
+                Up::Offer { fence, .. } | Up::Held { fence } => out.push(Cmd::Tell { to: r, run, msg: Down::Decline { fence } }),
+                Up::Waiting { .. } => out.push(Cmd::Tell { to: r, run, msg: Down::Withdraw }),
+                Up::Ended { .. } => out.push(Cmd::Tell { to: r, run, msg: Down::Ack }),
                 _ => {}
             }
-            return out;
+            return;
         };
-        let r = self.rid(runner);
-        let Some(tk) = self.t(t) else { return out };
+        while self.slots.len() <= ix(r) {
+            self.slots.push(Slot::default());
+        }
+        let Some(tk) = self.t(t) else { return };
         let stage = tk.stage;
         let here = tk.runner == Some(r);
         let probed = tk.word(r).is_some();
@@ -1226,22 +1378,22 @@ impl Owner {
         #[cfg(test)]
         let second = tk.second.is_some_and(|(s, _)| s == r);
         match msg {
-            ToOwner::Offer { fence, got: g, free, predicted, .. } => match stage {
+            Up::Offer { fence, got: g, free, predicted, .. } => match stage {
                 Stage::Waiting => {
                     if self.sooner_elsewhere(t, r, predicted, now) {
                         // Another runner is sure to finish it sooner: this one's room goes back, and
                         // it's probed again when what's known of the others changes.
                         self.unhold(t, r);
-                        out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } });
+                        out.push(Cmd::Tell { to: r, run, msg: Down::Decline { fence } });
                         self.set_word(t, r, Word::Passed);
-                        self.heard_of(t, &mut out);
-                        return out;
+                        self.heard_of(t, out);
+                        return;
                     }
                     if self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
-                        return out;
+                        return;
                     }
                     let at = later(now, self.hold(r));
-                    let Some(tk) = self.t_mut(t) else { return out };
+                    let Some(tk) = self.t_mut(t) else { return };
                     tk.offers.retain(|o| o.runner != r);
                     tk.offers.push(Offer { runner: r, fence, got: g, free });
                     // The first offer starts the hold.
@@ -1253,7 +1405,7 @@ impl Owner {
                     // Its next answer is where it starts, or, the offers lapsing, where it waits.
                     self.undue(t);
                     if self.all_answered(t) {
-                        self.choose_now(t, now, &mut out);
+                        self.choose_now(t, now, out);
                     }
                 }
                 // An older runner is being tried: the offer lapses back into that runner's line.
@@ -1264,25 +1416,25 @@ impl Owner {
                     if let Some(tk) = self.t_mut(t) {
                         tk.second = Some((r, fence));
                     }
-                    out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Take { run, fence } });
+                    out.push(Cmd::Tell { to: r, run, msg: Down::Take { fence } });
                 }
-                _ => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } }),
+                _ => out.push(Cmd::Tell { to: r, run, msg: Down::Decline { fence } }),
             },
-            ToOwner::Held { fence, .. } => match stage {
+            Up::Held { fence } => match stage {
                 Stage::Taking { fence: f } if f == fence && here => {
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Held { fence };
                     }
                     let name = self.name(r);
-                    out.push(Act::Go { run, runner: name.clone(), fence });
+                    out.push(Cmd::Go { run, to: r, fence });
                     let (g, free) = got.unwrap_or_default();
                     #[cfg(test)]
                     if super::mutant() == Some(super::Mutant::StartedAtHeld) {
-                        self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
-                        return out;
+                        self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, out);
+                        return;
                     }
                     let _ = free;
-                    self.tell(t, Answer::Starting { runner: name, got: g }, &mut out);
+                    self.tell(t, Answer::Starting { runner: name, got: g }, out);
                 }
                 Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence && here => {}
                 #[cfg(test)]
@@ -1292,105 +1444,104 @@ impl Owner {
                         tk.stage = Stage::Held { fence };
                         tk.runner = Some(r);
                     }
-                    out.push(Act::Go { run, runner: self.name(r), fence });
+                    out.push(Cmd::Go { run, to: r, fence });
                 }
-                _ => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } }),
+                _ => out.push(Cmd::Tell { to: r, run, msg: Down::Decline { fence } }),
             },
             // The runner's word that the process started: the one on which the asker is told so.
-            ToOwner::Started { fence, .. } => {
+            Up::Started { fence } => {
                 if matches!(stage, Stage::Starting { fence: f } | Stage::Held { fence: f } if f == fence) && here {
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Running { fence: Some(fence) };
                     }
                     let (g, free) = got.unwrap_or_default();
-                    self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
+                    self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, out);
                 }
             }
             // It started there before: it runs there, and nowhere else.
-            ToOwner::Ran { .. } => {
+            Up::Ran => {
                 if matches!(stage, Stage::Running { .. }) {
-                    return out;
+                    return;
                 }
                 if let (Stage::Taking { fence } | Stage::Held { fence }, false) = (stage, here)
                     && let Some(w) = self.t(t).and_then(|tk| tk.runner)
                 {
                     self.drop_word(t, w);
-                    out.push(Act::Tell { runner: self.name(w), msg: ToRunner::Decline { run: run.clone(), fence } });
+                    out.push(Cmd::Tell { to: w, run: Arc::clone(&run), msg: Down::Decline { fence } });
                 }
                 if let Some(tk) = self.t_mut(t) {
                     tk.stage = Stage::Running { fence: None };
                     tk.runner = Some(r);
                 }
                 self.unhold(t, r);
-                self.withdraw_others(t, Some(r), &mut out);
+                self.withdraw_others(t, Some(r), out);
                 self.set_word(t, r, Word::Offered);
                 self.undue(t);
                 let (g, free) = got.unwrap_or_default();
-                self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("it started there before ({} free as it was offered)", words(&free)) }, &mut out);
+                self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("it started there before ({} free as it was offered)", words(&free)) }, out);
             }
-            ToOwner::Ended { ok, .. } => {
-                self.withdraw_others(t, Some(r), &mut out);
+            Up::Ended { ok, .. } => {
+                self.withdraw_others(t, Some(r), out);
                 self.remove(t);
-                out.push(Act::Answer { run: run.clone(), answer: Answer::Ended { runner: self.name(r), ok } });
-                out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Ack { run } });
+                out.push(Cmd::Answer { run: Arc::clone(&run), answer: Answer::Ended { runner: self.name(r), ok } });
+                out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }
-            ToOwner::Waiting { reason, place, start, predicted, free, .. } => {
+            Up::Waiting { reason, place, start, predicted, free } => {
                 if stage == Stage::Waiting && probed {
                     // An offer held from it lapsed back into its line.
                     self.unhold(t, r);
                     self.set_word(t, r, Word::Waiting { reason, place, start, predicted, free });
-                    self.unpass(t, &mut out);
-                    self.settle(t, now, &mut out);
+                    self.unpass(t, out);
+                    self.settle(t, now, out);
                 }
             }
-            ToOwner::Never { why, .. } => {
+            Up::Never { why } => {
                 if probed {
                     self.unhold(t, r);
                     self.set_word(t, r, Word::Never(why));
                 }
                 if stage != Stage::Waiting {
-                    return out;
+                    return;
                 }
                 if self.t(t).is_some_and(Ticket::hungry) {
-                    self.widen(t, &mut out);
+                    self.widen(t, out);
                 }
                 // Every runner that places and suits it said never: older ones, or never.
-                let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return out };
+                let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return };
                 let suit = self.suit(&ask);
                 let all_never = self.t(t).is_some_and(|tk| !tk.words.is_empty() && tk.words.iter().all(|(_, w)| matches!(w, Word::Never(_))) && suit.live.iter().chain(&suit.away).all(|r| tk.word(*r).is_some()));
                 if all_never && !suit.older.is_empty() {
                     let older = suit.older.iter().map(|r| self.name(*r)).collect();
-                    self.fallback(t, older, &mut out);
+                    self.fallback(t, older, out);
                 } else if all_never {
-                    let Some(tk) = self.remove(t) else { return out };
+                    let Some(tk) = self.remove(t) else { return };
                     let need = tk.words.iter().filter_map(|(_, w)| if let Word::Never(why) = w { Some(why.clone()) } else { None }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("; ");
                     let nearest = match self.never(&tk.ask) {
                         Answer::Never { nearest, .. } => nearest,
                         _ => None,
                     };
-                    out.push(Act::Answer { run, answer: Answer::Never { need: format!("takes it as asked ({need})"), nearest } });
+                    out.push(Cmd::Answer { run, answer: Answer::Never { need: format!("takes it as asked ({need})"), nearest } });
                 } else {
-                    self.unpass(t, &mut out);
-                    self.settle(t, now, &mut out);
+                    self.unpass(t, out);
+                    self.settle(t, now, out);
                 }
             }
             // The runner's word that the claim isn't live there and the run wasn't started under
             // it: the one word that sends a ticket past waiting back to waiting. The asker, told it
             // was starting there, is told where it stands instead. An offer held lapsed: it waits
             // there again, its place told next.
-            ToOwner::Lapsed { fence, .. } => {
+            Up::Lapsed { fence, .. } => {
                 if stage == Stage::Waiting && self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
                     self.unhold(t, r);
                     self.set_word(t, r, Word::Asked);
-                    self.settle(t, now, &mut out);
+                    self.settle(t, now, out);
                 } else if matches!(stage, Stage::Taking { fence: f } | Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence) && here {
                     self.back_to_waiting(t);
-                    self.probe_afresh(t, &mut out);
-                    self.answer(t, &mut out);
+                    self.probe_afresh(t, out);
+                    self.answer(t, out);
                 }
             }
         }
-        out
     }
 
     /// The shell is about to start a run on `runner` under `fence`, its tree copied: whether it
@@ -1409,61 +1560,54 @@ impl Owner {
 
     /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an
     /// offer it held declined. A run starting or running is stopped by the shell, as any run is.
-    pub fn cancel(&mut self, run: &str) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(t) = self.by_run.get(run).copied() else { return out };
-        let Some(tk) = self.remove(t) else { return out };
+    pub fn cancel_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        let Some(t) = self.by_run.get(run).copied() else { return };
+        let Some(tk) = self.remove(t) else { return };
         if let (Stage::Taking { fence } | Stage::Held { fence }, Some(r)) = (tk.stage, tk.runner) {
-            out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run: run.to_owned(), fence } });
+            out.push(Cmd::Tell { to: r, run: Arc::clone(&tk.run), msg: Down::Decline { fence } });
         }
         for (r, w) in &tk.words {
             if tk.runner != Some(*r) && !matches!(w, Word::Never(_)) {
                 let msg = match tk.offer_of(*r) {
-                    Some(fence) => ToRunner::Decline { run: run.to_owned(), fence },
-                    None => ToRunner::Withdraw { run: run.to_owned() },
+                    Some(fence) => Down::Decline { fence },
+                    None => Down::Withdraw,
                 };
-                out.push(Act::Tell { runner: self.name(*r), msg });
+                out.push(Cmd::Tell { to: *r, run: Arc::clone(&tk.run), msg });
             }
         }
-        out
     }
 
     /// The shell's pick started the run on an older runner: it's followed as before placement,
     /// and its probes are withdrawn.
-    pub fn fallback_started(&mut self, run: &str) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(t) = self.by_run.get(run).copied() else { return out };
+    pub fn fallback_started_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        let Some(t) = self.by_run.get(run).copied() else { return };
         if self.t(t).is_some_and(|tk| tk.stage == Stage::Fallback) {
-            self.withdraw_others(t, None, &mut out);
+            self.withdraw_others(t, None, out);
             self.remove(t);
         }
-        out
     }
 
     /// The shell's pick couldn't start it on an older runner: it waits at the runners that place,
     /// its probes still in their lines (offers it let lapse meanwhile went back to their places).
-    pub fn fallback_refused(&mut self, run: &str) -> Vec<Act> {
-        let mut out = Vec::new();
-        let Some(t) = self.by_run.get(run).copied() else { return out };
+    pub fn fallback_refused_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        let Some(t) = self.by_run.get(run).copied() else { return };
         if let Some(tk) = self.t_mut(t)
             && tk.stage == Stage::Fallback
         {
             tk.stage = Stage::Waiting;
             if tk.words.is_empty() {
                 // Only older runners could take it: it waits for one, or for a runner that places.
-                self.answer(t, &mut out);
+                self.answer(t, out);
             } else {
-                self.heard_of(t, &mut out);
+                self.heard_of(t, out);
             }
         }
-        out
     }
 
     /// The time: choices due (an offer held its time) are made with the offers held, and first
     /// answers due (a runner probed hasn't answered within its link's timeout) are given with
     /// what's known.
-    pub fn tick(&mut self, now: i64) -> Vec<Act> {
-        let mut out = Vec::new();
+    pub fn tick_c(&mut self, now: i64, out: &mut Vec<Cmd>) {
         while let Some(&(at, t)) = self.choose.first() {
             if at > now {
                 break;
@@ -1473,7 +1617,7 @@ impl Owner {
                 tk.choose_at = None;
             }
             if self.t(t).is_some_and(|tk| tk.stage == Stage::Waiting && !tk.offers.is_empty()) {
-                self.choose_now(t, now, &mut out);
+                self.choose_now(t, now, out);
             }
         }
         while let Some(&(at, t)) = self.due.first() {
@@ -1484,9 +1628,8 @@ impl Owner {
             if let Some(tk) = self.t_mut(t) {
                 tk.due = None;
             }
-            self.answer(t, &mut out);
+            self.answer(t, out);
         }
-        out
     }
 
     /// When it's to be told the time again ([`Self::tick`]): the soonest choice or first answer
@@ -1527,7 +1670,7 @@ impl Owner {
 
     /// Its tickets' runs, in order.
     pub fn runs(&self) -> Vec<String> {
-        let mut runs: Vec<String> = self.by_run.keys().cloned().collect();
+        let mut runs: Vec<String> = self.by_run.keys().map(|r| r.to_string()).collect();
         runs.sort_unstable();
         runs
     }
@@ -1539,6 +1682,89 @@ impl Owner {
         v.sort_unstable();
         v
     }
+}
+
+// The wire's inputs and outputs: each input as its `_c` twin has it, its commands made [`Act`]s.
+impl Owner {
+    /// A [`Cmd`] as the wire has it.
+    pub fn act(&self, c: Cmd) -> Act {
+        match c {
+            Cmd::Tell { to, run, msg } => Act::Tell { runner: self.name(to), msg: msg.wire(&run) },
+            Cmd::Answer { run, answer } => Act::Answer { run: run.to_string(), answer },
+            Cmd::Go { run, to, fence } => Act::Go { run: run.to_string(), runner: self.name(to), fence },
+            Cmd::Fallback { run, runners } => Act::Fallback { run: run.to_string(), runners },
+            Cmd::Restart { run, to, fence } => Act::Restart { run: run.to_string(), runner: self.name(to), fence },
+        }
+    }
+
+    fn wire(&mut self, f: impl FnOnce(&mut Owner, &mut Vec<Cmd>)) -> Vec<Act> {
+        let mut c = Vec::new();
+        f(self, &mut c);
+        c.into_iter().map(|c| self.act(c)).collect()
+    }
+
+    /// A runner's handle here, given one if it has none: what [`Cmd`]s name it by.
+    pub fn runner_id(&mut self, name: &str) -> u32 {
+        self.rid(name)
+    }
+
+    /// A runner's name, by its handle.
+    pub fn runner_name(&self, r: u32) -> &str {
+        self.names.name(r)
+    }
+
+    pub fn machines(&mut self, ms: Vec<Machine>) -> Vec<Act> {
+        self.wire(|o, c| o.machines_c(ms, c))
+    }
+
+    pub fn away(&mut self, runner: &str) -> Vec<Act> {
+        self.wire(|o, c| o.away_c(runner, c))
+    }
+
+    pub fn back(&mut self, runner: &str) -> Vec<Act> {
+        self.wire(|o, c| o.back_c(runner, c))
+    }
+
+    pub fn ask(&mut self, ask: Ask, now: i64) -> Vec<Act> {
+        self.wire(|o, c| o.ask_c(ask, now, c))
+    }
+
+    /// A runner's word about a run, as the wire has it.
+    pub fn heard(&mut self, runner: &str, msg: ToOwner, now: i64) -> Vec<Act> {
+        let r = self.rid(runner);
+        let (run, up) = msg.split();
+        let run: Arc<str> = Arc::from(run);
+        self.wire(|o, c| o.heard_c(r, 0, &run, up, now, c))
+    }
+
+    pub fn cancel(&mut self, run: &str) -> Vec<Act> {
+        self.wire(|o, c| o.cancel_c(run, c))
+    }
+
+    pub fn fallback_started(&mut self, run: &str) -> Vec<Act> {
+        self.wire(|o, c| o.fallback_started_c(run, c))
+    }
+
+    pub fn fallback_refused(&mut self, run: &str) -> Vec<Act> {
+        self.wire(|o, c| o.fallback_refused_c(run, c))
+    }
+
+    pub fn tick(&mut self, now: i64) -> Vec<Act> {
+        self.wire(|o, c| o.tick_c(now, c))
+    }
+
+    /// [`Self::starting`], by handle: the run by its id, its runner by its handle here.
+    pub fn starting_c(&mut self, run: &str, r: u32, fence: Fence) -> bool {
+        let Some(t) = self.by_run.get(run).copied() else { return false };
+        match self.t_mut(t) {
+            Some(tk) if tk.stage == (Stage::Held { fence }) && tk.runner == Some(r) => {
+                tk.stage = Stage::Starting { fence };
+                true
+            }
+            _ => false,
+        }
+    }
+
 }
 
 /// An amount in words: "12 CPUs, 14 GiB".

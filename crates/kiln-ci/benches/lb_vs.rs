@@ -35,9 +35,9 @@ use std::time::Instant;
 
 use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
-use kiln_ci::place::msg::{ToOwner, ToRunner};
-use kiln_ci::place::owner::{Act, Machine, Owner, Size};
-use kiln_ci::place::runner::{Admission, Init, Records, Said, Settings};
+use kiln_ci::place::msg::{Down, ToOwner, ToRunner, Up};
+use kiln_ci::place::owner::{Act, Cmd, Machine, Owner, Size};
+use kiln_ci::place::runner::{Admission, Init, Records, Reply, Said, Settings};
 use kiln_ci::sched::needs::Needs;
 use kiln_ci::sched::state::{Cpus, Resources};
 
@@ -55,10 +55,15 @@ struct Args {
     out: Option<String>,
     /// Print each call's mean time by its kind (owner and runner), to stderr.
     profile: bool,
+    /// Runners publish their room to the owner (`-H 1`, the default).
+    hints: bool,
+    /// The wire's words between owner and runners (`-W 1`: names and runs copied into each, as
+    /// before), else the in-process ones by handle (the default).
+    wire: bool,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { algo: "place".into(), n: 0, c: 8, d: 1, rho: 0.0, steps: 200_000, seed: 1, out: None, profile: false };
+    let mut a = Args { algo: "place".into(), n: 0, c: 8, d: 1, rho: 0.0, steps: 200_000, seed: 1, out: None, profile: false, hints: true, wire: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut it = argv.chunks(2);
     for pair in &mut it {
@@ -74,6 +79,8 @@ fn parse() -> Result<Args, String> {
             "-S" => a.seed = v.parse().map_err(|e| bad(&e))?,
             "-o" => a.out = Some(v.clone()),
             "-P" => a.profile = v == "1",
+            "-H" => a.hints = v == "1",
+            "-W" => a.wire = v == "1",
             // cargo bench passes --bench; nothing else is ours.
             "--bench" => {}
             _ => return Err(format!("unknown flag {k}")),
@@ -83,7 +90,7 @@ fn parse() -> Result<Args, String> {
         a.n = 1;
     }
     if (a.n < 2 && a.algo != "local") || a.c < 1 || !(0.0..=1.0).contains(&a.rho) || ![1, 2, 4].contains(&a.d) || !["place", "local"].contains(&a.algo.as_str()) {
-        return Err("usage: -a place|local -n N [-c C] [-d 1|2|4] [-r rho in [0,1]] [-s steps] [-S seed] [-o raw]".into());
+        return Err("usage: -a place|local -n N [-c C] [-d 1|2|4] [-r rho in [0,1]] [-s steps] [-S seed] [-o raw] [-P 1: profile] [-H 0|1: hints] [-W 0|1: wire words]".into());
     }
     Ok(a)
 }
@@ -205,6 +212,44 @@ struct Fleet {
     /// With `-P 1`: each kind of call's count and total time, and the kind of the next.
     prof: std::collections::BTreeMap<&'static str, (u64, u64)>,
     kind: &'static str,
+    /// Each runner's room as it last published it, and the count of hints (the `offers` named
+    /// feature: each reaches the owner as the runner's room changes, the freshest a hint can be).
+    hinted: Vec<Option<Resources>>,
+    hints: u64,
+    /// `-H 0`: no hints (as before them).
+    hinting: bool,
+    /// The in-process path: each runner's handle at the owner and back, the commands pending,
+    /// and reused buffers of replies.
+    fast: bool,
+    rids: Vec<u32>,
+    by_rid: Vec<usize>,
+    queue: Vec<Cmd>,
+    replies: Vec<Reply>,
+    heard: Vec<(usize, Reply)>,
+}
+
+fn up_kind(m: &Up) -> &'static str {
+    match m {
+        Up::Offer { .. } => "owner.heard offer",
+        Up::Waiting { .. } => "owner.heard waiting",
+        Up::Never { .. } => "owner.heard never",
+        Up::Held { .. } => "owner.heard held",
+        Up::Lapsed { .. } => "owner.heard lapsed",
+        Up::Started { .. } => "owner.heard started",
+        Up::Ran => "owner.heard ran",
+        Up::Ended { .. } => "owner.heard ended",
+    }
+}
+
+fn down_kind(m: &Down) -> &'static str {
+    match m {
+        Down::Probe { .. } => "runner.probe",
+        Down::Withdraw => "runner.withdraw",
+        Down::Take { .. } => "runner.take",
+        Down::Decline { .. } => "runner.decline",
+        Down::Start { .. } => "runner.start (restart)",
+        Down::Ack => "runner.ack",
+    }
 }
 
 fn to_owner_kind(m: &ToOwner) -> &'static str {
@@ -260,7 +305,14 @@ impl Fleet {
         let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None }).collect();
         let _ = owner.machines(machines);
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
-        Fleet { owner, runners, index, names, overhead: overhead(), owner_ns: 0, runner_ns: vec![0; usize::try_from(a.n).unwrap_or(0)], messages: 0, net: a.seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new(), prof: Default::default(), kind: "" }
+        let rids: Vec<u32> = names.iter().map(|n| owner.runner_id(n)).collect();
+        let mut by_rid = vec![usize::MAX; rids.iter().map(|r| *r as usize + 1).max().unwrap_or(0)];
+        for (i, r) in rids.iter().enumerate() {
+            if let Some(x) = by_rid.get_mut(*r as usize) {
+                *x = i;
+            }
+        }
+        Fleet { owner, runners, index, names, overhead: overhead(), owner_ns: 0, runner_ns: vec![0; usize::try_from(a.n).unwrap_or(0)], messages: 0, net: a.seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new(), prof: Default::default(), kind: "", hinted: vec![None; usize::try_from(a.n).unwrap_or(0)], hints: 0, hinting: a.hints, fast: !a.wire, rids, by_rid, queue: Vec::new(), replies: Vec::new(), heard: Vec::new() }
     }
 
     fn less(&self, t: Instant) -> u64 {
@@ -274,6 +326,113 @@ impl Fleet {
         self.owner_ns += dt;
         self.count(dt);
         acts
+    }
+
+    /// Runner `i` publishes its room, if it changed: the owner takes it in (timed as the owner's).
+    fn publish(&mut self, i: usize) {
+        if !self.hinting {
+            return;
+        }
+        let Some(free) = self.runners.get(i).map(Admission::hint) else { return };
+        if self.hinted.get(i).copied().flatten() == Some(free) {
+            return;
+        }
+        if let Some(h) = self.hinted.get_mut(i) {
+            *h = Some(free);
+        }
+        self.hints += 1;
+        let (seq, name) = (self.hints, self.names.get(i).cloned().unwrap_or_default());
+        let rid = self.rids.get(i).copied().unwrap_or(0);
+        let t = Instant::now();
+        if self.fast {
+            self.owner.hint_c(rid, free, seq);
+        } else {
+            self.owner.hint(&name, free, seq);
+        }
+        let dt = self.less(t);
+        self.owner_ns += dt;
+        self.kind = "owner.hint";
+        self.count(dt);
+    }
+
+    /// An owner's call on the in-process path, its commands kept to carry out.
+    fn owner_c(&mut self, f: impl FnOnce(&mut Owner, &mut Vec<Cmd>)) {
+        let mut q = std::mem::take(&mut self.queue);
+        let t = Instant::now();
+        f(&mut self.owner, &mut q);
+        let dt = self.less(t);
+        self.queue = q;
+        self.owner_ns += dt;
+        self.count(dt);
+    }
+
+    /// [`Self::carry`] on the in-process path: commands by handle, replies by token, buffers
+    /// reused.
+    fn carry_fast(&mut self, now: i64) {
+        let peer = Peer { name: OWNER, epoch: 1 };
+        let mut cmds: Vec<Cmd> = Vec::new();
+        loop {
+            std::mem::swap(&mut cmds, &mut self.queue);
+            for c in cmds.drain(..) {
+                match c {
+                    Cmd::Tell { to, run, msg } => {
+                        let Some(&i) = self.by_rid.get(to as usize) else { continue };
+                        self.messages += 1;
+                        self.kind = down_kind(&msg);
+                        let mut out = std::mem::take(&mut self.replies);
+                        self.runner_does(i, |r| match msg {
+                            Down::Probe { ask, token } => r.probe_r(peer, ask, token, None, now, &mut out),
+                            Down::Withdraw => r.withdraw_r(peer, &run, now, &mut out),
+                            Down::Take { fence } => r.take_r(peer, &run, fence, now, &mut out),
+                            Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut out),
+                            Down::Start { fence } => {
+                                let _ = r.start_r(peer, &run, fence, now, &mut out);
+                            }
+                            Down::Ack => r.ack(peer, &run),
+                        });
+                        self.heard.extend(out.drain(..).map(|m| (i, m)));
+                        self.replies = out;
+                        self.publish(i);
+                    }
+                    Cmd::Go { run, to, fence } => {
+                        let Some(&i) = self.by_rid.get(to as usize) else { continue };
+                        let t = Instant::now();
+                        let go = self.owner.starting_c(&run, to, fence);
+                        let dt = self.less(t);
+                        self.owner_ns += dt;
+                        self.kind = "owner.starting";
+                        self.count(dt);
+                        if go {
+                            self.messages += 1;
+                            self.kind = "runner.start";
+                            let mut out = std::mem::take(&mut self.replies);
+                            let _ = self.runner_does(i, |r| r.start_r(peer, &run, fence, now, &mut out));
+                            self.heard.extend(out.drain(..).map(|m| (i, m)));
+                            self.replies = out;
+                            self.starts.push((i, run.to_string()));
+                            self.publish(i);
+                        }
+                    }
+                    Cmd::Answer { .. } | Cmd::Fallback { .. } | Cmd::Restart { .. } => {}
+                }
+            }
+            if self.heard.is_empty() {
+                self.queue = cmds;
+                return;
+            }
+            for j in (1..self.heard.len()).rev() {
+                let k = usize::try_from(splitmix(&mut self.net) % (j as u64 + 1)).unwrap_or(0);
+                self.heard.swap(j, k);
+            }
+            let mut heard = std::mem::take(&mut self.heard);
+            for (i, m) in heard.drain(..) {
+                self.messages += 1;
+                self.kind = up_kind(&m.msg);
+                let rid = self.rids.get(i).copied().unwrap_or(0);
+                self.owner_c(|o, q| o.heard_c(rid, m.token, &m.run, m.msg, now, q));
+            }
+            self.heard = heard;
+        }
     }
 
     fn count(&mut self, dt: u64) {
@@ -320,6 +479,7 @@ impl Fleet {
                             ToRunner::Ack { run } => r.ack(peer, &run),
                         });
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
+                        self.publish(i);
                     }
                     Act::Go { run, runner, fence } => {
                         let Some(&i) = self.index.get(&runner) else { continue };
@@ -336,6 +496,7 @@ impl Fleet {
                             let _ = self.runner_does(i, |r| r.start(peer, &run, fence, now, &mut said));
                             self.starts.push((i, run));
                             replies.extend(said.into_iter().map(|(_, m)| (i, m)));
+                            self.publish(i);
                         }
                     }
                     Act::Answer { .. } | Act::Fallback { .. } | Act::Restart { .. } => {}
@@ -383,7 +544,7 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn report(a: &Args, which: &str, k: u64, overhead: u64, ns: &[u64], q: &Quality, messages: f64, raw: Option<String>) {
+fn report(a: &Args, which: &str, k: u64, overhead: u64, ns: &[u64], q: &Quality, messages: f64, hints: f64, raw: Option<String>) {
     if let Some(path) = raw
         && let Ok(mut f) = std::fs::File::create(&path)
     {
@@ -397,7 +558,7 @@ fn report(a: &Args, which: &str, k: u64, overhead: u64, ns: &[u64], q: &Quality,
     let per_s = if mean > 0.0 { 1e9 / mean } else { 0.0 };
     let (cv, peak) = if q.samples > 0 { (q.cv / q.samples as f64, q.peak / q.samples as f64) } else { (0.0, 0.0) };
     println!(
-        "{{\"who\":\"kiln-{}\",\"algo\":\"{}.{which}\",\"n\":{},\"c\":{},\"rho\":{:.3},\"d\":{},\"k\":{k},\"steps\":{},\"seed\":{},\"overhead_ns\":{overhead},\"p50_ns\":{},\"p99_ns\":{},\"mean_ns\":{mean:.2},\"per_s\":{per_s:.0},\"over\":{},\"refused\":{},\"cv\":{cv:.5},\"peak\":{peak:.5},\"messages\":{messages:.1}}}",
+        "{{\"who\":\"kiln-{}\",\"algo\":\"{}.{which}\",\"n\":{},\"c\":{},\"rho\":{:.3},\"d\":{},\"k\":{k},\"steps\":{},\"seed\":{},\"overhead_ns\":{overhead},\"p50_ns\":{},\"p99_ns\":{},\"mean_ns\":{mean:.2},\"per_s\":{per_s:.0},\"over\":{},\"refused\":{},\"cv\":{cv:.5},\"peak\":{peak:.5},\"messages\":{messages:.1},\"hints\":{hints:.2}}}",
         env!("CARGO_PKG_VERSION"),
         if a.algo == "local" { "local" } else { "place" },
         a.n,
@@ -446,8 +607,13 @@ fn main() -> ExitCode {
         let x = ask(*next, a.d);
         let run = x.run.clone();
         fleet.kind = "owner.ask";
-        let acts = fleet.owner_does(|o| o.ask(x, now));
-        fleet.carry(acts, now);
+        if fleet.fast {
+            fleet.owner_c(|o, q| o.ask_c(x, now, q));
+            fleet.carry_fast(now);
+        } else {
+            let acts = fleet.owner_does(|o| o.ask(x, now));
+            fleet.carry(acts, now);
+        }
         let placed = settle(fleet, q, live, Some(&run));
         if placed.is_none() {
             q.refused += 1;
@@ -455,9 +621,25 @@ fn main() -> ExitCode {
         placed
     };
     let end = |fleet: &mut Fleet, q: &mut Quality, live: &mut Vec<(usize, String)>, i: usize, run: &str, now: i64| {
-        let mut said: Vec<Said> = Vec::new();
         fleet.kind = "runner.ended";
+        if fleet.fast {
+            let mut out = std::mem::take(&mut fleet.replies);
+            let _ = fleet.runner_does(i, |r| r.ended_r(peer, run, true, now, &mut out));
+            fleet.publish(i);
+            q.drop(i);
+            let rid = fleet.rids.get(i).copied().unwrap_or(0);
+            for m in out.drain(..) {
+                fleet.kind = up_kind(&m.msg);
+                fleet.owner_c(|o, c| o.heard_c(rid, m.token, &m.run, m.msg, now, c));
+                fleet.carry_fast(now);
+            }
+            fleet.replies = out;
+            let _ = settle(fleet, q, live, None);
+            return;
+        }
+        let mut said: Vec<Said> = Vec::new();
         let _ = fleet.runner_does(i, |r| r.ended(peer, run, true, now, &mut said));
+        fleet.publish(i);
         let replies = said.into_iter().map(|(_, m)| m).collect::<Vec<_>>();
         let name = fleet.names.get(i).cloned().unwrap_or_default();
         q.drop(i);
@@ -475,6 +657,7 @@ fn main() -> ExitCode {
     q.over = 0;
     q.refused = 0;
     fleet.prof.clear();
+    let hints_before = fleet.hints;
     let steps = usize::try_from(a.steps).unwrap_or(0);
     let (mut critical, mut owner, mut total) = (Vec::with_capacity(steps), Vec::with_capacity(steps), Vec::with_capacity(steps));
     let mut messages = 0u64;
@@ -503,10 +686,11 @@ fn main() -> ExitCode {
         }
     }
     let per = if a.steps > 0 { messages as f64 / a.steps as f64 } else { 0.0 };
+    let hints = if a.steps > 0 { (fleet.hints - hints_before) as f64 / a.steps as f64 } else { 0.0 };
     let raw = |w: &str| a.out.as_ref().map(|o| format!("{o}.{w}"));
-    report(&a, "critical", k, fleet.overhead, &critical, &q, per, raw("critical"));
-    report(&a, "owner", k, fleet.overhead, &owner, &q, per, raw("owner"));
-    report(&a, "total", k, fleet.overhead, &total, &q, per, raw("total"));
+    report(&a, "critical", k, fleet.overhead, &critical, &q, per, hints, raw("critical"));
+    report(&a, "owner", k, fleet.overhead, &owner, &q, per, hints, raw("owner"));
+    report(&a, "total", k, fleet.overhead, &total, &q, per, hints, raw("total"));
     if a.profile {
         for (kind, (n, ns)) in &fleet.prof {
             eprintln!("{kind:28} {n:>9} calls {:>9.0} ns each", *ns as f64 / (*n).max(1) as f64);

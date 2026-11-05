@@ -93,6 +93,8 @@ enum Ev {
     Restart { owner: Option<usize>, runner: Option<usize> },
     Forget { runner: usize, owner: usize, life: u64 },
     RelayLost { till: Duration },
+    /// A runner's published room reaches an owner (late, maybe overtaken by a later one).
+    Hint { owner: usize, runner: usize, seq: u64, free: Resources },
     RelayBack,
 }
 
@@ -146,6 +148,9 @@ struct RunnerNode {
     records: Records,
     epoch: u64,
     next_tick: Option<i64>,
+    /// Its published room (the `offers` named feature): the last it published, and its count.
+    hinted: Option<Resources>,
+    hints: u64,
 }
 
 /// What a run counted: across seeds, a fault that never happened tested nothing.
@@ -275,6 +280,8 @@ impl Sim {
                 records: Records::new(),
                 epoch: 0,
                 next_tick: None,
+                hinted: None,
+                hints: 0,
             });
         }
         let mut plans = Vec::new();
@@ -697,7 +704,25 @@ impl Sim {
         if let Some(Err(why)) = self.runners.get(j).and_then(|r| r.core.as_ref()).map(Admission::check) {
             self.fail(why);
         }
+        self.publish(j);
         self.schedule_runner(j);
+    }
+
+    /// Runner `j` publishes its room when it changed: each owner hears it a while later, in no
+    /// order with what else it hears (a hint, never a claim).
+    fn publish(&mut self, j: usize) {
+        let Some(r) = self.runners.get_mut(j) else { return };
+        let Some(free) = r.core.as_ref().map(Admission::hint) else { return };
+        if r.hinted == Some(free) {
+            return;
+        }
+        r.hinted = Some(free);
+        r.hints = r.hints.saturating_add(1);
+        let seq = r.hints;
+        for owner in 0..self.owners.len() {
+            let at = self.now.saturating_add(self.rng.span(Duration::from_millis(1), NOTICE));
+            self.q.push(at, Ev::Hint { owner, runner: j, seq, free });
+        }
     }
 
     /// No memory offered past the room: what the runner has less what other work uses holds every
@@ -1120,6 +1145,11 @@ impl Sim {
                 self.q.push(till, Ev::RelayBack);
             }
             Ev::RelayBack => self.directory(),
+            Ev::Hint { owner, runner, seq, free } => {
+                if let Some(o) = self.owners.get_mut(owner).filter(|o| o.alive) {
+                    o.core.hint(&rname(runner), free, seq);
+                }
+            }
         }
     }
 
