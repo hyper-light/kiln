@@ -693,7 +693,7 @@ and `rank` gives kiln's, Quiver's, the dependencies' and the allocator's locks t
 
 | crate | what it locks | where kiln reaches it |
 | --- | --- | --- |
-| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`) |
+| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | in train 8's tree, every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`). The next train takes the server's live commands, reach's relay, WebRTC, browser streams, blob reads, `rt::Notify` and `rt::Shutdown` off it (`memory::queue` and its lock-free waiter list) |
 | async-tungstenite 0.35.0 | a split WebSocket's stream, which its two halves share (a std Mutex) | every frame the API's WebSockets send, flush or read: each is split into a sender and a reader |
 | async-broadcast 0.7.2 | each channel's state (a std Mutex) | nowhere now: goal 4 made agent sessions' events, terminals' output, job logs and CD's changes lock-free lanes, and kiln takes only its error types |
 | parking 2.2.1 | a parked thread's `Parker` (a std Mutex beside its Condvar) | event-listener's blocking waits (a cluster copy's file read on the blocking pool, a child's output reader), unparked by the shard that sends or makes room |
@@ -869,7 +869,10 @@ First the locks (`scripts/locks.py census-tree`, then `rank`, train 3's tree, 3 
 hogs): 180 call sites, ranked by how often the window took each. The most taken, the store's capture (2,746
 a second), its tables (902), its learner's joiner (603), its groups' point (556), Quiver's node (487) and
 the live channel's receivers (459, one taker), each waited 0.000 ms a second; only Quiver's own locks
-(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on.
+(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on. (A site the census counts
+in more than one copy, one for each copy of its call site in the binary, as a generic or inlined caller makes, had
+one copy's counter taken from another's in these runs, 19 of them below zero in census-A: the census of train 8's
+tree, below, sums them and is exact.)
 
 Then the A/B, the medians of the rounds (ms, but the busy share):
 
@@ -891,17 +894,67 @@ to 475 a second calm) and whose jobs wait longer for it at p99 (0.25 to 7.4 ms c
 hogs): the work goals 3, 9 and 10 moved off the shards (shard 0, which ran 18.5% of the time calm, runs
 2.2%). Goal 9's step 5 (a tenth of the CPU) and goal 10's step 4 (runner messages) take those up.
 
+### The census again, the dependencies' and the allocator's locks counted (train 8's tree)
+
+fedora, 2026-11-05 20:43–20:51Z, the census build of train 8's tree (`08c38ea081f`: goal 4 step 5's lock-free
+`memory::queue` for every queue on the runner path and its lanes for harness frames, `Hub::events`, terminals'
+output, job logs and CD's changes; the async-channels it took off the sealed packer, a terminal's input, the feed,
+a job's writes and the API's replies), with kiln's `jemalloc` feature, so with the dependencies `deps.toml` lists
+and jemalloc's mutexes counted beside kiln's and Quiver's (built in release without LTO, zig, glibc 2.43); driven
+by a kiln-lab that sums each site's copies before it takes their growth (`copies` in `run.json`; `rank` refuses a
+run without them); production's layout (the server alone in its scope at `CPUWeight=1000` on CPUs 16-31), the
+`realistic` profile, 3 rounds calm and 3 with 16 hogs on the server's CPUs at weight 1, while other sessions held
+fedora's load at 23 to 40. Each owner's locks as the lab's window took them, a second, the median of the rounds,
+calm / with hogs:
+
+| owner | locks | taken/s | held when asked/s | waited ms/s | longest wait, ms |
+| --- | --- | --- | --- | --- | --- |
+| kiln's | 115 | 5,743 / 4,861 | 0.00 / 0.07 | 0.000 / 0.010 | 0.25 / 0.98 |
+| Quiver's (`node.rs`; `ephemeral.rs`, its topics' map and tails) | 3 | 1,000 / 854 | 6.27 / 9.62 | 0.006 / 0.695 | 0.31 / 1.93 |
+| event-listener | 1 | 5,084 / 4,348 | 80.0 / 56.8 | 0.052 / 1.783 | 1.01 / 2.41 |
+| async-tungstenite (a socket's two halves) | 1 | 499 / 468 | 0.00 / 0.00 | 0.000 / 0.000 | 0.00 / 0.00 |
+| uuid (`util::new_id`) | 1 | 0.1 / 0.1 | 0.00 / 0.00 | 0.000 / 0.000 | 0.02 / 0.00 |
+| async-broadcast, parking, futures-channel, tracing-subscriber | 0 | none taken | | | |
+| jemalloc (global, each arena's, each arena's bins summed) | 63 | 23,150 / 25,515 | 3.97 / 2.17 | 0.000 / 0.067 | 2 / 10 |
+
+None of kiln's locks on the hot path waited, calm or with hogs; the two that waited with hogs, a harness wait's
+`SENT` (0.03 held when asked a second, no time) and the store's groups' `leaves` (0.010 ms a second, 0.98 ms at
+the longest), are off it. The most taken: the store's capture (1,633 / 1,522 a second), its groups' point (850 /
+299), its learner's joiner (845 / 680), the live channel's receivers (473 / 469, the hub's loop's alone) and the
+feed's (352 / 382). Of the shared locks, event-listener's is the one that waits: calm 80 times a second found held
+and 0.05 ms waited, with hogs 1.8 ms a second, 2.4 ms at the longest, a holder a hog took off its CPU. Quiver's
+waited 0.7 ms a second with hogs; jemalloc's arenas, taken as threads' caches fill and flush, almost never blocked
+(0.07 ms a second with hogs, 10 ms once on arena 0's bins); a socket's two halves never met.
+
+Beside the locks, the store's calls by caller (each its wait for its connection and its run), calm / with hogs:
+custody's `take_read` 180 / 168 a second at 80 / 81 ms each on average (2.6 / 1.2 s at the longest, about 14 calls
+waiting at any time), identities' `enrolled_by` 37 / 33 at 4.6 / 6.0 ms, the audit log's writes 2.6 a second at 38
+/ 58 ms. These are the store's one writer and its read connections, not locks; its writer's group commit (branch
+`store-group`) and custody's reads from memory (goal 9 step 5) are on them.
+
 ### What's left, and why
 
-- **kiln's own.** None of kiln's or kiln-http's locks on the hot path waited in train 3's census, calm or with
-  hogs. `scripts/locks/hot.toml` lists those its modules still declare, each with why it's off the hot path, and
-  `scripts/locks.py check` keeps the rest out.
-- **Quiver's.** The only locks that waited: its topics' map and each topic's tail, 0.047 ms a second at the most.
-  Quiver is vendored (`vendor/quiver`, docs/vendoring.md), so its locks are Quiver's own change, made in Quiver
-  and vendored back, not kiln's to rewrite in its copy.
-- **The dependencies' and the allocator's.** The census counts them (above), each owner in a table of its own:
-  the dependencies kiln's hot path reaches that lock inside, and jemalloc's mutexes where the build has kiln's
-  `jemalloc` feature.
+- **kiln's own.** None of kiln's or kiln-http's locks on the hot path waited, in train 3's census or in train 8's,
+  calm or with hogs (above). `scripts/locks/hot.toml` lists those its modules still declare, each with why it's
+  off the hot path, and `scripts/locks.py check` keeps the rest out. The next train makes more lock-free: CP-T3.2's
+  messages waiting for their inbox's answer (an owner task of their own, `harness/answers.rs`), the conversation
+  feed's and mirrors' maps (copies); a terminal's screen (`termsess.rs` `state`) keeps its lock, listed with why
+  (`attach` answers at once from 14 places, and its replay and the live output must meet with no byte twice or lost).
+- **Quiver's.** Its topics' map and tails (`ephemeral.rs`) waited 0.006 ms a second calm and 0.7 ms with hogs, 1.9
+  ms at the longest. Quiver is vendored (`vendor/quiver`, docs/vendoring.md), so its locks are Quiver's own change,
+  made in Quiver and vendored back, not kiln's to rewrite in its copy.
+- **event-listener's.** The one dependency's lock the shards still share, under every async-channel and async-lock
+  wait and wake left on them: 1.8 ms a second waited with hogs, 2.4 ms at the longest. The next train takes the
+  server's live commands, reach's relay, WebRTC, browser streams, blob reads and kiln's `rt::Notify` and
+  `rt::Shutdown` off it; the runner process's own channels (its uplink, harness pumps, PTYs) follow. What stays
+  is async-lock's few uses on the shards (the password gate, cluster copies) and the `Event`s kiln holds directly,
+  each listed in `hot.toml`'s terms when it goes there.
+- **async-tungstenite's.** One lock a WebSocket, shared by the socket's two halves, each one task's on the socket's
+  shard: never found held, calm or with hogs. No other shard takes it, so it stays.
+- **The allocator's.** jemalloc's 63 mutexes (production's allocator since goal 11 step 4): its arenas' bins as
+  threads' caches fill and flush, 23,000 to 25,500 a second, found held 2 to 4 times a second in all and never
+  blocked calm; with hogs 0.07 ms a second, 10 ms once, a holder a hog took off its CPU. Its five arenas
+  (`narenas:5`) split the threads, so a preempted holder stalls only its own arena's.
 - **What no census inside the process can count.** musl's and glibc's malloc (no count kept: musl's waits only
   from outside, as `futex` waits on its lock), and the C libraries' and the standard library's own locks
   (above).
