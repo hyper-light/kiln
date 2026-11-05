@@ -101,7 +101,7 @@ impl Custodian for ToMirror {
             let hub = self.hub.upgrade()?;
             let peer = (*self.peer.lock().unwrap_or_else(PoisonError::into_inner))?;
             let instance = {
-                let instances = hub.instances.lock();
+                let instances = hub.instances.load();
                 let i = instances.get(peer)?;
                 ((u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0).then(|| i.label())?
             };

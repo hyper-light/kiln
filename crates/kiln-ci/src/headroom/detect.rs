@@ -12,6 +12,19 @@
 //! disk) starts a new regime; so does the engine when an alarm outlasts anything kiln's own cuts
 //! ever took to clear (the machine itself changed), and everything learned starts again.
 //!
+//! A target that comes first ([`Detector::first`]: kiln's own server's delay, docs/priority.md) is
+//! in trouble once it rises past what's calm, not only toward its tolerance: a second CUSUM steps
+//! each sample past calm's noise, its reference half a standard deviation of calm's log-latency
+//! above calm's mean (the shift that matters is one of calm's own spread; half of it is the
+//! reference for detecting it, as above), calibrated the same way on its own record. Its alarm holds
+//! until the target is back within calm's noise: the mirror of that CUSUM (what samples fell short
+//! of its reference, added up) passing the same threshold, which at calm takes as many samples as
+//! a rise past calm's noise takes to alarm. Calm, and both calibration records, come only from
+//! excursions that ended with no alarm (or with kiln quiet) and with kiln pacing nothing of its own
+//! (`paced`, the engine's to set): never from a degraded regime or a paced stretch (goal 8, plan
+//! 01a1a59c2b29 step 5: on 11-05 the legs' 2.5 and the agents' 4 to 6 times calm sat below the
+//! half-way-to-tolerance reference and became calm).
+//!
 //! Every estimate is exact (counts, sums, extremes); nothing here is a tuning constant.
 
 use serde::{Deserialize, Serialize};
@@ -103,15 +116,42 @@ impl Side {
     /// One step by `step` (the sample's distance past the reference); an excursion that ended
     /// without harm goes to the record.
     fn step(&mut self, step: f64, keep: usize) {
+        self.step_ended(step, keep);
+    }
+
+    /// [`Side::step`], saying whether an excursion ended with this step: `Some(true)` when it went
+    /// to the record (it was calm), `Some(false)` when it didn't.
+    fn step_ended(&mut self, step: f64, keep: usize) -> Option<bool> {
         self.s = (self.s + step).max(0.0);
         self.peak = self.peak.max(self.s);
         if self.s == 0.0 && self.peak > 0.0 {
-            if !self.harm {
+            let calm = !self.harm;
+            if calm {
                 self.peaks.add(self.peak, keep);
             }
             self.peak = 0.0;
             self.harm = false;
+            return Some(calm);
         }
+        None
+    }
+}
+
+/// The samples of an excursion past calm's noise under way, learned as calm until it shows it
+/// isn't (an alarm with kiln working, kiln paced, harm): their log-latency's count, sum and squares'
+/// sum, taken back out of calm then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Held {
+    n: u64,
+    sum: f64,
+    sumsq: f64,
+}
+
+impl Held {
+    fn add(&mut self, x: f64) {
+        self.n += 1;
+        self.sum += x;
+        self.sumsq += x * x;
     }
 }
 
@@ -134,8 +174,30 @@ pub struct Detector {
     /// Calm samples (their log-latency) in this regime.
     n: u64,
     sum: f64,
+    /// Their squares added up: calm's spread.
+    #[serde(default)]
+    sumsq: f64,
     up: Side,
     down: Side,
+    /// A target that comes first: the CUSUM past calm's noise, its calm record, and the time that
+    /// record covers (µs of samples that could calibrate it).
+    #[serde(default)]
+    past: Side,
+    #[serde(default)]
+    past_us: f64,
+    /// The samples of the excursion past calm's noise under way, learned until it shows it isn't calm.
+    #[serde(default)]
+    held: Held,
+    /// During an alarm on a target that comes first, from the samples that can show kiln's last cut
+    /// (whose time began at `counts_from_us` or later): what fell short of the reference past calm's
+    /// noise, added up (`back`: back within calm's noise once it passes the threshold), and what
+    /// went past it (`still`: still past calm's noise once that does).
+    #[serde(default)]
+    back: f64,
+    #[serde(default)]
+    still: f64,
+    #[serde(default)]
+    counts_from_us: u64,
     pub alarm: Option<Alarm>,
     /// The longest a cut of kiln's has taken to show (the engine's measure): an excursion that
     /// outlasts it under an alarm with kiln working may have been ended by kiln, so isn't noise.
@@ -145,11 +207,118 @@ pub struct Detector {
     /// long is harm, and how long one has been out says nothing of its answer.
     #[serde(skip)]
     pub window_us: Option<f64>,
+    /// Its target comes first ([`super::Target::first`], the engine's to set): a rise past calm's
+    /// noise is trouble, and an alarm holds until it's back within it.
+    #[serde(skip)]
+    pub first: bool,
+    /// kiln holds some of its own work below what it wants now (the engine's to set): what's
+    /// measured meanwhile isn't calm (for a target that comes first).
+    #[serde(default)]
+    pub paced: bool,
+    /// When the last sample came: a target with a window answers for the time since.
+    #[serde(default)]
+    prev_us: Option<u64>,
 }
 
 impl Detector {
     pub fn new(tolerance_us: f64, now_us: u64) -> Self {
-        Self { tolerance_us, regime_since_us: now_us, last_us: now_us, n: 0, sum: 0.0, up: Side::default(), down: Side::default(), alarm: None, lag_us: None, window_us: None }
+        Self {
+            tolerance_us,
+            regime_since_us: now_us,
+            last_us: now_us,
+            n: 0,
+            sum: 0.0,
+            sumsq: 0.0,
+            up: Side::default(),
+            down: Side::default(),
+            past: Side::default(),
+            past_us: 0.0,
+            held: Held::default(),
+            back: 0.0,
+            still: 0.0,
+            counts_from_us: 0,
+            alarm: None,
+            lag_us: None,
+            window_us: None,
+            first: false,
+            paced: false,
+            prev_us: None,
+        }
+    }
+
+    /// Calm's standard deviation of log-latency, once calm samples differ.
+    pub fn spread(&self) -> Option<f64> {
+        if self.n < 2 {
+            return None;
+        }
+        let n = self.n as f64;
+        let mean = self.sum / n;
+        Some((self.sumsq / n - mean * mean).max(0.0).sqrt()).filter(|s| *s > 0.0)
+    }
+
+    /// For a target that comes first: CUSUM's reference past calm's noise, half calm's standard
+    /// deviation (the shift that matters is one of calm's own spread).
+    fn past_reference(&self) -> Option<f64> {
+        if !self.first {
+            return None;
+        }
+        self.spread().map(|s| s / 2.0)
+    }
+
+    fn past_days(&self) -> f64 {
+        self.past_us / DAY_US
+    }
+
+    /// The threshold for a rise past calm's noise, calibrated as [`Detector::threshold`] is on its
+    /// own record, over the time that record covers.
+    pub fn past_threshold(&self, budget_per_day: f64) -> f64 {
+        let days = self.past_days();
+        self.past.peaks.threshold((budget_per_day.max(0.0) * days).floor() as usize, budget_per_day, days)
+    }
+
+    /// Samples a rise past calm's noise takes to alarm, and, mirrored, a return within it to clear
+    /// (the drift of a shift of calm's spread past its reference is the reference itself): at least
+    /// the samples a shift toward the tolerance takes. As [`Detector::delay_samples`] for a target
+    /// that doesn't come first.
+    pub fn settle_samples(&self, budget_per_day: f64) -> f64 {
+        let toward = self.delay_samples(budget_per_day);
+        match self.past_reference() {
+            Some(k) => toward.max((self.past_threshold(budget_per_day) / k).ceil()),
+            None => toward,
+        }
+    }
+
+    /// kiln just cut its own work for this alarm, and the cut can show in what's measured from
+    /// `show_us`: the evidence either way starts again from samples measured from then.
+    pub fn cut(&mut self, show_us: u64) {
+        self.back = 0.0;
+        self.still = 0.0;
+        self.counts_from_us = show_us;
+    }
+
+    /// Of an alarm on a target that comes first: since kiln's last cut could show, it went on rising
+    /// past calm's noise as far as the threshold. The cut wasn't enough.
+    pub fn persists(&self, budget_per_day: f64) -> bool {
+        self.alarm.is_some() && self.past_reference().is_some() && self.still > self.past_threshold(budget_per_day)
+    }
+
+    fn learn(&mut self, x: f64) {
+        self.n += 1;
+        self.sum += x;
+        self.sumsq += x * x;
+    }
+
+    /// The excursion past calm's noise under way isn't calm after all: it neither calibrates, nor
+    /// stays in calm, and nothing more of it is learned.
+    fn not_calm(&mut self) {
+        if self.past.harm {
+            return;
+        }
+        self.past.harm = true;
+        let h = std::mem::take(&mut self.held);
+        self.n = self.n.saturating_sub(h.n);
+        self.sum -= h.sum;
+        self.sumsq -= h.sumsq;
     }
 
     /// The calm mean of log-latency, once there's a sample.
@@ -179,8 +348,9 @@ impl Detector {
     /// The threshold for alarming, calibrated on this regime's calm record.
     /// Whether a sample of `us` pushes the CUSUM up: past calm by more than the reference (with
     /// nothing learned yet, only the tolerance does).
+    /// For a target that comes first, past calm's noise instead.
     pub fn rising(&self, us: f64) -> bool {
-        match (self.mean(), self.reference()) {
+        match (self.mean(), self.past_reference().or_else(|| self.reference())) {
             (Some(mean), Some(k)) => us.max(f64::MIN_POSITIVE).ln() - mean > k,
             _ => us >= self.tolerance_us,
         }
@@ -204,10 +374,12 @@ impl Detector {
         self.up.s
     }
 
-    /// The machine changed: a new regime from now, learning again.
+    /// The machine changed: a new regime from now, learning again. What the engine set (its
+    /// target's window, whether it comes first, the lag, whether kiln paces) stays.
     pub fn restart(&mut self, now_us: u64) {
-        let tolerance = self.tolerance_us;
-        *self = Detector::new(tolerance, now_us);
+        let (lag, window, first, paced) = (self.lag_us, self.window_us, self.first, self.paced);
+        *self = Detector::new(self.tolerance_us, now_us);
+        (self.lag_us, self.window_us, self.first, self.paced) = (lag, window, first, paced);
     }
 
     /// A probe still out after `age_us`: harm once it's out as long as the tolerance (or the window,
@@ -217,6 +389,10 @@ impl Detector {
         let (limit, of) = self.window_us.map_or((self.tolerance_us, "tolerance"), |w| (w, "window"));
         if age_us >= limit && self.alarm.is_none() {
             self.alarm = Some(Alarm { since_us: now_us, harm: true, quiet });
+            self.cut(now_us);
+            if self.first {
+                self.not_calm();
+            }
             return Event::Alarm(format!("a probe has been out {:.0} ms, its {of} {:.0} ms", age_us / 1e3, limit / 1e3));
         }
         // Out this long, it answers at least this slow: were that its answer, would the CUSUM cross
@@ -238,12 +414,23 @@ impl Detector {
         Event::Same
     }
 
+    /// When what a sample answering now measured began: for a target with a window, the last
+    /// sample (it answers for the time since); for any other, when its probe was sent.
+    pub fn began_us(&self, now_us: u64, us: f64) -> u64 {
+        match self.window_us {
+            Some(_) => self.prev_us.unwrap_or(now_us),
+            None => now_us.saturating_sub(us.max(0.0) as u64),
+        }
+    }
+
     /// A probe that answered in `us`. `quiet`: kiln's own heavy work is quiet now.
     pub fn sample(&mut self, now_us: u64, us: f64, quiet: bool, budget_per_day: f64) -> Event {
         self.last_us = self.last_us.max(now_us);
         if !us.is_finite() || us < 0.0 {
             return Event::Same;
         }
+        let began = self.began_us(now_us, us);
+        let since = self.prev_us.replace(now_us);
         let x = us.max(1.0).ln();
         if let Some(a) = self.alarm.as_mut() {
             a.quiet &= quiet;
@@ -252,8 +439,13 @@ impl Detector {
             }
         }
         if us >= self.tolerance_us {
+            if self.first {
+                // Harm is no calm: the excursion under way neither calibrates nor stays in calm.
+                self.not_calm();
+            }
             if self.alarm.is_none() {
                 self.alarm = Some(Alarm { since_us: now_us, harm: true, quiet });
+                self.cut(now_us);
                 self.up.harm = true;
                 // Held up until it's well under again: the excursion counts from here.
                 self.up.s = self.up.s.max(self.threshold(budget_per_day)).max(f64::MIN_POSITIVE);
@@ -268,8 +460,7 @@ impl Detector {
         }
         let (Some(mean), Some(k)) = (self.mean(), self.reference()) else {
             // Nothing learned yet: this is the first calm sample.
-            self.n += 1;
-            self.sum += x;
+            self.learn(x);
             return Event::Same;
         };
         if k <= 0.0 {
@@ -281,12 +472,23 @@ impl Detector {
             return Event::Same;
         }
         let keep = self.allowed(budget_per_day) + 1;
+        // For a target that comes first, what's measured while kiln paces its own work, or under an
+        // alarm with kiln working, isn't calm: it neither calibrates nor joins calm.
+        let calm = !self.paced && self.alarm.as_ref().is_none_or(|a| a.quiet);
+        if self.first && !calm && (self.up.s > 0.0 || x - mean - k > 0.0) {
+            self.up.harm = true;
+        }
         self.up.step(x - mean - k, keep);
         self.down.step(mean - x - k, keep);
+        let past = self.past_reference().map(|kp| mean + kp);
+        if let Some(r) = past {
+            self.past_step(now_us, since, began, x, r, calm, budget_per_day);
+        }
         match self.alarm.clone() {
             None => {
-                self.n += 1;
-                self.sum += x;
+                if !self.first || (past.is_none() && calm) {
+                    self.learn(x);
+                }
                 if self.down.s > self.down.peaks.threshold(self.allowed(budget_per_day), budget_per_day, self.days()) {
                     self.restart(now_us);
                     return Event::Regime("its latency fell well below its calm: a new regime".into());
@@ -294,7 +496,16 @@ impl Detector {
                 let h = self.threshold(budget_per_day);
                 if self.up.s > h {
                     self.alarm = Some(Alarm { since_us: now_us, harm: false, quiet });
+                    self.cut(now_us);
                     return Event::Alarm(format!("latency rising toward its tolerance: typical {:.1} ms, now {:.1} ms (CUSUM {:.2} past {:.2})", mean.exp() / 1e3, us / 1e3, self.up.s, h));
+                }
+                // Past calm's noise, once the record holds an excursion to tell it from (with none,
+                // no rise can be told from noise).
+                let hp = self.past_threshold(budget_per_day);
+                if past.is_some() && self.past.peaks.count > 0 && self.past.s > hp {
+                    self.alarm = Some(Alarm { since_us: now_us, harm: false, quiet });
+                    self.cut(now_us);
+                    return Event::Alarm(format!("rising past its calm: typical {:.2} ms, now {:.2} ms (CUSUM {:.2} past {:.2})", mean.exp() / 1e3, us / 1e3, self.past.s, hp));
                 }
                 Event::Same
             }
@@ -302,9 +513,47 @@ impl Detector {
                 if self.up.s > 0.0 {
                     return Event::Same;
                 }
+                // A target that comes first: back within calm's noise only once what fell short of
+                // the reference past it, since kiln's last cut could show, passes its threshold.
+                if past.is_some() && self.back <= self.past_threshold(budget_per_day) {
+                    return Event::Same;
+                }
                 self.alarm = None;
+                // Back within calm's noise: the rise that alarmed is over (it calibrates nothing).
+                self.past.s = 0.0;
+                self.past.peak = 0.0;
+                self.past.harm = false;
                 Event::Clear
             }
+        }
+    }
+
+    /// One sample of a target that comes first, stepped past calm's noise (`r`, the reference's
+    /// log-latency): learned as calm while it is, an excursion's samples taken back out once it shows
+    /// it isn't; under an alarm, the evidence either way from samples that can show kiln's cut.
+    #[allow(clippy::too_many_arguments)]
+    fn past_step(&mut self, now_us: u64, since: Option<u64>, began: u64, x: f64, r: f64, calm: bool, budget_per_day: f64) {
+        if calm {
+            self.past_us += since.map_or(0.0, |s| now_us.saturating_sub(s) as f64);
+        }
+        if !calm && (self.past.s > 0.0 || x > r) {
+            self.not_calm();
+        }
+        let keep = (budget_per_day.max(0.0) * self.past_days()).floor() as usize + 1;
+        let in_calm = calm && !self.past.harm;
+        let ended = self.past.step_ended(x - r, keep).is_some();
+        if in_calm {
+            self.learn(x);
+            if self.past.s > 0.0 {
+                self.held.add(x);
+            }
+        }
+        if ended {
+            self.held = Held::default();
+        }
+        if self.alarm.is_some() && began >= self.counts_from_us {
+            self.back = (self.back + r - x).max(0.0);
+            self.still = (self.still + x - r).max(0.0);
         }
     }
 }

@@ -52,6 +52,9 @@ pub fn deflate<'a>(level: Compression, parts: impl IntoIterator<Item = &'a [u8]>
         feed(&mut c, &mut out, part, false)?;
     }
     feed(&mut c, &mut out, &[], true)?;
+    // What it holds and no more: a segment is kept as long as its chunk (goal 11, plan 01a1a87b2e56 step 2),
+    // and the buffer it was deflated into grew by doubling.
+    out.shrink_to_fit();
     Ok(Segment { deflated: Bytes::from(out), crc: crc.finalize(), len })
 }
 

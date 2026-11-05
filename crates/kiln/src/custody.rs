@@ -217,7 +217,7 @@ async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
 /// come over that process's connection, and logged either way.
 pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
-    let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+    let instance = hub.instances.load().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
     let came_from = format!("runner {machine} (instance {instance})");
     // Something another runner handed it over a reach link that it refused where it would have
     // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with
@@ -877,7 +877,7 @@ async fn ask_receipt_of(hub: &crate::hub::Hub, session: &str, hand_on: &Value, f
     let ask = if first { json!({ "session": session, "hand_on": hand_on.to_string(), "first": true }) } else { json!({ "session": session, "hand_on": hand_on.to_string() }) };
     let msg = crate::proto::ServerMsg::Custody { json: ask.to_string() };
     let (owner, signs) = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         let owner = inst.owner(&crate::instances::Owned::Agent(session.to_owned()));
         let signs = owner.and_then(|p| inst.get(p)).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
         (owner, signs)
@@ -925,7 +925,7 @@ pub async fn subagents_handed(hub: &crate::hub::Hub, came_from: &str, hand_on: &
 /// that no receipt answers yet is asked for again (its ask may have gone while the runner was
 /// away).
 pub async fn ask_again(hub: &crate::hub::Hub, peer: crate::instances::PeerId, sessions: &[String]) {
-    let signs = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+    let signs = hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
     if !signs {
         return;
     }
