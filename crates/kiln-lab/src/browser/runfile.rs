@@ -94,7 +94,9 @@ pub struct JobRecord {
     pub protocols: std::collections::BTreeMap<String, String>,
     /// The calibration: its offset and the p99 of its residuals (µs), the worst client's.
     pub calibration_p99_us: Option<f64>,
-    /// The background's CPU rate (µs a second) and its noise: two background windows' difference.
+    /// The background's CPU rate (µs a second), the mean of a window before the job (once the
+    /// server is at rest) and one after, and its noise: the larger of two windows' difference
+    /// before and the before's and after's.
     pub background_us_per_s: f64,
     pub noise_us_per_s: f64,
     pub errors: Vec<String>,

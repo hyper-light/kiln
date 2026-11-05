@@ -63,7 +63,7 @@ fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) ->
             requests.push(if t.server == Server::Kiln {
                 json!({"name": "session snapshot", "ws_snapshot": true, "path": format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes")})
             } else {
-                json!({"name": "session snapshot", "ndjson": true, "path": "/api/harness/sessions/lab/snapshot"})
+                json!({"name": "session snapshot", "ndjson": true, "path": "/api/snapshots/lab"})
             });
             requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{id}/command"), "body": json!({"type": "send", "id": "lab-rec-{n}", "text": "lab:quiet"}).to_string()}));
             #[allow(clippy::cast_precision_loss)]
@@ -101,19 +101,30 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     }
     let dir = c.out.join("raw").join(cond.name().replace('/', "-")).join(format!("r{round:02}")).join(format!("{}-{browser}-{case}", t.name));
     std::fs::create_dir_all(&dir)?;
-    // The background: the server with nobody attached, two windows.
+    // The background: the server with nobody attached, once it is at rest (a server just started
+    // is still settling in: two windows in a row within a quarter, or 2 ms a second, of each other;
+    // 90 s at most), two windows.
     let bg = Duration::from_secs(c.s.background_s.max(1));
-    let a = cpu_now(r);
-    std::thread::sleep(bg);
-    let b = cpu_now(r);
-    std::thread::sleep(bg);
-    let d = cpu_now(r);
     let rate = |x: &CpuTick, y: &CpuTick| {
         #[allow(clippy::cast_precision_loss)]
         let v = (y.server_us + y.origin_us).saturating_sub(x.server_us + x.origin_us) as f64 / (y.t_us.saturating_sub(x.t_us).max(1) as f64 / 1e6);
         v
     };
-    let background = rate(&a, &d);
+    let settle_until = Instant::now() + Duration::from_secs(90);
+    let mut a = cpu_now(r);
+    std::thread::sleep(bg);
+    let mut b = cpu_now(r);
+    loop {
+        std::thread::sleep(bg);
+        let d = cpu_now(r);
+        let (x, y) = (rate(&a, &b), rate(&b, &d));
+        if (x - y).abs() <= (x.max(y) * 0.25).max(2000.0) || Instant::now() > settle_until {
+            break;
+        }
+        (a, b) = (b, d);
+    }
+    let d = cpu_now(r);
+    let before = rate(&a, &d);
     let noise = (rate(&a, &b) - rate(&b, &d)).abs();
     let ops = ops(t, case, &w, r.kiln.as_ref());
     // A capture on each client link, headers only, for as long as the job runs.
@@ -258,6 +269,12 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     }
     stop.store(true, Ordering::Relaxed);
     let cpu = sampler.join().map_err(|_| anyhow::anyhow!("the CPU sampler stopped"))?;
+    // The background again after the job, nobody attached: the job's is the mean of the two.
+    let e = cpu_now(r);
+    std::thread::sleep(bg);
+    let f = cpu_now(r);
+    let after = rate(&e, &f);
+    let background = f64::midpoint(before, after);
     std::fs::write(&cpu_file, cpu.iter().filter_map(|c| serde_json::to_string(c).ok()).collect::<Vec<_>>().join("\n"))?;
     let mut clients = Vec::new();
     let mut protocols = std::collections::BTreeMap::new();
@@ -315,7 +332,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         protocols,
         calibration_p99_us: calib,
         background_us_per_s: background,
-        noise_us_per_s: noise,
+        noise_us_per_s: noise.max((before - after).abs()),
         errors,
         capture,
         machine: machine(),
@@ -456,7 +473,7 @@ pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(Str
 /// Whether a process's network namespace has a UDP socket bound to `port`.
 fn udp_bound(pid: u32, port: u16) -> bool {
     let hex = format!(":{port:04X}");
-    std::fs::read_to_string(format!("/proc/{pid}/net/udp")).unwrap_or_default().lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|a| a.ends_with(&hex)))
+    ["udp", "udp6"].iter().any(|f| std::fs::read_to_string(format!("/proc/{pid}/net/{f}")).unwrap_or_default().lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|a| a.ends_with(&hex))))
 }
 
 /// Each file under `docroot` fetched from `t` by curl in the first client's namespace (HTTP/2,
@@ -473,7 +490,7 @@ fn served_bodies(lab: &Lab, t: &Target, docroot: &Path) -> (usize, usize, Option
     let (mut same, mut odd) = (0, None);
     for f in &files {
         let Ok(rel) = f.strip_prefix(docroot) else { continue };
-        let url = format!("{}/{}", t.origin(), rel.to_string_lossy().trim_end_matches("index.json").trim_end_matches('/'));
+        let url = format!("{}/{}", t.origin(), rel.to_string_lossy());
         let argv = vec!["curl".to_owned(), "-sk".to_owned(), "--http2".to_owned(), "--compressed".to_owned(), url.clone()];
         let got = lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
         match (got, std::fs::read(f)) {

@@ -176,18 +176,54 @@ and fetch for kiln today; Server-Sent Events, streaming fetch and fetch for the 
   body: requests go on a fixed open-loop schedule, each at its time whether or not those before it
   were answered, so a stall counts in full for every request behind it (no coordinated omission:
   f35). The page's clock (`timeOrigin + now()`, cross-origin isolated, so 5 µs fine) is calibrated
-  against the server's each job by WebSocket echoes over the unshaped control pair, taking the
-  offset of the echo with the least round trip (f29); the residuals of 200 more echoes are kept.
+  against the server's each job by 200 WebSocket echoes over the unshaped control pair (to the
+  lab's control echo, `crates/kiln-lab/web/control.mjs`), taking the offset of the echo with the
+  least round trip (f29). Its residual is the calibration taken again the same way, in 10 groups of
+  20 more echoes: how far each group's offset lies from the one the page uses (each echo's own
+  offset, off by up to half its round trip, is kept beside it). Chromium runs with Local Network
+  Access off (`--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets`):
+  the control echo is on another private address than the page's origin, which Chromium would
+  otherwise hold for a permission; the target's own operations are all same-origin.
 - **Bytes.** The client link's frames both ways (the client's own `eth0`, every header, ACK and
   retransmission), read every window (1 s) by the driver from its namespace's `/proc/net/dev`. Each
   window's bytes go to the operations that completed in it; windows with none are left out; the
   percentiles are across windows, and the mean is all bytes over all operations. The bytes above
   the transport (what the page was given) are a mean beside it.
 - **Server CPU.** The server's scope (and, for the reference servers, their origin's scope, counted
-  with it and shown apart) read every window, less the background's rate measured just before the
-  job with nobody attached, over the window's operations (every client's); percentiles across
-  windows, and the mean. Two background windows' difference is the CPU measure's noise floor,
-  reported beside every CPU number.
+  with it and shown apart) read every window, less the background's rate, over the window's
+  operations (every client's); percentiles across windows, and the mean. The background is the
+  server with nobody attached: once it is at rest (a server just started is still settling in: two
+  5 s windows in a row within a quarter, or 2 ms a second, of each other, 90 s at most), two windows
+  before the job, and one after it; its rate is the mean of before and after, and the larger of the
+  two windows' difference and the before's and after's is the CPU measure's noise floor, kept with
+  every job. kiln's runner (the agents' machine) is in a scope of its own and isn't the server's.
+
+### The probe's checks
+
+`kiln-lab browser check-probe RUN --catalogue CATALOGUE` reads a run made with `--capture` (a packet
+capture on each client link, `crates/kiln-lab/web/capture.py`: a raw packet socket in the client's
+own namespace, every frame's length and time, written as pcap with the browser's TLS keys beside it
+for goal 7) and `--stall 10` (the server stopped, every process of it, for 2 s, 10 s into each
+request job). On 2026-11-04 (`~/.cache/kiln-bp/g1/check4`, the good link, kiln today, h2o over
+HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
+
+- calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs);
+- capture against counters: 0.00% apart in all six jobs (2.1 MB to 15.8 MB each);
+- the probe's sizes above the transport against the real UI's, where the UI's payloads were the
+  same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
+  terminal's frames 0.1% apart; the message to an agent was 3.7% apart while the probe sent one id
+  for every message (the server answered repeats differently), and now sends a new id each time as
+  the UI does; operations whose payloads follow the lab kiln's state (the sessions' list, the
+  notices, the metrics' history, `/api/events`, a session's frames) aren't compared;
+- the stall: the longest request waited 2,156 ms (kiln today), 2,097 ms (h2o) and 2,001 ms (Caddy)
+  from its scheduled time: the whole wait counted;
+- the CPU measure's noise floor: kiln today 2,887 µs of CPU a second, h2o 8.2, Caddy 17.6.
+
+`kiln-lab browser start-stop --times 20` started and stopped each reference target 20 times (h2o
+and Caddy over HTTP/2 and HTTP/3) and kiln today 20 times: each came up on its port (and its UDP
+port for HTTP/3) every time, and each stop left none of its recorded processes and nothing in its
+scopes. Every static body each reference server served (14 of 14) came back byte for byte as the
+catalogue holds it.
 
 A target is a record (`crates/kiln-lab/src/browser/targets.rs`): its server, its port, whether it
 is HTTP/3, its carrier for streams, the protocol the page must have got, and the browsers it runs
@@ -208,7 +244,8 @@ into each round's folder.
 Each serves the catalogue's operations with kiln's own bodies:
 
 - **requests** as static files from the catalogue's docroot (`payloads/docroot`, each read's body as
-  the lab kiln answered it), the server's own best path, compressed as each does best (h2o: brotli,
+  the lab kiln answered it, each at its own path with no redirect; a session's snapshot, unpacked,
+  at `/api/snapshots/lab`), the server's own best path, compressed as each does best (h2o: brotli,
   then gzip; Caddy: zstd, then gzip), `cache-control: no-store` as kiln's API answers;
 - **streams and bursts** as Server-Sent Events, or as a streaming fetch (one frame a line), from the
   lab's origin (`crates/kiln-lab/web/origin.mjs`) over a Unix socket: it replays the frames kiln

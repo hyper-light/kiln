@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, statSy
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
+import { pathToFileURL } from "node:url";
 
 const ID = /[0-9a-f]{32}/g;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g;
@@ -75,23 +76,26 @@ function frameBytes(p) {
 }
 
 /**
- * A static body at `f`. A path that is also a folder's (`/api/agents` and `/api/agents/:id`) keeps
- * its body as the folder's index.json, whichever comes first.
+ * A static body at `f`, served at its own path with no redirect: a path under one that is already a
+ * file (`/api/harness/sessions/:id/terminals` under `/api/harness/sessions`) is left out, the
+ * shorter kept (reads are put shortest first). What was left out, by path.
  */
+const skipped = [];
 function put(f, body) {
   const parts = f.split("/");
   for (let i = 2; i < parts.length; i++) {
     const d = parts.slice(0, i).join("/");
     if (existsSync(d) && !statSync(d).isDirectory()) {
-      const held = readFileSync(d);
-      unlinkSync(d);
-      mkdirSync(d, { recursive: true });
-      writeFileSync(join(d, "index.json"), held);
+      skipped.push(f);
+      return;
     }
   }
+  if (existsSync(f) && statSync(f).isDirectory()) {
+    skipped.push(f);
+    return;
+  }
   mkdirSync(dirname(f), { recursive: true });
-  if (existsSync(f) && statSync(f).isDirectory()) writeFileSync(join(f, "index.json"), body);
-  else writeFileSync(f, body);
+  writeFileSync(f, body);
 }
 
 function build(recDir, cataloguePath, payloadDir) {
@@ -174,7 +178,7 @@ function build(recDir, cataloguePath, payloadDir) {
     const digest = createHash("sha256").update(frames.map(normal).join("\n")).digest("hex");
     operations.push({ case: "stream", op: s.kind, socket: s.pattern, journeys: [...s.journeys], frames_down: sizes(s.down), frames_up: sizes(s.up), stamped_frames: s.stamped, binary_frames: s.binary, rate_per_s: +(s.down.length / Math.max(1, s.secs)).toFixed(3), recorded_s: Math.round(s.secs), digest });
   }
-  for (const r of requests.values()) {
+  for (const r of [...requests.values()].sort((a, b) => a.pattern.length - b.pattern.length)) {
     const read = r.method === "GET";
     if (read && r.last) put(join(payloadDir, "docroot", r.pattern.split("?")[0].replace(/:id/g, "lab").replace(/:n/g, "1")), r.last);
     if (!read) replay.writes[`${r.method} ${r.pattern.split("?")[0].replace(/:id/g, "lab").replace(/:n/g, "1")}`] = { status: 200, body: r.last ? r.last.toString("utf8") : "" };
@@ -191,7 +195,7 @@ function build(recDir, cataloguePath, payloadDir) {
       digest: r.last ? createHash("sha256").update(normal(r.last.toString("utf8"))).digest("hex") : null,
     });
   }
-  if (replay.snapshot !== undefined) put(join(payloadDir, "docroot/api/harness/sessions/lab/snapshot"), replay.snapshot);
+  if (replay.snapshot !== undefined) put(join(payloadDir, "docroot/api/snapshots/lab"), replay.snapshot);
   // Bursts, from the streams: a stream's stamped frames in runs no more than 500 ms apart (an
   // agent's turn on its session; many agents changing at once on /api/events).
   for (const s of sockets.values()) {
@@ -213,7 +217,7 @@ function build(recDir, cataloguePath, payloadDir) {
     operations.push({ case: "burst", op: s.kind === "session" ? "an agent's turn (session socket)" : "agents changing at once (/api/events)", socket: s.pattern, bursts: bursts.length, events_per_burst: sizes(bursts.map((b) => b.n)), bytes_per_burst: sizes(bursts.map((b) => b.bytes)), burst_ms: sizes(bursts.map((b) => Math.round((b.last - b.first) / 1000))), rate_per_s: +(bursts.length / Math.max(1, s.secs)).toFixed(3) });
   }
   operations.sort((a, b) => (a.case + a.op).localeCompare(b.case + b.op));
-  const catalogue = { built_from: recDir, journeys: journeys.map((j) => j.name), operations, left_out: [...leftOut.values()].sort((a, b) => a.what.localeCompare(b.what)) };
+  const catalogue = { docroot_left_out: skipped.map((f) => f.slice(join(payloadDir, "docroot").length)), built_from: recDir, journeys: journeys.map((j) => j.name), operations, left_out: [...leftOut.values()].sort((a, b) => a.what.localeCompare(b.what)) };
   writeFileSync(cataloguePath, JSON.stringify(catalogue, null, 1) + "\n");
   writeFileSync(join(payloadDir, "replay.json"), JSON.stringify(replay));
   return catalogue;
@@ -245,8 +249,11 @@ function compare(a, b) {
   return { a: Object.keys(da).length, b: Object.keys(db).length, compared: both.length, equal: both.length - differ.length, differ: differ.slice(0, 20) };
 }
 
-const [mode, ...args] = process.argv.slice(2);
-if (mode === "build") console.log(JSON.stringify(build(...args).operations.map((o) => `${o.case} ${o.op}`)));
+const main = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+const [mode, ...args] = main ? process.argv.slice(2) : [null];
+if (!main) {
+  // Imported (its tests): nothing to run.
+} else if (mode === "build") console.log(JSON.stringify(build(...args).operations.map((o) => `${o.case} ${o.op}`)));
 else if (mode === "compare") console.log(JSON.stringify(compare(...args), null, 1));
 else {
   console.error("usage: node catalogue.mjs build RECORDINGS CATALOGUE.json PAYLOADS | compare A B");

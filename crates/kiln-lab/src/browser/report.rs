@@ -241,3 +241,31 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
     }
     (o, pass)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// plan 01a1a832e9cc step 10: docs/browser-lab.md's tables are the run files' it names
+    /// (`<!-- browser-lab run: PATH -->`, a path from the repository's root), regenerated here; a
+    /// number changed by hand in either fails, naming the row (its cell) and both values.
+    #[test]
+    fn browser_doc_truth() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let doc = std::fs::read_to_string(root.join("docs/browser-lab.md")).unwrap_or_default();
+        let runs: Vec<&str> = doc.lines().filter_map(|l| l.trim().strip_prefix("<!-- browser-lab run: ")?.strip_suffix(" -->")).collect();
+        if runs.is_empty() {
+            // No measured matrix yet: the doc says so where its tables go.
+            assert!(doc.contains("<!-- browser-lab tables: begin -->"), "docs/browser-lab.md has no tables' markers");
+            return;
+        }
+        for r in runs {
+            let text = std::fs::read(root.join(r)).unwrap_or_default();
+            let run: Result<BrowserRun, _> = serde_json::from_slice(&text);
+            assert!(run.is_ok(), "{r}: not a run file");
+            let Ok(run) = run else { return };
+            let d = doc_differs(&doc, &run);
+            assert!(d.is_empty(), "docs/browser-lab.md's tables aren't {r}'s:\n{}", d.iter().take(10).map(|(a, b)| format!("doc: {a}\nrun: {b}")).collect::<Vec<_>>().join("\n"));
+        }
+    }
+}
