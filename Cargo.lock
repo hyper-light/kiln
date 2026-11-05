@@ -2247,6 +2247,7 @@ dependencies = [
  "clap",
  "command-group",
  "concurrent-queue",
+ "crc32fast",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",
