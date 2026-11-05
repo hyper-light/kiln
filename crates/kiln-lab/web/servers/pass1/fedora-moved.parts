@@ -1,0 +1,34 @@
+# adacachy's share moved to fedora at 20:13Z (production's host deep in swap: each thaw slowed /readyz again); written reversed, for run-pass-tail.sh
+m-50k-1-stream --targets caddy-h2,caddy-h3 --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-100k-0-burst --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 100k --losses 0 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-50k-0-request-1 --targets caddy-h2,caddy-h3 --profiles 50k --losses 0 --cases request --rounds 11 --browsers chromium,webkit --k 8
+m-100k-1-burst --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 100k --losses 1 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-50k-1-request-1 --targets caddy-h2,caddy-h3 --profiles 50k --losses 1 --cases request --rounds 11 --browsers chromium,webkit --k 8
+m-100k-5-burst --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 100k --losses 5 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-100k-5-stream --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 100k --losses 5 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-100k-1-stream --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 100k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+pilot-50k-burst --targets kiln-today,kiln-today-b,h2o-h2,h2o-h3,h2o-h3-reno --profiles 50k --losses 1 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+pilot-50k-stream --targets kiln-today,kiln-today-b,h2o-h2,h2o-h3,h2o-h3-reno --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+pilot-50k-request --targets kiln-today,kiln-today-b,h2o-h2,h2o-h3,h2o-h3-reno --profiles 50k --losses 1 --cases request --rounds 5 --browsers chromium,webkit --k 8
+m-good-1-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-good-1-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 1 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-good-1-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 1 --cases request --rounds 5 --browsers chromium,webkit --k 8
+m-good-5-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 5 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-good-5-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 5 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-good-5-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles good --losses 5 --cases request --rounds 5 --browsers chromium,webkit --k 8
+m-100k-0-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 0 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-100k-0-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 0 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-100k-0-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 0 --cases request --rounds 6 --browsers chromium,webkit --k 8
+m-100k-1-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-100k-1-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 1 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-100k-1-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 1 --cases request --rounds 6 --browsers chromium,webkit --k 8
+m-100k-5-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 5 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-100k-5-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 5 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-100k-5-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 100k --losses 5 --cases request --rounds 6 --browsers chromium,webkit --k 8
+m-50k-0-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 0 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-50k-0-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 0 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-50k-0-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 0 --cases request --rounds 11 --browsers chromium,webkit --k 8
+m-50k-1-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 1 --cases request --rounds 11 --browsers chromium,webkit --k 8
+m-50k-5-stream-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 5 --cases stream --rounds 5 --browsers chromium,webkit --k 8
+m-50k-5-burst-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 5 --cases burst --rounds 5 --browsers chromium,webkit --k 8
+m-50k-5-request-h3 after=pilot-50k-request,pilot-50k-stream,pilot-50k-burst --targets $H3 --profiles 50k --losses 5 --cases request --rounds 11 --browsers chromium,webkit --k 8
