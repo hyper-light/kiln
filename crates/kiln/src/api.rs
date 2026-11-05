@@ -6427,7 +6427,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
-    let (mut tx, mut rx) = socket.split();
+    let (mut tx, rx) = socket.split();
+    // What its person sends, read only once its socket has some (goal 9, plan 01a1a87b2cec step 5): every frame
+    // and answer wakes this loop, and an ask with nothing come zero-fills the reader's 16 KiB and reads nothing.
+    let mut rx = ws::Gated::new(rx);
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
