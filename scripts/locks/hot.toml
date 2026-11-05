@@ -33,6 +33,10 @@ hot = [
   # The ship model, and the CI state the API reads.
   "crates/kiln/src/ship.rs",
   "crates/kiln/src/store.rs",
+  # The browser protocol (goal 2 of the browser protocol program): its sans-IO core, which every
+  # protocol connection runs, and kiln's topics fed from the hub and the bus.
+  "crates/kiln-bp/src",
+  "crates/kiln/src/bp",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
 ]
