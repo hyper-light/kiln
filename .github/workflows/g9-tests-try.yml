@@ -1,0 +1,86 @@
+# Trial only, never on main: goal 9's landing checks (plan 01a1a87b2cec), as AGENTS.md sizes them to the change: clippy
+# as ci/gate.sh runs it on the crates it touches (hyper-rt, kiln-lab, kiln) on Linux, macOS and Windows, and their
+# touched modules' tests on Linux, W27's custody tests among them. Run by a push to g9-tests-try.
+name: g9-tests-try
+
+on:
+  push:
+    branches: [g9-tests-try]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g9-tests-try
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  KILN_SKIP_UI_BUILD: "1"
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+
+jobs:
+  check:
+    name: ${{ matrix.part }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, part: clippy }
+          - { os: macos-latest, part: clippy }
+          - { os: windows-latest, part: clippy }
+          - { os: ubuntu-latest, part: lib-tests }
+          - { os: ubuntu-latest, part: integration-tests }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Room to build
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          swap=/mnt/kiln-swap
+          [ -d /mnt ] || swap=/kiln-swap
+          sudo fallocate -l 16G "$swap" || sudo dd if=/dev/zero of="$swap" bs=1M count=16384
+          sudo chmod 600 "$swap" && sudo mkswap "$swap" && sudo swapon "$swap"
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+      - id: run
+        name: ${{ matrix.part }}
+        timeout-minutes: 170
+        run: |
+          case "${{ matrix.part }}" in
+            clippy)
+              if [ "$RUNNER_OS" = Linux ]; then all=--all-targets; else all=; fi
+              cargo clippy --locked -p hyper-rt -p kiln-lab -p kiln $all -- -D warnings 2>&1 | tee "$RUNNER_TEMP/out.txt" ;;
+            lib-tests)
+              { cargo test --locked -p hyper-rt --lib --test watchdog --test coop_budget \
+                && cargo test --locked -p kiln-lab \
+                && cargo test --locked -p kiln --lib -- route_latency:: os::tests:: rt::tests:: proc::tests:: sup:: custody:: observe::errors:: shard_health:: w27; } 2>&1 | tee "$RUNNER_TEMP/out.txt" ;;
+            integration-tests)
+              cargo test --locked -p kiln --test held_polls --test shard_health --test cores_apart --test spread_services --test custody --test custody_production --test transfers --test trail 2>&1 | tee "$RUNNER_TEMP/out.txt" ;;
+          esac
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          set +e +o pipefail
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }'; }
+          out="$RUNNER_TEMP/out.txt"
+          [ -s "$out" ] || exit 0
+          plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ')
+          if [ "${{ matrix.part }}" = clippy ]; then
+            text=$(printf '%s\n' "$plain" | grep -E '^(error|warning)|-->' | grep -v focal-memory | head -n 80); [ -n "$text" ] || text="clippy clean"
+          else
+            text=$(printf '%s\n' "$plain" | grep -E '^test .*FAILED$|^test result|panicked|^error|Running ' | head -n 100)
+          fi
+          level=notice; [ "$OUTCOME" != success ] && level=error
+          echo "::$level title=${{ matrix.part }} on ${{ matrix.os }} $OUTCOME::$(printf '%s\n' "$text" | esc)"
