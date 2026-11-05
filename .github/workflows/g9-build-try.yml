@@ -1,0 +1,75 @@
+# Trial only, never on main: goal 9's lab build (plan 01a1a87b2cec): a release kiln and kiln-lab of this branch's parent
+# commit, the UI's client built in as docs/runtime-lab.md builds the lab's, with symbols and line tables (perf names the
+# shards' code), and a stripped copy of the same build for the measured rounds; one artifact, for fedora's lab
+# (adacachy's disk has no room for it). Run by a push to g9-build-try.
+name: g9-build-try
+
+on:
+  push:
+    branches: [g9-build-try]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g9-build-try
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Room to build
+        run: |
+          swap=/mnt/kiln-swap
+          [ -d /mnt ] || swap=/kiln-swap
+          sudo fallocate -l 16G "$swap" || sudo dd if=/dev/zero of="$swap" bs=1M count=16384
+          sudo chmod 600 "$swap" && sudo mkswap "$swap" && sudo swapon "$swap"
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+      - name: The UI's client
+        working-directory: ui
+        run: |
+          npm ci --no-audit --no-fund
+          KILN_UI_SERVER=off npm run build
+      - name: kiln and kiln-lab
+        env:
+          KILN_UI_SERVER: "off"
+          CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: |
+          export KILN_COMMIT=$(git rev-parse HEAD^)
+          cargo build --locked --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab
+          mkdir -p out
+          cp target/release/kiln out/kiln-prof
+          strip -o out/kiln target/release/kiln
+          cp target/release/kiln-lab out/kiln-lab
+          echo "$KILN_COMMIT" > out/COMMIT
+          ls -la out
+          echo "::notice title=g9 build::$KILN_COMMIT: $(ls -la out | awk 'NR>1 {print $5, $9}' | tr '\n' ' '); glibc at most $(objdump -T out/kiln | grep -oE 'GLIBC_[0-9.]+' | sort -t. -k2,2n -k3,3n -u | tail -1)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: g9-bins
+          path: out/
+          retention-days: 3
