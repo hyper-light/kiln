@@ -25,7 +25,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -153,10 +153,146 @@ pub fn profile() -> Profile {
 /// goal 8, plan 01a1a59c2b29 step 6), as [`pin`] chose them.
 static CORES: OnceLock<Vec<u32>> = OnceLock::new();
 
+/// Whether the process's other threads are kept off its shards' cores ([`pin`]): its compute pool
+/// is then sized to the cores they have, the shards not among them.
+static SHARDS_APART: AtomicBool = AtomicBool::new(false);
+
 /// Fix the runtime's shards to `cores`, cores of the process's own (the server's `[server] cores`),
-/// in their order: only the first call before the runtime starts has any effect.
+/// in their order, one shard to a core, and keep every other thread the process starts from here on
+/// off the shards' cores, so a shard waking finds its core free (goal 9, plan 01a1a87b2cec step 4: under
+/// Linux's lazy preemption a waking thread waits up to a tick, 1 ms, for a busy core's thread to
+/// give way, research 01a1a59c2b2a f36). Call it on the thread that starts the runtime, before it
+/// starts: only the first call has any effect.
 pub fn pin(cores: Vec<u32>) {
+    if CORES.get().is_some() {
+        return;
+    }
+    let mut shards = shard_cores(&cores, profile().shards);
+    shards.sort_unstable();
+    shards.dedup();
+    // Apart only where the other threads keep a core: the first, which `shard_cores` leaves them.
+    let apart = !shards.is_empty() && shards.len() < cores.len();
     let _ = CORES.set(cores);
+    if apart {
+        match crate::os::keep_threads_off(&shards) {
+            Ok(()) => SHARDS_APART.store(true, Ordering::Relaxed),
+            Err(why) => tracing::warn!(why = %why, "the server's other threads share its shards' cores"),
+        }
+    }
+}
+
+/// The real-time priority the shards ask for ([`realtime`]): the lowest (sched(7): 1 to 99), above
+/// every thread of the normal policies whatever its nice value and below the kernel's own real-time
+/// threads; what `kiln install` gives the server's unit room for (`LimitRTPRIO=`).
+pub const REALTIME_PRIORITY: i32 = hyper_rt::compute::REALTIME_LOWEST;
+
+/// Whether the shards ask for Linux's round-robin real-time class ([`realtime`]).
+static REALTIME: AtomicBool = AtomicBool::new(false);
+
+/// The shards' answers as each took the real-time class or was refused it: those that took it
+/// counted in units of one, those refused in units of [`REFUSED_ONE`], in one atomic, so exactly one
+/// shard, the last to answer, sees every answer in.
+static REALTIME_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// A refused shard's count in [`REALTIME_ANSWERS`]: past the most shards a runtime has
+/// (`Profile::with_env_overrides`' 64), so the two counts never meet.
+const REFUSED_ONE: u32 = 1 << 16;
+
+/// How many shards asked for the real-time class: the runtime's, once it started.
+static REALTIME_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The first refusal a shard met, for why.
+static REALTIME_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
+
+/// The server's shards in Linux's round-robin real-time class (`[server] realtime`; docs/priority.md,
+/// "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9, plan 01a1a87b2cec
+/// step 4): each shard asks as it starts, at [`REALTIME_PRIORITY`], so nothing it starts inherits it
+/// (reset on fork). Under Linux's lazy preemption a shard of the normal class waking where a process
+/// is busy in user space waits up to a tick, 1 ms, for it; a real-time one takes the CPU at once.
+/// Where the system refuses it (no `CAP_SYS_NICE` or `RLIMIT_RTPRIO` room; macOS and Windows), a shard
+/// runs as before, with a slice of its step, and the log and `/healthz/server` say why
+/// ([`realtime_status`]). Call it before the runtime starts: later calls change nothing.
+pub fn realtime(on: bool) {
+    REALTIME.store(on, Ordering::Relaxed);
+}
+
+/// How the shards took the real-time class ([`realtime`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Realtime {
+    /// Whether it was asked for (`[server] realtime`).
+    pub asked: bool,
+    /// The shards that asked.
+    pub shards: u32,
+    /// Of them, those that took it.
+    pub took: u32,
+    /// And those refused it, which run at the normal class with a slice of their step.
+    pub refused: u32,
+    /// Why those refused were, for a person.
+    pub why: Option<String>,
+}
+
+impl Realtime {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        if !self.asked || self.took.saturating_add(self.refused) < self.shards {
+            return None;
+        }
+        Some(match (self.took, &self.why) {
+            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}: a shard waking takes its CPU at once, whatever runs there"),
+            (0, why) => format!("the server's {} shards run at the normal class, with a slice of their step: the real-time class was refused ({})", self.refused, why.as_deref().unwrap_or("no reason given")),
+            (took, why) => format!("{took} of the server's {} shards run in the real-time class, {} at the normal class: it was refused ({})", self.shards, self.refused, why.as_deref().unwrap_or("no reason given")),
+        })
+    }
+}
+
+/// Why the real-time class was refused, for a person, from what refused it.
+fn realtime_why(refusal: &hyper_rt::compute::Refusal) -> String {
+    match refusal.code.map(|c| io::Error::from_raw_os_error(c).kind()) {
+        Some(io::ErrorKind::PermissionDenied) => format!(
+            "{refusal}: this process has neither CAP_SYS_NICE nor RLIMIT_RTPRIO room for priority {REALTIME_PRIORITY} (`kiln install` gives the server's unit LimitRTPRIO={REALTIME_PRIORITY}, which a user's service manager grants only as far as its own limit), or its kernel schedules real-time groups and gave the server's cgroup no real-time runtime"
+        ),
+        Some(io::ErrorKind::InvalidInput) => format!("{refusal}: the kernel doesn't take the round-robin real-time class here"),
+        Some(_) => refusal.to_string(),
+        None => refusal.call.to_owned(),
+    }
+}
+
+/// How the shards took the real-time class so far ([`realtime`]).
+pub fn realtime_status() -> Realtime {
+    realtime_of(REALTIME_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Realtime`] from the shards' `answers` ([`REALTIME_ANSWERS`]).
+fn realtime_of(answers: u32) -> Realtime {
+    Realtime {
+        asked: REALTIME.load(Ordering::Relaxed),
+        shards: REALTIME_SHARDS.load(Ordering::Relaxed),
+        took: answers % REFUSED_ONE,
+        refused: answers / REFUSED_ONE,
+        why: REALTIME_REFUSAL.get().map(realtime_why),
+    }
+}
+
+/// A shard asks for the real-time class ([`realtime`]): whether it took it. The last shard to answer
+/// says how they all did, once.
+fn took_realtime() -> bool {
+    let took = hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY);
+    if let Err(refusal) = took {
+        let _ = REALTIME_REFUSAL.set(refusal);
+    }
+    let one = if took.is_ok() { 1 } else { REFUSED_ONE };
+    let answers = REALTIME_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
+    let status = realtime_of(answers);
+    if status.took.saturating_add(status.refused) == status.shards
+        && let Some(line) = status.said()
+    {
+        if status.refused == 0 {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
+    }
+    took.is_ok()
 }
 
 /// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
@@ -224,6 +360,11 @@ fn start() -> Result<Rt, String> {
         Err(e) => return Err(format!("blocking pool: {e}")),
     }
     let mut config = runtime_config(p.shards, p.tasks_per_shard);
+    // The step quantum from `KILN_RT_QUANTUM_US`: the lab's A/B of quanta on one build (goal 9, plan
+    // 01a1a87b2cec step 3).
+    if let Some(us) = std::env::var("KILN_RT_QUANTUM_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
+        config.step_budget_ns = us.saturating_mul(1000);
+    }
     if let Some(cores) = CORES.get() {
         config.cores = shard_cores(cores, p.shards);
         config.pin = !config.cores.is_empty();
@@ -235,17 +376,67 @@ fn start() -> Result<Rt, String> {
         return Err("runtime started without shards".to_owned());
     }
     // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
-    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux).
+    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
+    // the real-time class is asked for and granted ([`realtime`]), it takes that instead: a real-time thread
+    // has no slice of the normal class's to ask for, and asking would put it back in that class.
+    let realtime = REALTIME.load(Ordering::Relaxed);
+    if realtime {
+        REALTIME_SHARDS.store(u32::try_from(holders.len()).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if realtime && took_realtime() {
+                return;
+            }
             if let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice) {
                 tracing::debug!(%refusal, "a shard kept the OS's slice");
             }
         });
     }
+    if SHARDS_APART.load(Ordering::Relaxed) {
+        keep_apart(&holders);
+    }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
     Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
+}
+
+/// Keeps the process's other threads off its shards' cores for as long as it runs ([`pin`]; goal 9,
+/// plan 01a1a87b2cec step 4): a thread starts with the CPUs of the thread that started it, and the
+/// server starts most of its threads from tasks on its shards, each fixed to its core. Each shard
+/// tells its thread's kernel id; then a thread of its own, once each period of the shards' probes
+/// (`crate::shard_health::PERIOD`, so a thread a shard started shares its core for at most a probe's
+/// period), moves each thread it hasn't seen yet that may run on a shard's core
+/// (`crate::os::keep_off_shards`). A child process a shard starts is moved as it starts
+/// (`crate::os::keep_child_off_shards`).
+fn keep_apart(holders: &[SlotHolder]) {
+    let tids: Arc<Vec<std::sync::atomic::AtomicU32>> = Arc::new(holders.iter().map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+    for (i, holder) in holders.iter().enumerate() {
+        let tids = Arc::clone(&tids);
+        let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if let (Some(slot), Some(id)) = (tids.get(i), crate::os::thread_id()) {
+                slot.store(id, Ordering::Release);
+            }
+        });
+    }
+    let spawned = std::thread::Builder::new().name("kiln-apart".into()).spawn(move || {
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            std::thread::sleep(crate::shard_health::PERIOD);
+            let shards: Vec<u32> = tids.iter().map(|t| t.load(Ordering::Acquire)).collect();
+            // Not until every shard has said which thread is its own.
+            if shards.contains(&0) {
+                continue;
+            }
+            let moved = crate::os::keep_off_shards(&shards, &mut seen);
+            if moved > 0 {
+                tracing::debug!(moved, "threads moved off the shards' cores");
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "the server's other threads may share its shards' cores: no thread to keep them off");
+    }
 }
 
 /// The compute pool (goal 3 of the API runtime program, plan 01a1a59c2a8e step 1; `hyper_rt::compute`): as
@@ -261,7 +452,8 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
     }
     let grant = hyper_rt::compute::Grant::of_process();
     let shards = usize::from(p.shards);
-    let workers = hyper_rt::compute::workers_for(&grant, shards);
+    // Shards on cores of their own aren't among the cores the pool's threads may take ([`pin`]).
+    let workers = hyper_rt::compute::workers_for(&grant, if SHARDS_APART.load(Ordering::Relaxed) { 0 } else { shards });
     let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns, rank: hyper_rt::compute::Rank::Below };
     // Each job's wait for a thread and each piece's time, on /metrics (step 3; `crate::pool_health`).
     let _ = hyper_rt::compute::observe(crate::pool_health::compute_job);
@@ -271,7 +463,11 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
                 Ok(priority) => priority.to_string(),
                 Err(refusal) => format!("the process's own ({refusal})"),
             };
-            let size = format!("{} threads: {grant}, less {shards} shards", started.workers);
+            let size = if SHARDS_APART.load(Ordering::Relaxed) {
+                format!("{} threads: {grant}, its shards on cores of their own", started.workers)
+            } else {
+                format!("{} threads: {grant}, less {shards} shards", started.workers)
+            };
             if p.announce {
                 tracing::info!(size = %size, priority = %priority, lowered = started.lowered, "compute pool started");
             } else {
@@ -452,6 +648,44 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
+/// [`spawn`], placed as [`spawn_spread`] places a task: on the next shard round-robin wherever the
+/// caller is, passing over one the watchdog sees held. For a service the process starts and keeps (a
+/// supervised child, a feed's loop): started from a task on one shard, as a server's are by its
+/// start-up on the shard that runs it, [`spawn`] would keep every one of them on that shard (goal 9,
+/// plan 01a1a87b2cec step 3: the lab's calm baseline found the server's shard 0 busy 0.24 of the time
+/// against 0.016 on each of the others, and its delay p99.9 94 ms against about 1 ms).
+#[track_caller]
+pub fn spawn_spread_joined<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let (fut, abort) = futures::future::abortable(fut);
+    let slot = handoff(Box::pin(async move {
+        if let Ok(v) = fut.await {
+            let _ = tx.send(v);
+        }
+    }));
+    let mut placed = submit_spread(&slot) || submit(&slot);
+    // Off the runtime (start-up, tests), a burst that filled the control queues is waited out, as
+    // `spawn_boxed` waits it out (a loop, not a closure, so the caller's place stays the spawn site).
+    if !placed && !on_shard() {
+        for _ in 0..2000 {
+            std::thread::sleep(Duration::from_millis(2));
+            if submit_spread(&slot) {
+                placed = true;
+                break;
+            }
+        }
+    }
+    if !placed {
+        crate::metrics::global().panics_caught.inc();
+        tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+    }
+    JoinHandle { rx, abort }
+}
+
 /// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
 /// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
 /// task starting Critical: its first request's head must be read before the request's class is known, and
@@ -475,30 +709,30 @@ pub fn shard_count() -> usize {
 
 /// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
 /// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
-/// rest. Whether the shard took it.
+/// rest. Whether the shard took it. The caller's place is the task's spawn site.
+#[track_caller]
 pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
     let Ok(rt) = rt() else { return false };
-    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+    let Some(holder) = rt.holders.get(i) else { return false };
+    hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok()
 }
 
 /// Run `fut` as its own task on shard `shard` (of [`shard_count`]) for its whole life, wherever the
 /// caller is: a task that owns what belongs to that shard (each agent session's copy,
 /// `crate::harness::copies`). Refused there (its arena or control queue full), it waits as
 /// [`spawn`] does off the runtime, then runs on whichever shard takes it, said, rather than not at
-/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2.
+/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2. The caller's place is the
+/// task's spawn site.
+#[track_caller]
 pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
     let slot = handoff(Box::pin(fut));
-    let there = |slot: &Arc<Mutex<Option<Boxed>>>| {
-        let holder = rt().ok().and_then(|rt| rt.holders.get(shard % rt.holders.len().max(1)).copied());
-        holder.is_some_and(|h| hyper_rt::runtime::submit_to_holder(h, bootstrap(slot)).is_ok())
-    };
-    if there(&slot) {
+    if owner_takes(shard, &slot) {
         return;
     }
     if !on_shard() {
         for _ in 0..2000 {
             std::thread::sleep(Duration::from_millis(2));
-            if there(&slot) {
+            if owner_takes(shard, &slot) {
                 return;
             }
         }
@@ -509,6 +743,26 @@ pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F
     }
     crate::metrics::global().panics_caught.inc();
     tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+}
+
+/// Whether shard `shard` (of [`shard_count`], around again past the last) took the task in `slot`.
+#[track_caller]
+fn owner_takes(shard: usize, slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    let Some(holder) = rt().ok().and_then(|rt| rt.holders.get(shard.checked_rem(rt.holders.len())?).copied()) else { return false };
+    hyper_rt::runtime::submit_to_holder(holder, bootstrap(slot)).is_ok()
+}
+
+/// `fut`, each of its polls labeled `label` for the shards' table of slow polls: should a poll of it hold
+/// its shard past 100 µs, the shard counts it against `label` as well as its task's spawn site
+/// (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2). A request's route, say
+/// (`crate::route_latency::label_of`).
+pub async fn labeled<F: Future>(label: &'static hyper_rt::slow::Label, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        hyper_rt::futures::label(label);
+        fut.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
@@ -1519,6 +1773,30 @@ mod tests {
         assert_eq!(shard_cores(&[8, 9, 10], 4), vec![9, 10, 9, 10]);
         assert_eq!(shard_cores(&[5], 2), vec![5, 5]);
         assert!(shard_cores(&[], 2).is_empty());
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7), goal 9 (plan 01a1a87b2cec step 4): how the shards took the
+    /// real-time class is said once all of them answered, and never when it wasn't asked for; a refusal
+    /// says why in a person's words, naming the grant `kiln install` writes.
+    #[test]
+    fn g9_s4_the_real_time_class_is_said_as_the_shards_took_it() {
+        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned) };
+        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None }.said(), None, "not asked for: nothing to say");
+        assert_eq!(status(3, 0, None).said(), None, "not every shard has answered");
+        assert!(status(4, 0, None).said().is_some_and(|s| s.contains("4 shards run in Linux's round-robin real-time class at priority 1")));
+        assert!(status(0, 4, Some("no room")).said().is_some_and(|s| s.contains("4 shards run at the normal class") && s.contains("no room")));
+        assert!(status(1, 3, Some("no room")).said().is_some_and(|s| s.starts_with("1 of the server's 4 shards")));
+        // EPERM, as Unix numbers it.
+        if cfg!(unix) {
+            let eperm = hyper_rt::compute::Refusal { call: "sched_setattr", code: Some(1) };
+            let why = realtime_why(&eperm);
+            assert!(why.contains("RLIMIT_RTPRIO") && why.contains("LimitRTPRIO=1"), "{why}");
+        }
+        let elsewhere = hyper_rt::compute::Refusal { call: "no real-time class to ask for on macOS", code: None };
+        assert_eq!(realtime_why(&elsewhere), "no real-time class to ask for on macOS");
+        // Both kinds of answer counted in one atomic, each read back apart.
+        let answers = 3 + 2 * REFUSED_ONE;
+        assert_eq!((answers % REFUSED_ONE, answers / REFUSED_ONE), (3, 2));
     }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four

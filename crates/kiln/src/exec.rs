@@ -533,6 +533,11 @@ impl Exec {
         let mut child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);
         let pgid = child.process_id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        // Off the cores of a server beside it, as a step on pipes starts (docs/priority.md, "Legs and
+        // agents keep off the server's cores"; goal 8, plan 01a1a59c2b29 step 7): moved as it starts.
+        if pgid > 0 {
+            crate::os::onto_work_cpus_pid(pgid.unsigned_abs());
+        }
         // A pty's step leads a session of its own: its process group is its id. It joins its job's
         // cgroup as it starts (W26-R22).
         if let Some(f) = crate::runner::freeze::of(&self.assign.job_id).filter(|_| pgid > 0) {

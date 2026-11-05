@@ -115,8 +115,23 @@ const REFUSED: Class = Class::Command(Away::Refuse);
 
 /// A function giving every variant of an enum its class, matched without a catch-all arm, and a
 /// table of the variants' names and classes in the same order (what docs/wire.md is checked
-/// against).
+/// against). With a third name, also each variant's label for the shards' table of slow polls.
 macro_rules! classes {
+    ($(#[$doc:meta])* fn $f:ident($e:ty) -> $table:ident, $named:ident, $labeled:ident { $($p:pat => $c:expr,)+ }) => {
+        classes! { $(#[$doc])* fn $f($e) -> $table, $named { $($p => $c,)+ } }
+
+        /// What the polls handling a message are labeled with in the shards' table of what held them
+        /// (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 3): a static of each variant's own, named
+        /// by its pattern, so a label costs a match and nothing is kept per message.
+        pub fn $labeled(m: &$e) -> &'static hyper_rt::slow::Label {
+            match m {
+                $($p => {
+                    static LABEL: hyper_rt::slow::Label = hyper_rt::slow::Label { name: concat!("runner ", stringify!($p)) };
+                    &LABEL
+                })+
+            }
+        }
+    };
     ($(#[$doc:meta])* fn $f:ident($e:ty) -> $table:ident, $named:ident { $($p:pat => $c:expr,)+ }) => {
         $(#[$doc])*
         pub fn $f(m: &$e) -> Class {
@@ -148,7 +163,7 @@ fn variant(pattern: &'static str) -> &'static str {
 
 classes! {
     /// A runner's messages to the server.
-    fn agent_class(AgentMsg) -> agent_classes, agent_name {
+    fn agent_class(AgentMsg) -> agent_classes, agent_name, agent_label {
         AgentMsg::Hello(..) => Class::Handshake,
         AgentMsg::Heartbeat { .. } => Class::Telemetry,
         AgentMsg::Sample(..) => Class::Telemetry,
@@ -584,6 +599,19 @@ mod contract {
         assert_eq!(variant("AgentMsg::Hello(..)"), "Hello");
         assert_eq!(variant("ServerMsg::Welcome { .. }"), "Welcome");
         assert_eq!(variant("ServerMsg::Drain"), "Drain");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a runner's message labels the polls that handle it by its kind, one
+    /// static for each variant, named by its pattern.
+    #[test]
+    fn g9_s3_a_runners_message_is_labeled_by_its_kind() {
+        let harness = agent_label(&AgentMsg::Harness { session: "s".into(), json: "{}".into() });
+        let again = agent_label(&AgentMsg::Harness { session: "t".into(), json: "[]".into() });
+        let front = agent_label(&AgentMsg::FrontDoorStatus { json: "{}".into() });
+        assert!(std::ptr::eq(harness, again), "one label for each kind");
+        assert!(!std::ptr::eq(harness, front), "each kind its own");
+        assert_eq!(variant(harness.name.trim_start_matches("runner ")), "Harness");
+        assert_eq!(variant(front.name.trim_start_matches("runner ")), "FrontDoorStatus");
     }
 
     #[test]

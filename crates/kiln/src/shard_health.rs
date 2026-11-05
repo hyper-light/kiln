@@ -11,9 +11,11 @@
 //! takes no lock and asks nothing of the shard's loop.
 //!
 //! - **Delay** (`kiln_shard_delay_seconds`): how late each probe ran against when its timer fell
-//!   due. It includes up to one tick of the timer wheel (100 µs, `crate::rt::runtime_config`) by
-//!   design. A shard held for good stops probing: `kiln_shard_stalled_seconds` says how long since
-//!   its probe last ran, before any late wake can be noted.
+//!   due, in buckets fine enough to read to tens of microseconds below a millisecond ([`DELAY_BUCKETS`]).
+//!   It includes up to one tick of the timer wheel (100 µs, `crate::rt::runtime_config`) and the
+//!   shard thread's timer slack (its tick again) by design. A shard held for good stops probing:
+//!   `kiln_shard_stalled_seconds` says how long since its probe last ran, before any late wake can be
+//!   noted.
 //! - **Busy** (`kiln_shard_busy_seconds_total`): the CPU time the shard's thread has run, so its rate
 //!   is the share of the time the shard was on the CPU (Linux and macOS; Windows keeps a thread's
 //!   times at the scheduler's tick, so no series there). Time the host held a ready shard off the
@@ -23,17 +25,39 @@
 //!   runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU), `blocking` (it waited
 //!   inside a call), `host` (it was runnable and off the CPU: preempted), `unknown` (where the OS
 //!   can't tell: off the CPU on macOS, every one on Windows).
+//! - **Tasks** (`kiln_shard_tasks`, `kiln_shard_tasks_most`): the tasks each shard holds as its probe
+//!   wakes (admitted and not yet ended, by hyper-rt's counts), and the most it has held so: what a shard's
+//!   task slots, which it makes as it starts, are sized from (`crate::rt::Profile`; goal 11, plan
+//!   01a1a87b2e56 step 3).
+//! - **What held a shard** (`kiln_shard_held_*`, by `site` and `label`): every poll past 100 µs
+//!   (`hyper_rt::slow::SLOW_POLL_NS`, goal 9, plan 01a1a87b2cec step 2), counted against the spawn
+//!   site of its task and the label its code set (a request's route, `crate::route_latency::label_of`),
+//!   as the shard keeps them (`hyper_rt::slow`): how many, their holds added up, and the longest; and of
+//!   them, those the host held (preempted, as hyper-rt finds out for a poll past twice its step quantum),
+//!   with their time: what no code held (steps 3 and 4).
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::metrics::{Histogram, STALL_BUCKETS};
+use crate::metrics::Histogram;
 
 /// How often each probe wakes, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): Node's default
 /// sampling of its loop's delay (research 01a1a59c2a6a, f8).
 pub const PERIOD: Duration = Duration::from_millis(10);
+
+/// How late a probe ran, in seconds (goal 9, plan 01a1a87b2cec step 1): a shard's ready work is to run within
+/// a millisecond at p99.9 (Ada, 2026-11-05), so the buckets resolve that millisecond: 25 µs apart to 250 µs,
+/// where a calm probe lands (the wheel's tick and the timer slack, up to 100 µs each by design), then 50 µs
+/// apart to 1 ms, so a quantile read off them (linearly within a bucket, as `histogram_quantile` does) is
+/// within 25 µs of the probe's own below 1 ms, a fortieth of the bar; then 250 µs apart to 2 ms and the
+/// steps of the stall buckets (`crate::metrics::STALL_BUCKETS`) to a minute, so a stall of seconds still lands
+/// in a bucket of its own.
+pub const DELAY_BUCKETS: &[f64] = &[
+    0.00001, 0.000025, 0.00005, 0.000075, 0.0001, 0.000125, 0.00015, 0.000175, 0.0002, 0.000225, 0.00025, 0.0003, 0.00035, 0.0004, 0.00045, 0.0005, 0.00055, 0.0006, 0.00065, 0.0007,
+    0.00075, 0.0008, 0.00085, 0.0009, 0.00095, 0.001, 0.00125, 0.0015, 0.00175, 0.002, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0,
+];
 
 /// One shard's figures, written by its probe alone, read by `/metrics`. On a cache line of its own
 /// (the largest we target, Apple silicon's 128 bytes, as hyper-rt's own pulse is): each probe writes
@@ -54,12 +78,14 @@ pub struct Shard {
     slow_unknown: AtomicU64,
     longest_poll_ns: AtomicU64,
     overrun_ns: AtomicU64,
+    tasks: AtomicU64,
+    most_tasks: AtomicU64,
 }
 
 impl Shard {
     fn new() -> Self {
         Self {
-            delay: Histogram::new(STALL_BUCKETS),
+            delay: Histogram::new(DELAY_BUCKETS),
             last_ns: AtomicU64::new(0),
             late_ns: AtomicU64::new(0),
             most_late_ns: AtomicU64::new(0),
@@ -71,6 +97,8 @@ impl Shard {
             slow_unknown: AtomicU64::new(0),
             longest_poll_ns: AtomicU64::new(0),
             overrun_ns: AtomicU64::new(0),
+            tasks: AtomicU64::new(0),
+            most_tasks: AtomicU64::new(0),
         }
     }
 
@@ -90,6 +118,9 @@ impl Shard {
             self.slow_unknown.store(c.unattributed_steps, Ordering::Relaxed);
             self.longest_poll_ns.store(c.longest_step_ns, Ordering::Relaxed);
             self.overrun_ns.store(c.scheduler_overrun_ns, Ordering::Relaxed);
+            let tasks = held_tasks(&c);
+            self.tasks.store(tasks, Ordering::Relaxed);
+            self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
         }
         let cpu = thread_cpu_ns();
         if let Some(cpu) = cpu {
@@ -122,8 +153,16 @@ impl Shard {
             },
             longest_poll: Duration::from_nanos(self.longest_poll_ns.load(Ordering::Relaxed)),
             overrun: Duration::from_nanos(self.overrun_ns.load(Ordering::Relaxed)),
+            tasks: self.tasks.load(Ordering::Relaxed),
+            most_tasks: self.most_tasks.load(Ordering::Relaxed),
         }
     }
+}
+
+/// The tasks a shard holds by its counts: those admitted, less those whose future returned, was dropped or
+/// unwound.
+fn held_tasks(c: &hyper_rt::shard_loop::Counters) -> u64 {
+    c.spawns.saturating_sub(c.completed).saturating_sub(c.cancelled).saturating_sub(c.unwound)
 }
 
 /// Slow polls by cause (see the module's notes).
@@ -160,6 +199,9 @@ pub struct Snapshot {
     pub slow: Slow,
     pub longest_poll: Duration,
     pub overrun: Duration,
+    /// The tasks it held at its probe's latest wake, and the most it held at any.
+    pub tasks: u64,
+    pub most_tasks: u64,
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -274,7 +316,7 @@ pub fn render(o: &mut String) {
         let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
     };
     let snaps: Vec<Snapshot> = all.iter().map(Shard::snapshot).collect();
-    help(o, "kiln_shard_delay_seconds", "histogram", "How late ready work ran on each shard: a probe's timer, due every period, against when the probe ran (up to a timer tick, 100 us, by design).");
+    help(o, "kiln_shard_delay_seconds", "histogram", "How late ready work ran on each shard: a probe's timer, due every period, against when the probe ran (up to a timer tick and the thread's timer slack, 100 us each, by design).");
     for (i, s) in all.iter().enumerate() {
         s.delay.render(o, "kiln_shard_delay_seconds", &format!("shard=\"{i}\""));
     }
@@ -313,4 +355,55 @@ pub fn render(o: &mut String) {
     for (i, s) in snaps.iter().enumerate() {
         let _ = writeln!(o, "kiln_shard_scheduler_overrun_seconds{{shard=\"{i}\"}} {}", secs(s.overrun));
     }
+    help(o, "kiln_shard_tasks", "gauge", "Tasks each shard held (admitted, not yet ended) as its probe last woke.");
+    for (i, s) in snaps.iter().enumerate() {
+        let _ = writeln!(o, "kiln_shard_tasks{{shard=\"{i}\"}} {}", s.tasks);
+    }
+    help(o, "kiln_shard_tasks_most", "gauge", "The most tasks each shard has held as its probe woke: what its task slots are sized from.");
+    for (i, s) in snaps.iter().enumerate() {
+        let _ = writeln!(o, "kiln_shard_tasks_most{{shard=\"{i}\"}} {}", s.most_tasks);
+    }
+    render_held(o, &help);
+}
+
+/// The `kiln_shard_held_*` families: what held each shard past 100 µs, by its task's spawn site and the
+/// label its code set (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2). Read from each shard's own table,
+/// which only the shard writes: no lock, nothing asked of the shard.
+fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    // No probes, no runtime asked for (rendering must not start one).
+    if shards().is_empty() {
+        return;
+    }
+    // Each shard's entries by what the exposition names them (two labels of one name are one series): polls,
+    // their time, the longest, and those of them the host held with their time.
+    type Row = (u64, u64, u64, u64, u64);
+    let mut rows: std::collections::BTreeMap<(usize, String, &'static str), Row> = std::collections::BTreeMap::new();
+    for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
+        for p in hyper_rt::slow::slow_polls(holder) {
+            let site = p.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            let row = rows.entry((i, site, p.label.map_or("", |l| l.name))).or_default();
+            *row = (row.0.saturating_add(p.polls), row.1.saturating_add(p.total_ns), row.2.max(p.longest_ns), row.3.saturating_add(p.host_polls), row.4.saturating_add(p.host_ns));
+        }
+    }
+    let series = |o: &mut String, name: &str, value: &dyn Fn(&Row) -> String| {
+        for ((i, site, label), row) in &rows {
+            let _ = writeln!(o, "{name}{{shard=\"{i}\",site=\"{}\",label=\"{}\"}} {}", escape(site), escape(label), value(row));
+        }
+    };
+    help(o, "kiln_shard_held_polls_total", "counter", "Polls that held a shard past 100 us, by the spawn site of their task and the label its code set (a request's route).");
+    series(o, "kiln_shard_held_polls_total", &|r| r.0.to_string());
+    help(o, "kiln_shard_held_seconds_total", "counter", "How long those polls held their shard, added up.");
+    series(o, "kiln_shard_held_seconds_total", &|r| secs(Duration::from_nanos(r.1)).to_string());
+    help(o, "kiln_shard_held_longest_seconds", "gauge", "The longest of those polls.");
+    series(o, "kiln_shard_held_longest_seconds", &|r| secs(Duration::from_nanos(r.2)).to_string());
+    // Goal 9, plan 01a1a87b2cec steps 3 and 4: what of it no code held.
+    help(o, "kiln_shard_held_host_polls_total", "counter", "Of those polls, the ones the host held: the shard's thread runnable and off the CPU (preempted), as found for polls past twice the step quantum.");
+    series(o, "kiln_shard_held_host_polls_total", &|r| r.3.to_string());
+    help(o, "kiln_shard_held_host_seconds_total", "counter", "How long the polls the host held held their shard, added up.");
+    series(o, "kiln_shard_held_host_seconds_total", &|r| secs(Duration::from_nanos(r.4)).to_string());
+}
+
+/// A label's value as the exposition writes it: its backslashes, quotes and line ends escaped.
+fn escape(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }

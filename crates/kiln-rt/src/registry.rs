@@ -125,6 +125,9 @@ pub struct Entry {
     /// The shard thread's id in the kernel (Linux: its `gettid`), recorded as it starts, for the watchdog to read
     /// its state (`/proc/self/task/<tid>/stat`): zero until then and on other platforms.
     os_thread: AtomicU64,
+    /// The shard's polls past `crate::slow::SLOW_POLL_NS`, by spawn site and label: the shard writes it after
+    /// such a poll, any thread reads it (`crate::slow`, kiln's goal 9).
+    pub(crate) slow: crate::slow::SlowTable,
 }
 
 impl Entry {
@@ -547,6 +550,7 @@ pub(crate) fn register_runtime_slot(
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             os_thread: AtomicU64::new(0),
+            slow: crate::slow::SlowTable::default(),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,

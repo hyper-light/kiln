@@ -232,13 +232,15 @@ fn summary_line(r: &lab::Round) -> String {
     // Latencies to the microsecond (goal 10, plan 01a1a87b2dae step 1).
     let get = |k: &str| r.numbers.get(k).map_or_else(|| "-".to_owned(), |v| format!("{v:.3}"));
     format!(
-        "api_read p50 {} p99.9 {} ms, websocket p50 {} p99.9 {} ms, attach p99 {} ms, shards' delay p99 {} ms, server CPU {} ms a request",
+        "api_read p50 {} p99.9 {} ms, websocket p50 {} p99.9 {} ms, attach p99 {} ms, shards' delay p99.9 {} µs (worst shard {} µs), shards' busy share {}, server CPU {} ms a request",
         get("api_read.p50_ms"),
         get("api_read.p999_ms"),
         get("websocket.p50_ms"),
         get("websocket.p999_ms"),
         get("attach.p99_ms"),
-        get("shards.delay_p99_ms"),
+        get("shards.delay_p999_us"),
+        get("shards.worst_delay_p999_us"),
+        get("shards.busy_share"),
         get("server.cpu_ms_per_request")
     )
 }

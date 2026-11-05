@@ -266,21 +266,20 @@ impl Hub {
             self.send_peer(peer, &crate::proto::ServerMsg::Refused { reason: why.clone() }).await;
             return;
         }
-        if self.instances.lock().newest(agent) != Some(peer) {
+        if self.instances.load().newest(agent) != Some(peer) {
             return;
         }
-        let snapshot = {
-            let mut g = self.agents.lock();
-            let Some(a) = g.get_mut(agent) else { return };
-            if a.skew == s {
-                return;
-            }
-            if let Some(why) = s.holds() {
-                tracing::info!(%agent, %why, "a runner behind the server's kiln takes no new work until it's upgraded");
-            }
-            a.skew = s;
+        if self.agents.load().get(agent).is_none_or(|a| a.skew == s) {
+            return;
+        }
+        let changed = self.change_agent(agent, |a| (a.skew != s).then(|| {
+            a.skew = s.clone();
             a.clone()
-        };
+        }));
+        let Some(snapshot) = changed.flatten() else { return };
+        if let Some(why) = s.holds() {
+            tracing::info!(%agent, %why, "a runner behind the server's kiln takes no new work until it's upgraded");
+        }
         self.emit_agent(&snapshot);
         // Its legs: none while it's to be upgraded (CI's dispatch counts no slots for it).
         self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() });
@@ -291,8 +290,8 @@ impl Hub {
     /// Every connected runner process weighed again (the tolerances changed).
     pub(crate) async fn skew_again(self: &Arc<Self>) {
         let procs: Vec<(String, PeerId, Option<String>)> = {
-            let inst = self.instances.lock();
-            self.agents.lock().values().filter(|a| a.connected).flat_map(|a| inst.of(&a.name).into_iter().map(|p| (a.name.clone(), p, inst.get(p).and_then(|i| i.kiln.as_ref().map(|k| k.commit.clone()))))).collect()
+            let inst = self.instances.load();
+            self.agents.load().values().filter(|a| a.connected).flat_map(|a| inst.of(&a.name).into_iter().map(|p| (a.name.clone(), p, inst.get(p).and_then(|i| i.kiln.as_ref().map(|k| k.commit.clone()))))).collect()
         };
         for (agent, peer, commit) in procs {
             self.skew_check(&agent, peer, commit);
@@ -301,7 +300,7 @@ impl Hub {
 
     /// Why machine `agent` takes no new work now, when it doesn't (its kiln is to be upgraded).
     pub fn skew_holds(&self, agent: &str) -> Option<String> {
-        self.agents.lock().get(agent).and_then(|a| a.skew.holds().map(|w| format!("{}: {w}", a.shown())))
+        self.agents.load().get(agent).and_then(|a| a.skew.holds().map(|w| format!("{}: {w}", a.shown())))
     }
 }
 

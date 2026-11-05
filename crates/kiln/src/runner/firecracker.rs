@@ -241,6 +241,11 @@ fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_
     if let Some(g) = &group {
         g.enter(&mut cmd);
     }
+    // A leg's VMM, its vCPUs' threads with it, keeps off the cores of a server beside it
+    // (docs/priority.md, "Legs and agents keep off the server's cores").
+    if whose == Whose::Leg {
+        crate::os::onto_work_cpus(&mut cmd);
+    }
     let child = cmd.current_dir(dir).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().with_context(|| format!("starting {}", m.firecracker.display()))?;
     Ok(Vm { child: Some(child), console, group })
 }

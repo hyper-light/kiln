@@ -107,17 +107,19 @@ pub fn token(key: &str, machine: &str) -> String {
     crate::util::hmac_hex(key.as_bytes(), format!("cluster:{machine}").as_bytes())
 }
 
-/// This process's learner, when it holds one (the front door answers reads from it).
-static GLOBAL: parking_lot::RwLock<Option<Arc<Learner>>> = parking_lot::RwLock::new(None);
+/// This process's learner, when it holds one (the front door answers reads from it): read on every
+/// front-door connection without a lock, swapped as the learner starts and stops (goal 5, plan
+/// 01a1a59c2aae step 2; P2, plan 01a1a283e14c).
+static GLOBAL: arc_swap::ArcSwapOption<Learner> = arc_swap::ArcSwapOption::const_empty();
 
 /// Says this process holds `learner` (or none now).
 pub fn set_global(learner: Option<Arc<Learner>>) {
-    *GLOBAL.write() = learner;
+    GLOBAL.store(learner);
 }
 
 /// This process's learner, if it holds one.
 pub fn global() -> Option<Arc<Learner>> {
-    GLOBAL.read().clone()
+    GLOBAL.load_full()
 }
 
 /// Where a runner keeps its replica and its log.
@@ -137,8 +139,9 @@ pub struct Learner {
     me: String,
     /// What it says to the server.
     say: async_channel::Sender<AgentMsg>,
-    /// Questions to the server of where kiln.db stands, waiting for their answers.
-    asks: parking_lot::Mutex<std::collections::HashMap<u64, async_channel::Sender<u64>>>,
+    /// Questions to the server of where kiln.db stands, waiting for their answers: each answer, or its
+    /// asker giving up, takes it once, with no lock (`crate::rcu::Pending`; goal 5, plan 01a1a59c2aae).
+    asks: crate::rcu::Pending<u64, async_channel::Sender<u64>>,
     next_ask: std::sync::atomic::AtomicU64,
     /// The server's checkpoints of the log, to check in the order they came.
     checkpoints: async_channel::Sender<Checkpoint>,
@@ -193,7 +196,7 @@ impl Learner {
             store,
             me: me.to_owned(),
             say,
-            asks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            asks: crate::rcu::Pending::default(),
             next_ask: std::sync::atomic::AtomicU64::new(1),
             checkpoints,
             diverged,
@@ -220,7 +223,7 @@ impl Learner {
         }
         let id = self.next_ask.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = async_channel::bounded(1);
-        self.asks.lock().insert(id, tx);
+        self.asks.put(id, tx);
         let checks = checks(&self.group);
         let asked = async {
             self.say.send(AgentMsg::Cluster { json: encode(&Msg::Ask { id, checks }), raft: Vec::new() }).await.ok()?;
@@ -231,7 +234,7 @@ impl Learner {
             Some(())
         };
         let done = matches!(crate::rt::timeout(within, asked).await, Ok(Some(())));
-        self.asks.lock().remove(&id);
+        drop(self.asks.take(&id));
         done
     }
 
@@ -239,8 +242,7 @@ impl Learner {
     /// stands; or a checkpoint of the log, to check.
     pub fn heard(&self, msg: &Msg, raft: Vec<u8>) {
         if let Msg::At { id, seq } = *msg {
-            let waiting = self.asks.lock().remove(&id);
-            if let Some(tx) = waiting {
+            if let Some(tx) = self.asks.take(&id) {
                 tx.try_send(seq).ok();
             }
             return;
@@ -444,8 +446,9 @@ impl Periods {
 #[derive(Default)]
 pub struct Learners {
     /// Each learner's machine, by its member: those that said they hold one since the server
-    /// started (the group's other learners are away).
-    machines: parking_lot::Mutex<std::collections::HashMap<u64, String>>,
+    /// started (the group's other learners are away). Read for every message the group sends a
+    /// learner without a lock, a copy swapped in as learners come and go (goal 5, plan 01a1a59c2aae).
+    machines: crate::rcu::Rcu<std::collections::HashMap<u64, String>>,
     joiner: parking_lot::Mutex<Joiner>,
     next: std::sync::atomic::AtomicU64,
     /// The checkpoints of the log owed to the learners that check them (docs/ci.md W27-R08).
@@ -462,11 +465,11 @@ impl Learners {
     pub fn announced(&self, group: &Group, machine: &str) -> u64 {
         let member = super::group::member_of(machine);
         let mut wanted: std::collections::BTreeSet<u64> = group.point().1.learners.iter().copied().collect();
-        {
-            let mut m = self.machines.lock();
+        let known: Vec<u64> = self.machines.update(|m| {
             m.insert(member, machine.to_owned());
-            wanted.extend(m.keys().copied());
-        }
+            m.keys().copied().collect()
+        });
+        wanted.extend(known);
         group.learners(wanted);
         member
     }
@@ -475,17 +478,17 @@ impl Learners {
     /// the group, and the machine comes back as a new one when it announces itself as it is now.
     pub fn moved(&self, group: &Group, from: &str) {
         let gone = super::group::member_of(from);
-        let wanted: std::collections::BTreeSet<u64> = {
-            let mut m = self.machines.lock();
+        let known: Vec<u64> = self.machines.update(|m| {
             m.remove(&gone);
-            group.point().1.learners.iter().copied().filter(|l| *l != gone).chain(m.keys().copied()).collect()
-        };
+            m.keys().copied().collect()
+        });
+        let wanted: std::collections::BTreeSet<u64> = group.point().1.learners.iter().copied().filter(|l| *l != gone).chain(known).collect();
         group.learners(wanted);
     }
 
     /// The machine of learner `member`, if it said so since the server started.
     pub fn machine(&self, member: u64) -> Option<String> {
-        self.machines.lock().get(&member).cloned()
+        self.machines.load().get(&member).cloned()
     }
 
     /// A raft message from `machine`'s learner, or a part of one: to the group once whole.

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Step 7's lab (docs/priority.md, "Step 7's lab"; goal 8, plan 01a1a59c2b29 step 7; goal 9, plan 01a1a87b2cec step 4):
+# scripts/shard_lab/kiln-server with one setting more. The lab's kiln with its server alone in a scope of its own at
+# CPUWeight=1000, as kiln.slice gives the server on bare metal (docs/priority.md), on CPUs of its own. Given to
+# kiln-lab as --kiln, beside the kiln it runs (bin/kiln). The lab starts its server as `kiln --config <file> server`;
+# systemd-run --scope and taskset exec it in place, so its pid and process group stay the lab's to stop. Linux with
+# systemd's user manager. From the server's environment (kiln-lab --env):
+#   LAB_SERVER_CPUS    the server on these CPUs (its scope's AllowedCPUs= and its affinity), whatever the lab's own
+#   LAB_SERVER_CORES   `[server] cores` in its config: its shards on cores of their own, its other threads off them
+#   LAB_SERVER_RTPRIO  its RLIMIT_RTPRIO raised to this, the soft limit within the hard one, as `kiln install`'s unit
+#                      grants LimitRTPRIO= (a scope takes no limits of systemd's): what lets its shards take the
+#                      real-time class it asks for with KILN_RT_REALTIME=1. A machine whose hard limit is lower
+#                      refuses it, and the server says so (its log, /healthz/server).
+real=$(dirname "$(readlink -f "$0")")/kiln
+if [ "${3:-}" = server ]; then
+  props=(-p CPUWeight=1000 -p MemoryMax=8G)
+  on=()
+  if [ -n "${LAB_SERVER_CPUS:-}" ]; then
+    props+=(-p AllowedCPUs="$LAB_SERVER_CPUS")
+    on=(taskset -c "$LAB_SERVER_CPUS")
+  fi
+  if [ -n "${LAB_SERVER_CORES:-}" ]; then
+    sed -i "s/^\[server\]\$/[server]\ncores = \"$LAB_SERVER_CORES\"/" "$2"
+  fi
+  if [ -n "${LAB_SERVER_RTPRIO:-}" ]; then
+    ulimit -Sr "$LAB_SERVER_RTPRIO" 2>/dev/null ||
+      echo "kiln-server-s7c: RLIMIT_RTPRIO stays $(ulimit -Sr) (hard $(ulimit -Hr)): the real-time class will be refused" >&2
+  fi
+  exec systemd-run --user --scope --quiet --collect "${props[@]}" --unit="kiln-lab-server-$$" "${on[@]}" "$real" "$@"
+fi
+exec "$real" "$@"

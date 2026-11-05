@@ -407,12 +407,15 @@ pub fn stacks(c: &rusqlite::Connection) -> anyhow::Result<Stacks> {
 }
 
 impl Stacks {
-    /// Agent `agent`'s stack as [`get`] answers it: joined, not encoded but for its name.
+    /// Agent `agent`'s stack as [`get`] answers it: joined, nothing encoded. A name JSON escapes
+    /// nothing of (no quote, backslash or control character: every agent's id) is its own JSON
+    /// string between quotes; another is encoded (`crate::reads::encode`).
     pub fn answer(&self, agent: &str) -> anyhow::Result<bytes::Bytes> {
         if let Some(s) = self.by.get(agent) {
             return Ok(s.clone());
         }
-        let name = serde_json::to_vec(agent)?;
+        let plain = agent.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\');
+        let name = if plain { bytes::Bytes::from(format!("\"{agent}\"")) } else { crate::reads::encode(agent)? };
         let mut out = Vec::with_capacity(br#"{"agent":"#.len() + name.len() + self.empty.len());
         out.extend_from_slice(br#"{"agent":"#);
         out.extend_from_slice(&name);

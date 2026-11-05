@@ -83,7 +83,7 @@ async fn kept(hub: &Hub, bundle: &Value) {
 /// The URI of runner process `instance` of `machine`, if it's connected and takes custody records.
 async fn learner_uri(hub: &Hub, machine: &str, instance: &str) -> Option<String> {
     let takes = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.of(machine).into_iter().filter_map(|p| inst.get(p)).any(|i| i.label() == instance && (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0)
     };
     if !takes {
@@ -125,7 +125,8 @@ pub async fn copy_hand_on(hub: &Hub, machine: &str, instance: Option<&str>, path
     hub.cluster.copied(machine, at);
     let to = learner_uri(hub, machine, instance?).await?;
     let server = super::server_uri(&hub.pki.organization());
-    let bundle = match super::server_signed(&hub.pki, &hand_on(&server, &to, copy_thing(at, &sha256), "a copy of kiln.db, for the replica this runner keeps")) {
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = match super::server_signed_off(&hub.pki, hand_on(&server, &to, copy_thing(at, &sha256), "a copy of kiln.db, for the replica this runner keeps")).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "kiln's hand-on of a copy of kiln.db couldn't be signed: it goes unsigned");
@@ -157,7 +158,7 @@ pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 async fn checkpoint(hub: &Hub, d: Due) {
     let Some(group) = hub.store.group() else { return };
     let instance = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.newest_with(&d.machine, crate::proto::CAP_CLUSTER).filter(|p| *p == d.peer).and_then(|p| inst.get(p)).map(crate::instances::Instance::label)
     };
     let to = match instance {
@@ -176,7 +177,9 @@ async fn checkpoint(hub: &Hub, d: Due) {
     };
     let server = super::server_uri(&hub.pki.organization());
     let why = if d.closes { "entries of kiln's cluster log, for the replica this runner keeps: the last of a period" } else { "entries of kiln's cluster log, for the replica this runner keeps" };
-    let bundle = match super::server_signed(&hub.pki, &hand_on(&server, &to, log_thing(d.from, d.to, &digest), why)) {
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a public-key signature,
+    // for each learner each period, on the shard that ran this loop.
+    let bundle = match super::server_signed_off(&hub.pki, hand_on(&server, &to, log_thing(d.from, d.to, &digest), why)).await {
         Ok(b) => b,
         Err(e) => return tracing::warn!(target: "kiln.custody", machine = %d.machine, error = %format!("{e:#}"), "a checkpoint of the cluster log couldn't be signed"),
     };

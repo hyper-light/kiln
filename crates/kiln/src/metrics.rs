@@ -672,6 +672,12 @@ impl NetMetrics {
             .collect()
     }
 
+    /// The frames dropped toward every runner, as they stand now: a copy swapped in whole at each drop,
+    /// so by its identity a read kept in memory knows they changed (`crate::reads::AgentsKey`).
+    pub fn toward_all(&self) -> std::sync::Arc<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>> {
+        self.toward.get()
+    }
+
     /// What this process dropped of what it had for `peer`, by lane and reason.
     pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
         self.toward
@@ -1261,6 +1267,15 @@ pub fn render() -> String {
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
     crate::placement::render(&mut o);
+    // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
+    // count and its limit ([bus] memory).
+    let bus = bus_gauges();
+    let bus = (u64::try_from(bus.memory_bytes.get()).unwrap_or(0), u64::try_from(bus.memory_limit_bytes.get()).ok().filter(|l| *l > 0));
+    let segments = u64::try_from(crate::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+    // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
+    let search = kiln_search::memory();
+    let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
+    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None), ("search_indexes", search.0, search.1)]);
 
     let samples = agent_samples().load();
     if !samples.is_empty() {

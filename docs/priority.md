@@ -116,10 +116,25 @@ probes off, is no reading, never a breach.
   its probes keep that pace, and a probe still out is harm only once it's out that long (what it
   answers is what the server measured, not how long asking took).
 
-It's detected as every target is ([headroom.md](headroom.md)): a shift of the delay from calm toward
-the tolerance cuts kiln's CPU and write budgets, and the pacer slows what runs. CI jobs' cgroups are
-paced, as agents' sessions are, so the legs and agents beside the server are what's slowed first. A
-job a person paused is the pause's alone: the pacer neither stops it nor lets it go on.
+It comes first ([headroom.md](headroom.md), "Detection"): besides a shift toward the tolerance, a
+rise past calm's noise is trouble, read by a second CUSUM whose reference is half calm's standard
+deviation above calm's mean. Trouble cuts kiln's CPU (whatever the disks deliver: this delay is the
+CPU's) and write budgets, and the pacer slows what runs. CI jobs' cgroups are paced, as agents'
+sessions are, so the legs and agents beside the server are what's slowed first. A job a person
+paused is the pause's alone: the pacer neither stops it nor lets it go on.
+
+- **The cut holds** until the delay is back within calm's noise: the mirror of that CUSUM (what
+  samples fell short of its reference, added up) passing the same threshold, counted from samples
+  measured after the cut could show. At calm that takes as many samples as a rise past calm's
+  noise takes to alarm (on a calm like fedora's, about 45 reads, 22 s). A cut that leaves the delay rising
+  past calm's noise to the threshold again, once it could show, is cut again.
+- **Calm stays calm:** what's measured while any share under 1 is in force, or under an alarm that
+  cut kiln's work, neither joins calm nor calibrates the thresholds; an excursion learned as it
+  came is taken back out once it turns out not to be calm.
+- **Raised only as it holds:** a level counts as held only once it stayed calm as long as a rise
+  past calm's noise takes to be seen, plus the longest a cut took to show; and the level is what
+  kiln's work used, never more than its budget let it (CPU paced groups give up, unpaced ones take,
+  so what kiln uses barely moves while the pacer holds it to less).
 
 ## Cores of its own
 
@@ -130,12 +145,159 @@ job a person paused is the pause's alone: the pacer neither stops it nor lets it
   root): nothing outside it runs on those cores (f21). A user's install can confine the server
   there, not keep others off.
 - The server fixes its shards to them, one each, keeping the first core for its threads that
-  aren't shards, as hyper-rt's placement does (f11).
+  aren't shards, as hyper-rt's placement does (f11), and keeps its other threads off the shards'
+  cores (goal 9, plan `01a1a87b2cec` step 4): a thread or process starts with the CPUs of the thread
+  that started it, so the threads it starts after fixing them start on the rest, a thread a task on
+  a shard starts is moved off within the shards' probe period (`crate::rt::keep_apart`), and a child
+  a shard starts is moved as it starts. Linux alone: macOS and Windows have no cores of the server's
+  own (`[server] cores` is refused there), so nothing changes on them.
+- kiln's own legs and agents keep off them (step 7; "Legs and agents keep off the server's cores",
+  below): those the server's own runner starts, and those of every runner whose config declares them.
 
 In the lab, cores of its own held every page and API number within noise of the server alone, which
 weights didn't ("The lab", below). It stays off all the same: cores held for the server sit idle
 whenever it does, which weights never leave idle, and how many it needs is its machine's and its
 load's to say, not a constant's. A person turns it on where the server's medians must hold too.
+
+## The kernel's preemption, and the server's tail
+
+How soon a thread that wakes gets a CPU another thread holds is the kernel's preemption mode. A kernel
+built with `CONFIG_PREEMPT_DYNAMIC` picks one at boot (`preempt=` on its command line; root reads the
+mode in force in `/sys/kernel/debug/sched/preempt`):
+
+| mode | a normal thread waking where another is busy in user space | where the other runs kernel code | a real-time thread waking |
+| --- | --- | --- | --- |
+| `none` | the CPU is interrupted at once and the waker runs as the other returns to user space: microseconds | not until that code blocks or returns | at once |
+| `voluntary` | as `none` | at the kernel's preemption points | at once |
+| `full` | as `none` | at once, outside sections that hold preemption off | at once |
+| `lazy` | no interrupt: a lazy reschedule, taken as the other next returns from the kernel (a system call, an interrupt) or at the CPU's next tick, 1 ms at 1000 Hz | as for user space | at once: a real-time wake's preemption is never lazy |
+| `rt` (`PREEMPT_RT`) | as `full`, interrupts handled in threads (fair threads may be preempted lazily where the kernel has lazy preemption) | at once | at once |
+
+So under `lazy` a shard of the normal class that wakes where something is busy in user space waits up to a
+tick, and its weight doesn't shorten the wait: the waker is marked, not run (research `01a1a87b2cee` f17;
+`01a1a59c2b2a` f36). What the lab's machine measured, a thread woken as a shard is, with hogs at `cpu.weight` 1
+beside it at `CPUWeight=1000` (`scripts/priority_lab/wakelab.sh`, fedora's Linux 6.19 with lazy preemption at
+1000 Hz):
+
+- **wake-look1:** woken by a socket on its own CPU beside spinning hogs, p99.9 812 µs, at most 1.05 ms; beside
+  hogs that enter the kernel every 20 µs, p99.9 31.6 µs; with no hogs of the lab's, p99.9 400 µs (its
+  neighbours'). Asking EEVDF for a 250 µs slice made the spinning hogs' wakes worse (p99 617 µs against 19).
+- **wake-2** (2026-11-05, 06:40 to 07:04 UTC, three rounds of 10 s a cell, a load of 37 to 89 from other
+  sessions): woken from another CPU onto a busy one, **p99 1.00 ms with every kind of hog, and with none of the
+  lab's** (spinning 1001 µs, compilers 1009, entering the kernel 951, none 1003): other sessions' work kept the
+  CPUs busy, and a lazy remote wake waits for the busy CPU's tick. On its own CPU a socket's wake waited a tick
+  only behind hogs that never enter the kernel (spinning: p99.9 895 µs; pinned one to a CPU and entering the
+  kernel every 20 µs: 15 µs). A 250 µs slice didn't move it (1000.4 µs at p99 against 1001.3).
+
+Production (adacachy) runs `full`: a remote wake interrupts the busy CPU at once, so its tail beside legs is the
+scheduler's choice of who runs, not the tick. fedora's tail with hogs is its kernel's, not production's, and
+without root there (`preempt=full` at boot, or a cpuset partition) the lab can't show production's.
+
+What it means for the server:
+
+- **Weights alone can't hold a shard under a tick on a lazy kernel** beside anything busy in user space on its
+  CPU (block 5 above: pages' p99 0.30 ms calm, 2.34 ms beside legs).
+- **Cores of its own help as far as nothing else runs on them.** kiln keeps its own legs and agents off them
+  (below), but on a lazy kernel anything else there (another user's work, other services) still holds a waking
+  shard for a tick, as wake-2's neighbours did. **The installer's cpuset partition is what makes the server's
+  cores its own on a lazy kernel:** a system install (root, once) makes `kiln.slice` a partition, and nothing
+  outside it runs on its cores.
+- **The real-time class works whatever else runs** ("A real-time class for the shards", below): a real-time
+  wake preempts at once in every mode, lazy included.
+- `preempt=full` at boot gives every normal wake its interrupt at once: the machine owner's call.
+
+## Legs and agents keep off the server's cores
+
+With `[server] cores`, kiln keeps its own legs and agents off the server's cores on Linux (goal 8, plan
+`01a1a59c2b29` step 7):
+
+- **Who.** The server's own runner (`[local_agent]`), and every runner whose config file declares
+  `[server] cores` (a server and a runner one person installed share the machine's config, `KILN_CONFIG`). Each
+  works out its work CPUs once as it starts, the CPUs it may run on less the server's
+  (`crate::os::keep_work_off`), and says what it did and why: in its log, its facts
+  (`executors.host.priority`), and for the server's own runner `/healthz/server` (`priority.work`).
+- **How.** By CPU affinity, from each process's first instruction, which everything it starts inherits:
+  - an agent's harness and the runs an agent asks for take the work CPUs between fork and exec
+    (`crate::os::onto_work_cpus`): what of the CPUs it would start on are work CPUs, or the work CPUs whole
+    where it starts from a thread fixed to a shard's core;
+  - a CI leg's steps take them through the runner's ledger of CPUs (`crate::runner::cpus`, docs/ci.md
+    W05-R03), which lends and shares only work CPUs and starts every step on them or on its leg's share of
+    them; a step on a pty is moved onto them as it starts; a leg's job container and services get its CPUs as
+    `--cpuset-cpus`, and its egress relay, its Docker actions and the containers its steps make through its
+    Docker socket the work CPUs (a container that names CPUs of its own keeps them); a leg's microVM's VMM,
+    its vCPUs with it, takes them as a harness does.
+  - Affinity rather than a cpuset on kiln's folders of groups: a user's service manager doesn't delegate the
+    `cpuset` controller (systemd's `user@.service` delegates `pids memory cpu`), and where a system install
+    could, its partition already keeps everything outside `kiln.slice` off the server's cores. A process can
+    widen its own affinity again (`taskset`); only a cpuset holds it there.
+- **What it can't do.**
+  - It keeps kiln's own work off, nothing else's: on a lazy kernel anything else on the server's cores still
+    holds a waking shard for a tick (wake-2, above). The partition makes them the server's alone.
+  - The server's own runner shares the server's cores wherever its slice holds the server there
+    (`AllowedCPUs=` applied: a system install, or a user's manager given the `cpuset` controller), since
+    everything the server starts is in its slice. It says so; a runner of its own beside the server keeps them
+    off (`[local_agent] enabled = false`, and `kiln install --agent`).
+- **macOS and Windows:** nothing changes, as a server has no cores of its own there. macOS has no CPU affinity
+  for a process, and its legs and agents already run under background policy, which Apple silicon runs on its
+  efficiency cores; on Windows they run below normal, and its scheduler preempts them at once for the server.
+
+## A real-time class for the shards
+
+`[server] realtime = true` (off until declared; `KILN_RT_REALTIME` overrides it) puts each of the server's
+shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-time priority, 1 (goal 8, plan
+`01a1a59c2b29` step 7; goal 9, plan `01a1a87b2cec` step 4; `hyper_rt::compute::realtime_current_thread`):
+
+- A real-time thread waking where a normal one runs preempts it at once in every preemption mode, lazy
+  included: whatever runs on the shard's CPU, kiln's or anyone's.
+- Each shard asks as it starts, with the reset-on-fork flag, so a thread or process a shard starts runs at the
+  normal policy (sched(7)); the server's other threads, its pools and helpers, stay as they were. Priority 1 is
+  above every normal thread and below every other real-time one, the kernel's threaded interrupt handlers
+  (50) among them.
+- **What the installer's unit grants.** An unprivileged thread may take `SCHED_RR` up to its `RLIMIT_RTPRIO`
+  (sched(7)). With `[server] realtime`, `kiln install` gives the server's unit `LimitRTPRIO=1`, that priority
+  and no more. A system install's server runs as root and needs no grant. A user's service manager gives what
+  its own limit allows (systemd sets the nearest it can, never failing the unit), which is 0 unless the
+  machine's owner raised it for the user (a `limits.d` entry, `rtprio 1`). Not `CPUSchedulingPolicy=`: it would
+  put every thread of the server, and everything it starts, in the class. On 2026-11-05 fedora (the lab) gave its
+  user 0, in a shell and in a user scope; adacachy (production) gives its user 99, soft and hard, so there the class
+  needs nothing the installer can't give.
+- **Refused,** a shard runs as it would without it, with a slice of its step, and the server says so: in its
+  log once every shard has answered, and in `/healthz/server` (`priority.realtime`: asked, shards, took,
+  refused, why). It never fails for it. A kernel with real-time group scheduling (`CONFIG_RT_GROUP_SCHED`)
+  refuses it too where the server's cgroup has no real-time runtime.
+- **Its cost.** A real-time shard keeps its CPU from normal threads for as long as it runs, a long poll (goal
+  9's slow polls) too: it belongs with shards that give up their CPU on time, as kiln's do at their step. The
+  kernel keeps 5% of every CPU for normal threads (`sched_rt_runtime_us`: real-time threads get 950 ms of each
+  second), and shards await other threads' work rather than spin on it.
+- **macOS and Windows** refuse it, saying why: macOS's real-time policy for user threads (time constraint) is
+  for periodic work of a known computation, as audio's is, and demotes a thread that overruns it; Windows
+  preempts a lower priority level at once already, and its real-time priority class would put the server above
+  the system's own work.
+
+It stays off until an A/B where it's granted picks it ("Step 7's lab", below). Where it needs no more than the
+installer can grant (a system install), the winner becomes the bare-metal default; on a user's install it
+needs the machine owner's grant, theirs to give.
+
+## Step 7's lab
+
+`scripts/priority_lab/s7c.sh` runs the A/B of the three ways to keep the host off the shards, in production's
+layout (the server alone in a scope of its own at `CPUWeight=1000`, hogs at `cpu.weight` 1), the
+configurations taking turns round by round, eight rounds each (goal 9, plan `01a1a87b2cec` step 4: shard delay
+p99.9 under 1 ms with hogs):
+
+- `calm`: the server on `SERVER_CPUS` (16-31), no hogs; `hogs`, `hogs-cc`: weights alone, with as many spinning
+  hogs or C compilers as those CPUs;
+- `cores-calm`, `cores`, `cores-cc`: the server on cores of its own (`CORES`, 16-23: its scope's `AllowedCPUs=`
+  and `[server] cores`), the hogs on the rest (24-31), where the work CPUs put kiln's own;
+- `fence`: as `cores`, but the hogs are a kiln runner's agents (the stand-in's `lab:hog`), started by a runner
+  held to `SERVER_CPUS` whose config declares the server's cores, so kiln itself puts them on 24-31; each
+  round notes the CPUs each hog thread may run on;
+- `rt`, `rt-cc`: weights alone with the shards in the real-time class (`KILN_RT_REALTIME=1`, the scope given
+  `LimitRTPRIO=1` as the installer's unit is); run only where the machine grants it, else skipped and said so.
+
+Each round notes `/healthz/server` (the real-time class as the shards took it, the work CPUs) and how busy
+other processes kept the server's cores (`foreign.py`): on a lazy kernel, work that isn't the lab's on those
+cores holds a waking shard for a tick, and only a partition keeps it out.
 
 ## The lab
 
@@ -329,6 +491,36 @@ since the stall wasn't kiln's. The engine's test with the lab's numbers
 paces the leg and the agent alike, and the delay back down clears the alarm, the cut held until the
 level holds.
 
+**item2: main let go (`0c11fb03a06`, 2026-11-05 01:27-01:39 UTC, CPUs 16-31).** Research
+01a1a59c2b2a, f52 to f55. The server joined the runner's cgroup at 90 s, the legs (32 threads)
+started at 120 s and the agents (64) at 210 s. In 10 s bins of `timeline.py`:
+
+| t s | delay med ms | mean since read med ms | shards p99 ms | calm ms | CUSUM | threshold | CPU budget | paced | least share |
+|---|---|---|---|---|---|---|---|---|---|
+| 110 | 0.21 | 0.20 | 0.60 | 0.234 | 0.00 | 0.21 | - | 0 | |
+| 120 | 1.00 | 0.55 | 7.76 | 0.245 | 0.00 | 1.79 | 14.3 | 8 | 52 |
+| 130 | 0.76 | 0.51 | 5.99 | 0.260 | 0.00 | 1.77 | 28.6 | 0 | |
+| 220 | 5.75 | 1.38 | 21.84 | 0.407 | 0.00 | 5.25 | 29.6 | 0 | |
+| 340 | 0.21 | 0.25 | 13.89 | 0.607 | 0.00 | 3.89 | 7.5 | 5 | 24 |
+| 460 | 10.04 | 2.05 | 33.15 | 0.757 | 0.00 | 3.40 | 30.1 | 0 | |
+| 630 | 3.97 | 1.05 | 19.41 | 0.914 | 0.00 | 3.40 | 28.4 | 0 | |
+
+headroom alarmed at 126 s ("typical 0.2 ms, now 3.5 ms (CUSUM 0.82 past 0.23)") and cut kiln's CPU
+from 14.3 cores to 7.1, was back to calm a second later, and had the budget at 28.6 cores by 137 s.
+The agents' alarm at 216 s cut nothing and cleared at 221 s. From then to the end the delay sat at
+4 to 6 times calm with nothing paced, but for a runner-disk alarm at 346 s whose cut (the agents at
+24-30%) brought it back to calm until it was let go at 358 s. Read back from its own status, the
+causes: every sample not under an alarm joined calm, and the legs' 2.5 and the agents' 4 to 6.4
+times calm sat below the CUSUM's reference (half way to the 10 ms tolerance, 6.6 times calm), so
+calm drifted from 0.238 ms to 0.919 and the CUSUM never rose again; an alarm cleared the moment its
+CUSUM touched zero; the engine read only the writes' lag, unknown all run since only the CPU was cut,
+so a level counted as held after a second, and every excursion a cut ended was learned as noise (the
+threshold from 0.23 to 5.6); the CPU knee took kiln's measured cores, 12.9-14.4 under a 7.1-core
+budget (what paced groups gave up, unpaced ones took), as the level held, and so disproved the bound
+it had cut at; and the alarm at 216 s found the disks "full" against a capacity read during the
+kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this as a trace, and goal
+8 step 5's engine holds it there; item2b below is the lab's word.
+
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
@@ -338,6 +530,13 @@ level holds.
   runs.
 - The user manager must give its units the `cpu` controller: systemd's own `user@.service`
   delegates `pids memory cpu`, and a runner's unit's `cgroup.controllers` says what it got.
+- On a lazy kernel, the server's cores are its own only with the partition (a system install): kiln
+  keeps its own legs and agents off them, nothing else.
+- The real-time class for a user's install: the machine's owner raises the user's `RLIMIT_RTPRIO` to 1
+  (a `limits.d` entry), or installs the server system-wide. `preempt=full` at boot, on a lazy kernel.
+- The lab: its machine's kernel is lazy and it has no root there, so its A/Bs of the partition and of the
+  real-time class wait on the owner (research `01a1a87b2cee` f17, f18: rtkit refuses this user a
+  real-time class there).
 
 ## Tests
 
@@ -366,9 +565,31 @@ level holds.
   numbers: calm near 0.43 ms with a stall every two minutes, then legs and agents raising it to
   1.9 to 4.5 ms: the engine alarms within seconds, cuts kiln's CPU, paces a leg and an agent alike,
   sees it back to calm, and probes at the window's pace, not the tolerance's.
-  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: a rise the
-  weights held (1.4 to 1.8 times calm) is no trouble, and a probe out is harm only at the window.
+  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: for a
+  windowed target that doesn't come first, a rise the weights held (1.4 to 1.8 times calm) is no
+  trouble, and a probe out is harm only at the window.
+- kiln-ci's `headroom::sim::g8_s5_the_11_05_lab_rising_delay_paces_the_legs_and_holds_it_down_until_the_load_ends`:
+  item2 as a trace (headroom.md, "Simulation"). On main's engine every loaded stretch was past
+  calm's noise and nothing was paced 5 s after the first cut; now the legs are paced within 30 s,
+  the delay is held within calm's noise while the load stays, something stays paced until it ends,
+  it's calm after, and calm stays what it was.
 - kiln-lab's `standin::tests::g8_s5_a_hog_turn_burns_for_its_time_and_no_longer`: the stand-in's CPU
   hog turn, the lab's agents.
 - `rt::tests::g8_s6_shards_are_fixed_to_cores_of_the_servers_own` and
   `os::tests::g8_s6_a_cpu_list_reads_as_linux_writes_one`: cores of the server's own.
+- `os::tests::g8_s7_legs_and_agents_keep_off_the_servers_cores` and
+  `g8_s7_cpus_are_written_as_linux_writes_a_list`: the work CPUs, this process's less the server's; where
+  they'd run anyway beside a partition; shared, and said so, when the server's are all a process has.
+  `os::contain::tests::g8_s7_a_process_keeps_what_of_its_cpus_are_work_cpus` and
+  `g8_s7_a_leg_or_agent_starts_on_the_work_cpus` (Linux): a process started there runs on them from its
+  first instruction, what it starts too, from a thread that may run anywhere and from one fixed to a
+  shard's core, and a leg's share stays its share.
+- `runner::cpus::tests::g8_s7_legs_keep_off_the_servers_cores`: a runner beside a server with cores of its
+  own makes its legs' shares and leases of its work CPUs alone and runs a step that holds nothing on them;
+  `runner::docker_sock::tests::g8_s7_a_steps_containers_keep_to_the_work_cpus`: a container a step makes
+  keeps to them unless it names its own.
+- kiln-rt's `compute::tests::g9_s4_the_real_time_class_is_taken_whole_or_refused` (Linux): a shard asking
+  gets the class whole, a thread it starts at the normal policy, or is refused and runs as it did;
+  `g9_s4_a_real_time_class_ranks_above_every_other_policy`. `rt::tests::g9_s4_the_real_time_class_is_said_as_the_shards_took_it`:
+  said once every shard answered, a refusal in a person's words. `install::tests::g8_units_are_delegated_and_the_server_comes_first`:
+  `LimitRTPRIO=1` for a server asking for the class, and no policy for all of it.

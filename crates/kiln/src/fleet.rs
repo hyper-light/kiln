@@ -592,7 +592,7 @@ pub(crate) fn builds_itself(hub: &Hub, r: &RunnerInfo) -> Result<(), String> {
     if let Some(why) = cant_build(hub, &r.name) {
         return Err(why);
     }
-    let missing = hub.agents.lock().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
+    let missing = hub.agents.load().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
     match missing {
         Some(m) if m.is_empty() => Ok(()),
         Some(m) => Err(format!("it has no {} to build kiln with", m.join(" or "))),
@@ -646,7 +646,7 @@ pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder
     }
     let candidates: Vec<Candidate> = hub
         .agents
-        .lock()
+        .load()
         .values()
         .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
         .filter_map(|a| {
@@ -868,7 +868,7 @@ async fn tell(hub: &Arc<Hub>, t: &Target) {
         if hub.updates.fleet.told.lock().contains(&key) {
             continue;
         }
-        let Some(peer) = hub.instances.lock().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
+        let Some(peer) = hub.instances.load().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
         let from = r.from.clone().unwrap_or_else(|| format!("no build of it for {} yet", r.target.as_deref().unwrap_or("its platform")));
         let msg = crate::proto::ServerMsg::UpdateAvailable { commit: t.commit.clone(), build: r.target_build.clone().unwrap_or_default(), from };
         hub.command_peers(&r.name, vec![peer], &msg).await.log_when_answered(crate::hub::LOG_WITHIN);
@@ -1481,7 +1481,7 @@ mod tests {
     async fn fleet() -> anyhow::Result<Arc<Hub>> {
         let hub = crate::hub::tests::scratch_hub().await?;
         for a in [live("studio", "macos", "aarch64", &["git", "docker"]), live("macbook", "macos", "aarch64", &["cargo", "node", "git"]), live("linux", "linux", "x86_64", &["cargo", "node", "python3"])] {
-            hub.agents.lock().insert(a.name.clone(), a);
+            hub.put_agent(a);
         }
         Ok(hub)
     }
@@ -1524,13 +1524,13 @@ mod tests {
             assert!(build.ok && build.on.as_deref() == Some("macbook"), "{ways:?}");
             assert_eq!(build.why, "macbook builds e511eabdeab2 for aarch64-apple-darwin from the server's source, and it downloads that build");
             assert!(ways.iter().any(|w| w.way == crate::updates::Way::Download && !w.ok));
-            if let Some(m) = hub.agents.lock().get_mut("macbook") {
-                m.draining = true;
-            }
+            hub.change_agent("macbook", |m| m.draining = true);
             assert_eq!(built_by(&plan(&hub, &studio, &t).await), Some(("linux".to_owned(), false, true)), "no Mac to build it: cross-built");
-            if let Some(f) = hub.agents.lock().get_mut("linux").and_then(|l| l.facts.as_mut()) {
-                f.tools.remove("python3");
-            }
+            hub.change_agent("linux", |l| {
+                if let Some(f) = l.facts.as_mut() {
+                    f.tools.remove("python3");
+                }
+            });
             match plan(&hub, &studio, &t).await {
                 Plan::Wait(why) => assert_eq!(
                     why,
@@ -1538,7 +1538,7 @@ mod tests {
                 ),
                 other => anyhow::bail!("nowhere to build: {other:?}"),
             }
-            hub.agents.lock().insert("box".into(), live("box", "linux", "x86_64", &["git"]));
+            hub.put_agent(live("box", "linux", "x86_64", &["git"]));
             assert!(matches!(plan(&hub, &runner(&hub, "box").await?, &t).await, Plan::Wait(_)), "a Linux build is its machine's own: never made elsewhere");
             Ok(())
         })
@@ -1601,9 +1601,7 @@ mod tests {
     fn a_runner_joining_a_build_downloads_it_once_kept() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = fleet().await?;
-            if let Some(s) = hub.agents.lock().get_mut("studio") {
-                s.terminal = false;
-            }
+            hub.change_agent("studio", |s| s.terminal = false);
             let studio = runner(&hub, "studio").await?;
             let other = crate::updates::new_job("runner", "studio-2", "build", None, None);
             hub.updates.insert(other.clone());

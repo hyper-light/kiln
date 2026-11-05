@@ -18,7 +18,7 @@ const PEERS_EVERY: Duration = Duration::from_secs(30);
 /// What the server sees of every store now.
 pub fn seen(hub: &Hub) -> Seen {
     let r = &hub.harness;
-    let machines = hub.agents.lock().values().filter(|a| !a.ephemeral && !a.outpost).map(|a| Machine { name: a.name.clone(), connected: a.connected, version: a.version.clone(), label: a.label.clone() }).collect();
+    let machines = hub.agents.load().values().filter(|a| !a.ephemeral && !a.outpost).map(|a| Machine { name: a.name.clone(), connected: a.connected, version: a.version.clone(), label: a.label.clone() }).collect();
     Seen {
         now: crate::util::now_ms(),
         server: r.convo.as_ref().map(crate::convo::store::Store::report),
