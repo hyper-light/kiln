@@ -32,7 +32,7 @@ struct Lab {
     /// under it), in order.
     ended: Arc<Mutex<Vec<String>>>,
     /// What linux is handed to take over.
-    adoptions: async_channel::Receiver<node::Adoption>,
+    adoptions: crate::memory::queue::Receiver<node::Adoption>,
     ctl: async_channel::Sender<Ctl>,
     _dirs: Vec<tempfile::TempDir>,
     mirrors: std::path::PathBuf,
@@ -74,9 +74,9 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
     let [mac_version, linux_version] = versions;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
-    let (adopt_tx, adoptions) = async_channel::unbounded();
+    let (adopt_tx, adoptions) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let using = Arc::new(super::keeper::Using::default());
-    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config {
+    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<crate::memory::queue::Sender<node::Adoption>>| Config {
         name: name.into(),
         dir: d.path().join("reach"),
         accept: true,

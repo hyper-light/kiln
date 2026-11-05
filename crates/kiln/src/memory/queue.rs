@@ -1224,4 +1224,35 @@ mod tests {
         drop((b, rb));
         assert_eq!((OWNER.bytes(), OWNER.bound()), (130, Some(100)));
     }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side, run by kiln's CI with every test: the runner
+    /// process's queues on its paths are this module's, none an async-channel's, whose waits take
+    /// event-listener's `Mutex` on the sender's shard (or thread) and the taker's: its loop's uplink, its own
+    /// words, its jobs' results, its terminals' and sessions' output and its blue/green words (`agent.rs`,
+    /// `exec.rs`), its sessions' lanes and hand-overs (`harness/host.rs`, `harness/handing.rs`), its
+    /// harnesses' and steps' pipes on every platform (`os/proc_unix.rs`, `os/proc_windows.rs`), its terminals
+    /// on every platform (`terminal.rs`, `os/pty_unix.rs`, `os/pty_windows.rs`, `runner/kept.rs`), and its
+    /// ports' bytes (`browser/ports.rs`).
+    #[test]
+    fn g5_the_runners_paths_make_no_async_channel() {
+        let files = [
+            ("agent.rs", include_str!("../agent.rs")),
+            ("exec.rs", include_str!("../exec.rs")),
+            ("harness/host.rs", include_str!("../harness/host.rs")),
+            ("harness/handing.rs", include_str!("../harness/handing.rs")),
+            ("os/proc_unix.rs", include_str!("../os/proc_unix.rs")),
+            ("os/proc_windows.rs", include_str!("../os/proc_windows.rs")),
+            ("terminal.rs", include_str!("../terminal.rs")),
+            ("os/pty_unix.rs", include_str!("../os/pty_unix.rs")),
+            ("os/pty_windows.rs", include_str!("../os/pty_windows.rs")),
+            ("runner/kept.rs", include_str!("../runner/kept.rs")),
+            ("browser/ports.rs", include_str!("../browser/ports.rs")),
+        ];
+        for (file, src) in files {
+            let code = code_of(src);
+            for made in ["async_channel::bounded", "async_channel::unbounded"] {
+                assert!(!code.contains(made), "{file} makes an async-channel, whose waits take a lock ({made})");
+            }
+        }
+    }
 }
