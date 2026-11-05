@@ -82,6 +82,15 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// This binary's own pages in resident memory, taken out once they're done with: [`crate::resident`]'s
+/// implementation (Linux; elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
+#[cfg(target_os = "linux")]
+#[path = "pages_linux.rs"]
+pub mod pages;
+#[cfg(not(target_os = "linux"))]
+#[path = "pages_none.rs"]
+pub mod pages;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";
@@ -172,15 +181,24 @@ pub enum WorkCpus {
     /// On the server's cores: they're every CPU this process may run on (its slice holds it there,
     /// as it holds the server's own runner).
     Shared,
+    /// On the server's cores but off its shards': they're every CPU this process may run on (its slice
+    /// holds it there, as a system install's partition holds the server's own runner), and these are
+    /// those of them its shards aren't fixed to (goal 9, plan 01a1a87b2cec step 4).
+    Beside(Vec<u32>),
 }
 
-/// [`WorkCpus`] for a process that may run on `allowed`, beside a server whose cores are `server`.
-pub fn work_cpus_for(allowed: &[u32], server: &[u32]) -> WorkCpus {
+/// [`WorkCpus`] for a process that may run on `allowed`, beside a server whose cores are `server` and
+/// whose shards are fixed to `shards` of them (none known: a runner of its own beside the server).
+pub fn work_cpus_for(allowed: &[u32], server: &[u32], shards: &[u32]) -> WorkCpus {
     if !allowed.iter().any(|c| server.contains(c)) {
         return WorkCpus::Clear;
     }
     let rest: Vec<u32> = allowed.iter().copied().filter(|c| !server.contains(c)).collect();
-    if rest.is_empty() { WorkCpus::Shared } else { WorkCpus::Apart(rest) }
+    if !rest.is_empty() {
+        return WorkCpus::Apart(rest);
+    }
+    let beside: Vec<u32> = allowed.iter().copied().filter(|c| !shards.contains(c)).collect();
+    if beside.is_empty() || beside.len() == allowed.len() { WorkCpus::Shared } else { WorkCpus::Beside(beside) }
 }
 
 impl WorkCpus {
@@ -193,17 +211,23 @@ impl WorkCpus {
             WorkCpus::Shared => format!(
                 "kiln's own legs and agents share the server's cores {server}: this process may run on them alone, as its slice holds everything the server starts; a runner of its own beside the server keeps them off ([local_agent] enabled = false, and `kiln install --agent`)"
             ),
+            WorkCpus::Beside(cpus) => format!(
+                "kiln's own legs and agents run on the server's cores {server}, off its shards': on {}, as this process may run on the server's cores alone (its slice holds everything the server starts); a runner of its own beside the server keeps them off all of them ([local_agent] enabled = false, and `kiln install --agent`)",
+                cpu_list_text(cpus)
+            ),
         }
     }
 }
 
 /// Keeps kiln's own legs and agents off the server's cores, `server` (a CPU list, `[server] cores`),
-/// as this process starts them from now on (goal 8, plan 01a1a59c2b29 step 7), and says what it did
-/// and why; `whose` starts them (for the log). Worked out once, from the CPUs the calling thread may
-/// run on: call it on the thread that starts the runtime, before it starts and before a server fixes
-/// its shards to their cores (`crate::rt::pin`). Linux only: elsewhere a server has no cores of its
-/// own (`own_cores`), so nothing is kept off and it says so.
-pub fn keep_work_off(server: &str, whose: &str) {
+/// as this process starts them from now on (goal 8, plan 01a1a59c2b29 step 7), or, where its slice
+/// holds this process on them, off the cores of them its shards are fixed to, `shards` (goal 9, plan
+/// 01a1a87b2cec step 4: a system install's partition holds the server's own runner there), and says
+/// what it did and why; `whose` starts them (for the log). Worked out once, from the CPUs the calling
+/// thread may run on: call it on the thread that starts the runtime, before it starts and before a
+/// server fixes its shards to their cores (`crate::rt::pin`). Linux only: elsewhere a server has no
+/// cores of its own (`own_cores`), so nothing is kept off and it says so.
+pub fn keep_work_off(server: &str, shards: &[u32], whose: &str) {
     let cores = match cpu_list(server) {
         Ok(cores) => cores,
         Err(why) => {
@@ -212,15 +236,44 @@ pub fn keep_work_off(server: &str, whose: &str) {
         }
     };
     #[cfg(target_os = "linux")]
-    match contain::keep_work_off(&cores, server) {
+    match contain::keep_work_off(&cores, shards, server) {
         Ok(work) => tracing::info!(whose, "{}", work.said(server)),
         Err(why) => tracing::warn!(whose, why = %why, "kiln's own legs and agents run where they did"),
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = cores;
+        let _ = (cores, shards);
         tracing::info!(whose, "kiln's own legs and agents run where they did: cores of the server's own are Linux's alone");
     }
+}
+
+/// Gives up the room for Linux's real-time class (`RLIMIT_RTPRIO`, soft and hard, set to 0) this process
+/// has, or process `pid`'s: a server does once its shards have asked for the class (`crate::rt::realtime`;
+/// goal 9, plan 01a1a87b2cec step 4), so the room its unit gave them (`LimitRTPRIO=`) is theirs alone,
+/// and nothing it starts from then on, its own runner's legs and agents among them, inherits it and takes
+/// the class beside them. A thread in the class already keeps it: the limit bounds asking, not having.
+/// Why not, where it can't. Linux only: elsewhere there's no such room to give up.
+pub fn drop_realtime_room(pid: Option<u32>) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = pid.map(|p| i32::try_from(p).ok().and_then(rustix::process::Pid::from_raw).ok_or_else(|| format!("{p} isn't a process's id"))).transpose()?;
+        let none = rustix::process::Rlimit { current: Some(0), maximum: Some(0) };
+        rustix::process::prlimit(pid, rustix::process::Resource::Rtprio, none).map(|_| ()).map_err(|e| format!("RLIMIT_RTPRIO can't be set: {e}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+/// `RLIMIT_RTPRIO` as `/proc/<pid>/limits` gives it (`Max realtime priority  0  0`): its soft and hard
+/// limits, `u64::MAX` for unlimited.
+pub fn rtprio_limits(limits: &str) -> Option<(u64, u64)> {
+    let rest = limits.lines().find_map(|l| l.strip_prefix("Max realtime priority"))?;
+    let limit = |s: &str| if s == "unlimited" { Some(u64::MAX) } else { s.parse().ok() };
+    let mut words = rest.split_whitespace();
+    Some((limit(words.next()?)?, limit(words.next()?)?))
 }
 
 /// Makes `cmd`'s process, a leg's or an agent's, start on the work CPUs ([`keep_work_off`]) from its
@@ -769,15 +822,56 @@ mod tests {
     fn g8_s7_legs_and_agents_keep_off_the_servers_cores() {
         let all: Vec<u32> = (0..32).collect();
         let server: Vec<u32> = (16..24).collect();
+        let shards: Vec<u32> = (17..21).collect();
         let rest: Vec<u32> = (0..16).chain(24..32).collect();
-        assert_eq!(work_cpus_for(&all, &server), WorkCpus::Apart(rest));
+        assert_eq!(work_cpus_for(&all, &server, &shards), WorkCpus::Apart(rest));
         let lab: Vec<u32> = (16..32).collect();
-        assert_eq!(work_cpus_for(&lab, &server), WorkCpus::Apart((24..32).collect()), "a runner held to 16-31 puts them on 24-31");
-        assert_eq!(work_cpus_for(&(0..16).collect::<Vec<u32>>(), &server), WorkCpus::Clear);
-        assert_eq!(work_cpus_for(&server, &server), WorkCpus::Shared);
+        assert_eq!(work_cpus_for(&lab, &server, &shards), WorkCpus::Apart((24..32).collect()), "a runner held to 16-31 puts them on 24-31");
+        assert_eq!(work_cpus_for(&(0..16).collect::<Vec<u32>>(), &server, &shards), WorkCpus::Clear);
+        assert_eq!(work_cpus_for(&server, &server, &[]), WorkCpus::Shared, "held to the server's cores, its shards unknown");
         assert_eq!(WorkCpus::Apart((0..16).collect()).said("16-23"), "kiln's own legs and agents keep off the server's cores 16-23: they run on 0-15");
         assert!(WorkCpus::Shared.said("16-23").contains("share the server's cores 16-23"));
         assert!(WorkCpus::Clear.said("16-23").contains("none of the server's cores 16-23"));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: where the server's slice holds its own runner on its cores (a
+    /// system install's partition), kiln's own legs and agents run on those cores off its shards': the
+    /// first, which its other threads keep, and those past the shards'; with every core a shard's, they
+    /// share them, said so.
+    #[test]
+    fn g9_s4_legs_and_agents_in_a_partition_keep_off_the_shards_cores() {
+        let server: Vec<u32> = (16..24).collect();
+        let shards: Vec<u32> = (17..21).collect();
+        let beside = work_cpus_for(&server, &server, &shards);
+        assert_eq!(beside, WorkCpus::Beside(vec![16, 21, 22, 23]));
+        assert_eq!(
+            beside.said("16-23"),
+            "kiln's own legs and agents run on the server's cores 16-23, off its shards': on 16,21-23, as this process may run on the server's cores alone (its slice holds everything the server starts); a runner of its own beside the server keeps them off all of them ([local_agent] enabled = false, and `kiln install --agent`)"
+        );
+        assert_eq!(work_cpus_for(&[8, 9], &[8, 9], &[9]), WorkCpus::Beside(vec![8]), "two cores: the shards on the second, legs and agents on the first");
+        assert_eq!(work_cpus_for(&[8], &[8], &[8]), WorkCpus::Shared, "one core: the shards' and everything's");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a server gives up the real-time room its unit gave its shards once
+    /// they've asked, so what it starts inherits none: a process's `RLIMIT_RTPRIO` set to 0, soft and hard,
+    /// read back from its `/proc/<pid>/limits` as Linux writes them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_the_real_time_room_is_given_up_whole() -> anyhow::Result<()> {
+        assert_eq!(rtprio_limits("Max realtime priority     99                   99                   \n"), Some((99, 99)));
+        assert_eq!(rtprio_limits("Max realtime priority     0                    unlimited            \n"), Some((0, u64::MAX)));
+        assert_eq!(rtprio_limits("Max realtime timeout      unlimited            unlimited            us\n"), None);
+        // A process of its own stands in for the server: whatever room it started with (this machine's), none after.
+        let mut child = std::process::Command::new("sleep").arg("30").stdin(std::process::Stdio::null()).spawn()?;
+        let pid = child.id();
+        let before = rtprio_limits(&std::fs::read_to_string(format!("/proc/{pid}/limits"))?);
+        let dropped = drop_realtime_room(Some(pid));
+        let after = rtprio_limits(&std::fs::read_to_string(format!("/proc/{pid}/limits"))?);
+        let _ = child.kill();
+        let _ = child.wait();
+        dropped.map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(before.is_some() && after == Some((0, 0)), "before {before:?}, after {after:?}");
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 4: a server with cores of its own keeps its other threads off its

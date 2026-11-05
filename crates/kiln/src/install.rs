@@ -428,11 +428,12 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         ("kiln-agent", agent_setup(a).await?)
     } else {
         if !config_path.exists() {
-            let cfg = crate::config::Config::default();
-            let text = format!(
-                "# kiln configuration. Every key is optional; see docs/configuration.md.\n\n{}",
-                toml::to_string_pretty(&cfg).unwrap_or_default()
-            );
+            let mut cfg = crate::config::Config::default();
+            // The bare-metal default (goal 9, plan 01a1a87b2cec step 4; docs/priority.md): the shards in the
+            // real-time class wherever the unit this install writes grants it, declared here and said why.
+            let realtime = realtime_default(a.boot, system).filter(|g| g.granted);
+            cfg.server.realtime = realtime.is_some();
+            let text = fresh_config(&cfg, realtime.as_ref());
             crate::util::write_secret(config_path, text.as_bytes(), 0o640)?;
             say(format!("config      {} (new)", config_path.display()));
         } else {
@@ -640,27 +641,64 @@ fn systemd_version() -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?.parse().ok()
 }
 
+/// kiln.slice's cpuset partition flag, system-wide (cgroup v2's `cpuset.cpus.partition`: `member`, or
+/// `root` for a partition of its own): what the server's unit sets as it starts ([`Partition`]) and an
+/// uninstall sets back.
+const SLICE_PARTITION: &str = "/sys/fs/cgroup/kiln.slice/cpuset.cpus.partition";
+
+/// What the server's unit does to kiln.slice's cpuset partition as it starts, as root (goal 8, plan
+/// 01a1a59c2b29 step 6; goal 9, plan 01a1a87b2cec step 4; docs/priority.md, "Cores of its own").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Partition {
+    /// Makes the slice a partition of the cores it's given (`AllowedCPUs=`): nothing outside it runs on
+    /// them from then on. A system install with cores of its own.
+    Make,
+    /// Makes it a member again, where an earlier install made it a partition: a system install without
+    /// cores of its own gives the machine back those it had.
+    Undo,
+    /// Neither: a user's install, whose slice can't be a partition (`cores_room`), or a runner's unit.
+    Leave,
+}
+
+/// The server's place on its machine as its unit gives it (docs/priority.md): what the unit does to
+/// kiln.slice's partition, and whether it has room for the shards' real-time class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Place {
+    partition: Partition,
+    /// `[server] realtime`: the unit's `LimitRTPRIO=`.
+    realtime: bool,
+}
+
+impl Place {
+    /// A runner's unit's, or a server's with nothing of the sort.
+    const NONE: Place = Place { partition: Partition::Leave, realtime: false };
+}
+
 /// The systemd service that runs `i`: `exec` with `env`, restarted when its supervisor exits.
 /// Each is delegated to kiln (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2), so its runner
 /// can share the CPU among the legs and agents it starts, each in a cgroup of its own at the least
 /// CPU weight, with kiln's own processes in the unit's leaf (`DelegateSubgroup=`, on a systemd that
-/// has it). A server's goes in `kiln.slice` ([`kiln_slice`]) with the slice's weights, and, when it
-/// has cores of its own system-wide (`partition`), makes them a cpuset partition as it starts; with
-/// its shards in the real-time class (`realtime`, `[server] realtime`), it has room for that class at
-/// the priority they ask for (`LimitRTPRIO=`), and only that: `CPUSchedulingPolicy=` would put every
-/// thread of the server, and what it starts, in the class.
-fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, partition: bool, realtime: bool) -> String {
+/// has it). A server's goes in `kiln.slice` ([`kiln_slice`]) with the slice's weights, and, as `place`
+/// says, makes the slice a cpuset partition of its cores as it starts or a member again (a system
+/// install's, as root: `+`, its failure no failure of the unit's, `-`; the server says what it got);
+/// with its shards in the real-time class (`[server] realtime`), it has room for that class at the
+/// priority they ask for (`LimitRTPRIO=`), and only that: `CPUSchedulingPolicy=` would put every
+/// thread of the server, and what it starts, in the class. No `LimitRTTIME=`: a shard busy with ready
+/// work makes no blocking call for as long as the work lasts, and the limit would kill the server for it.
+fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, place: Place) -> String {
     let unit = i.unit;
     let target = if i.system { "multi-user.target" } else { "default.target" };
     let subgroup = if systemd.is_some_and(|v| v >= DELEGATE_SUBGROUP_SINCE) { format!("DelegateSubgroup={}\n", crate::os::UNIT_LEAF) } else { String::new() };
     let server = if i.server() {
-        let partition = if partition {
+        let partition = match place.partition {
             // As root, before it starts: nothing outside the slice runs on its cores from then on.
-            "ExecStartPre=+-/bin/sh -c 'echo root > /sys/fs/cgroup/kiln.slice/cpuset.cpus.partition'\n"
-        } else {
-            ""
+            Partition::Make => format!("ExecStartPre=+-/bin/sh -c 'echo root > {SLICE_PARTITION}'\n"),
+            // As root, before it starts: an earlier install's partition gives its cores back (a slice the
+            // cpuset controller never reached has no such file, and nothing to give back).
+            Partition::Undo => format!("ExecStartPre=+-/bin/sh -c 'test ! -e {SLICE_PARTITION} || echo member > {SLICE_PARTITION}'\n"),
+            Partition::Leave => String::new(),
         };
-        let realtime = if realtime {
+        let realtime = if place.realtime {
             // Room for the shards' real-time class at its lowest priority (docs/priority.md, "A real-time
             // class for the shards"): a user's service manager gives what of it its own limit allows, and
             // the server says what it got.
@@ -693,18 +731,219 @@ fn kiln_slice(cores: Option<&str>) -> String {
     format!("[Unit]\nDescription=kiln's server, first among what this machine runs (docs/priority.md)\n\n[Slice]\nCPUWeight={SERVER_WEIGHT}\nIOWeight={SERVER_WEIGHT}\n{allowed}")
 }
 
-/// Returns true when the boot mechanism also started the service now.
-fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
+/// What this machine lets the server's systemd unit have, as `kiln install` reads it before writing
+/// the unit (docs/priority.md, "What kiln install grants"; goal 9, plan 01a1a87b2cec step 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Room {
+    /// Installed system-wide: the system's service manager starts the unit, as root.
+    system: bool,
+    /// Who installs it, for what to ask root for.
+    user: String,
+    /// For a user's install, the most `RLIMIT_RTPRIO` its service manager can give a unit: its own hard
+    /// limit, as the unit's process is the manager's child and may lower its limits but not raise them
+    /// (systemd sets the nearest it can, never failing the unit). `u64::MAX` is unlimited; `None`, it
+    /// couldn't be read (and a system install needs none).
+    rtprio: Option<u64>,
+    /// Whether the manager's cgroup has the cpuset controller to give its units, so `AllowedCPUs=`
+    /// applies: a system install's, the root cgroup's; a user's, what root delegated to their service
+    /// manager (systemd's own `user@.service` delegates `pids memory cpu`).
+    cpuset: bool,
+}
+
+/// Whether an install grants something of the server's place on its machine, and why, for a person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Grant {
+    granted: bool,
+    why: String,
+}
+
+/// `RLIMIT_RTPRIO` as `/proc/<pid>/limits` says it, for a person.
+fn rtprio_text(limit: u64) -> String {
+    if limit == u64::MAX { "unlimited".to_owned() } else { limit.to_string() }
+}
+
+/// Whether the server's unit grants its shards Linux's real-time class at [`crate::rt::REALTIME_PRIORITY`]
+/// (`[server] realtime`; docs/priority.md, "A real-time class for the shards"): a system install's
+/// server runs as root, which may take it whatever its limits (`CAP_SYS_NICE`, sched(7)); a user's
+/// takes what its unit's `LimitRTPRIO=` asks only as far as its service manager's own hard limit, which
+/// only root raises. Whether the kernel takes it too (one that schedules real-time groups gives the
+/// server's cgroup no real-time time) only the server can tell, and says.
+fn realtime_room(room: &Room) -> Grant {
+    let p = crate::rt::REALTIME_PRIORITY;
+    if room.system {
+        return Grant { granted: true, why: "a system install's server runs as root, which may take it".to_owned() };
+    }
+    match room.rtprio {
+        Some(limit) if u64::try_from(p).is_ok_and(|p| limit >= p) => {
+            Grant { granted: true, why: format!("your service manager allows RLIMIT_RTPRIO {}, and the unit takes {p} of it (LimitRTPRIO={p})", rtprio_text(limit)) }
+        }
+        Some(limit) => Grant {
+            granted: false,
+            why: format!(
+                "your service manager allows RLIMIT_RTPRIO {}, and a user's unit gets no more without root: root grants priority {p} (`{user} - rtprio {p}` in /etc/security/limits.d, then a new service manager: log out and in, or reboot), or the server installs system-wide (--system)",
+                rtprio_text(limit),
+                user = if room.user.is_empty() { "<user>" } else { room.user.as_str() }
+            ),
+        },
+        None => Grant { granted: false, why: "your service manager's RLIMIT_RTPRIO couldn't be read (its /proc/<pid>/limits), so whether the unit could take the class is unknown".to_owned() },
+    }
+}
+
+/// What `[server] cores` gets from the server's unit ([`cores_room`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoresRoom {
+    /// kiln.slice made a cpuset partition of them as the server starts.
+    partition: bool,
+    /// What that means, for a person.
+    said: String,
+}
+
+/// What `[server] cores` (`cores`, as declared) gets from the server's unit (goal 8, plan 01a1a59c2b29
+/// steps 6 and 7; goal 9, plan 01a1a87b2cec step 4; docs/priority.md, "Cores of its own"). The shards
+/// are fixed to them either way (`crate::rt::pin`, by CPU affinity, which needs nothing of systemd's).
+/// `AllowedCPUs=` applies where the manager has the cpuset controller. A partition is a system
+/// install's alone: `cpuset.cpus.partition` is the parent cgroup's to set, it makes a partition of a
+/// child only of a partition (the root cgroup is one), and a user's slice sits inside their service
+/// manager's, under cgroups root owns. `own_runner` (`[local_agent] enabled`): the server's own runner
+/// runs in kiln.slice, so where the slice is confined to the cores its legs and agents run on them
+/// too, off the shards' (`crate::os::WorkCpus::Beside`).
+fn cores_room(room: &Room, cores: &str, own_runner: bool) -> CoresRoom {
+    // kiln.slice is confined to them where AllowedCPUs= applies.
+    let (confined, partition) = (room.cpuset, room.system && room.cpuset);
+    let how = match (room.system, room.cpuset) {
+        (true, true) => "kiln.slice's alone (AllowedCPUs=), a cpuset partition: nothing outside it runs on them".to_owned(),
+        (true, false) => "not kiln.slice's alone: this machine's root cgroup has no cpuset controller to give it (cgroup v2's), so neither AllowedCPUs= nor a partition applies".to_owned(),
+        (false, true) => "kiln.slice confined to them (AllowedCPUs=), but not a partition: other work still runs on them, which only a system install keeps off (--system)".to_owned(),
+        (false, false) => "by CPU affinity alone: your service manager has no cpuset controller for AllowedCPUs= (root delegates it, `Delegate=pids memory cpu cpuset` in a drop-in for user@.service), and other work still runs on them, which only a system install keeps off (--system)".to_owned(),
+    };
+    let runner = if confined && own_runner {
+        "; the server's own runner runs in kiln.slice, so its legs and agents run on them too, off the shards' ([local_agent] enabled = false, and `kiln install --agent`, keep them off all of them)"
+    } else {
+        ""
+    };
+    CoresRoom { partition, said: format!("{cores}, the shards fixed to them: {how}{runner}") }
+}
+
+/// What the server's unit does to kiln.slice's partition ([`Partition`]): makes it one where `cores`
+/// may be ([`cores_room`]), gives an earlier one's cores back on a system install without them, and
+/// leaves a user's slice be.
+fn partition_for(room: &Room, cores: Option<&CoresRoom>) -> Partition {
+    match cores {
+        Some(c) if c.partition => Partition::Make,
+        None if room.system => Partition::Undo,
+        _ => Partition::Leave,
+    }
+}
+
+/// What `kiln install` says of the shards' real-time class: whether `[server] realtime` (`declared`) is
+/// on, and whether the unit grants it (`grant`), and what to do about either (`config`: kiln.toml).
+fn realtime_said(grant: &Grant, declared: bool, config: &Path) -> String {
+    let p = crate::rt::REALTIME_PRIORITY;
+    match (declared, grant.granted) {
+        (true, true) => format!("the shards in Linux's real-time class at priority {p}: {}; [server] realtime = false turns it off", grant.why),
+        (true, false) => format!("asked for ([server] realtime), not granted: {}; the shards run at the normal class until it is, and the server says so", grant.why),
+        (false, true) => format!("off, though this install grants it ({}): [server] realtime = true in {}, then kiln install again, turns it on", grant.why, config.display()),
+        (false, false) => format!("off, and not granted here: {}", grant.why),
+    }
+}
+
+/// The bare-metal default for the shards' real-time class (goal 9, plan 01a1a87b2cec step 4;
+/// docs/priority.md, "The bare-metal default"): on where the systemd unit this install writes grants
+/// it ([`realtime_room`]), declared in the config it writes for a new server, so it's on until the
+/// person says otherwise and says why it's on. `None` where the install writes no systemd unit (cron,
+/// XDG autostart, none; macOS and Windows, whose own ways stay: docs/priority.md).
+fn realtime_default(boot: Boot, system: bool) -> Option<Grant> {
+    (cfg!(target_os = "linux") && resolved_boot(boot, system) == Boot::Systemd).then(|| realtime_room(&room_here(system)))
+}
+
+/// A new server's kiln.toml, as `kiln install` writes it: `cfg` whole, and why `[server] realtime` is
+/// on where it's the bare-metal default (`realtime`, its grant).
+fn fresh_config(cfg: &crate::config::Config, realtime: Option<&Grant>) -> String {
+    let why = realtime.map(|g| format!("# [server] realtime is on: this install grants the shards Linux's real-time class ({}; docs/priority.md, \"The bare-metal default\").\n", g.why)).unwrap_or_default();
+    format!("# kiln configuration. Every key is optional; see docs/configuration.md.\n{why}\n{}", toml::to_string_pretty(cfg).unwrap_or_default())
+}
+
+/// `RLIMIT_RTPRIO`'s hard limit as `/proc/<pid>/limits` gives it (`Max realtime priority  0  0`, its
+/// soft and hard limits): `u64::MAX` for unlimited.
+fn rtprio_hard(limits: &str) -> Option<u64> {
+    crate::os::rtprio_limits(limits).map(|(_, hard)| hard)
+}
+
+/// A service manager's own cgroup from its `/proc/<pid>/cgroup` (`0::/user.slice/…/user@1000.service/init.scope`):
+/// the unit's, above the leaf systemd starts it in (`DelegateSubgroup=init.scope`).
+fn manager_cgroup(proc_cgroup: &str) -> Option<String> {
+    let path = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    Some(path.strip_suffix("/init.scope").unwrap_or(path).to_owned())
+}
+
+/// Whether a `cgroup.controllers` file names `controller`.
+fn has_controller(controllers: &str, controller: &str) -> bool {
+    controllers.split_whitespace().any(|c| c == controller)
+}
+
+/// [`Room`] on this machine: a system install's, from the root cgroup; a user's, from their service
+/// manager (`user@<uid>.service`'s process: its limits and its cgroup's controllers).
+#[cfg(target_os = "linux")]
+fn room_here(system: bool) -> Room {
+    let user = std::env::var("USER").unwrap_or_default();
+    let controllers = |cgroup: &str| std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/cgroup.controllers")).is_ok_and(|c| has_controller(&c, "cpuset"));
+    if system {
+        return Room { system, user, rtprio: None, cpuset: controllers("") };
+    }
+    let uid = crate::os::uid();
+    let manager = Command::new("systemctl")
+        .args(["show", "--property=MainPID", "--value", &format!("user@{uid}.service")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0);
+    let rtprio = manager.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()).and_then(|l| rtprio_hard(&l));
+    let cgroup = manager
+        .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok())
+        .and_then(|c| manager_cgroup(&c))
+        .unwrap_or_else(|| format!("/user.slice/user-{uid}.slice/user@{uid}.service"));
+    Room { system, user, rtprio, cpuset: controllers(&cgroup) }
+}
+
+/// [`Room`] off Linux: no systemd unit, nothing of the sort to grant.
+#[cfg(not(target_os = "linux"))]
+fn room_here(system: bool) -> Room {
+    Room { system, user: String::new(), rtprio: None, cpuset: false }
+}
+
+/// How the server starts at boot for `boot` as asked (`auto`: what this machine has), as [`setup_boot`]
+/// chooses it.
+fn resolved_boot(boot: Boot, system: bool) -> Boot {
     let systemd = have("systemctl") && Path::new("/run/systemd/system").exists();
-    let boot = match boot {
+    match boot {
         Boot::Auto if cfg!(windows) => Boot::Task,
         Boot::Auto if cfg!(target_os = "macos") => Boot::Launchd,
         Boot::Auto if systemd => Boot::Systemd,
         Boot::Auto if have("crontab") => Boot::Cron,
-        Boot::Auto if !i.system => Boot::Xdg,
+        Boot::Auto if !system => Boot::Xdg,
         Boot::Auto => Boot::None,
         b => b,
-    };
+    }
+}
+
+/// Gives the machine back the cores of kiln.slice's partition, which outlives the server's unit: the
+/// slice stays as it was, its cores held from everything else, until it's a member again.
+fn give_back_cores() {
+    let Ok(state) = std::fs::read_to_string(SLICE_PARTITION) else { return };
+    if state.trim() == "member" {
+        return;
+    }
+    match std::fs::write(SLICE_PARTITION, "member") {
+        Ok(()) => say("cores       kiln.slice's partition undone: its cores are the machine's again"),
+        Err(e) => say(format!("cores       kiln.slice is still a partition ({e}): as root, `echo member > {SLICE_PARTITION}` gives its cores back")),
+    }
+}
+
+/// Returns true when the boot mechanism also started the service now.
+fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
+    let boot = resolved_boot(boot, i.system);
     let (system, unit, bin, args, config) = (i.system, i.unit, i.bin, i.args, i.config);
     let exec = format!(
         "{} {}",
@@ -723,15 +962,19 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
                     path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
                 ),
             };
-            // Cores of the server's own (docs/priority.md, "Cores of its own"), read as Linux will, and
-            // whether its shards ask for the real-time class.
-            let server = if i.server() { crate::config::Config::load(config).ok().map(|c| c.server) } else { None };
-            let cores = server.as_ref().and_then(|s| s.cores.clone());
+            // The server's place on its machine (docs/priority.md; goal 9, plan 01a1a87b2cec step 4): its
+            // cores of its own, read as Linux will, whether its shards ask for the real-time class, and what
+            // this install can grant of each.
+            let server = if i.server() { crate::config::Config::load(config).ok() } else { None };
+            let cores = server.as_ref().and_then(|c| c.server.cores.clone());
             if let Some(c) = &cores {
                 crate::os::cpu_list(c).map_err(|e| anyhow::anyhow!("[server] cores in {}: {e}", config.display()))?;
             }
-            let realtime = server.as_ref().is_some_and(|s| s.realtime);
-            let body = systemd_unit(i, &env, &exec, systemd_version(), system && cores.is_some(), realtime);
+            let realtime = server.as_ref().is_some_and(|c| c.server.realtime);
+            let room = if i.server() { room_here(system) } else { Room { system, user: String::new(), rtprio: None, cpuset: false } };
+            let cores_grant = cores.as_deref().map(|c| cores_room(&room, c, server.as_ref().is_some_and(|s| s.local_agent.enabled)));
+            let place = if i.server() { Place { partition: partition_for(&room, cores_grant.as_ref()), realtime } } else { Place::NONE };
+            let body = systemd_unit(i, &env, &exec, systemd_version(), place);
             let (path, user_flag): (PathBuf, &[&str]) = if system {
                 (PathBuf::from(format!("/etc/systemd/system/{unit}.service")), &[])
             } else {
@@ -740,12 +983,12 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             if i.server() {
                 let slice = path.with_file_name("kiln.slice");
                 crate::util::write_secret(&slice, kiln_slice(cores.as_deref()).as_bytes(), 0o644)?;
-                let own = match (&cores, system) {
-                    (Some(c), true) => format!(", cores {c} its own"),
-                    (Some(c), false) => format!(", cores {c} (its own only installed system-wide: --system)"),
-                    (None, _) => String::new(),
-                };
-                say(format!("priority    {} (CPU and I/O weight {SERVER_WEIGHT}{own})", slice.display()));
+                let ranks = if system { "ahead of user.slice and system.slice, where CI and agents run" } else { "ahead of your other units; ahead of the system's slices only installed system-wide (--system)" };
+                say(format!("priority    {} (CPU and I/O weight {SERVER_WEIGHT}, {ranks})", slice.display()));
+                say(format!("realtime    {}", realtime_said(&realtime_room(&room), realtime, config)));
+                if let Some(c) = &cores_grant {
+                    say(format!("cores       {}", c.said));
+                }
             }
             crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
             run(Command::new("systemctl").args(user_flag).arg("daemon-reload"))?;
@@ -1265,6 +1508,10 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
         }
     };
     crate::util::write_secret(&path, launchd_body(i, &log, launcher.as_deref()).as_bytes(), 0o644)?;
+    if i.server() {
+        // macOS's own ways stay (docs/priority.md, "macOS"; goal 9, plan 01a1a87b2cec step 4).
+        say("priority    ProcessType Interactive: the server runs as an app does, its legs and agents under background policy; cores of its own and the real-time class are Linux's (docs/priority.md)");
+    }
     let kind = if i.system { "LaunchDaemon" } else { "LaunchAgent" };
     let domains = launchd_domains(i.system);
     let job: Vec<u32> = domains.iter().filter_map(|d| launchd_job(d, &label).flatten()).collect();
@@ -1442,6 +1689,10 @@ pub(crate) fn startup_script(unit: &str) -> PathBuf {
 /// here for), else at sign-in. Returns whether the task started kiln now.
 fn scheduled_task(i: &Install<'_>, start: TaskStart) -> anyhow::Result<bool> {
     std::fs::create_dir_all(i.state_dir).with_context(|| format!("create {}", i.state_dir.display()))?;
+    if i.server() {
+        // Windows' own ways stay (docs/priority.md, "Windows"; goal 9, plan 01a1a87b2cec step 4).
+        say("priority    the server above normal, its legs and agents below normal in jobs of their own; cores of its own and the real-time class are Linux's (docs/priority.md)");
+    }
     let user = crate::os::user_principal();
     let elevated = crate::os::elevated();
     let mut not_at_boot = None;
@@ -1648,8 +1899,12 @@ fn remove_service(agent: bool) {
         home().join(format!(".config/autostart/{unit}.desktop")),
         PathBuf::from(format!("/etc/systemd/system/{unit}.service")),
     ];
-    // The server's slice (docs/priority.md) goes with it.
+    // The server's slice (docs/priority.md) goes with it, and the cores a partition of it held go back
+    // to the machine (goal 9, plan 01a1a87b2cec step 4): the slice outlives its unit.
     if !agent {
+        if cfg!(target_os = "linux") {
+            give_back_cores();
+        }
         paths.extend([home().join(".config/systemd/user/kiln.slice"), PathBuf::from("/etc/systemd/system/kiln.slice")]);
     }
     if cfg!(target_os = "macos") {
@@ -1926,22 +2181,23 @@ mod tests {
         let agent = ["supervise", "--", "agent"].map(str::to_owned);
         let server = ["supervise", "--", "server"].map(str::to_owned);
         let i = Install { system: true, unit: "kiln-agent", bin: Path::new("/usr/local/bin/kiln"), args: &agent, config: Path::new("/etc/kiln/kiln.toml"), state_dir: Path::new("/var/lib/kiln"), env: None, ask: false };
-        let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), false, false);
+        let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), Place::NONE);
         anyhow::ensure!(runner.contains("\nDelegate=yes\nDelegateSubgroup=kiln\n"), "{runner}");
         anyhow::ensure!(!runner.contains("Slice=") && !runner.contains("CPUWeight") && !runner.contains("ProcessType"), "{runner}");
         // kiln's upgrades still read what it runs.
         anyhow::ensure!(crate::upgrade::parse_unit(&runner, "kiln-agent", true).is_some_and(|e| e.args == ["agent"]), "{runner}");
-        let old = systemd_unit(&i, "", "x", Some(252), false, false);
+        let old = systemd_unit(&i, "", "x", Some(252), Place::NONE);
         anyhow::ensure!(old.contains("\nDelegate=yes\n") && !old.contains("DelegateSubgroup"), "{old}");
         let s = Install { unit: "kiln", args: &server, ..i };
-        let first = systemd_unit(&s, "", "/usr/local/bin/kiln supervise -- server", Some(262), true, false);
+        let first = systemd_unit(&s, "", "/usr/local/bin/kiln supervise -- server", Some(262), Place { partition: Partition::Make, realtime: false });
         anyhow::ensure!(first.contains("\nSlice=kiln.slice\nCPUWeight=1000\nIOWeight=1000\n") && first.contains("cpuset.cpus.partition"), "{first}");
-        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), false, false).contains("partition"));
+        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), Place::NONE).contains("partition"));
         // Goal 8, plan 01a1a59c2b29 step 7: with its shards in the real-time class, room for that class
         // at the priority they ask for, and no policy for every thread of it; a runner's never.
-        let realtime = systemd_unit(&s, "", "x", Some(262), false, true);
+        let realtime = systemd_unit(&s, "", "x", Some(262), Place { partition: Partition::Leave, realtime: true });
         anyhow::ensure!(realtime.contains("\nLimitRTPRIO=1\n") && !realtime.contains("CPUSchedulingPolicy"), "{realtime}");
-        anyhow::ensure!(!first.contains("LimitRTPRIO") && !systemd_unit(&i, "", "x", Some(262), false, true).contains("LimitRTPRIO"), "only a server asking for it gets the room");
+        let runner_asked = systemd_unit(&i, "", "x", Some(262), Place { partition: Partition::Make, realtime: true });
+        anyhow::ensure!(!first.contains("LimitRTPRIO") && !runner_asked.contains("LimitRTPRIO") && !runner_asked.contains("partition"), "only a server asking for it gets the room");
         anyhow::ensure!(kiln_slice(None).contains("\n[Slice]\nCPUWeight=1000\nIOWeight=1000\n") && !kiln_slice(None).contains("AllowedCPUs"));
         anyhow::ensure!(kiln_slice(Some("8-15")).ends_with("\nAllowedCPUs=8-15\n"));
         let plist = launchd_body(&s, Path::new("/tmp/kiln.log"), None);
@@ -1964,9 +2220,12 @@ mod tests {
         let server = ["supervise", "--", "server"].map(str::to_owned);
         let i = Install { system: false, unit: "kiln-g8-agent", bin: Path::new("/bin/true"), args: &agent, config: Path::new("/tmp/kiln.toml"), state_dir: dir.path(), env: None, ask: false };
         let s = Install { unit: "kiln-g8-server", args: &server, ..i };
+        // Goal 9, plan 01a1a87b2cec step 4: a server's unit that gives an earlier partition's cores back too.
+        let u = Install { unit: "kiln-g8-undo", ..s };
         let units = [
-            ("kiln-g8-agent.service", systemd_unit(&i, "", "/bin/true supervise -- agent", systemd_version(), false, false)),
-            ("kiln-g8-server.service", systemd_unit(&s, "", "/bin/true supervise -- server", systemd_version(), true, true)),
+            ("kiln-g8-agent.service", systemd_unit(&i, "", "/bin/true supervise -- agent", systemd_version(), Place::NONE)),
+            ("kiln-g8-server.service", systemd_unit(&s, "", "/bin/true supervise -- server", systemd_version(), Place { partition: Partition::Make, realtime: true })),
+            ("kiln-g8-undo.service", systemd_unit(&u, "", "/bin/true supervise -- server", systemd_version(), Place { partition: Partition::Undo, realtime: false })),
             ("kiln.slice", kiln_slice(Some("0-1"))),
         ];
         let mut paths = Vec::new();
@@ -1981,6 +2240,129 @@ mod tests {
         let ours: Vec<&str> = said.lines().filter(|l| l.contains("kiln-g8-") || l.contains("kiln.slice")).collect();
         anyhow::ensure!(out.status.success() && ours.is_empty(), "systemd-analyze: {said}");
         Ok(())
+    }
+
+    /// A user's install as fedora's and adacachy's service managers are (2026-11-05): RLIMIT_RTPRIO
+    /// `limit`, the cpuset controller delegated or not.
+    fn users(rtprio: Option<u64>, cpuset: bool) -> Room {
+        Room { system: false, user: "ada".to_owned(), rtprio, cpuset }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a system install grants the shards Linux's real-time class (its
+    /// server runs as root); a user's grants it as far as their service manager's own hard limit, and
+    /// where that's 0 says what root has to do; one it can't read grants nothing.
+    #[test]
+    fn g9_s4_the_real_time_class_is_granted_by_a_system_install_and_within_a_users_manager_limit() -> anyhow::Result<()> {
+        let system = realtime_room(&Room { system: true, user: "root".to_owned(), rtprio: None, cpuset: true });
+        anyhow::ensure!(system.granted && system.why.contains("runs as root"), "{system:?}");
+        for (limit, says) in [(99, "RLIMIT_RTPRIO 99"), (1, "RLIMIT_RTPRIO 1"), (u64::MAX, "RLIMIT_RTPRIO unlimited")] {
+            let grant = realtime_room(&users(Some(limit), true));
+            anyhow::ensure!(grant.granted && grant.why.contains(says) && grant.why.contains("LimitRTPRIO=1"), "{limit}: {grant:?}");
+        }
+        let refused = realtime_room(&users(Some(0), true));
+        anyhow::ensure!(!refused.granted, "{refused:?}");
+        for says in ["RLIMIT_RTPRIO 0", "`ada - rtprio 1` in /etc/security/limits.d", "a new service manager", "--system"] {
+            anyhow::ensure!(refused.why.contains(says), "{says:?} not in {:?}", refused.why);
+        }
+        anyhow::ensure!(!realtime_room(&users(None, true)).granted, "a limit it couldn't read grants nothing");
+        anyhow::ensure!(realtime_room(&Room { user: String::new(), ..users(Some(0), false) }).why.contains("`<user> - rtprio 1`"));
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what `[server] cores` gets of each install. A system install
+    /// confines kiln.slice to them and makes them a partition as the server starts; without cores, its
+    /// unit gives an earlier partition's back. A user's confines the slice only where root delegated the
+    /// cpuset controller to their service manager, never makes a partition, and says what it would take.
+    /// Where the slice is confined, the server's own runner's legs and agents run there, off the shards'.
+    #[test]
+    fn g9_s4_cores_get_what_each_install_may() -> anyhow::Result<()> {
+        let system = Room { system: true, user: "root".to_owned(), rtprio: None, cpuset: true };
+        let own = cores_room(&system, "8-15", true);
+        anyhow::ensure!(own.partition && own.said.starts_with("8-15, the shards fixed to them: ") && own.said.contains("a cpuset partition"), "{own:?}");
+        anyhow::ensure!(own.said.contains("[local_agent] enabled = false") && !cores_room(&system, "8-15", false).said.contains("local_agent"), "{own:?}");
+        anyhow::ensure!(partition_for(&system, Some(&own)) == Partition::Make && partition_for(&system, None) == Partition::Undo);
+        let v1 = cores_room(&Room { cpuset: false, ..system.clone() }, "8-15", true);
+        anyhow::ensure!(!v1.partition && v1.said.contains("no cpuset controller") && !v1.said.contains("local_agent"), "{v1:?}");
+        anyhow::ensure!(partition_for(&system, Some(&v1)) == Partition::Leave);
+        let delegated = cores_room(&users(Some(0), true), "8-15", true);
+        anyhow::ensure!(!delegated.partition && delegated.said.contains("kiln.slice confined to them") && delegated.said.contains("not a partition") && delegated.said.contains("--system"), "{delegated:?}");
+        anyhow::ensure!(partition_for(&users(Some(0), true), Some(&delegated)) == Partition::Leave && partition_for(&users(Some(0), true), None) == Partition::Leave);
+        let stock = cores_room(&users(Some(0), false), "8-15", true);
+        anyhow::ensure!(!stock.partition && stock.said.contains("Delegate=pids memory cpu cpuset") && !stock.said.contains("local_agent"), "{stock:?}");
+        // As the server's unit writes them: made, given back, neither.
+        let server = ["supervise", "--", "server"].map(str::to_owned);
+        let s = Install { system: true, unit: "kiln", bin: Path::new("/usr/local/bin/kiln"), args: &server, config: Path::new("/etc/kiln/kiln.toml"), state_dir: Path::new("/var/lib/kiln"), env: None, ask: false };
+        let made = systemd_unit(&s, "", "x", Some(262), Place { partition: Partition::Make, realtime: false });
+        anyhow::ensure!(made.contains("\nExecStartPre=+-/bin/sh -c 'echo root > /sys/fs/cgroup/kiln.slice/cpuset.cpus.partition'\n"), "{made}");
+        let undone = systemd_unit(&s, "", "x", Some(262), Place { partition: Partition::Undo, realtime: false });
+        anyhow::ensure!(undone.contains("\nExecStartPre=+-/bin/sh -c 'test ! -e /sys/fs/cgroup/kiln.slice/cpuset.cpus.partition || echo member > /sys/fs/cgroup/kiln.slice/cpuset.cpus.partition'\n"), "{undone}");
+        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), Place::NONE).contains("ExecStartPre"));
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: `kiln install` says of the real-time class whether it's on and
+    /// whether this install grants it, and what to do about either.
+    #[test]
+    fn g9_s4_kiln_install_says_how_the_shards_run() {
+        let config = Path::new("/home/ada/.config/kiln/kiln.toml");
+        let yes = Grant { granted: true, why: "a system install's server runs as root, which may take it".to_owned() };
+        let no = Grant { granted: false, why: "your service manager allows RLIMIT_RTPRIO 0".to_owned() };
+        let on = realtime_said(&yes, true, config);
+        assert!(on.starts_with("the shards in Linux's real-time class at priority 1: a system install's") && on.ends_with("[server] realtime = false turns it off"), "{on}");
+        let refused = realtime_said(&no, true, config);
+        assert!(refused.starts_with("asked for ([server] realtime), not granted: your service manager allows RLIMIT_RTPRIO 0") && refused.contains("the server says so"), "{refused}");
+        let could = realtime_said(&yes, false, config);
+        assert!(could.starts_with("off, though this install grants it") && could.contains("[server] realtime = true in /home/ada/.config/kiln/kiln.toml, then kiln install again"), "{could}");
+        assert_eq!(realtime_said(&no, false, config), "off, and not granted here: your service manager allows RLIMIT_RTPRIO 0");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a new server's kiln.toml on bare metal declares the real-time class
+    /// where its unit grants it, and says why; where it doesn't, the class stays off.
+    #[test]
+    fn g9_s4_a_new_servers_config_declares_the_class_where_its_unit_grants_it() -> anyhow::Result<()> {
+        let grant = Grant { granted: true, why: "a system install's server runs as root, which may take it".to_owned() };
+        let mut cfg = crate::config::Config::default();
+        cfg.server.realtime = true;
+        let text = fresh_config(&cfg, Some(&grant));
+        anyhow::ensure!(text.starts_with("# kiln configuration. Every key is optional; see docs/configuration.md.\n# [server] realtime is on: this install grants the shards Linux's real-time class (a system install's"), "{text}");
+        anyhow::ensure!(toml::from_str::<crate::config::Config>(&text)?.server.realtime, "{text}");
+        let plain = fresh_config(&crate::config::Config::default(), None);
+        anyhow::ensure!(plain.starts_with("# kiln configuration. Every key is optional; see docs/configuration.md.\n\n") && !plain.contains("realtime is on"), "{plain}");
+        anyhow::ensure!(!toml::from_str::<crate::config::Config>(&plain)?.server.realtime, "{plain}");
+        anyhow::ensure!(!crate::config::Config::default().server.realtime, "off until declared, wherever kiln install doesn't declare it");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what `kiln install` reads of a service manager, as fedora's and
+    /// adacachy's said it on 2026-11-05: its `RLIMIT_RTPRIO` (not the real-time timeout's line beside it),
+    /// its cgroup above the leaf it runs in, and its cgroup's controllers.
+    #[test]
+    fn g9_s4_a_service_managers_limits_and_cgroup_read_as_linux_writes_them() {
+        let limits = |rtprio: &str| format!("Limit                     Soft Limit           Hard Limit           Units     \nMax nice priority         0                    0                    \nMax realtime priority     {rtprio}\nMax realtime timeout      unlimited            unlimited            us        \n");
+        assert_eq!(rtprio_hard(&limits("0                    0                    ")), Some(0), "fedora's");
+        assert_eq!(rtprio_hard(&limits("99                   99                   ")), Some(99), "adacachy's");
+        assert_eq!(rtprio_hard(&limits("0                    unlimited            ")), Some(u64::MAX));
+        assert_eq!(rtprio_hard("Max realtime timeout      unlimited            unlimited            us\n"), None);
+        assert_eq!(manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service/init.scope\n").as_deref(), Some("/user.slice/user-1000.slice/user@1000.service"));
+        assert_eq!(manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service\n").as_deref(), Some("/user.slice/user-1000.slice/user@1000.service"));
+        assert_eq!(manager_cgroup("1:name=systemd:/user.slice\n"), None, "cgroup v1 alone");
+        assert!(has_controller("cpuset cpu io memory pids\n", "cpuset") && !has_controller("cpu io memory pids\n", "cpuset") && !has_controller("cpusetx\n", "cpuset"));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: on a Linux machine with a user's service manager, `kiln install`
+    /// reads its real-time limit, and the grant follows it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_this_machines_service_manager_is_read() {
+        let uid = crate::os::uid();
+        if !have("systemctl") || !Path::new(&format!("/run/user/{uid}/systemd")).exists() {
+            eprintln!("no service manager of this user's here: skipped");
+            return;
+        }
+        let room = room_here(false);
+        assert!(room.rtprio.is_some(), "{room:?}");
+        let grant = realtime_room(&room);
+        assert_eq!(grant.granted, room.rtprio.is_some_and(|l| l >= 1), "{room:?}: {grant:?}");
     }
 
     #[test]

@@ -24,11 +24,18 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. |
 | `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. |
 | `kiln_shard_polls_total{shard}` | Task polls. |
-| `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (250 µs here, so past 500 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
+| `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (266.7 µs, `rt::STEP_BUDGET_NS`, derived in goal 9's step 3: so past 533 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
 | `kiln_shard_longest_poll_seconds{shard}` | The longest single poll the shard has run. |
+| `kiln_shard_quantum_seconds{shard}` | The step quantum the shard runs with, as its probe read it: the longest a poll is to hold it (goal 9's step 3), and half the hold its slow polls are counted past. `kiln-lab` holds what held the shards to it. |
 | `kiln_shard_scheduler_overrun_seconds{shard}` | How late the shard's steps ran after its waits, as the shard measured it: the host descheduling it, decaying as it recovers. |
 | `kiln_shard_held_polls_total{shard,site,label}`, `kiln_shard_held_seconds_total{...}`, `kiln_shard_held_longest_seconds{...}` | What held the shard: every poll past 100 µs (`hyper_rt::slow::SLOW_POLL_NS`, a tenth of goal 9's bar), counted against the spawn site of its task (`#[track_caller]`, `file:line:column`) and the label its code set (`label`: an HTTP request's route, as `read /api/harness/sessions`; `crate::route_latency::label_of`), with their holds added up and the longest. Each shard keeps its own table (`hyper_rt::slow`), which only it writes; `/metrics` reads it without a lock. |
 | `kiln_shard_held_host_polls_total{shard,site,label}`, `kiln_shard_held_host_seconds_total{...}` | Of those polls, the ones the host held, and their time: the shard's thread runnable and off the CPU (preempted), as hyper-rt attributes a poll past twice the step quantum (`hyper_rt::attribution`), so a shorter one is never among them. What no code held, and cores of its own would (goal 9, plan 01a1a87b2cec steps 3 and 4); the lab's report gives each site and label's share. |
+| `kiln_shard_steps_total{shard}`, `kiln_shard_parks_total{shard}`, `kiln_shard_parks_withdrawn_total{shard}` | What each request costs a shard beside its polls (goal 9, plan 01a1a87b2cec step 5; `crate::shard_health::Wakes`): its loop's steps; its parks that waited in its driver, each a system call and a sleep; and those withdrawn, an inbox already holding work, which cost neither. |
+| `kiln_shard_wakeups_total{shard,by}` | Its parks by what ended them: `kick` (another thread's wake or message: the driver's kick, one a park however many senders), `io` (a socket's readiness, a completion), `timer` (the deadline it waited for, or a signal). |
+| `kiln_shard_wakes_taken_total{shard}`, `kiln_shard_wakes_sent_total{shard,to}` | Wakes from other threads the shard took in (bits drained: a task's wakes before it runs are one), and the wakes its own thread made through tasks' wakers (a channel's send, a broadcast's subscribers, a cell's publisher): `to="own"` to its own tasks, `to="other"` to other shards'. |
+| `kiln_shard_kicks_sent_total{shard}`, `kiln_shard_kicks_saved_total{shard}` | The kicks its thread made to parked shards, each a system call on it, counted by the sender as it claims the park's kick; and the wakes and messages sent to it that found it running or its park's kick claimed, which cost their senders none (`hyper_rt::parking`). |
+| `kiln_shard_threads_woken_total{shard}` | The threads its thread unparked: compute pool workers woken for the jobs it queued, a thread waiting on what its task published; each a system call on it. |
+| `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -60,8 +67,9 @@ places and its run. The histograms are atomics the pools' threads write as they 
 | --- | --- |
 | `kiln_compute_jobs_total`, `kiln_compute_refused_total` | Jobs the compute pool took, and those it refused at its bound (each asked again). |
 | `kiln_compute_pieces_total`, `kiln_compute_yielded_total` | Pieces its jobs ran, and those after which their job gave its thread to a waiting one. |
+| `kiln_compute_unparks_total`, `kiln_compute_parks_total` | What handing it work costs (goal 9, plan 01a1a87b2cec step 5): its workers woken from their park, each a system call (a futex wake on Linux) on the thread that queued the job (a shard's, counted there too: `kiln_shard_threads_woken_total`) or on a worker that found more; and the times a worker went to park with nothing to do. |
 | `kiln_compute_wait_seconds` (histogram) | How long each job waited for a thread: from its submission to its first piece. |
-| `kiln_compute_piece_seconds` (histogram) | How long each piece held its thread. A piece ends once its job has run a shard's step (250 µs) and another job waits, at the next unit of its work. |
+| `kiln_compute_piece_seconds` (histogram) | How long each piece held its thread. A piece ends once its job has run a shard's step quantum (266.7 µs) and another job waits, at the next unit of its work. |
 | `kiln_compute_longest_piece_seconds` | The longest piece yet. |
 | `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's reads, each on a read-only connection of its own), `fs` (files, `/proc`, archives, a child's wait); and `store_write`, kiln.db's writer, a thread of its own that takes every call that may write in turn (goal 5). |
 | `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`); `store_write`'s one. |
@@ -195,6 +203,22 @@ mean; and the worst shard's p99.9 and busy share (`shards.worst_delay_p999_us`,
 `shards.worst_busy_share`). What held the shards past 100 µs (`kiln_shard_held_*`) is each round's
 too, in the window and over the fill (`held`, `fill_held` in `run.json`), and the report lists it by
 spawn site and label: polls and milliseconds held a second, the mean hold and the longest.
+
+What each request cost the shards beside its CPU (goal 9, plan `01a1a87b2cec` step 5): their loop steps,
+polls, parks and wakes over the window, summed over the shards, over its requests (`shards.<what>_per_request`):
+`steps`, `polls`, `parks` (each a system call and a sleep) and `parks_withdrawn` (none), the parks by what
+ended them (`wakeups_kick`, `wakeups_io`, `wakeups_timer`), the wakes from other threads taken in
+(`wakes_taken`), the wakes the shards' threads made (`wakes_sent_own`, `wakes_sent_other`), the kicks they
+sent (`kicks_sent`, each a system call on the shard) and were saved (`kicks_saved`), the threads they
+unparked (`threads_woken`), their driver's harvests (`harvests`) and readiness registrations (`arms`), and their tasks' TCP calls
+(`socket_accepts`, `socket_reads`, `socket_writes`) with those that moved nothing (`socket_reads_empty`,
+`socket_writes_full`): with the parks and kicks, most of the system calls a request costs the shards, summed
+as `shards.syscalls_per_request` (not counted: a socket's options and shutdown, the probe's clock, the futex
+a channel to a thread of kiln's own may wake inside std, and, before goal 9's step 5, the read that drained
+the kick's eventfd on each kicked wake). Beside them, what each request handed the pools: the compute pool's jobs, the
+workers they woke and the times a worker went to park (`compute.jobs_per_request`, `.unparks_per_request`,
+`.parks_per_request`), and each blocking share's jobs, kiln.db's writer's among them
+(`blocking.<share>.per_request`).
 
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
@@ -1097,6 +1121,56 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   waits either way, so its messages keep their order.
 - **The server's host sample on the blocking pool** (`Hub::sampler_loop`), as a runner's already was: it
   held its shard about 2 s every minute where sysinfo samples (found by the Bare Metal Migration agent).
+- **The step quantum, from the measurements** (`rt::STEP_BUDGET_NS`: 266,666 ns, where it was a configured
+  250 µs): the longest a poll may hold a shard, so that every shard runs its ready work within 1 ms at
+  p99.9. A ready task waits:
+  - its floor, 200 µs: its timer falls due on the wheel's next tick (100 µs), and the OS wakes the
+    shard's thread within its timer slack (the tick again); the calm shards' median, 192 µs (g6c2 calm on
+    rt5, 191 to 194 over six rounds), is that floor;
+  - the polls it finds in hand or ahead of it: on a shard busy a share ρ of the time it finds n or more
+    with a chance of about ρⁿ (a single server's queue, as what arrives finds it), and on the lab's
+    busiest shard (ρ = 0.065, shard 1; the mean 0.052) ρ² is 0.42% and ρ³ 0.027%, so the 1-in-1000 wake
+    finds two, each a quantum at most where no poll holds a shard past it (step 3's done-when);
+  - its CPU where another thread holds it, about a quantum again: the slice each shard asks the OS for
+    is its quantum (`hyper_rt::compute::prefer_current_thread`; beside four pool threads on one core a
+    shard's p99 wake took 0.21 ms with a 250 µs slice).
+
+  So the floor and three quanta come to the bar: (1 ms − 200 µs) / 3 = 266.7 µs, the largest quantum
+  within it. It holds ordinary work's long polls: of a site the list doesn't name, the largest mean hold
+  past 100 µs was 0.246 ms (`reads.rs:338`); the listed paths' held 0.15 to 0.26 ms on average, but for
+  what's left to cut: `write /api/mcp` 0.92 ms, a supervised child (`server.rs:245`) 0.57, the owners'
+  `Update::Meta` 0.40, custody's receipts 0.38 and records 0.37. With 250 µs the two shards ran 12.1 polls
+  a second past twice the quantum (500 µs): six a shard, each 0.5 ms or more, so a shard was held so 0.3%
+  of the time or more, past the 0.1% its p99.9 can spare, and its p99.9 was 1295 µs. Where the kernel's
+  preemption is lazy (fedora's), a wake onto a busy CPU waits for its next tick instead, up to 1 ms
+  (docs/priority.md, wake-2): step 4's to keep off, not the quantum's. As step 5 cuts the busy share the
+  same rule gives a longer quantum: at 0.011 a wake finds one poll at p99.9, and 400 µs would do. The
+  quantum also sets a cooperative task's share of its shard and its loops' turns (`rt::Turns`), how often
+  a busy shard reads its inputs, the slow polls' threshold (twice it: 533 µs), the watchdog's stall (64
+  quanta: 17.1 ms), the compute pool's pieces, the slice each shard asks for, and placement's margin.
+  `KILN_RT_QUANTUM_US` still sets another for the lab's A/B of quanta. The derivation is
+  `rt::tests::g9_s3_the_step_quantum_is_derived_from_the_lab`.
+- **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
+  it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
+  past it.
+
+### Step 3's check
+
+`kiln-lab`'s report says of each build whether step 3's done-when holds, "no poll past the new quantum
+from the listed paths". It finds each path of step 2's list in the rounds' `kiln_shard_held_*`: by the
+file of its task's spawn site (custody's receipts `custody/feeds.rs`, the hub's tasks `hub.rs`, the feed
+to the mirrors `convo/feed.rs`, the owners `harness/copies.rs`, the server's own tasks `server.rs` and
+`sup.rs`, a viewer's socket `api.rs`), the hub's net loop by the site its `runner …` labels name, and the
+four requests by their routes at the site the requests' routes name. It holds the longest poll of each,
+the window's and the fill's (`kiln_shard_held_longest_seconds` is the longest since the server started),
+to the quantum the rounds' shards ran with (`kiln_shard_quantum_seconds`), round by round. Its first line
+says met or not; then a row a path, with where its longest poll was, the rounds past, its polls past
+100 µs a second and the host's share of their time (preempted: step 4's, not the code's); then what else
+passed the quantum. Rounds of a build from before the gauge, or held to another quantum:
+
+```sh
+kiln-lab report --quantum-us 266.666 <run>/run.json
+```
 
 ## Goal 11: a tenth of the memory
 
@@ -1301,6 +1375,93 @@ What it says:
   ms with hogs). Production's machine preempts fully and its installer can make the cores a
   partition; on fedora that needs root, as does the real-time class (`RLIMIT_RTPRIO` 0 there), so
   neither ran here.
+
+### The bare-metal default (goal 9 step 4)
+
+What `kiln install` gives the server on Linux with systemd, and why (docs/priority.md, "What kiln install
+grants" and "The bare-metal default"):
+
+- **The shards in the real-time class wherever the server's unit grants it**, declared in a new server's
+  config (`[server] realtime = true`, with a line saying why) and given room by its unit (`LimitRTPRIO=1`):
+  every system install (the server runs as root), and a user's install whose service manager allows
+  `RLIMIT_RTPRIO` 1 or more. Elsewhere it stays off, and the install says what it would take. Once its shards
+  have asked, the server gives up the room, so nothing it starts inherits it.
+- **Cores of its own stay declared** (`[server] cores`); declared on a system install, they're a cpuset
+  partition as the server starts (given back without them, and by `kiln uninstall`), the server says whether
+  the partition took (its log; `/healthz/server`'s `priority.cores`), and its own runner's legs and agents run
+  off the shards' cores.
+- **macOS and Windows keep what they have** (launchd's `Interactive` job and background policy; above and below
+  normal priority classes), and say so.
+- **Its basis:** the table above (weights alone 3.28 ms at p99.9 with hogs, cores by affinity 1.96, neither
+  under 1 ms on fedora's lazy kernel), the kernel's rules (a real-time wake preempts at once under every
+  preemption mode; a normal one waits for a lazy kernel's tick, wake-2's 1.00 ms), and what the installer can
+  grant. Not yet a lab A/B of the class itself: the one below decides it, and if the class doesn't beat weights
+  alone there, the default goes back to off (`realtime_default`, `crates/kiln/src/install.rs`).
+
+What the lab's machines grant (read 2026-11-05 ~15:20 UTC):
+
+| | fedora (the lab) | adacachy (production) |
+| --- | --- | --- |
+| kernel, preemption | 6.19.10, lazy at 1000 Hz | 7.2.9, full at 1000 Hz |
+| real-time group scheduling | none | none |
+| the user's service manager's `RLIMIT_RTPRIO` | 0, soft and hard | 99, soft and hard (`limits.d`, group `audio`) |
+| cpuset delegated to that manager | yes (`DelegateControllers=cpu cpuset io memory pids`) | yes (a `delegate.conf` drop-in) |
+| the production server's own `RLIMIT_RTPRIO` | | 0, soft and hard: a system unit with `User=`, which `limits.d` doesn't reach |
+
+So no lab machine grants the class today, and production's server wouldn't take it as deployed.
+
+**Ada's call:**
+
+- **The real-time A/B on fedora** needs one root command there, which restarts nothing and lasts until the
+  user's service manager next starts (a reboot or a re-login): it raises that manager's own limit, so a unit
+  that asks for `LimitRTPRIO=1`, as the lab's rt-* rounds do, gets it, and no other unit changes (each gets
+  the limits the manager started with unless it asks):
+  `sudo prlimit --pid "$(systemctl show -p MainPID --value user@1000.service)" --rtprio=1:1`. The lasting
+  alternative, `adalundhe - rtprio 1` in `/etc/security/limits.d`, takes a new service manager there, which
+  restarts fedora's runner.
+- **Production:** `LimitRTPRIO=1` in `kiln-server.service` and `[server] realtime = true` in its config, a
+  deploy; cores of its own there would also want a partition its hand-written unit doesn't make.
+- **A partition in the lab,** `preempt=full` at boot there, and `isolated` partitions anywhere: root's, and
+  outside what the lab's driver can do as a user.
+
+### The A/B to run (goal 9 step 4)
+
+Weights alone against cores of its own against the real-time class, beside the same hogs in production's
+layout, eight rounds each, interleaved, with `scripts/shard_lab/driver.sh` on fedora (the coordinator's):
+
+- `hogs`: weights alone (the server at `CPUWeight=1000` on 16-31, 16 spinning hogs at `cpu.weight` 1 there);
+- `cores`: the server on cores of its own (16-23, its shards on 17-20), the hogs on 24-31;
+- `rt-hogs`: `hogs` with the shards in the real-time class: the bare-metal default where it's granted;
+- `rt-cores`: `cores` with the class;
+- `calm` and `rt-calm`: no hogs, so the class is seen to cost calm nothing.
+
+Once Ada has given the room (above), check it, then run (this branch's `kiln` and `kiln-lab`, built as for
+step 7's lab):
+
+```sh
+# 1, where a unit asking for LimitRTPRIO=1 gets it; 0 and every rt-* configuration is skipped, said in driver.log
+systemd-run --user --quiet --wait --pipe --collect -p LimitRTPRIO=1 bash -c 'ulimit -Hr'
+systemd-run --user --unit=g9s4-ab --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+  env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 CORES=16-23 CORES_HOGS=24-31 SHARDS=4 \
+  CONFIGS="calm hogs cores rt-calm rt-hogs rt-cores" \
+  bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g9s4
+```
+
+About 2.5 to 3 minutes a round, 48 rounds: two to two and a half hours. Without the room the same command runs
+`calm hogs cores` and logs each rt-* configuration skipped. `COMPARE` (driver.sh) sets the report's pairs; by
+default `calm:hogs hogs:cores hogs:rt-hogs hogs:rt-cores cores:rt-cores calm:rt-calm cores-calm:cores`.
+
+What to read:
+
+- `driver.log`: each rt-* round's line `4 of 4 shard threads in the real-time class` (from the hook's
+  `affinity.txt`: policy 2 is `SCHED_RR`); fewer, and that round measured something else.
+- `report.md`: the shards' delay p99.9 of `hogs`, `cores`, `rt-hogs` and `rt-cores` (goal 9 step 4's bar: under
+  1 ms with hogs), and `kiln-lab compare` of each pair, over every number at once.
+- **The class stays the default** where `rt-hogs` makes the bar or beats `hogs` beyond noise, with no number of
+  `rt-calm` worse than `calm` beyond noise (API reads, pages and frames among them: a shard in the class also
+  preempts the server's own pools on its CPU). **It goes back to off** where `rt-hogs` doesn't beat `hogs`.
+  **Cores need Ada's call** where only `rt-cores` (or `cores`) makes the bar: then cores of its own, which take a
+  choice of how many and which, would have to become a default the installer derives.
 
 ## What the lab doesn't do yet
 

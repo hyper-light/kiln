@@ -2482,13 +2482,15 @@ mod tests {
         let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         anyhow::ensure!(chunks.len() == 4, "{} chunks past the newest page", chunks.len());
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
-        let held = SEGMENT_BYTES.load(Ordering::Relaxed);
+        // This copy's own segments in memory (not the process's: other tests pack beside it).
+        let resident = |m: &Mirror| m.events.chunks().iter().filter_map(|c| c.packed()).map(|s| s.deflated.len()).sum::<usize>();
+        let held = resident(&m);
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4, "every one of them spilled");
         drop((chunks, segments));
         m.publish();
         anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_spilled()).all(|c| c.packed().is_none()), "a spilled chunk keeps no segment in memory");
-        anyhow::ensure!(SEGMENT_BYTES.load(Ordering::Relaxed) < held, "what went to the file left memory");
+        anyhow::ensure!(resident(&m) < held, "what went to the file left the copy's memory: {} of {held}", resident(&m));
         anyhow::ensure!(attached(&m)? == before, "the same bytes, in the same order, after the spill");
         anyhow::ensure!(m.view().events_json(None, 50) == newest, "the newest page still from memory");
         anyhow::ensure!(m.view().events_json(Some(20), 10).is_none(), "an older page is the store's to answer");

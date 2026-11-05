@@ -704,7 +704,6 @@ impl Snapshot {
     /// deflated now and kept only once it's full), between them the few bytes of its frame stored as
     /// they are, and the other frames deflated as they come. One gzip member: every decoder reads it.
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
-        use flate2::Compression;
         let plan = self.plan();
         let chunks = self.parts.events.chunks();
         let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.metas().last().map_or(0, |m| m.off + m.len) / 4, |s| s.deflated.len())).sum::<usize>();
@@ -712,38 +711,90 @@ impl Snapshot {
         // The frames between the chunks, deflated together.
         let mut loose: Vec<u8> = Vec::new();
         for part in &plan.parts {
-            match part {
-                Part::Chunk(i) => {
-                    let Some(chunk) = chunks.get(*i) else { continue };
-                    gz.deflate(Compression::fast(), &loose)?;
-                    loose.clear();
-                    gz.stored(br#"{"t":"events","events":["#);
-                    if *i + 1 == chunks.len() && !chunk.is_full() {
-                        gz.segment(&chunk.deflate(Compression::fast())?);
-                    } else {
-                        let packed = match chunk.pack() {
-                            Ok(packed) => packed,
-                            // A spilled one its file doesn't give back: its events as the store keeps them.
-                            Err(e) if chunk.is_spilled() => {
-                                let joined = self.read_from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
-                                Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        gz.segment(&packed);
-                    }
-                    gz.stored(b"]}\n");
-                }
-                other => {
-                    loose.reserve(self.room(&plan, other).saturating_add(1));
-                    self.write(&plan, other, &mut loose)?;
-                    loose.push(b'\n');
-                }
-            }
+            self.part_into(&plan, part, &mut gz, &mut loose)?;
         }
         loose.extend_from_slice(last.as_bytes());
-        gz.deflate(Compression::fast(), &loose)?;
+        gz.deflate(flate2::Compression::fast(), &loose)?;
         Ok(gz.finish())
+    }
+
+    /// `part` of `plan` as [`Snapshot::packed`] puts it in: a chunk of events after the frames before it (in
+    /// `loose`, deflated together), as it was packed (the newest, which the next event changes, deflated now),
+    /// between the few bytes of its frame stored as they are; another frame onto `loose`.
+    fn part_into(&self, plan: &Plan, part: &Part, gz: &mut super::packed::Gzip, loose: &mut Vec<u8>) -> std::io::Result<()> {
+        use flate2::Compression;
+        match part {
+            Part::Chunk(i) => {
+                let chunks = self.parts.events.chunks();
+                let Some(chunk) = chunks.get(*i) else { return Ok(()) };
+                gz.deflate(Compression::fast(), loose)?;
+                loose.clear();
+                gz.stored(br#"{"t":"events","events":["#);
+                if *i + 1 == chunks.len() && !chunk.is_full() {
+                    gz.segment(&chunk.deflate(Compression::fast())?);
+                } else {
+                    let packed = match chunk.pack() {
+                        Ok(packed) => packed,
+                        // A spilled one its file doesn't give back: its events as the store keeps them.
+                        Err(e) if chunk.is_spilled() => {
+                            let joined = self.read_from_store(chunk).map_err(|s| std::io::Error::other(format!("{e}; from the store: {s}")))?;
+                            Arc::new(super::packed::deflate(Compression::default(), [joined.as_slice()])?)
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    gz.segment(&packed);
+                }
+                gz.stored(b"]}\n");
+            }
+            other => {
+                loose.reserve(self.room(plan, other).saturating_add(1));
+                self.write(plan, other, loose)?;
+                loose.push(b'\n');
+            }
+        }
+        Ok(())
+    }
+
+    /// It packed as it goes out ([`Packing`]): the message [`Snapshot::packed`] makes at once, made a piece
+    /// at a time, `last` its end.
+    pub fn packing(self, last: &str) -> Packing {
+        let plan = self.plan();
+        Packing { snapshot: self, plan, next: 0, gz: Some(super::packed::Gzip::new(0)), loose: Vec::new(), last: last.to_owned() }
+    }
+}
+
+/// A snapshot packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): its message a piece at a time, each
+/// made on the blocking pool and written before the next is made. A viewer that reads slowly holds a piece and
+/// the next, not its whole snapshot, nor a place of the pool while it reads: made at once, a long session's
+/// packed snapshot (megabytes) was held until its last piece went, and a place held for all of its making.
+pub struct Packing {
+    snapshot: Snapshot,
+    plan: Plan,
+    /// Its next part.
+    next: usize,
+    /// The message being made; none once it's all out.
+    gz: Option<super::packed::Gzip>,
+    loose: Vec<u8>,
+    last: String,
+}
+
+impl Packing {
+    /// Its next piece: at least `piece` bytes of the message as it's made (the last may be fewer), none once
+    /// it's all out. Piece after piece, the bytes [`Snapshot::packed`] makes at once.
+    pub fn next_piece(&mut self, piece: usize) -> std::io::Result<Option<Vec<u8>>> {
+        let Some(gz) = self.gz.as_mut() else { return Ok(None) };
+        while gz.made() < piece {
+            let Some(part) = self.plan.parts.get(self.next) else {
+                // Every part in: the frames after the last chunk and `last`, then the member's end.
+                self.loose.extend_from_slice(self.last.as_bytes());
+                gz.deflate(flate2::Compression::fast(), &self.loose)?;
+                self.loose = Vec::new();
+                return Ok(self.gz.take().map(super::packed::Gzip::finish));
+            };
+            self.next += 1;
+            self.snapshot.part_into(&self.plan, part, gz, &mut self.loose)?;
+        }
+        Ok(Some(gz.take()))
     }
 }
 
@@ -5009,6 +5060,44 @@ mod tests {
         let s = Snapshot { parts: m.view().parts(), files: None, store: None };
         anyhow::ensure!(s.weight(false) == texts, "as frames, its texts: {} of {texts}", s.weight(false));
         anyhow::ensure!(s.weight(true) >= segments && s.weight(true) < texts, "packed, its segments: {} of {segments}", s.weight(true));
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a snapshot packed as it goes out is, piece after piece, the message
+    /// made at once: each piece but the last at least the size asked for, none once it's all out; whatever its
+    /// chunks are (packed, spilled, the open one) and its other frames (kept files among them).
+    #[test]
+    fn g11_s5_a_snapshot_packed_as_it_goes_is_the_one_made_at_once() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut m = super::super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+        for q in 1..=500u64 {
+            m.rev = q;
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": format!("line {q}: {}", "of what was said ".repeat(usize::try_from(q % 7)?))}))));
+        }
+        // Some chunks packed, the oldest of them spilled, the newest open.
+        let parts = m.view().parts();
+        for c in parts.events.chunks().iter().filter(|c| c.is_full()).take(5) {
+            c.pack()?;
+        }
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let mut events = parts.events.clone();
+        events.compact(None);
+        let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
+        let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
+        anyhow::ensure!(events.spilled(&chunks, spilled) > 0, "some spilled");
+        let snapshot = || Snapshot { parts: Parts { events: events.clone(), ..m.view().parts() }, files: Some(r#"{"t":"files","files":[]}"#.into()), store: None };
+        let whole = snapshot().packed("synced")?;
+        for size in [1, 1024, 64 << 10, usize::MAX] {
+            let mut packing = snapshot().packing("synced");
+            let mut pieces = Vec::new();
+            while let Some(piece) = packing.next_piece(size)? {
+                pieces.push(piece);
+            }
+            anyhow::ensure!(pieces.iter().rev().skip(1).all(|p| p.len() >= size), "each but the last at least {size}");
+            anyhow::ensure!(pieces.concat() == whole, "pieces of {size}: the message made at once");
+            anyhow::ensure!(packing.next_piece(size)?.is_none(), "none once it's all out");
+        }
         Ok(())
     }
 }
