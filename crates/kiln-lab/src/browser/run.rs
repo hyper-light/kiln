@@ -171,7 +171,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         let stop = stop.clone();
         let scope = r.scope.clone();
         let origin = if r.kiln.is_some() { None } else { r.origin_scope.clone() };
-        let every = Duration::from_millis(c.s.window_ms.max(50));
+        let every = Duration::from_millis(c.s.window_ms.max(10));
         std::thread::spawn(move || {
             let mut out = Vec::new();
             while !stop.load(Ordering::Relaxed) {
@@ -482,6 +482,13 @@ pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(Str
                         let (same, of, odd) = served_bodies(&lab, t, &p.join("docroot"));
                         let _ = writeln!(text, "- {}: {same} of {of} static bodies served as the catalogue holds them{}", t.name, odd.map_or_else(String::new, |o| format!(" (not: {o})")));
                         all &= same == of && of > 0;
+                        // And every stream frame the origin replays, as the server sends it on, on
+                        // both carriers (check-origin.mjs's `served`, in the client's namespace).
+                        if let Some(sock) = &r.replay_sock {
+                            let (ok, said) = served_streams(&lab, t, &s.web, sock, p);
+                            let _ = writeln!(text, "- {}: streams through the server: {}{said}", t.name, if ok { "every frame holds" } else { "**some frames differ**" });
+                            all &= ok;
+                        }
                     }
                     let scopes_of = [Some(r.scope.clone()), r.origin_scope.clone()];
                     drop(r);
@@ -509,6 +516,21 @@ pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(Str
 fn udp_bound(pid: u32, port: u16) -> bool {
     let hex = format!(":{port:04X}");
     ["udp", "udp6"].iter().any(|f| std::fs::read_to_string(format!("/proc/{pid}/net/{f}")).unwrap_or_default().lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|a| a.ends_with(&hex))))
+}
+
+/// Every stream the origin replays, read through `t`'s HTTP/2 (gzip asked for) on both carriers by
+/// `check-origin.mjs served` in the first client's namespace: whether every frame held, and what
+/// it said of each stream.
+fn served_streams(lab: &Lab, t: &Target, web: &Path, sock: &Path, payloads: &Path) -> (bool, String) {
+    let argv = vec!["node".to_owned(), web.join("check-origin.mjs").display().to_string(), "served".to_owned(), t.origin(), sock.display().to_string(), payloads.display().to_string()];
+    match lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?)) {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let lines: Vec<String> = out.lines().filter(|l| l.starts_with('{')).map(|l| format!("\n    {}", l.chars().take(400).collect::<String>())).collect();
+            (o.status.success(), lines.concat())
+        }
+        Err(e) => (false, format!(" ({e:#})")),
+    }
 }
 
 /// Each file under `docroot` fetched from `t` by curl in the first client's namespace (HTTP/2,

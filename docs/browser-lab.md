@@ -314,9 +314,18 @@ The tuning, and why:
 
 - TLS 1.3 only, with the lab kiln's chain (one ECDSA P-256 leaf under a lab CA), so the handshake's
   certificate bytes are the same for every target.
-- TCP's congestion control is CUBIC for every target, kiln today's included: BBR needs root on the
-  lab host to load `tcp_bbr` (f21), which is Ada's to allow; the default qdisc on the server's veth
-  is the kernel's own for every target.
+- JSON compressed as each server does best, since the bar is against each protocol's best
+  practice: h2o brotli, then gzip (its `compress: [ br, gzip ]`), Caddy zstd, then gzip (`encode
+  zstd gzip`), on its static bodies and its streams alike; kiln today sends JSON uncompressed (f8),
+  as it does in production.
+- The kernel settings kiln uses, the same for every target: kiln's server sets `TCP_NOTSENT_LOWAT`
+  to 128 KiB on each connection (`crates/kiln/src/http/server.rs`), and h2o and Caddy have no
+  setting for it, so the server's namespace takes it as every socket's default
+  (`net.ipv4.tcp_notsent_lowat=131072`, set by `link::topology`; writable in the lab's own
+  namespace without root). kiln sets no qdisc of its own (no `fq`), so neither does any baseline:
+  the server's veth keeps the kernel's own.
+- TCP's congestion control is CUBIC for every target, kiln today's included: BBR would need root on
+  the lab host to load `tcp_bbr` (f21), which is Ada's to allow; it is used nowhere until she does.
 - QUIC's congestion control: h2o's `cc` set to Cubic (h2o defaults to Reno; its choices are Reno,
   Cubic and Pico: f32); Caddy's is quic-go's Cubic (quic-go has no BBR: f33). The pilot (step 7)
   measures h2o's Reno against Cubic at 50 kbit/s with 1% loss and keeps the lower p99.
@@ -330,6 +339,8 @@ The tuning, and why:
 - No WebSocket over HTTP/2 (RFC 8441): neither h2o nor Caddy's file and proxy paths here serve it to
   every browser (f34), so the baselines' streams are what every HTTP/2 and HTTP/3 server serves in
   every browser.
+- Each server's whole config is written by `servers.rs` into each round's folder beside its log
+  (`h2o.conf`, `Caddyfile`), and `kiln-lab browser start-stop` starts each from it.
 - HTTP/3 rows run in Chromium only: WebKit on Linux has no HTTP/3 (f30). Chromium reaches them with
   `--origin-to-force-quic-on=10.77.0.1:<port>` and the leaf's key hash in
   `--ignore-certificate-errors-spki-list`, since it takes no locally added root for QUIC (f31); the
@@ -376,7 +387,7 @@ a budget of 120 h:
 | 8 | 109.6 | none |
 | 16 | 73.4 | none |
 
-The matrix runs at **K = 8**, Chromium only (see "What the lab leaves out"), on the recording's
+The matrix runs at **K = 8**, in both browsers (WebKit in Playwright's image), on the recording's
 seed (`--seed 7`, so the baselines' replay is what the run's kiln sends). Each case's pace on each
 profile is `runfile::workload`: a stream case opens an agent's session (its events at 5 a second
 on the good link, 0.5 at 100 kbit/s and 0.25 at 50), a terminal (its lines at 20, 2 and 1 a second)
@@ -401,9 +412,26 @@ message to an agent) in turn. Each job runs 60 s on the good link and 180 s on t
 | 50k/0, 50k/1, 50k/5 | burst | 1,440 | 7 | 3.72 each |
 | 50k/0, 50k/1, 50k/5 | request | 360 | 28 | 14.87 each |
 
-The CPU measure's percentiles are across 1 s windows, so a cell's CPU p99.9 rests on its rounds'
-seconds, not its operations: under 3,688 windows (most cells) the CPU p99.9 is reported with its
-count and marked as not bounded, and its mean carries the cell.
+Bytes and CPU have as many samples as the operations (2026-11-05): the link's counters and the
+server's CPU are read every 25 ms (`--window-ms`, finer than any case's pace on a link), and each
+reading's amount since the last one an operation completed in goes to the operations completing in
+it (a reading with none carries its amount on), so no byte or microsecond is left out and an
+operation on a reading of its own is a sample of its own. Pass 0's 1 s windows gave a cell about 60
+CPU and 480 bytes samples a round (goal 10's look at its pilot), below the floor at any rounds the
+plan gives. The run plan's hours don't change: the readings cost nothing a job doesn't already
+spend. Two limits, said where they bind: a reading holds at most one sample of the server's CPU,
+so where operations come faster than 40 a second across the links (the good link's streams,
+requests and bursts) the CPU's samples are the readings, about 2,400 a round, or 12,000 over 5
+rounds; a burst's CPU on the good link (40 events in 1 s every 3 s, each sent to all 8 links)
+reaches about 4,000 over its 5 rounds, above 3,688 but under 10,000. And the background's noise
+over a reading's length (the job's noise per second times `cpu_us.window_ms.p50`, recorded with
+every job) is the floor a per-operation CPU percentile must clear; where it doesn't, the cell gives
+the CPU's mean and says so.
+
+The whole run at K = 8: the pilot (good/0 and 50k/1, 5 rounds, kiln today twice, h2o over HTTP/2
+and HTTP/3 with Cubic and Reno, both browsers where each runs: about 12 h, scaled from pass 0's
+Chromium-only pilot, 1.7 h and about 5.3 h, by 8 rows to 5) and the matrix's 109.5 h above: about
+122 h, a little over five days.
 <!-- run plan: end -->
 
 ## Running it
@@ -426,22 +454,36 @@ if its carrier is new, the probe page's reading of it in `probe.js`.
 ## The numbers
 
 <!-- browser-lab tables: begin -->
-(The matrix's tables go here: step 8. As of 2026-11-05 03:37Z the pilot is running on the lab
-machine, in the unit `kiln-bp-g1-lab` (`crates/kiln-lab/web/servers/run-all.sh`), and the matrix
-follows it there; see "Where the run stands".)
+(The matrix's tables go here: step 8. Pass 1, the pilot and then the matrix, runs on the lab
+machine in the unit `kiln-bp-g1-lab` (`crates/kiln-lab/web/servers/run-all.sh`); see "Where the
+run stands".)
 <!-- browser-lab tables: end -->
 
 ### Where the run stands
 
-The pilot and the matrix run in one systemd user unit on the lab machine, started by the agent that
-built the lab, from a snapshot of the lab (`~/.cache/kiln-bp/g1/lab-snap`: the `kiln-lab` binary,
-the web driver and `run-all.sh`) that nothing edits while it runs:
+**Pass 0, superseded.** The first pilot ran from 2026-11-05 03:37Z to 08:31Z (pilot-good done,
+pilot-50k three rounds in), from a snapshot of the lab as it stood on 2026-11-04 (`lab-snap`), and
+was stopped by its unit's name; its files are kept in `~/.cache/kiln-bp/g1/lab-pass0`. None of its
+numbers are used, for five reasons found since: it ran Chromium only; a write's id was the same in
+every job, so kiln answered later jobs' writes as repeats (14 bytes longer); its baselines' terminal
+frames crossed SSE and the streaming fetch without their line ends (1 to 3 bytes a frame short); its
+baselines ran without kiln's `TCP_NOTSENT_LOWAT` (the host's default, 4 GiB, against kiln's
+128 KiB), which would make them slower on the slow links and flatter kiln; and its bytes and CPU
+had a sample a second, too few for the tails. Its kiln-today request job of pilot-50k round 0 had
+no samples: none of its eight drivers wrote anything (not even its empty samples file), a failure
+of the lab's, which a job now records as a named failure ("the driver left no result"), never as a
+cell with nothing in it; requests a page scheduled and had no answer to by the job's end are now
+counted as misses with their wait (`missed`, open loop), so a starved link shows as misses.
+
+**Pass 1** runs the pilot and the matrix in one systemd user unit on the lab machine, from a
+snapshot of the lab (`~/.cache/kiln-bp/g1/lab-snap1`: the `kiln-lab` binary, the web driver and
+`run-all.sh`) that nothing edits while it runs:
 
 ```sh
 systemd-run --user --unit=kiln-bp-g1-lab -E PATH=$PATH -E HOME=$HOME -p Delegate=yes \
   -p StandardOutput=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
   -p StandardError=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
-  --collect bash $HOME/.cache/kiln-bp/g1/lab-snap/run-all.sh
+  --collect bash $HOME/.cache/kiln-bp/g1/lab-snap1/run-all.sh
 ```
 
 Its parts (the pilot's three, then the matrix's 21: each condition and case with the rounds the run

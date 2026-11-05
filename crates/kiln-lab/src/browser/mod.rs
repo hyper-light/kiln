@@ -166,7 +166,9 @@ pub struct RunArgs {
         /// Seconds each job runs (each case's own on each profile otherwise).
         #[arg(long)]
         duration: Option<u64>,
-        #[arg(long, default_value_t = 1000)]
+        /// How often the link's counters and the server's CPU are read (ms): finer than the
+        /// operations' pace, so each operation's bytes and CPU are a sample of their own.
+        #[arg(long, default_value_t = 25)]
         window_ms: u64,
         #[arg(long, default_value_t = 5)]
         background_s: u64,

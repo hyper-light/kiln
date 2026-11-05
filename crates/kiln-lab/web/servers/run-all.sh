@@ -1,20 +1,22 @@
 #!/bin/bash
-# The pilot (step 7) and then the matrix (step 8), in a unit of its own, from a snapshot of the lab
-# that nothing edits while it runs. Each part writes into a folder of its own and leaves `done`
-# there when it ends; started again, it skips what is done (so it resumes where it stood).
-#   systemd-run --user --unit=kiln-bp-g1-lab -p Delegate=yes bash $G/lab-snap/run-all.sh
+# The pilot (step 7) and then the matrix (step 8), in both browsers (WebKit in Playwright's image:
+# KILN_LAB_PODMAN), in a unit of its own, from a snapshot of the lab that nothing edits while it
+# runs. Each part writes into a folder of its own and leaves `done` there when it ends; started
+# again, it skips what is done (so it resumes where it stood).
+#   systemd-run --user --unit=kiln-bp-g1-lab -p Delegate=yes bash $G/lab-snap1/run-all.sh
 set -u
 G=$HOME/.cache/kiln-bp/g1
-S=$G/lab-snap
+S=$G/lab-snap1
 L=$S/kiln-lab
 T=$G/tools/rpm
 export KILN_LAB_TC=$T/usr/bin/tc TC_LIB_DIR=$T/usr/lib64/tc KILN_LAB_WEB=$S/web
+export KILN_LAB_PODMAN=mcr.microsoft.com/playwright:v1.64.1-noble
 K=$G/target-kiln/release/kiln
 H2O=$G/tools/h2o/build/h2o
 CADDY=$G/tools/caddy/caddy
 P=$G/catalogue2/payloads
 command -v node >/dev/null || { echo "no node on the PATH: start the unit with -E PATH=..."; exit 1; }
-COMMON="--seed 7 --browsers chromium --kiln $K --h2o $H2O --caddy $CADDY --payloads $P"
+COMMON="--seed 7 --browsers chromium,webkit --kiln $K --h2o $H2O --caddy $CADDY --payloads $P"
 part() { # name, then run's arguments
   local name=$1; shift
   local out=$G/lab/$name

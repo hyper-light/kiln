@@ -88,15 +88,22 @@ fn put_quantiles(out: &mut BTreeMap<String, f64>, name: &str, mut v: Vec<f64>) {
     out.insert(format!("{name}.n"), v.len() as f64);
 }
 
-/// Per-window values: each window's `amount` over the operations whose times fall in it.
-fn per_window(edges: &[(u64, f64)], op_times: &[u64]) -> Vec<f64> {
+/// Per-operation values from a counter read every tick: the amount since the last tick an
+/// operation completed in, shared by the operations completing in this one. A tick with none
+/// carries its amount on to the next that has one, so every amount after the first operation's
+/// tick counts, and with ticks finer than the operations' pace each operation is a sample of its
+/// own (plan 01a1a832e9cc step 4: the tails need as many samples as there are operations). Each
+/// value comes with the length of time it covers (µs).
+fn per_window(edges: &[(u64, f64)], op_times: &[u64]) -> Vec<(f64, u64)> {
     let mut out = Vec::new();
+    let mut from: Option<(u64, f64)> = edges.first().copied();
     for w in edges.windows(2) {
-        let (Some((t0, a0)), Some((t1, a1))) = (w.first(), w.get(1)) else { continue };
+        let (Some((t0, _)), Some((t1, a1))) = (w.first(), w.get(1)) else { continue };
         let ops = op_times.iter().filter(|t| **t > *t0 && **t <= *t1).count();
-        if ops > 0 {
+        if let (true, Some((f_t, f_a))) = (ops > 0, from) {
             #[allow(clippy::cast_precision_loss)]
-            out.push((a1 - a0) / ops as f64);
+            out.push(((a1 - f_a) / ops as f64, t1.saturating_sub(f_t)));
+            from = Some((*t1, *a1));
         }
     }
     out
@@ -135,7 +142,7 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
         let ticks: Vec<&Tick> = ticks.iter().filter(|t| t.t_us >= from_us).collect();
         #[allow(clippy::cast_precision_loss)]
         let edges: Vec<(u64, f64)> = ticks.iter().map(|t| (t.t_us, (t.rx_bytes + t.tx_bytes) as f64)).collect();
-        bytes_w.extend(per_window(&edges, &op_times));
+        bytes_w.extend(per_window(&edges, &op_times).into_iter().map(|(v, _)| v));
         if let (Some(f), Some(l)) = (ticks.first(), ticks.last()) {
             bytes_all += (l.rx_bytes + l.tx_bytes).saturating_sub(f.rx_bytes + f.tx_bytes);
         }
@@ -181,7 +188,14 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
     let cpu: Vec<&CpuTick> = cpu.iter().filter(|c| c.t_us >= from_us).collect();
     #[allow(clippy::cast_precision_loss)]
     let edges: Vec<(u64, f64)> = cpu.iter().map(|c| (c.t_us, (c.server_us + c.origin_us) as f64 - bg_us_per_s * c.t_us as f64 / 1e6)).collect();
-    put_quantiles(&mut n, "cpu_us", per_window(&edges, &all_op_times));
+    let cpu_w = per_window(&edges, &all_op_times);
+    // How long the CPU's windows were: the background's noise over that length is the floor a
+    // per-operation CPU percentile has to clear (the job's record keeps the noise per second).
+    #[allow(clippy::cast_precision_loss)]
+    let mut lens: Vec<f64> = cpu_w.iter().map(|(_, dt)| *dt as f64 / 1000.0).collect();
+    lens.sort_by(f64::total_cmp);
+    n.extend(quantile(&lens, 0.5).map(|m| ("cpu_us.window_ms.p50".to_owned(), m)));
+    put_quantiles(&mut n, "cpu_us", cpu_w.into_iter().map(|(v, _)| v).collect());
     if let (Some(f), Some(l)) = (cpu.first(), cpu.last()) {
         #[allow(clippy::cast_precision_loss)]
         let secs = l.t_us.saturating_sub(f.t_us) as f64 / 1e6;
@@ -216,6 +230,19 @@ pub fn quantile_band(n: usize, q: f64) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// plan 01a1a832e9cc step 4 (the lead's sample-count finding): ticks with no operation carry
+    /// their amount to the next tick that has one, so no byte is left out and each operation on
+    /// its own tick is a sample of its own.
+    #[test]
+    fn g1_s4_amounts_between_operations_carry_to_the_next() {
+        let edges = [(0, 0.0), (25, 100.0), (50, 300.0), (75, 300.0), (100, 700.0)];
+        // Operations at 40 and 90: 300 bytes for the first (0..50), 400 for the second (50..100).
+        assert_eq!(per_window(&edges, &[40, 90]), vec![(300.0, 50), (400.0, 50)]);
+        // Two in one tick share it.
+        assert_eq!(per_window(&edges, &[30, 45]), vec![(150.0, 50)]);
+        assert!(per_window(&edges, &[]).is_empty());
+    }
 
     /// A request with no answer by the job's end is a miss: counted, and its wait until then is
     /// in the times (open loop), never left out as missing data (goal 10's rule).

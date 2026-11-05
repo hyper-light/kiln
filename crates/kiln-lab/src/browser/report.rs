@@ -255,6 +255,30 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
             let _ = writeln!(o, "- stall at {at} s: {} {} {}: the longest request {} ms, p99 {} ms{}", j.condition, j.target, j.browser, fmt(top), fmt(j.numbers.get("time.p99_ms").copied().unwrap_or(0.0)), if ok { ", the whole wait counted" } else { " (**the stall's wait is missing**)" });
         }
     }
+    // Step 5: every path of every job came over the protocol its target is configured for (h2 or
+    // h3; h2 in WebKit, which has no HTTP/3 on Linux), as the page's nextHopProtocol says.
+    // (The reference servers': kiln today's sockets are HTTP/1.1 connections of their own.)
+    for t in run.settings.targets.iter().filter(|t| t.server != super::targets::Server::Kiln) {
+        let jobs: Vec<&JobRecord> = run.jobs.iter().filter(|j| j.target == t.name).collect();
+        if jobs.is_empty() {
+            continue;
+        }
+        let mut by_browser: BTreeMap<&str, (usize, Vec<String>)> = BTreeMap::new();
+        for j in &jobs {
+            let e = by_browser.entry(j.browser.as_str()).or_default();
+            for (path, proto) in &j.protocols {
+                e.0 += 1;
+                if *proto != t.protocol {
+                    e.1.push(format!("{path} {proto}"));
+                }
+            }
+        }
+        for (b, (paths, odd)) in by_browser {
+            let ok = paths > 0 && odd.is_empty();
+            pass &= ok;
+            let _ = writeln!(o, "- protocol: {} {b}: {paths} paths over {}{}", t.name, t.protocol, if ok { String::new() } else if paths == 0 { " (**none recorded**)".to_owned() } else { format!(" (**not: {}**)", odd.join(", ")) });
+        }
+    }
     let mut floors: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for j in &run.jobs {
         floors.entry(j.target.clone()).or_default().push(j.noise_us_per_s);

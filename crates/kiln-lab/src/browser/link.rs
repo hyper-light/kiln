@@ -301,6 +301,10 @@ pub fn topology(server_pid: u32, client_pids: &[u32], ethtool: bool) -> Vec<Cmd>
     out.push(cmd(Ns::Server, words(&["ip", "link", "set", "eth0", "up"])));
     out.push(cmd(Ns::Server, words(&["ip", "neigh", "replace", "10.77.0.254", "lladdr", &s_link, "dev", "eth0", "nud", "permanent"])));
     out.push(cmd(Ns::Server, words(&["ip", "route", "add", "10.78.0.0/16", "via", "10.77.0.254"])));
+    // kiln's server sets TCP_NOTSENT_LOWAT to 128 KiB on each connection (crates/kiln/src/http/
+    // server.rs); h2o and Caddy have no setting for it, so the server's namespace takes it as every
+    // socket's default (plan 01a1a832e9cc step 5: the kernel settings kiln uses, for every target).
+    out.push(cmd(Ns::Server, words(&["sysctl", "-qw", "net.ipv4.tcp_notsent_lowat=131072"])));
     for (i, pid) in client_pids.iter().enumerate() {
         let (c, ifb) = (format!("c{i}"), format!("ifb{i}"));
         let (c_link, c_cli) = (mac(1, i, 0xfe), mac(1, i, 0x02));
@@ -435,6 +439,7 @@ mod tests {
         // Every neighbour is pinned: no ARP draws on a seeded loss.
         assert_eq!(lines.iter().filter(|l| l.contains("nud permanent")).count(), 2 + 2 * 4);
         assert!(t.iter().filter(|c| c.ns == Ns::Client(1)).any(|c| join(c) == "ip route add default via 10.78.1.1"));
+        assert!(t.iter().filter(|c| c.ns == Ns::Server).any(|c| join(c) == "sysctl -qw net.ipv4.tcp_notsent_lowat=131072"));
         let no_ethtool = topology(100, &[200], false);
         assert!(no_ethtool.iter().map(join).any(|l| l == "ip link set dev eth0 gso_max_segs 1"));
     }
