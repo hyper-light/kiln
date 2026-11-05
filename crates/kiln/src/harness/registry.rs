@@ -836,6 +836,9 @@ pub struct Registry {
     copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
     /// Every store, as the server sees it: the System page's (`super::stores`).
     pub board: crate::convo::board::Board,
+    /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
+    /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
+    pub views: crate::reads::Views,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -1040,6 +1043,7 @@ impl Registry {
             copies,
             copies_out,
             board: crate::convo::board::Board::default(),
+            views: crate::reads::Views::default(),
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),

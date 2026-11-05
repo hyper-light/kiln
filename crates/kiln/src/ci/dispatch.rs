@@ -1347,7 +1347,7 @@ impl Dispatch {
     /// with; `Some("")` for another ephemeral runner (a v1 job's pod, or an executor's from
     /// before a restart), which takes no leg of the engine's.
     fn hosted_executor(&self, agent: &str, ephemeral: bool) -> Option<String> {
-        match self.hub.pod_executors.lock().get(agent) {
+        match self.hub.pod_executors.load().get(agent) {
             Some(e) => Some(e.clone()),
             None => ephemeral.then(String::new),
         }
@@ -2494,7 +2494,7 @@ impl Dispatch {
         // A one-leg runner in a pod (`kiln agent --ephemeral`: a job's, a `k8s` pool's) has the
         // CPUs its cluster gives it, its node's, which the node's other pods share: CPUs of the
         // leg's own taken there would be the same first ones in each pod (W05-R03).
-        let pod = self.hub.pod_executors.lock().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
+        let pod = self.hub.pod_executors.load().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
         if pod && let Some(o) = a.executor.options.as_object_mut() {
             o.remove("cpus");
         }
@@ -2549,7 +2549,7 @@ impl Dispatch {
         }
         // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
         // an exec into the pod, not a shell on a machine (W17-R01).
-        let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
+        let recorded = if self.hub.pod_executors.load().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
         runs::claim(&self.hub, leg, runner, recorded, attempt).await?;
         // The run's first leg to start: `workflow_run` `in_progress`.
         if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {

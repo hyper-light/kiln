@@ -69,7 +69,7 @@ fn member_in(c: &rusqlite::Connection, user: &str, r: &str) -> rusqlite::Result<
 pub async fn member_of_any(hub: &Hub, user: &str, refs: &[String]) -> anyhow::Result<bool> {
     let (user, refs) = (user.to_owned(), refs.to_vec());
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             for r in &refs {
                 if member_in(c, &user, r)? {
                     return Ok(true);
@@ -85,7 +85,7 @@ pub async fn member_of_any(hub: &Hub, user: &str, refs: &[String]) -> anyhow::Re
 pub async fn of_user(hub: &Hub, user: &str) -> anyhow::Result<Vec<String>> {
     let user = user.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT g.name FROM user_group_members m JOIN user_groups g ON g.name = m.group_name WHERE m.user_id = ?1 ORDER BY g.name")?;
             let mut out = st.query_map([&user], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             let mut st = c.prepare("SELECT provider, groups FROM user_identities WHERE user_id = ?1 ORDER BY provider")?;
@@ -119,7 +119,7 @@ pub async fn route(hub: &Hub, caller: &Caller, method: &Method, s: &[&str], req:
 async fn list(hub: &Hub, only: Option<&str>) -> Result<Vec<Value>, Fail> {
     let only = only.map(str::to_owned);
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare(
                 "SELECT g.name, g.description, g.created_at, g.created_by,
                         (SELECT json_group_array(n) FROM (SELECT u.name AS n FROM user_group_members m JOIN users u ON u.id = m.user_id
@@ -233,7 +233,7 @@ async fn delete(hub: &Hub, caller: &Caller, name: &str) -> Result<Response, Fail
 async fn there(hub: &Hub, name: &str) -> Result<String, Fail> {
     let n = name.to_owned();
     hub.store
-        .call(move |c| Ok(c.query_row("SELECT name FROM user_groups WHERE name = ?1", [&n], |r| r.get::<_, String>(0)).optional()?))
+        .read(move |c| Ok(c.query_row("SELECT name FROM user_groups WHERE name = ?1", [&n], |r| r.get::<_, String>(0)).optional()?))
         .await
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no group `{name}`")))
