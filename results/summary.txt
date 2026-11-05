@@ -1,0 +1,11 @@
+clippy exit 0
+clippy mimalloc exit 0
+build mimalloc exit 0
+run mimalloc exit 0
+kiln 0.2.0
+lib tests exit 0
+/Users/runner/work/_temp/mac/build-mimalloc.txt:warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+/Users/runner/work/_temp/mac/build-mimalloc.txt:warning: `kiln` (bin "kiln") generated 1 warning
+/Users/runner/work/_temp/mac/lib-tests.txt:warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+/Users/runner/work/_temp/mac/lib-tests.txt:warning: `kiln` (lib test) generated 1 warning
+/Users/runner/work/_temp/mac/lib-tests.txt:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2803 filtered out; finished in 9.40s
