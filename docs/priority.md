@@ -344,6 +344,36 @@ since the stall wasn't kiln's. The engine's test with the lab's numbers
 paces the leg and the agent alike, and the delay back down clears the alarm, the cut held until the
 level holds.
 
+**item2: main let go (`0c11fb03a06`, 2026-11-05 01:27-01:39 UTC, CPUs 16-31).** Research
+01a1a59c2b2a, f52 to f55. The server joined the runner's cgroup at 90 s, the legs (32 threads)
+started at 120 s and the agents (64) at 210 s. In 10 s bins of `timeline.py`:
+
+| t s | delay med ms | mean since read med ms | shards p99 ms | calm ms | CUSUM | threshold | CPU budget | paced | least share |
+|---|---|---|---|---|---|---|---|---|---|
+| 110 | 0.21 | 0.20 | 0.60 | 0.234 | 0.00 | 0.21 | - | 0 | |
+| 120 | 1.00 | 0.55 | 7.76 | 0.245 | 0.00 | 1.79 | 14.3 | 8 | 52 |
+| 130 | 0.76 | 0.51 | 5.99 | 0.260 | 0.00 | 1.77 | 28.6 | 0 | |
+| 220 | 5.75 | 1.38 | 21.84 | 0.407 | 0.00 | 5.25 | 29.6 | 0 | |
+| 340 | 0.21 | 0.25 | 13.89 | 0.607 | 0.00 | 3.89 | 7.5 | 5 | 24 |
+| 460 | 10.04 | 2.05 | 33.15 | 0.757 | 0.00 | 3.40 | 30.1 | 0 | |
+| 630 | 3.97 | 1.05 | 19.41 | 0.914 | 0.00 | 3.40 | 28.4 | 0 | |
+
+headroom alarmed at 126 s ("typical 0.2 ms, now 3.5 ms (CUSUM 0.82 past 0.23)") and cut kiln's CPU
+from 14.3 cores to 7.1, was back to calm a second later, and had the budget at 28.6 cores by 137 s.
+The agents' alarm at 216 s cut nothing and cleared at 221 s. From then to the end the delay sat at
+4 to 6 times calm with nothing paced, but for a runner-disk alarm at 346 s whose cut (the agents at
+24-30%) brought it back to calm until it was let go at 358 s. Read back from its own status, the
+causes: every sample not under an alarm joined calm, and the legs' 2.5 and the agents' 4 to 6.4
+times calm sat below the CUSUM's reference (half way to the 10 ms tolerance, 6.6 times calm), so
+calm drifted from 0.238 ms to 0.919 and the CUSUM never rose again; an alarm cleared the moment its
+CUSUM touched zero; the engine read only the writes' lag, unknown all run since only the CPU was cut,
+so a level counted as held after a second, and every excursion a cut ended was learned as noise (the
+threshold from 0.23 to 5.6); the CPU knee took kiln's measured cores, 12.9-14.4 under a 7.1-core
+budget (what paced groups gave up, unpaced ones took), as the level held, and so disproved the bound
+it had cut at; and the alarm at 216 s found the disks "full" against a capacity read during the
+kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this as a trace, and goal
+8 step 5's engine holds it there; item2b below is the lab's word.
+
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
