@@ -631,9 +631,12 @@ hands it each relayed frame without waiting, it forwards them in order, and the 
 each runner's announcement from a copy. A live job's files have one writer each, a task of its own that
 writes what it's sent (its runner's chunks, which the hub's loop waits for as it waited for the write; its
 steps; its end) in order, a batch at a time on the blocking pool; a read of the job, and a retry's mark,
-wait for what was sent before, and a retried job's next writer for the last one. Still on the hot path,
-listed so (`todo`): a runner's front door answering reads from its replica (`frontdoor/replica.rs`,
-`store/learner.rs`), the peer-to-peer unification's. Inside Quiver
+wait for what was sent before, and a retried job's next writer for the last one. A runner's front
+door answering reads from its replica (the peer-to-peer unification's P2, plan 01a1a283e14c) takes
+its learner from an atomic pointer on each connection, the owners it knows from a copy, whether its
+replica is behind from an atomic, its kept connections to the server from a lock-free queue, and its
+learner's questions of the server from take-once cells; the server's side reads its learners'
+machines from a copy. Inside Quiver
 (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
 ## Goal 7: placement
