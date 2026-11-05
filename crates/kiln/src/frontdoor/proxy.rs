@@ -11,7 +11,8 @@
 //!   so phones that leave the Wi-Fi do not hold connections forever. At most [`MAX_CONNECTIONS`]
 //!   at once; the TLS handshake gets [`HANDSHAKE`], the upstream connection [`CONNECT`].
 //! * **Certificates** are swapped in place (renewal, upload): new connections get the new one,
-//!   open ones keep theirs.
+//!   open ones keep theirs. TLS sessions are the listener's, shared by its connections, so a
+//!   browser resumes on its next connection; a renewal keeps them ([`Shared::set_tls`]).
 //! * **Ending.** Each direction ends on its reader's end and closes its writer (close_notify for
 //!   TLS); the connection is done when both are. A stopped listener ends its connections.
 
@@ -98,6 +99,20 @@ pub struct Shared {
     /// While this runner holds a replica of kiln's records: the handler that serves requests one
     /// by one (kept across connections, with what it learned of whose credentials are whose).
     pub door: RwLock<Option<Arc<super::replica::Door>>>,
+}
+
+impl Shared {
+    /// Serve `tls` to new connections (open ones keep theirs). A renewal for the same names keeps
+    /// the sessions browsers resume (goal 7 step 3); other names start with none
+    /// ([`ServerTls::succeeding`]).
+    pub fn set_tls(&self, tls: ServerTls) {
+        let mut slot = self.tls.write();
+        let tls = match slot.as_ref() {
+            Some(old) => tls.succeeding(old),
+            None => tls,
+        };
+        *slot = Some(tls);
+    }
 }
 
 /// The handler for requests one by one while this runner holds a replica of kiln's records
@@ -293,6 +308,7 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     // The browser's protocol passes through as it is: HTTP/2 needs an upstream that speaks it.
     let h2 = client.alpn_protocol() == Some(H2);
     shared.served.fetch_add(1, Ordering::Relaxed);
+    crate::metrics::tls().handshake("front_door", client.handshake());
     // A peered cluster's address: forwarded from this machine, request by request.
     let peer = client.server_name().map(str::to_ascii_lowercase).and_then(|sni| {
         let f = shared.peers.read().clone()?;
@@ -805,6 +821,73 @@ mod tests {
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/1.1 kiln.test");
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac): the front door's TLS sessions are
+    /// its listener's, so the second connection from one client configuration resumes; after a
+    /// renewal (the same names) it still resumes while a new browser gets the new certificate;
+    /// after a certificate for other names, the next connect is a full one that sees it.
+    #[test]
+    fn g7_s3_front_door_resumes_and_serves_a_changed_certificate() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let issue = |names: &[&str]| -> anyhow::Result<ServerTls> {
+                let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+                let key = crate::pki::new_key_pem()?;
+                let csr = crate::pki::front_door_csr(&names, &key)?;
+                ServerTls::from_pem(&pki.sign_front_door(&csr, &names, 30)?, &key)
+            };
+            let roots = ClientTls::new(crate::http::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
+            let shared = Arc::new(Shared::default());
+            let first = issue(&["kiln.test"])?;
+            shared.set_tls(first.clone());
+            *shared.upstream.write() = Some(Upstream::parse(&format!("http://{}", upstream(false)?), &[])?);
+            let port = crate::frontdoor::test_port()?;
+            let _l = listen_https(port, &shared)?;
+            // One connection through the front door and an answer back: its kind, and the leaf the
+            // client holds (the one it was shown, or for a resumed session the one it was shown before).
+            async fn through(config: hyper_quic::rustls::ClientConfig, port: u16) -> anyhow::Result<(&'static str, Option<Vec<u8>>, hyper_quic::rustls::ClientConfig)> {
+                let tcp = hyper_rt::tcp::TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut tls = TlsStream::connect(RtFuturesIo::new(tcp), config, crate::http::tls::server_name("kiln.test")?).await?;
+                let kind = tls.handshake();
+                let leaf = tls.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+                tls.write_all(b"GET / HTTP/1.1\r\nHost: kiln.test\r\nConnection: close\r\n\r\n").await?;
+                tls.flush().await?;
+                let mut said = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !String::from_utf8_lossy(&said).contains("HTTP/1.1 kiln.test") {
+                    let n = tls.read_some(&mut buf).await?;
+                    anyhow::ensure!(n > 0, "no answer: {}", String::from_utf8_lossy(&said));
+                    said.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                Ok((kind, leaf, tls.into_config()))
+            }
+            let resumed_before = crate::metrics::tls().handshakes.get(&["front_door", "resumed"]);
+            let (kind, _, config) = through(roots.config()?, port).await?;
+            assert_eq!(kind, "full");
+            let (kind, _, config) = through(config, port).await?;
+            assert_eq!(kind, "resumed", "the second connection resumes");
+            assert!(crate::metrics::tls().handshakes.get(&["front_door", "resumed"]) > resumed_before, "counted on /metrics");
+
+            // Renewed: the same names, a new key and certificate.
+            let renewed = issue(&["kiln.test"])?;
+            shared.set_tls(renewed.clone());
+            let (kind, _, config) = through(config, port).await?;
+            assert_eq!(kind, "resumed", "a renewal keeps the sessions");
+            let (kind, leaf, _) = through(roots.config()?, port).await?;
+            assert_eq!(kind, "full");
+            assert_eq!(leaf.as_deref(), renewed.leaf(), "a new browser gets the renewed certificate");
+            assert_ne!(renewed.leaf(), first.leaf());
+
+            // Other names: the sessions go, and the next connect sees the new certificate.
+            let other = issue(&["kiln.test", "other.test"])?;
+            shared.set_tls(other.clone());
+            let (kind, leaf, _) = through(config, port).await?;
+            assert_eq!(kind, "full");
+            assert_eq!(leaf.as_deref(), other.leaf());
             Ok(())
         })
     }
