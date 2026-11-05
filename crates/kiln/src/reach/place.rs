@@ -166,6 +166,83 @@ pub struct Placer {
     /// Probes its health bars (L2), by owner and epoch: answered so, and probed once a measure
     /// shows the cause cleared.
     parked: Vec<(String, u64, std::sync::Arc<Ask>)>,
+    /// The groups of the placed runs here that run, by (owner, epoch, run): what each uses is
+    /// read from its own group when the machine is, and taken out of what the machine has in use,
+    /// so the room a run holds isn't counted again as others' load (docs/needs.md E5).
+    groups: std::collections::HashMap<(String, u64, String), Held>,
+}
+
+/// Where a placed run's processes are counted, and its CPU time as last read with when.
+#[derive(Debug, Clone)]
+struct Held {
+    at: Group,
+    cpu: Option<(u64, std::time::Instant)>,
+}
+
+/// A placed run's group: a folder (a command's, found by its process; a CI leg's job group), or
+/// an agent session's, found by its id as it reads (its group comes once its harness starts).
+#[derive(Debug, Clone)]
+pub enum Group {
+    Dir(std::path::PathBuf),
+    Session(String),
+}
+
+/// What a placed run uses now, read from its group (Linux; elsewhere nothing is read, and the run
+/// counts as the machine's load as before): CPUs, its `cpu.stat` time over the time since its last
+/// read, the same interval the machine's own idle share covers (both read in one measure);
+/// memory, its anonymous memory (cgroup v2 `memory.stat` `anon`, what `MemAvailable` doesn't
+/// count free; page cache is reclaimable and counted free there too), or, where its group has no
+/// memory controller, the anonymous resident memory of its processes (`/proc/<pid>/status`
+/// `RssAnon`).
+fn group_use(h: &mut Held) -> Resources {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = match &h.at {
+            Group::Dir(d) => d.clone(),
+            Group::Session(id) => match crate::os::contain::Group::existing(id) {
+                Some(g) => g.dir().to_path_buf(),
+                None => return Resources::default(),
+            },
+        };
+        let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
+        let now = std::time::Instant::now();
+        let cpu_us = read("cpu.stat").and_then(|t| crate::sense::parse::keyed(&t, "usage_usec"));
+        let milli = match (cpu_us, h.cpu) {
+            (Some(c), Some((c0, t0))) => {
+                let span = u64::try_from(now.duration_since(t0).as_micros()).unwrap_or(u64::MAX);
+                u64::try_from(u128::from(c.saturating_sub(c0)).saturating_mul(1000) / u128::from(span.max(1))).unwrap_or(u64::MAX)
+            }
+            _ => 0,
+        };
+        h.cpu = cpu_us.map(|c| (c, now));
+        let mem = read("memory.stat").and_then(|t| crate::sense::parse::keyed(&t, "anon")).unwrap_or_else(|| procs_in(&dir).into_iter().filter_map(rss_anon).sum());
+        Resources { cpu: Cpus::milli(milli), mem, disk: 0, gpu: 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = h;
+        Resources::default()
+    }
+}
+
+/// Every process in group `dir` and the groups under it.
+#[cfg(target_os = "linux")]
+fn procs_in(dir: &std::path::Path) -> Vec<u32> {
+    let mut out: Vec<u32> = std::fs::read_to_string(dir.join("cgroup.procs")).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())) {
+            out.extend(procs_in(&e.path()));
+        }
+    }
+    out
+}
+
+/// Process `pid`'s anonymous resident memory, bytes (`/proc/<pid>/status` `RssAnon`, in kB).
+#[cfg(target_os = "linux")]
+fn rss_anon(pid: u32) -> Option<u64> {
+    let t = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kb: u64 = t.lines().find_map(|l| l.strip_prefix("RssAnon:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    kb.checked_mul(1024)
 }
 
 /// Placement's epoch for the node whose state lives in `dir`: one past the last it used, kept in
@@ -228,7 +305,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new() }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -249,7 +326,9 @@ impl Placer {
     fn measure_now(&mut self, now: i64, said: &mut Vec<(String, ToOwner)>) {
         let Some(sensor) = self.sensor.as_mut() else { return };
         let m = sensor.measure();
-        let sample = sample_of_measure(&m, self.last.as_ref());
+        let mut sample = sample_of_measure(&m, self.last.as_ref());
+        // What each placed run here uses, from its own group, in the same moment.
+        sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
         let target = kiln_ci::sched::state::knee(m.cpus);
         let strained = crate::sense::health::strained(&m, target);
@@ -267,6 +346,26 @@ impl Placer {
             }
         }
         self.last = Some(m);
+    }
+
+    /// Placed run `run` of owner `owner` (`epoch`) runs in group `at`: what it uses is read from
+    /// there and taken out of the machine's load, so its room isn't counted twice.
+    pub fn grouped(&mut self, owner: &str, epoch: u64, run: &str, at: Group) {
+        self.groups.insert((owner.to_owned(), epoch, run.to_owned()), Held { at, cpu: None });
+    }
+
+    /// The placed run a process `pid` started for: its group, found by the process.
+    fn grouped_pid(&mut self, owner: &str, epoch: u64, run: &str, pid: Option<u32>) {
+        #[cfg(target_os = "linux")]
+        if let Some(dir) = pid.and_then(crate::os::contain::group_of_pid) {
+            self.grouped(owner, epoch, run, Group::Dir(dir));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (owner, epoch, run, pid);
+    }
+
+    fn ungrouped(&mut self, owner: &str, epoch: u64, run: &str) {
+        self.groups.remove(&(owner.to_owned(), epoch, run.to_owned()));
     }
 
     /// Why its machine is under strain now, if it is, as its last measure said (the hint's state).
@@ -340,6 +439,13 @@ impl Placer {
         serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg: ToRunner::Start { run: run.to_owned(), fence } }).unwrap_or_default()
     }
 
+    /// A run of this node's started here: its process is up (the runner's word), process `pid`.
+    pub fn local_spawned_pid(&mut self, run: &str, pid: Option<u32>, now: i64) -> Vec<Out> {
+        let (me, epoch) = (self.me.clone(), self.epoch);
+        self.grouped_pid(&me, epoch, run, pid);
+        self.local_spawned(run, now)
+    }
+
     /// A run of this node's started here: its process is up (the runner's word).
     pub fn local_spawned(&mut self, run: &str, now: i64) -> Vec<Out> {
         let mut said = Vec::new();
@@ -350,6 +456,8 @@ impl Placer {
 
     /// A run of this node's here ended (`ok`: its process exited).
     pub fn local_ended(&mut self, run: &str, ok: bool, now: i64) -> Vec<Out> {
+        let (me, epoch) = (self.me.clone(), self.epoch);
+        self.ungrouped(&me, epoch, run);
         let mut said = Vec::new();
         let me = Peer { name: &self.me, epoch: self.epoch };
         self.admission.ended(me, run, ok, now, &mut said);
@@ -405,6 +513,14 @@ impl Placer {
         }
     }
 
+    /// A run started here for `peer` (spec `id`) is up, process `pid`.
+    pub fn spawned_pid(&mut self, peer: &str, id: u64, pid: Option<u32>, now: i64) -> Vec<Out> {
+        if let Some((epoch, run)) = self.started.get(&(peer.to_owned(), id)).cloned() {
+            self.grouped_pid(peer, epoch, &run, pid);
+        }
+        self.spawned(peer, id, now)
+    }
+
     /// A run started here for `peer` (spec `id`) is up.
     pub fn spawned(&mut self, peer: &str, id: u64, now: i64) -> Vec<Out> {
         let Some((epoch, run)) = self.started.get(&(peer.to_owned(), id)).cloned() else { return Vec::new() };
@@ -416,6 +532,7 @@ impl Placer {
     /// A run started here for `peer` (spec `id`) ended.
     pub fn ended(&mut self, peer: &str, id: u64, ok: bool, now: i64) -> Vec<Out> {
         let Some((epoch, run)) = self.started.remove(&(peer.to_owned(), id)) else { return Vec::new() };
+        self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
         self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
         self.measure_now(now, &mut said);
@@ -526,6 +643,11 @@ impl Placer {
                 match self.admission.start(ci, &run, fence, now, &mut more) {
                     Some(Start::New) => {
                         self.admission.spawned(ci, &run, &mut more);
+                        #[cfg(target_os = "linux")]
+                        if let Some(j) = crate::os::contain::Job::of(&run) {
+                            let epoch = self.epoch;
+                            self.grouped(CI, epoch, &run, Group::Dir(j.dir().to_path_buf()));
+                        }
                         Ok(())
                     }
                     _ => {
@@ -547,6 +669,7 @@ impl Placer {
     /// CI leg `run` ended here (`ok`: its process exited): its room is free at once.
     pub fn leg_ended(&mut self, run: &str, ok: bool, now: i64) -> Vec<Out> {
         let ci = Peer { name: CI, epoch: self.epoch };
+        self.groups.remove(&(CI.to_owned(), self.epoch, run.to_owned()));
         let mut said = Vec::new();
         self.admission.ended(ci, run, ok, now, &mut said);
         self.admission.ack(ci, run);
@@ -569,7 +692,10 @@ impl Placer {
     /// until [`Self::session_ended`], as a run's is. Its owner's word that it may (`Start`) is the
     /// claim the server gave the session; this runner's word that it started goes to that owner.
     /// A claim that isn't live here any more starts nothing (`false`).
-    pub fn session_start(&mut self, c: &Claim, now: i64) -> (bool, Vec<Out>) {
+    pub fn session_start(&mut self, c: &Claim, session: Option<&str>, now: i64) -> (bool, Vec<Out>) {
+        if let Some(id) = session {
+            self.grouped(&c.owner, c.epoch, &c.run, Group::Session(id.to_owned()));
+        }
         let mut said = Vec::new();
         let started = if c.owner == self.me {
             // Its owner is this node: its start was taken as it was told to go (`starting`).
@@ -591,6 +717,7 @@ impl Placer {
     /// An agent session placed here under claim `c` ended (closed, or gone on elsewhere): its
     /// room is free at once.
     pub fn session_ended(&mut self, c: &Claim, now: i64) -> Vec<Out> {
+        self.ungrouped(&c.owner, c.epoch, &c.run);
         if c.owner == self.me {
             return self.local_ended(&c.run, true, now);
         }
@@ -747,5 +874,34 @@ impl Placer {
             }
         }
         out
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// Room counted once (docs/needs.md E5): a placed run's use is read from its own group, its
+    /// CPUs as its `cpu.stat` time over the time since its last read (none at its first read: no
+    /// interval yet), its memory as `memory.stat`'s anonymous memory.
+    #[test]
+    fn a_placed_runs_use_is_read_from_its_own_group() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("cpu.stat"), "usage_usec 1000000\nuser_usec 900000\n")?;
+        std::fs::write(dir.path().join("memory.stat"), "anon 2147483648\nfile 999\n")?;
+        let mut h = Held { at: Group::Dir(dir.path().to_path_buf()), cpu: None };
+        let first = group_use(&mut h);
+        anyhow::ensure!(first.cpu.get() == 0 && first.mem == 2 << 30, "{first:?}");
+        // As if 2 s of CPU time went by over the interval since: some CPUs, never more than 2 s
+        // over the (shorter or longer) wall time between the reads, as the kernel counted them.
+        let before = h.cpu.map(|(_, t)| t).ok_or_else(|| anyhow::anyhow!("its time kept"))?;
+        std::fs::write(dir.path().join("cpu.stat"), "usage_usec 3000000\n")?;
+        let second = group_use(&mut h);
+        let span_us = u128::try_from(before.elapsed().as_micros())?;
+        anyhow::ensure!(second.cpu.get() > 0 && u128::from(second.cpu.get()) <= 2_000_000_000 / span_us.max(1) + 1, "{second:?} over {span_us} us");
+        // No memory controller: its processes' anonymous memory (none here: no processes).
+        std::fs::remove_file(dir.path().join("memory.stat"))?;
+        anyhow::ensure!(group_use(&mut h).mem == 0);
+        Ok(())
     }
 }

@@ -548,7 +548,7 @@ async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &async_chann
                 Ok(super::serve::Event::Started { pid: p, cwd }) => {
                     pid = Some(p);
                     if let Some((h, run)) = &placed {
-                        h.place_local(run, None).await;
+                        h.place_local_up(run, p).await;
                     }
                     told.started();
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;

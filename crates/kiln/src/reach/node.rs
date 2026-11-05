@@ -224,7 +224,7 @@ pub enum Local {
     /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
     PlaceRun { peer: String, run: String, fence: kiln_ci::sched::Fence, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
     /// A run of this node's that placement started here is up (`ended` None), or ended.
-    PlaceLocal { run: String, ended: Option<bool> },
+    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32> },
     /// Its asker doesn't want a run any more.
     PlaceCancel { run: String },
     /// CI leg `ask.run`, assigned this runner: admitted against placement's ledger, or refused and
@@ -233,7 +233,7 @@ pub enum Local {
     /// CI leg `run` ended here.
     LegEnded { run: String, ok: bool },
     /// An agent session placed here under `claim` started (`true` answered: its claim was live).
-    SessionStarted { claim: super::place::Claim, reply: oneshot::Sender<bool> },
+    SessionStarted { claim: super::place::Claim, session: Option<String>, reply: oneshot::Sender<bool> },
     /// An agent session placed here under `claim` ended.
     SessionEnded { claim: super::place::Claim },
     /// What this runner's admission holds, for a view (JSON).
@@ -316,8 +316,8 @@ impl Handle {
 
     /// An agent session placed here under `claim` started: whether its claim was live (its room
     /// held from now, AUDIT M4).
-    pub async fn session_started(&self, claim: super::place::Claim) -> anyhow::Result<bool> {
-        self.ask(|reply| Local::SessionStarted { claim, reply }).await
+    pub async fn session_started(&self, claim: super::place::Claim, session: Option<String>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::SessionStarted { claim, session, reply }).await
     }
 
     /// An agent session placed here under `claim` ended: its room is free.
@@ -343,7 +343,13 @@ impl Handle {
 
     /// A placed run here is up (`ended` None) or ended.
     pub async fn place_local(&self, run: &str, ended: Option<bool>) {
-        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended })).await;
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None })).await;
+    }
+
+    /// A run of this node's that placement started here is up, as process `pid`: what it uses is
+    /// read from its group (room counted once).
+    pub async fn place_local_up(&self, run: &str, pid: u32) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid) })).await;
     }
 
     /// Its asker doesn't want run `run` any more.
@@ -1861,7 +1867,7 @@ impl Node {
                 if let Some(link) = link {
                     self.say_on(&link, &Say::Started { id, pid, cwd }).await;
                 }
-                let outs = self.place.spawned(&key.0, id, crate::util::now_ms());
+                let outs = self.place.spawned_pid(&key.0, id, Some(pid), crate::util::now_ms());
                 self.place_do(outs).await;
             }
             serve::Event::Output { stream, data } => {
@@ -2075,8 +2081,8 @@ impl Node {
                 let outs = self.place.leg_ended(&run, ok, crate::util::now_ms());
                 self.place_do(outs).await;
             }
-            Local::SessionStarted { claim, reply } => {
-                let (ok, outs) = self.place.session_start(&claim, crate::util::now_ms());
+            Local::SessionStarted { claim, session, reply } => {
+                let (ok, outs) = self.place.session_start(&claim, session.as_deref(), crate::util::now_ms());
                 let _ = reply.send(ok);
                 self.place_do(outs).await;
             }
@@ -2102,10 +2108,10 @@ impl Node {
                 self.send_or_queue(&peer, Ask::Place { json }).await;
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }
-            Local::PlaceLocal { run, ended } => {
+            Local::PlaceLocal { run, ended, pid } => {
                 let now = crate::util::now_ms();
                 let outs = match ended {
-                    None => self.place.local_spawned(&run, now),
+                    None => self.place.local_spawned_pid(&run, pid, now),
                     Some(ok) => self.place.local_ended(&run, ok, now),
                 };
                 self.place_do(outs).await;

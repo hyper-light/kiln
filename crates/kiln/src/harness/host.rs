@@ -821,7 +821,7 @@ impl Host {
         let s = self.open_seeded(id, spec, None, None, Vec::new(), false, true)?;
         // Placed here by a runner's owner: its room is held while it runs (AUDIT M4).
         if let Some(c) = claim {
-            hold_claim(c);
+            hold_claim(c, s.id.clone());
         }
         Ok(s)
     }
@@ -2283,10 +2283,10 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
 
 /// An agent session placed here under `c` started: this runner's placement holds its room
 /// (AUDIT M4), off the caller's thread.
-fn hold_claim(c: crate::reach::place::Claim) {
+fn hold_claim(c: crate::reach::place::Claim, session: String) {
     let Some(reach) = crate::reach::node::global() else { return };
     crate::rt::spawn(async move {
-        if !reach.session_started(c.clone()).await.unwrap_or(false) {
+        if !reach.session_started(c.clone(), Some(session)).await.unwrap_or(false) {
             tracing::info!(run = %c.run, owner = %c.owner, "an agent session's claim here wasn't live: it runs, and its room isn't held");
         }
     });

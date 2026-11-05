@@ -332,6 +332,11 @@ impl Job {
         out
     }
 
+    /// Its folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Freezes everything in it (`cgroup.freeze`), or lets it go on, and waits up to `within` for
     /// the kernel to say it has (`cgroup.events`). A process that joins it while it's frozen is
     /// frozen as it joins. Blocks: call it off the shards.
@@ -425,6 +430,15 @@ pub fn prune_jobs(running: impl Fn(&str) -> bool) {
             prune(&e.path(), DEPTH);
         }
     }
+}
+
+/// The cgroup folder process `pid` is in now (`/proc/<pid>/cgroup`'s v2 line, under the
+/// hierarchy's mount): what the kernel counts of a run whose process it is (docs/needs.md E5:
+/// room counted once).
+pub fn group_of_pid(pid: u32) -> Option<PathBuf> {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?.trim().trim_start_matches('/');
+    Some(Path::new(ROOT).join(rel))
 }
 
 /// The agent session process `pid` belongs to by its group, when it's in one.

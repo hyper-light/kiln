@@ -1537,7 +1537,7 @@ fn m4_g1_sessions_legs_and_commands_never_pass_a_runners_budget_together() -> an
                 break claim;
             }
         };
-        anyhow::ensure!(lab.linux.session_started(claim.clone()).await?, "its claim was live on linux");
+        anyhow::ensure!(lab.linux.session_started(claim.clone(), None).await?, "its claim was live on linux");
         let hc = held_and_cap(&lab.linux).await?;
         anyhow::ensure!(hc.0.first() == Some(&4_000) && within(hc), "the session holds its 4 CPUs: {hc:?}");
         let six = lab.linux.admit_leg(leg("leg-6", 6)?).await?;
