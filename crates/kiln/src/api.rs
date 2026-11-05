@@ -6491,8 +6491,9 @@ fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, peri
 /// (docs/cd-targets.md §10). The commit it runs; how long it has been up; how many times kiln's
 /// supervisor started it again (a crash, or the kernel's OOM killer: neither shows in its pod's
 /// status); its container's memory, from its cgroup; and its runners, connected now and just
-/// before it started, and the share of those back (checks' criteria compare, they don't count).
-/// Numbers and the commit only, so it's open, as `/healthz` is.
+/// before it started, and the share of those back (checks' criteria compare, they don't count); and
+/// how it runs on its machine (its shards' real-time class, where its own runner's legs and agents
+/// run). Numbers, the commit and how it runs only, nothing anyone's, so it's open, as `/healthz` is.
 fn server_health(hub: &Hub) -> Response {
     let memory = crate::os::cgroup::memory().map(|m| json!({ "used": m.used, "limit": m.limit, "share": m.share(), "peak": m.peak, "oom_kills": m.oom_kills }));
     let connected = hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).count() as u64;
@@ -6509,6 +6510,10 @@ fn server_health(hub: &Hub) -> Response {
             // doesn't roll back to a build older than `min_reader`.
             "schema": { "epoch": crate::store::migrations::SCHEMA_EPOCH, "min_reader": crate::store::migrations::min_reader() },
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
+            // Its place on its machine (docs/priority.md; goal 8, plan 01a1a59c2b29 step 7): its shards'
+            // real-time class as they took it, or why not (`[server] realtime`), and where the legs and
+            // agents its own runner starts run beside its cores (`[server] cores`).
+            "priority": { "realtime": crate::rt::realtime_status(), "work": crate::os::work_said() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
