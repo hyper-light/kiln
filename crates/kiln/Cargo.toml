@@ -7,6 +7,11 @@ license.workspace = true
 [features]
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
+# The binary allocates through jemalloc on Linux, for the allocator's A/B (goal 11, plan 01a1a87b2e56 step 4) on
+# the build production runs (static musl, whose malloc takes no preload): in the lab's realistic profile the
+# server's anonymous memory was 261 MB on jemalloc (one round, its profile on), 393 MB on glibc's malloc and
+# 401 MB on musl's (the median of 8; g11load, 2026-11-05). Off until the A/B, latency included, says so.
+jemalloc = ["dep:tikv-jemallocator"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
 # rather than running nothing (docs/wire.md, "The lab").
@@ -137,6 +142,11 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"] }
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
+# The `jemalloc` feature's allocator, where it's taken (Linux, glibc's or musl's): jemalloc 5, its sources
+# built with the target's C compiler (zig's for kiln's releases).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
 rustix = { version = "1.1", features = ["process", "termios", "net", "thread"] }
