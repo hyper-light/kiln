@@ -99,6 +99,10 @@ mod tests {
         let heard = |n: usize| (crate::net::SERVER_PEER, "m1".to_owned(), crate::convo::feed::Msg::Hello { store: "s".into(), restore: false }, vec![0u8; n]).weight();
         assert_eq!(heard(3 << 20) - heard(0), 3 << 20);
         assert_eq!(crate::convo::feed::HEARD_BYTES, usize::try_from(crate::net::WINDOW).unwrap_or(0));
+        // What goes to a mirror weighs the same way, and is bounded as the net thread's queue it goes into.
+        let to_mirror = |n: usize| -> crate::convo::mirror::Out { (crate::net::SERVER_PEER, "{}".to_owned(), vec![0u8; n]) };
+        assert_eq!(to_mirror(3 << 20).weight() - to_mirror(0).weight(), 3 << 20);
+        assert_eq!(crate::convo::mirror::OUT_BYTES, crate::net::OUT_BYTES);
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: the queues made with a registry are bounded in bytes on
@@ -111,7 +115,7 @@ mod tests {
         anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
-        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "sqlite"] {
+        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "sqlite"] {
             anyhow::ensure!(o.contains(&format!("kiln_memory_bytes{{owner=\"{name}\"}} ")), "{name} isn't on /metrics:\n{o}");
         }
         anyhow::ensure!(o.contains("kiln_memory_bound_bytes{owner=\"local_updates\"} "), "{o}");
