@@ -70,22 +70,40 @@ places and its run. The histograms are atomics the pools' threads write as they 
 
 Goal 6 of the API runtime program (plan `01a1a59c2abe`): each request is Critical (health, sign-in, a
 person's pages and actions), Normal (the API) or Background (agents' and CI's polling, catch-ups, sync,
-telemetry). Goal 1's probe on each shard ticks detectors that learn the shard's calm (headroom's CUSUM,
-`kiln_ci::headroom::detect`): the shard's delay for Normal, its Background tasks' waits for Background.
-The first shard's probe also ticks one for the compute pool and one for each of the blocking pool's
-shares, on the mean wait of the jobs whose waits the pool told over the period, since what a request
-waits on off its shard waits there, where no shard's delay sees it. A pool whose waits leave their calm
-sheds Background requests on every shard, and once its waits reach the tolerance (1 s), Normal ones
-too, while any of its jobs waits; Critical never. A shed request is answered 503 at once, before its
-body is read, with `Retry-After` (the delay that shed it, in whole seconds) and `x-kiln-shed` (its
-class). Shedding is off until `[server] shed = true` or `KILN_SHED=1`; the detectors run either way.
+telemetry). Goal 1's probe on each shard ticks a watch for each of the shard's queues: the shard's delay
+for Normal, its Background tasks' waits for Background. The first shard's probe also ticks one for the
+compute pool's line, each of the blocking pool's shares' and kiln.db's writer's, on the mean wait of the
+jobs whose waits the pool told over the period, since what a request waits on off its shard waits there,
+where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of the periods it came
+back to) and sheds only on a queue that *stands*, CoDel's test (research f14): every period for a whole
+tolerance (1 s, Kubernetes' default probe timeout) past its calm and past the shard's quantum, a pool's
+line never emptying, and a pool's line kept standing by work that came after it formed (it stood a
+tolerance longer than its jobs' longest wait), not one request's batch worked off. A queue that stood a
+tolerance sheds Background requests; one that stood another with Background shed, Normal ones too (a
+shard's: its API queue's); Critical never; shedding stops the period it comes back. A shed request is
+answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
+seconds) and `x-kiln-shed` (its class); kiln's client sends it again after that (a file's upload read
+again from its start, a WebSocket's opening too). Shedding is off until `[server] shed = true` or
+`KILN_SHED=1`; the watches run either way.
+
+Calm is bursty, and a queue that comes back is not overload: in the lab's calm on fedora (2026-11-05,
+research f32) the store share's jobs waited 307 to 620 ms at p99 (one attach's reads queued behind each
+other while the share held under one of its 24 places on average) and every round's shards ran a probe
+250 ms late; the CUSUM on each period's mean wait that this replaced (headroom's, with nothing it
+learned of calm's excursions) read those as shifts and shed 6.5 Background requests a calm round. Its
+unit tests replay those waits (`overload::tests`, `g6_s4_*`): the lab's calm store share, fan-outs whose
+reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a scheduler's tick of jitter
+shed nothing; work outrunning a pool, a closed loop past its places and a saturated shard shed
+Background a tolerance in and Normal a tolerance later.
 
 | series | what it says |
 | --- | --- |
 | `kiln_shard_queue_delay_seconds{shard,class}` | Each class's mean wait from ready to run on the shard, over the probe's last period. |
-| `kiln_shard_shedding{shard,class}` | 1 while the shard's own queueing delay sheds the class's requests. |
-| `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its detector read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares). |
-| `kiln_pool_shedding{pool,class}` | 1 while work waiting in the pool past its calm sheds the class's requests on every shard. |
+| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stayed past its calm (0 once back): it sheds at a tolerance. |
+| `kiln_shard_shedding{shard,class}` | 1 while the shard's own queue, standing, sheds the class's requests. |
+| `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its watch read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares), `store_write` (kiln.db's writer). |
+| `kiln_pool_queue_standing_seconds{pool}` | How long the pool's line has stood past its calm, never emptying (0 once back). |
+| `kiln_pool_shedding{pool,class}` | 1 while work standing in the pool's line sheds the class's requests on every shard. |
 | `kiln_shed_total{class}` | Requests answered 503 at once, by class (`background`, `normal`; Critical is never shed). |
 | `kiln_shard_stalled`, `kiln_shard_stalls_total`, `kiln_shard_stall_moved_total` and the others | kiln-rt's watchdog: a shard held in one poll past its limit, and the spawns it moved to other shards. |
 
@@ -132,7 +150,9 @@ for its viewers and readers (each asks again as soon as it is answered): with on
 (`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
 (`--env-b KILN_SHED=1` against the same build without). A request the server sheds counts as an
 error, and its worker waits out the answer's `Retry-After` before asking again, as kiln's own clients
-do, rather than asking again at once. `--profile many` is production's whole shape rather than its
+do, rather than asking again at once. `--profile flood` is the overload profile with 64 readers and 8
+agents calling MCP, none thinking: more work than one shard runs, as goal 6 overloads one on purpose.
+`--profile many` is production's whole shape rather than its
 busy hour's share: its ten runners and all 134 live feeds (the realistic profile's sizes, the rest of
 400 events), every one at work at the realistic pace, as goal 4 measures many sessions changing at
 once.
@@ -535,28 +555,40 @@ The step holds when `page.p99_ms` with hogs is within noise of calm in productio
 
 ### Shedding by priority, overloaded on purpose (step 4)
 
-The lab's overload sits in kiln-rt's pools, not on a shard (research `01a1a59c2abf`, f28: with one
-shard and no think time, API reads took 2 to 3 s at p99 and attaches 7 to 8 s while the shard's delay
-stayed at 1.8 ms at p99), so the pools' waits shed too: the compute pool's and each of the blocking
-pool's shares' (`kiln_pool_*`). `scripts/overload_lab/overload.sh` runs the `overload` profile with one
-shard, shedding off against on, interleaved (`kiln-lab ab`, the server in its scope as above); with
-`PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server.
+What the lab found on fedora (2026-11-05, main `0c11fb03a06`, 6 interleaved rounds each, the server alone
+in its scope on 8 CPUs of its own, the lab on 8 others): with the CUSUM shedding replaced, a calm server
+(the `realistic` profile, 4 shards) shed 6.5 Background requests a round (research f32), and one
+overloaded on purpose (the `overload` profile, one shard) 14.5 (f31), neither moving a latency beyond
+noise. Both were calm's own fan-outs in the store share: its jobs waited less at p99 overloaded (97 to
+206 ms) than calm (307 to 620 ms). The overload itself was the server's CPUs, 7.8 of its 8 busy, mostly
+with the blocking pool's `fs` share's threads (9 places busy, the attaches'), while the one shard stayed
+34% busy, its probes late by a scheduler's tick at a time (p99 17 ms): no queue of the server's stood. So
+the overloaded run now uses `--profile flood`, the overload profile with 64 readers and 8 agents calling
+MCP, none thinking, more work than one shard runs, its readers' event catch-ups Background, its other
+reads and MCP calls Normal, its pages and `/api/me` Critical.
+
+`scripts/overload_lab/overload.sh` runs a profile shedding off against on, interleaved (`kiln-lab ab`, the
+server in its scope as above): one shard and `PROFILE=flood` overloads it on purpose; with
+`PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server, which should be nothing.
 
 ```sh
-ROUNDS=6 CPUS=16-31 scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-overload
+ROUNDS=6 CPUS=16-31 PROFILE=flood scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-overload
 ROUNDS=6 CPUS=16-31 PROFILE=realistic SHARDS=default scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-calm-shedding
 ```
 
 Each round's `server.shed.background` and `server.shed.normal` are the sheds by class
-(`kiln_shed_total`), and `page.errors` and `page.p99_ms` whether Critical requests were served.
+(`kiln_shed_total`), and `page.errors` and `page.p99_ms` whether Critical requests were served. Each round's
+server log says each queue that stood, when and why (`shard overloaded: its queue stood past its calm`,
+`work waiting in a pool stood past its calm`), and its `/metrics` how long each queue stood
+(`kiln_*_queue_standing_seconds`).
 
-In process, `crates/kiln/tests/overload.rs` shows both detectors at work on kiln's own HTTP server with
-shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
-while Critical ones are served (at a 0.56 ms median); and a backlog in the blocking pool's `store` share
-while every shard is calm (its jobs waiting about 200 ms each for a place, then 1.5 s) sheds Background
-requests at the first, Normal ones only past the tolerance, never Critical ones (served at a 0.08 ms
-median), and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by
-class in both.
+In process, `crates/kiln/tests/overload.rs` shows both kinds of watch at work on kiln's own HTTP server
+with shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
+while Critical ones are served; and a backlog in the blocking pool's `store` share while every shard is
+calm (its line kept full so its jobs wait about 200 ms each for a place, then 1.5 s) sheds Background
+requests once it has stood a tolerance past those waits, Normal ones a tolerance later, never Critical
+ones, and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by class in
+both.
 
 ## Goal 5: no lock on the hot path
 

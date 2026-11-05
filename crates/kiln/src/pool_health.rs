@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use hyper_rt::compute::Observed;
 
@@ -65,6 +65,24 @@ pub fn store_write(waited: std::time::Duration, ran: std::time::Duration) {
     let p = pools();
     p.store_write_wait.observe(waited.as_secs_f64());
     p.store_write_run.observe(ran.as_secs_f64());
+    longest(QUEUES.len() - 1, u64::try_from(waited.as_micros()).unwrap_or(u64::MAX));
+}
+
+/// The longest wait each pool of [`QUEUES`] told since the overload detector last took them, microseconds (goal 6,
+/// plan 01a1a59c2abe step 4): the oldest of its line's jobs served, which says whether its line stands on work
+/// that came after it formed, or on one batch submitted at once being worked off (`crate::overload`).
+static LONGEST_US: [AtomicU64; QUEUES.len()] = [const { AtomicU64::new(0) }; QUEUES.len()];
+
+fn longest(pool: usize, waited_us: u64) {
+    if let Some(slot) = LONGEST_US.get(pool) {
+        slot.fetch_max(waited_us, Ordering::Relaxed);
+    }
+}
+
+/// The longest wait each pool of [`QUEUES`] told since the last call, microseconds, each taken back to zero as it
+/// is read: the overload detector's, the first shard's probe, which alone calls it, once a period.
+pub fn take_longest() -> [u64; QUEUES.len()] {
+    std::array::from_fn(|i| LONGEST_US.get(i).map_or(0, |slot| slot.swap(0, Ordering::Relaxed)))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -75,7 +93,10 @@ fn secs(ns: u64) -> f64 {
 /// What the compute pool told of a job's wait or a piece (`hyper_rt::compute::observe`).
 pub fn compute_job(observed: Observed) {
     match observed {
-        Observed::Waited(ns) => pools().compute_wait.observe(secs(ns)),
+        Observed::Waited(ns) => {
+            pools().compute_wait.observe(secs(ns));
+            longest(0, ns / 1_000);
+        }
         Observed::Ran(ns) => pools().compute_piece.observe(secs(ns)),
     }
 }
@@ -88,6 +109,8 @@ pub fn blocking_job(share: &'static str, waited_ns: u64, ran_ns: u64) {
         wait.observe(secs(waited_ns));
         run.observe(secs(ran_ns));
     }
+    // The compute pool is `QUEUES`' first; the shares follow in `SHARES`' order.
+    longest(i + 1, waited_ns / 1_000);
 }
 
 /// What the overload detector reads of one pool (goal 6, plan 01a1a59c2abe step 4; `crate::overload`): the waits

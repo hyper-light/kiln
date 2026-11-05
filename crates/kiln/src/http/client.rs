@@ -114,11 +114,25 @@ impl Client {
         self.websocket_with(url, &[], max_message).await
     }
 
-    /// [`Self::websocket`], with `headers` on the handshake.
+    /// [`Self::websocket`], with `headers` on the handshake. An opening a kiln server shed did nothing (goal 6, plan
+    /// 01a1a59c2abe step 4): it is opened again after the server's `Retry-After`, while that leaves time before the
+    /// deadline (a runner's tunnel then opens once the server takes it, not on a path of its own choosing).
     pub async fn websocket_with(&self, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
-        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
+        let deadline = Instant::now().checked_add(DEFAULT_TIMEOUT);
+        loop {
+            let left = deadline.map_or(DEFAULT_TIMEOUT, |d| d.saturating_duration_since(Instant::now()));
+            let opened = match crate::rt::timeout(left, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
+                Ok(r) => r,
+                Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
+            };
+            let shed = opened.as_ref().err().and_then(|e| e.downcast_ref::<super::ws::Shed>()).map(|s| s.wait);
+            match shed {
+                Some(wait) if Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end) => {
+                    tracing::debug!(url, wait_s = wait.as_secs(), "the server shed the WebSocket's opening; opening it again after its Retry-After");
+                    crate::rt::sleep(wait).await;
+                }
+                _ => return opened,
+            }
         }
     }
 }
@@ -127,7 +141,13 @@ enum Payload {
     None,
     Bytes(Bytes),
     Stream(async_channel::Receiver<Bytes>),
+    /// A stream made anew for each send ([`RequestBuilder::body_reopen`]).
+    Reopen(Reopen),
 }
+
+/// What makes a request's streamed body anew for each send (a file read again from its start): a request a kiln
+/// server shed is sent again whole (goal 6, plan 01a1a59c2abe step 4).
+pub type Reopen = std::sync::Arc<dyn Fn() -> anyhow::Result<async_channel::Receiver<Bytes>> + Send + Sync>;
 
 pub struct RequestBuilder<'c> {
     client: &'c Client,
@@ -166,10 +186,25 @@ impl RequestBuilder<'_> {
         self
     }
 
-    /// Stream the request body from a channel (sent chunked); the body ends when the sender drops.
+    /// Stream the request body from a channel (sent chunked); the body ends when the sender drops. A request a
+    /// kiln server sheds can't be sent again with it ([`Self::body_reopen`] can).
     pub fn body_stream(mut self, rx: async_channel::Receiver<Bytes>) -> Self {
         self.body = Payload::Stream(rx);
         self
+    }
+
+    /// Stream the request body (sent chunked) from what `open` makes, made anew for each send: a request a kiln
+    /// server shed is sent again after its `Retry-After` with its body whole (goal 6, plan 01a1a59c2abe step 4).
+    pub fn body_reopen(mut self, open: impl Fn() -> anyhow::Result<async_channel::Receiver<Bytes>> + Send + Sync + 'static) -> Self {
+        self.body = Payload::Reopen(std::sync::Arc::new(open));
+        self
+    }
+
+    /// Stream the request body from the file at `path` (sent chunked), read from its start for each send
+    /// ([`Self::body_reopen`]).
+    pub fn body_file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        self.body_reopen(move || crate::rt::file_source(path.clone()))
     }
 
     /// Time allowed to connect and receive the response head (bodies are read separately).
@@ -202,11 +237,13 @@ impl RequestBuilder<'_> {
         }
     }
 
-    /// The same request again, when its body can be sent again (none, or bytes held; a stream can't).
+    /// The same request again, when its body can be sent again (none, bytes held, or a stream made anew; a
+    /// channel's stream can't).
     fn again(&self) -> Option<Self> {
         let body = match &self.body {
             Payload::None => Payload::None,
             Payload::Bytes(b) => Payload::Bytes(b.clone()),
+            Payload::Reopen(open) => Payload::Reopen(std::sync::Arc::clone(open)),
             Payload::Stream(_) => return None,
         };
         Some(Self {
@@ -236,6 +273,7 @@ impl RequestBuilder<'_> {
             Payload::None => empty(),
             Payload::Bytes(b) => full(b),
             Payload::Stream(rx) => channel_body(rx),
+            Payload::Reopen(open) => channel_body(open()?),
         };
         let mut req = http::Request::builder()
             .method(self.method.as_http())
@@ -354,6 +392,69 @@ mod tests {
         })?;
         let bodies = server.join().map_err(|_| anyhow::anyhow!("the server thread panicked"))??;
         anyhow::ensure!(bodies.iter().take(2).all(|b| b.ends_with("hello")), "the body went again: {bodies:?}");
+        Ok(())
+    }
+
+    /// The body of HTTP/1.1 request `raw` (its head, then its body chunked), unchunked.
+    fn dechunk(raw: &[u8]) -> Vec<u8> {
+        let Some(head) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return Vec::new() };
+        let mut rest = raw.get(head + 4..).unwrap_or_default();
+        let mut out = Vec::new();
+        while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+            let size = std::str::from_utf8(rest.get(..eol).unwrap_or_default()).ok().and_then(|h| usize::from_str_radix(h.split(';').next().unwrap_or("").trim(), 16).ok()).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(rest.get(eol + 2..eol + 2 + size).unwrap_or_default());
+            rest = rest.get(eol + 4 + size..).unwrap_or_default();
+        }
+        out
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a file's upload a kiln server shed (a runner's blob or bundle, a memo's file:
+    /// `body_file`, `body_reopen`) is sent again after the wait it was given, the file read again from its start, so
+    /// whole each time.
+    #[test]
+    fn g6_s4_a_shed_upload_of_a_file_is_sent_again_whole() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("blob");
+        let content: Vec<u8> = (0..70_000u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        std::fs::write(&path, &content)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<Vec<u8>>> {
+            let mut bodies = Vec::new();
+            for answer in [
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            ] {
+                let (mut s, _) = listener.accept()?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let (mut got, mut buf) = (Vec::new(), [0u8; 8192]);
+                // A chunked body ends with its last chunk, of no bytes.
+                while !got.ends_with(b"\r\n0\r\n\r\n") {
+                    let n = s.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                bodies.push(dechunk(&got));
+                s.write_all(answer.as_bytes())?;
+            }
+            Ok(bodies)
+        });
+        let upload = path.clone();
+        crate::rt::block_on(async move {
+            let started = Instant::now();
+            let r = Client::public()?.put(&format!("http://{addr}/api/sync/blobs/x")).body_file(upload).send().await?;
+            anyhow::ensure!(r.status() == 200, "served on the second send: {}", r.status());
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(1), "after the Retry-After: {:?}", started.elapsed());
+            Ok(())
+        })?;
+        let bodies = server.join().map_err(|_| anyhow::anyhow!("the server thread panicked"))??;
+        anyhow::ensure!(bodies.len() == 2 && bodies.iter().all(|b| *b == content), "the file went whole each time: {:?} of {}", bodies.iter().map(Vec::len).collect::<Vec<_>>(), content.len());
         Ok(())
     }
 
