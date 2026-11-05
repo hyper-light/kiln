@@ -17,7 +17,11 @@
 //! **Where offered**, [`TcpStream::set_notsent_lowat`] makes writability mean "the unsent queue is low"
 //! (Linux, macOS), keeping a slow peer's backlog in the application's hands where a budget sees it, and
 //! [`TcpStream::set_user_timeout`] bounds how long sent data may stay unacknowledged (Linux
-//! `TCP_USER_TIMEOUT`, RFC 5482; macOS `TCP_RXT_CONNDROPTIME`; Windows `TCP_MAXRTMS`).
+//! `TCP_USER_TIMEOUT`, RFC 5482; macOS `TCP_RXT_CONNDROPTIME`; Windows `TCP_MAXRTMS`). A stream or listener
+//! picks its congestion control ([`TcpStream::set_congestion`], Linux), a stream bounds its kernel buffers
+//! ([`TcpStream::set_send_buffer`], [`TcpStream::set_recv_buffer`]), and [`TcpStream::tcp_info`] reads what
+//! the kernel says of the connection (unsent and in-flight bytes, RTTs, delivery rate): each says whether
+//! the platform offers it.
 //!
 //! **A connection budget.** A listener given a [`ConnectionBudget`] takes a slot of it for every connection
 //! it accepts; past the budget it closes the connection at once and counts it (a refusal by close, which a
@@ -45,7 +49,9 @@ use crate::tcpsys::{self, Stream};
 // The address types are `core::net`'s, re-exported so a caller names an address without a backend.
 pub use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-pub use crate::tcpsys::Shutdown;
+pub use crate::tcpsys::{
+    CONGESTION_NAME_MAX, CongestionError, CongestionName, CongestionRefusal, Shutdown, TcpInfo,
+};
 
 /// The owned OS handle a stream or listener moves as: a file descriptor on Unix, a Winsock socket on
 /// Windows.
@@ -201,6 +207,20 @@ impl TcpListener {
     /// The local address the listener is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, RtError> {
         tcpsys::local_addr(&self.stream)
+    }
+
+    /// Picks the congestion control every connection it accepts from now on starts with (Linux
+    /// `TCP_CONGESTION`, which accepted connections inherit, tcp(7)). Whether the platform offers it (Linux
+    /// does; macOS and Windows have no per-socket choice). A refusal names the algorithm and why (not
+    /// allowed, not loaded), and the listener keeps its default (bp-g3 step 1, plan
+    /// `01a1a832eb2f711f9c6f51d88effe89d`).
+    pub fn set_congestion(&self, name: CongestionName) -> Result<bool, CongestionError> {
+        tcpsys::set_congestion(&self.stream, name)
+    }
+
+    /// The congestion control accepted connections start with, where offered (bp-g3 step 1).
+    pub fn congestion(&self) -> Result<Option<CongestionName>, RtError> {
+        tcpsys::congestion(&self.stream)
     }
 
     /// Connections closed at once because the budget was full.
@@ -373,6 +393,51 @@ impl TcpStream {
     /// The deadline [`TcpStream::set_user_timeout`] set, in milliseconds, where offered.
     pub fn user_timeout_ms(&self) -> Result<Option<u32>, RtError> {
         tcpsys::user_timeout_ms(&self.stream)
+    }
+
+    /// Picks the stream's congestion control (Linux `TCP_CONGESTION`). Whether the platform offers it (Linux
+    /// does; macOS and Windows have no per-socket choice). An unprivileged process may pick only what
+    /// `net.ipv4.tcp_allowed_congestion_control` lists, of what is loaded: a refusal names the algorithm and
+    /// the reason ([`CongestionRefusal::NotAllowed`], [`CongestionRefusal::NotLoaded`]), never a panic, and
+    /// the stream goes on with the algorithm it had (bp-g3 step 1, plan `01a1a832eb2f711f9c6f51d88effe89d`).
+    pub fn set_congestion(&self, name: CongestionName) -> Result<bool, CongestionError> {
+        tcpsys::set_congestion(&self.stream, name)
+    }
+
+    /// The congestion control in use, where offered (Linux; bp-g3 step 1).
+    pub fn congestion(&self) -> Result<Option<CongestionName>, RtError> {
+        tcpsys::congestion(&self.stream)
+    }
+
+    /// Sets the kernel's send buffer for the stream (`SO_SNDBUF`), which turns its autotuning off. Whether
+    /// the platform offers it (Linux, macOS and Windows do; bp-g3 step 1).
+    pub fn set_send_buffer(&self, bytes: u32) -> Result<bool, RtError> {
+        tcpsys::set_send_buffer(&self.stream, bytes)
+    }
+
+    /// `SO_SNDBUF` read back, where offered (Linux reports twice what was set, for its bookkeeping).
+    pub fn send_buffer(&self) -> Result<Option<u32>, RtError> {
+        tcpsys::send_buffer(&self.stream)
+    }
+
+    /// Sets the kernel's receive buffer for the stream (`SO_RCVBUF`), which turns its autotuning off and so
+    /// bounds what the kernel holds that the application hasn't read. Set before connecting to have the
+    /// window scale fit it. Whether the platform offers it (Linux, macOS and Windows do; bp-g3 step 1).
+    pub fn set_recv_buffer(&self, bytes: u32) -> Result<bool, RtError> {
+        tcpsys::set_recv_buffer(&self.stream, bytes)
+    }
+
+    /// `SO_RCVBUF` read back, where offered (Linux reports twice what was set).
+    pub fn recv_buffer(&self) -> Result<Option<u32>, RtError> {
+        tcpsys::recv_buffer(&self.stream)
+    }
+
+    /// What the kernel says of the connection now: unsent and in-flight bytes, minimum and smoothed RTT,
+    /// delivery rate, window, segment size, retransmissions and the congestion control in use, each `None`
+    /// where the platform doesn't give it ([`TcpInfo`]); `None` as a whole where it gives nothing. One or
+    /// two system calls, no allocation (bp-g3 step 1).
+    pub fn tcp_info(&self) -> Result<Option<TcpInfo>, RtError> {
+        tcpsys::tcp_info(&self.stream)
     }
 
     /// Awaits read readiness once (or a spurious wake).
