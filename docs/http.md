@@ -59,6 +59,18 @@ types and bodies are `http-body`'s, so handlers are written as they were on hype
   within 20 (kiln's settings).
 - No server push, and no extended CONNECT: browsers open HTTP/1.1 connections for WebSockets.
 
+## TLS sessions
+
+A TLS listener (`server.https`, and each runner's front door) keeps the sessions it makes in one
+store that all its connections share, so a browser that comes back resumes: the server sends no
+certificate and no signature again. Sessions are stateful: TLS 1.3 sends 2 tickets after each
+handshake, and each ticket resumes once, then is gone. The store holds at most 4,096 sessions
+(the oldest go first; none over 2 KiB), each resumable for 24 hours, the lifetime hyper-tls tells
+clients. It lives in memory: a restart empties it, and every browser's next connect is a full
+handshake. Resumption still exchanges keys (browsers resume with `psk_dhe_ke` only), so it saves
+bytes, not a round trip. `kiln_tls_handshakes_total{door,kind}` counts handshakes by door
+(`server`, `front_door`) and kind (`full`, `full_hello_retry`, `resumed`).
+
 ## Clients
 
 `kiln_http::client::http1` sends one request at a time over a kept-alive connection, mirroring

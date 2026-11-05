@@ -7,20 +7,27 @@
 //! (`process_new_packets(&mut config)`) borrows it, for the connection's whole life (a TLS 1.3
 //! client files NewSessionTickets into it after the handshake). So each connection owns its own
 //! configuration, built from shared material: a root store ([`ClientTls::config`]), or a
-//! certificate and its key, parsed once ([`ServerTls::config`]).
+//! certificate and its key, parsed once, and the listener's TLS sessions ([`ServerTls::config`]).
+//!
+//! A server's sessions outlive the connection that made them (goal 7 step 3, plan
+//! 01a1a832ebbf7327a203df446e16ecac): every connection's configuration files the tickets it
+//! sends into one bounded store its [`ServerTls`] holds ([`Sessions`]), so a browser coming
+//! back resumes, without the certificate and its signature, rather than starting again.
 
 use std::future::poll_fn;
 use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::io::{AsyncRead, AsyncWrite};
 use hyper_quic::rustls::crypto::CryptoProvider;
 use hyper_quic::rustls::pki_types::pem::PemObject as _;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use hyper_quic::rustls::server::{ClientHello, ResolvesServerCert};
+use hyper_quic::rustls::server::{ClientHello, ResolvesServerCert, StoresServerSessions};
 use hyper_quic::rustls::sign::CertifiedKey;
 use hyper_quic::rustls::{self, ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 
@@ -113,16 +120,170 @@ pub const HTTP11: &[u8] = b"http/1.1";
 
 // ------------------------------------------------------------------------------- server side
 
-/// A server's certificate chain and key, parsed (and checked to belong together) once; each
-/// connection's configuration is made from them ([`Self::config`]). Cheap to clone.
+/// How a TLS listener keeps sessions for browsers to resume (goal 7 step 3): stateful, each
+/// TLS 1.3 session used once, in one store per listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resumption {
+    /// Sessions kept at most; past it, the oldest goes first.
+    pub capacity: usize,
+    /// How long a session may be resumed after it was made, at most [`STATEFUL_LIFETIME`].
+    pub lifetime: Duration,
+    /// TLS 1.3 tickets sent after each handshake (each resumes once).
+    pub tickets: usize,
+}
+
+/// The lifetime hyper-tls tells clients a stateful ticket has (24 hours, under TLS 1.3's 7 days):
+/// a client drops its ticket then, so a longer [`Resumption::lifetime`] could never be used.
+pub const STATEFUL_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most a stored session takes (its key and its value): hyper-tls's own encoding of a
+/// session without client certificates is a few hundred bytes; one larger is not kept.
+pub const SESSION_BYTES: usize = 2048;
+
+impl Default for Resumption {
+    /// 4,096 sessions (at most about 8 MiB, typically a few hundred KiB), resumable for 24 hours,
+    /// and hyper-tls's 2 tickets a handshake (as before). The lifetime and the tickets are Ada's to
+    /// confirm against the lab's count of connections per page load (goal 7 step 2).
+    fn default() -> Self {
+        Self { capacity: 4096, lifetime: STATEFUL_LIFETIME, tickets: 2 }
+    }
+}
+
+/// One listener's TLS sessions, shared by the configurations of all its connections: bounded by
+/// [`Resumption::capacity`] (oldest first out) and [`SESSION_BYTES`] each, and a TLS 1.3
+/// session is taken out when it is resumed, so a ticket resumes once and is refused after. In
+/// memory only: a restart empties it, and browsers' next connects are full handshakes.
+pub struct Sessions {
+    resumption: Resumption,
+    inner: parking_lot::Mutex<Kept>,
+}
+
+#[derive(Default)]
+struct Kept {
+    by_key: HashMap<Vec<u8>, Session>,
+    /// Keys in the order they were stored, for oldest-first eviction.
+    order: BTreeMap<u64, Vec<u8>>,
+    next: u64,
+    bytes: usize,
+}
+
+struct Session {
+    value: Vec<u8>,
+    seq: u64,
+    made: Instant,
+}
+
+impl Kept {
+    fn remove(&mut self, key: &[u8]) -> Option<Session> {
+        let s = self.by_key.remove(key)?;
+        self.order.remove(&s.seq);
+        self.bytes = self.bytes.saturating_sub(key.len().saturating_add(s.value.len()));
+        Some(s)
+    }
+}
+
+impl std::fmt::Debug for Sessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the keys or the secrets.
+        f.debug_struct("Sessions").field("resumption", &self.resumption).field("kept", &self.len()).finish()
+    }
+}
+
+impl Sessions {
+    pub fn new(resumption: Resumption) -> Self {
+        let resumption = Resumption { lifetime: resumption.lifetime.min(STATEFUL_LIFETIME), ..resumption };
+        Self { resumption, inner: parking_lot::Mutex::new(Kept::default()) }
+    }
+
+    pub fn resumption(&self) -> Resumption {
+        self.resumption
+    }
+
+    /// Sessions kept now.
+    pub fn len(&self) -> usize {
+        self.inner.lock().by_key.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes of the sessions kept now (keys and values).
+    pub fn bytes(&self) -> usize {
+        self.inner.lock().bytes
+    }
+
+    fn fresh(&self, s: &Session) -> bool {
+        s.made.elapsed() < self.resumption.lifetime
+    }
+
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let size = key.len().saturating_add(value.len());
+        if self.resumption.capacity == 0 || size > SESSION_BYTES {
+            return false;
+        }
+        let mut kept = self.inner.lock();
+        kept.remove(&key);
+        while kept.by_key.len() >= self.resumption.capacity {
+            let Some((_, oldest)) = kept.order.pop_first() else { break };
+            kept.remove(&oldest);
+        }
+        let seq = kept.next;
+        kept.next = kept.next.wrapping_add(1);
+        kept.order.insert(seq, key.clone());
+        kept.bytes = kept.bytes.saturating_add(size);
+        kept.by_key.insert(key, Session { value, seq, made: Instant::now() });
+        true
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let kept = self.inner.lock();
+        kept.by_key.get(key).filter(|s| self.fresh(s)).map(|s| s.value.clone())
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let taken = self.inner.lock().remove(key)?;
+        self.fresh(&taken).then_some(taken.value)
+    }
+}
+
+/// A connection configuration's handle on its listener's [`Sessions`] (hyper-tls's
+/// `StoresServerSessions`, over shared state; hyper-tls itself is unchanged).
+#[derive(Debug)]
+struct SharedSessions(Arc<Sessions>);
+
+impl StoresServerSessions for SharedSessions {
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.0.put(key, value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key)
+    }
+
+    fn take(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.take(key)
+    }
+
+    fn can_cache(&self) -> bool {
+        self.0.resumption.capacity > 0
+    }
+}
+
+/// A server's certificate chain and key, parsed (and checked to belong together) once, and the
+/// TLS sessions of the listener it serves ([`Sessions`]); each connection's configuration is made
+/// from them ([`Self::config`]). Cheap to clone: clones share the certificate and the sessions.
 #[derive(Clone)]
 pub struct ServerTls {
     key: Arc<CertifiedKey>,
+    /// The leaf's names (its subject alternative names), sorted: which sessions it may resume.
+    names: Arc<[String]>,
+    sessions: Arc<Sessions>,
 }
 
 impl std::fmt::Debug for ServerTls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerTls").field("chain", &self.key.cert.len()).field("key", &"<redacted>").finish()
+        f.debug_struct("ServerTls").field("chain", &self.key.cert.len()).field("key", &"<redacted>").field("sessions", &self.sessions).finish()
     }
 }
 
@@ -139,7 +300,7 @@ impl ResolvesServerCert for OneCertificate {
 impl ServerTls {
     /// A PEM certificate chain (leaf first) and its PEM private key (PKCS#8, PKCS#1 or SEC1).
     /// Refuses a chain without certificates, a key that does not parse, and a key that is not the
-    /// leaf's. Errors never quote the key.
+    /// leaf's. Errors never quote the key. Its sessions start empty ([`Resumption::default`]).
     pub fn from_pem(chain_pem: &str, key_pem: &str) -> anyhow::Result<Self> {
         let chain = CertificateDer::pem_slice_iter(chain_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
@@ -151,7 +312,10 @@ impl ServerTls {
             rustls::Error::InconsistentKeys(_) => anyhow::anyhow!("the private key is not the certificate's"),
             other => anyhow::anyhow!("the private key cannot be used: {other}"),
         })?;
-        let tls = Self { key: Arc::new(key) };
+        let mut names = key.cert.first().and_then(|leaf| crate::pki::cert_info_der(leaf).ok()).map(|i| i.names).unwrap_or_default();
+        names.sort();
+        names.dedup();
+        let tls = Self { key: Arc::new(key), names: names.into(), sessions: Arc::new(Sessions::new(Resumption::default())) };
         tls.config()?;
         Ok(tls)
     }
@@ -161,8 +325,24 @@ impl ServerTls {
         self.key.cert.first().map(|c| c.as_ref())
     }
 
+    /// The listener's sessions.
+    pub fn sessions(&self) -> &Arc<Sessions> {
+        &self.sessions
+    }
+
+    /// This certificate in place of `old` on the same listener: a renewal (a leaf for the same
+    /// names) keeps `old`'s sessions, so browsers resume across it; a certificate for other names
+    /// starts with none, and every browser's next connect is a full handshake that sees it.
+    pub fn succeeding(self, old: &ServerTls) -> Self {
+        if !self.names.is_empty() && self.names == old.names {
+            Self { sessions: Arc::clone(&old.sessions), ..self }
+        } else {
+            self
+        }
+    }
+
     /// A fresh configuration for one connection (TLS 1.3 and 1.2, ALPN http/1.1, no client
-    /// certificates).
+    /// certificates), filing its sessions in the listener's.
     pub fn config(&self) -> anyhow::Result<ServerConfig> {
         self.config_alpn(&[HTTP11])
     }
@@ -176,6 +356,9 @@ impl ServerTls {
             .with_no_client_auth()
             .with_cert_resolver(Box::new(OneCertificate(Arc::clone(&self.key))));
         config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        // Stateful sessions (no ticketer): each TLS 1.3 session resumes once.
+        config.session_storage = Box::new(SharedSessions(Arc::clone(&self.sessions)));
+        config.send_tls13_tickets = self.sessions.resumption.tickets;
         Ok(config)
     }
 }
@@ -196,6 +379,7 @@ pub trait Side {
     fn send_close_notify(&mut self);
     fn alpn_protocol(&self) -> Option<&[u8]>;
     fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]>;
+    fn handshake_kind(&self) -> Option<rustls::HandshakeKind>;
 }
 
 macro_rules! side {
@@ -231,6 +415,9 @@ macro_rules! side {
             }
             fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
                 (**self).peer_certificates()
+            }
+            fn handshake_kind(&self) -> Option<rustls::HandshakeKind> {
+                (**self).handshake_kind()
             }
         }
     };
@@ -332,6 +519,22 @@ impl<S, C: Side> Stream<S, C> {
     /// The certificates the peer presented, its own first (a server's chain to a client).
     pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
         self.conn.peer_certificates()
+    }
+
+    /// What the handshake was, as `kiln_tls_handshakes_total` counts it: `full`,
+    /// `full_hello_retry` (a full one after a HelloRetryRequest) or `resumed`.
+    pub fn handshake(&self) -> &'static str {
+        match self.conn.handshake_kind() {
+            Some(rustls::HandshakeKind::Resumed) => "resumed",
+            Some(rustls::HandshakeKind::FullWithHelloRetryRequest) => "full_hello_retry",
+            _ => "full",
+        }
+    }
+
+    /// The configuration back, for the next connection (a client's, holding its tickets).
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> C::Config {
+        self.config
     }
 }
 
@@ -655,5 +858,180 @@ mod tests {
             assert!(TlsStream::connect(super::super::io::RtFuturesIo::new(tcp), roots.config()?, server_name("kiln.home")?).await.is_err());
             Ok(())
         })
+    }
+
+    /// A front-door certificate from kiln's CA for `names` (the kiln leaf's shape), and its key.
+    fn kiln_leaf(pki: &crate::pki::Pki, names: &[&str]) -> anyhow::Result<(String, String)> {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let key = crate::pki::new_key_pem()?;
+        let csr = crate::pki::front_door_csr(&names, &key)?;
+        Ok((pki.sign_front_door(&csr, &names, 30)?, key))
+    }
+
+    /// Records from one end to the other until neither has more to say: the bytes each way, and
+    /// the client's first flight (its ClientHello), kept to be replayed.
+    struct Pumped {
+        up: usize,
+        down: usize,
+        hello: Vec<u8>,
+    }
+
+    fn pump(client: &mut ClientConnection, ccfg: &mut ClientConfig, server: &mut ServerConnection, scfg: &mut ServerConfig) -> anyhow::Result<Pumped> {
+        let mut p = Pumped { up: 0, down: 0, hello: Vec::new() };
+        for _ in 0..16 {
+            let mut up = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut up)?;
+            }
+            if p.hello.is_empty() {
+                p.hello.clone_from(&up);
+            }
+            p.up += up.len();
+            let mut rd = up.as_slice();
+            while !rd.is_empty() {
+                server.read_tls(&mut rd)?;
+                server.process_new_packets(scfg)?;
+            }
+            let mut down = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut down)?;
+            }
+            p.down += down.len();
+            let mut rd = down.as_slice();
+            while !rd.is_empty() {
+                client.read_tls(&mut rd)?;
+                client.process_new_packets(ccfg)?;
+            }
+            if up.is_empty() && down.is_empty() && !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(p);
+            }
+        }
+        anyhow::bail!("the handshake didn't settle")
+    }
+
+    /// One connection, in memory, from the client's configuration to the listener's.
+    fn connect(ccfg: &mut ClientConfig, server: &ServerTls) -> anyhow::Result<(Pumped, Option<rustls::HandshakeKind>, Option<rustls::HandshakeKind>)> {
+        let mut client = ClientConnection::new(ccfg, server_name("kiln.test")?)?;
+        let mut scfg = server.config()?;
+        let mut conn = ServerConnection::new(&scfg)?;
+        let p = pump(&mut client, ccfg, &mut conn, &mut scfg)?;
+        Ok((p, client.handshake_kind(), conn.handshake_kind()))
+    }
+
+    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac), "the ledger client resumes with a
+    /// ticket from a previous connection to the same listener": the second connection from one
+    /// client configuration resumes (the PSK accepted, so no Certificate or CertificateVerify in
+    /// the server's flight, RFC 8446 §2.2), and the server sends at least 25% fewer handshake
+    /// bytes than for the full one: same client, same key exchange (X25519MLKEM768), kiln's leaf.
+    #[test]
+    fn g7_s3_a_ticket_from_one_connection_resumes_the_next() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open(dir.path())?;
+        let (cert, key) = kiln_leaf(&pki, &["kiln.test"])?;
+        let server = ServerTls::from_pem(&cert, &key)?;
+        let mut ccfg = ClientTls::new(Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?.config()?;
+        let (full, ck, sk) = connect(&mut ccfg, &server)?;
+        assert_eq!((ck, sk), (Some(rustls::HandshakeKind::Full), Some(rustls::HandshakeKind::Full)));
+        assert_eq!(server.sessions().len(), 2, "the listener keeps both tickets it sent");
+        let (resumed, ck, sk) = connect(&mut ccfg, &server)?;
+        assert_eq!((ck, sk), (Some(rustls::HandshakeKind::Resumed), Some(rustls::HandshakeKind::Resumed)));
+        // One ticket used, two new ones: three kept.
+        assert_eq!(server.sessions().len(), 3);
+        let fall = 1.0 - resumed.down as f64 / full.down as f64;
+        assert!(fall >= 0.25, "server-to-client handshake bytes: full {} B, resumed {} B ({:.1}% less)", full.down, resumed.down, fall * 100.0);
+        let leaf = server.leaf().map_or(0, <[u8]>::len);
+        assert!(full.down.saturating_sub(resumed.down) >= leaf, "the certificate ({leaf} B) isn't sent again: full {} B, resumed {} B", full.down, resumed.down);
+        // The third resumes too, with the other ticket of the first.
+        let (_, ck, _) = connect(&mut ccfg, &server)?;
+        assert_eq!(ck, Some(rustls::HandshakeKind::Resumed));
+        Ok(())
+    }
+
+    /// Goal 7 step 3, "the same ticket offered twice": the ClientHello of a resumed connection,
+    /// sent again whole (its ticket, its binder), gets a full handshake: the session went from the
+    /// store the first time it was used.
+    #[test]
+    fn g7_s3_a_ticket_resumes_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open(dir.path())?;
+        let (cert, key) = kiln_leaf(&pki, &["kiln.test"])?;
+        let server = ServerTls::from_pem(&cert, &key)?;
+        let mut ccfg = ClientTls::new(Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?.config()?;
+        connect(&mut ccfg, &server)?;
+        let (resumed, _, sk) = connect(&mut ccfg, &server)?;
+        assert_eq!(sk, Some(rustls::HandshakeKind::Resumed));
+        let mut scfg = server.config()?;
+        let mut again = ServerConnection::new(&scfg)?;
+        let mut rd = resumed.hello.as_slice();
+        while !rd.is_empty() {
+            again.read_tls(&mut rd)?;
+            again.process_new_packets(&mut scfg)?;
+        }
+        assert_eq!(again.handshake_kind(), Some(rustls::HandshakeKind::Full), "a replayed ticket is refused");
+        Ok(())
+    }
+
+    /// Goal 7 step 3, "store at capacity": the oldest session goes first, the store never holds
+    /// more than its capacity (nor a session over [`SESSION_BYTES`]), and nothing panics; a session
+    /// taken is gone, and one past its lifetime isn't resumed.
+    #[test]
+    fn g7_s3_the_store_at_capacity_lets_its_oldest_go() {
+        let sessions = Sessions::new(Resumption { capacity: 3, ..Resumption::default() });
+        let key = |i: u32| i.to_be_bytes().repeat(8);
+        for i in 0..5 {
+            assert!(sessions.put(key(i), vec![7; 100]));
+        }
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.bytes(), 3 * (32 + 100));
+        assert!(sessions.get(&key(0)).is_none() && sessions.get(&key(1)).is_none(), "the oldest went first");
+        assert!(sessions.get(&key(2)).is_some(), "get leaves it (TLS 1.2's session ids)");
+        assert!(sessions.take(&key(4)).is_some());
+        assert!(sessions.take(&key(4)).is_none(), "used once, refused after");
+        assert_eq!(sessions.len(), 2);
+        // Many more, and the same key again: still at the bound, in bytes too.
+        for i in 0..10_000 {
+            sessions.put(key(i % 7), vec![1; 200]);
+        }
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.bytes(), 3 * (32 + 200));
+        assert_eq!(sessions.inner.lock().order.len(), 3, "the eviction order holds only what's kept");
+        assert!(!sessions.put(key(1), vec![0; SESSION_BYTES]), "too big to keep");
+        // Lifetimes: none past it, and never beyond what hyper-tls tells clients.
+        let expired = Sessions::new(Resumption { lifetime: Duration::ZERO, ..Resumption::default() });
+        assert!(expired.put(key(1), vec![1; 10]));
+        assert!(expired.take(&key(1)).is_none());
+        assert_eq!(Sessions::new(Resumption { lifetime: Duration::from_secs(7 * 86_400), ..Resumption::default() }).resumption().lifetime, STATEFUL_LIFETIME);
+        // No room at all: nothing kept, and hyper-tls is told so.
+        let none = Sessions::new(Resumption { capacity: 0, ..Resumption::default() });
+        assert!(!none.put(key(1), vec![1; 10]));
+        assert!(!SharedSessions(Arc::new(none)).can_cache());
+    }
+
+    /// Goal 7 step 3: a renewed certificate (the same names) keeps the listener's sessions; one for
+    /// other names starts with none. Either way new connections get the new certificate.
+    #[test]
+    fn g7_s3_a_renewal_keeps_the_sessions_other_names_drop_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open(dir.path())?;
+        let (cert, key) = kiln_leaf(&pki, &["kiln.test", "www.kiln.test"])?;
+        let old = ServerTls::from_pem(&cert, &key)?;
+        let mut ccfg = ClientTls::new(Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?.config()?;
+        connect(&mut ccfg, &old)?;
+        let (cert, key) = kiln_leaf(&pki, &["www.kiln.test", "kiln.test"])?;
+        let renewed = ServerTls::from_pem(&cert, &key)?.succeeding(&old);
+        assert!(Arc::ptr_eq(renewed.sessions(), old.sessions()));
+        assert_ne!(renewed.leaf(), old.leaf());
+        let (_, ck, _) = connect(&mut ccfg, &renewed)?;
+        assert_eq!(ck, Some(rustls::HandshakeKind::Resumed), "resumed across the renewal");
+        let (cert, key) = kiln_leaf(&pki, &["kiln.test", "other.test"])?;
+        let other = ServerTls::from_pem(&cert, &key)?.succeeding(&renewed);
+        assert!(other.sessions().is_empty());
+        let mut client = ClientConnection::new(&mut ccfg, server_name("kiln.test")?)?;
+        let mut scfg = other.config()?;
+        let mut conn = ServerConnection::new(&scfg)?;
+        pump(&mut client, &mut ccfg, &mut conn, &mut scfg)?;
+        assert_eq!(client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        assert_eq!(client.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref()), other.leaf(), "the new certificate");
+        Ok(())
     }
 }

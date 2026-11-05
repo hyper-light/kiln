@@ -110,8 +110,15 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
             let Ok(config) = tls.config_alpn(&[super::tls::H2, super::tls::HTTP11]) else { return };
             let io = super::tls::Prefixed::new(head, io);
             match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
-                Ok(Ok(s)) if s.alpn_protocol() == Some(super::tls::H2) => Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await,
-                Ok(Ok(s)) => Box::pin(serve_read(s, Bytes::new(), handler, remote, true)).await,
+                Ok(Ok(s)) => {
+                    // Full or resumed (goal 7 step 3): the listener's sessions are shared.
+                    crate::metrics::tls().handshake("server", s.handshake());
+                    if s.alpn_protocol() == Some(super::tls::H2) {
+                        Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await
+                    } else {
+                        Box::pin(serve_read(s, Bytes::new(), handler, remote, true)).await
+                    }
+                }
                 Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
                 Err(_) => tracing::debug!(?remote, "TLS handshake timed out"),
             }
@@ -465,6 +472,47 @@ mod tests {
             let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             let tls = super::super::tls::TlsStream::connect(super::super::io::RtFuturesIo::new(tcp), roots.config()?, super::super::tls::server_name("kiln.test")?).await?;
             assert_eq!(tls.alpn_protocol(), Some(super::super::tls::HTTP11));
+            Ok(())
+        })
+    }
+
+    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac): `server.https` keeps its TLS
+    /// sessions across connections, so the second connection from one client configuration
+    /// resumes, and `kiln_tls_handshakes_total` counts both kinds.
+    #[test]
+    fn g7_s3_server_https_resumes_across_connections() -> anyhow::Result<()> {
+        use futures::AsyncWriteExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::front_door_csr(&["kiln.test".to_owned()], &key)?;
+            let cert = pki.sign_front_door(&csr, &["kiln.test".to_owned()], 30)?;
+            let addr = listener(Some(super::super::tls::ServerTls::from_pem(&cert, &key)?))?;
+            let roots = super::super::tls::ClientTls::new(super::super::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
+            let counted = |kind: &str| crate::metrics::tls().handshakes.get(&["server", kind]);
+            let resumed_before = counted("resumed");
+            let mut config = roots.config()?;
+            let mut kinds = Vec::new();
+            for _ in 0..2 {
+                let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut tls = super::super::tls::TlsStream::connect(super::super::io::RtFuturesIo::new(tcp), config, super::super::tls::server_name("kiln.test")?).await?;
+                kinds.push(tls.handshake());
+                // An answer read: the tickets, sent before it, are filed in the client's configuration.
+                tls.write_all(b"GET /x HTTP/1.1\r\nHost: kiln.test\r\nConnection: close\r\n\r\n").await?;
+                tls.flush().await?;
+                let mut said = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !String::from_utf8_lossy(&said).contains("secure=true") {
+                    let n = tls.read_some(&mut buf).await?;
+                    anyhow::ensure!(n > 0, "no answer: {}", String::from_utf8_lossy(&said));
+                    said.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                config = tls.into_config();
+            }
+            assert_eq!(kinds, ["full", "resumed"]);
+            assert!(counted("resumed") > resumed_before, "counted on /metrics");
+            assert!(crate::metrics::render().contains("kiln_tls_handshakes_total{door=\"server\",kind=\"resumed\"}"));
             Ok(())
         })
     }

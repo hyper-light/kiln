@@ -26,8 +26,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use flate2::Compression;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
@@ -366,6 +367,38 @@ impl Events {
         self.chunks.get(c)?.meta.get(k)
     }
 
+    /// The texts of the events in `range`, joined by `,` as an `events` frame joins them, onto `out`: a
+    /// compact chunk's inflated once for all of its events there (goal 11, plan 01a1a87b2e56 step 2), whose
+    /// texts lie joined so in its segment, from the first one's `off` to the end of the last one's. None when
+    /// the range isn't all there, or a compact chunk's segment can't be read.
+    pub fn texts_into(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) -> Option<()> {
+        let mut i = range.start;
+        while i < range.end {
+            let (c, k) = self.place(i)?;
+            let chunk = self.chunks.get(c)?;
+            let n = chunk.len().checked_sub(k)?.min(range.end - i);
+            if n == 0 {
+                return None;
+            }
+            if i > range.start {
+                out.push(b',');
+            }
+            if chunk.is_compact() {
+                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
+                out.extend_from_slice(chunk.joined().ok()?.get(first.off..last.off + last.len)?);
+            } else {
+                for (j, e) in chunk.evs.get(k..k + n)?.iter().enumerate() {
+                    if j > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(e.entry.text().as_bytes());
+                }
+            }
+            i += n;
+        }
+        Some(())
+    }
+
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
         self.len.checked_sub(1).and_then(|i| self.get(i))
     }
@@ -547,6 +580,10 @@ fn seal(chunk: Arc<Chunk>, home: Option<Home>) {
 /// A session's copy as its owner last published it, whole and immutable: what every reader takes.
 pub struct View {
     pub info: Arc<Info>,
+    /// Its info as the API answers with it (`GET /api/harness/sessions` and `.../{id}`): encoded by
+    /// its owner once per change of it, shared by every view until the next, so no read encodes it
+    /// (goal 10, plan 01a1a87b2dae step 2).
+    pub info_json: Bytes,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
     pub state: Arc<Value>,
@@ -566,7 +603,7 @@ impl View {
     /// Its frames are written off the runtime's threads (`super::registry::Snapshot`).
     pub fn parts(&self) -> Parts {
         Parts {
-            info: json!(*self.info),
+            info: Arc::clone(&self.info),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
             changes: self.changes.clone(),
@@ -595,6 +632,38 @@ impl View {
         let mut events: Vec<(u64, u64)> = self.events.metas().filter(|m| !m.id.is_empty()).filter_map(|m| Some((m.seq?, m.sum))).collect();
         events.sort_unstable_by_key(|(seq, _)| *seq);
         crate::wire::sums::kept(session.to_owned(), self.info.epoch, &events)
+    }
+
+    /// `{"events":[…]}` of its newest `limit` events numbered before `before` (when given), oldest
+    /// first: what the conversation store answers `GET /api/harness/sessions/{id}/events` with
+    /// (`crate::convo::store::Store::events`), made of the events' texts as each was written once,
+    /// joined, so the read neither touches the store nor encodes anything (goal 10, plan 01a1a87b2dae
+    /// step 2). None when the copy can't say all of it: it holds fewer than `limit` of them and not
+    /// its timeline from the first event (its oldest let go of, a conversation cleared, a copy that
+    /// went on from part of it), or one of them has no number or id. Fresher than the store's while
+    /// an event streams: the store keeps an event as it last came whole.
+    pub fn events_json(&self, before: Option<u64>, limit: usize) -> Option<Bytes> {
+        let end = match before {
+            Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
+            None => self.events.len(),
+        };
+        let start = end.saturating_sub(limit);
+        if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
+            return None;
+        }
+        let mut len = r#"{"events":[]}"#.len();
+        for i in start..end {
+            let m = self.events.meta(i)?;
+            if m.seq.is_none() || m.id.is_empty() {
+                return None;
+            }
+            len += m.len + 1;
+        }
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(br#"{"events":["#);
+        self.events.texts_into(start..end, &mut out)?;
+        out.extend_from_slice(b"]}");
+        Some(Bytes::from(out))
     }
 }
 
@@ -675,9 +744,16 @@ pub struct Mirror {
     pub(super) opened_at: Option<std::time::Instant>,
     /// What its readers find of it.
     slot: Arc<Slot>,
+    /// Its info's encoding ([`View::info_json`]), and the info it's of: made again when that changes.
+    info_json: (Arc<Info>, Bytes),
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
     owner: Option<async_channel::WeakSender<Msg>>,
+}
+
+/// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
+fn info_json(info: &Info) -> Bytes {
+    serde_json::to_vec(info).map_or_else(|_| Bytes::from_static(b"null"), Bytes::from)
 }
 
 /// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
@@ -691,8 +767,10 @@ impl Mirror {
     pub fn new(info: Info, location: Location, bus: Arc<dyn kiln_seams::Bus>) -> Self {
         let feed = Feed::open(bus, &info.id);
         let (info, location) = (Arc::new(info), Arc::new(location));
+        let encoded = info_json(&info);
         let view = View {
             info: Arc::clone(&info),
+            info_json: encoded.clone(),
             location: Arc::clone(&location),
             meta: null(),
             state: null(),
@@ -705,6 +783,7 @@ impl Mirror {
             closed: false,
         };
         let slot = Arc::new(Slot { id: Arc::from(info.id.as_str()), view: ArcSwap::from_pointee(view), tap: feed.tap() });
+        let encoding = (Arc::clone(&info), encoded);
         Self {
             info,
             reported: String::new(),
@@ -725,6 +804,7 @@ impl Mirror {
             started_over_pending: false,
             opened_at: None,
             slot,
+            info_json: encoding,
             owner: None,
         }
     }
@@ -736,8 +816,12 @@ impl Mirror {
 
     /// The copy as it is now, for its readers.
     pub fn view(&self) -> View {
+        let (of, encoded) = &self.info_json;
         View {
             info: Arc::clone(&self.info),
+            // Encoded as it was published ([`Mirror::publish`]), or now, should the info have changed
+            // since without a publish.
+            info_json: if Arc::ptr_eq(of, &self.info) { encoded.clone() } else { info_json(&self.info) },
             location: Arc::clone(&self.location),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
@@ -751,8 +835,12 @@ impl Mirror {
         }
     }
 
-    /// Its readers take the copy as it is now: its view swapped in whole.
-    pub fn publish(&self) {
+    /// Its readers take the copy as it is now: its view swapped in whole, its info encoded again
+    /// first if it changed.
+    pub fn publish(&mut self) {
+        if !Arc::ptr_eq(&self.info_json.0, &self.info) {
+            self.info_json = (Arc::clone(&self.info), info_json(&self.info));
+        }
         self.slot.view.store(Arc::new(self.view()));
     }
 
@@ -1301,6 +1389,8 @@ async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLo
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// What a source file's code says outside its tests, its comments left out.
@@ -1485,6 +1575,34 @@ mod tests {
         assert!(events.chunks().get(1).is_some_and(|c| c.packed().is_some()), "and still packed");
         assert_eq!(events.get(0).and_then(|e| e.entry.seq()), Some(u64::try_from(CHUNK + 6).unwrap_or(0)));
         assert_eq!(events.len(), CHUNK * 3 - 3);
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 2: a copy whose sealed chunks are kept compact (their metas and
+    /// segment alone) reads as it did: each event, and the events' texts joined as `View::events_json`
+    /// joins them, over ranges across the chunks' edges, each compact chunk's segment read once a range.
+    #[test]
+    fn g11_s2_compact_chunks_read_as_they_did() -> anyhow::Result<()> {
+        let mut events = Events::default();
+        let n = CHUNK * 3 + 7;
+        for s in 1..=u64::try_from(n)? {
+            let _ = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
+        }
+        let texts: Vec<String> = events.iter().map(|e| e.entry.text().to_owned()).collect();
+        for c in events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        events.compact(None);
+        assert_eq!(events.chunks().iter().filter(|c| c.is_compact()).count(), 3, "every sealed chunk, not the newest");
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(events.get(i).map(|e| e.entry.text().to_owned()).as_deref(), Some(t.as_str()), "event {i}");
+        }
+        for (start, end) in [(0, n), (0, 1), (CHUNK - 2, CHUNK + 3), (CHUNK, 2 * CHUNK), (5, 3 * CHUNK + 2), (n - 4, n), (7, 7)] {
+            let mut out = Vec::new();
+            events.texts_into(start..end, &mut out).ok_or_else(|| anyhow::anyhow!("{start}..{end} not read"))?;
+            assert_eq!(String::from_utf8(out)?, texts.get(start..end).unwrap_or_default().join(","), "{start}..{end}");
+        }
+        assert!(events.texts_into(n - 1..n + 1, &mut Vec::new()).is_none(), "past its end");
         Ok(())
     }
 

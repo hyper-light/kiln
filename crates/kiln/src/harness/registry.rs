@@ -398,7 +398,9 @@ pub(super) fn null() -> Arc<Value> {
 /// A snapshot of a copy, or what a viewer lacks of it since a revision, not yet made into frames
 /// (`super::copies::View::parts`, `View::parts_since`): references to what an immutable view holds.
 pub struct Parts {
-    pub(super) info: Value,
+    /// Its info, made into the head's JSON where the snapshot is written (off the shard that takes
+    /// it: goal 10, plan 01a1a87b2dae step 3).
+    pub(super) info: Arc<Info>,
     pub(super) meta: Arc<Value>,
     pub(super) state: Arc<Value>,
     pub(super) changes: Option<Files>,
@@ -516,7 +518,7 @@ impl Snapshot {
         let p = &self.parts;
         match part {
             Part::Head => {
-                let (info, born) = (p.info.clone(), Some(born()));
+                let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
                 let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
             }
@@ -1653,6 +1655,38 @@ impl Registry {
         self.sessions.each(|_, view| v.push(Info::clone(&view.info)));
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         v
+    }
+
+    /// [`Registry::list`] as `GET /api/harness/sessions` answers it, in its order: each session's
+    /// info as its owner encoded it once ([`super::copies::View::info_json`]), joined into a JSON
+    /// array; nothing is encoded here (goal 10, plan 01a1a87b2dae step 2).
+    pub fn list_json(&self) -> bytes::Bytes {
+        let mut all: Vec<(Arc<Info>, bytes::Bytes)> = Vec::new();
+        self.sessions.each(|_, view| all.push((Arc::clone(&view.info), view.info_json.clone())));
+        all.sort_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        let mut out = Vec::with_capacity(all.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 2);
+        out.push(b'[');
+        for (i, (_, json)) in all.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(json);
+        }
+        out.push(b']');
+        bytes::Bytes::from(out)
+    }
+
+    /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
+    /// ([`super::copies::View::info_json`]). None when there's no such session.
+    pub fn info_json(&self, id: &str) -> Option<bytes::Bytes> {
+        self.sessions.with(id, |v| v.info_json.clone())
+    }
+
+    /// Session `id`'s newest `limit` events before number `before`, as its copy holds them
+    /// ([`super::copies::View::events_json`]). None when there's no such session or its copy can't
+    /// say all of them.
+    pub fn events_json(&self, id: &str, before: Option<u64>, limit: usize) -> Option<bytes::Bytes> {
+        self.sessions.with(id, |v| v.events_json(before, limit)).flatten()
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {

@@ -61,8 +61,8 @@ places and its run. The histograms are atomics the pools' threads write as they 
 | `kiln_compute_wait_seconds` (histogram) | How long each job waited for a thread: from its submission to its first piece. |
 | `kiln_compute_piece_seconds` (histogram) | How long each piece held its thread. A piece ends once its job has run a shard's step (250 µs) and another job waits, at the next unit of its work. |
 | `kiln_compute_longest_piece_seconds` | The longest piece yet. |
-| `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's statements), `fs` (files, `/proc`, archives, a child's wait). |
-| `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`). |
+| `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's reads, each on a read-only connection of its own), `fs` (files, `/proc`, archives, a child's wait); and `store_write`, kiln.db's writer, a thread of its own that takes every call that may write in turn (goal 5). |
+| `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`); `store_write`'s one. |
 
 ### What overload sheds (`crate::overload`)
 
@@ -152,6 +152,16 @@ second, their run and wait at p99, the places they held on average (`busy`: thei
 window's) and the places Little's law asks of their rate and p99 run (`little_p99`, as hyper-rt sizes
 a shard's tasks: `admission_limit`) (`blocking.<share>.*`).
 
+Every latency is reported to the microsecond (goal 10, plan `01a1a87b2dae`, step 1: its bar is under
+a millisecond). Beside the numbers an A/B compares, not among them, each round breaks its classes down
+(`seen` in `run.json`): each API read by its route (`api_read.sessions`, `.session`, `.events`,
+`.agents`, `.me`, `.overview`, `.runs`, `.plans`, `.goals`), each API write by its kind
+(`api_write.command`, the MCP calls'), pages and their files apart, and the frames by how they met
+the attaches, as each viewer saw them: `websocket.own_attach`, published before the viewer's own
+snapshot came, which they wait for by protocol; `websocket.while_another_attaches`, published while
+another viewer of the same session attached, which shouldn't wait for that; and `websocket.live`, the
+rest.
+
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
 conversation written at once and sent by each runner's shipper to the server's intake, a batch of up to
@@ -195,6 +205,18 @@ kiln-lab ab --a kiln --b kiln --label-a fs-8 --label-b fs-26 --env-a KILN_RT_BLO
 kiln-lab compare first/run.json second/run.json
 kiln-lab report run/run.json
 kiln-lab table calm=calm/run.json "16 hogs=hogs/run.json"
+```
+
+On Linux, `--server-cpus <list>` starts the server and its hogs on those CPUs (`taskset`) and keeps
+the CPUs the lab was started on to its clients, runners and stand-ins, so the lab times the server, not
+itself; `Nx` hogs then count the server's CPUs. `--layout production` (with systemd's user manager)
+starts the server in a scope of its own at `CPUWeight=1000` and the hogs in one at `CPUWeight=1`, as
+kiln.slice and CI legs and agents run on bare metal (docs/priority.md); `shared`, the default, keeps
+everything in the lab's own cgroup. The two together are production's layout:
+
+```sh
+# the lab's clients on CPUs 8-15; the server and as many hogs as its CPUs on 16-31, at production's weights
+taskset -c 8-15 target/release/kiln-lab run --kiln target/release/kiln --server-cpus 16-31 --layout production --hogs 1x
 ```
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
@@ -521,6 +543,72 @@ requests at the first, Normal ones only past the tolerance, never Critical ones 
 median), and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by
 class in both.
 
+## Goal 5: no lock on the hot path
+
+Goal 5 of the API runtime program (plan `01a1a59c2aae`, research `01a1a59c2aaf77dfa0fe35f461a3d75f`):
+no request, websocket or runner path takes a lock two shards share, since a shard the OS preempts while
+it holds one stalls every shard that needs it (research f2), and spinning before parking doesn't change
+that (f5, f6).
+
+### Counting the locks the lab's load takes
+
+`scripts/locks.py` counts them. `census-tree` copies the tree and routes kiln's, kiln-http's and Quiver's
+`parking_lot` and `std` locks through `scripts/locks/census.rs`, whose wrappers count each acquisition at
+its call site (`#[track_caller]`), whether it found the lock held and how long it then waited, and the
+first few addresses of the locks taken there; it counts the store's calls at their callers too
+(`store_call`), with how long each took. Built in release, that kiln says it all on `/metrics`
+(`kiln_lock_*`), which kiln-lab keeps for each round's window and fill (`Round::locks`, apart from the
+numbers an A/B compares), and `rank` ranks the locks (the sites that took one lock, by its address,
+together) by how often the window took each:
+
+```sh
+python3 scripts/locks.py census-tree --to ~/.cache/census --ui ui/dist
+(cd ~/.cache/census && CARGO_PROFILE_RELEASE_LTO=off cargo build --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab)
+taskset -c 16-31 ~/.cache/census/target/release/kiln-lab run --kiln ~/.cache/census/target/release/kiln --label census --rounds 3 --out census
+python3 scripts/locks.py rank census/run.json
+```
+
+### What each became
+
+- **The store** (`crate::store`). Its one connection behind a lock took every statement in turn: the
+  lab's API reads waited 82 ms at p99 there, its writes 441 ms (goal 3, above). Now what may write goes
+  as a message to the one connection that writes, owned by a thread of its own (`kiln-store`), which
+  runs the calls in turn (SQLite takes one writer at a time); and what only reads (`Store::read`) takes a
+  read-only connection of its own on the blocking pool's `store` share, from a lock-free queue of those
+  not in use, in one read transaction, so reads run side by side, with each other and with the writer
+  (WAL), and see every write committed before them. The API's reads on the lab's paths (the runners,
+  the overview, runs, plans, goals, sign-in and access checks) and the store's own read methods read so.
+  The share's places are goal 3's Little's-law measure of the store's calls (24); the writer's waits and
+  runs are `kiln_blocking_*{share="store_write"}`.
+- **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
+  readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
+  compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and
+  samples, the terminals' outputs, the AI sessions each machine reported, the refusals of what the wires
+  couldn't read, the pods it launches and the tokens they enroll with, paused jobs, cancels, declines,
+  lost processes, tool fixes and repositories asked to be polled; the metrics' labelled families (their
+  series' values atomics); the UI's compressed files; Ship's model (its repositories' rows shared between
+  copies); the logs' live jobs.
+- **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
+  cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
+- **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
+  every change and question as a message, in order; a sync path's command (`Hub::command_soon`) is queued
+  in its turn and its answer comes on its one wait.
+
+### Keeping them out
+
+`python3 scripts/locks.py check` fails when a Mutex, RwLock or Condvar appears in the modules
+`scripts/locks/hot.toml` names (the HTTP server and the API, sign-in, the hub, the runners' link and
+processes, the websockets' feeds, the bus, the logs, Ship, the store) outside a test build's code, but
+those the file lists, each with why it's off the hot path, or (`todo`) what replaces it. Both CIs run it
+(`.kiln/ci.yaml`'s `locks` job, `.github/workflows/ci.yml`'s), with `scripts/test_locks.py`, which plants
+a lock in a copy of the hub and holds the check to failing on it.
+
+Still on the hot path, listed so (`todo`): the hub's runners (`agents`) and runner processes
+(`instances`), which `harness/registry.rs` takes too, next now that goal 4's rewrite of it is on main;
+reach's relay (`reach`), each relayed frame's in the hub's loop; and a live job's files (`logs.rs`'s
+`files`), one per job, its writers' alone. Inside Quiver (vendored, the bus's node): its topics' map and
+each topic's tail, for Quiver's own change.
+
 ## Goal 7: placement
 
 Goal 7 of the API runtime program (plan `01a1a59c2aea73e487fb6fcfe90c5fcc`, research
@@ -708,7 +796,6 @@ What it says:
 - **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
   queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
   shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.
-
 
 ## What the lab doesn't do yet
 
