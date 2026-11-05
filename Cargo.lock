@@ -1836,6 +1836,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "crossbeam-deque",
+ "crossbeam-utils",
  "hyper-measure",
  "libc",
  "loom",
@@ -2233,6 +2234,7 @@ name = "kiln"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-broadcast",
  "async-channel",
@@ -2244,6 +2246,8 @@ dependencies = [
  "bytes",
  "clap",
  "command-group",
+ "concurrent-queue",
+ "crc32fast",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",

@@ -8,6 +8,7 @@
 //! ```text
 //! kiln-lab run --kiln target/release/kiln --rounds 8 [--hogs 1x] [--out DIR]
 //! kiln-lab ab --a main/kiln --b branch/kiln --rounds 8 [--hogs 2x]
+//! kiln-lab run --kiln kiln --server-cpus 16-31 --layout production --hogs 1x   # the lab on its own CPUs
 //! kiln-lab compare first/run.json second/run.json
 //! kiln-lab report DIR/run.json
 //! kiln-lab browser probe|profiles|check-profiles   (the browser lab: docs/browser-lab.md)
@@ -43,11 +44,22 @@ struct Common {
     /// Rounds for each build: each a fresh kiln, filled, then measured.
     #[arg(long, default_value_t = 8)]
     rounds: usize,
-    /// CPU hogs beside the server: a count, or a multiple of the lab's CPUs (`1x`, `2x`).
+    /// CPU hogs beside the server: a count, or a multiple of the lab's CPUs (`1x`, `2x`), or of the
+    /// server's (`--server-cpus`).
     #[arg(long, default_value = "0")]
     hogs: String,
-    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time) or `small` (to try
-    /// the lab out).
+    /// The CPUs the server and the hogs run on (Linux, `taskset`'s list: `16-31`), so the lab's clients,
+    /// runners and stand-ins keep the CPUs the lab was started on to themselves and it times the
+    /// server, not itself (goal 10, plan 01a1a87b2dae step 1). Everything on the lab's CPUs otherwise.
+    #[arg(long)]
+    server_cpus: Option<String>,
+    /// `shared`: the hogs beside everything in the lab's own cgroup; `production`: the server in a
+    /// scope of its own at `CPUWeight=1000` and the hogs in one at `CPUWeight=1`, as kiln.slice and
+    /// CI legs and agents run on bare metal (docs/priority.md; Linux with systemd's user manager).
+    #[arg(long, default_value = "shared")]
+    layout: String,
+    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `many` (all of
+    /// production's live sessions at work at once) or `small` (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -111,9 +123,12 @@ enum Cmd {
         /// `label=path/run.json`, or a path (labelled by its folder).
         runs: Vec<String>,
     },
-    /// A CPU hog (the lab starts these itself).
+    /// A CPU hog (the lab starts these itself): `threads` threads, each spinning.
     #[command(hide = true)]
-    Hog,
+    Hog {
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+    },
     /// The browser lab: real browsers over emulated links (docs/browser-lab.md).
     #[command(subcommand)]
     Browser(browser::Cmd),
@@ -136,8 +151,8 @@ fn utc(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-fn hogs(spec: &str) -> anyhow::Result<usize> {
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+/// Hogs `spec` asks for: a count, or a multiple of `cpus`.
+fn hogs(spec: &str, cpus: usize) -> anyhow::Result<usize> {
     match spec.strip_suffix('x') {
         Some(k) => Ok(cpus.saturating_mul(k.parse::<usize>()?)),
         None => Ok(spec.parse()?),
@@ -166,14 +181,26 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
         "small" => Profile::small(),
         "realistic" => Profile::realistic(),
         "overload" => Profile::overload(),
-        p => anyhow::bail!("no profile {p}: realistic, overload or small"),
+        "many" => Profile::many(),
+        p => anyhow::bail!("no profile {p}: realistic, overload, many or small"),
     };
     if let Some(w) = c.window {
         profile.window_s = w;
     }
-    let hogs = hogs(&c.hogs)?;
+    let place = lab::Place::of(c.server_cpus.as_deref(), &c.layout)?;
+    let cpus = place.cpus.as_deref().map_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get), |list| lab::cpus_in(list).len().max(1));
+    let hogs = hogs(&c.hogs, cpus)?;
     let bin = lab::stand_in(&out)?;
-    let mut run = Run { command: std::env::args().collect::<Vec<_>>().join(" "), started: utc(started_secs), profile: profile.clone(), hogs, rounds: Vec::new(), failures: Vec::new() };
+    let mut run = Run {
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        started: utc(started_secs),
+        profile: profile.clone(),
+        hogs,
+        layout: place.layout.clone(),
+        server_cpus: place.cpus.clone(),
+        rounds: Vec::new(),
+        failures: Vec::new(),
+    };
     let mut index = 0;
     for i in 0..c.rounds {
         let order: Vec<&Build> = if i % 2 == 0 { builds.iter().collect() } else { builds.iter().rev().collect() };
@@ -181,7 +208,7 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
             index += 1;
             let dir = out.join("rounds").join(format!("{index:03}-{}", b.label));
             eprintln!("kiln-lab: round {index} ({}) in {}", b.label, dir.display());
-            match lab::round(b, &profile, hogs, &dir, &bin, index) {
+            match lab::round(b, &profile, hogs, &place, &dir, &bin, index) {
                 Ok(r) => {
                     eprintln!("kiln-lab: round {index} done: {}", summary_line(&r));
                     run.rounds.push(r);
@@ -205,11 +232,14 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
 }
 
 fn summary_line(r: &lab::Round) -> String {
-    let get = |k: &str| r.numbers.get(k).map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"));
+    // Latencies to the microsecond (goal 10, plan 01a1a87b2dae step 1).
+    let get = |k: &str| r.numbers.get(k).map_or_else(|| "-".to_owned(), |v| format!("{v:.3}"));
     format!(
-        "api_read p99 {} ms, websocket p99 {} ms, attach p99 {} ms, shards' delay p99 {} ms, server CPU {} ms a request",
-        get("api_read.p99_ms"),
-        get("websocket.p99_ms"),
+        "api_read p50 {} p99.9 {} ms, websocket p50 {} p99.9 {} ms, attach p99 {} ms, shards' delay p99 {} ms, server CPU {} ms a request",
+        get("api_read.p50_ms"),
+        get("api_read.p999_ms"),
+        get("websocket.p50_ms"),
+        get("websocket.p999_ms"),
         get("attach.p99_ms"),
         get("shards.delay_p99_ms"),
         get("server.cpu_ms_per_request")
@@ -258,7 +288,7 @@ fn main() -> anyhow::Result<()> {
             }
             print!("{}", report::table(&loaded));
         }
-        Cmd::Hog => lab::hog(),
+        Cmd::Hog { threads } => lab::hog(threads),
         Cmd::Browser(b) => browser::run(b)?,
     }
     Ok(())

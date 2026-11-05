@@ -1882,7 +1882,7 @@ mod tests {
         let hub = crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             hub.agents.lock().insert("box".into(), crate::hub::tests::live_runner("box", "linux", "x86_64"));
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             Ok(hub)
         })?;
         let dir = tempfile::tempdir()?;

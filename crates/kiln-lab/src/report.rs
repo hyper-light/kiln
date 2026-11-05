@@ -21,10 +21,20 @@ pub struct Run {
     pub started: String,
     pub profile: Profile,
     pub hogs: usize,
+    /// Where the server and its hogs ran (`--layout`, `--server-cpus`; goal 10, plan 01a1a87b2dae
+    /// step 1): `shared` and the lab's CPUs where a run doesn't say.
+    #[serde(default = "shared")]
+    pub layout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cpus: Option<String>,
     pub rounds: Vec<Round>,
     /// Rounds that didn't finish, and why.
     #[serde(default)]
     pub failures: Vec<String>,
+}
+
+fn shared() -> String {
+    "shared".to_owned()
 }
 
 impl Run {
@@ -53,6 +63,27 @@ impl Run {
     /// Each number of `build`'s, its median and noise.
     pub fn summary(&self, build: &str) -> BTreeMap<String, Summary> {
         self.numbers(build).into_iter().filter_map(|(k, v)| Some((k.clone(), stats::summarize(&v, LEVEL, stats::seed_of(&k))?))).collect()
+    }
+
+    /// What `build`'s rounds saw finer than its classes (each API read's route, the frames against the
+    /// attaches: `measure::seen_by_what`, `lab::frames_against_attaches`): for each, the samples in all
+    /// its rounds, and the median of the rounds' p50, p99, p99.9 and most.
+    pub fn detail(&self, build: &str) -> Vec<(String, u64, [Option<f64>; 4])> {
+        let mut by: BTreeMap<String, Vec<&crate::measure::Seen>> = BTreeMap::new();
+        for r in self.rounds.iter().filter(|r| r.build == build) {
+            for (k, s) in r.seen.iter().filter(|(k, _)| k.contains('.')) {
+                by.entry(k.clone()).or_default().push(s);
+            }
+        }
+        by.into_iter()
+            .map(|(k, all)| {
+                let med = |f: fn(&crate::measure::Seen) -> Option<f64>| {
+                    let v: Vec<f64> = all.iter().filter_map(|s| f(s)).collect();
+                    stats::summarize(&v, LEVEL, 0).map(|s| s.median)
+                };
+                (k, all.iter().map(|s| s.n).sum(), [med(|s| s.p50_ms), med(|s| s.p99_ms), med(|s| s.p999_ms), med(|s| s.max_ms)])
+            })
+            .collect()
     }
 }
 
@@ -100,6 +131,12 @@ impl Comparison {
     }
 }
 
+/// A number as a report shows it: a latency (`_ms`) to the microsecond (goal 10, plan 01a1a87b2dae
+/// step 1), anything else to about three figures.
+fn show(name: &str, v: f64) -> String {
+    if name.ends_with("_ms") { format!("{v:.3}") } else { fmt(v) }
+}
+
 fn fmt(v: f64) -> String {
     let a = v.abs();
     if a >= 100.0 {
@@ -128,7 +165,8 @@ pub fn markdown(run: &Run) -> String {
     let _ = writeln!(o, "`{}`\n", run.command);
     if let Some(r) = run.rounds.first() {
         let m = &r.machine;
-        let _ = writeln!(o, "Machine: {} ({}), {} CPUs for the lab, {} CPU hogs beside the server, {} shards.\n", m.host, m.os, m.cpus, run.hogs, r.shards);
+        let server = run.server_cpus.as_deref().map_or_else(|| "the server on the lab's CPUs".to_owned(), |c| format!("the server on CPUs {c} of its own"));
+        let _ = writeln!(o, "Machine: {} ({}), {} CPUs for the lab, {server}, {} CPU hogs beside it ({} layout), {} shards.\n", m.host, m.os, m.cpus, run.hogs, run.layout, r.shards);
     }
     let _ = writeln!(o, "Profile: {}\n", serde_json::to_string(&run.profile).unwrap_or_default());
     for build in run.builds() {
@@ -139,7 +177,16 @@ pub fn markdown(run: &Run) -> String {
         let mut s: Vec<(String, Summary)> = run.summary(&build).into_iter().collect();
         s.sort_by_key(|(k, _)| order(k));
         for (k, v) in s {
-            let _ = writeln!(o, "| {k} | {} | {} to {} |", fmt(v.median), fmt(v.lo), fmt(v.hi));
+            let _ = writeln!(o, "| {k} | {} | {} to {} |", show(&k, v.median), show(&k, v.lo), show(&k, v.hi));
+        }
+        let detail = run.detail(&build);
+        if !detail.is_empty() {
+            let _ = writeln!(o, "\nFiner than the classes (not compared): each API read's route, each API write's kind, and the frames against the attaches (`websocket.own_attach`: published before the viewer's own snapshot came; `websocket.while_another_attaches`: while another viewer of the session attached). Samples in all rounds, then the median of the rounds' figures, in ms:\n");
+            let _ = writeln!(o, "| what | samples | p50 | p99 | p99.9 | most |\n| --- | --- | --- | --- | --- | --- |");
+            for (k, n, q) in detail {
+                let cell = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.3}"));
+                let _ = writeln!(o, "| {k} | {n} | {} | {} | {} | {} |", cell(q[0]), cell(q[1]), cell(q[2]), cell(q[3]));
+            }
         }
         let _ = writeln!(o, "\nRounds (machine load before and after each window):\n");
         for r in run.rounds.iter().filter(|r| r.build == build) {
@@ -187,7 +234,7 @@ pub fn table(runs: &[(String, Run)]) -> String {
     let _ = writeln!(o, "| number | {} |", runs.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" | "));
     let _ = writeln!(o, "| --- |{}", " --- |".repeat(runs.len()));
     for k in names {
-        let cells: Vec<String> = summaries.iter().map(|s| s.get(&k).map_or_else(|| "-".to_owned(), |v| format!("{} ({} to {})", fmt(v.median), fmt(v.lo), fmt(v.hi)))).collect();
+        let cells: Vec<String> = summaries.iter().map(|s| s.get(&k).map_or_else(|| "-".to_owned(), |v| format!("{} ({} to {})", show(&k, v.median), show(&k, v.lo), show(&k, v.hi)))).collect();
         let _ = writeln!(o, "| {k} | {} |", cells.join(" | "));
     }
     o
@@ -205,8 +252,10 @@ pub fn machine_line<'a>(rounds: impl Iterator<Item = &'a Round>) -> String {
     let load = med(&|r| r.machine.load_before.map(|[one, _, _]| one));
     let psi = med(&|r| r.machine.cpu_pressure_before);
     let mhz = med(&|r| r.machine.mhz_before);
-    let show = |v: Option<f64>, unit: &str| v.map_or_else(|| "?".to_owned(), |v| format!("{}{unit}", fmt(v)));
-    format!("{} rounds; load {} before each window, CPU pressure {}, the lab's CPUs at {}", rounds.len(), show(load, ""), show(psi, "%"), show(mhz, " MHz"))
+    let server_mhz = med(&|r| r.machine.server_mhz_before);
+    let say = |v: Option<f64>, unit: &str| v.map_or_else(|| "?".to_owned(), |v| format!("{}{unit}", fmt(v)));
+    let server = server_mhz.map_or_else(String::new, |v| format!(", the server's at {}", say(Some(v), " MHz")));
+    format!("{} rounds; load {} before each window, CPU pressure {}, the lab's CPUs at {}{server}", rounds.len(), say(load, ""), say(psi, "%"), say(mhz, " MHz"))
 }
 
 /// A comparison, in Markdown.
@@ -236,14 +285,14 @@ pub fn comparison_markdown(c: &Comparison) -> String {
     let mut rows: Vec<(&String, &Diff)> = c.diffs.iter().collect();
     rows.sort_by_key(|(k, _)| order(k));
     for (k, d) in rows {
-        let rel = d.rel.map_or_else(|| fmt(d.delta), |r| format!("{:+.1}%", r * 100.0));
-        let noise = d.noise.map_or_else(|| format!("{} to {}", fmt(d.lo), fmt(d.hi)), |n| format!("±{:.1}%", n * 100.0));
+        let rel = d.rel.map_or_else(|| show(k, d.delta), |r| format!("{:+.1}%", r * 100.0));
+        let noise = d.noise.map_or_else(|| format!("{} to {}", show(k, d.lo), show(k, d.hi)), |n| format!("±{:.1}%", n * 100.0));
         let verdict = match d.verdict {
             Verdict::Same => "same",
             Verdict::Better => "**better**",
             Verdict::Worse => "**worse**",
         };
-        let _ = writeln!(o, "| {k} | {} | {} | {rel} | {noise} | {verdict} |", fmt(d.a), fmt(d.b));
+        let _ = writeln!(o, "| {k} | {} | {} | {rel} | {noise} | {verdict} |", show(k, d.a), show(k, d.b));
     }
     let _ = writeln!(o);
     o

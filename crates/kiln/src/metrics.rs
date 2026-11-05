@@ -1,14 +1,17 @@
 //! Prometheus metrics with no allocation on the hot path: atomics for counters and gauges, fixed
 //! bucket histograms, and labelled families keyed by a small string set. Host statistics are read
-//! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero.
+//! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero. No lock: a
+//! labelled family's series are an immutable copy swapped in whole as a series is added (`crate::rcu`),
+//! each series' value an atomic (goal 5 of the API runtime program, plan 01a1a59c2aae).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+use crate::rcu::Rcu;
 
 #[derive(Default)]
 pub struct Counter(AtomicU64);
@@ -125,20 +128,20 @@ impl Histogram {
 /// Each runner's machine id and the name people see, by the name kiln knows it by
 /// (docs/machines.md): every series of a machine carries both, `machine_id` and `machine_name`, so
 /// metrics group by either.
-fn machines() -> &'static RwLock<std::collections::HashMap<String, (String, String)>> {
-    static M: OnceLock<RwLock<std::collections::HashMap<String, (String, String)>>> = OnceLock::new();
+fn machines() -> &'static Rcu<std::collections::HashMap<String, (String, String)>> {
+    static M: OnceLock<Rcu<std::collections::HashMap<String, (String, String)>>> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
 /// Runner `key` is machine `machine_id` (empty when kiln doesn't know it), shown as `name`.
 pub fn set_machine(key: &str, machine_id: &str, name: &str) {
-    machines().write().insert(key.to_owned(), (machine_id.to_owned(), name.to_owned()));
+    machines().update(|m| m.insert(key.to_owned(), (machine_id.to_owned(), name.to_owned())));
 }
 
 /// The labels of runner `key`'s machine, to follow a series' own: its id (empty when kiln doesn't
 /// know it) and the name people see (`key`, when it has no other).
 fn machine_labels(key: &str) -> String {
-    let g = machines().read();
+    let g = machines().load();
     let (id, name) = g.get(key).map_or(("", key), |(i, n)| (i.as_str(), n.as_str()));
     format!(",machine_id=\"{}\",machine_name=\"{}\"", escape(id), escape(name))
 }
@@ -158,18 +161,18 @@ pub struct CounterVec {
     keys: &'static [&'static str],
     /// Which label is a runner's name ([`machine_labels`]).
     machine: Option<usize>,
-    series: RwLock<BTreeMap<Vec<String>, u64>>,
+    series: Rcu<BTreeMap<Vec<String>, Arc<AtomicU64>>>,
 }
 
 impl CounterVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: Rcu::default() }
     }
 
     /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
     /// id and name too.
     pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
-        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: Some(at), series: Rcu::default() }
     }
 
     pub fn inc(&self, values: &[&str]) {
@@ -178,23 +181,23 @@ impl CounterVec {
 
     pub fn add(&self, values: &[&str], n: u64) {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        *self.series.write().entry(key).or_insert(0) += n;
+        series_of(&self.series, key).fetch_add(n, Ordering::Relaxed);
     }
 
     /// One series' count (0 before it's counted).
     pub fn get(&self, values: &[&str]) -> u64 {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        self.series.read().get(&key).copied().unwrap_or(0)
+        self.series.load().get(&key).map_or(0, |n| n.load(Ordering::Relaxed))
     }
 
     /// Every series counted so far: its label values and its count.
     pub fn series(&self) -> Vec<(Vec<String>, u64)> {
-        self.series.read().iter().map(|(k, n)| (k.clone(), *n)).collect()
+        self.series.load().iter().map(|(k, n)| (k.clone(), n.load(Ordering::Relaxed))).collect()
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, n) in self.series.read().iter() {
-            let _ = writeln!(out, "{name}{{{}}} {n}", labels_with_machine(self.keys, vals, self.machine));
+        for (vals, n) in self.series.load().iter() {
+            let _ = writeln!(out, "{name}{{{}}} {}", labels_with_machine(self.keys, vals, self.machine), n.load(Ordering::Relaxed));
         }
     }
 }
@@ -205,36 +208,38 @@ pub struct GaugeVec {
     keys: &'static [&'static str],
     /// Which label is a runner's name ([`machine_labels`]).
     machine: Option<usize>,
-    series: RwLock<BTreeMap<Vec<String>, i64>>,
+    series: Rcu<BTreeMap<Vec<String>, i64>>,
 }
 
 impl GaugeVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: Rcu::default() }
     }
 
     /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
     /// id and name too.
     pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
-        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: Some(at), series: Rcu::default() }
     }
 
     /// Every series, as just measured: label values (in `keys` order) and value.
     pub fn replace(&self, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
-        *self.series.write() = series.into_iter().collect();
+        self.series.set(series.into_iter().collect());
     }
 
     /// The series of one publisher, as just measured: those whose first label is one of `owned`
     /// (what it published before, and now) replaced, another publisher's kept (several sync
     /// servers in one process, as tests have them).
     pub fn replace_owned(&self, owned: &BTreeSet<String>, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
-        let mut g = self.series.write();
-        g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
-        g.extend(series);
+        let series: Vec<(Vec<String>, i64)> = series.into_iter().collect();
+        self.series.update(|g| {
+            g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
+            g.extend(series.iter().cloned());
+        });
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, v) in self.series.read().iter() {
+        for (vals, v) in self.series.load().iter() {
             let _ = writeln!(out, "{name}{{{}}} {v}", labels_with_machine(self.keys, vals, self.machine));
         }
     }
@@ -244,28 +249,34 @@ impl GaugeVec {
 pub struct HistogramVec {
     keys: &'static [&'static str],
     bounds: &'static [f64],
-    series: RwLock<BTreeMap<Vec<String>, Histogram>>,
+    series: Rcu<BTreeMap<Vec<String>, Arc<Histogram>>>,
 }
 
 impl HistogramVec {
     pub fn new(keys: &'static [&'static str], bounds: &'static [f64]) -> Self {
-        Self { keys, bounds, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, bounds, series: Rcu::default() }
     }
 
     pub fn observe(&self, values: &[&str], secs: f64) {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        if let Some(h) = self.series.read().get(&key) {
-            h.observe(secs);
-            return;
-        }
-        self.series.write().entry(key).or_insert_with(|| Histogram::new(self.bounds)).observe(secs);
+        let found = self.series.load().get(&key).cloned();
+        let h = found.unwrap_or_else(|| self.series.update(|m| Arc::clone(m.entry(key.clone()).or_insert_with(|| Arc::new(Histogram::new(self.bounds))))));
+        h.observe(secs);
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, h) in self.series.read().iter() {
+        for (vals, h) in self.series.load().iter() {
             h.render(out, name, &labels(self.keys, vals));
         }
     }
+}
+
+/// Series `key` of a family whose values are atomics: the one there, else one made, swapped in with it.
+fn series_of<V: Default>(series: &Rcu<BTreeMap<Vec<String>, Arc<V>>>, key: Vec<String>) -> Arc<V> {
+    if let Some(v) = series.load().get(&key) {
+        return Arc::clone(v);
+    }
+    series.update(|m| Arc::clone(m.entry(key.clone()).or_default()))
 }
 
 fn escape(v: &str) -> String {
@@ -635,7 +646,7 @@ fn render_agents(m: &AgentMetrics, o: &mut String) {
 /// the server's runner pages.
 pub struct NetMetrics {
     pub frames_dropped: CounterVec,
-    toward: RwLock<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+    toward: Rcu<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
 }
 
 impl NetMetrics {
@@ -646,7 +657,7 @@ impl NetMetrics {
         }
         let lane = crate::proto::lane_name(lane);
         self.frames_dropped.add(&[lane, reason], n);
-        *self.toward.write().entry(peer).or_default().entry((lane, reason)).or_insert(0) += n;
+        self.toward.update(|t| *t.entry(peer).or_default().entry((lane, reason)).or_insert(0) += n);
     }
 
     /// What this process dropped, by lane and reason.
@@ -664,7 +675,7 @@ impl NetMetrics {
     /// What this process dropped of what it had for `peer`, by lane and reason.
     pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
         self.toward
-            .read()
+            .load()
             .get(&peer)
             .map(|m| m.iter().map(|((lane, reason), n)| crate::proto::NetDrop { lane: (*lane).to_owned(), reason: (*reason).to_owned(), frames: *n }).collect())
             .unwrap_or_default()
@@ -708,9 +719,50 @@ fn render_wire(o: &mut String) {
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
 }
 
+/// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan
+/// 01a1a832ebbf7327a203df446e16ecac), by `door` (`server`: the server's own listeners with
+/// `server.https`; `front_door`: a runner's HTTPS) and `kind` (`full`, `full_hello_retry`,
+/// `resumed`): every series there from the start.
+pub struct TlsMetrics {
+    pub handshakes: CounterVec,
+}
+
+/// The doors [`TlsMetrics`] counts.
+pub const TLS_DOORS: [&str; 2] = ["server", "front_door"];
+/// The kinds of handshake it counts (`crate::http::tls::Stream::handshake`).
+pub const TLS_HANDSHAKES: [&str; 3] = ["full", "full_hello_retry", "resumed"];
+
+impl TlsMetrics {
+    /// One handshake completed on `door`, of `kind`.
+    pub fn handshake(&self, door: &'static str, kind: &'static str) {
+        self.handshakes.inc(&[door, kind]);
+    }
+}
+
+pub fn tls() -> &'static TlsMetrics {
+    static M: OnceLock<TlsMetrics> = OnceLock::new();
+    M.get_or_init(|| {
+        let handshakes = CounterVec::new(&["door", "kind"]);
+        for door in TLS_DOORS {
+            for kind in TLS_HANDSHAKES {
+                handshakes.add(&[door, kind], 0);
+            }
+        }
+        TlsMetrics { handshakes }
+    })
+}
+
+fn render_tls(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_tls_handshakes_total TLS handshakes completed on kiln's browser-facing listeners, by door (server, front_door) and kind (full, full_hello_retry, resumed).\n# TYPE kiln_tls_handshakes_total counter"
+    );
+    tls().handshakes.render(o, "kiln_tls_handshakes_total");
+}
+
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default() })
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
@@ -1060,10 +1112,10 @@ pub struct HostSample {
     pub procs: u32,
 }
 
-pub static AGENT_SAMPLES: OnceLock<RwLock<BTreeMap<String, HostSample>>> = OnceLock::new();
+pub static AGENT_SAMPLES: OnceLock<Rcu<BTreeMap<String, HostSample>>> = OnceLock::new();
 
-pub fn agent_samples() -> &'static RwLock<BTreeMap<String, HostSample>> {
-    AGENT_SAMPLES.get_or_init(|| RwLock::new(BTreeMap::new()))
+pub fn agent_samples() -> &'static Rcu<BTreeMap<String, HostSample>> {
+    AGENT_SAMPLES.get_or_init(Rcu::default)
 }
 
 /// The conversation stores' metrics (`crate::convo::board`): name, type and help of each, in the
@@ -1086,10 +1138,10 @@ const CONVO: [(&str, &str, &str); 13] = [
 
 /// Each store's labels (`store`, `role`, `machine`) and its [`CONVO`] values (None: not known).
 type ConvoRow = ([String; 3], [Option<i64>; 13]);
-static CONVO_ROWS: OnceLock<RwLock<Vec<ConvoRow>>> = OnceLock::new();
+static CONVO_ROWS: OnceLock<Rcu<Vec<ConvoRow>>> = OnceLock::new();
 
-fn convo_rows() -> &'static RwLock<Vec<ConvoRow>> {
-    CONVO_ROWS.get_or_init(|| RwLock::new(Vec::new()))
+fn convo_rows() -> &'static Rcu<Vec<ConvoRow>> {
+    CONVO_ROWS.get_or_init(Rcu::default)
 }
 
 /// The conversation stores as the board just sampled them.
@@ -1132,7 +1184,7 @@ pub fn set_convo(status: &crate::convo::board::Status) {
             )
         })
         .collect();
-    *convo_rows().write() = rows;
+    convo_rows().set(rows);
 }
 
 pub fn render() -> String {
@@ -1203,12 +1255,14 @@ pub fn render() -> String {
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
+    render_tls(&mut o);
     crate::shard_health::render(&mut o);
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
+    crate::placement::render(&mut o);
 
-    let samples = agent_samples().read();
+    let samples = agent_samples().load();
     if !samples.is_empty() {
         for (name, kind, h) in [
             ("kiln_agent_cpu_percent", "gauge", "Agent host CPU utilisation."),
@@ -1242,7 +1296,7 @@ pub fn render() -> String {
             }
         }
     }
-    let convo = convo_rows().read();
+    let convo = convo_rows().load();
     if !convo.is_empty() {
         for (i, (name, kind, h)) in CONVO.iter().enumerate() {
             help(&mut o, name, kind, h);

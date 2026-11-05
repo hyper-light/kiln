@@ -1399,6 +1399,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The certificate names this agent (the server checks Hello against it); an approved join may
     // have given a variant of the requested name.
     let name = crate::pki::leaf_name(&leaf).unwrap_or_else(|| o.name.clone());
+    // The machine it is, said to the server as it connects (`AgentMsg::Machine`).
+    let machine = crate::rt::blocking(crate::os::machine_id).await.ok().flatten().and_then(|id| crate::join::machine_key(Some(&id)));
     if name != crate::pki::sanitize_name(&o.name) {
         tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
     }
@@ -1867,7 +1869,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_kinds_tick: u32 = 0;
     // Whether its user's login shell had said its PATH when they were last looked at.
     let mut users_path_known = false;
-    let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
+    // Its host's sample is taken on the blocking pool, never on this loop: on a Mac it reads the
+    // work dir's volume through CacheDelete (an XPC call, slow on a full disk) and, before, every
+    // process; inline it held this loop's shard for all of every interval (2026-11-04), so the
+    // server's commands went unanswered and its agent sessions read offline. One at a time.
+    let sampler = Arc::new(parking_lot::Mutex::new(crate::host::Sampler::new(Some(&o.work_dir))));
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
     let mut watchdog = Interval::new(Duration::from_secs(5));
@@ -2690,7 +2697,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
-                // Which process of this machine this is, then Hello (an older server skips the first).
+                // The machine it is (docs/machines.md, "One record a machine"), which process of it
+                // this is, then Hello (an older server skips the first two).
+                if !o.ephemeral
+                    && let Some(id) = &machine
+                    && let Ok(b) = proto::encode(&AgentMsg::Machine { id: id.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&AgentMsg::Instance(instance_hello.clone()))
                 {
@@ -4600,8 +4614,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     own.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                 }
                 if connected {
-                    let s = sampler.sample();
-                    own.msg(AgentMsg::Sample(s)).await;
+                    if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
+                        crate::rt::spawn(async move {
+                            if let Ok(s) = crate::rt::blocking(move || sampler.lock().sample()).await {
+                                said.msg(AgentMsg::Sample(s)).await;
+                            }
+                            sampling.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                     // What its QUIC layer let go below the channel, for its page: once it changed.
                     let dropped = crate::metrics::net().counts();
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
@@ -5602,7 +5623,7 @@ mod tests {
             // The copy: the session's first 150 events, as they went over the wire.
             for u in [Update::Open { info: Box::new(info.clone()), since: None }, Update::Events { events: timeline.iter().take(150).cloned().collect() }] {
                 for json in harness_frames("s", &u) {
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?);
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?).await;
                 }
             }
             let kept = hub.harness.kept_on("box");
@@ -5787,13 +5808,13 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "codex".into(), ..Default::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None }).await;
             let mut sent = SentChanges::default();
             sent.server(true);
-            let take = |frames: &[String]| -> anyhow::Result<()> {
+            let take = async |frames: &[String]| -> anyhow::Result<()> {
                 for f in frames {
                     anyhow::ensure!(f.len() <= HARNESS_FRAME, "a frame of {} bytes", f.len());
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?);
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?).await;
                 }
                 Ok(())
             };
@@ -5801,7 +5822,7 @@ mod tests {
             let mut files = long_changeset();
             let frames = sent.frames("s", &files, true);
             anyhow::ensure!(frames.len() > 1 && frames.first().is_some_and(|f| f.starts_with(r#"{"t":"changes""#)));
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the picture, whole, every diff kept");
             // The agent edits one file of 43: one small frame, that file.
             if let Some(f) = files.get_mut(20) {
@@ -5810,13 +5831,13 @@ mod tests {
             let frames = sent.frames("s", &files, false);
             let [edit] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
             anyhow::ensure!(edit.starts_with(r#"{"t":"changes_patch""#) && edit.len() < 32 << 10, "{} bytes", edit.len());
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the edit taken in place");
             // It puts one back: that file's key alone.
             let back = files.remove(5);
             let frames = sent.frames("s", &files, false);
             anyhow::ensure!(frames == vec![serde_json::to_string(&Update::ChangesPatch { set: Vec::new(), gone: vec![back.key()] })?]);
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the file put back gone");
             anyhow::ensure!(sent.frames("s", &files, false).is_empty(), "nothing changed, nothing sent");
             // The copy starts over (an Open on the stream): every file again.
