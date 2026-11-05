@@ -314,15 +314,22 @@ fn listed(site: &str, label: &str, net: &BTreeSet<&str>, http: &BTreeSet<&str>) 
     }
 }
 
+/// Whether a spawn site is the shards' probes' (`crate::shard_health`, a probe a shard).
+fn is_probe(site: &str) -> bool {
+    site.split(':').next().unwrap_or(site).replace('\\', "/").ends_with("kiln/src/shard_health.rs")
+}
+
 /// Format: the sites and labels past the quantum that step 2 didn't list, the longest first.
 const UNLISTED_ROWS: usize = 5;
 
 /// Goal 9's step 3 done-when, "the lab shows no poll past the new quantum from the listed paths" (plan 01a1a87b2cec),
 /// for a build's rounds, in Markdown: met or not in its first line, then each path step 2 listed with its longest poll
 /// in the rounds (the window's and the fill's: `kiln_shard_held_longest_seconds` is the longest since the server
-/// started), where it was, the rounds it passed the quantum in, its polls past 100 µs a second in the window and the
-/// share of their time the host held (preempted: step 4's, not the code's); then what else passed the quantum. The
-/// quantum is the least the rounds say their shards ran with (`Round::quantum_us`, or `kiln-lab report --quantum-us`).
+/// started), where it was, the rounds it passed the quantum in (and of them, those it passed the shards' probes' longest
+/// poll in too: a probe's own work is tens of microseconds, so the host held its shard that long, and may have held any
+/// poll as long), its polls past 100 µs a second in the window and the share of their time the host was found to hold
+/// (preempted: step 4's, not the code's); then what else passed the quantum. The quantum is the least the rounds say
+/// their shards ran with (`Round::quantum_us`, or `kiln-lab report --quantum-us`).
 fn listed_markdown(rounds: &[&Round]) -> String {
     /// A path's longest poll, its site and label, the rounds past the quantum, its window's polls past 100 µs a
     /// second (all rounds' added), and their time and the host's.
@@ -332,6 +339,7 @@ fn listed_markdown(rounds: &[&Round]) -> String {
         longest_ms: f64,
         at: (String, String),
         past: usize,
+        past_probe: usize,
         polls_s: f64,
         ms: f64,
         host_ms: f64,
@@ -347,8 +355,14 @@ fn listed_markdown(rounds: &[&Round]) -> String {
     let quantum_ms = rounds.iter().filter_map(|r| r.quantum_us).reduce(f64::min).map(|us| us / 1000.0);
     let mut paths: Vec<Path> = LISTED.iter().map(|_| Path::default()).collect();
     let mut unlisted: BTreeMap<(String, String), f64> = BTreeMap::new();
+    // The shards' probes' longest poll, the most of any round's: a probe's own work is tens of microseconds (a note of
+    // how late it ran: `shard_health`), so what held its poll past that was the host's, and the host may have held any
+    // other poll as long.
+    let mut probe_most_ms = 0.0_f64;
     for r in rounds {
         let mut longest_here = vec![0.0_f64; LISTED.len()];
+        let probe_ms = r.held.iter().chain(r.fill_held.iter()).filter(|h| is_probe(&h.site)).map(|h| h.longest_ms).fold(0.0_f64, f64::max);
+        probe_most_ms = probe_most_ms.max(probe_ms);
         for (in_window, h) in r.held.iter().map(|h| (true, h)).chain(r.fill_held.iter().map(|h| (false, h))) {
             let Some(i) = listed(&h.site, &h.label, &net, &http) else {
                 if quantum_ms.is_some_and(|q| h.longest_ms > q) {
@@ -376,6 +390,9 @@ fn listed_markdown(rounds: &[&Round]) -> String {
             for (p, most) in paths.iter_mut().zip(&longest_here) {
                 if *most > q {
                     p.past += 1;
+                    if *most > probe_ms {
+                        p.past_probe += 1;
+                    }
                 }
             }
         }
@@ -385,18 +402,23 @@ fn listed_markdown(rounds: &[&Round]) -> String {
         Some(q) => {
             let past = paths.iter().filter(|p| p.past > 0).count();
             let verdict = if past == 0 { "**met**".to_owned() } else { format!("**not met**, {past} of {} past it", LISTED.len()) };
-            let _ = writeln!(o, "\nStep 3's check (goal 9, plan 01a1a87b2cec): no poll past the quantum ({q:.3} ms) from the paths step 2 listed: {verdict}.\n");
+            let beyond = paths.iter().filter(|p| p.past_probe > 0).count();
+            let _ = writeln!(
+                o,
+                "\nStep 3's check (goal 9, plan 01a1a87b2cec): no poll past the quantum ({q:.3} ms) from the paths step 2 listed: {verdict}. Past it and past the shards' probes' longest poll too ({probe_most_ms:.3} ms; a probe's own work is tens of microseconds, so that much was the host's), {beyond} of {}.\n",
+                LISTED.len()
+            );
         }
         None => {
             let _ = writeln!(o, "\nStep 3's check (goal 9, plan 01a1a87b2cec): these rounds don't say the quantum their shards ran with (a build from before `kiln_shard_quantum_seconds`): `kiln-lab report --quantum-us <µs>` holds them to one.\n");
         }
     }
     let _ = writeln!(o, "Each path step 2 listed, its longest poll in {n} rounds (the window's and the fill's) and where, the rounds it passed the quantum in, its polls past 100 µs a second in the window (the mean of the rounds) and the host's share of their time:\n");
-    let _ = writeln!(o, "| listed path | whose | longest ms | where | rounds past the quantum | polls past 100 µs a second | host's share |\n| --- | --- | --- | --- | --- | --- | --- |");
+    let _ = writeln!(o, "| listed path | whose | longest ms | where | rounds past the quantum (and the probe's longest) | polls past 100 µs a second | host's share |\n| --- | --- | --- | --- | --- | --- | --- |");
     #[allow(clippy::cast_precision_loss)]
     let rounds_f = n as f64;
     for ((name, whose), p) in LISTED.iter().zip(&paths) {
-        let past = quantum_ms.map_or_else(|| "-".to_owned(), |_| format!("{} of {n}", p.past));
+        let past = quantum_ms.map_or_else(|| "-".to_owned(), |_| format!("{} of {n} ({})", p.past, p.past_probe));
         if !p.seen {
             let _ = writeln!(o, "| {name} | {whose} | - | none past 100 µs | {past} | 0 | - |");
             continue;
@@ -506,27 +528,36 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 3: the done-when's check finds step 2's paths by the files of their sites, and
     /// the net loop's and the requests' by the sites their labels name; holds each path's longest poll, the window's
-    /// or the fill's, to the quantum round by round; says met only where none passed it; names apart what else
-    /// passed it; and says so of rounds that don't say their quantum, with no verdict.
+    /// or the fill's, to the quantum round by round, and to the shards' probes' longest in the round (the host's);
+    /// says met only where none passed the quantum; names apart what else passed it; and says so of rounds that
+    /// don't say their quantum, with no verdict.
     #[test]
     fn g9_s3_the_listed_paths_are_held_to_the_quantum() {
         let (net, http) = ("crates/kiln/src/server.rs:170:9", "crates/kiln/src/server.rs:477:29");
         let one = round(
-            vec![held(net, "runner AgentMsg::Harness { .. }", 0.2), held(http, "read /api/harness/sessions", 2.23), held(http, "read /api/me", 1.49), held("crates/kiln/src/custody/feeds.rs:32:9", "", 0.25)],
+            vec![
+                held(net, "runner AgentMsg::Harness { .. }", 0.2),
+                held(http, "read /api/harness/sessions", 2.23),
+                held(http, "read /api/me", 1.49),
+                held("crates/kiln/src/custody/feeds.rs:32:9", "", 0.25),
+                held("crates/kiln/src/shard_health.rs:268:12", "", 2.5),
+            ],
             vec![held("crates/kiln/src/harness/copies.rs:1480:13", "owner Update::Events { .. }", 3.17), held("crates/kiln/src/server.rs:245:9", "", 0.1)],
             Some(266.666),
         );
         let two = round(vec![held(net, "runner AgentMsg::Wire(..)", 0.3), held("crates/kiln/src/reads.rs:338:14", "", 1.14)], vec![], Some(266.666));
         let md = listed_markdown(&[&one, &two]);
         assert!(md.contains("no poll past the quantum (0.267 ms) from the paths step 2 listed: **not met**, 3 of 11 past it."), "{md}");
+        // The sessions' read, 2.23 ms beside a probe held 2.5 ms in its round, is past the quantum and not the probe's.
+        assert!(md.contains("Past it and past the shards' probes' longest poll too (2.500 ms; a probe's own work is tens of microseconds, so that much was the host's), 2 of 11."), "{md}");
         let row = |name: &str| md.lines().find(|l| l.starts_with(&format!("| {name} |"))).unwrap_or_default().to_owned();
-        assert!(row("the hub's net loop (its labels `runner …`)").contains("| 0.300 | `crates/kiln/src/server.rs:170:9` runner AgentMsg::Wire(..) | 1 of 2 | 1.00 | 0.000 |"), "{md}");
-        assert!(row("read /api/harness/sessions").contains("| 2.230 | `crates/kiln/src/server.rs:477:29` read /api/harness/sessions | 1 of 2 | 0.500 |"), "{md}");
-        assert!(row("custody's receipts of the feeds' batches (`custody/feeds.rs`)").contains("| 0.250 | `crates/kiln/src/custody/feeds.rs:32:9` | 0 of 2 |"), "{md}");
-        assert!(row("sessions' owners (`harness/copies.rs`)").contains("| 3.170 |"), "the fill's too: {md}");
-        assert!(row("the server's own tasks: its supervised children, Error Tracking's save (`server.rs`, `sup.rs`)").contains("| 0.100 | `crates/kiln/src/server.rs:245:9` | 0 of 2 |"), "{md}");
-        assert!(row("write /api/mcp").contains("| - | none past 100 µs | 0 of 2 |"), "{md}");
-        assert!(md.contains("Past the quantum, not listed (the longest first): `crates/kiln/src/server.rs:477:29` read /api/me 1.490 ms; `crates/kiln/src/reads.rs:338:14` 1.140 ms."), "{md}");
+        assert!(row("the hub's net loop (its labels `runner …`)").contains("| 0.300 | `crates/kiln/src/server.rs:170:9` runner AgentMsg::Wire(..) | 1 of 2 (1) | 1.00 | 0.000 |"), "{md}");
+        assert!(row("read /api/harness/sessions").contains("| 2.230 | `crates/kiln/src/server.rs:477:29` read /api/harness/sessions | 1 of 2 (0) | 0.500 |"), "{md}");
+        assert!(row("custody's receipts of the feeds' batches (`custody/feeds.rs`)").contains("| 0.250 | `crates/kiln/src/custody/feeds.rs:32:9` | 0 of 2 (0) |"), "{md}");
+        assert!(row("sessions' owners (`harness/copies.rs`)").contains("| 3.170 | `crates/kiln/src/harness/copies.rs:1480:13` owner Update::Events { .. } | 1 of 2 (1) |"), "the fill's too: {md}");
+        assert!(row("the server's own tasks: its supervised children, Error Tracking's save (`server.rs`, `sup.rs`)").contains("| 0.100 | `crates/kiln/src/server.rs:245:9` | 0 of 2 (0) |"), "{md}");
+        assert!(row("write /api/mcp").contains("| - | none past 100 µs | 0 of 2 (0) |"), "{md}");
+        assert!(md.contains("Past the quantum, not listed (the longest first): `crates/kiln/src/shard_health.rs:268:12` 2.500 ms; `crates/kiln/src/server.rs:477:29` read /api/me 1.490 ms; `crates/kiln/src/reads.rs:338:14` 1.140 ms."), "{md}");
         let calm = round(vec![held(net, "runner AgentMsg::Harness { .. }", 0.2)], vec![], Some(266.666));
         assert!(listed_markdown(&[&calm]).contains("from the paths step 2 listed: **met**."));
         let md = listed_markdown(&[&round(vec![held(net, "runner AgentMsg::Harness { .. }", 0.2)], vec![], None)]);

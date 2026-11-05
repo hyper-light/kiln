@@ -1164,9 +1164,13 @@ to the mirrors `convo/feed.rs`, the owners `harness/copies.rs`, the server's own
 four requests by their routes at the site the requests' routes name. It holds the longest poll of each,
 the window's and the fill's (`kiln_shard_held_longest_seconds` is the longest since the server started),
 to the quantum the rounds' shards ran with (`kiln_shard_quantum_seconds`), round by round. Its first line
-says met or not; then a row a path, with where its longest poll was, the rounds past, its polls past
-100 µs a second and the host's share of their time (preempted: step 4's, not the code's); then what else
-passed the quantum. Rounds of a build from before the gauge, or held to another quantum:
+says met or not, and how many paths passed the shards' probes' longest poll too: a probe's own work is
+tens of microseconds (`shard_health`), so that much of its hold was the host's, and on a shared machine
+the host may hold any poll as long (g9p6 on fedora, at a load of 23 to 45: the probes' polls held up to
+5.3 ms calm and 18.9 ms with hogs). Then a row a path, with where its longest poll was, the rounds past
+(and past the probe's), its polls past 100 µs a second and the share of their time the host was found to
+hold (preempted: step 4's, not the code's); then what else passed the quantum. Rounds of a build from
+before the gauge, or held to another quantum:
 
 ```sh
 kiln-lab report --quantum-us 266.666 <run>/run.json
