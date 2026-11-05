@@ -143,8 +143,14 @@ pub static CI_GRAPHS: Owner = Owner::new("ci_graphs");
 /// are read up to 32 MiB). Past it the lists read longest ago go: read from the host again when asked.
 pub static PULL_LISTS: Owner = Owner::new("pull_lists");
 
+/// observe's grok rules compiled (`crate::observe::pipeline::grok::Lazy`), each counted at what its regex's
+/// lazy DFA may keep for one thread searching it (forward and reverse caches at regex's capacity, 2 MiB
+/// each; regex reports no figure of what they hold). For each further thread searching a rule at once it
+/// may keep that again. Let go with their pipeline.
+pub static GROK_DFA: Owner = Owner::new("grok_dfa");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 22] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS];
+pub(super) const ALL: [&Owner; 23] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA];
 
 #[cfg(test)]
 mod tests {

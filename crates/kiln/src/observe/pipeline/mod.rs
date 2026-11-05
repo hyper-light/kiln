@@ -1231,5 +1231,7 @@ mod tests {
         apply_all(&pipelines, &mut r, 0, &mut s);
         assert_eq!(pipelines.iter().map(made).collect::<Vec<_>>(), [true, false], "nginx's alone, once a record of its reached it");
         assert!(r.attrs.iter().any(|(k, v)| k == "http.status_code" && v == "200"), "parsed: {:?}", r.attrs);
+        // Counted on /metrics as they're compiled: each rule at its lazy DFA's capacity (regex says no less).
+        assert!(crate::memory::owners::GROK_DFA.bytes() >= crate::observe::pipeline::grok::LAZY_DFA, "{}", crate::memory::owners::GROK_DFA.bytes());
     }
 }

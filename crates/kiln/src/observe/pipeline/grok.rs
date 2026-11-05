@@ -415,14 +415,36 @@ impl Lazy {
     }
 
     /// The rules compiled: the first record to reach them compiles them (one reaching them meanwhile, on
-    /// another thread, waits for it).
+    /// another thread, waits for it). Counted on `/metrics` as they're made (`crate::memory::owners::GROK_DFA`).
     pub fn get(&self) -> Option<&Grok> {
-        self.made.get_or_init(|| Grok::compile(&self.match_rules, &self.support_rules).ok()).as_ref()
+        self.made
+            .get_or_init(|| {
+                let made = Grok::compile(&self.match_rules, &self.support_rules).ok();
+                if let Some(g) = &made {
+                    crate::memory::owners::GROK_DFA.add(g.rules.len().saturating_mul(LAZY_DFA));
+                }
+                made
+            })
+            .as_ref()
     }
 
     /// Whether they've been compiled yet.
     pub fn made(&self) -> bool {
         self.made.get().is_some()
+    }
+}
+
+/// What a compiled rule's regex may keep for each thread searching it at once: its lazy DFA's caches,
+/// forward and reverse, each at regex's own capacity (`RegexBuilder::dfa_size_limit`'s default, 2 MiB;
+/// kiln sets none). regex reports no figure of what they hold, so this is what's counted (goal 11, plan
+/// 01a1a87b2e56 step 3: `crate::memory::owners::GROK_DFA`).
+pub const LAZY_DFA: usize = 2 * (2 << 20);
+
+impl Drop for Lazy {
+    fn drop(&mut self) {
+        if let Some(Some(g)) = self.made.get() {
+            crate::memory::owners::GROK_DFA.sub(g.rules.len().saturating_mul(LAZY_DFA));
+        }
     }
 }
 
