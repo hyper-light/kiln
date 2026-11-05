@@ -467,6 +467,89 @@ fn answer_nudge(nudges: bool, period_ns: u64) {
     }
 }
 
+/// What each of the server's shards asks of its spin before a park (goal 9, plan 01a1a87b2cec step 4;
+/// `hyper_rt::park_spin`; docs/priority.md, "A spin before the park"): `KILN_RT_SPIN_US` microseconds,
+/// `fixed_us`, where it's set and above 0, at every idle moment whatever it costs (the lab's measure of what a
+/// spin buys and costs); else, where `KILN_RT_SPIN` is on, `on`, the spin each shard's own gaps make cheapest
+/// in CPU, up to 16 µs (`hyper_rt::park_spin::CAP_NS`), so it spends less of the shard's CPU than parking at
+/// once wherever it spins; else none, as before. Off until asked: the lab's A/B decides whether it becomes a
+/// default (docs/runtime-lab.md, "The shard's own wake path").
+fn spin_ask(on: Option<&str>, fixed_us: Option<&str>) -> hyper_rt::park_spin::Ask {
+    use hyper_rt::park_spin::{Ask, CAP_NS};
+    if let Some(us) = fixed_us.and_then(|us| us.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
+        return Ask::Fixed { ns: us.saturating_mul(1000) };
+    }
+    match on.map(str::trim) {
+        Some(v) if !v.is_empty() && !matches!(v, "0" | "false" | "off" | "no") => Ask::Sized { cap_ns: CAP_NS },
+        _ => Ask::Off,
+    }
+}
+
+/// The spin before a park the shards were asked for ([`spin_ask`]), once the runtime started.
+static SPIN: OnceLock<hyper_rt::park_spin::Ask> = OnceLock::new();
+
+/// How many shards answer the spin: the runtime's, where one was asked for.
+static SPIN_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The shards that took the spin, and those refused it (a task off its shard's thread: never, here), in one atomic
+/// as the nudge's answers are, refusals in units of [`REFUSED_ONE`].
+static SPIN_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// How the shards took the spin before a park ([`spin_ask`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Spin {
+    /// What was asked: `off`, `sized` (as long as each shard's own gaps make cheapest in CPU) or `fixed`.
+    pub asked: &'static str,
+    /// Its length, microseconds: the sized spin's cap, the fixed spin's time; 0 when off.
+    pub us: u64,
+    /// The shards that answered it.
+    pub shards: u32,
+    /// Of them, those that took it.
+    pub took: u32,
+}
+
+impl Spin {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        if self.asked == "off" || self.shards == 0 || self.took < self.shards {
+            return None;
+        }
+        Some(match self.asked {
+            "sized" => format!("the server's {} shards spin before each park as long as their own gaps make cheapest in CPU, up to {} µs: a gap a spin catches needs no wake (KILN_RT_SPIN)", self.took, self.us),
+            _ => format!("the server's {} shards spin {} µs before each park, whatever it costs (KILN_RT_SPIN_US, the lab's measure)", self.took, self.us),
+        })
+    }
+}
+
+/// How the shards took the spin so far ([`spin_ask`]).
+pub fn spin_status() -> Spin {
+    spin_of(SPIN.get().copied().unwrap_or_default(), SPIN_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Spin`] from what was asked and the shards' `answers` ([`SPIN_ANSWERS`]).
+fn spin_of(ask: hyper_rt::park_spin::Ask, answers: u32) -> Spin {
+    use hyper_rt::park_spin::Ask;
+    let (asked, ns) = match ask {
+        Ask::Off => ("off", 0),
+        Ask::Sized { cap_ns } => ("sized", cap_ns),
+        Ask::Fixed { ns } => ("fixed", ns),
+    };
+    Spin { asked, us: ns / 1000, shards: SPIN_SHARDS.load(Ordering::Relaxed), took: answers % REFUSED_ONE }
+}
+
+/// A shard takes the spin asked for ([`spin_ask`]), on its own thread; the last to answer says how they all did, once.
+fn answer_spin(ask: hyper_rt::park_spin::Ask) {
+    let one = if hyper_rt::park_spin::ask_current_thread(ask).is_ok() { 1 } else { REFUSED_ONE };
+    let answers = SPIN_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
+    let status = spin_of(ask, answers);
+    if status.took.saturating_add(answers / REFUSED_ONE) == status.shards {
+        match status.said() {
+            Some(line) => tracing::info!("{line}"),
+            None => tracing::warn!(refused = answers / REFUSED_ONE, "a shard was refused its spin before a park: it parks at once"),
+        }
+    }
+}
+
 /// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
 /// for its threads that aren't shards (its blocking pool, its timers' helpers), as hyper-rt's
 /// placement keeps one, and each shard on the next, around again when there are more shards than
@@ -645,6 +728,12 @@ fn start() -> Result<Rt, String> {
         NUDGE_PERIOD_NS.store(period_ns, Ordering::Relaxed);
         NUDGE_SHARDS.store(shards, Ordering::Relaxed);
     }
+    // The spin before each park, where the lab asks for one (goal 9, plan 01a1a87b2cec step 4; [`spin_ask`]).
+    let spin = spin_ask(std::env::var("KILN_RT_SPIN").ok().as_deref(), std::env::var("KILN_RT_SPIN_US").ok().as_deref());
+    let _ = SPIN.set(spin);
+    if spin != hyper_rt::park_spin::Ask::Off {
+        SPIN_SHARDS.store(shards, Ordering::Relaxed);
+    }
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
@@ -660,6 +749,9 @@ fn start() -> Result<Rt, String> {
             }
             if nudge {
                 answer_nudge(asks.nudge, period_ns);
+            }
+            if spin != hyper_rt::park_spin::Ask::Off {
+                answer_spin(spin);
             }
         });
     }
@@ -2269,6 +2361,41 @@ mod tests {
         assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some(" 250 ")), 250_000);
         assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("0")), derived, "0 isn't a period");
         assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("soon")), derived);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): the spin before a park is off unless the lab asks for it: `KILN_RT_SPIN` on
+    /// asks for the spin each shard's own gaps size, up to 16 µs; `KILN_RT_SPIN_US` for a fixed one, which goes first;
+    /// anything else is none, as before.
+    #[test]
+    fn g9_s4_the_spin_before_a_park_is_the_labs_to_ask_for() {
+        use hyper_rt::park_spin::{Ask, CAP_NS};
+        assert_eq!(spin_ask(None, None), Ask::Off);
+        for off in ["", "0", "false", "off", "no", " off "] {
+            assert_eq!(spin_ask(Some(off), None), Ask::Off, "{off:?}");
+        }
+        for on in ["1", "on", "true", "auto", " yes "] {
+            assert_eq!(spin_ask(Some(on), None), Ask::Sized { cap_ns: CAP_NS }, "{on:?}");
+        }
+        assert_eq!(CAP_NS, 16_000);
+        assert_eq!(spin_ask(None, Some("16")), Ask::Fixed { ns: 16_000 });
+        assert_eq!(spin_ask(Some("off"), Some(" 4 ")), Ask::Fixed { ns: 4_000 }, "a fixed spin asked for goes first");
+        assert_eq!(spin_ask(Some("1"), Some("0")), Ask::Sized { cap_ns: CAP_NS }, "0 isn't a spin's length");
+        assert_eq!(spin_ask(None, Some("soon")), Ask::Off);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): how the shards took the spin is said once every shard has answered, never
+    /// when none was asked for; what was asked reads back from its ask, and the answers count in one atomic.
+    #[test]
+    fn g9_s4_the_spin_is_said_as_the_shards_took_it() {
+        use hyper_rt::park_spin::Ask;
+        let status = |asked, us, took| Spin { asked, us, shards: 4, took };
+        assert_eq!(Spin { asked: "off", us: 0, shards: 0, took: 0 }.said(), None, "not asked for: nothing to say");
+        assert_eq!(status("sized", 16, 3).said(), None, "not every shard has answered");
+        assert!(status("sized", 16, 4).said().is_some_and(|s| s.contains("4 shards spin before each park") && s.contains("up to 16 µs")));
+        assert!(status("fixed", 8, 4).said().is_some_and(|s| s.contains("spin 8 µs before each park") && s.contains("KILN_RT_SPIN_US")));
+        let sized = spin_of(Ask::Sized { cap_ns: 16_000 }, 2 + REFUSED_ONE);
+        assert_eq!((sized.asked, sized.us, sized.took), ("sized", 16, 2));
+        assert_eq!((spin_of(Ask::Fixed { ns: 8_000 }, 0).asked, spin_of(Ask::Off, 0).asked), ("fixed", "off"));
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): how the shards took the nudge is said once all of them answered,
