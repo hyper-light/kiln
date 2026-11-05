@@ -606,6 +606,13 @@ pub fn cd_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Res
     own_signed_as(pki, "cd", &cd_uri(&pki.organization()), PAYLOAD_CUSTODY, s)
 }
 
+/// [`cd_signed`] on the compute pool, off the shards, as [`server_signed_off`] (goal 9, plan 01a1a87b2cec step 3): CD's
+/// key and certificate read from their files, and the signature, for each sync's records and each image it holds.
+pub async fn cd_signed_off(pki: &std::sync::Arc<crate::pki::Pki>, s: statement::Statement) -> anyhow::Result<Value> {
+    let pki = std::sync::Arc::clone(pki);
+    crate::rt::compute(move || cd_signed(&pki, &s)).await?
+}
+
 /// `s` signed as `payload_type` with the key of kiln's own identity `kind` (`server`, `cd`), whose
 /// URI is `by`, its body naming it.
 fn own_signed_as(pki: &crate::pki::Pki, kind: &str, by: &str, payload_type: &str, s: &statement::Statement) -> anyhow::Result<Value> {
@@ -935,7 +942,9 @@ pub async fn hand_work(hub: &crate::hub::Hub, thing: statement::Subject, to: &st
     };
     let body = custody::Body { to: Some(to.to_owned()), why: why.to_owned(), acts_for, taken_for, ..custody::Body::new(kind, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows, ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards: the server's key and certificate read from their files, and the
+    // signature (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok((t.digest, bundle)),
         Err(why) => anyhow::bail!("kiln refused its own hand-on: {why}"),
@@ -957,7 +966,8 @@ pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: sta
     let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: {missing}");
     let body = custody::Body { from: Some(giver.to_owned()), taken_for: Some(person.to_owned()), why, ..custody::Body::new(Kind::Received, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok(t.digest),
         Err(why) => anyhow::bail!("kiln refused its own receipt for {person}: {why}"),
@@ -970,7 +980,8 @@ pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: sta
 pub async fn person_receipt(hub: &crate::hub::Hub, person: &str, hand_on: &str, bundle: &Value, came_from: &str) -> anyhow::Result<Result<String, String>> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let c = match statement::verify(bundle, &hub.pki.ca_der, &revocations, at) {
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = match verify_off(bundle, &hub.pki.ca_der, revocations, at).await? {
         Ok(c) => c,
         Err(e) => return Ok(Err(format!("the receipt doesn't verify: {e}"))),
     };
@@ -990,7 +1001,8 @@ pub async fn person_receipt(hub: &crate::hub::Hub, person: &str, hand_on: &str, 
 pub async fn person_hand_on(hub: &crate::hub::Hub, person: &str, to: &str, thing: &statement::Subject, bundle: &Value, came_from: &str) -> anyhow::Result<Result<String, String>> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let c = match statement::verify(bundle, &hub.pki.ca_der, &revocations, at) {
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = match verify_off(bundle, &hub.pki.ca_der, revocations, at).await? {
         Ok(c) => c,
         Err(e) => return Ok(Err(format!("the hand-on doesn't verify: {e}"))),
     };
@@ -1025,7 +1037,8 @@ pub async fn pass_on(hub: &crate::hub::Hub, things: Vec<statement::Subject>, han
     let org = hub.pki.organization();
     let body = custody::Body { from: Some(from.to_owned()), to: Some(to.to_owned()), why: why.to_owned(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
     let s = statement::Statement { subject: things, follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok((t.digest, bundle)),
         Err(why) => anyhow::bail!("kiln refused its own pass of {hand_on}: {why}"),
@@ -1764,13 +1777,14 @@ pub async fn carry(hub: &crate::hub::Hub, diff: &str, verdict: &str, from: &Side
     let (server, came_from) = (server_uri(&org), format!("kiln's review of {diff}"));
     let version = |v: &Side<'_>| format!("v{} at {} on base {}", v.n, short(v.commit), short(v.base));
     let b = custody::Body { to: Some(server.clone()), component: Some(version(from)), why: why.clone(), ..custody::Body::new(Kind::HandedOn, "") };
-    let hand_on = server_signed(&hub.pki, &statement::Statement { subject: things.clone(), ..statement::Statement::new(custody::to_value(&b)) })?;
+    // Each record signed on the compute pool, off the shards, in turn (goal 9, plan 01a1a87b2cec step 3).
+    let hand_on = server_signed_off(&hub.pki, statement::Statement { subject: things.clone(), ..statement::Statement::new(custody::to_value(&b)) }).await?;
     let handed = match take(&hub.store, &hub.pki.ca_der, &org, &hand_on, &came_from, at).await? {
         Ok(t) => t.digest,
         Err(why) => return Ok(Err(format!("its hand-on wasn't kept: {why}"))),
     };
     let b = custody::Body { from: Some(server), component: Some(version(to)), why: why.clone(), ..custody::Body::new(Kind::Received, "") };
-    let receipt = server_signed(&hub.pki, &statement::Statement { subject: things, follows: vec![handed], ..statement::Statement::new(custody::to_value(&b)) })?;
+    let receipt = server_signed_off(&hub.pki, statement::Statement { subject: things, follows: vec![handed], ..statement::Statement::new(custody::to_value(&b)) }).await?;
     Ok(match take(&hub.store, &hub.pki.ca_der, &org, &receipt, &came_from, at).await? {
         Ok(t) => Ok((t.digest, why)),
         Err(why) => Err(format!("its receipt wasn't kept: {why}")),
@@ -1927,19 +1941,28 @@ async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) ->
 
 /// A walk's break at a record kiln doesn't have, when kiln keeps it but it no longer checks as kiln
 /// took it (changed where it's kept): a break at that record, saying so, not a record missing.
-async fn unchecked(store: &Store, root: &[u8], revocations: &[Revocation], b: Break) -> anyhow::Result<Break> {
+async fn unchecked(store: &Store, root: &std::sync::Arc<[u8]>, revocations: &std::sync::Arc<[Revocation]>, b: Break) -> anyhow::Result<Break> {
     let Break::NoRecord { record, .. } = &b else { return Ok(b) };
     let d = record.clone();
     let kept: Option<(String, i64)> = store.call(move |c| Ok(c.query_row("SELECT envelope, taken_at FROM custody WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
     let Some((envelope, at)) = kept else { return Ok(b) };
-    let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
-    let checked = serde_json::from_str::<Value>(&envelope).map_err(|e| e.to_string()).and_then(|bundle| statement::verify(&bundle, root, &before, at).map_err(|e| e.to_string()));
+    // Checked again on the compute pool, off the shards, with the walk's root and revocations shared, not copied (goal 9,
+    // plan 01a1a87b2cec step 3).
+    let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
+    let checked = crate::rt::compute(move || checked_as_taken(&envelope, &root, &revocations, at)).await?;
     let why = match checked {
         Ok(c) if c.digest == *record => return Ok(b),
         Ok(c) => format!("what kiln keeps as it is another record, {}", c.digest),
         Err(e) => format!("what kiln keeps as it no longer checks as kiln took it: {e}"),
     };
     Ok(Break::Unreadable { record: record.clone(), why })
+}
+
+/// A record as kiln keeps it (`envelope`, taken at `at`) checked again as of then, against kiln's root `root` and the
+/// revocations before then ([`unchecked`]): on the thread it's called on, a compute job's.
+fn checked_as_taken(envelope: &str, root: &[u8], revocations: &[Revocation], at: i64) -> Result<Checked, String> {
+    let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
+    serde_json::from_str::<Value>(envelope).map_err(|e| e.to_string()).and_then(|bundle| statement::verify(&bundle, root, &before, at).map_err(|e| e.to_string()))
 }
 
 /// A thing's chain of custody walked for whoever audits it (docs/ci.md W27-R08; the Transfers
@@ -2286,6 +2309,50 @@ mod tests {
         assert!(load_with.contains("Arc::clone(root)") && load_with.contains("Arc::clone(revocations)"), "{load_with}");
         assert!(!load_with.contains("root.to_vec()") && !load_with.contains("revocations.to_vec()"), "{load_with}");
     }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the rarer paths that sign or check a statement as they go (kiln's own hand-ons,
+    /// receipts, passes and carried approvals; a person's own receipt or hand-on; a walk's break at a record kiln keeps;
+    /// a review's signed verdicts; a leg's inputs; KilnCD's records; the store of bytes'; a commit kiln makes) hand it
+    /// to the compute or blocking pool: none signs or checks in its own code. What each finds is the W27 tests'.
+    #[test]
+    fn g9_s3_the_rare_signing_paths_sign_and_check_off_the_shards() {
+        // A file's code outside its tests (all of it, with none), each line without its comment.
+        let code = |file: &str| file.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let (custody, verdicts, signed, cd, blobs, revision) = (code(include_str!("custody.rs")), code(include_str!("ci/verdicts.rs")), code(include_str!("ci/signed.rs")), code(include_str!("cd/custody.rs")), code(include_str!("custody/blobs.rs")), code(include_str!("ci/revision.rs")));
+        let promotion = code(include_str!("deploy/promotion.rs"));
+        // Where a function's body ends: a free function's brace, or a method's in its `impl`.
+        let (free, method) = ("\n}\n", "\n    }\n");
+        let moved = [
+            (custody.as_str(), "pub async fn hand_work(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn receive_for_because(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn pass_on(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn carry(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn person_receipt(", free, "verify_off(bundle, "),
+            (custody.as_str(), "pub async fn person_hand_on(", free, "verify_off(bundle, "),
+            (custody.as_str(), "async fn unchecked(", free, "crate::rt::compute(move || checked_as_taken("),
+            (verdicts.as_str(), "pub async fn take(", free, "crate::custody::verify_off(bundle, "),
+            (verdicts.as_str(), "pub async fn holding(", free, "crate::rt::compute_map(rows, "),
+            (signed.as_str(), "async fn hand_to_runner(", free, "crate::custody::server_signed_off(&hub.pki, "),
+            (cd.as_str(), "async fn as_cd(", free, "crate::custody::cd_signed_off(&hub.pki, "),
+            (cd.as_str(), "async fn as_server(", free, "crate::custody::server_signed_off(&hub.pki, "),
+            (blobs.as_str(), "async fn keep(", method, "super::server_signed_off(&self.pki, "),
+            (revision.as_str(), "pub(crate) async fn sign_as_kiln(", free, "crate::rt::blocking(move || signed_by_kiln("),
+            (signed.as_str(), "async fn take(", free, "a.check(&pki.ca_der, b, at)"),
+            (signed.as_str(), "pub async fn judged(", free, "a.check(&pki.ca_der, &b, r.taken_at)"),
+            (signed.as_str(), "async fn receipt(", free, "crate::rt::blocking(move || crate::identities::sign_as(&pki, "),
+            (promotion.as_str(), "pub async fn hand_on(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
+            (promotion.as_str(), "pub async fn receipt(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
+        ];
+        for (src, head, end, off) in moved {
+            let b = src.split(head).nth(1).and_then(|rest| rest.split(end).next()).unwrap_or_default();
+            assert!(!b.is_empty(), "{head} not found");
+            for on_shard in ["statement::verify(", "server_signed(&", "cd_signed(&", "sign_own(", "against.check(hub", "sign_as(&hub.pki"] {
+                assert!(!b.contains(on_shard), "{head} calls {on_shard} on its shard: {b}");
+            }
+            assert!(b.contains(off), "{head} doesn't hand its signature or check to a pool ({off}): {b}");
+        }
+    }
+
     const FEDORA: &str = "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed";
     const JUPITER: &str = "kiln://hyper-light/person/ada/machine/jupiter/instance/01a18b00";
     const LEFT: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/0/machine/fedora/instance/01a14c4f";

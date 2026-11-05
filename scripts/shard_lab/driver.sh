@@ -18,6 +18,9 @@
 #                rest (rt::pin); no hogs.
 #   cores:       that, and N busy loops at cpu.weight 1 on CORES_HOGS, the CPUs past the server's.
 #   q<µs>-<cfg>: <cfg> with the shards' step quantum at <µs> (KILN_RT_QUANTUM_US): step 3's A/B of quanta on one build.
+#   nudge-<mode>-<cfg>: <cfg> with `[server] nudge` at <mode>, off, on or auto (KILN_RT_NUDGE; goal 8 step 7 and goal 6
+#                step 3's A/B on one build). Without it a configuration runs the build's default (auto, from the branch
+#                g6-critical-hogs on; off before).
 #   rt-<cfg>:    <cfg> with the server's shards in Linux's real-time class (goal 9 step 4: KILN_RT_REALTIME=1, the lab's
 #                unit given LimitRTPRIO=1 as kiln install's unit has, the server's soft limit raised to it). Run only
 #                where this user's service manager grants a unit that room (the most it gives is its own hard
@@ -81,6 +84,8 @@ one() {
   case "$cfg" in prof-*) base=${cfg#prof-}; bin=$D/prof/kiln-server; run+=(-E PERF_ON=1 -E PERF="$PERF" -E PERF_LIBS="$PERF_LIBS" -E PERF_CALL_GRAPH="$PERF_CALL_GRAPH" -E PERF_FROM="$PERF_FROM") ;; esac
   local quantum=""
   case "$base" in q[0-9]*-*) quantum=${base%%-*}; quantum=${quantum#q}; base=${base#*-} ;; esac
+  local nudge=""
+  case "$base" in nudge-off-* | nudge-on-* | nudge-auto-*) nudge=${base#nudge-}; nudge=${nudge%%-*}; base=${base#nudge-"$nudge"-} ;; esac
   local rt=""
   case "$base" in rt-*) rt=1; base=${base#rt-} ;; esac
   case "$base" in
@@ -90,6 +95,7 @@ one() {
   esac
   [ -n "$SHARDS" ] && senv+=(--env "KILN_RT_SHARDS=$SHARDS")
   [ -n "$quantum" ] && senv+=(--env "KILN_RT_QUANTUM_US=$quantum")
+  [ -n "$nudge" ] && senv+=(--env "KILN_RT_NUDGE=$nudge")
   if [ -n "$rt" ]; then
     senv+=(--env KILN_RT_REALTIME=1 --env LAB_SERVER_RTPRIO=1)
     unit=(-p LimitRTPRIO=1)

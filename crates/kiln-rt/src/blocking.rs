@@ -7,6 +7,13 @@
 //! turn, as a busy machine's work must. A job's result returns through a [`crate::sync::oneshot`], which a
 //! task awaits.
 //!
+//! **Critical first** (kiln's departure, ORIGIN.md; kiln's goal 6, plan `01a1a59c2abe` step 3): a job submitted
+//! from a task of [`crate::coop::Class::Critical`], what a person waits on or the platform checks, waits ahead of
+//! the rest of its share's line, as a shard's run queue takes that class first. Its share's places bound it as
+//! they bound the rest, and each kind keeps its order. A share's line was first come, first served whatever a
+//! job's class: a person's read waited behind every read of the jobs before it (kiln's census, train 8: custody's
+//! reads held its `store` share's line at about 14 jobs, 80 ms each on average).
+//!
 //! **No locks** (the workspace's wall: single owners and moves over channels). A dispatcher thread owns
 //! the shares' lines, their running counts and the list of idle workers; each worker owns a one-job slot
 //! and tells the dispatcher when it is idle again and which share's job it finished, so a job is handed to
@@ -136,8 +143,12 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// What the dispatcher receives.
 enum Message {
-    /// A job of the share at `share`.
-    Job { share: usize, job: Job },
+    /// A job of the share at `share`; `critical` where its submitter ran in the Critical class.
+    Job {
+        share: usize,
+        job: Job,
+        critical: bool,
+    },
     /// A worker is idle again, after finishing a job of `finished` when it ran one.
     Idle {
         worker: usize,
@@ -268,12 +279,40 @@ fn next<T>(take: &Receiver<T>, cold: Option<Cold>) -> Option<T> {
     take.recv().ok()
 }
 
+/// A share's jobs waiting for one of its places: those submitted from a Critical task first, each kind in the
+/// order given (the module's notes, "Critical first").
+#[derive(Default)]
+struct Line {
+    critical: VecDeque<Job>,
+    rest: VecDeque<Job>,
+}
+
+impl Line {
+    /// Joins `job` at the back of its kind.
+    fn push(&mut self, job: Job, critical: bool) {
+        if critical {
+            self.critical.push_back(job);
+        } else {
+            self.rest.push_back(job);
+        }
+    }
+
+    /// The next to run: the first Critical job waiting, else the first of the rest.
+    fn pop(&mut self) -> Option<Job> {
+        self.critical.pop_front().or_else(|| self.rest.pop_front())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.critical.is_empty() && self.rest.is_empty()
+    }
+}
+
 /// The dispatcher's own state: each share's line and running count, and the workers idle.
 struct Dispatcher {
     slots: Vec<SyncSender<(usize, Job)>>,
     limits: Vec<usize>,
     running: Vec<usize>,
-    lines: Vec<VecDeque<Job>>,
+    lines: Vec<Line>,
     idle: Vec<usize>,
     /// The share the next hand-out looks at first, so the shares take the idle workers in turn.
     next: usize,
@@ -286,7 +325,7 @@ impl Dispatcher {
             slots,
             limits,
             running: vec![0; shares],
-            lines: (0..shares).map(|_| VecDeque::new()).collect(),
+            lines: (0..shares).map(|_| Line::default()).collect(),
             idle: Vec::new(),
             next: 0,
         }
@@ -299,16 +338,20 @@ impl Dispatcher {
         let mut stopping = None;
         while let Ok(message) = messages.recv() {
             match message {
-                Message::Job { share, job } => {
+                Message::Job {
+                    share,
+                    job,
+                    critical,
+                } => {
                     if let Some(line) = self.lines.get_mut(share) {
-                        line.push_back(job);
+                        line.push(job, critical);
                     }
                 }
                 Message::Idle { worker, finished } => self.idle_again(worker, finished),
                 Message::Stop(done) => stopping = Some(done),
             }
             self.hand_out();
-            let drained = self.lines.iter().all(VecDeque::is_empty) && self.idle.len() == total;
+            let drained = self.lines.iter().all(Line::is_empty) && self.idle.len() == total;
             if drained && let Some(done) = stopping.take() {
                 // A job submitted once the stop began is refused. One that raced the stop's start ran
                 // if it reached the lines before they drained, and is dropped unrun after, its
@@ -335,7 +378,7 @@ impl Dispatcher {
     }
 
     /// Hands each idle worker the next job of a share with a free place, the shares taken in turn and each
-    /// share's jobs in the order given.
+    /// share's jobs Critical first, each kind in the order given ([`Line::pop`]).
     fn hand_out(&mut self) {
         let shares = self.lines.len();
         while !self.idle.is_empty() {
@@ -346,7 +389,7 @@ impl Dispatcher {
                 return;
             };
             let (Some(job), Some(worker)) = (
-                self.lines.get_mut(share).and_then(VecDeque::pop_front),
+                self.lines.get_mut(share).and_then(Line::pop),
                 self.idle.pop(),
             ) else {
                 return;
@@ -378,9 +421,9 @@ impl Dispatcher {
 }
 
 /// Runs `job` on the pool under `share`; its result arrives on the returned receiver. The job runs when
-/// one of its share's places frees, after the share's jobs submitted before it. Refused `Capacity` when
-/// the share's places and line are full, `BadConfig` for an unknown share, a pool not running or one
-/// stopping.
+/// one of its share's places frees, after the share's jobs submitted before it, or, submitted from a task of
+/// the Critical class, after its Critical ones alone (the module's notes). Refused `Capacity` when the
+/// share's places and line are full, `BadConfig` for an unknown share, a pool not running or one stopping.
 pub fn run<T, F>(share: &str, job: F) -> Result<OneshotReceiver<T>, RtError>
 where
     T: Send + 'static,
@@ -447,9 +490,12 @@ where
             None => drop(sender),
         }
     });
+    // The submitting task's class, read here where it runs (none off a shard: the rest's line).
+    let critical = crate::coop::class() == Some(crate::coop::Class::Critical);
     match pool.submit.send(Message::Job {
         share: index,
         job: wrapped,
+        critical,
     }) {
         Ok(()) => {
             ACCEPTED.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +557,47 @@ mod tests {
     use super::*;
 
     static COLD: AtomicUsize = AtomicUsize::new(0);
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 3: a share's jobs from Critical tasks run before the rest waiting for its
+    /// places, each kind in the order given; its places bound them as they bound the rest, and another share keeps its
+    /// own turn.
+    #[test]
+    fn g6_s3_critical_jobs_go_first_in_their_share_s_line() {
+        let (done, order) = channel::<u32>();
+        let job = |id: u32| -> Job {
+            let done = done.clone();
+            Box::new(move || {
+                let _ = done.send(id);
+            })
+        };
+        // One worker; share 0 of one place, share 1 of one.
+        let (slot, take) = sync_channel::<(usize, Job)>(1);
+        let mut d = Dispatcher::new(vec![slot], vec![1, 1]);
+        for (id, critical) in [(1, false), (2, false), (3, true), (4, true), (5, false)] {
+            d.lines[0].push(job(id), critical);
+        }
+        d.lines[1].push(job(6), false);
+        d.idle_again(0, None);
+        let mut ran = Vec::new();
+        let mut shares = Vec::new();
+        while !d.lines.iter().all(Line::is_empty) {
+            d.hand_out();
+            let (share, handed) = take.try_recv().unwrap();
+            handed();
+            ran.push(order.try_recv().unwrap());
+            shares.push(share);
+            d.idle_again(0, Some(share));
+        }
+        // The shares take the worker in turn; share 0's Critical jobs first, then the rest, each in order.
+        assert_eq!(ran, vec![3, 6, 4, 1, 2, 5]);
+        assert_eq!(shares, vec![0, 1, 0, 0, 0, 0]);
+        // A full share's place holds its Critical jobs as it holds the rest.
+        d.running[0] = 1;
+        d.lines[0].push(job(7), true);
+        d.hand_out();
+        assert!(take.try_recv().is_err(), "share 0's one place is taken");
+        assert!(!d.lines[0].is_empty());
+    }
 
     fn went_cold() {
         COLD.fetch_add(1, Ordering::SeqCst);

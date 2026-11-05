@@ -12,7 +12,7 @@
 //! nowhere to go it waits for the reset where it is, its timeline says why, and kiln looks again
 //! every few minutes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::Mutex;
@@ -49,8 +49,11 @@ static TRIED: LazyLock<Mutex<HashMap<String, Tried>>> = LazyLock::new(|| Mutex::
 /// Every few seconds (`goals::run`): the paused sessions that opted in look for a machine to go on
 /// on, once a pause, then again now and then.
 pub fn tick(hub: &Arc<Hub>, all: &[Info], now: i64) {
+    // The paused sessions that opted in, looked up in a set, not scanned for each one tried (goal 9, plan 01a1a87b2cec
+    // step 3).
+    let waiting: HashSet<&str> = all.iter().filter(|i| i.pause.is_some() && i.move_on_limit).map(|i| i.id.as_str()).collect();
     let mut tried = TRIED.lock();
-    tried.retain(|id, _| all.iter().any(|i| &i.id == id && i.pause.is_some() && i.move_on_limit));
+    tried.retain(|id, _| waiting.contains(id.as_str()));
     for info in all {
         let Some(p) = info.pause.as_ref() else { continue };
         if !info.move_on_limit || matches!(info.status, Status::Exited) {

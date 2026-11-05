@@ -140,8 +140,10 @@ impl Attested {
     }
 
     /// Signs `s` as kiln's server and keeps it, as it came from the store's side of kiln.
-    async fn keep(&self, s: &Statement) {
-        let bundle = match super::server_signed(&self.pki, s) {
+    async fn keep(&self, s: Statement) {
+        // Signed on the compute pool, off the shards: two signatures for each put and each whole read (goal 9, plan
+        // 01a1a87b2cec step 3).
+        let bundle = match super::server_signed_off(&self.pki, s).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a record of kiln's store of bytes couldn't be signed");
@@ -160,8 +162,8 @@ impl Attested {
     async fn put_kept(&self, key: &str, sent: &str, etag: &str) {
         let hand_on = self.hand_on(key, sent);
         let digest = self.digest(&hand_on);
-        self.keep(&hand_on).await;
-        self.keep(&self.kept_by_store(key, etag, &digest)).await;
+        self.keep(hand_on).await;
+        self.keep(self.kept_by_store(key, etag, &digest)).await;
     }
 
     /// `key`'s object read back whole: the store said `etag`, the bytes hashed to `got`.
@@ -188,9 +190,9 @@ impl Attested {
         let body = Body { to: Some(server.clone()), taken_for: Some(self.uri.clone()), why: "the store has no key of kiln's: kiln hands it on for it".into(), ..Body::new(Kind::Taken, &server) };
         let take = Statement { subject: vec![Self::object(key, etag)], follows, ..Statement::new(to_value(&body)) };
         let digest = self.digest(&take);
-        self.keep(&take).await;
+        self.keep(take).await;
         let body = Body { from: Some(self.uri.clone()), why: "read back from kiln's store of bytes".into(), ..Body::new(Kind::Received, &server) };
-        self.keep(&Statement { subject: vec![Self::object(key, got)], follows: vec![digest], ..Statement::new(to_value(&body)) }).await;
+        self.keep(Statement { subject: vec![Self::object(key, got)], follows: vec![digest], ..Statement::new(to_value(&body)) }).await;
     }
 
     /// A whole read of `key` that isn't what the store says: the break, recorded where kiln
