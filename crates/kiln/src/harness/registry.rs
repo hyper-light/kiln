@@ -94,6 +94,17 @@ impl Entry {
         *self.sum.get_or_init(|| crate::wire::sums::event_text(self.text()))
     }
 
+    /// Its id: what the copy finds an event by (read through here, not its JSON's tree, which goal 11's
+    /// stored form doesn't keep).
+    pub fn id(&self) -> Option<&str> {
+        self.value.get("id").and_then(Value::as_str)
+    }
+
+    /// Its number in its session's timeline.
+    pub fn seq(&self) -> Option<u64> {
+        self.value.get("seq").and_then(Value::as_u64)
+    }
+
     /// Its value, to change: its text and digest are made again when next asked for.
     pub(super) fn value_mut(&mut self) -> &mut Value {
         self.text = std::sync::OnceLock::new();
@@ -306,8 +317,9 @@ pub struct Snapshot {
 }
 
 /// One of a snapshot's frames, in the order they go: its head (`open` or `resumed`), its meta,
-/// state, changes and kept files, then its events a batch at a time (where they are among those it
-/// brings).
+/// state, changes and kept files, then its events: a whole snapshot's a chunk of the copy's at a time
+/// (`super::copies::Chunk`, each packed once: `super::packed`), a catch-up's those it brings a batch at
+/// a time (where they are among them).
 enum Part {
     Head,
     Meta,
@@ -315,6 +327,8 @@ enum Part {
     Changes,
     Files,
     Events(std::ops::Range<usize>),
+    /// The copy's chunk of events at this place among its chunks, whole.
+    Chunk(usize),
 }
 
 /// What a snapshot written out holds of its frames: where the events it brings are in its parts',
@@ -325,11 +339,12 @@ struct Plan {
 }
 
 impl Snapshot {
-    /// Its frames, in order. The events it brings are all of them, or those changed since its
-    /// revision, in batches of about [`EVENTS_FRAME`] bytes each (one alone when it's larger).
+    /// Its frames, in order. The events it brings are all of them, a frame for each of the copy's
+    /// chunks (goal 10, plan 01a1a87b2dae step 3: each chunk's frame is packed once, then taken as it
+    /// is), or those changed since its revision, in batches of about [`EVENTS_FRAME`] bytes each (one
+    /// alone when it's larger). Planned from the events' metas alone.
     fn plan(&self) -> Plan {
         let p = &self.parts;
-        let brought: Vec<usize> = p.events.iter().enumerate().filter(|(_, e)| p.since.is_none_or(|s| e.at > s)).map(|(i, _)| i).collect();
         let mut parts = vec![Part::Head];
         if !p.meta.is_null() {
             parts.push(Part::Meta);
@@ -343,9 +358,14 @@ impl Snapshot {
         if self.files.is_some() {
             parts.push(Part::Files);
         }
+        if p.since.is_none() {
+            parts.extend(p.events.chunks().iter().enumerate().filter(|(_, c)| !c.is_empty()).map(|(i, _)| Part::Chunk(i)));
+            return Plan { brought: Vec::new(), parts };
+        }
+        let brought: Vec<usize> = p.events.metas().enumerate().filter(|(_, m)| p.since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
         let (mut from, mut size) = (0usize, 0usize);
         for (i, at) in brought.iter().enumerate() {
-            let n = p.events.get(*at).map_or(0, |e| e.entry.text().len());
+            let n = p.events.meta(*at).map_or(0, |m| m.len);
             if size + n > EVENTS_FRAME && i > from {
                 parts.push(Part::Events(from..i));
                 from = i;
@@ -375,6 +395,8 @@ impl Snapshot {
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
             Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch)),
+            // Its texts joined, and the `[` and `]` around them.
+            Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).and_then(|c| c.metas().last()).map_or(0, |m| m.off + m.len) + "[]".len(),
         }
     }
 
@@ -396,6 +418,7 @@ impl Snapshot {
             },
             Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
             Part::Events(batch) => write::events(w, self.batch(plan, batch), None),
+            Part::Chunk(i) => write::events(w, p.events.chunks().get(*i).map(|c| c.evs()).unwrap_or_default().iter().map(|e| &*e.entry), None),
         }
     }
 
@@ -406,29 +429,44 @@ impl Snapshot {
         plan.parts.iter().map(|part| write::string(self.room(&plan, part), |b| self.write(&plan, part, b))).collect()
     }
 
-    /// Its frames and then `last` (the socket's `synced`), a frame a line, gzip'd as one message.
-    /// Each is written into one buffer used again for the next, and goes to the encoder whole:
-    /// written straight into the encoder, a frame's many small writes cost it more than the frame.
+    /// Its frames and then `last` (the socket's `synced`), a frame a line, gzip'd as one message, put
+    /// together from pieces (goal 10, plan 01a1a87b2dae step 3; `super::packed`): each chunk of events
+    /// as it was packed once ([`super::copies::Chunk::pack`]; the newest, which the next event changes,
+    /// deflated now and kept only once it's full), between them the few bytes of its frame stored as
+    /// they are, and the other frames deflated as they come. One gzip member: every decoder reads it.
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
-        use std::io::Write as _;
+        use flate2::Compression;
         let plan = self.plan();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        let mut frame: Vec<u8> = Vec::new();
+        let chunks = self.parts.events.chunks();
+        let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.metas().last().map_or(0, |m| m.off + m.len) / 4, |s| s.deflated.len())).sum::<usize>();
+        let mut gz = super::packed::Gzip::new(room);
+        // The frames between the chunks, deflated together.
+        let mut loose: Vec<u8> = Vec::new();
         for part in &plan.parts {
-            self.pack(&plan, part, &mut frame, &mut gz)?;
+            match part {
+                Part::Chunk(i) => {
+                    let Some(chunk) = chunks.get(*i) else { continue };
+                    gz.deflate(Compression::fast(), &loose)?;
+                    loose.clear();
+                    gz.stored(br#"{"t":"events","events":["#);
+                    if *i + 1 == chunks.len() && !chunk.is_full() {
+                        gz.segment(&chunk.deflate(Compression::fast())?);
+                    } else {
+                        let packed = chunk.pack()?;
+                        gz.segment(&packed);
+                    }
+                    gz.stored(b"]}\n");
+                }
+                other => {
+                    loose.reserve(self.room(&plan, other).saturating_add(1));
+                    self.write(&plan, other, &mut loose)?;
+                    loose.push(b'\n');
+                }
+            }
         }
-        gz.write_all(last.as_bytes())?;
-        gz.finish()
-    }
-
-    /// `part` written into `frame` (cleared first), a line, then to `gz` whole.
-    fn pack(&self, plan: &Plan, part: &Part, frame: &mut Vec<u8>, gz: &mut flate2::write::GzEncoder<Vec<u8>>) -> std::io::Result<()> {
-        use std::io::Write as _;
-        frame.clear();
-        frame.reserve(self.room(plan, part));
-        self.write(plan, part, frame)?;
-        frame.push(b'\n');
-        gz.write_all(frame)
+        loose.extend_from_slice(last.as_bytes());
+        gz.deflate(Compression::fast(), &loose)?;
+        Ok(gz.finish())
     }
 }
 
@@ -1757,7 +1795,7 @@ impl Registry {
             match keep {
                 Some(n) => {
                     let had = m.events.len();
-                    m.events.retain(|e| e.entry.get("seq").and_then(Value::as_u64).is_some_and(|q| q <= n));
+                    m.events.retain(|e| e.seq.is_some_and(|q| q <= n));
                     m.reindex();
                     // Past its machine's newest it had what the machine no longer has: its
                     // viewers let go of that too.
@@ -2159,7 +2197,7 @@ impl Registry {
     /// Machine `from` is known as `to` from now on (docs/machines.md): its sessions are there (and
     /// kept so in the conversation store), and what it offers is its. Its runner, coming back as
     /// `to`, finds them its own.
-    pub async fn move_machine(&self, hub: &Hub, from: &str, to: &str) {
+    pub async fn move_machine(&self, hub: &Hub, from: &str, to: &str) -> Vec<String> {
         let (at, now) = (Location::Machine(from.to_owned()), Location::Machine(to.to_owned()));
         let (was, there) = (at.clone(), now.clone());
         let moved: Vec<Info> = self
@@ -2190,9 +2228,42 @@ impl Registry {
         if let Some(st) = &self.convo {
             st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
         }
+        let ids: Vec<String> = moved.iter().map(|i| i.id.clone()).collect();
         for info in moved {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
+        ids
+    }
+
+    /// Sessions `moved` onto `machine`, connected now (docs/machines.md, "One record a machine"):
+    /// those its runner processes hold (`held`) and that read disconnected come back as they are
+    /// (their snapshots are asked for, the ids returned); those none of them holds aren't on the
+    /// machine, and are gone, as its next inventory would say.
+    pub async fn moved_onto_connected(&self, hub: &Hub, machine: &str, moved: &[String], held: &[String]) -> Vec<String> {
+        let mine: Vec<String> = moved.iter().filter(|id| held.contains(*id)).cloned().collect();
+        let ask = self.still_disconnected(machine, &mine);
+        let at = Location::Machine(machine.to_owned());
+        let away = Arc::new(moved.iter().filter(|id| !held.contains(*id)).cloned().collect::<Vec<String>>());
+        let gone: Vec<String> = self
+            .sessions
+            .on_each(move |s| {
+                let gone: Vec<String> = s.mirrors().filter(|(id, m)| *m.location == at && away.contains(*id)).map(|(id, _)| id.clone()).collect();
+                // Its viewers are told, and its feed's topic goes with the last of them.
+                for id in &gone {
+                    s.remove(id);
+                }
+                gone
+            })
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        self.forget_holders(&gone);
+        for id in gone {
+            super::archive::closed(hub, &id);
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
+        }
+        ask
     }
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.

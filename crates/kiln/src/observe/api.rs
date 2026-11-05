@@ -2471,10 +2471,12 @@ fn behind() -> Response {
 }
 
 /// `GET /api/observe/v1/snapshot/{snapshot}/{file}?machine=`: a snapshot's file for the machine
-/// whose member fetches it, with that machine's token.
-pub fn snapshot(snapshot: &str, file: &str, req: &Request) -> Result<Response, Fail> {
+/// whose member fetches it, with that machine's token. `machine_of` is the machine a name the
+/// runner calls itself is (docs/machines.md, "One record a machine": its certificate may carry a
+/// name from before).
+pub fn snapshot(snapshot: &str, file: &str, req: &Request, machine_of: impl Fn(&str) -> String) -> Result<Response, Fail> {
     let o = observe()?;
-    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let machine = srv::query(req).get("machine").map(|m| machine_of(m)).unwrap_or_default();
     let given = srv::header_str(req, &header::AUTHORIZATION).and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
     let want = o.token(&machine).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this node serves no snapshots"))?;
     if machine.is_empty() || !crate::util::ct_eq(given.as_bytes(), want.as_bytes()) {
