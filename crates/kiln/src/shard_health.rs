@@ -320,7 +320,7 @@ impl Shard {
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
             // At its first wake and every [`COUNTS_EVERY`]th after (this wake's number is its delay's count).
-            if self.delay.count().saturating_sub(1) % COUNTS_EVERY == 0 {
+            if self.delay.count().saturating_sub(1).is_multiple_of(COUNTS_EVERY) {
                 self.wakes.store(&Wakes::of(c));
                 self.calls.store(&Calls::of(c));
                 self.parks.store(&ParkTimes::of(c));

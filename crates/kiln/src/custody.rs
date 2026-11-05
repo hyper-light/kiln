@@ -555,7 +555,11 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
     if let Some(r) = bundle.get("refused_word") {
         let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         let word: Option<Value> = r.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str(w).ok());
-        let signer = word.as_ref().and_then(|w| statement::verify(w, &hub.pki.ca_der, &[], crate::util::now_unix()).ok()).map(|c| c.custodian).unwrap_or_default();
+        // Who signed it, read on the compute pool (goal 9, plan 01a1a87b2cec step 3).
+        let signer = match &word {
+            Some(w) => verify_off(w, &hub.pki.ca_der, Vec::new(), crate::util::now_unix()).await.ok().and_then(Result::ok).map(|c| c.custodian).unwrap_or_default(),
+            None => String::new(),
+        };
         let why = format!("session {}: {}", text("session"), text("why"));
         let refusal = Refusal { digest: word.as_ref().map(digest_of).unwrap_or_default(), act: "a hand-over's word".into(), signer, why: why.clone(), envelope: word.map(|w| w.to_string()).unwrap_or_default(), came_from, at: crate::util::now_unix(), ..Refusal::default() };
         if let Err(e) = refuse(&hub.store, refusal).await {
@@ -724,8 +728,13 @@ pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, si
         return Ok(Err(why));
     };
     let what = signed_part(ask);
+    // Checked on the compute pool, against every revocation read now, which is let go of there: a signed act's two
+    // signature checks (one again without the revocations when it's refused) and the whole list's free were each of a
+    // runner's agents' signed asks' on its shard (goal 9, plan 01a1a87b2cec step 3).
     let revocations = crate::identities::revocations(&hub.store).await?;
-    match act_check(&act, &hub.pki.ca_der, &revocations, &held, what.as_bytes(), at) {
+    let (pki, holder) = (std::sync::Arc::clone(&hub.pki), held.clone());
+    let (checked, act) = crate::rt::compute(move || (act_check(&act, &pki.ca_der, &revocations, &holder, what.as_bytes(), at), act)).await?;
+    match checked {
         Ok(()) => Ok(Ok(())),
         Err((signer, why)) => {
             refuse(&hub.store, record(signer.clone(), epoch_of(&signer), why.clone(), Some(&act))).await?;
@@ -777,7 +786,11 @@ pub async fn refused_work_act(hub: &crate::hub::Hub, machine: &str, instance: &s
 #[allow(clippy::too_many_arguments)]
 async fn refused_act_of(hub: &crate::hub::Hub, machine: &str, instance: &str, session: &str, ask: &Value, why: &str, transfer: Option<String>, at: i64) -> anyhow::Result<String> {
     let act = ask.get("act").and_then(Value::as_str).and_then(|a| serde_json::from_str::<Value>(a).ok());
-    let signer = act.as_ref().and_then(|a| statement::verify(a, &hub.pki.ca_der, &[], at).ok()).map(|c| c.custodian).unwrap_or_default();
+    // Who signed it, revocations aside, read on the compute pool (goal 9, plan 01a1a87b2cec step 3).
+    let signer = match &act {
+        Some(a) => verify_off(a, &hub.pki.ca_der, Vec::new(), at).await.ok().and_then(Result::ok).map(|c| c.custodian).unwrap_or_default(),
+        None => String::new(),
+    };
     // The epoch it's from: the one it's signed at, or, unsigned, the newest kiln certified this
     // process for the session at.
     let epoch = match epoch_of(&signer) {
@@ -857,15 +870,19 @@ async fn issued_at(store: &Store, subject: &str) -> anyhow::Result<Option<i64>> 
 /// when): to the session at the next epoch, whichever process takes it, following that process's
 /// receipt of it if kiln has one. Kept here at once, and carried in the session's package: its
 /// receipt follows it as a hand-on's does (docs/ci.md W27-R08). None if kiln never certified the
-/// session at that epoch: it goes on unsigned, as before.
-pub async fn take_for(store: &Store, pki: &crate::pki::Pki, session: &str, epoch: u64, events: &[crate::harness::model::Event], why: &str) -> anyhow::Result<Option<Value>> {
+/// session at that epoch: it goes on unsigned, as before. `timeline` is the session's timeline as it leaves that epoch
+/// ([`timeline`]), worked out where its package is made, off the shards: it's every event's digest (goal 9, plan
+/// 01a1a87b2cec step 3).
+pub async fn take_for(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>, session: &str, epoch: u64, timeline: statement::Subject, why: &str) -> anyhow::Result<Option<Value>> {
     let Some(holder) = crate::identities::holder_at(store, session, epoch).await? else { return Ok(None) };
     let org = pki.organization();
     let to = at_epoch(&holder, epoch.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("{holder} isn't an agent session's identity"))?;
     let body = custody::Body { taken_for: Some(holder.clone()), to: Some(to), why: why.to_owned(), epoch: Some(epoch.saturating_add(1)), ..custody::Body::new(Kind::Taken, &server_uri(&org)) };
     let follows = receipt_of(store, &holder).await?.into_iter().collect();
-    let s = statement::Statement { subject: vec![timeline(session, epoch, events)], follows, ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(pki, &s)?;
+    let s = statement::Statement { subject: vec![timeline], follows, ..statement::Statement::new(custody::to_value(&body)) };
+    // Signed on the compute pool: the server's key and certificate read from their files, and the signature, were the
+    // owner's shard's as a session's machine stayed away (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(pki, s).await?;
     match take(store, &pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(_) => Ok(Some(bundle)),
         Err(why) => anyhow::bail!("kiln refused its own take: {why}"),
@@ -1344,8 +1361,9 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
         Ok(t) => t.digest,
         Err(why) => return Ok(Err(format!("its hand-on was refused: {why}"))),
     };
-    // Kept, so checked when kiln took it: read again, revocations aside.
-    let b = statement::verify(&given, root, &[], at).map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
+    // Kept, so checked when kiln took it: read again, revocations aside, on the compute pool (goal 9, plan 01a1a87b2cec
+    // step 3: a hand-over's two checks were the hub's loop's, as it answered the runner's ask for its identity).
+    let b = verify_off(&given, root, Vec::new(), at).await?.map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
     if let Err(why) = hands_on_to(&b, issued, epoch) {
         return Ok(Err(why));
     }
@@ -1362,7 +1380,7 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
     if let Some(broke) = &got.broke {
         tracing::warn!(target: "kiln.custody", record = %got.digest, %broke, "a hand-over's receipt breaks its chain");
     }
-    let follows = statement::verify(&bundle, root, &[], at).map(|c| c.statement.follows).unwrap_or_default();
+    let follows = verify_off(&bundle, root, Vec::new(), at).await?.map(|c| c.statement.follows).unwrap_or_default();
     if !follows.contains(&handed) {
         return Ok(Err(format!("its receipt doesn't follow its hand-on {handed}")));
     }
@@ -2241,6 +2259,22 @@ mod tests {
     use rcgen::SigningKey as _;
 
     const ORG: &str = "hyper-light";
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what custody checks or signs as runners' agents act, refuse and hand over, and as
+    /// kiln takes a session it resumes, is done off the shards: no signature is checked or made in those functions' own
+    /// code, only in the compute or blocking pool's jobs they hand it to (`verify_off`, `server_signed_off`, `act_check`
+    /// in a job). What each finds is the W27 tests'.
+    #[test]
+    fn g9_s3_custodys_signatures_are_checked_and_made_off_the_shards() {
+        let code: String = include_str!("custody.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let body = |head: &str| code.split(head).nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default().to_owned();
+        for f in ["pub async fn act_counts(", "async fn refused_act_of(", "pub async fn take_for(", "pub async fn transfer(", "pub async fn on_runner("] {
+            let b = body(f);
+            assert!(!b.is_empty(), "{f} not found");
+            assert!(!b.contains("statement::verify(") && !b.contains("server_signed(pki"), "{f} checks or signs on its shard: {b}");
+        }
+        assert!(body("pub async fn act_counts(").contains("crate::rt::compute(move || (act_check("), "act_counts checks in a job");
+    }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a record that waited for this one is checked with kiln's root and every
     /// revocation handed to its loads' compute jobs as they're shared, not copied on its shard for each of its two

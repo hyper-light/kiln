@@ -923,9 +923,10 @@ impl Store {
         self.inner.revoked.load_full()
     }
 
-    /// Keeps `revoked`, read just now, for the reads after it (`crate::identities::revoked_now`).
-    pub(crate) fn keep_revoked(&self, revoked: Arc<crate::identities::Revoked>) {
-        self.inner.revoked.store(Some(revoked));
+    /// Keeps `revoked`, read just now, for the reads after it (`crate::identities::revoked_now`): what it kept before comes
+    /// back, for its caller to let go of off the shards (every revocation, freed one by one where it's dropped).
+    pub(crate) fn keep_revoked(&self, revoked: Arc<crate::identities::Revoked>) -> Option<Arc<crate::identities::Revoked>> {
+        self.inner.revoked.swap(Some(revoked))
     }
 
     /// How many calls and reads it's been asked for, ever: what shows a read answered without it

@@ -56,7 +56,35 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                 Ok(Err(e)) | Err(e) => tracing::debug!(error = %format!("{e:#}"), "the conversation store's peers couldn't be read"),
             }
         }
-        let status = hub.harness.board.sample(&seen(&hub));
-        crate::metrics::set_convo(&status);
+        sample(&hub).await;
+    }
+}
+
+/// A sample of every store ([`crate::convo::board::Board::sample`]), `/metrics` told of it, on the compute pool: what the
+/// server sees of each store, each one's series and rates, its notes and the log, every few seconds on this task's shard
+/// (goal 9, plan 01a1a87b2cec step 3). Waited for, so the samples keep their order.
+pub(crate) async fn sample(hub: &Arc<Hub>) {
+    let h = Arc::clone(hub);
+    if let Err(e) = crate::rt::compute(move || crate::metrics::set_convo(&h.harness.board.sample(&seen(&h)))).await {
+        tracing::debug!(error = %format!("{e:#}"), "the conversation stores weren't sampled");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a sample made on the compute pool is the board's: its first says telemetry began,
+    /// and the board answers that from then on.
+    #[test]
+    fn g9_s3_a_sample_is_made_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let began = |hub: &Hub| status(hub).notes.iter().any(|n| n.text.starts_with("telemetry began"));
+            anyhow::ensure!(!began(&hub), "nothing sampled yet");
+            sample(&hub).await;
+            anyhow::ensure!(began(&hub), "sampled: {:?}", status(&hub).notes.iter().map(|n| n.text.clone()).collect::<Vec<_>>());
+            Ok(())
+        })
     }
 }
