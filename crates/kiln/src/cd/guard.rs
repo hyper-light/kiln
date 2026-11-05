@@ -896,7 +896,7 @@ impl Cd {
         let _ = self.store.submit(Command::PutSetting(SETTING.into(), Value::Null)).await;
         // A failed one counts as attempted: automation doesn't deploy the same content again.
         if let Some(content) = m.content {
-            self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded });
+            self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded }).await;
         }
         if succeeded {
             tracing::info!(app = %m.app, message = %message, "deployments: a self-deploy took");
