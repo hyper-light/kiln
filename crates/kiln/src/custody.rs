@@ -134,7 +134,7 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
     }
     let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest.clone(), act: act.to_owned(), signer, why, envelope: envelope.clone(), came_from: came_from.to_owned(), at, ..Refusal::default() };
     let (kind, rows) = match verdict {
-        Verdict::Custody { kind, rows } => (kind, rows),
+        Verdict::Custody { kind, rows } => (kind, *rows),
         Verdict::Unsigned { why, signer } => {
             // Who signed it, as its certificate says, revocations aside (`read`): a copy left
             // behind signs as the epoch it left.
@@ -181,7 +181,7 @@ enum Verdict {
     /// It checks, but isn't a custody record or a delegation kiln reads: what it was taken for, why, and its signer.
     NotCustody { act: &'static str, why: String, custodian: String },
     /// A custody record (its kind) or a delegation (none), with the rows that keep it.
-    Custody { kind: Option<Kind>, rows: Rows },
+    Custody { kind: Option<Kind>, rows: Box<Rows> },
 }
 
 /// `bundle` read for [`take`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): its digest, its
@@ -217,7 +217,7 @@ fn verdict_of(c: &Checked, envelope: String, came_from: String) -> Verdict {
         },
         other => return not("a signed statement", format!("it's a {other} statement, not a custody record or a delegation")),
     };
-    Verdict::Custody { kind, rows: rows(c, kind, counterpart, envelope, came_from) }
+    Verdict::Custody { kind, rows: Box::new(rows(c, kind, counterpart, envelope, came_from)) }
 }
 
 /// The records that act under delegation `digest`.
