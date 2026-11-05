@@ -3,9 +3,9 @@
 //! `kiln.machines.run` are answered at once, started, queued or never, and a queued run waits as
 //! probes at the runners that could take it until one admits it.
 //!
-//! - **The asking node owns its run** ([`owner`], Ray's ownership): it probes every runner whose
-//!   constraints the run meets, takes the first offer (no scan: O(1)), withdraws the rest, and sends
-//!   the run's start to that one runner only. It goes back to waiting only on that runner's word
+//! - **The asking node owns its run** ([`owner`], Ray's ownership): it probes two runners drawn at
+//!   random among those whose constraints the run meets (the power of two choices), takes the
+//!   emptiest offer, declines the other, and sends the run's start to that one runner only. It goes back to waiting only on that runner's word
 //!   that it never started it, never on its silence, so no run starts twice.
 //! - **The runner that owns the room admits** ([`runner`], HTCondor's claiming): against its own
 //!   measured room, never past its budget (G1), its line ordered by class and fair share
@@ -24,12 +24,15 @@
 
 pub mod answer;
 pub mod ask;
+pub mod keys;
 pub mod line;
 pub mod link;
 pub mod msg;
 pub mod owner;
 pub mod runner;
 
+#[cfg(test)]
+mod balance_tests;
 #[cfg(test)]
 mod model;
 #[cfg(test)]
