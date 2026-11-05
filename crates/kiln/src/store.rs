@@ -827,6 +827,7 @@ impl Store {
         R: Send + 'static,
     {
         self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::reads::trace::asked();
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
@@ -859,6 +860,7 @@ impl Store {
         R: Send + 'static,
     {
         self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::reads::trace::asked();
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
@@ -878,6 +880,7 @@ impl Store {
         R: Send + 'static,
     {
         self.inner.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::reads::trace::asked();
         #[cfg(test)]
         if let Some(c) = &self.inline {
             yield_once().await;
@@ -1214,20 +1217,7 @@ impl Store {
     }
 
     pub async fn runs(&self, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
-        self.read(move |c| {
-            let mut st = c.prepare(
-                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
-                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
-                        r.error, r.concurrency_group
-                 FROM runs r JOIN repos p ON p.id = r.repo_id
-                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
-                   AND (?3 IS NULL OR r.created_at < ?3)
-                 ORDER BY r.created_at DESC, r.number DESC LIMIT ?2",
-            )?;
-            let rows = st.query_map(params![repo, limit.min(500), before], row_run)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await
+        self.read(move |c| runs_on(c, repo.as_deref(), limit, before)).await
     }
 
     /// [`Self::runs`], of the repositories named only.
@@ -1258,24 +1248,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        self.read(move |c| {
-            let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
-            let rows = st.query_map([serde_json::to_string(&ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
-            let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
-            for row in rows {
-                let (run, agent, executor) = row?;
-                let hosts = out.entry(run).or_default();
-                for (list, v) in [(&mut hosts.0, agent), (&mut hosts.1, executor)] {
-                    if let Some(v) = v.filter(|v| !v.is_empty())
-                        && !list.contains(&v)
-                    {
-                        list.push(v);
-                    }
-                }
-            }
-            Ok(out)
-        })
-        .await
+        self.read(move |c| run_hosts_on(c, &ids)).await
     }
 
     pub async fn runs_sorted(&self, among: Option<Vec<String>>, repo: Option<String>, order: &str, limit: u32, offset: u32) -> anyhow::Result<Vec<Run>> {
@@ -1781,64 +1754,7 @@ impl Store {
     /// a person of some repositories, W10).
     pub async fn stats(&self, among: Option<Vec<String>>) -> anyhow::Result<serde_json::Value> {
         let among = among.map(|names| serde_json::to_string(&names).unwrap_or_default());
-        self.read(move |c| {
-            let since = crate::util::now_unix() - 86_400;
-            // `?2`: the repositories, or NULL for all of them.
-            const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
-            const JOBS_IN: &str = "(?2 IS NULL OR run_id IN (SELECT r.id FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name IN (SELECT value FROM json_each(?2))))";
-            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(&sql.replace("{RUNS_IN}", RUNS_IN), params![since, among], |r| r.get(0)) };
-            let mut by_status = serde_json::Map::new();
-            {
-                let mut st = c.prepare(&format!("SELECT status, COUNT(*) FROM jobs WHERE (COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running')) AND {JOBS_IN} GROUP BY status"))?;
-                let rows = st.query_map(params![since, among], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-                for row in rows {
-                    let (s, n) = row?;
-                    by_status.insert(s, n.into());
-                }
-            }
-            let mut hourly = Vec::new();
-            {
-                let mut st = c.prepare(&format!(
-                    "SELECT (finished_at / 3600) * 3600 AS h,
-                            SUM(status = 'succeeded'), SUM(status IN ('failed','timed_out')),
-                            AVG(finished_at - started_at)
-                     FROM jobs WHERE finished_at >= ?1 AND {JOBS_IN} GROUP BY h ORDER BY h"
-                ))?;
-                let rows = st.query_map(params![since, among], |r| {
-                    Ok(serde_json::json!({
-                        "ts": r.get::<_, i64>(0)?,
-                        "succeeded": r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                        "failed": r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                        "avg_seconds": r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    }))
-                })?;
-                let mut found = std::collections::HashMap::new();
-                for row in rows {
-                    let v = row?;
-                    found.insert(v.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0), v);
-                }
-                // A fixed 24-bucket series (zero-filled) so charts keep a real time axis.
-                let first = (since / 3600 + 1) * 3600;
-                for h in 0..24 {
-                    let ts = first + h * 3600;
-                    hourly.push(found.remove(&ts).unwrap_or_else(|| {
-                        serde_json::json!({ "ts": ts, "succeeded": 0, "failed": 0, "avg_seconds": 0.0 })
-                    }));
-                }
-            }
-            Ok(serde_json::json!({
-                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND {RUNS_IN}")?,
-                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out') AND {RUNS_IN}")?,
-                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded' AND {RUNS_IN}")?,
-                "median_job_seconds": c.query_row(
-                    &format!("SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN}
-                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN})"),
-                    params![since, among], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
-                "jobs_by_status": by_status,
-                "hourly": hourly,
-            }))
-        })
-        .await
+        self.read(move |c| stats_in(c, crate::util::now_unix() - 86_400, among.as_deref())).await
     }
 
     /// How many jobs of these repositories (by name) wait and run: a person of some repositories'
@@ -1914,29 +1830,7 @@ impl Store {
     }
 
     pub async fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
-        self.read(|c| {
-            let mut st = c.prepare(
-                "SELECT name, labels, slots, hostname, os, arch, version, ephemeral, connected,
-                        last_seen, enrolled_at FROM agents ORDER BY connected DESC, COALESCE(label, name)",
-            )?;
-            let rows = st.query_map([], |r| {
-                Ok(AgentRow {
-                    name: r.get(0)?,
-                    labels: from_json(&r.get::<_, String>(1)?),
-                    slots: r.get(2)?,
-                    hostname: r.get(3)?,
-                    os: r.get(4)?,
-                    arch: r.get(5)?,
-                    version: r.get(6)?,
-                    ephemeral: r.get(7)?,
-                    connected: r.get(8)?,
-                    last_seen: r.get(9)?,
-                    enrolled_at: r.get(10)?,
-                })
-            })?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await
+        self.read(agents_on).await
     }
 
     pub async fn delete_agent(&self, name: String) -> anyhow::Result<()> {
@@ -2097,22 +1991,12 @@ impl Store {
 
     /// Each agent's label, by name: those that have one.
     pub async fn agent_labels(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        self.read(|c| {
-            let mut st = c.prepare("SELECT name, label FROM agents WHERE label IS NOT NULL")?;
-            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-        .await
+        self.read(agent_labels_on).await
     }
 
     /// Each agent's machine, by name: those whose runner said it.
     pub async fn agent_machines(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        self.read(|c| {
-            let mut st = c.prepare("SELECT name, machine_id FROM agents WHERE machine_id IS NOT NULL")?;
-            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-        .await
+        self.read(agent_machines_on).await
     }
 
     // ---------------------------------------------------------------- key/value
@@ -2453,6 +2337,201 @@ fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option
         return Ok(Some(status));
     }
     Ok(None)
+}
+
+// ------------------------------------------------------- reads kept in memory (goal 10, plan 01a1a87b2dae step 2)
+
+/// Every agent's row, connected first ([`Store::agents`]).
+fn agents_on(c: &Connection) -> anyhow::Result<Vec<AgentRow>> {
+    let mut st = c.prepare(
+        "SELECT name, labels, slots, hostname, os, arch, version, ephemeral, connected,
+                last_seen, enrolled_at FROM agents ORDER BY connected DESC, COALESCE(label, name)",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(AgentRow {
+            name: r.get(0)?,
+            labels: from_json(&r.get::<_, String>(1)?),
+            slots: r.get(2)?,
+            hostname: r.get(3)?,
+            os: r.get(4)?,
+            arch: r.get(5)?,
+            version: r.get(6)?,
+            ephemeral: r.get(7)?,
+            connected: r.get(8)?,
+            last_seen: r.get(9)?,
+            enrolled_at: r.get(10)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Each agent's label, by name: those with one ([`Store::agent_labels`]).
+fn agent_labels_on(c: &Connection) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut st = c.prepare("SELECT name, label FROM agents WHERE label IS NOT NULL")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Each agent's machine, by name: those whose runner said it ([`Store::agent_machines`]).
+fn agent_machines_on(c: &Connection) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut st = c.prepare("SELECT name, machine_id FROM agents WHERE machine_id IS NOT NULL")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The tables the runners' rows are in: `agents` alone, written as a runner connects, goes, is
+/// labelled or says its machine, never as it's heard from (its live record has that).
+pub const AGENT_ROWS_FROM: &[&str] = &["agents"];
+
+/// What `GET /api/agents` and the overview read of the store ([`crate::hub::Hub::agent_list`]): every
+/// agent's row, label and machine, kept in memory (`crate::reads::Kept`).
+#[derive(Debug, Clone, Default)]
+pub struct AgentRows {
+    pub rows: Vec<AgentRow>,
+    pub labels: std::collections::HashMap<String, String>,
+    pub machines: std::collections::HashMap<String, String>,
+}
+
+/// The runners' rows as the store holds them now, in one read.
+pub fn agent_rows(c: &Connection) -> anyhow::Result<AgentRows> {
+    Ok(AgentRows { rows: agents_on(c)?, labels: agent_labels_on(c)?, machines: agent_machines_on(c)? })
+}
+
+/// Runs, newest first: of repository `repo` (its id or name) or all, created before `before` when
+/// given, `limit` of them (500 at most) ([`Store::runs`]).
+pub fn runs_on(c: &Connection, repo: Option<&str>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
+    let mut st = c.prepare(
+        "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                r.error, r.concurrency_group
+         FROM runs r JOIN repos p ON p.id = r.repo_id
+         WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+           AND (?3 IS NULL OR r.created_at < ?3)
+         ORDER BY r.created_at DESC, r.number DESC LIMIT ?2",
+    )?;
+    let rows = st.query_map(params![repo, limit.min(500), before], row_run)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The runners and executors the legs of each run `ids` names ran on, by run ([`Store::run_hosts`]).
+pub fn run_hosts_on(c: &Connection, ids: &[String]) -> anyhow::Result<std::collections::HashMap<String, (Vec<String>, Vec<String>)>> {
+    let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
+    let rows = st.query_map([serde_json::to_string(ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
+    for row in rows {
+        let (run, agent, executor) = row?;
+        let hosts = out.entry(run).or_default();
+        for (list, v) in [(&mut hosts.0, agent), (&mut hosts.1, executor)] {
+            if let Some(v) = v.filter(|v| !v.is_empty())
+                && !list.contains(&v)
+            {
+                list.push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The last day's runs and jobs ([`Store::stats`]) from `since` on, every repository's or `among` these
+/// (their names, as a JSON array).
+fn stats_in(c: &Connection, since: i64, among: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    // `?2`: the repositories, or NULL for all of them.
+    const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
+    const JOBS_IN: &str = "(?2 IS NULL OR run_id IN (SELECT r.id FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name IN (SELECT value FROM json_each(?2))))";
+    let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(&sql.replace("{RUNS_IN}", RUNS_IN), params![since, among], |r| r.get(0)) };
+    let mut by_status = serde_json::Map::new();
+    {
+        let mut st = c.prepare(&format!("SELECT status, COUNT(*) FROM jobs WHERE (COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running')) AND {JOBS_IN} GROUP BY status"))?;
+        let rows = st.query_map(params![since, among], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (s, n) = row?;
+            by_status.insert(s, n.into());
+        }
+    }
+    let mut hourly = Vec::new();
+    {
+        let mut st = c.prepare(&format!(
+            "SELECT (finished_at / 3600) * 3600 AS h,
+                    SUM(status = 'succeeded'), SUM(status IN ('failed','timed_out')),
+                    AVG(finished_at - started_at)
+             FROM jobs WHERE finished_at >= ?1 AND {JOBS_IN} GROUP BY h ORDER BY h"
+        ))?;
+        let rows = st.query_map(params![since, among], |r| {
+            Ok(serde_json::json!({
+                "ts": r.get::<_, i64>(0)?,
+                "succeeded": r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                "failed": r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                "avg_seconds": r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            }))
+        })?;
+        let mut found = std::collections::HashMap::new();
+        for row in rows {
+            let v = row?;
+            found.insert(v.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0), v);
+        }
+        // A fixed 24-bucket series (zero-filled) so charts keep a real time axis.
+        let first = (since / 3600 + 1) * 3600;
+        for h in 0..24 {
+            let ts = first + h * 3600;
+            hourly.push(found.remove(&ts).unwrap_or_else(|| {
+                serde_json::json!({ "ts": ts, "succeeded": 0, "failed": 0, "avg_seconds": 0.0 })
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND {RUNS_IN}")?,
+        "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out') AND {RUNS_IN}")?,
+        "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded' AND {RUNS_IN}")?,
+        "median_job_seconds": c.query_row(
+            &format!("SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN}
+             ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN})"),
+            params![since, among], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
+        "jobs_by_status": by_status,
+        "hourly": hourly,
+    }))
+}
+
+/// The tables the last day's figures are made of.
+pub const STATS_FROM: &[&str] = &["runs", "jobs", "repos"];
+
+/// The last day's figures of every repository ([`Store::stats`]), kept in memory (`crate::reads::Kept`)
+/// with the seconds they hold through whatever isn't written: made at `made_at`, they're what a read
+/// at any second up to `until` would say, the window then (the day up to that second) having lost
+/// none of the rows it counted and its hours being the same ([`stats_now`]).
+#[derive(Debug, Clone)]
+pub struct Stats {
+    pub json: serde_json::Value,
+    pub made_at: i64,
+    pub until: i64,
+}
+
+impl Stats {
+    /// Whether they're what a read now would say (the store's tables aside).
+    pub fn holds_now(&self) -> bool {
+        (self.made_at..=self.until).contains(&crate::util::now_unix())
+    }
+}
+
+/// The last day's figures of every repository as the store holds them now, and until when they hold.
+/// A read at second `t` counts the rows of the day before it (from `t - 86400` on) and buckets their
+/// hours from the one after `t - 86400`'s: past `made_at`, the window loses rows only as the oldest
+/// counted leaves it (a second after it's a day old), and its hours change only with `t`'s hour.
+pub fn stats_now(c: &Connection) -> anyhow::Result<Stats> {
+    let now = crate::util::now_unix();
+    let since = now - 86_400;
+    let json = stats_in(c, since, None)?;
+    let oldest: Option<i64> = c.query_row(
+        "SELECT MIN(x) FROM (SELECT MIN(created_at) AS x FROM runs WHERE created_at >= ?1
+                             UNION ALL SELECT MIN(COALESCE(finished_at, queued_at, 0)) FROM jobs WHERE COALESCE(finished_at, queued_at, 0) >= ?1
+                             UNION ALL SELECT MIN(finished_at) FROM jobs WHERE finished_at >= ?1)",
+        [since],
+        |r| r.get(0),
+    )?;
+    let hour_ends = now.div_euclid(3600) * 3600 + 3599;
+    Ok(Stats { json, made_at: now, until: oldest.map_or(hour_ends, |x| hour_ends.min(x + 86_400)) })
 }
 
 #[cfg(test)]

@@ -672,6 +672,12 @@ impl NetMetrics {
             .collect()
     }
 
+    /// The frames dropped toward every runner, as they stand now: a copy swapped in whole at each drop,
+    /// so by its identity a read kept in memory knows they changed (`crate::reads::AgentsKey`).
+    pub fn toward_all(&self) -> std::sync::Arc<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>> {
+        self.toward.get()
+    }
+
     /// What this process dropped of what it had for `peer`, by lane and reason.
     pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
         self.toward

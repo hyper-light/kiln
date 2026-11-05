@@ -992,13 +992,17 @@ impl Hub {
     /// runners' ([`crate::rcu::Rcu::update`]: `f` may run again, on a newer copy, so it only changes
     /// the record it's given), and what `f` said; none when the runner isn't known.
     pub(crate) fn change_agent<R>(&self, name: &str, mut f: impl FnMut(&mut AgentLive) -> R) -> Option<R> {
-        self.agents.update(|m| m.get_mut(name).map(|a| f(Arc::make_mut(a))))
+        let changed = self.agents.update(|m| m.get_mut(name).map(|a| f(Arc::make_mut(a))));
+        // `GET /api/agents` and the overview, kept encoded, are made again (goal 10, plan 01a1a87b2dae step 2).
+        self.harness.views.changed();
+        changed
     }
 
     /// Runner `a`'s live record from now on, in place of one by its name.
     pub(crate) fn put_agent(&self, a: AgentLive) {
         let a = Arc::new(a);
         self.agents.update(|m| m.insert(a.name.clone(), Arc::clone(&a)));
+        self.harness.views.changed();
     }
 
     /// Where `msg` for machine `name` goes ([`crate::instances::Instances::route`]): read from the
@@ -1198,6 +1202,8 @@ impl Hub {
     }
 
     pub fn emit_queue(&self) {
+        // The overview says them (goal 10, plan 01a1a87b2dae step 2).
+        self.harness.views.changed();
         let m = metrics::global();
         self.emit(&ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: m.jobs_queued.get(), running: m.jobs_running.get() }));
     }
@@ -1210,6 +1216,10 @@ impl Hub {
             }
             q.push_back(s.clone());
         });
+        // The overview says the server's newest (goal 10, plan 01a1a87b2dae step 2).
+        if agent == "server" {
+            self.harness.views.changed();
+        }
         if agent != "server" {
             metrics::agent_samples().update(|m| m.insert(agent.to_owned(), s.clone()));
             // A runner too old to report its own figures (`crate::observe::host`): its samples, as
@@ -1228,7 +1238,13 @@ impl Hub {
         let rows = self.store.agents().await.unwrap_or_default();
         let labels = self.store.agent_labels().await.unwrap_or_default();
         let machines = self.store.agent_machines().await.unwrap_or_default();
-        let live = self.agents.get();
+        self.agent_list_of(rows, &labels, &machines, &self.agents.get())
+    }
+
+    /// [`Hub::agent_list`] of the store's rows, labels and machines given (kept in memory for `GET
+    /// /api/agents` and the overview: goal 10, plan 01a1a87b2dae step 2) and the runners' live records
+    /// `live`.
+    pub fn agent_list_of(&self, rows: Vec<crate::store::AgentRow>, labels: &HashMap<String, String>, machines: &HashMap<String, String>, live: &HashMap<String, Arc<AgentLive>>) -> Vec<AgentLive> {
         let mut out: Vec<AgentLive> = rows
             .into_iter()
             .map(|r| match live.get(&r.name) {
