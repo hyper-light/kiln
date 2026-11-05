@@ -2095,9 +2095,12 @@ impl Hub {
                 _ => None,
             };
             let began = Instant::now();
+            // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
+            // once it's read (goal 9, plan 01a1a87b2cec step 3).
+            let label = Self::net_label(&ev);
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied.
-            if let Err(e) = self.on_net(ev).await {
+            if let Err(e) = crate::rt::labeled(label, self.on_net(ev)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
             if let Some(at) = arrived {
@@ -2106,6 +2109,29 @@ impl Hub {
             turns.after().await;
         }
         anyhow::bail!("transport event stream ended")
+    }
+
+    /// Whether a frame of `kind` on `lane` is job output: bulk frames are, but on the conversation
+    /// feed's and the files' lanes (messages, in bulk).
+    fn job_log(kind: Kind, lane: u32) -> bool {
+        kind == Kind::Log && lane != proto::LANE_CONVO && lane != proto::LANE_FILES
+    }
+
+    /// What [`Hub::net_loop`] labels its polls with for event `ev` in the shards' table of what held
+    /// them (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 3); a runner's message, read, then by its
+    /// kind (`crate::wire::agent_label`).
+    fn net_label(ev: &NetEvent) -> &'static hyper_rt::slow::Label {
+        use hyper_rt::slow::Label;
+        static CONNECTED: Label = Label { name: "runner connected" };
+        static CLOSED: Label = Label { name: "runner closed" };
+        static LOG: Label = Label { name: "runner job log" };
+        static FRAME: Label = Label { name: "runner frame" };
+        match ev {
+            NetEvent::Connected { .. } => &CONNECTED,
+            NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => &CLOSED,
+            NetEvent::Frame { kind, lane, .. } if Self::job_log(*kind, *lane) => &LOG,
+            NetEvent::Frame { .. } => &FRAME,
+        }
     }
 
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
@@ -2162,9 +2188,7 @@ impl Hub {
                     }
                 }
             }
-            // Bulk frames are job output, but on the conversation feed's and the files' lanes
-            // (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
+            NetEvent::Frame { peer, kind, lane, data, .. } if Self::job_log(kind, lane) => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
                         // Written on the blocking pool, in order (each waited for): a busy disk
@@ -2191,7 +2215,7 @@ impl Hub {
                         tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
                     }
                 }
-                crate::wire::payload::Frame::Read(carried) => self.on_carried(peer, carried).await?,
+                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, self.on_carried(peer, carried)).await?,
                 crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
             },
         }
