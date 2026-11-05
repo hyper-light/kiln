@@ -135,10 +135,14 @@ impl Mirrors {
         self.store.id()
     }
 
+    /// Which runners were chosen, kept as `mirrors.json`, whole and synced to the disk, off the caller's
+    /// thread (`crate::keep::synced`): a runner's Build picks them again on the hub's loop, whose shard
+    /// waited on the disk for the file and its folder, 5 to 34 ms in the lab's g9p6 (goal 9, plan
+    /// 01a1a87b2cec step 3). Kept in the order chosen, the newest written.
     fn save(&self, chosen: &[Chosen]) {
-        let written = serde_json::to_vec(chosen).map_err(anyhow::Error::from).and_then(|b| crate::sync::group::save_atomic(&self.file, &b).map_err(anyhow::Error::from));
-        if let Err(e) = written {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't keep which runners mirror the conversation store");
+        match serde_json::to_vec(chosen) {
+            Ok(b) => crate::keep::synced(self.file.clone(), b),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "couldn't keep which runners mirror the conversation store"),
         }
     }
 
@@ -320,8 +324,22 @@ mod tests {
             assert_eq!(m.view().iter().map(|v| v.machine.as_str()).collect::<Vec<_>>(), vec!["early"]);
             m.connected(vec![cand("early", 100, 10), cand("named", 200, 10)]);
             assert_eq!(m.view().iter().map(|v| v.machine.as_str()).collect::<Vec<_>>(), vec!["named"]);
+            // Written before the test's folder goes.
+            kept(&dir.path().join("mirrors.json"), &["named"]).await?;
             Ok(())
         })
+    }
+
+    /// The chosen as `file` holds them, once the writer has written them (`crate::keep`).
+    async fn kept(file: &std::path::Path, machines: &[&str]) -> anyhow::Result<()> {
+        for _ in 0..500 {
+            let held: Vec<Chosen> = std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            if held.iter().map(|c| c.machine.as_str()).eq(machines.iter().copied()) {
+                return Ok(());
+            }
+            crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("{} doesn't hold {machines:?}: {:?}", file.display(), std::fs::read_to_string(file))
     }
 
     #[test]
@@ -332,6 +350,7 @@ mod tests {
             let (m, _out) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone(), None);
             m.connected(vec![cand("b", 200, 10), cand("a", 100, 10)]);
             assert_eq!(m.view().iter().map(|v| v.machine.as_str()).collect::<Vec<_>>(), vec!["a"]);
+            kept(&file, &["a"]).await?;
             // Kept across a restart of the server, and while it's away (a day at most).
             let (m2, _out2) = Mirrors::start(store.clone(), 1, Vec::new(), file.clone(), None);
             m2.connected(vec![cand("b", 200, 10)]);
@@ -339,9 +358,32 @@ mod tests {
             // Away for longer: replaced.
             let stale = vec![Chosen { machine: "a".into(), chosen_at: 0, last_seen: crate::util::now_ms() - AWAY_MS - 1 }];
             std::fs::write(&file, serde_json::to_vec(&stale)?)?;
-            let (m3, _out3) = Mirrors::start(store, 1, Vec::new(), file, None);
+            let (m3, _out3) = Mirrors::start(store, 1, Vec::new(), file.clone(), None);
             m3.connected(vec![cand("b", 200, 10)]);
             assert_eq!(m3.view().iter().map(|v| (v.machine.as_str(), v.connected)).collect::<Vec<_>>(), vec![("b", true)]);
+            kept(&file, &["b"]).await?;
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the mirrors chosen as a runner's Build comes (on the hub's loop) are
+    /// kept by the writer, synced, off the caller's thread, which makes no file call for them; a choice made
+    /// while the last is on its way is written as the newest.
+    #[test]
+    fn g9_s3_the_mirrors_chosen_are_kept_off_the_callers_thread() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (dir, store) = super::super::store::scratch()?;
+            let file = dir.path().join("mirrors.json");
+            let (m, _out) = Mirrors::start(store, 2, Vec::new(), file.clone(), None);
+            m.connected(vec![cand("a", 100, 10)]);
+            anyhow::ensure!(crate::keep::kept_through(&file) == Some(true), "the choice goes to the writer, to be written synced");
+            m.connected(vec![cand("a", 100, 10), cand("b", 200, 10)]);
+            kept(&file, &["a", "b"]).await?;
+            // The code that chooses makes no file call of its own to keep them: the writer's alone.
+            let code: String = include_str!("mirror.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            for call in ["save_atomic", "fs::write", "sync_all", "File::create"] {
+                anyhow::ensure!(!code.contains(call), "mirror.rs calls {call}");
+            }
             Ok(())
         })
     }

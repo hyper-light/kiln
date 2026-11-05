@@ -21,14 +21,15 @@
 # directory, the stubs and extra macOS link arguments (regen-macos-stubs.sh uses them).
 #
 # The Linux binaries' allocator (goal 11, plan 01a1a87b2e56 step 4; docs/runtime-lab.md, "The allocator
-# (step 4)"): `musl`, musl's own malloc, or `jemalloc`, kiln's `jemalloc` feature (jemalloc 5.3 with
-# kiln::os::alloc's settings for giving memory back). The default below is the one switch: it moves to
-# jemalloc once the lab's A/B picks it, and KILN_LINUX_ALLOCATOR overrides it for one build.
+# (step 4)"): `jemalloc`, kiln's `jemalloc` feature (jemalloc 5.3 with kiln::os::alloc's settings for giving
+# memory back), or `musl`, musl's own malloc. The default is jemalloc, the lab's pick: on the static musl
+# build, resident memory 523 to 333 MB, and no latency number worse beyond noise. KILN_LINUX_ALLOCATOR=musl
+# leaves it out of one build.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
 
-linux_allocator=${KILN_LINUX_ALLOCATOR:-musl}
+linux_allocator=${KILN_LINUX_ALLOCATOR:-jemalloc}
 case $linux_allocator in
   musl | jemalloc) ;;
   *) echo "KILN_LINUX_ALLOCATOR is musl or jemalloc, not $linux_allocator" >&2; exit 1 ;;

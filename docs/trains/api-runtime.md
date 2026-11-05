@@ -248,9 +248,13 @@ step 10).
 - **Lab** (step 1, production's static musl build, calm): 1,126 MB resident on main before goal 11,
   against 526 MB on train 4's tree. Of that, 127 MB is the binary's pages and 401 MB anonymous. The
   live heap is about 165 MB (jemalloc's profile of the same tree).
-- **Lab** (step 4, rt-next's builds, calm, 8 rounds each): musl 523 MB against 333 MB with jemalloc
-  (anonymous 398 to 207 MB), and glibc 530 against 338 MB; no latency worse.
-- Open: step 4's pick in production's build, and step 5 (the 113 MB bar: Ada's decisions).
+- **Lab** (step 4, rt-next's builds, calm, 8 rounds each): production's static musl build 523 MB
+  against 333 MB with jemalloc (anonymous 398 to 207 MB), no latency number worse beyond noise and the
+  server's wait at p99.9 for API reads and pages better; glibc 530 against 338 MB with jemalloc
+  preloaded, where attaches' median was worse beyond noise (3.3 to 4.4 ms).
+- **In the next train:** the release build takes jemalloc by default (`KILN_LINUX_ALLOCATOR=musl`
+  builds one without it), with the lab's settings compiled in.
+- Open: step 5 (the 113 MB bar: Ada's decisions).
 
 **Others' work in the same deploy** (from production's commit to main):
 - runners keyed by machine id (`1df4674ca2d`, with notes of its own: docs/trains/machine-ids.md);
@@ -293,7 +297,8 @@ behaviour, until declared (docs/ci.md §0.3):
 - `[server] cores` was there already. With it, kiln now also keeps its own legs and agents off those
   cores.
 - `KILN_RT_QUANTUM_US` (goal 9) sets the shards' step quantum, for the lab's A/B of quanta.
-- The release build leaves jemalloc out (`ci/release/build.sh` doesn't ask for the feature).
+- The release build takes jemalloc in the next train (`ci/release/build.sh`'s `KILN_LINUX_ALLOCATOR`,
+  `jemalloc` by default, `musl` for musl's malloc); trains 1 to 7 leave it out.
 
 **Migrations:** none of the program's. The deploy brings one of machine-ids',
 `20261104-1200_machines_names`: a new table, with no epoch line.

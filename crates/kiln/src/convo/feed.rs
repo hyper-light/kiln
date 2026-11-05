@@ -205,11 +205,29 @@ pub enum Link {
     Wrote,
 }
 
+/// A feed's parts waiting for its link to take them, at the most: as many as the channel they waited in
+/// held. The feed waits for room past them, so a slow link holds it back.
+const OUT_PARTS: usize = 16;
+
+/// What a feed hears of its link, lock-free (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5: an
+/// async-channel's wait took event-listener's `Mutex`, the runner's link and its store's commits sending on
+/// their shards and the feed waiting on its own). Unbounded, as that channel was: a link's word and a commit's
+/// nudge never wait, and the feed takes each as it comes.
+fn links() -> (crate::memory::queue::Sender<Link>, crate::memory::queue::Receiver<Link>) {
+    crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
+
+/// A feed's parts to send, `(json, bytes)`: [`OUT_PARTS`] of them whatever each carries (a part up to
+/// [`PART`]), lock-free (goal 4, plan 01a1a59c2a9c step 5, as [`links`]).
+fn parts_out() -> (crate::memory::queue::Sender<(String, Vec<u8>)>, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, OUT_PARTS)
+}
+
 /// A runner's feed: tell it of the link with [`Shipper::link`]; what it sends comes out of the
 /// receiver [`Shipper::start`] returns, as `(json, bytes)` for [`proto::AgentMsg::Convo`].
 #[derive(Clone)]
 pub struct Shipper {
-    tx: async_channel::Sender<Link>,
+    tx: crate::memory::queue::Sender<Link>,
     stats: std::sync::Arc<ShipStats>,
     signs: Signs,
 }
@@ -218,26 +236,26 @@ pub struct Shipper {
 pub type Skip = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 impl Shipper {
-    pub fn start(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start(store: Store) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, false, None)
     }
 
     /// [`Shipper::start`], leaving out the rows `skip` says the taker has (what a mirror sent
     /// back to restore this store from isn't sent to it again, [`Echoes`]).
-    pub fn start_skipping(store: Store, skip: Skip) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start_skipping(store: Store, skip: Skip) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, false, Some(skip))
     }
 
     /// A mirror's copy of the server's store, sent back for the server to restore its own from
     /// ([`Msg::Restore`]): everything the copy holds now, then [`Msg::Restored`], and the feed
     /// ends (what it takes meanwhile, it takes from the server: not sent back).
-    pub fn start_restore(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start_restore(store: Store) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, true, None)
     }
 
-    fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
-        let (tx, rx) = async_channel::unbounded::<Link>();
-        let (out_tx, out_rx) = async_channel::bounded::<(String, Vec<u8>)>(16);
+    fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
+        let (tx, rx) = links();
+        let (out_tx, out_rx) = parts_out();
         // Each commit, as a nudge in the same queue.
         let watch = store.watch();
         let nudge = tx.clone();
@@ -292,7 +310,7 @@ struct Shipping {
 /// A test build's `feed_changed` changed a batch of this process's once already.
 static CHANGED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
+async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -309,7 +327,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
     };
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
-    let hello = |out: &async_channel::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
+    let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
     loop {
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(ev)) => Some(ev),
@@ -532,6 +550,17 @@ impl crate::memory::queue::Weigh for Heard {
     }
 }
 
+/// An intake's answers waiting to go to their runners, at the most: as many as the channel they waited in
+/// held. Its thread waits for room past them.
+const ANSWERS: usize = 1024;
+
+/// An intake's answers to its feeds, [`ANSWERS`] of them, lock-free (`crate::memory::queue`; goal 4, plan
+/// 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex`, the intake's thread sending and
+/// the task that sends them on waiting on its shard).
+fn answers() -> (crate::memory::queue::Sender<Out>, crate::memory::queue::Receiver<Out>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, ANSWERS)
+}
+
 /// The bytes of messages waiting for an intake's thread, at most (goal 11, plan 01a1a87b2e56 step 3): one
 /// connection's receive window ([`crate::net::WINDOW`]), what the hub's queue of runner events it's handed
 /// from may hold; a feed sends at most [`WINDOW`] batches of [`BATCH_BYTES`] ahead of the server, so it
@@ -571,9 +600,9 @@ type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
 
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
-    pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
+    pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, crate::memory::queue::Receiver<Out>)> {
         let (tx, rx) = crate::memory::queue::bounded::<Heard>(&crate::memory::owners::FEED_INTAKE, HEARD_BYTES);
-        let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
+        let (out_tx, out_rx) = answers();
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
         let signs = Signs::default();
@@ -1258,8 +1287,69 @@ mod tests {
         })
     }
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: a feed's queues, lock-free now (`crate::memory::queue`). Its link's
+    /// words, sent from every shard at once, reach it each sender's in order, none refused, lost or doubled
+    /// (unbounded, as before). Its parts to send hold [`OUT_PARTS`] whatever each carries and hold the feed
+    /// back past them, in order. An intake's answers hold [`ANSWERS`], its thread waiting past them.
+    #[test]
+    fn g4_s5_a_feeds_queues_keep_their_order_and_their_bounds() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (tx, rx) = links();
+            let (senders, per) = (8usize, 500u64);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let tx = tx.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move { (0..per).all(|rev| tx.try_send(Link::Heard(Msg::Ack { store: s.to_string(), rev })).is_ok()) }));
+            }
+            drop(tx);
+            for s in sending {
+                anyhow::ensure!(s.await.unwrap_or(false), "a link's word was refused");
+            }
+            let mut got = vec![Vec::new(); senders];
+            while let Ok(l) = rx.try_recv() {
+                let Link::Heard(Msg::Ack { store, rev }) = l else { anyhow::bail!("a word no sender of the test's sent") };
+                got.get_mut(store.parse::<usize>()?).ok_or_else(|| anyhow::anyhow!("no sender {store}"))?.push(rev);
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            // Parts: as many as their places, a whole part or none; the next waits until one is taken.
+            let (out, parts) = parts_out();
+            for n in 0..OUT_PARTS {
+                anyhow::ensure!(out.try_send((n.to_string(), vec![0; if n == 0 { PART } else { 0 }])).is_ok(), "part {n} had no room");
+            }
+            anyhow::ensure!(matches!(out.try_send(("over".into(), Vec::new())), Err(async_channel::TrySendError::Full(_))), "a part past its places");
+            let waiting = crate::rt::spawn_spread_joined({
+                let out = out.clone();
+                async move { out.send(("last".into(), Vec::new())).await.is_ok() }
+            });
+            crate::rt::sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(parts.len() == OUT_PARTS, "the feed didn't wait for room: {} parts", parts.len());
+            for n in 0..OUT_PARTS {
+                let (json, _) = crate::rt::timeout(Duration::from_secs(5), parts.recv()).await??;
+                anyhow::ensure!(json == n.to_string(), "part {n} came as {json}");
+            }
+            let (json, _) = crate::rt::timeout(Duration::from_secs(5), parts.recv()).await??;
+            anyhow::ensure!(json == "last" && waiting.await.unwrap_or(false), "the waiting part, last: {json}");
+            // Answers: as many as their places; the intake's thread waits past them.
+            let (answer, told) = answers();
+            for n in 0..ANSWERS {
+                anyhow::ensure!(answer.try_send(Out { peer: 7, json: n.to_string() }).is_ok(), "answer {n} had no room");
+            }
+            anyhow::ensure!(matches!(answer.try_send(Out { peer: 7, json: "over".into() }), Err(async_channel::TrySendError::Full(_))), "an answer past its places");
+            let thread = std::thread::spawn(move || answer.send_blocking(Out { peer: 7, json: "last".into() }).is_ok());
+            for n in 0..ANSWERS {
+                let o = crate::rt::timeout(Duration::from_secs(5), told.recv()).await??;
+                anyhow::ensure!(o.json == n.to_string() && o.peer == 7, "answer {n} came as {}", o.json);
+            }
+            let last = crate::rt::timeout(Duration::from_secs(5), told.recv()).await??;
+            anyhow::ensure!(last.json == "last" && thread.join().unwrap_or(false), "the waiting answer, last: {}", last.json);
+            Ok(())
+        })
+    }
+
     /// What the shipper sends next, within `wait` (None: nothing).
-    async fn next_sent(out: &async_channel::Receiver<(String, Vec<u8>)>, wait: Duration) -> Option<Msg> {
+    async fn next_sent(out: &crate::memory::queue::Receiver<(String, Vec<u8>)>, wait: Duration) -> Option<Msg> {
         crate::rt::timeout(wait, out.recv()).await.ok().and_then(Result::ok).and_then(|(json, _)| decode(&json))
     }
 
