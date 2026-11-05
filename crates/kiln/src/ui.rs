@@ -2,11 +2,11 @@
 //! Start's client build). Hashed assets are served as immutable. Pages, server functions and server
 //! components come from the UI server (`crate::uiserver`); a page that renders only in the browser
 //! (every one the build doesn't list as rendered on the server, `_server-pages.json`) gets the app's
-//! shell (`_shell.html`) from here, as does every page without the UI server. Compressible files go out brotli-compressed
-//! (or gzipped, to a browser that doesn't take brotli), each compressed once and kept in memory:
-//! the embedded ones in the background as the server starts (`warm`), so no request waits. Only this
-//! build's files are kept so, which bounds what they take (`crate::memory::UI_ASSETS`; goal 11, plan
-//! 01a1a87b2e56 step 3); an earlier build's goes as the build packed it, or as it is.
+//! shell (`_shell.html`) from here, as does every page without the UI server. Compressible files go
+//! out brotli-compressed (or gzipped, to a browser that doesn't take brotli), each compressed once and
+//! kept in memory: the embedded ones in the background as the server starts (`warm`), so no request
+//! waits. Only this build's files are kept so, which bounds what they take (`crate::memory::UI_ASSETS`;
+//! goal 11, plan 01a1a87b2e56 step 3); an earlier build's goes as its build packed it, or as it is.
 //!
 //! Every response carries a strong ETag of the bytes it sends (its file's SHA-256 and its coding),
 //! and a request whose If-None-Match names it gets a 304 with no body: the shell and the other
@@ -14,8 +14,17 @@
 //! browser protocol program, plan 01a1a832ebfd step 3; docs/http.md "The UI's files").
 //!
 //! Earlier builds' assets are kept on disk (`keep_assets`), each with the brotli copy its build
-//! packed, so a page loaded before a deploy can still load the parts it hasn't yet. An asset no build has is a 404, never `index.html`: a
-//! browser handed HTML for a script fails in a way only a reload fixes.
+//! packed, so a page loaded before a deploy can still load the parts it hasn't yet. An asset no
+//! build has is a 404, never `index.html`: a browser handed HTML for a script fails in a way only a
+//! reload fixes.
+//!
+//! What a deploy changed goes as a delta against what the browser has (Compression Dictionary
+//! Transport, RFC 9842; goal 8, plan 01a1a832ebfd step 5): every hashed script and stylesheet is
+//! offered as a dictionary for the later versions of its name (`Use-As-Dictionary`), and a request
+//! naming one kiln has (`Available-Dictionary`, a version of the same name) gets Brotli against it
+//! (`dcb`), made once per pair on the compute pool and kept on disk beside the kept assets; until
+//! it's made, the plain brotli copy goes, so no request waits. Only kiln's own static, same-origin,
+//! secret-free files. Chromium only: other engines don't ask.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -98,15 +107,167 @@ pub fn keep_assets(data_dir: &Path) {
             let _ = std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(now));
         }
     }
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    let mut index = HashMap::new();
+    for d in [dir.clone(), dir.join(DELTAS)] {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > KEEP_FOR);
             if old {
                 let _ = std::fs::remove_file(e.path());
+                continue;
+            }
+            // The kept scripts and stylesheets, by their SHA-256: the dictionaries a browser may name
+            // (goal 8, plan 01a1a832ebfd step 5).
+            let name = format!("assets/{}", e.file_name().to_string_lossy());
+            if d == dir
+                && versioned(&name).is_some()
+                && let Ok(data) = std::fs::read(e.path())
+            {
+                index.insert(crate::ui_pack::sha256(&data), name);
             }
         }
     }
+    kept_dictionaries().set(index);
+    let _ = std::fs::create_dir_all(dir.join(DELTAS));
     let _ = KEPT.set(dir);
+}
+
+/// Where the deltas are kept, in the kept assets' directory (a name no asset path can reach).
+const DELTAS: &str = ".deltas";
+
+/// The kept scripts and stylesheets by their SHA-256: made whole as the builds are kept
+/// (`keep_assets`) and swapped in, read on a request without a lock (`crate::rcu`; the API runtime's
+/// lockless hot path, scripts/locks/hot.toml).
+fn kept_dictionaries() -> &'static Rcu<HashMap<[u8; 32], String>> {
+    static D: OnceLock<Rcu<HashMap<[u8; 32], String>>> = OnceLock::new();
+    D.get_or_init(Default::default)
+}
+
+/// This build's scripts and stylesheets by their SHA-256.
+fn embedded_dictionaries() -> &'static HashMap<[u8; 32], String> {
+    static D: OnceLock<HashMap<[u8; 32], String>> = OnceLock::new();
+    D.get_or_init(|| Assets::iter().filter(|n| versioned(n).is_some()).filter_map(|n| Some((Assets::get(&n)?.metadata.sha256_hash(), n.into_owned()))).collect())
+}
+
+/// What a hashed script or stylesheet is a version of: `assets/<stem>-<8 hash chars>.js|css` as
+/// (`<stem>`, `js`|`css`).
+fn versioned(name: &str) -> Option<(&str, &str)> {
+    let file = name.strip_prefix("assets/")?;
+    let (base, ext) = file.rsplit_once('.')?;
+    if !matches!(ext, "js" | "css") || base.len() < 10 || !base.is_ascii() {
+        return None;
+    }
+    let (stem, dash_hash) = base.split_at_checked(base.len().checked_sub(9)?)?;
+    let hash = dash_hash.strip_prefix('-')?;
+    let plain = hash.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) && stem.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    (plain && !stem.is_empty()).then_some((stem, ext))
+}
+
+/// The `Use-As-Dictionary` a version of `stem` goes with: it serves for the later versions of its
+/// name. A stem is letters, digits, `.`, `-` and `_` (`versioned`), none of them special in a URL
+/// pattern or a structured field string.
+fn use_as_dictionary(stem: &str, ext: &str) -> String {
+    let dest = if ext == "css" { "style" } else { "script" };
+    format!("match=\"/assets/{stem}-*.{ext}\", match-dest=(\"{dest}\")")
+}
+
+/// The SHA-256 an `Available-Dictionary` names (a structured field byte sequence, `:<base64>:`).
+fn available_dictionary(header: Option<&str>) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let b64 = header?.trim().strip_prefix(':')?.strip_suffix(':')?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    bytes.try_into().ok()
+}
+
+/// A file's bytes, this build's or an earlier build's kept one.
+fn any_build(name: &str) -> Option<Bytes> {
+    Assets::get(name).map(|f| embedded(f.data)).or_else(|| kept(name).map(Bytes::from))
+}
+
+/// The dictionary a request names for `name`: a version of the same name kiln has (this build's or
+/// a kept one), not `name` itself, as its bytes.
+fn dictionary_for(name: &str, sha: &[u8; 32]) -> Option<(String, Bytes)> {
+    let want = versioned(name)?;
+    let dict = embedded_dictionaries().get(sha).cloned().or_else(|| kept_dictionaries().load().get(sha).cloned())?;
+    if dict == name || versioned(&dict)? != want {
+        return None;
+    }
+    let data = any_build(&dict)?;
+    Some((dict, data))
+}
+
+/// `data` as a dictionary-compressed Brotli stream against `dict` (RFC 9842 section 4: the magic,
+/// the dictionary's SHA-256, then Brotli with the dictionary as its prefix).
+fn dcb(data: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    // The dictionary and the file both fit Brotli's largest standard window (16 MiB).
+    if dict.len() + data.len() > (1 << 24) - 16 {
+        return None;
+    }
+    let params = brotli::enc::BrotliEncoderParams { quality: 11, lgwin: 24, size_hint: data.len(), ..Default::default() };
+    let mut out = Vec::with_capacity(36 + data.len() / 8);
+    out.extend_from_slice(&DCB_MAGIC);
+    out.extend_from_slice(&crate::ui_pack::sha256(dict));
+    let mut input = vec![0u8; 1 << 16];
+    let mut output = vec![0u8; 1 << 16];
+    brotli::enc::BrotliCompressCustomIoCustomDict(
+        &mut brotli::IoReaderWrapper(&mut &data[..]),
+        &mut brotli::IoWriterWrapper(&mut out),
+        &mut input,
+        &mut output,
+        &params,
+        brotli::enc::StandardAlloc::default(),
+        &mut |_: &mut _, _: &mut _, _: brotli::InputPair, _: &mut _| (),
+        dict,
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "brotli: the file ended early"),
+    )
+    .ok()?;
+    Some(out)
+}
+
+/// A dictionary-compressed response's first bytes (RFC 9842 section 4).
+const DCB_MAGIC: [u8; 4] = [0xff, 0x44, 0x43, 0x42];
+
+/// Where the delta of `name` against the dictionary `dict` is kept.
+fn delta_path(dir: &Path, name: &str, dict: &[u8; 32]) -> Option<PathBuf> {
+    let file = asset_file(name)?;
+    Some(dir.join(DELTAS).join(format!("{file}.{}.dcb", hex::encode(dict.get(..16).unwrap_or(dict.as_slice())))))
+}
+
+/// The delta of `name` against the dictionary the request names, when kiln has made it; else none
+/// now, and it's made on the compute pool (once at a time for a pair) for the requests after.
+fn delta(name: &str, asked: Option<&str>, available: Option<&str>) -> Option<Bytes> {
+    if !accepts(asked, "dcb") {
+        return None;
+    }
+    let sha = available_dictionary(available)?;
+    let dir = KEPT.get()?;
+    let path = delta_path(dir, name, &sha)?;
+    if let Ok(data) = std::fs::read(&path) {
+        return Some(Bytes::from(data));
+    }
+    let (_, dict) = dictionary_for(name, &sha)?;
+    let target = any_build(name)?;
+    // The pairs being made, so a pair is made once at a time: a set swapped in whole (`crate::rcu`),
+    // claimed by compare-and-swap, so no request waits on another for it. Were two to make one pair
+    // anyway, each writes a file of its own and renames it into place: the same bytes win.
+    static MAKING: OnceLock<Rcu<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let making = MAKING.get_or_init(Default::default);
+    if making.update(|m| m.insert(path.clone())) {
+        drop(crate::rt::spawn(async move {
+            let p = path.clone();
+            let _ = crate::rt::compute(move || {
+                let Some(out) = dcb(&target, &dict) else { return };
+                static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tmp = p.with_extension(format!("making-{}", NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                if std::fs::write(&tmp, &out).is_ok() {
+                    let _ = std::fs::rename(&tmp, &p);
+                }
+            })
+            .await;
+            making.update(|m| m.remove(&path));
+        }));
+    }
+    None
 }
 
 /// The file an asset path names (`assets/<name>`): a plain file name, nothing that leaves the
@@ -293,6 +454,11 @@ pub fn static_file(req: &Request) -> Option<Response> {
     if path.is_empty() || path.starts_with('_') {
         return None;
     }
+    let available = srv::header_str(req, &header::HeaderName::from_static("available-dictionary"));
+    if let Some(d) = delta(path, srv::header_str(req, &header::ACCEPT_ENCODING), available) {
+        let sha = crate::ui_pack::sha256(&d);
+        return Some(send(req, path, d, Some("dcb"), &sha));
+    }
     let (data, ours) = match Assets::get(path) {
         Some(f) => {
             let sha = f.metadata.sha256_hash();
@@ -400,7 +566,13 @@ fn send(req: &Request, name: &str, body: Bytes, coding: Option<&'static str>, sh
     };
     r = srv::with_header(r, header::ETAG, &tag);
     r = srv::with_header(r, header::CACHE_CONTROL, cache);
-    r = srv::with_header(r, header::VARY, "Accept-Encoding");
+    r = match versioned(name) {
+        Some((stem, ext)) => {
+            let r = srv::with_header(r, header::HeaderName::from_static("use-as-dictionary"), &use_as_dictionary(stem, ext));
+            srv::with_header(r, header::VARY, "Accept-Encoding, Available-Dictionary")
+        }
+        None => srv::with_header(r, header::VARY, "Accept-Encoding"),
+    };
     srv::with_header(r, header::HeaderName::from_static("x-content-type-options"), "nosniff")
 }
 
@@ -483,6 +655,54 @@ mod tests {
         assert!(in_browser(&prefixes, "/agents/abc"));
         assert!(in_browser(&prefixes, "/"));
         assert!(!in_browser(&prefixes, "/shared/plans/tok"));
+    }
+
+    /// Goal 8, plan 01a1a832ebfd step 5: a dcb response decodes with its dictionary to the exact file, and its
+    /// header carries the dictionary's SHA-256.
+    #[test]
+    fn g8_s5_a_delta_decodes_with_its_dictionary_to_the_file() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let old: Vec<u8> = (0..4000).flat_map(|i| format!("export const v{i}=\"kiln {i}\";").into_bytes()).collect();
+        let mut new = old.clone();
+        new.extend_from_slice(b"export const added=1;");
+        let d = dcb(&new, &old).ok_or_else(|| anyhow::anyhow!("no delta"))?;
+        assert_eq!(d.get(..4), Some(&DCB_MAGIC[..]));
+        assert_eq!(d.get(4..36), Some(&crate::ui_pack::sha256(&old)[..]));
+        let mut back = Vec::new();
+        brotli::Decompressor::new_with_custom_dict(d.get(36..).unwrap_or_default(), 4096, old.clone().into()).read_to_end(&mut back)?;
+        assert_eq!(back, new);
+        // A delta is a sliver of the file.
+        assert!(d.len() < 36 + 100, "delta {} bytes of {}", d.len(), new.len());
+        Ok(())
+    }
+
+    /// Goal 8, plan 01a1a832ebfd step 5: an unknown or malformed Available-Dictionary gets no delta (plain
+    /// brotli).
+    #[test]
+    fn g8_s5_an_unknown_or_malformed_dictionary_gets_plain_brotli() {
+        use base64::Engine as _;
+        let sha = crate::ui_pack::sha256(b"x");
+        let good = format!(":{}:", base64::engine::general_purpose::STANDARD.encode(sha));
+        assert_eq!(available_dictionary(Some(&good)), Some(sha));
+        for bad in ["", "::", ":notbase64!:", "abc", ":YWJj:"] {
+            assert_eq!(available_dictionary(Some(bad)), None, "{bad}");
+        }
+        assert!(dictionary_for("assets/index-AbCdEfGh.js", &sha).is_none());
+        assert!(delta("assets/index-AbCdEfGh.js", Some("br, dcb"), Some(":YWJj:")).is_none());
+        assert!(delta("assets/index-AbCdEfGh.js", Some("br"), Some(&good)).is_none());
+    }
+
+    /// Goal 8, plan 01a1a832ebfd step 5: the versions of a name share one dictionary pattern; a packed copy, a
+    /// WebAssembly file or an unhashed file is no dictionary.
+    #[test]
+    fn g8_s5_versions_of_a_name_share_a_dictionary_pattern() {
+        assert_eq!(versioned("assets/_app.agents._id-Ba-HR-xj.js"), Some(("_app.agents._id", "js")));
+        assert_eq!(versioned("assets/index-CWlGCPL-.css"), Some(("index", "css")));
+        assert_eq!(versioned("assets/index-CWlGCPL-.css.br"), None);
+        assert_eq!(versioned("assets/rust-AbCdEfGh.wasm"), None);
+        assert_eq!(versioned("_shell.html"), None);
+        assert_eq!(versioned("assets/-AbCdEfGh.js"), None);
+        assert_eq!(use_as_dictionary("_app.agents._id", "js"), r#"match="/assets/_app.agents._id-*.js", match-dest=("script")"#);
     }
 
     #[test]
