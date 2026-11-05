@@ -160,14 +160,26 @@ pub async fn object(hub: &Hub, digest: &str) -> anyhow::Result<Option<Object>> {
 }
 
 /// Streams bytes `[start, end)` of an object. A piece that can't be read ends the stream early (the
-/// reader sees fewer bytes than it was promised), with a warning.
-pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
+/// reader sees fewer bytes than it was promised), with a warning. Lock-free (`crate::blobs::io::read_stream`;
+/// goal 5, plan 01a1a59c2aae, its top goal): runners' caches, artifacts and images, and the registry's blobs.
+pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> crate::memory::queue::Receiver<Bytes> {
+    let end = end.min(obj.size);
+    if start >= end {
+        // No sender: it ends at once.
+        return crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1).1;
+    }
+    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
+}
+
+/// [`read`] on an async-channel, for CD's providers (`crate::cd::artifacts::Files::open`), whose uploads take
+/// one ([`crate::blobs::io::read_channel`]).
+pub fn read_channel(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
     let end = end.min(obj.size);
     if start >= end {
         let (_, rx) = async_channel::bounded(1);
         return rx;
     }
-    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
+    crate::blobs::io::read_channel(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
 }
 
 // ---------------------------------------------------------------------------------------- chunks

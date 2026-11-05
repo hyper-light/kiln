@@ -154,7 +154,7 @@ type Call = Box<dyn FnOnce(&mut Commands) + Send>;
 /// a task of their own owns them and takes every change and question as a message, in the order they
 /// come. A caller waits for its turn, not on a lock, and no shard stalls another holding them.
 pub struct Owner {
-    tx: async_channel::Sender<Call>,
+    tx: crate::memory::queue::Sender<Call>,
 }
 
 impl Owner {
@@ -165,7 +165,10 @@ impl Owner {
         // `tell`'s are `crate::hub::Hub::command_soon`'s, a command each for a session told at once (an
         // account's sessions held at its limit, a stale session's snapshot asked), each at most
         // [`ITEM_MOST`]. What the commands keep unanswered is [`ROOM`] a runner process at the most.
-        let (tx, rx) = async_channel::unbounded::<Call>();
+        // Lock-free (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's
+        // wait took event-listener's `Mutex`, each caller's shard sending (a terminal's keystrokes, every
+        // `command_start`) and the owner's waiting.
+        let (tx, rx) = crate::memory::queue::unbounded::<Call>(&crate::memory::owners::CHANNELS);
         drop(crate::rt::spawn(async move {
             let mut commands = commands;
             while let Ok(call) = rx.recv().await {
@@ -534,6 +537,45 @@ mod tests {
 
     fn t(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): the commands' owner takes its calls on a lock-free queue now.
+    /// Calls told from every shard at once (as each terminal's keystrokes and every `command_start` are) are
+    /// each run once, each sender's in the order it told them, and a question asked after them is answered
+    /// once they've all run.
+    #[test]
+    fn g5_the_commands_owner_runs_calls_from_every_shard_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let owner = std::sync::Arc::new(Owner::start(Commands::new(1)));
+            let (ran, log) = crate::memory::queue::unbounded::<(usize, usize)>(&crate::memory::owners::CHANNELS);
+            let (senders, per) = (8usize, 500usize);
+            let mut telling = Vec::new();
+            for s in 0..senders {
+                let (owner, ran) = (std::sync::Arc::clone(&owner), ran.clone());
+                telling.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        let ran = ran.clone();
+                        owner.tell(move |_| {
+                            let _ = ran.try_send((s, n));
+                        });
+                    }
+                }));
+            }
+            drop(ran);
+            for t in telling {
+                t.await.map_err(|_| anyhow::anyhow!("a sender ended before its calls"))?;
+            }
+            let asked = crate::rt::timeout(Duration::from_secs(10), owner.ask(|c| c.waiting())).await.map_err(|_| anyhow::anyhow!("never answered"))?;
+            anyhow::ensure!(asked == Some(0), "{asked:?}");
+            let mut got = vec![Vec::new(); senders];
+            while let Ok((s, n)) = log.try_recv() {
+                got.get_mut(s).ok_or_else(|| anyhow::anyhow!("no sender {s}"))?.push(n);
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     /// The runner's side: takes every command it's sent (refusing those `refuse` picks), its
