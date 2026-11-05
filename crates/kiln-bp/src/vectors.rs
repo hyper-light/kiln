@@ -211,6 +211,22 @@ pub fn render() -> String {
     }).collect();
     out.push_str(&js.join(",\n"));
     out.push_str("\n  ],\n");
+    // Batches deflated through one context, sync-flushed: a browser's one long-lived
+    // DecompressionStream must give each back whole before the next (plan step 8).
+    let mut z = crate::compress::Compressors::new(false);
+    let batches: Vec<String> = inflate_batches()
+        .iter()
+        .map(|plain| {
+            let data = z.deflate(2, crate::conn::Lane::Control, plain);
+            let (mut p, mut d) = (String::new(), String::new());
+            hex(plain, &mut p);
+            hex(&data, &mut d);
+            format!("    {{\"len\":{},\"data\":\"{d}\",\"plain\":\"{p}\"}}", plain.len())
+        })
+        .collect();
+    out.push_str("  \"inflate\": [\n");
+    out.push_str(&batches.join(",\n"));
+    out.push_str("\n  ],\n");
     let blocks: Vec<String> = (0..FUZZ_COUNT / FUZZ_BLOCK).map(|b| format!("\"{}\"", crate::fuzz::digest(FUZZ_SEED, b * FUZZ_BLOCK, (b + 1) * FUZZ_BLOCK))).collect();
     let _ = writeln!(out, "  \"fuzz\": {{\"seed\": \"{FUZZ_SEED}\", \"count\": {FUZZ_COUNT}, \"block\": {FUZZ_BLOCK}, \"digests\": [{}]}}", blocks.join(", "));
     out.push_str("}\n");
@@ -222,10 +238,10 @@ pub fn render() -> String {
 pub fn refusals_held() -> Vec<Why> {
     let mut seen: Vec<Why> = Vec::new();
     let mut note = |r: &Result<Read, Fault>| {
-        if let Err(e) = r {
-            if !seen.contains(&e.why) {
-                seen.push(e.why);
-            }
+        if let Err(e) = r
+            && !seen.contains(&e.why)
+        {
+            seen.push(e.why);
         }
     };
     for (_, m) in hostile() {
@@ -242,4 +258,19 @@ pub fn refusals_held() -> Vec<Why> {
         }
     }
     seen
+}
+
+/// What the inflate vectors deflate: frames as a log subscription sends them, a long one, and a
+/// run of samples alike but for a field.
+pub fn inflate_batches() -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    for i in 0..6u64 {
+        let line = format!("step {i}: compiling kiln-bp v0.2.0 (crates/kiln-bp) ... ok\n");
+        v.push(Frame::Change(Change { sub: 2, rev: 10 + i, step: 1, delta: Delta::Append { at: i * 60, data: Bytes::from(line.as_str()) } }).encode(VERSION));
+    }
+    v.push(Frame::Tail(Tail { sub: 2, data: Bytes(b"0123456789abcdef".repeat(400)) }).encode(VERSION));
+    for i in 0..4u8 {
+        v.push(Frame::Change(Change { sub: 1, rev: 50 + u64::from(i), step: 1, delta: Delta::Patch { key: Key::Ref { n: 0 }, mask: crate::wire::Bits(0b11), fields: vec![Bytes(vec![i]), Bytes(vec![7, 7])] } }).encode(VERSION));
+    }
+    v
 }

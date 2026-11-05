@@ -1,6 +1,5 @@
 // Made from kiln-bp's Rust types (crates/kiln-bp/src/frames.rs): change those, then run
 // `KILN_WRITE_BP=1 cargo test -p kiln-bp --test ts`.
-/* eslint-disable */
 import { BpError, Gen, Reader, Why, Writer } from "./runtime";
 
 /** The protocol version this build speaks, and the oldest it still serves. */

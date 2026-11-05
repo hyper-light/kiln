@@ -13,7 +13,7 @@ const COMPRESSED = 19;
 
 /** One context's inflater. */
 class Context {
-  private writer: WritableStreamDefaultWriter<Uint8Array>;
+  private writer: WritableStreamDefaultWriter<BufferSource>;
   private reader: ReadableStreamDefaultReader<Uint8Array>;
   /** Bytes the stream gave past the last batch (none, when the server flushes each). */
   private spare: Uint8Array[] = [];
@@ -26,7 +26,7 @@ class Context {
 
   async inflate(data: Uint8Array, len: number): Promise<Uint8Array> {
     // Not awaited: the stream takes input as its reader is read.
-    void this.writer.write(data);
+    void this.writer.write(data as Uint8Array<ArrayBuffer>);
     const out = new Uint8Array(len);
     let at = 0;
     while (at < len) {

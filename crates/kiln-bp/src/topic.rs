@@ -70,6 +70,12 @@ impl TopicLog {
         self
     }
 
+    /// Keeps at most `bytes` of a text topic's stream for snapshots.
+    pub fn with_text_keep(mut self, bytes: usize) -> Self {
+        self.text_keep = bytes;
+        self
+    }
+
     pub fn cursor(&self) -> Cursor {
         Cursor { born: self.born, rev: self.rev }
     }
@@ -102,11 +108,13 @@ impl TopicLog {
     /// How a subscription with `cursor` starts: resumed when the cursor is this incarnation's and
     /// the log holds every change after it, else a snapshot.
     pub fn start(&self, cursor: Option<&Cursor>) -> Start {
-        if let Some(c) = cursor {
-            if c.born == self.born && c.rev <= self.rev && c.rev >= self.resumes_from() {
-                let changes = self.log.iter().filter(|p| p.rev > c.rev).cloned().collect();
-                return Start::Resume { from: c.clone(), changes };
-            }
+        if let Some(c) = cursor
+            && c.born == self.born
+            && c.rev <= self.rev
+            && c.rev >= self.resumes_from()
+        {
+            let changes = self.log.iter().filter(|p| p.rev > c.rev).cloned().collect();
+            return Start::Resume { from: c.clone(), changes };
         }
         Start::Snapshot { cursor: self.cursor(), items: self.state.snapshot() }
     }

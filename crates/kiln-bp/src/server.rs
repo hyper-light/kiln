@@ -536,11 +536,11 @@ impl Server {
             Frame::Idle(_) => {}
             Frame::Probe(p) => self.acks.push_back(ProbeAck { nonce: p.nonce, got: self.got }),
             Frame::ProbeAck(a) => {
-                if let Some((n, at)) = self.probe_out {
-                    if n == a.nonce {
-                        self.live.round_trip(now.saturating_sub(at));
-                        self.probe_out = None;
-                    }
+                if let Some((n, at)) = self.probe_out
+                    && n == a.nonce
+                {
+                    self.live.round_trip(now.saturating_sub(at));
+                    self.probe_out = None;
                 }
             }
             Frame::Unread(u) => self.events.push_back(Event::Unread { kind: u.kind, code: u.code, why: u.why }),
@@ -726,44 +726,44 @@ impl Server {
     fn enqueue(s: &mut Sub, p: &Published) {
         s.queued_hi = s.queued_hi.max(p.rev);
         let d = &p.delta;
-        if matches!(s.spec.class, Class::State | Class::Telemetry) {
-            if let Some(key) = merge_key(d) {
-                if let Some(seq) = s.index.get(&key).copied() {
-                    let at = usize::try_from(seq.saturating_sub(s.head)).unwrap_or(usize::MAX);
-                    if let Some(Item::Change { hi, delta, snapshot: false, .. }) = s.items.get_mut(at) {
-                        if let Some(m) = merge(delta, d) {
-                            let before = weight(delta);
-                            *delta = Arc::new(m);
-                            *hi = p.rev;
-                            s.queued = s.queued.saturating_sub(before).saturating_add(weight(delta));
-                            return;
-                        }
-                    }
-                }
-                let seq = s.next;
-                s.push_item(Item::Change { lo: p.rev, hi: p.rev, delta: d.clone(), snapshot: false });
-                s.index.insert(key, seq);
-                return;
-            }
-        }
-        // Text appended to where the last waiting change left off joins it (up to a fragment's worth).
-        if let Some(Item::Change { hi, delta, snapshot: false, .. }) = s.items.back_mut() {
-            if let Some(j) = join(delta, d, 1024) {
+        if matches!(s.spec.class, Class::State | Class::Telemetry)
+            && let Some(key) = merge_key(d)
+        {
+            if let Some(seq) = s.index.get(&key).copied()
+                && let Some(Item::Change { hi, delta, snapshot: false, .. }) = s.items.get_mut(usize::try_from(seq.saturating_sub(s.head)).unwrap_or(usize::MAX))
+                && let Some(m) = merge(delta, d)
+            {
                 let before = weight(delta);
-                *delta = Arc::new(j);
+                *delta = Arc::new(m);
                 *hi = p.rev;
                 s.queued = s.queued.saturating_sub(before).saturating_add(weight(delta));
                 return;
             }
+            let seq = s.next;
+            s.push_item(Item::Change { lo: p.rev, hi: p.rev, delta: d.clone(), snapshot: false });
+            s.index.insert(key, seq);
+            return;
+        }
+        // Text appended to where the last waiting change left off joins it (up to a fragment's worth).
+        if let Some(Item::Change { hi, delta, snapshot: false, .. }) = s.items.back_mut()
+            && let Some(j) = join(delta, d, 1024)
+        {
+            let before = weight(delta);
+            *delta = Arc::new(j);
+            *hi = p.rev;
+            s.queued = s.queued.saturating_sub(before).saturating_add(weight(delta));
+            return;
         }
         s.push_item(Item::Change { lo: p.rev, hi: p.rev, delta: d.clone(), snapshot: false });
     }
 
     /// Keeps what waits within the bound: the largest subscription lets its waiting changes go,
-    /// to be resumed from its cursor once it has room.
+    /// to be resumed from its cursor once it has room. A snapshot under way goes whole, as the
+    /// channel's do (docs/wire.md): the bound holds what waits after it, and a topic's own bounds
+    /// (its log, the text it keeps) hold a snapshot's size.
     fn bound(&mut self) {
         while self.queued() > self.cfg.max_queued {
-            let Some((&id, _)) = self.subs.iter().filter(|(_, s)| s.queued > 0 && !s.ended).max_by_key(|(_, s)| s.queued) else { return };
+            let Some((&id, _)) = self.subs.iter().filter(|(_, s)| s.queued > 0 && !s.ended && !s.in_snapshot).max_by_key(|(_, s)| s.queued) else { return };
             if let Some(s) = self.subs.get_mut(&id) {
                 s.let_go();
                 s.behind = true;
@@ -773,12 +773,11 @@ impl Server {
     }
 
     fn expire(&mut self, now: u64) {
-        if self.phase == Phase::Open {
-            if let Some(at) = self.principal.expires_at {
-                if now >= at {
-                    self.close(CloseCode::Expired, "the browser session ended", "");
-                }
-            }
+        if self.phase == Phase::Open
+            && let Some(at) = self.principal.expires_at
+            && now >= at
+        {
+            self.close(CloseCode::Expired, "the browser session ended", "");
         }
     }
 
@@ -992,15 +991,16 @@ impl Server {
                     (through, step)
                 };
                 let target = target_of(&delta);
-                if let Some((t, at, len)) = &target {
-                    if step == 1 && s.tail.as_ref().is_some_and(|(tt, end)| tt == t && end == at) {
-                        s.tail = Some((t.clone(), at.saturating_add(*len as u64)));
-                        let data = match delta.as_ref() {
-                            Delta::Append { data, .. } | Delta::Extend { data, .. } => data.clone(),
-                            _ => Bytes::default(),
-                        };
-                        return Some(Frame::Tail(Tail { sub: id, data }));
-                    }
+                if let Some((t, at, len)) = &target
+                    && step == 1
+                    && s.tail.as_ref().is_some_and(|(tt, end)| tt == t && end == at)
+                {
+                    s.tail = Some((t.clone(), at.saturating_add(*len as u64)));
+                    let data = match delta.as_ref() {
+                        Delta::Append { data, .. } | Delta::Extend { data, .. } => data.clone(),
+                        _ => Bytes::default(),
+                    };
+                    return Some(Frame::Tail(Tail { sub: id, data }));
                 }
                 s.tail = target.map(|(t, at, len)| (t, at.saturating_add(len as u64)));
                 let delta = Self::alias(s, delta.as_ref());

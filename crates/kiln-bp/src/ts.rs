@@ -228,7 +228,6 @@ pub fn render() -> String {
     let reg = registry();
     let bodies: Vec<&str> = KINDS.iter().map(|k| k.body()).collect();
     let mut out = String::from(HEADER);
-    out.push_str("/* eslint-disable */\n");
     out.push_str("import { BpError, Gen, Reader, Why, Writer } from \"./runtime\";\n\n");
     let _ = writeln!(out, "/** The protocol version this build speaks, and the oldest it still serves. */");
     let _ = writeln!(out, "export const VERSION = {VERSION};");

@@ -20,6 +20,7 @@ type Vectors = {
   schema: string;
   vectors: { name: string; hex: string; outcomes: Outcome[] }[];
   joins: { name: string; fragments: { hex: string; times?: number }[]; outcomes: Outcome[] }[];
+  inflate: { len: number; data: string; plain: string }[];
   fuzz: { seed: string; count: number; block: number; digests: string[] };
 };
 
@@ -108,4 +109,11 @@ test("a million seeded inputs read to Rust's digests (differential fuzzing)", ()
         `KILN_BP_FUZZ_FROM=${from} KILN_BP_FUZZ_TO=${from + V.fuzz.block} cargo test -p kiln-bp --test vectors replay -- --nocapture`,
     );
   }
+});
+
+test("one long-lived inflater gives each batch back whole, before the next", async () => {
+  const { check } = await import("./bp-check.ts");
+  const r = await check(V, 0);
+  assert.deepEqual(r.failed, []);
+  assert.ok(V.inflate.length >= 10);
 });

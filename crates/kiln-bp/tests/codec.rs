@@ -244,7 +244,7 @@ fn bp_g2_s2_a_million_seeded_inputs_read_without_a_panic() {
     let mut counts = [0u64; 5];
     let (mut read, mut refused) = (0u64, 0u64);
     for i in 0..n {
-        let (made, msg) = fuzz::input(0xB0B5_EED, i);
+        let (made, msg) = fuzz::input(0x0B0B_5EED, i);
         if let Some(c) = counts.get_mut(made as usize) {
             *c += 1;
         }

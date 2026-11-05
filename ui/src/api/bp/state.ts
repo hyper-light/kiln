@@ -38,7 +38,7 @@ function setFields(into: Uint8Array[], mask: bigint, fields: Uint8Array[]): void
 
 /** Appends `data` to a field encoded as `str` or `bytes`, at offset `at` of what it holds. */
 function extendField(field: Uint8Array, at: number, data: Uint8Array): Uint8Array | Misfit {
-  let held = EMPTY;
+  let held: Uint8Array = EMPTY;
   if (field.length > 0) {
     try {
       const r = new Reader(field);

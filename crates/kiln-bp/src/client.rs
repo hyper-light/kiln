@@ -363,11 +363,11 @@ impl Client {
             Frame::Idle(_) => {}
             Frame::Probe(p) => self.acks.push_back(ProbeAck { nonce: p.nonce, got: self.got }),
             Frame::ProbeAck(a) => {
-                if let Some((n, at)) = self.probe_out {
-                    if n == a.nonce {
-                        self.live.round_trip(now.saturating_sub(at));
-                        self.probe_out = None;
-                    }
+                if let Some((n, at)) = self.probe_out
+                    && n == a.nonce
+                {
+                    self.live.round_trip(now.saturating_sub(at));
+                    self.probe_out = None;
                 }
             }
             Frame::Unread(u) => self.events.push_back(ClientEvent::Unread { kind: u.kind, code: u.code, why: u.why }),

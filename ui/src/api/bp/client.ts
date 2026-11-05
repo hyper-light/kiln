@@ -9,7 +9,25 @@
  */
 import { CAP_DEFLATE_RAW } from "./caps";
 import { encodeFrame, Frames, decodeBody, type Outcome as ReadOutcome } from "./frames";
-import { KIND_INDEX, OLDEST, SCHEMA_HASH, VERSION, type Call, type CloseCode, type Cursor, type Delta, type EndCode, type Frame, type Key, type Mark, type OpenRefusal, type Outcome, type Topic, type UnreadCode, type UnreadWhy } from "./gen";
+import {
+  KIND_INDEX,
+  OLDEST,
+  SCHEMA_HASH,
+  VERSION,
+  type Call,
+  type CloseCode,
+  type Cursor,
+  type Delta,
+  type EndCode,
+  type Frame,
+  type Key,
+  type Mark,
+  type OpenRefusal,
+  type Outcome,
+  type Topic,
+  type UnreadCode,
+  type UnreadWhy,
+} from "./gen";
 import { Joiner } from "./join";
 import { Liveness, type Verdict } from "./liveness";
 import { itemKey, keyOf, TopicState, type ItemKey } from "./state";
@@ -114,7 +132,10 @@ export class Client {
     this.lastSent = now;
     this.granted = cfg.window;
     this.live = new Liveness(cfg.idleMs, now);
-    this.up.push({ f: { kind: "Open", body: { version: cfg.version, oldest: cfg.oldest, caps: cfg.caps, schema: SCHEMA_HASH, ticket, idle_ms: cfg.idleMs, window: cfg.window, build: cfg.build } }, prio: "control" });
+    this.up.push({
+      f: { kind: "Open", body: { version: cfg.version, oldest: cfg.oldest, caps: cfg.caps, schema: SCHEMA_HASH, ticket, idle_ms: cfg.idleMs, window: cfg.window, build: cfg.build } },
+      prio: "control",
+    });
   }
 
   /** A new connection carrying this one's subscriptions (from their cursors) and unanswered requests. */
@@ -427,7 +448,6 @@ export class Client {
       if (this.up.length === 0 && now - this.lastSent >= this.cfg.idleMs) this.idleDue = true;
     }
     const parts: { kind: Frame["kind"]; lane: Sent["lane"]; b: Uint8Array }[] = [];
-    let used = 0;
     const version = this.phase === "opening" ? this.cfg.version : this.version;
     if (this.probeWant && this.phase === "open") {
       this.nonce = (this.nonce + 1) >>> 0;
@@ -437,7 +457,7 @@ export class Client {
       this.live.probeSent(now);
     }
     for (const a of this.acks.splice(0)) parts.push({ kind: "ProbeAck", lane: "datagram", b: encodeFrame({ kind: "ProbeAck", body: a }, version) });
-    used = parts.reduce((n, p) => n + p.b.length, 0);
+    let used = parts.reduce((n, p) => n + p.b.length, 0);
     const order = [...this.up.keys()].sort((a, b) => Number(this.up[a]!.prio !== "interactive") - Number(this.up[b]!.prio !== "interactive") || a - b);
     const taken = new Set<number>();
     for (const i of order) {

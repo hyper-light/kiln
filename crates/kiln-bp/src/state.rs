@@ -72,10 +72,10 @@ pub fn merge_fields(a_mask: Bits, a: &[Bytes], b_mask: Bits, b: &[Bytes]) -> (Bi
     for (mask, fields) in [(a_mask, a), (b_mask, b)] {
         let mut it = fields.iter();
         for bit in 0..64usize {
-            if mask.0 & (1u64 << bit) != 0 {
-                if let (Some(f), Some(slot)) = (it.next(), full.get_mut(bit)) {
-                    *slot = Some(f.clone());
-                }
+            if mask.0 & (1u64 << bit) != 0
+                && let (Some(f), Some(slot)) = (it.next(), full.get_mut(bit))
+            {
+                *slot = Some(f.clone());
             }
         }
     }

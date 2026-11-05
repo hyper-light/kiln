@@ -620,7 +620,7 @@ pub fn hex(b: &[u8], out: &mut String) {
 /// Hex back to bytes (the vectors' form); `None` for what isn't.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return None;
     }
     let nib = |c: u8| -> Option<u8> {
