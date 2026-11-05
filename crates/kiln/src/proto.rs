@@ -936,7 +936,7 @@ pub struct LogChunk {
 /// varint length, then each byte as itself), so a peer of any build reads either (`tests`,
 /// `bytes_fields_keep_the_wire`); and read and written with one copy rather than a call a byte, which held
 /// the shards that read runners' frames and wrote the server's (the lab's calm baseline, research f21).
-mod wire_bytes {
+pub(crate) mod wire_bytes {
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -977,8 +977,34 @@ mod wire_bytes {
     }
 }
 
+/// `v` as postcard writes it, into one buffer the size it comes to (goal 9, plan 01a1a87b2cec step 5): measured
+/// first (a walk that adds up lengths, a byte string's or a text's at once), then written once. Written into a buffer
+/// that grew as it went, a message was copied again at each doubling: in rt7's calm profile half of what the cluster
+/// loop cost its shard was growing the buffers its learners' entries were encoded into.
 pub fn encode<T: Serialize>(v: &T) -> anyhow::Result<Vec<u8>> {
-    postcard::to_allocvec(v).map_err(|e| anyhow::anyhow!("encode: {e}"))
+    let size = postcard::experimental::serialized_size(v).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    postcard::serialize_with_flavor::<T, Exact, Vec<u8>>(v, Exact(Vec::with_capacity(size))).map_err(|e| anyhow::anyhow!("encode: {e}"))
+}
+
+/// postcard's output as one buffer made the size it will come to ([`encode`]).
+struct Exact(Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Exact {
+    type Output = Vec<u8>;
+
+    fn try_push(&mut self, b: u8) -> postcard::Result<()> {
+        self.0.push(b);
+        Ok(())
+    }
+
+    fn try_extend(&mut self, b: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Vec<u8>> {
+        Ok(self.0)
+    }
 }
 
 /// Why a frame couldn't be read ([`read`]).
@@ -1087,6 +1113,48 @@ mod tests {
     /// encoded. What the server and a runner read goes through `read` (`read_agent`, `read_server`).
     fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> anyhow::Result<T> {
         postcard::from_bytes(b).map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a message is written once into a buffer the size it comes to, the same bytes
+    /// postcard writes into one that grows: a learner's entry with its raft bytes, an empty one, and a small frame.
+    #[test]
+    fn g9_s5_a_message_is_written_once_into_its_size() -> anyhow::Result<()> {
+        let raft: Vec<u8> = (0..70_000_u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        for m in [ServerMsg::Cluster { json: "{\"t\":\"append\"}".into(), raft }, ServerMsg::Cluster { json: String::new(), raft: Vec::new() }] {
+            let once = encode(&m)?;
+            anyhow::ensure!(once == postcard::to_allocvec(&m)?, "the same bytes");
+            anyhow::ensure!(once.capacity() == once.len(), "{} bytes in a buffer of {}", once.len(), once.capacity());
+        }
+        let caps = AgentMsg::Caps { caps: CAP_WIRE };
+        let small = encode(&caps)?;
+        anyhow::ensure!(small == postcard::to_allocvec(&caps)? && small.capacity() == small.len(), "{small:?}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a channel item's body, written as bytes, is the same on the wire as the
+    /// sequence of `u8` it was, at each length where its varint grows, alone and inside `AgentMsg::Wire` as a
+    /// runner sends it; each shape reads the other's, and their JSON is the same.
+    #[test]
+    fn g9_s5_a_channel_items_body_keeps_the_wire() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Seq};
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        enum Old {
+            Item { stream: String, seq: Seq, low: Seq, body: Vec<u8> },
+        }
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384] {
+            let body: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            let new = Frame::Item { stream: "s:s1#7.0".into(), seq: 9, low: 4, body: body.clone() };
+            let old = Old::Item { stream: "s:s1#7.0".into(), seq: 9, low: 4, body };
+            let (n, o) = (encode(&new)?, encode(&old)?);
+            anyhow::ensure!(n == o, "{len} bytes: {} and {} on the wire", n.len(), o.len());
+            anyhow::ensure!(decode::<Frame>(&o)? == new && decode::<Old>(&n)? == old, "{len} bytes didn't read back");
+            anyhow::ensure!(serde_json::to_string(&new)? == serde_json::to_string(&old)?, "{len} bytes in JSON");
+            match read_agent(&encode(&AgentMsg::Wire(new.clone()))?).map_err(|e| anyhow::anyhow!("{}", e.why("AgentMsg")))? {
+                AgentMsg::Wire(f) => anyhow::ensure!(f == new, "{len} bytes in AgentMsg::Wire"),
+                _ => anyhow::bail!("read back as another message"),
+            }
+        }
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a `Vec<u8>` field written as bytes (`wire_bytes`) is the same on the
