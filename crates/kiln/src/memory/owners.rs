@@ -114,8 +114,21 @@ pub static WEBHOOK_QUEUES: Owner = Owner::new("webhook_queues");
 /// and a TCP sender waits: its connection isn't read until there's room.
 pub static SYSLOG_WAITING: Owner = Owner::new("syslog_waiting");
 
+/// Messages waiting for the CI engine's dispatcher (`crate::ci::dispatch::Handle`): at most
+/// [`crate::net::EVENTS_BYTES`], as much as the hub's queue of runners' messages its runners' messages are
+/// made from, one a message. At the bound the hub's loop waits to hand it a runner's message, and behind
+/// it the net thread and QUIC's flow control hold the runners. A person's request (a run started, a
+/// cancel, a rerun) never waits: one message each, counted all the same.
+pub static CI_INBOX: Owner = Owner::new("ci_inbox");
+
+/// Small files kept whole (`crate::keep`: a registry's names and epochs, its holders, the terminals'
+/// names), waiting for their writer: each file's newest bytes alone, so at most one copy of each kept
+/// file waits (and one is written), the bytes before them let go as they come. No bound of its own past
+/// that: the files' sizes are the registries'.
+pub static KEEP_WAITING: Owner = Owner::new("keep_waiting");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 17] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING];
+pub(super) const ALL: [&Owner; 19] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING];
 
 #[cfg(test)]
 mod tests {

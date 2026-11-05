@@ -223,6 +223,11 @@ impl Sync {
         {
             tracing::warn!(target: "kiln.sync", event = "sync.incoming", error = %e, "contents half-sent before the server stopped couldn't be removed");
         }
+        // Both unbounded, and bounded by the groups (goal 11, plan 01a1a87b2e56 step 3): what the owner
+        // sends (`out`) is its groups' raft messages, each group's in flight within the limits hyper-raft
+        // derives from the 64 MiB it states (`super::group::settings`), each message at most
+        // `super::group::MESSAGE`; what comes in (`tx`) is the copies' answers to those (they're learners:
+        // they answer, never lead), runners' word on their copies, and asks each waited for.
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));
