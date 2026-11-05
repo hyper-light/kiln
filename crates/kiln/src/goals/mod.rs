@@ -2041,7 +2041,7 @@ where
         let now = self.clock.unix_ms();
         let due: Vec<String> = self
             .store
-            .call(move |c| {
+            .read(move |c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
                 let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -2056,7 +2056,7 @@ where
         }
         let running: Vec<String> = self
             .store
-            .call(|c| {
+            .read(|c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
                 let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -2082,7 +2082,7 @@ where
         }
         let waiting: Vec<String> = self
             .store
-            .call(|c| {
+            .read(|c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
                 let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -2706,7 +2706,7 @@ fn ended(stack: &Stack, item: &Item, info: &Info, busy: bool) -> Option<Next> {
 /// The goals agents paused for a person, until someone resumes them (`Stack::held_for`), by agent.
 pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
     store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT agent, COALESCE(reason, ''), held_for, dropped_at FROM goal_stacks WHERE state = 'paused' AND held_for IS NOT NULL")?;
             let v = st
                 .query_map([], |r| {
@@ -2732,7 +2732,7 @@ async fn say_held(hub: &Hub) {
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
     let like = format!("{}%", crate::programs::PAUSED_FOR_USAGE);
     let paused = store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND reason LIKE ?1")?;
             let v = st.query_map(params![like], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)
