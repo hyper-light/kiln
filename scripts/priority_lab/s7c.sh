@@ -22,6 +22,7 @@
 #               wait in a shard's driver ends by its timer tick, no privilege asked), N busy loops on SERVER_CPUS.
 #   nudge-cc    that, the hogs N C compilers.
 #   calm-nudge  the nudge with no hogs: what it costs a calm server.
+#               NUDGE_US sets the nudge's period for all three (KILN_RT_NUDGE_US; unset, the server's timer tick).
 # rt and rt-cc run only where this machine grants a user's process RLIMIT_RTPRIO room for priority 1; elsewhere they
 # are skipped and the log says so (the machine owner's call). A *-cc configuration needs CC_SRC (sqlite3.c from
 # cargo's registry, unless given). Every configuration's server runs SHARDS shards (4: what it sizes itself to on
@@ -97,6 +98,9 @@ one() {
     nudge) senv+=(--env KILN_RT_NUDGE=1); hog=spin; hogcpus=$SERVER_CPUS ;;
     nudge-cc) senv+=(--env KILN_RT_NUDGE=1); hog=cc; hogcpus=$SERVER_CPUS ;;
     calm-nudge) senv+=(--env KILN_RT_NUDGE=1) ;;
+  esac
+  case "$cfg" in
+    nudge | nudge-cc | calm-nudge) [ -n "${NUDGE_US:-}" ] && senv+=(--env "KILN_RT_NUDGE_US=$NUDGE_US") ;;
   esac
   senv+=(--env "LAB_SERVER_CPUS=$server_cpus")
   [ -n "$SHARDS" ] && senv+=(--env "KILN_RT_SHARDS=$SHARDS")
