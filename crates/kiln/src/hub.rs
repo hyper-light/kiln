@@ -4265,10 +4265,11 @@ impl Hub {
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
         // Its turns on its shard: a queue that finds no runner was walked whole in one poll, every second; one job's
-        // pick at a time now, the shard given up once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+        // pick at a time now, its poll ended once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3: no
+        // poll past the quantum, `rt::Turns::end`).
         let mut turns = crate::rt::Turns::new();
         for job in queued {
-            turns.after().await;
+            turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
             if !runs.contains_key(&job.run_id) {
                 let r = self.store.run(job.run_id.clone()).await?;

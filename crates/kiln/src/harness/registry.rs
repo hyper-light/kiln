@@ -2303,7 +2303,7 @@ impl Registry {
         loop {
             let Ok((id, u)) = rx.recv().await else { return Ok(()) };
             hub.harness.ingest_from(&hub, &Location::Local, &id, u, false).await;
-            turns.after().await;
+            turns.end().await;
         }
     }
 

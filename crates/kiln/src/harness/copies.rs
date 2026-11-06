@@ -4599,7 +4599,7 @@ async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
 /// one), then each message while it's expected to end within the quantum ([`Costs`]), an update's events while the next and
 /// what ends the update are. What's left of a message its turn ran out in (an update's events), or one it had no room for,
 /// goes first at its next turn, before anything newer. A turn spent with more to take gives the shard up whether or not
-/// another task wants it: one that went on while none did (`crate::rt::Turns::after`, `maybe_yield`) ran on in the same poll,
+/// another task wants it: one that went on while none did (`maybe_yield`) ran on in the same poll,
 /// which the shards' table counted whole (the lab's g9p9 fill: this owner's polls past 100 µs, 0.7 to 1.6 ms on average by
 /// round, the longest 7 to 53 ms on the CPU, each labeled by a message of its last turn alone).
 ///

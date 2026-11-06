@@ -1708,21 +1708,13 @@ impl Turns {
         Self { began: Instant::now(), looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
     }
 
-    /// After a piece of the loop's work: its turn given up once its next piece would pass its step's quantum.
-    pub async fn after(&mut self) {
-        if self.over() {
-            maybe_yield().await;
-            *self = Self::new();
-        }
-    }
-
-    /// After a piece of the loop's work: as [`Turns::after`], its turn over once its next piece would pass its step's
-    /// quantum, but its poll ends there too, whether or not anything else wants the shard now (`yield_now`, where
-    /// `after` asks `maybe_yield`). Goal 9, plan 01a1a87b2cec step 3: no poll past the quantum. Told that nothing
-    /// wanted the shard, the hub's net loop went on into its next turn in the same poll, and a burst of runners' frames
-    /// held its shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end
-    /// costs a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else
-    /// is ready: once a quantum at the most, and only while frames wait.
+    /// After a piece of the loop's work: its turn over once its next piece would pass its step's quantum, and its poll
+    /// with it, whether or not anything else wants the shard now (`yield_now`). Goal 9, plan 01a1a87b2cec step 3: no
+    /// poll past the quantum. Told that nothing wanted the shard (`maybe_yield`, which every loop took until
+    /// 2026-11-06), a loop went on into its next turn in the same poll: a burst of runners' frames held the hub's net
+    /// loop's shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end costs
+    /// a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else is
+    /// ready: once a quantum at the most, and only while work waits.
     pub async fn end(&mut self) {
         if self.over() {
             hyper_rt::futures::yield_now().await;
@@ -1798,7 +1790,7 @@ impl Turns {
     }
 
     /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
-    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
+    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::end`].
     pub fn over(&self) -> bool {
         hyper_rt::futures::step_budget_ns().is_some_and(|q| self.over_at(Instant::now(), q))
     }
@@ -2780,8 +2772,8 @@ mod tests {
     }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): a turn that's over ends its poll whether or not anything else wants the shard
-    /// (`end`), where `after` goes on in the same poll when nothing does; and a piece expected to run past the quantum
-    /// waits for the next turn (`before`), never a turn's first, nor one that fits.
+    /// (`end`); and a piece expected to run past the quantum waits for the next turn (`before`), never a turn's first,
+    /// nor one that fits.
     #[test]
     fn g9_s3_a_turn_over_ends_its_poll_and_a_piece_that_wont_fit_waits_for_the_next() -> anyhow::Result<()> {
         // Of 100 µs pieces against 266.666 µs: one done, the next 100 µs and 60 µs more of its read ends at 260 µs, within;
