@@ -2292,6 +2292,25 @@ What each risks, for the lab to say: a read of the newest page that inflates the
 keeps (up to the chunk's 250 KB, a memcpy beside the inflate's 0.3 ms): watch the events reads' p99. A meta's offset
 reckoned costs a read at most 70 additions.
 
+**A window found off the shards** (goal 9 step 3's rule, and the idle copies' cut's first part, below). The UI's agent
+page asks its socket for a lean window (`?window=1&lean=1`: `ui/src/api/harness.ts`'s `TAKES`). Finding where that
+window begins (`View::window_start`), and whether a resume fits one (`View::fits`), read each of its events as the
+viewer takes it, lean (its JSON read whole), on the socket's shard as its parts were taken
+(`Registry::attach_from`, `Registry::frames_since`), and so did a packed snapshot's plan (`Snapshot::packing`, taken by
+`api::send_snapshot` on the shard): with `Events::get`, which reads a compact chunk again whole (inflated, each of its
+events parsed) for each event it gives. A window of ten of a long session's turns, about 400 events over 5 compact
+chunks, read them again about 330 times on the shard (est. 100 to 300 ms); kiln-lab's viewers ask for neither, so the
+lab never saw it. Now:
+- the window is found where the snapshot is written, on the blocking pool (`Parts::find`, `Parts::resolved`, called by
+  `Snapshot::plan`), and a packed snapshot is planned with its first piece (`Packing::next_piece`), not where it's taken;
+- each read of events one after another reads each compact chunk again once (`copies::Reading`: a window's start, a
+  resume's fit, a plan's lean sizes, an older page);
+- an older page (`GET .../timeline`) and an event read whole (`GET .../events/{event}`) are read on the blocking pool
+  (`Registry::page`, `Registry::event_text`).
+What the lab would show: its viewers asking as the UI does (`window=1&lean=1` beside `z=gzip&patch=state&patch=changes`,
+`kiln-lab`'s `lab.rs` viewer), A (without) against B (with): attach p50 and p99 and the viewers' sockets' slow polls
+(their snapshot's label) fall with B, and no read or frame number is worse.
+
 **Looked at, and not cut:**
 - **Sessions' copies, the rest.** What the open chunks hold as text (`session_entries`): the 24 idle copies' 50 events
   each, est. 4.3 MB, the 8 at work about 1 MB. A read of a copy's newest page takes them, and the lab's readers read
@@ -2299,9 +2318,9 @@ reckoned costs a read at most 70 additions.
   nothing in for `os::alloc::COLD_AFTER`, read back off the shard before its next event, as a change to a compact
   chunk is) would give est. 17 MB in production's shape (126 idle copies at 35 events on average), 0.3 MB in the lab
   (its entries' own allocations; the reads keep the texts). It takes the snapshot's newest chunk packed as it's kept,
-  the update's thaw before an event goes in at a compact newest chunk and before a stream into one, and a window's
-  start (`View::window_start`) reading a compact chunk once, not once an event. Not made here: the lab wouldn't
-  see it, and it changes the owners' hot paths.
+  the update's thaw before an event goes in at a compact newest chunk and before a stream into one (off the shard,
+  finished before the next event or stream is taken), and a window found off the shards (below). Next, once the
+  owners' polls' own changes (goal 9 step 3) have landed: production's ~17 MB, with what the lab would measure.
 - **The registry**: its maps (names, holders, epochs, uploads) and each copy's own (about 0.5 KB a copy beside its
   events): under 0.1 MB in the lab.
 - **The bus**: as in part 4.

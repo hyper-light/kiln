@@ -1390,6 +1390,76 @@ impl Events {
         }
         lo
     }
+
+    /// Its events read by their place one after another ([`Reading`]).
+    pub fn reading(&self) -> Reading<'_> {
+        Reading { events: self, read: None }
+    }
+
+    /// Whether the events changed after revision `after` fit a window's bounds (`super::window`), as a viewer that
+    /// takes them `lean` is sent them: what a window's resume is held to (`super::registry::Parts::resolved`).
+    pub(super) fn fit_since(&self, after: u64, lean: bool) -> bool {
+        let (mut rows, mut bytes) = (0usize, 0usize);
+        let mut reading = self.reading();
+        for (i, m) in self.metas().enumerate() {
+            if m.at <= after {
+                continue;
+            }
+            rows += 1;
+            bytes = bytes.saturating_add(if lean { reading.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.text_len() });
+            if rows > super::window::ROWS || bytes > super::window::BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Where a window of the events before `end` begins, holding at most `turns` turns (`super::window::start_at`),
+    /// as a viewer that takes them `lean` is sent them: read from `end` back, each compact chunk inflated once.
+    pub(super) fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
+        let mut reading = self.reading();
+        super::window::start_at(end, turns, |i| reading.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
+    }
+}
+
+/// A copy's events read by their place one after another (goal 9, plan 01a1a87b2cec step 3; goal 11, plan
+/// 01a1a87b2e56 step 5): each compact chunk among them read again once, for all of its events read in turn.
+/// [`Events::get`] reads a compact chunk again whole (inflated, each of its events parsed) for each event it gives,
+/// so a window over a long session's compact chunks read each of them again once an event: the UI's lean window
+/// (`?window=1&lean=1`), about 400 events over 5 compact chunks, about 330 inflates of a 70-event chunk.
+pub struct Reading<'a> {
+    events: &'a Events,
+    /// The compact chunk read last: where it is among the chunks, and its events read again.
+    read: Option<(usize, Vec<Ev>)>,
+}
+
+impl Reading<'_> {
+    /// Event `i`: as its chunk keeps it, or read again with the rest of its compact chunk, once for them all.
+    pub fn get(&mut self, i: usize) -> Option<&Ev> {
+        let events = self.events;
+        let (c, k) = events.place(i)?;
+        let chunk = events.chunk(c)?;
+        if !chunk.is_compact() {
+            return chunk.evs.get(k);
+        }
+        if self.read.as_ref().is_none_or(|(was, _)| *was != c) {
+            self.read = Some((c, chunk.evs().ok()?.into_owned()));
+        }
+        self.read.as_ref().and_then(|(_, evs)| evs.get(k))
+    }
+}
+
+/// The number a copy's timeline begins at, as its state says: where a clear began it again (`State::cleared`, read
+/// from the state's own field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
+fn floor_of(state: &StateDoc) -> u64 {
+    state.get::<u64>("cleared").unwrap_or(1).max(1)
+}
+
+/// A window (or a page) of `events` that begins at event `begin`: that event's number, and whether there's more before
+/// it, in the copy or (`older`) perhaps in the conversation store, the timeline beginning where `state` says.
+pub(super) fn window_at(events: &Events, state: &StateDoc, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
+    let before = events.meta(begin).and_then(|m| m.seq());
+    crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > floor_of(state))) }
 }
 
 /// A chunk that sealed, waiting to be packed, with its copy's home, whose owner keeps it compact once
@@ -1618,6 +1688,7 @@ impl View {
             lean: false,
             window: None,
             from: 0,
+            find: None,
         }
     }
 
@@ -1625,56 +1696,30 @@ impl View {
     /// "Windows"): all of it, or its newest events alone, as many as a window holds
     /// (`super::window::start`), and where they begin. `older`: events before what the copy holds may
     /// be kept elsewhere (the server's conversation store), so a window that begins at the copy's
-    /// first may still have more before it.
+    /// first may still have more before it. The window is found where the snapshot is written, off the
+    /// shards (`super::registry::Parts::resolved`; goal 9, plan 01a1a87b2cec step 3, and goal 11, plan
+    /// 01a1a87b2e56 step 5): finding it reads its events as the viewer takes them, a lean viewer's each
+    /// made lean, and was done on the socket's shard.
     pub fn parts_for(&self, view: super::registry::View, older: bool) -> Parts {
-        let from = if view.window { self.window_start(self.events.len(), super::window::TURNS, view.lean) } else { 0 };
-        Parts { lean: view.lean, window: view.window.then(|| self.window_at(from, older)), from, ..self.parts() }
+        Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..self.parts() }
     }
 
     /// What a viewer that had revision `after` (None: nothing) and takes the session as `view` says
     /// is sent: what it lacks when the copy can say, else a snapshot. To a viewer that takes a window,
     /// what changed since is sent only while it's no more than a window holds; past that it's sent a
-    /// window: a resume never costs more than a first load.
+    /// window: a resume never costs more than a first load. Which of the two is told where the snapshot
+    /// is written, off the shards, as a window is found ([`View::parts_for`]).
     pub fn parts_after(&self, after: Option<u64>, view: super::registry::View, older: bool) -> Parts {
-        let since = after.and_then(|rev| self.parts_since(rev)).filter(|p| !view.window || self.fits(p.since.unwrap_or_default(), view.lean));
-        match since {
-            Some(p) => Parts { lean: view.lean, ..p },
+        match after.and_then(|rev| self.parts_since(rev)) {
+            Some(p) => Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..p },
             None => self.parts_for(view, older),
         }
-    }
-
-    /// Whether the events changed after revision `after` fit a window's bounds.
-    fn fits(&self, after: u64, lean: bool) -> bool {
-        let (mut rows, mut bytes) = (0usize, 0usize);
-        for (i, m) in self.events.metas().enumerate() {
-            if m.at <= after {
-                continue;
-            }
-            rows += 1;
-            bytes = bytes.saturating_add(if lean { self.events.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.text_len() });
-            if rows > super::window::ROWS || bytes > super::window::BYTES {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Where a window of the events before `end` begins, holding at most `turns` turns.
-    fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
-        super::window::start_at(end, turns, |i| self.events.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
-    }
-
-    /// The number its timeline begins at: where a clear began it again (`State::cleared`, read from the state's own
-    /// field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
-    fn floor(&self) -> u64 {
-        self.state.get::<u64>("cleared").unwrap_or(1).max(1)
     }
 
     /// A window (or a page) that begins at event `begin`: that event's number, and whether there's
     /// more before it, in the copy or (`older`) perhaps in the conversation store.
     pub(super) fn window_at(&self, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
-        let before = self.events.meta(begin).and_then(|m| m.seq());
-        crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > self.floor())) }
+        window_at(&self.events, &self.state, begin, older)
     }
 
     /// An older page of its events, for a viewer that has them from number `before` on: those just
@@ -1684,11 +1729,12 @@ impl View {
         use super::registry::Paged;
         let end = self.events.partition_point(|m| m.seq().is_some_and(|s| s < before));
         if end == 0 {
-            let floor = self.floor();
+            let floor = floor_of(&self.state);
             return if older && before > floor { Paged::Store { before, floor } } else { Paged::Page { events: Vec::new(), window: crate::wire::ui::EventsWindow { before: None, more: false } } };
         }
-        let begin = self.window_start(end, super::window::PAGE_TURNS, lean);
-        let events = (begin..end).filter_map(|i| self.events.get(i)).map(|e| e.entry.sent(lean).to_owned()).collect();
+        let begin = self.events.window_start(end, super::window::PAGE_TURNS, lean);
+        let mut reading = self.events.reading();
+        let events = (begin..end).filter_map(|i| reading.get(i).map(|e| e.entry.sent(lean).to_owned())).collect();
         Paged::Page { events, window: self.window_at(begin, older) }
     }
 
@@ -4970,6 +5016,34 @@ mod tests {
         }
         anyhow::ensure!(chunk.span(1, 3).and_then(|r| joined.get(r)) == texts.get(1..4).map(|t| t.join(",")).as_deref(), "events 1 to 3 joined");
         anyhow::ensure!(chunk.span(5, 1).is_none() && chunk.span(0, 0).is_none() && chunk.span(4, 2).is_none(), "nothing past its events");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a copy's events read one after another ([`Reading`]), from the
+    /// newest back as a window reads them, read each compact chunk again once for all of its events, where
+    /// `Events::get` reads it again for each: the same events, and none past them.
+    #[test]
+    fn g11_s5_heap_events_read_in_turn_read_each_compact_chunk_once() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut events = Events::default();
+        let n = CHUNK * 3 + 5;
+        for q in 1..=u64::try_from(n)? {
+            events.push(Ev { entry: entry(&format!("e{q}"), q), at: q });
+        }
+        for c in events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        events.compact(None);
+        let compact = events.chunks().iter().filter(|c| c.is_compact()).count();
+        anyhow::ensure!(compact == 3, "three compact chunks: {compact}");
+        let want: Vec<String> = (0..n).filter_map(|i| events.get(i).map(|e| e.entry.text().to_owned())).collect();
+        let was = inflated();
+        let mut reading = events.reading();
+        let mut got: Vec<String> = (0..n).rev().filter_map(|i| reading.get(i).map(|e| e.entry.text().to_owned())).collect();
+        got.reverse();
+        anyhow::ensure!(got == want && got.len() == n, "the same events");
+        anyhow::ensure!(usize::try_from(inflated() - was)? == compact, "each compact chunk read again once: {}", inflated() - was);
+        anyhow::ensure!(reading.get(n).is_none(), "none past them");
         Ok(())
     }
 
