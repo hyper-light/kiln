@@ -20,7 +20,7 @@ const browser = Object.assign(new EventTarget(), {
   location: { reload: () => void reloads++ },
 });
 Object.assign(globalThis, { window: browser, sessionStorage: storage, localStorage: storage, document: new EventTarget(), location: { protocol: "http:", host: "localhost" } });
-const { watchForUpdates } = await import("../src/lib/update.ts");
+const { buildIn, watchForUpdates } = await import("../src/lib/update.ts");
 watchForUpdates();
 
 /** A lazily loaded part fails, as Vite says it; whether the page took Vite's error. */
@@ -48,4 +48,21 @@ await test("leaving the page, what its leaving cancels reloads nothing; still th
   for (const fn of timers.splice(0)) fn();
   assert.equal(fails(), true);
   assert.equal(reloads, 1);
+});
+
+// What a page counts as a new build: the import map its HTML carries, which a deploy of any chunk
+// changes, even when the entry keeps its name (goal 8, plan 01a1a832ebfd step 4).
+const page = (map: string, entry = "/assets/index-AAAAAAAA.js") =>
+  `<html><head><script type="importmap">${map}</script></head><body><script type="module" async="" src="${entry}"></script></body></html>`;
+
+await test("a deploy that changed only a route's chunk is a new build", () => {
+  const a = page(`{"imports":{"/assets/k/index.js":"/assets/index-AAAAAAAA.js","/assets/k/_app.agents._id.js":"/assets/_app.agents._id-11111111.js"}}`);
+  const b = page(`{"imports":{"/assets/k/index.js":"/assets/index-AAAAAAAA.js","/assets/k/_app.agents._id.js":"/assets/_app.agents._id-22222222.js"}}`);
+  assert.notEqual(buildIn(a), buildIn(b));
+  assert.equal(buildIn(a), buildIn(page(`{"imports":{"/assets/k/index.js":"/assets/index-AAAAAAAA.js","/assets/k/_app.agents._id.js":"/assets/_app.agents._id-11111111.js"}}`)));
+});
+
+await test("a build without an import map is its entry script", () => {
+  assert.equal(buildIn(`<script type="module" async="" src="/assets/index-BbBbBbBb.js"></script>`), "/assets/index-BbBbBbBb.js");
+  assert.equal(buildIn("<html></html>"), null);
 });

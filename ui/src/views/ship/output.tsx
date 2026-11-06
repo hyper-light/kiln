@@ -16,7 +16,7 @@ import { toast } from "@/components/ui/toast";
 import { sendingProps, useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
-import LogViewer from "@/views/run-detail/log-viewer";
+import { LazyLogViewer as LogViewer } from "@/views/run-detail/log-lazy";
 import { copyLater } from "@/views/terminal/clipboard";
 import { stepToShow } from "@/views/updates/logs";
 import { StatusGlyph } from "@/components/ui/status-glyph";

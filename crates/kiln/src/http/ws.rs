@@ -58,7 +58,7 @@ pub fn accept_limited(
     req: Request,
     max_message: usize,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
-    accept_with(req, limits(max_message))
+    handshake(req, limits(max_message), true)
 }
 
 /// What a socket whose peer sends people's commands reads at a time: a TLS record's most (RFC 8446 §5.1, 2^14
@@ -84,7 +84,7 @@ pub const SOCKET_WRITE: usize = 16 << 10;
 pub fn accept_commands(
     req: Request,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
-    accept_with(req, commands_config())
+    handshake(req, commands_config(), true)
 }
 
 /// A socket's of [`accept_commands`]: its message's limit, and its reads and writes a TLS record at a time.
@@ -92,10 +92,23 @@ fn commands_config() -> WebSocketConfig {
     limits(16 << 20).read_buffer_size(COMMANDS_READ).write_buffer_size(SOCKET_WRITE)
 }
 
-/// Answers the handshake for a socket of `config`.
-fn accept_with(
+/// [`accept`], with the WebSocket's settings given whole (the browser protocol's socket bounds its
+/// write buffer too, `crate::live`). The 101 names no extension, whatever the client offered:
+/// permessage-deflate is declined there, as the browser protocol compresses by trust class itself
+/// and never a secret beside what a page's peer can steer (docs/browser-protocol.md).
+pub fn accept_with(
     req: Request,
     config: WebSocketConfig,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    handshake(req, config, false)
+}
+
+/// Answers the handshake for a socket of `config`, taking permessage-deflate when the client offers
+/// it and `deflate` lets it (W21-R15).
+fn handshake(
+    req: Request,
+    config: WebSocketConfig,
+    deflate: bool,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
     let bad = |reason: &'static str| Refused { status: StatusCode::BAD_REQUEST, reason };
     if !is_upgrade(&req) {
@@ -118,7 +131,7 @@ fn accept_with(
     }
     // permessage-deflate, when the client offers it (W21-R15): what a browser's socket carries most
     // is JSON much like the message before it.
-    let deflate = super::deflate::negotiate(req.headers());
+    let deflate = if deflate { super::deflate::negotiate(req.headers()) } else { None };
     // What an inflated message may come to: the socket's own bound (none, none).
     let max_message = config.max_message_size.unwrap_or(usize::MAX);
     if let Some(agreed) = deflate {

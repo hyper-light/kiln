@@ -12,3 +12,6 @@ export { Joiner, readOne } from "./join";
 export { Estimate, GRAIN_MS, Liveness, type Verdict } from "./liveness";
 export { BpError, codeOf, Reader, Why, WHY_NAMES, Writer } from "./runtime";
 export { itemKey, keyOf, TopicState, type ItemKey, type Misfit } from "./state";
+export { Carrier, protocolOf, type CarrierState } from "./carrier";
+export { CHANNEL, Hub, OWNER_LOCK, snapshotOf, type Down, type SubEvent, type Up } from "./hub";
+export { Live, live, useTopic, type LiveMode, type LiveOptions } from "./shared";

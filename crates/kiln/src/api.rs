@@ -513,6 +513,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers()).await),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
+        // The browser protocol's lab page, on a lab's server alone (`KILN_LIVE_LAB`, `crate::live`).
+        (&Method::GET, ["__live", file]) if crate::live::lab_dir().is_some() => return Ok(boxed(|| crate::live::lab_file(file)).await),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
         (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
@@ -567,6 +569,31 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         Err(e) => e.0.as_u16(),
     })
     .await
+}
+
+/// A read run as `caller` through the API's own routes and checks (`authorized`), for the browser
+/// protocol's requests (`crate::live`, goal 3 of the browser protocol program): the answer's status and
+/// body, a body past `most` answered 413. Only the API's reads, never the protocol's own endpoint.
+pub(crate) async fn live_read(hub: Arc<Hub>, caller: crate::authz::Caller, path: &str, most: usize) -> (u16, Vec<u8>) {
+    use http_body_util::BodyExt as _;
+    if !path.starts_with("/api/") || path.starts_with(crate::live::PATH) {
+        return (404, b"not a read the protocol carries".to_vec());
+    }
+    let Ok(req) = http::Request::builder().method(Method::GET).uri(path).body(kiln_http::Incoming::empty()) else {
+        return (400, b"not a path".to_vec());
+    };
+    // Its segments, as the router splits a request's path for `authorized` (goal 10, plan 01a1a87b2dae step 5).
+    let at = req.uri().path().to_owned();
+    let seg = segments(&at);
+    let resp = match boxed(|| authorized(hub, caller, req, seg)).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    let status = resp.status().as_u16();
+    match http_body_util::Limited::new(resp.into_body(), most).collect().await {
+        Ok(c) => (status, c.to_bytes().to_vec()),
+        Err(_) => (413, b"the answer is larger than a frame holds".to_vec()),
+    }
 }
 
 /// A future made and boxed in a frame of its own. A debug build gives each temporary of an async
@@ -1043,6 +1070,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::DELETE, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::delete(&hub)).await),
         (&Method::PUT, ["api", "settings", "password"]) => boxed(|| set_password(&hub, req)).await,
         (&Method::DELETE, ["api", "settings", "password"]) => boxed(|| clear_password(&hub)).await,
+        // The browser protocol over one WebSocket (goal 3 of the browser protocol program, `crate::live`):
+        // a ticket for the open, the socket, and the caller's own sockets as the server holds them.
+        (&Method::POST, ["api", "live", "ticket"]) => Ok(crate::live::ticket(&hub, &caller, &req)),
+        (&Method::GET, ["api", "live"]) => Ok(crate::live::socket(hub.clone(), caller.clone(), req)),
+        (&Method::GET, ["api", "live", "sockets"]) => Ok(crate::live::sockets(&hub, &caller)),
         (&Method::GET, ["api", "events"]) => {
             // A person of some repositories hears theirs (W10); the server's scope hears it all.
             let narrow = boxed(|| crate::authz::gate::readable(&hub, &caller, "runs.read"))
@@ -2947,6 +2979,9 @@ fn me_json(hub: &Hub, caller: Option<&crate::authz::Caller>, groups: Vec<String>
         "kind": caller.map(|c| c.kind),
         "grants": caller.and_then(crate::authz::Caller::grants),
         "groups": groups,
+        // The browser protocol's endpoint, when served (`crate::live`): a page never tries it on a
+        // server that lacks it.
+        "live": hub.live.offer(),
         // What it may do (W10-R02), for pages that show only what one can use: each
         // capability held on the whole server, or only somewhere (a repository, …).
         "can": caller.map(|c| {
@@ -3204,6 +3239,8 @@ fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
         "sample": s.sample,
         "kubernetes": s.kubernetes,
         "runtime": "hyper-rt",
+        // The browser protocol's endpoint, when served (`crate::live`).
+        "live": hub.live.offer(),
     })
 }
 

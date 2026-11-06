@@ -45,6 +45,11 @@ pub async fn serve(req: Request) -> Response {
         return r;
     }
     let page = get && srv::header_str(&req, &header::ACCEPT).is_some_and(|a| a.contains("text/html"));
+    // A page that renders only in the browser is the shell, whoever renders it: kiln sends its own,
+    // packed by the build and revalidated by its ETag (goal 8, plan 01a1a832ebfd step 3).
+    if page && crate::ui::renders_in_browser(req.uri().path()) {
+        return crate::ui::shell(&req);
+    }
     let port = PORT.load(Ordering::Relaxed);
     if port == 0 {
         return if page { crate::ui::shell(&req) } else { srv::text(StatusCode::SERVICE_UNAVAILABLE, "kiln's UI server isn't running") };

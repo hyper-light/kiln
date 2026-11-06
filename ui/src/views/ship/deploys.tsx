@@ -38,7 +38,7 @@ import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { relativeTime } from "@/lib/format";
-import LogViewer from "@/views/run-detail/log-viewer";
+import { LazyLogViewer as LogViewer } from "@/views/run-detail/log-lazy";
 import { Shimmer } from "@/views/harness/signals";
 import { SectionHead } from "./head";
 import { glyphOf, optionsOf, strip } from "./model";
