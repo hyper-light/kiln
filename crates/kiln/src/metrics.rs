@@ -1145,7 +1145,7 @@ mod tests {
         spread.render(&mut a, "d", "s=\"0\"");
         one.render(&mut b, "d", "s=\"0\"");
         anyhow::ensure!(a == b, "rendered as one:\n{a}\nagainst\n{b}");
-        anyhow::ensure!(std::mem::align_of::<Line>() >= 128 && std::mem::size_of::<Line>() % 128 == 0, "a copy on lines of its own");
+        anyhow::ensure!(std::mem::align_of::<Line>() >= 128 && std::mem::size_of::<Line>().is_multiple_of(128), "a copy on lines of its own");
         Ok(())
     }
 

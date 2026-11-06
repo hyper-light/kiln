@@ -2259,7 +2259,7 @@ impl Mirror {
         let held = Arc::clone(&e);
         let Some(id) = held.id() else { return false };
         let ev = Ev { entry: e, at: self.rev };
-        let found = self.index.get(&self.events, &id);
+        let found = self.index.get(&self.events, id);
         if found.is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
             return false;
         }
@@ -2274,7 +2274,7 @@ impl Mirror {
                 let displaced = self.events.change(at, |slot| *slot = ev.clone());
                 if displaced {
                     self.index.forget(&was, at);
-                    self.index.insert(&self.events, &id, at);
+                    self.index.insert(&self.events, id, at);
                 }
                 return displaced;
             }
@@ -2284,7 +2284,7 @@ impl Mirror {
         }
         let at = self.events.len();
         let sealed = self.events.push(ev);
-        self.index.insert(&self.events, &id, at);
+        self.index.insert(&self.events, id, at);
         if let Some(sealed) = sealed {
             seal(&sealed, self.home());
         }
