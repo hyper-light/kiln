@@ -848,6 +848,17 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
 }
 
+/// Keeps a scrape of the round's server's `/metrics` as it came, `name` in the round's `<round>.hook` folder (kept when
+/// its kiln's is removed, [`Hook`]): every family a round reads and every one it doesn't yet, to read afterwards (goal 9,
+/// plan 01a1a87b2cec step 5: the shards' timer wakes by site, `kiln_shard_timer_wakes_total`, and their kicks by sender,
+/// `kiln_shard_kicks_in_total`, between the window's two). One that can't be written is said, and the round goes on.
+fn keep_scrape(round: &Path, name: &str, body: &[u8]) {
+    let dir = round.with_extension("hook");
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(name), body)) {
+        eprintln!("kiln-lab: the window's scrape {name} wasn't kept: {e}");
+    }
+}
+
 /// A command the lab runs as each part of a round begins and ends, from `KILN_LAB_HOOK` (goal 9, plan
 /// 01a1a87b2cec step 2: a profiler of the round's server over its window): `<hook> <event> <server's pid>
 /// <folder>`, the event `fill-start`, `fill-end`, `window-start` or `window-end`, the folder one of the
@@ -1054,7 +1065,9 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         m.cpu_pressure_before = cpu_pressure();
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
         m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
-        let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None).context("the window's first scrape of the server's /metrics")?.body));
+        let before = scraper.send("GET", "/metrics", None).context("the window's first scrape of the server's /metrics")?.body;
+        keep_scrape(dir, "window-before.prom", &before);
+        let before = Scrape::parse(&String::from_utf8_lossy(&before));
         hook.run("window-start");
         let start = now_us();
         let interrupted = crate::rx::interrupted();
@@ -1062,7 +1075,9 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         let end = now_us();
         m.interrupted_reads = Some(crate::rx::interrupted().saturating_sub(interrupted));
         hook.run("window-end");
-        let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None).context("the window's last scrape of the server's /metrics")?.body));
+        let after = scraper.send("GET", "/metrics", None).context("the window's last scrape of the server's /metrics")?.body;
+        keep_scrape(dir, "window-after.prom", &after);
+        let after = Scrape::parse(&String::from_utf8_lossy(&after));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
         m.mhz_after = cpu_mhz(m.affinity.as_deref());
