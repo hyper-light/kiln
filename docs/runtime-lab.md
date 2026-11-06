@@ -308,6 +308,54 @@ takes about the fill plus 70 s. Stop a run by the unit or run it's in: the lab's
 lead process groups of their own (so each one's harnesses go with it), which a kill of the lab's
 process alone leaves running.
 
+### Fixed rates (`kiln-lab rate`)
+
+Where a round replays a realistic mix, `kiln-lab rate` asks one read at a time at fixed rates (100,
+1,000, 10,000, 100,000 and 1,000,000 a second by default), open loop and without coordinated omission,
+as wrk2 does: each request is sent when the schedule says (or as soon as a connection is free after),
+and its latency runs from when the schedule said, so a stall is charged to every request it held back.
+It measures any server a target file describes, so kiln and another product (T3 Code, for goal 10's
+benchmark) are measured by one generator:
+
+```sh
+kiln-lab rate --target crates/kiln-lab/targets/kiln.toml --kiln new=a/kiln --kiln prod=b/kiln \
+              --target t3code.toml [--rates 100,1k,10k,100k,1m] [--out DIR]
+```
+
+A target file (TOML) names the target, its server and its reads. `[server] kind = "kiln"` starts each
+`--kiln` as a round does (a fresh data dir, the lab's runners and stand-in, `--profile`'s sessions
+filled in; `${token}` is its admin token and `${session}` its sessions, largest first); `kind =
+"command"` runs `command` (with `cwd`, `env`) on a free port of its own, waits until it answers
+(`ready`: the port, or a path's `GET`), and runs `seed`, whose last line of output, a JSON object, gives
+the reads' values. Each `[[workload]]` is `kind = "http"` (method, path, headers and body over
+keep-alive HTTP/1.1, `pipeline` deep where the server takes it, as kiln's does) or `kind = "ws-rpc"`
+(JSON requests over WebSockets, `hello` messages first, each answer matched by its id at a JSON
+pointer, `final` and `ok` tests on it). Strings are templates: `${port}`, `${dir}`, `${token}`, a
+request's `${id}`, and the seed's values. kiln's file has its two reads: the sessions' list and the
+largest session's newest page (`GET /api/harness/sessions/${session}/events`, its newest 100 events).
+
+For each target, each rate (ascending) and each read in turn, the connections open, then a warm-up at
+the rate (5 s, the realistic profile's), the window (the longer of 10 s, wrk's default, and 10,000
+requests, so p99.9 rests on ten samples past it), and the drain (the window's backlog still sent for
+a warm-up's length; each request answered within 90 s, the lab's patience, or timed out). Connections
+follow Little's law: the rate times `--expect-ms` (1 ms, goal 10's bar) times 2 (each busy at most half
+the time), over what a connection carries at once, at least one for each of the generator's threads
+(`--gen-cpus`: a quarter of the CPUs, or all of the lab's with `--server-cpus`). The lab raises its
+open-files limit to kiln's service's (1,048,576 on Linux, 10,240 on macOS) before any server starts,
+so servers run under production's, and holds connections to what it allows, saying so.
+
+Each read at each rate is one line of `results.jsonl` and a row of `report.md`: the rate asked and
+the rates sent and answered, good answers and errors (bad statuses, timeouts, connections cut, requests
+never sent), p50, p99, p99.9 and the most from when each fell due (and the same from each send, what
+coordinated omission would have said), the answers' bytes, the server's CPU (CPUs' worth) and RSS
+through the window (its whole process tree: `/proc` every 100 ms on Linux, `ps` every second on
+macOS; Windows isn't sampled), and the generator's CPU, its busiest thread's work, and its own
+lateness. It says who couldn't keep up: the generator, when its busiest thread worked 90% of the window
+or its lateness at p99 is a tenth of the latency's; the connections, when the rate fell short while
+requests waited for one; the server, when it fell short otherwise (under 99% answered, or over 1%
+errors). Its threads ask their OS to be punctual (Linux's timer slack of 1 ns, macOS's
+user-interactive QoS) and spin through the last of each wait, their own oversleeps' 90th percentile.
+
 ## Main's baseline
 
 Measured on 2026-11-04 (10:00 to 11:56 UTC) on a Linux machine with an Intel Core i9-14900HX (32

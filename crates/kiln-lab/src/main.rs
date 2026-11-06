@@ -11,12 +11,16 @@
 //! kiln-lab run --kiln kiln --server-cpus 16-31 --layout production --hogs 1x   # the lab on its own CPUs
 //! kiln-lab compare first/run.json second/run.json
 //! kiln-lab report DIR/run.json [--quantum-us 266.666]
+//! kiln-lab rate --target targets/kiln.toml --kiln new=a/kiln --kiln prod=b/kiln --target t3.toml   # fixed rates
 //! ```
+//!
+//! `rate` measures servers at fixed request rates, open loop (goal 10, Ada's fixed-rate benchmark; `rate`).
 
 mod client;
 mod fleet;
 mod lab;
 mod measure;
+mod rate;
 mod report;
 mod standin;
 mod stats;
@@ -133,6 +137,9 @@ enum Cmd {
         /// `label=path/run.json`, or a path (labelled by its folder).
         runs: Vec<String>,
     },
+    /// Servers at fixed request rates, open loop and without coordinated omission: each read of each target at
+    /// each rate, its latency from when each request fell due, the server's CPU and memory, and the generator's own.
+    Rate(rate::Args),
     /// A CPU hog (the lab starts these itself): `threads` threads, each spinning.
     #[command(hide = true)]
     Hog {
@@ -184,14 +191,7 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
         None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("no HOME"))?).join(".cache/kiln-lab").join(utc(started_secs).replace(':', "")),
     };
     std::fs::create_dir_all(&out)?;
-    let mut profile = match c.profile.as_str() {
-        "small" => Profile::small(),
-        "realistic" => Profile::realistic(),
-        "overload" => Profile::overload(),
-        "many" => Profile::many(),
-        "flood" => Profile::flood(),
-        p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
-    };
+    let mut profile = Profile::named(&c.profile)?;
     if let Some(w) = c.window {
         profile.window_s = w;
     }
@@ -303,6 +303,7 @@ fn main() -> anyhow::Result<()> {
             }
             print!("{}", report::table(&loaded));
         }
+        Cmd::Rate(a) => rate::main(&a)?,
         Cmd::Hog { threads } => lab::hog(threads),
     }
     Ok(())
