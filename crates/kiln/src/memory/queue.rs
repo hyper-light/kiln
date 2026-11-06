@@ -469,6 +469,15 @@ impl<T> std::fmt::Debug for Sender<T> {
     }
 }
 
+#[cfg(test)]
+impl<T> Sender<T> {
+    /// How many receivers' waits are listed now, each one a send would wake (a test's: a receiver that never
+    /// waits on the queue lists none, so a send wakes no one).
+    pub(crate) fn takers_listed(&self) -> usize {
+        self.chan.takers.listed()
+    }
+}
+
 impl<T> Sender<T> {
     /// Queues `item`, waiting first while the queue has no room for it: an error, with the item, once no
     /// one takes from the queue any more.
