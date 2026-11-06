@@ -6658,7 +6658,14 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     // Whose its commands' ids are: a caller's, as an Idempotency-Key's are.
     let scope = caller.as_ref().map_or_else(String::new, crate::harness::ops::key_scope);
     let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
-    crate::rt::spawn(async move {
+    // Served on its session's owner's shard, where the session's frames are published (goal 10, plan 01a1a87b2dae step
+    // 5): a frame then reaches this viewer in its owner's own thread once the owner's turn ends, where a viewer on
+    // another shard (its connection's, dealt round-robin: three in four with four shards) was woken across threads for
+    // each, its shard kicked where it was parked, and behind a busy CPU up to a tick on a kernel that preempts lazily
+    // (`crate::route_latency::FrameLeg::WokenOther`). Its connection moves there with its upgrade: a socket's waits are
+    // one-shot, armed on whichever shard awaits it, and one left armed where it was is withdrawn there
+    // (`hyper_rt::readiness`), as an accepted connection moves to the shard it's dealt.
+    crate::rt::spawn_owner(hub.harness.owner_shard(&id), async move {
         let Ok(socket) = upgrade.await else { return };
         // Watching is seeing (checked before the upgrade); commands on the socket need acting, and
         // each is audited as its caller.
@@ -7012,6 +7019,11 @@ where
     Ok(came_to)
 }
 
+/// The session sockets' viewers that ran on another shard than their session's owner, and on it, in this test process
+/// (goal 10, plan 01a1a87b2dae step 5): each viewer is served on its owner's shard (`harness_ws`).
+#[cfg(test)]
+static VIEWERS_ON_OWNER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
 /// What a viewer's socket is doing, for the shards' table of what held them (`hyper_rt::slow`; goal 10, plan
 /// 01a1a87b2dae step 5: g9p7's calm lab named the socket's task by its spawn site alone, held 6.3 ms, and not which
 /// of its parts held it): its attach (what's kept of its files, its place among the viewers, the view), its
@@ -7092,6 +7104,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // Whether it runs on its session's owner's shard, where its frames are published: then their wake is no other
     // thread's (goal 10, plan 01a1a87b2dae step 5).
     let own = crate::rt::shard_index() == Some(hub.harness.owner_shard(&id));
+    #[cfg(test)]
+    if let Some(n) = VIEWERS_ON_OWNER.get(usize::from(own)) {
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
@@ -8470,6 +8486,80 @@ mod tests {
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             drop(feed);
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's viewer is served on its session's owner's shard, wherever its
+    /// connection came in: its socket moves there with its upgrade, and its snapshot and live frames come over it; no
+    /// viewer in this test process runs off its session's owner's shard. Here the session's owner is another shard than
+    /// the one its connection was served on (where the runtime has another), so its socket moved.
+    #[test]
+    fn g10_s5_a_viewer_is_served_on_its_sessions_owner_shard() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::sync::atomic::Ordering;
+        const MARK: &str = "g10-s5: a frame to a viewer on its session's owner's shard";
+        crate::rt::block_on(async {
+            // kiln's API on a port of its own, its connections served on this task's shard.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let port = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let here = crate::rt::shard_index().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (api, remote) = (Arc::clone(&api), stream.peer_addr().ok());
+                    crate::rt::spawn(async move { crate::http::server::serve_accepted(stream, api, remote, None).await });
+                }
+            });
+            // A session another shard owns.
+            let elsewhere = crate::rt::shard_count() > 1;
+            let id = (0u64..1024).map(|n| format!("viewed-{n}")).find(|id| !elsewhere || hub.harness.owner_shard(id) != here).ok_or_else(|| anyhow::anyhow!("no session another shard owns"))?;
+            anyhow::ensure!(!elsewhere || hub.harness.owner_shard(&id) != here, "{id} is owned where its viewer's connection is served");
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, &id, Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.to_owned(), streaming: false } };
+            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(1, "the retry loop reads its deadline")] }).await;
+            let on0 = VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed));
+            // The viewer: its snapshot (its frames, then `synced`), then the live frame.
+            let (tx, rx) = async_channel::unbounded::<Result<bool, String>>();
+            let path = format!("/api/harness/sessions/{id}/ws");
+            std::thread::spawn(move || {
+                let watch = || -> anyhow::Result<()> {
+                    let mut ws = ws_client(port, &path, None)?;
+                    loop {
+                        if let tungstenite::Message::Text(t) = ws.read()? {
+                            if t.as_str() == synced() {
+                                let _ = tx.send_blocking(Ok(false));
+                            } else if t.as_str().contains(MARK) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+                let _ = tx.send_blocking(watch().map(|()| true).map_err(|e| format!("{e:#}")));
+            });
+            let wait = Duration::from_secs(60);
+            let next = |what: &'static str| {
+                let rx = rx.clone();
+                async move {
+                    match crate::rt::timeout(wait, rx.recv()).await {
+                        Ok(Ok(Ok(live))) => Ok(live),
+                        Ok(Ok(Err(why))) => Err(anyhow::anyhow!("{what}: {why}")),
+                        Ok(Err(_)) => Err(anyhow::anyhow!("{what}: its viewer went")),
+                        Err(_) => Err(anyhow::anyhow!("{what}: not within {wait:?}")),
+                    }
+                }
+            };
+            anyhow::ensure!(!next("its snapshot").await?, "its snapshot comes first");
+            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(2, MARK)] }).await;
+            anyhow::ensure!(next("its live frame").await?, "the live frame");
+            let (off, on) = (VIEWERS_ON_OWNER.first().map_or(0, |n| n.load(Ordering::Relaxed)), VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed)));
+            anyhow::ensure!(off == 0, "{off} viewers in this process ran off their session's owner's shard");
+            anyhow::ensure!(on > on0, "this one ran on its owner's shard: {on0} then {on}");
             Ok(())
         })
     }
