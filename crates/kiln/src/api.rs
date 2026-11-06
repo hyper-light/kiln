@@ -8737,9 +8737,15 @@ mod tests {
             // share, the request's extensions (their table, kiln-http's arrival time, the connection's), the slot an
             // idle connection makes again, the handler's and the router's futures, the path's segments, the answer's
             // body and its box, its header map and its timing. Two more allow for another test's request on the same
-            // shard taking the map given back between two of these.
+            // shard taking the map given back between two of these. And FINISH more since train 9 put main's compression
+            // (W21-R15, `crate::http::compress::finish`) on this path: a GET answered 200 with a body it may validate,
+            // /healthz's "ok" too, gets its future boxed, the body gathered whole, a weak ETag (its digest as hex, then
+            // as `W/"…"`, then a header value), the ETag's and cache-control's room in the header map, and the body boxed
+            // again: 9 on both protocols, measured on main b6519ca5756 and on train 10 alike (25 and 22, 2026-11-06).
+            // Goal 9 step 5's cuts of finish's own allocations lower FINISH.
+            const FINISH: u64 = 9;
             let fixed = |costs: &Costs| costs.iter().find(|(p, _, _)| *p == "/healthz").map_or(u64::MAX, |(_, m, _)| m.blocks);
-            anyhow::ensure!(fixed(&one) <= 16 + 2 && fixed(&two) <= 13 + 2, "the serve path's own: {} allocations over HTTP/1.1, {} over HTTP/2", fixed(&one), fixed(&two));
+            anyhow::ensure!(fixed(&one) <= 16 + FINISH + 2 && fixed(&two) <= 13 + FINISH + 2, "the serve path's own: {} allocations over HTTP/1.1, {} over HTTP/2", fixed(&one), fixed(&two));
             Ok(())
         })
     }
