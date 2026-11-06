@@ -43,6 +43,12 @@ pub static FEED_INTAKE: Owner = Owner::new("feed_intake");
 /// queue their hand-ons came in. At the bound a receipt is let go, said so, its hand-on unanswered.
 pub static CUSTODY_RECEIPTS: Owner = Owner::new("custody_receipts");
 
+/// Runners' custody records waiting for the task that reads, checks and keeps them in the order they came
+/// (`crate::custody::runners::Intake`; goal 9, plan 01a1a87b2cec step 3): at most
+/// [`crate::custody::runners::RECORDS_BYTES`], as much as the hub's queue of runner events they came off. At the
+/// bound the hub's loop waits, and behind it the net thread and QUIC's flow control: no record is let go.
+pub static CUSTODY_RECORDS: Owner = Owner::new("custody_records");
+
 /// Finished messages' mentions of files waiting for the task that keeps them (`crate::harness::kept`): at
 /// most `QUEUE_BYTES` there, an owner's inbox's bytes ([`crate::net::EVENTS_BYTES`]), where the messages
 /// came from. At the bound a message's files aren't kept as it finishes: they're read when someone looks.
@@ -204,7 +210,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

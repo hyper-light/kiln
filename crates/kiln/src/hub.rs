@@ -673,6 +673,10 @@ pub struct Hub {
     /// What kiln takes from relays and relays itself, checked and numbered (docs/ci.md W27-R08's
     /// relays: `crate::relays`).
     pub(crate) relays: crate::relays::Relays,
+    /// Runners' custody records on their way off the net loop to the one task that reads, checks and
+    /// keeps them in the order they came, started on first use ([`Hub::custody_intake`]; goal 9, plan
+    /// 01a1a87b2cec step 3).
+    pub(crate) custody_in: crate::custody::runners::Intake,
     /// The copies of runners' trees other runners keep: the rules for them, and what each runner
     /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
     pub copies: crate::reach::copies::Copies,
@@ -818,6 +822,7 @@ impl Hub {
             sync,
             reach: crate::reach::relay::Owner::default(),
             relays: crate::relays::Relays::default(),
+            custody_in: crate::custody::runners::Intake::default(),
             copies,
             places,
             tasks,
@@ -1819,6 +1824,17 @@ impl Hub {
         &self.reach
     }
 
+    /// Custody's intake of runners' records, its task started on first use, on the next shard round-robin rather than the
+    /// net loop's (goal 9, plan 01a1a87b2cec step 3): it reads, checks and keeps each record, one at a time in the order
+    /// they came, and holds the hub weakly (`crate::custody::runners::intake_loop`). Its place is here, so the shards'
+    /// table of what held them names it among the hub's tasks, as runners' custody records were.
+    pub(crate) fn custody_intake(self: &Arc<Self>) -> &crate::custody::runners::Intake {
+        if let Some(rx) = self.custody_in.starting() {
+            drop(crate::rt::spawn_spread_joined(crate::custody::runners::intake_loop(Arc::downgrade(self), rx)));
+        }
+        &self.custody_in
+    }
+
     /// Reach's relay's one owner: it alone changes the relay, taking each frame, lost connection and
     /// question in the order sent, and sends what the relay passes on in that order. It holds the hub
     /// weakly: once the hub goes, its sender with it, so does this.
@@ -2295,10 +2311,12 @@ impl Hub {
         let mut turns = crate::rt::Turns::new();
         // A turn starts afresh with an event this loop waited for (goal 10, plan 01a1a87b2dae step 5).
         while let Some(ev) = turns.next(&rx).await {
-            // A frame whose read on the shard would take its turn past its quantum waits for the next turn, the shard
-            // given up first (goal 9, plan 01a1a87b2cec step 3).
-            if let NetEvent::Frame { data, .. } = &ev {
-                turns.before(crate::wire::payload::expected_ns(data)).await;
+            // A frame that may hold the shard past what's left of its turn's quantum, its reads there and its handler at the
+            // most, waits for the next turn, the shard given up first (goal 9, plan 01a1a87b2cec step 3;
+            // `crate::wire::payload::Piece`).
+            let piece = Self::piece_of(&ev);
+            if let Some(p) = &piece {
+                turns.room_for(p.bound_ns()).await;
             }
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
@@ -2316,8 +2334,9 @@ impl Hub {
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
             let label = Self::net_label(&ev);
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
-            // a message read whole that couldn't be applied.
-            if let Err(e) = crate::rt::labeled(label, self.on_net_at(ev, &mut arrived)).await {
+            // a message read whole that couldn't be applied. What its piece held the shard for is learned as
+            // it's taken (goal 9, plan 01a1a87b2cec step 3).
+            if let Err(e) = crate::wire::payload::Piece::take(piece, crate::rt::labeled(label, self.on_net_at(ev, &mut arrived))).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
             // An agent session's update is timed where it's taken, by the shard that owns its copy,
@@ -2355,6 +2374,16 @@ impl Hub {
             NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => &CLOSED,
             NetEvent::Frame { kind, lane, .. } if Self::job_log(*kind, *lane) => &LOG,
             NetEvent::Frame { .. } => &FRAME,
+        }
+    }
+
+    /// What [`Hub::net_loop`] takes event `ev` as, a piece of its turn on its shard (`crate::wire::payload::Piece`; goal 9,
+    /// plan 01a1a87b2cec step 3): a runner's frame, by what it carries; none for its link coming or going.
+    fn piece_of(ev: &NetEvent) -> Option<crate::wire::payload::Piece> {
+        match ev {
+            NetEvent::Frame { kind, lane, .. } if Self::job_log(*kind, *lane) => Some(crate::wire::payload::Piece::job_log()),
+            NetEvent::Frame { data, .. } => Some(crate::wire::payload::Piece::of(data)),
+            NetEvent::Connected { .. } | NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => None,
         }
     }
 
@@ -2485,7 +2514,7 @@ impl Hub {
 
     /// What a message of `peer`'s carries couldn't be read (`crate::wire::payload`): noted as
     /// [`Hub::unreadable`] notes a frame, and on its agent session's page too for a session's.
-    async fn unreadable_payload(&self, peer: PeerId, e: Box<crate::wire::payload::Unreadable>, tell: bool) {
+    pub(crate) async fn unreadable_payload(&self, peer: PeerId, e: Box<crate::wire::payload::Unreadable>, tell: bool) {
         use crate::wire::payload::Waits;
         // What waits on it is told why: the runner's question answered so, the server's own asker
         // told so.
@@ -3344,10 +3373,12 @@ impl Hub {
                     crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error).await;
                 }
             }
-            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08).
+            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08): read, checked and kept
+            // off this loop, one at a time in the order its runner sent them, by custody's intake (goal 9, plan
+            // 01a1a87b2cec step 3; `crate::custody::runners`), the process it came over named as it is now.
             FromRunner::Custody(record) => {
-                let (hub, machine) = (Arc::clone(self), agent.to_owned());
-                crate::rt::spawn(async move { crate::custody::on_runner(&hub, peer, &machine, record).await });
+                let instance = self.instances.load().get(peer).map(crate::instances::Instance::label);
+                self.custody_intake().send(crate::custody::runners::Sent { peer, machine: agent.to_owned(), instance, record }).await;
             }
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
@@ -5313,6 +5344,58 @@ pub(crate) mod tests {
             hub.on_net(item(1, "s:s1#a1", 5, "s1", &Update::Closed)?).await?;
             assert_eq!(holder("s1"), None, "s1 let go of before the loop went on");
             assert_eq!(answered("s:s1#a1"), Some((5, 0)), "its Closed answered taken");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the net loop takes each runner frame as a piece of its turn on its shard, each
+    /// given up for where it won't fit what's left of the turn's quantum, and loses none of them nor their order: a session's
+    /// Open and its events, one a frame, end in its copy as sent; a custody record among them goes on to custody's intake
+    /// and is kept there; and the loop ends once its queue does. Half the page of events a copy keeps in memory
+    /// (`crate::harness::copies::EVENTS_PAGE`): none of them is spilled, so the copy's page from memory has them all.
+    #[test]
+    fn g9_s3_the_net_loop_takes_each_frame_in_order_as_pieces_of_its_turns() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (tx, rx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, crate::net::EVENTS_BYTES);
+            let mut looped = crate::rt::spawn(Arc::clone(&hub).net_loop(rx));
+            let frame = |msg: &AgentMsg| -> anyhow::Result<NetEvent> { Ok(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(msg)?, at: Instant::now() }) };
+            let say = |u: &Update| -> anyhow::Result<AgentMsg> { Ok(AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? }) };
+            let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            tx.send(frame(&say(&open)?)?).await.map_err(|_| anyhow::anyhow!("the loop's queue closed"))?;
+            let events = u64::try_from(crate::harness::copies::EVENTS_PAGE / 2)?;
+            for n in 1..=events {
+                let said = Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } };
+                tx.send(frame(&say(&Update::Events { events: vec![said] })?)?).await.map_err(|_| anyhow::anyhow!("the loop's queue closed"))?;
+                if n == events / 2 {
+                    let json = serde_json::json!({ "refused_hop": { "what": "a run", "from": "box-b", "why": "its digest differs" } }).to_string();
+                    tx.send(frame(&AgentMsg::Custody { json })?).await.map_err(|_| anyhow::anyhow!("the loop's queue closed"))?;
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let seen = loop {
+                hub.harness.applied("s1").await;
+                let page = hub.harness.events_json("s1", None, crate::harness::copies::EVENTS_PAGE).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+                let seen: Vec<String> = page.as_ref().and_then(|v| v.get("events")).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+                if seen.len() >= usize::try_from(events)? {
+                    break seen;
+                }
+                if Instant::now() >= deadline {
+                    let ended = futures::poll!(&mut looped).map(|r| r.map(|r| r.map_err(|e| format!("{e:#}"))));
+                    anyhow::bail!("{} of {events} events taken in 60 s; {} frames left in the loop's queue, the loop ended {ended:?}, its page {page:?}", seen.len(), tx.len());
+                }
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(seen, (1..=events).map(|n| format!("e{n}")).collect::<Vec<_>>(), "every event, in the order sent");
+            while crate::custody::refusals(&hub.store, 10).await?.is_empty() {
+                anyhow::ensure!(Instant::now() < deadline, "the custody record among them wasn't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            drop(tx);
+            let ended = crate::rt::timeout(Duration::from_secs(30), looped).await.map_err(|_| anyhow::anyhow!("the loop went on past its queue"))?;
+            anyhow::ensure!(matches!(ended, Ok(Err(_))), "the loop ends, saying its stream ended");
             Ok(())
         })
     }
