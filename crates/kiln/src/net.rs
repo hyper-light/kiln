@@ -402,6 +402,68 @@ impl NetHandle {
     }
 }
 
+/// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
+/// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
+/// none, and it's dropped), its frames made on the compute pool (`make`), and each handed to `send`. A frame is a copy
+/// of its message's bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes),
+/// which made on a shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe
+/// loops). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard
+/// is given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its
+/// polls ends within the quantum. Returns once `out` is closed and empty.
+pub async fn send_made<M, X, F, S, Fut>(out: &async_channel::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, make: F, mut send: S)
+where
+    X: Send + 'static,
+    F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
+    S: FnMut(PeerId, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let make = Arc::new(make);
+    let mut turns = crate::rt::Turns::new();
+    loop {
+        // One waiting already goes on in this turn; one waited for starts a turn afresh, the wait having given the
+        // shard to its other work (as `rt::Turns::next` takes a queue's).
+        let first = match out.try_recv() {
+            Ok(m) => m,
+            Err(async_channel::TryRecvError::Closed) => return,
+            Err(async_channel::TryRecvError::Empty) => match out.recv().await {
+                Ok(m) => {
+                    turns = crate::rt::Turns::new();
+                    m
+                }
+                Err(_) => return,
+            },
+        };
+        let mut batch = Vec::new();
+        let mut next = Some(first);
+        while let Some(m) = next.take() {
+            batch.extend(route(m));
+            if !turns.over() {
+                next = out.try_recv().ok();
+            }
+        }
+        if !batch.is_empty() {
+            let make = Arc::clone(&make);
+            let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
+            // The wait for the pool ended the poll: the sends start a turn of their own.
+            turns = crate::rt::Turns::new();
+            match made {
+                Ok(made) => {
+                    for (peer, frames) in made {
+                        for frame in frames {
+                            send(peer, frame).await;
+                            turns.end().await;
+                        }
+                    }
+                }
+                // A job that unwound (a bug where they're made): its messages are lost, as a link that drops them
+                // loses them, and their senders' own repair sends what's needed again.
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "messages' frames weren't made: dropped"),
+            }
+        }
+        turns.end().await;
+    }
+}
+
 /// Per-peer, per-lane frames refused with `LaneFull`, bounded.
 const OUTBOX_FRAMES: usize = 8192;
 
@@ -1241,6 +1303,74 @@ fn on_event<B, D>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what `send_made` sends is what came, in the order it came and each message's
+    /// frames in theirs, less what had nowhere to go; the frames are made off the shards (on the compute pool); and no
+    /// poll of it runs more sends than its turn has room for, though nothing else asks for its shard: each send here
+    /// takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding the thread only makes
+    /// sends longer, and turns shorter).
+    #[test]
+    fn g9_s3_frames_are_made_off_the_shards_and_sent_in_order_in_turns() -> anyhow::Result<()> {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        crate::rt::block_on(async {
+            const SEND: Duration = Duration::from_micros(20);
+            let send_ns = u64::try_from(SEND.as_nanos()).unwrap_or(u64::MAX);
+            let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
+            anyhow::ensure!(quantum_ns > 0, "a shard has a quantum");
+            // Sends for several turns: two frames a message, a third of the messages with nowhere to go.
+            let n = u32::try_from(quantum_ns.saturating_mul(8) / send_ns).unwrap_or(u32::MAX).max(64);
+            let (tx, rx) = async_channel::unbounded::<u32>();
+            for m in 0..n {
+                tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
+            }
+            drop(tx);
+            let route = |m: u32| (!m.is_multiple_of(3)).then_some((u64::from(m % 5), m));
+            let made_on_a_shard = Arc::new(AtomicBool::new(false));
+            let make = {
+                let on = Arc::clone(&made_on_a_shard);
+                move |m: u32| {
+                    if crate::rt::on_shard() {
+                        on.store(true, Ordering::SeqCst);
+                    }
+                    vec![m.to_be_bytes().to_vec(), vec![0xff]]
+                }
+            };
+            let (sends, most_quantum_ns) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(quantum_ns)));
+            let mut sent: Vec<(PeerId, Vec<u8>)> = Vec::new();
+            let (mut polls, mut most_in_a_poll) = (0u64, 0u64);
+            {
+                let (counted, quantum) = (Arc::clone(&sends), Arc::clone(&most_quantum_ns));
+                let send = |peer: PeerId, frame: Vec<u8>| {
+                    let until = Instant::now() + SEND;
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    // The quantum as the turn reads it (the shard's online estimate may move).
+                    quantum.fetch_max(hyper_rt::futures::step_budget_ns().unwrap_or(0), Ordering::SeqCst);
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    sent.push((peer, frame));
+                    async { true }
+                };
+                let mut work = std::pin::pin!(send_made(&rx, route, make, send));
+                std::future::poll_fn(|cx| {
+                    let before = sends.load(Ordering::SeqCst);
+                    let polled = work.as_mut().poll(cx);
+                    polls += 1;
+                    most_in_a_poll = most_in_a_poll.max(sends.load(Ordering::SeqCst).saturating_sub(before));
+                    polled
+                })
+                .await;
+            }
+            let expected: Vec<(PeerId, Vec<u8>)> = (0..n).filter(|m| !m.is_multiple_of(3)).flat_map(|m| [(u64::from(m % 5), m.to_be_bytes().to_vec()), (u64::from(m % 5), vec![0xff])]).collect();
+            anyhow::ensure!(sent == expected, "sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+            anyhow::ensure!(!made_on_a_shard.load(Ordering::SeqCst), "frames were made on a shard");
+            let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(send_ns).saturating_sub(1).max(1);
+            anyhow::ensure!(most_in_a_poll <= bound, "a poll ran {most_in_a_poll} sends of at least {SEND:?}, past its turn's {bound}");
+            anyhow::ensure!(polls > 1, "{} sends in one poll", sent.len());
+            Ok(())
+        })
+    }
 
     /// A frame garbled for a test can't be read: cut short, given bytes after it, or what follows
     /// its variant index mangled (its index stays).
