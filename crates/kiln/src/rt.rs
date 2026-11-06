@@ -2470,6 +2470,19 @@ impl<'a> Listen<'a> {
         Arc::clone(&held.place)
     }
 
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify.
+    pub fn wait(mut self) {
+        let waker = crate::memory::queue::thread_waker();
+        while !self.over() {
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return;
+            }
+            std::thread::park();
+        }
+    }
+
     /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
     /// notify came.
     pub fn wait_deadline(mut self, until: Instant) -> bool {
@@ -2603,13 +2616,14 @@ const SINK_BATCH: usize = 1 << 20;
 
 /// Stream a file in chunks. Opening happens now (so a missing file is an error here); each chunk is
 /// read on the blocking pool, and no thread waits while the consumer is slow. The stream ends at
-/// end of file (or a read error, which is logged). Its chunks wait in a queue of four
-/// (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top goal), as in the
-/// async-channel it was, whose every chunk took event-listener's `Mutex` (a download's, an artifact's).
+/// end of file (or a read error, which is logged). Its chunks wait in a pipe whose room its pace sets
+/// (`crate::memory::queue::pipe`: what its consumer takes while the next chunk is read, a chunk past it;
+/// consts-audit B4: four, as the channel it replaced held), lock-free (goal 5, plan 01a1a59c2aae, its top goal:
+/// the async-channel it was took event-listener's `Mutex` for every chunk, a download's, an artifact's).
 pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     let path = path.into();
     let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 4);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     spawn(async move {
         let mut offset = 0u64;
         loop {
@@ -2648,8 +2662,10 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::qu
 /// Write a stream of chunks to a new file. Send chunks into the returned sender, drop it, then
 /// await the future for the byte count. Writing runs concurrently (bounded), so the sender sees
 /// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write. Its chunks
-/// wait in a queue of sixteen (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top
-/// goal), as in the async-channel it was, whose every chunk took event-listener's `Mutex` (an upload's).
+/// wait in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what the file's writes take while
+/// the next chunk comes, a chunk past it; consts-audit B4: sixteen, as the channel it replaced held),
+/// lock-free (goal 5, plan 01a1a59c2aae, its top goal: the async-channel it was took event-listener's `Mutex`
+/// for every chunk, an upload's).
 pub fn file_sink(
     path: impl Into<PathBuf>,
     max: u64,
@@ -2659,7 +2675,7 @@ pub fn file_sink(
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     let writer = spawn(async move {
         let mut total = 0u64;
         // Each receive a charge of the task's turn (`hyper_rt::coop`).
