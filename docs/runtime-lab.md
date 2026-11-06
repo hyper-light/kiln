@@ -2026,12 +2026,17 @@ owner counted (`sqlite` counts page caches): 604 KB for its 202 tables and 283 i
 opened (SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), and its statements. The store kept
 every connection a burst of reads ever opened, up to the `store` share's 24 places, and took them in turn
 (a queue), so none went idle. Now a read takes the lowest place's connection and gives it back to the lowest
-place free, and once each 5 s (`os::alloc::COLD_AFTER`) a read giving one back closes the highest place's
-connection that no read took in that long: what stays open is the reads' recent peak. It saves about 0.75 MB
-for each connection past that peak; how many there were is `kiln_memory_bound_bytes{owner="sqlite"}` over a
-connection's bound (4.6 MB, `store::cache_bound`). A read past the peak opens a connection and parses the
-schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the blocking pool): watch store-backed
-numbers' p99 (pages, MCP, fill).
+place free, so the `n`-th read at once uses place `n - 1`. A read past the open connections opens one and parses
+the schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the read's job), so which connections
+close is learned from the reads themselves (goal 11's audit, row B17; the first cut closed any idle 5 s, and every
+burst after a 5 s quiet reopened): each level of reads at once learns the longest it was quiet before reads came
+back to it, and keeps its connection while its quiet is within that. The floor kept is every level up to the
+highest still expected back; above it a read giving its connection back closes the highest place's, one a read,
+never place 0's, on a job of its own so no read's answer waits for the close. A level that never came back is kept
+as long as any level was away and came back, so a burst that doesn't recur gives its connections back. A level
+back after a longer quiet than it ever had costs that read an open, once. It saves about 0.75 MB for each
+connection past the floor; how many there are is `kiln_memory_bound_bytes{owner="sqlite"}` over a connection's
+bound (4.6 MB, `store::cache_bound`). Watch store-backed numbers' p99 (pages, MCP, fill) after quiets.
 
 ### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
 
