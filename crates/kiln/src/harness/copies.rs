@@ -23,10 +23,12 @@
 //! a frame past where it reads from.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::BuildHasher as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
@@ -215,6 +217,19 @@ impl Index {
             std::collections::hash_map::Entry::Occupied(_) => {
                 self.apart.insert(id.into(), at);
             }
+        }
+    }
+
+    /// Lets go of event `id`'s place, where it's `at`: another event takes that place (`Mirror::upsert`, goal 9, plan
+    /// 01a1a87b2cec step 3: the index was made again for it, every event's id hashed, on the owner's shard).
+    pub(super) fn forget(&mut self, id: &str, at: usize) {
+        if let std::collections::hash_map::Entry::Occupied(o) = self.by_hash.entry(Self::hash(id))
+            && *o.get() == at
+        {
+            o.remove();
+        }
+        if self.apart.get(id) == Some(&at) {
+            self.apart.remove(id);
         }
     }
 
@@ -1921,14 +1936,20 @@ impl Mirror {
             && q <= top
         {
             let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < q));
-            let displaced = if self.events.meta(at).is_some_and(|m| m.seq == Some(q)) {
-                self.events.change(at, |slot| *slot = ev.clone())
-            } else {
-                self.events.insert(at, ev);
-                false
-            };
+            if let Some(was) = self.events.meta(at).filter(|m| m.seq == Some(q)).map(|m| m.id().to_owned()) {
+                // Another id under that number, in its place: the index lets go of that one there and finds this one, the
+                // rest of it as it was (goal 9, plan 01a1a87b2cec step 3: it was made again, every event's id hashed, on the
+                // owner's shard). One that couldn't be changed leaves the copy, and so its index, as they were.
+                let displaced = self.events.change(at, |slot| *slot = ev.clone());
+                if displaced {
+                    self.index.forget(&was, at);
+                    self.index.insert(&self.events, &id, at);
+                }
+                return displaced;
+            }
+            self.events.insert(at, ev);
             self.reindex();
-            return displaced;
+            return false;
         }
         let at = self.events.len();
         let sealed = self.events.push(ev);
@@ -2024,6 +2045,114 @@ pub struct Shard {
     /// The session and event last put in so (or tried): one still to be put in as an update comes back to it is put in
     /// where it is, as before, so an update always goes on.
     inserted: Option<(String, String)>,
+    /// An event an update takes that's long to write out (a large tool output, [`long_to_write`]), the first of what's left
+    /// of the update: written out off the shard before the update goes on ([`Shard::want_write`]; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    write: Option<Writing>,
+    /// What was made of the event last written out so, or tried, for the update's next take alone ([`Shard::take_written`]).
+    written: Option<Written>,
+    /// Events written out so ([`Shard::written_off`]).
+    written_off: u64,
+}
+
+/// What its owner needs to write an event of session `session` out off the shard ([`Shard::want_write`]): whether a row of it
+/// is kept for the conversation store, and where the session works, for the files the event mentions.
+struct Writing {
+    session: String,
+    keep: bool,
+    cwd: String,
+    location: Location,
+}
+
+/// An event of a session's update written out off its owner's shard ([`Shard::want_write`]), or tried: what was made of it,
+/// for the update to take as it comes back to it (`Registry::apply`).
+pub(super) struct Written {
+    session: String,
+    id: String,
+    seq: u64,
+    /// None when it couldn't be written there: it's written where it is, as before, so an update always goes on.
+    pub(super) made: Option<Made>,
+}
+
+impl Written {
+    /// Whether it's session `session`'s event `e`.
+    pub(super) fn is(&self, session: &str, e: &super::model::Event) -> bool {
+        self.session == session && self.id == e.id && self.seq == e.seq
+    }
+}
+
+/// An event written out: its entry, its row for the conversation store (where one is kept), and the files it mentions
+/// (`super::registry::mentions`), each made as `Registry::apply` makes them.
+pub(super) struct Made {
+    pub(super) entry: Arc<Entry>,
+    pub(super) row: Option<crate::convo::rows::Row>,
+    pub(super) mentions: Option<super::kept::Job>,
+}
+
+/// Event `e` of session `session` written out as `Registry::apply` writes it ([`Made`]): its row kept when `keep`, the files it
+/// mentions found as a session working in `cwd` at `location` finds them.
+fn made_of(session: &str, e: &super::model::Event, keep: bool, cwd: &str, location: &Location) -> Made {
+    let mut row = None;
+    let entry = if keep {
+        Entry::of_event(e, Some(&mut |text: String| row = Some(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(session, e, text))))))
+    } else {
+        Entry::of_event(e, None)
+    };
+    Made { entry: Arc::new(entry), row, mentions: super::registry::mentions(session, cwd, location, e) }
+}
+
+/// What writing an event out takes by its bytes (`super::weigh::event`), as the owners write them on their shards and off
+/// (goal 9, plan 01a1a87b2cec step 3): moving averages of each one's bytes and of how long it took, nanoseconds, a new
+/// sample's weight 1/8 as RFC 6298 smooths a round trip, as `crate::wire::payload` learns what reading a runner's frame
+/// takes. Every owner learns into it, a load and a store each: a sample lost to another owner's at the same moment is one
+/// of many.
+static WRITES: Rate = Rate::new();
+
+/// A rate learned by moving averages of samples' sizes and times ([`WRITES`]).
+struct Rate {
+    bytes: AtomicU64,
+    ns: AtomicU64,
+}
+
+impl Rate {
+    const fn new() -> Self {
+        Self { bytes: AtomicU64::new(0), ns: AtomicU64::new(0) }
+    }
+
+    /// Nanoseconds a sample of `bytes` is expected to take, at the rate learned: none until one was taken.
+    fn expected(&self, bytes: u64) -> u64 {
+        bytes.saturating_mul(self.ns.load(Ordering::Relaxed)).checked_div(self.bytes.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// A sample of `bytes` took `ns`.
+    fn learn(&self, bytes: u64, ns: u64) {
+        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
+        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
+        self.bytes.store(smooth(self.bytes.load(Ordering::Relaxed), bytes), Ordering::Relaxed);
+        self.ns.store(smooth(self.ns.load(Ordering::Relaxed), ns), Ordering::Relaxed);
+    }
+}
+
+/// Whole nanoseconds of `d`.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Nanoseconds writing event `e` out is expected to take ([`WRITES`]).
+pub(super) fn write_ns(e: &super::model::Event) -> u64 {
+    WRITES.expected(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
+}
+
+/// Whether writing event `e` out is expected to hold its owner's shard past a slow poll (`hyper_rt::slow::SLOW_POLL_NS`), as a
+/// runner's frame expected to is read off the shard (`crate::wire::payload`): it's written on the compute pool instead
+/// ([`Shard::want_write`]).
+pub(super) fn long_to_write(e: &super::model::Event) -> bool {
+    write_ns(e) > hyper_rt::slow::SLOW_POLL_NS
+}
+
+/// Event `e` was written out in `took`, on its owner's shard ([`WRITES`]).
+pub(super) fn wrote(e: &super::model::Event, took: Duration) {
+    WRITES.learn(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX), nanos(took));
 }
 
 impl Shard {
@@ -2075,6 +2204,26 @@ impl Shard {
         m.events = made;
         m.index = index;
         true
+    }
+
+    /// Session `id`'s update stopped before an event that's long to write out ([`long_to_write`]: a large tool output), the
+    /// first of what's left of it (`Registry::apply`): its owner writes it out on the compute pool before it takes the rest
+    /// ([`own`]), where it was written on this shard, its JSON and its row's text, past the step's quantum (goal 9, plan
+    /// 01a1a87b2cec step 3). `keep`: a row of it is kept for the conversation store. `cwd` and `location`: where the session
+    /// works, for the files the event mentions.
+    pub(super) fn want_write(&mut self, id: &str, keep: bool, cwd: String, location: Location) {
+        self.write = Some(Writing { session: id.to_owned(), keep, cwd, location });
+    }
+
+    /// What was made of session `id`'s event written out off the shard ([`Shard::want_write`]), or tried, for its update to take
+    /// as it comes back to it: its owner's next take alone has it.
+    pub(super) fn take_written(&mut self, id: &str) -> Option<Written> {
+        self.written.take().filter(|w| w.session == id)
+    }
+
+    /// How many events of its sessions' updates this owner wrote out off its shard ([`Shard::want_write`]).
+    pub(super) fn written_off(&self) -> u64 {
+        self.written_off
     }
 
     pub fn get(&self, id: &str) -> Option<&Mirror> {
@@ -2213,8 +2362,9 @@ impl Shard {
     }
 
     /// Takes one message, a panic in it caught (its shard goes on with the rest): what's left of it when
-    /// its owner's turn ran out first (`over`; an update's events, `Registry::apply`), to take next.
-    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>, over: &dyn Fn() -> bool) -> Option<Msg> {
+    /// its owner's turn ran out first (`over`, asked with what the next piece is expected to take; an update's
+    /// events, `Registry::apply`), to take next.
+    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>, over: &dyn Fn(u64) -> bool) -> Option<Msg> {
         let mut rest = None;
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
             Msg::Update(i) => {
@@ -2373,7 +2523,7 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None, write: None, written: None, written_off: 0 };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
@@ -2554,13 +2704,234 @@ fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     }
 }
 
-/// A shard's owner: its messages, in the order they came, as fast as they come, in bounded turns of
-/// its shard (the HTTP listener may share it). It waits on nothing but its inbox, and ends with it.
-/// A message its turn ran out in the middle of (an update's events) goes on at its next turn, before
-/// anything newer (goal 9, plan 01a1a87b2cec step 3).
+/// An owner's turn on its shard (goal 9, plan 01a1a87b2cec step 3): a poll of its own, from when it took the shard up to
+/// when it gives it up, held within the shard's step quantum (`crate::rt::STEP_BUDGET_NS`, 266.7 µs: the longest a poll may
+/// hold a shard, step 3's done-when). What it takes is learned as it's taken ([`Costs`]); within an update its events are
+/// pieces, timed between the looks at them, as `crate::rt::Turns` times a loop's.
+struct Turn {
+    began: Instant,
+    /// When an update's events were last looked at (the end of the last one taken, or the update's start), and the longest
+    /// piece between two looks this turn.
+    looked: Cell<Instant>,
+    longest: Cell<Duration>,
+}
+
+impl Turn {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { began: now, looked: Cell::new(now), longest: Cell::new(Duration::ZERO) }
+    }
+
+    /// The shard's step quantum (`hyper_rt::futures::step_budget_ns`): none off a shard, where a turn never ends.
+    fn quantum() -> Option<Duration> {
+        hyper_rt::futures::step_budget_ns().map(Duration::from_nanos)
+    }
+
+    /// Whether a piece expected to take `piece` would still end within the quantum.
+    fn fits(&self, piece: Duration) -> bool {
+        self.fits_at(Instant::now(), Self::quantum(), piece)
+    }
+
+    /// [`Turn::fits`] at `now`, against `quantum`.
+    fn fits_at(&self, now: Instant, quantum: Option<Duration>, piece: Duration) -> bool {
+        quantum.is_none_or(|q| now.saturating_duration_since(self.began).saturating_add(piece) < q)
+    }
+
+    /// A message begins at `now`: its pieces are timed from here, what came before it none of them.
+    fn begin(&self, now: Instant) {
+        self.looked.set(now);
+    }
+
+    /// After a piece, at `now`: whether the next, expected to take `next` and taken to be as long as the longest yet (the one
+    /// just done among them), with `room` after it for what ends its message, would end past `quantum`. So a turn ends within
+    /// the quantum where its pieces don't outgrow what's expected of them; one that looked only for its quantum to have
+    /// passed held its shard a piece past it, and what ends the message (an update's commit) past that.
+    fn over_at(&self, now: Instant, quantum: Option<Duration>, next: Duration, room: Duration) -> bool {
+        let piece = now.saturating_duration_since(self.looked.get());
+        self.looked.set(now);
+        let longest = self.longest.get().max(piece);
+        self.longest.set(longest);
+        !self.fits_at(now, quantum, longest.max(next).saturating_add(room))
+    }
+}
+
+/// What a kind of an owner's pieces takes, nanoseconds, as RFC 6298 estimates a round trip (goal 9, plan 01a1a87b2cec step
+/// 3): a smoothed mean (gain 1/8) and mean deviation (gain 1/4), the first sample taken as the mean with half of it as its
+/// deviation, and what's expected the mean and four deviations (RFC 6298's retransmission timeout, `K` = 4), so a piece
+/// rarely takes past it. None expected until one was taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Expect {
+    mean: u64,
+    dev: u64,
+    seen: bool,
+}
+
+impl Expect {
+    fn learn(&mut self, ns: u64) {
+        if !self.seen {
+            *self = Self { mean: ns, dev: ns / 2, seen: true };
+            return;
+        }
+        self.dev = self.dev - self.dev / 4 + self.mean.abs_diff(ns) / 4;
+        self.mean = self.mean - self.mean / 8 + ns / 8;
+    }
+
+    fn expected(&self) -> Duration {
+        Duration::from_nanos(self.mean.saturating_add(self.dev.saturating_mul(4)))
+    }
+}
+
+/// What an owner's messages take, learned as it takes them (goal 9, plan 01a1a87b2cec step 3): each kind's start (a message
+/// whole, or an update's head and first event, up to the first look at its events), and the tail of an update its turn ran
+/// out in (from that look on: its copy's commit, its frame, what it tells the rest of kiln). A turn takes a message only
+/// where what it's expected to take still ends within the quantum ([`Turn::fits`]), and an update's events only while the
+/// next and that tail do ([`Turn::over_at`]): a turn that took the next message while its last piece did held its shard past
+/// the quantum by as much as that message took past it (a state after an update's events), and by its commit.
+#[derive(Debug, Default)]
+struct Costs {
+    kinds: Vec<(&'static hyper_rt::slow::Label, Expect)>,
+    tail: Expect,
+}
+
+impl Costs {
+    /// A start of kind `label` took `ns`.
+    fn learn(&mut self, label: &'static hyper_rt::slow::Label, ns: u64) {
+        match self.kinds.iter_mut().find(|(l, _)| std::ptr::eq(*l, label)) {
+            Some((_, e)) => e.learn(ns),
+            None => {
+                let mut e = Expect::default();
+                e.learn(ns);
+                self.kinds.push((label, e));
+            }
+        }
+    }
+
+    /// What taking `msg` is expected to take: its kind's start, and for an update's events the tail after them, its first
+    /// event written out ([`write_ns`]) where that's more.
+    fn expected(&self, msg: &Msg) -> Duration {
+        let label = label_of(msg);
+        let start = self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)).map_or(Duration::ZERO, |(_, e)| e.expected());
+        let u = match msg {
+            Msg::Update(i) => &i.u,
+            Msg::Runner(r) => &r.update,
+            Msg::Run(_) => return start,
+        };
+        match u {
+            Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(self.tail.expected()),
+            _ => start,
+        }
+    }
+
+    /// `msg` taken by `shard` in `turn`: what's left of it when the turn ran out in its events, and how long it took, both
+    /// learned (its start, and the tail after the look that ended its turn).
+    fn take(&mut self, shard: &mut Shard, msg: Msg, hub: Option<&Arc<Hub>>, turn: &Turn) -> (Option<Msg>, Duration) {
+        let label = label_of(&msg);
+        let (quantum, room) = (Turn::quantum(), self.tail.expected());
+        let began = Instant::now();
+        turn.begin(began);
+        // The first look at its events, and the one that ended its turn.
+        let (first, ran_out) = (Cell::new(None::<Instant>), Cell::new(None::<Instant>));
+        let over = |next_ns: u64| {
+            let now = Instant::now();
+            if first.get().is_none() {
+                first.set(Some(now));
+            }
+            let over = turn.over_at(now, quantum, Duration::from_nanos(next_ns), room);
+            if over {
+                ran_out.set(Some(now));
+            }
+            over
+        };
+        let left = shard.take(msg, hub, &over);
+        // What was written out off the shard for this take alone: one it didn't take (its update gone meanwhile) isn't kept.
+        shard.written = None;
+        let end = Instant::now();
+        self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
+        if let Some(at) = ran_out.get() {
+            self.tail.learn(nanos(end.saturating_duration_since(at)));
+        }
+        (left, end.saturating_duration_since(began))
+    }
+}
+
+/// `fut`, and whether it gave its shard up waiting (it was pending at least once) rather than being ready at once.
+async fn waited<F: std::future::Future>(fut: F) -> (F::Output, bool) {
+    let mut fut = std::pin::pin!(fut);
+    let mut gave_up = false;
+    let out = std::future::poll_fn(|cx| {
+        let poll = fut.as_mut().poll(cx);
+        gave_up |= poll.is_pending();
+        poll
+    })
+    .await;
+    (out, gave_up)
+}
+
+/// A placeholder for an event taken out of its update while it's written out off the shard ([`write_off`]): never taken, the
+/// event put back before its update is.
+fn taken_out() -> super::model::Event {
+    super::model::Event { id: String::new(), seq: 0, at: 0, parent: None, by: None, body: super::model::Body::Assistant { text: String::new(), streaming: false } }
+}
+
+/// The event `writing` names, the first of what's left of its update (`rest`), written out on the compute pool while the shard
+/// does its other work (goal 9, plan 01a1a87b2cec step 3): taken out of the update, not copied (a large tool output's
+/// megabytes, on the shard), and put back once written, what was made of it kept for the update's next take
+/// ([`Shard::take_written`]). One that couldn't be written there is marked so, and written where it is. Whether the shard was
+/// given up.
+async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) -> bool {
+    let Some(Msg::Update(i)) = rest.as_mut() else { return false };
+    let Update::Events { events } = &mut i.u else { return false };
+    let Some(slot) = events.first_mut() else { return false };
+    let Writing { session, keep, cwd, location } = writing;
+    let e = std::mem::replace(slot, taken_out());
+    let (id, seq, of) = (e.id.clone(), e.seq, session.clone());
+    let (written, gave_up) = waited(crate::rt::compute(move || {
+        let began = Instant::now();
+        // Caught here, so the event comes back whatever: its update keeps every event.
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_of(&of, &e, keep, &cwd, &location))).ok();
+        let took = began.elapsed();
+        (e, made, took)
+    }))
+    .await;
+    match written {
+        Ok((e, made, took)) => {
+            if made.is_some() {
+                wrote(&e, took);
+                shard.written_off = shard.written_off.saturating_add(1);
+            }
+            *slot = e;
+            shard.written = Some(Written { session, id, seq, made });
+        }
+        Err(err) => {
+            // The pool dropped the job unrun (the process is going), the event with it: its update goes on without it, and its
+            // runner sends it again, as it sends what a copy lacks (`crate::wire::sums`).
+            tracing::error!(session = %session, event = %id, error = %format!("{err:#}"), "a session's event was lost being written out off its owner's shard");
+            if !events.is_empty() {
+                events.remove(0);
+            }
+            if events.is_empty() {
+                *rest = None;
+            }
+        }
+    }
+    gave_up
+}
+
+/// A shard's owner: its messages, in the order they came, as fast as they come, in turns of its shard (the HTTP listener may
+/// share it), each a poll of its own within the shard's step quantum ([`Turn`]; goal 9, plan 01a1a87b2cec step 3). It waits on
+/// nothing but its inbox, and ends with it. A turn takes its first piece whatever that's expected to take (so each takes
+/// one), then each message while it's expected to end within the quantum ([`Costs`]), an update's events while the next and
+/// what ends the update are. What's left of a message its turn ran out in (an update's events), or one it had no room for,
+/// goes first at its next turn, before anything newer. A turn spent with more to take gives the shard up whether or not
+/// another task wants it: one that went on while none did (`crate::rt::Turns::after`, `maybe_yield`) ran on in the same poll,
+/// which the shards' table counted whole (the lab's g9p9 fill: this owner's polls past 100 µs, 0.7 to 1.6 ms on average by
+/// round, the longest 7 to 53 ms on the CPU, each labeled by a message of its last turn alone).
 async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
-    let mut turns = crate::rt::Turns::new();
-    // What's left of the message the last turn ran out in.
+    let mut costs = Costs::default();
+    let mut turn = Turn::new();
+    // Nothing taken yet this turn: its first piece goes whatever it's expected to take.
+    let mut fresh = true;
+    // What's left of the message the last turn ran out in, or the next it had no room for.
     let mut rest: Option<Msg> = None;
     loop {
         let msg = match rest.take() {
@@ -2568,39 +2939,43 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
             None => match rx.try_recv() {
                 Ok(msg) => msg,
                 Err(async_channel::TryRecvError::Closed) => return,
-                // None waiting: waiting for one gives the shard to its other work, so its turn starts afresh
-                // once one comes (else an update after a quiet spell would find its turn spent already).
-                Err(async_channel::TryRecvError::Empty) => match rx.recv().await {
-                    Ok(msg) => {
-                        turns = crate::rt::Turns::new();
+                // None waiting: waiting for one gives the shard to its other work, so a turn starts afresh once one comes
+                // (else an update after a quiet spell would find its turn spent already). One that came as it asked is this
+                // turn's still.
+                Err(async_channel::TryRecvError::Empty) => match waited(rx.recv()).await {
+                    (Ok(msg), gave_up) => {
+                        if gave_up {
+                            (turn, fresh) = (Turn::new(), true);
+                        }
                         msg
                     }
-                    Err(_) => return,
+                    (Err(_), _) => return,
                 },
             },
         };
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
         let h = hub.get().and_then(Weak::upgrade);
-        let over = || turns.over();
-        // The turn's poll labeled by the kind of the message that took longest in it, should the poll hold the
-        // shard (goal 9, plan 01a1a87b2cec step 3: the lab's s7c named this owner's polls, up to 12 ms, not what
-        // held them).
-        let mut longest = std::time::Duration::ZERO;
-        let mut take = |shard: &mut Shard, msg: Msg| {
-            let (label, began) = (label_of(&msg), std::time::Instant::now());
-            let rest = shard.take(msg, h.as_ref(), &over);
-            let took = began.elapsed();
+        // The turn's poll labeled by the kind of the message that took longest in it, should the poll hold the shard (goal 9,
+        // plan 01a1a87b2cec step 3: the lab's s7c named this owner's polls, up to 12 ms, not what held them).
+        let mut longest = Duration::ZERO;
+        // What's waiting already goes in the same turn, where it's expected to end within the quantum.
+        let mut next = Some(msg);
+        while let Some(msg) = next.take() {
+            if !fresh && !turn.fits(costs.expected(&msg)) {
+                rest = Some(msg);
+                break;
+            }
+            fresh = false;
+            let label = label_of(&msg);
+            let (left, took) = costs.take(&mut shard, msg, h.as_ref(), &turn);
             if took >= longest {
                 longest = took;
                 hyper_rt::futures::label(label);
             }
-            rest
-        };
-        rest = take(&mut shard, msg);
-        // What's waiting already goes in the same turn.
-        while rest.is_none() && !over() {
-            let Ok(msg) = rx.try_recv() else { break };
-            rest = take(&mut shard, msg);
+            rest = left;
+            if rest.is_none() {
+                next = rx.try_recv().ok();
+            }
         }
         drop(h);
         // A change to an event of a compact chunk: that chunk read back on the blocking pool, the shard given up meanwhile,
@@ -2608,7 +2983,8 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         // as they waited for it to be read back here.
         if let Some((id, chunk)) = shard.thaw.take() {
             let c = Arc::clone(&chunk);
-            match crate::rt::blocking(move || c.evs().map(|evs| Chunk::of(evs.into_owned()))).await {
+            let (read, gave_up) = waited(crate::rt::blocking(move || c.evs().map(|evs| Chunk::of(evs.into_owned())))).await;
+            match read {
                 Ok(Ok(made)) => {
                     shard.take_thawed(&id, &chunk, made);
                 }
@@ -2621,6 +2997,9 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                     shard.thawed = Arc::downgrade(&chunk);
                 }
             }
+            if gave_up {
+                (turn, fresh) = (Turn::new(), true);
+            }
         }
         // An event under an older number than the copy's newest: the copy's events made again with it in on the blocking
         // pool, the shard given up meanwhile, before the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3).
@@ -2629,20 +3008,37 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
             shard.inserted = Some((id.clone(), e.id.clone()));
             if let Some(was) = shard.get(&id).map(|m| m.events.clone()) {
                 let from = was.clone();
-                match crate::rt::blocking(move || from.inserted(at, Ev { entry: Arc::new(Entry::of_event(&e, None)), at: rev })).await {
+                let (made, gave_up) = waited(crate::rt::blocking(move || from.inserted(at, Ev { entry: Arc::new(Entry::of_event(&e, None)), at: rev }))).await;
+                match made {
                     Ok((made, index)) => {
                         shard.take_inserted(&id, &was, made, index);
                     }
                     Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's events couldn't be made again off its shard: the event goes in where they are"),
                 }
+                if gave_up {
+                    (turn, fresh) = (Turn::new(), true);
+                }
             }
         }
+        // An event long to write out (a large tool output): written on the compute pool, the shard given up meanwhile, before
+        // the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3).
+        if let Some(writing) = shard.write.take()
+            && write_off(&mut shard, writing, &mut rest).await
+        {
+            (turn, fresh) = (Turn::new(), true);
+        }
+        // The turn spent with more to take: the shard given up, whether or not another task wants it, so each turn is a poll
+        // of its own. With nothing to take, the inbox's wait gives it up.
+        //
         // The owner never waits for the conversation store (goal 10, plan 01a1a87b2dae step 5): it did, between its
         // turns, while the store was over its bound (goal 11's, what its writer commits in 50 ms), and a disk that
         // stalled the writer stalled every frame and attach of every session it owned. The rows its updates make
         // wait in the store's queue instead, as many as would have waited in its inbox, and what hands it updates
         // waits past that (`crate::harness::registry::Registry::from_runner`, `ingest_from`).
-        turns.after().await;
+        if rest.is_some() && !fresh {
+            hyper_rt::futures::yield_now().await;
+            (turn, fresh) = (Turn::new(), true);
+        }
     }
 }
 
@@ -3956,5 +4352,237 @@ mod tests {
         let len = m.events.len();
         m.upsert(entry(&format!("e{n}"), n));
         assert_eq!(m.events.len(), len, "taken again where it is");
+    }
+
+    /// A turn begun at `t0`, as `Turn::new` begins one.
+    fn turn_at(t0: Instant) -> Turn {
+        Turn { began: t0, looked: Cell::new(t0), longest: Cell::new(Duration::ZERO) }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a turn takes pieces while the next (as long as the longest yet, or as what's expected
+    /// of it where that's more) and what ends its message would still end within the quantum, so its poll ends within it.
+    /// Pieces of 20 µs with a commit of 40 µs after them stop at 220 µs of a 266.7 µs quantum, the commit ending at 260 µs
+    /// (one more piece would have ended it at 280); a next piece expected to take 100 µs stops them at 140 µs. A message is
+    /// taken where what it's expected to take still ends within the quantum. Off a shard nothing ends a turn.
+    #[test]
+    fn g9_s3_a_turn_ends_within_its_quantum_with_room_for_what_ends_it() {
+        let us = Duration::from_micros;
+        let quantum = Duration::from_nanos(crate::rt::STEP_BUDGET_NS);
+        let stops = |piece: Duration, next: Duration, room: Duration| -> Option<Duration> {
+            let t0 = Instant::now();
+            let turn = turn_at(t0);
+            let mut at = t0;
+            for _ in 0..1000 {
+                at = at.checked_add(piece)?;
+                if turn.over_at(at, Some(quantum), next, room) {
+                    return Some(at.saturating_duration_since(t0));
+                }
+            }
+            None
+        };
+        let ended = stops(us(20), Duration::ZERO, us(40));
+        assert_eq!(ended, Some(us(220)), "pieces of 20 µs, a commit of 40 µs after them");
+        assert!(ended.is_some_and(|at| at + us(40) <= quantum && at + us(20) + us(40) > quantum), "the commit ends within the quantum, and one more piece wouldn't have");
+        assert_eq!(stops(us(20), us(100), us(40)), Some(us(140)), "a next piece expected to take 100 µs");
+        assert_eq!(stops(us(300), Duration::ZERO, Duration::ZERO), Some(us(300)), "a piece past the quantum ends its turn at once");
+        let t0 = Instant::now();
+        let turn = turn_at(t0);
+        assert!(turn.fits_at(t0 + us(200), Some(quantum), us(60)), "60 µs from 200 µs ends within it");
+        assert!(!turn.fits_at(t0 + us(210), Some(quantum), us(60)), "from 210 µs it wouldn't");
+        assert!(turn.fits_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1)) && !turn.over_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1), Duration::from_secs(1)), "off a shard nothing ends a turn");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a piece is expected to take is estimated as RFC 6298 estimates a round trip:
+    /// nothing until one was taken, then its mean and four of its mean deviations (the first sample the mean, half of it the
+    /// deviation), down to the mean as samples agree, up past an outlier at once, and back down as they agree again.
+    #[test]
+    fn g9_s3_what_a_piece_takes_is_expected_as_rfc_6298_expects_a_round_trip() {
+        let us = Duration::from_micros;
+        let mut e = Expect::default();
+        assert_eq!(e.expected(), Duration::ZERO, "none expected until one was taken");
+        e.learn(100_000);
+        assert_eq!(e.expected(), us(300), "the first: itself and four half-samples");
+        e.learn(100_000);
+        assert_eq!(e.expected(), us(250), "its deviation by a quarter toward none");
+        for _ in 0..200 {
+            e.learn(100_000);
+        }
+        assert!(e.expected() < us(101), "samples that agree: their mean, {:?}", e.expected());
+        e.learn(1_000_000);
+        assert!(e.expected() > Duration::from_millis(1), "past an outlier at once: {:?}", e.expected());
+        for _ in 0..100 {
+            e.learn(100_000);
+        }
+        assert!(e.expected() < us(110), "back down as they agree again: {:?}", e.expected());
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what an owner expects a message to take is what its kind's starts took (nothing
+    /// before one did), and for an update's events the tail after them too (its commit), its first event's writing where
+    /// that's more; a turn takes it while that still ends within its quantum, and leaves it for its next turn otherwise.
+    #[test]
+    fn g9_s3_a_turn_takes_a_message_while_what_its_expected_to_take_ends_within_it() {
+        use crate::harness::model::{Body, Event};
+        let us = Duration::from_micros;
+        let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
+        let update = |u: Update| Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u, shipped: true, reported: String::new() }));
+        let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
+        let events = || update(Update::Events { events: vec![first.clone()] });
+        let mut costs = Costs::default();
+        assert_eq!((costs.expected(&job()), costs.expected(&events())), (Duration::ZERO, Duration::ZERO), "nothing before one was taken");
+        costs.learn(label_of(&job()), 120_000);
+        assert_eq!(costs.expected(&job()), us(360), "a job: its starts' mean and four deviations");
+        costs.learn(label_of(&events()), 20_000);
+        costs.tail.learn(30_000);
+        // Its first event's writing is learned by every owner as they write (the tests beside this one's too): a few bytes', far
+        // under the start learned here.
+        let got = costs.expected(&events());
+        assert!(got >= us(60) + us(90) && got < us(60) + us(90) + Duration::from_millis(1), "an update's events: its start, then its tail: {got:?}");
+        assert_eq!(costs.expected(&update(Update::Closed)), Duration::ZERO, "another kind isn't these");
+        let t0 = Instant::now();
+        let (turn, quantum) = (turn_at(t0), Some(Duration::from_nanos(crate::rt::STEP_BUDGET_NS)));
+        assert!(!turn.fits_at(t0 + us(150), quantum, costs.expected(&job())), "a job expected to take 360 µs waits for the next turn");
+        assert!(turn.fits_at(t0 + us(100), quantum, us(150)), "one expected to take 150 µs from 100 µs goes in this one");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an event under a number its copy has with another id (the timeline went another way)
+    /// takes that one's place, and the copy's index lets go of the one that was there and finds this one, every other one
+    /// where it was, as an index made anew finds them: the index was made anew for each such event, on its owner's shard.
+    #[test]
+    fn g9_s3_an_event_in_anothers_place_moves_the_index_there_alone() {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let n = u64::try_from(CHUNK * 2 + 5).unwrap_or(u64::MAX);
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        let held = m.index.len();
+        assert!(m.upsert(entry("x7", 7)), "said as the timeline going another way");
+        assert_eq!((m.index.get(&m.events, "x7"), m.index.get(&m.events, "e7")), (Some(6), None), "this one where that one was");
+        assert_eq!((m.index.len(), m.events.len()), (held, usize::try_from(n).unwrap_or(0)), "one in another's place");
+        for (at, meta) in m.events.metas().enumerate() {
+            assert_eq!(m.index.get(&m.events, meta.id()), Some(at), "{}", meta.id());
+        }
+        assert_eq!(m.index, Index::of(&m.events), "as one made anew");
+        // One the copy has under that number with that id already is changed where it is, as before.
+        assert!(!m.upsert(entry("x7", 7)) && m.index.get(&m.events, "x7") == Some(6));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an event written out off its owner's shard is what `Registry::apply` writes on it: the
+    /// same entry, the same row for the conversation store (where one is kept), the same files it mentions.
+    #[test]
+    fn g9_s3_an_event_written_off_the_shard_is_as_one_written_on_it() {
+        use crate::harness::model::{Body, Event};
+        let e = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "see `/work/shot.png` for it".into(), streaming: false } };
+        let made = made_of("s", &e, true, "/work", &Location::Local);
+        let mut row = None;
+        let here = Entry::of_event(&e, Some(&mut |text: String| row = Some(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written("s", &e, text))))));
+        assert_eq!(made.entry.text(), here.text());
+        assert_eq!((made.entry.id(), made.entry.seq(), made.entry.kind()), (here.id(), here.seq(), here.kind()));
+        assert!(made.row.is_some() && made.row == row, "its row as apply makes it");
+        assert!(made.mentions.as_ref().is_some_and(|j| j.paths == ["/work/shot.png"] && j.seq == 1), "{:?}", made.mentions);
+        assert!(made_of("s", &e, false, "/work", &Location::Local).row.is_none(), "none where no row is kept");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an owner takes a long update in turns that each give its shard up: a task on the same
+    /// shard that always wants it runs between them, about a quantum apart (the median gap within four quanta, whatever the
+    /// host does to a few of them; the update whole took a poll of tens of milliseconds), and a job sent behind the update
+    /// finds every one of its events in the copy, in order, none lost.
+    #[test]
+    fn g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            copies.bind(&hub);
+            let id = "turns".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            // A task on the owner's shard that always wants it, noting when it runs.
+            let (stop, runs) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+            let (tx, rx) = futures::channel::oneshot::channel::<Vec<Instant>>();
+            let witness = {
+                let (stop, runs) = (Arc::clone(&stop), Arc::clone(&runs));
+                async move {
+                    let mut at = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        at.push(Instant::now());
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        hyper_rt::futures::yield_now().await;
+                    }
+                    let _ = tx.send(at);
+                }
+            };
+            anyhow::ensure!(crate::rt::spawn_on(copies.owner_of(&id), witness), "a task on the owner's shard");
+            let read = |copies: Arc<Copies>, id: String, runs: Arc<AtomicU64>| async move {
+                let i = id.clone();
+                copies.on(&id, move |s| s.get(&i).map(|m| (m.rev, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), runs.load(Ordering::SeqCst)))).await.flatten()
+            };
+            let Some((rev, _, ran)) = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await else { anyhow::bail!("no copy") };
+            let n = u64::try_from(MAX_EVENTS)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
+            let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new() };
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(update))).await, "sent");
+            let after = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await;
+            stop.store(true, Ordering::SeqCst);
+            let at = rx.await?;
+            let Some((now, seqs, ran_after)) = after else { anyhow::bail!("no copy") };
+            anyhow::ensure!(seqs == (1..=n).collect::<Vec<u64>>(), "every event, in order: {} of {n}", seqs.len());
+            // Each turn of the update took its events in one apply, and counted one revision.
+            let turns = now.saturating_sub(rev);
+            let between = ran_after.saturating_sub(ran);
+            anyhow::ensure!(turns >= 4 && between >= turns / 2, "{turns} turns, the other task run {between} times between them");
+            let during = at.get(usize::try_from(ran)?..usize::try_from(ran_after)?).unwrap_or_default();
+            let mut gaps: Vec<Duration> = during.windows(2).filter_map(|w| Some(w.get(1)?.saturating_duration_since(*w.first()?))).collect();
+            gaps.sort();
+            let median = gaps.get(gaps.len() / 2).copied().unwrap_or_default();
+            let quantum = Duration::from_nanos(hyper_rt::futures::step_budget_ns().unwrap_or(crate::rt::STEP_BUDGET_NS));
+            anyhow::ensure!(median <= quantum * 4, "the other task ran {median:?} apart at the median ({} gaps), the quantum {quantum:?}", gaps.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an event long to write out (a large tool output's megabytes) is written by its owner off
+    /// its shard, as the owner counts it, and taken as it was written there: in its place in its update, those before it written
+    /// on the shard as they were, those after it taken after it, none lost, each where its index says.
+    #[test]
+    fn g9_s3_an_event_long_to_write_out_is_written_off_its_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "large".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            // Short ones, written on the shard, teach what writing one out takes.
+            anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
+            let was = copies.on(&id, |s| s.written_off()).await.unwrap_or_default();
+            let large = "x".repeat(8 << 20);
+            anyhow::ensure!(long_to_write(&said(10, large.clone())), "8 MB expected to take past a slow poll to write out");
+            anyhow::ensure!(copies.send(&id, update(vec![said(9, "before".into()), said(10, large.clone()), said(11, "after".into())])).await, "sent");
+            let i = id.clone();
+            let now = copies
+                .on(&id, move |s| {
+                    let off = s.written_off();
+                    s.get(&i).map(|m| (off, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), m.events.get(9).map(|e| e.entry.text().len()), m.index.get(&m.events, "e10"), m.index.get(&m.events, "e11")))
+                })
+                .await
+                .flatten();
+            let Some((off, seqs, len, at, after)) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(off == was + 1, "written off its owner's shard once: {was} then {off}");
+            anyhow::ensure!(seqs == (1..=11).collect::<Vec<u64>>(), "in order, none lost: {seqs:?}");
+            anyhow::ensure!(len.is_some_and(|l| l > large.len()) && at == Some(9) && after == Some(10), "taken as written, in its place: {len:?} {at:?} {after:?}");
+            Ok(())
+        })
     }
 }
