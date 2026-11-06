@@ -2205,6 +2205,15 @@ the code it runs lies spread over about half of its `.text`'s 64 KiB windows. So
 what runs is laid out together: est. 12 to 17 MB with BOLT's layout (g11s5-layout's estimate from g9p7's profile:
 its hot functions, 2.4 MB of code, lie on 558 windows of rt7fp's layout and would fit in 38).
 
+**The drops are off by default** (goal 11's audit, row B14): `crate::resident` drops nothing unless
+`KILN_KEEP_PAGES=0`. A dropped page faults back on whichever thread next runs or reads it, a shard's among them:
+a minor fault while the page cache holds the file, a read from the disk once the host has reclaimed it (production's
+host is short of memory, and its file system stalls). `resident`'s
+`g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not` measures it on a shard
+(`getrusage(RUSAGE_THREAD)`): re-reading data kept, no fault; re-reading it dropped, a fault for each window. The
+20 MB the drops took (125 to 105 MB) were pages the page cache holds anyway; the code's layout, below, is how the
+binary's pages fall without a fault. `KILN_KEEP_PAGES=0` drops them, for the memory A/B.
+
 **The binary's sections**, rt9 (the lab's glibc build, `dfb491ef3dc`; its symbols from rt9fp, the same tree with
 frame pointers), and what reads each:
 
