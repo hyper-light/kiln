@@ -525,18 +525,21 @@ pub struct Hub {
     /// ([`Hub::machine_of`]), so nothing in the server keys a runner by one. Loaded as it starts
     /// ([`Hub::one_record_a_machine`]), kept as runners move.
     machine_names: crate::rcu::Rcu<HashMap<String, String>>,
-    /// The machine id each connection's runner said before its Hello ([`AgentMsg::Machine`]).
-    said_machine: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    /// The machine id each connection's runner said before its Hello ([`AgentMsg::Machine`]). By link: the net thread's own
+    /// numbers for its connections, no peer's to choose ([`crate::util::FastMap`]), as [`Hub::peers`]'s.
+    said_machine: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// The name each connection's certificate carries, where it isn't the machine's id it's keyed
     /// by (a runner process from before its certificate for the id): what that process signs and
     /// checks its custody words as, until it restarts with its certificate for the id.
-    pub(crate) peer_certs: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    pub(crate) peer_certs: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
     /// Each connected runner process's machine, by its link (read on every message a runner sends:
-    /// a copy swapped in whole as runners come and go, `crate::rcu`).
-    peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
-    pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    /// a copy swapped in whole as runners come and go, `crate::rcu`). Links are the net thread's own
+    /// numbers for its connections, no peer's to choose: a [`crate::util::FastMap`] (goal 9, plan
+    /// 01a1a87b2cec step 5: a SipHash of the link on every frame).
+    peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
+    pending_peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
     /// What kiln's own listeners hear (`GET /api/events` sockets read [`Hub::feed`]), each event as its JSON

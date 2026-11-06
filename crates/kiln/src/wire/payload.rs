@@ -170,15 +170,28 @@ fn read_by_tree<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, j
 /// `json`, what a message of variant `of` carries, read as a JSON tree: what isn't JSON is refused as `malformed`, saying
 /// why ([`read_by_tree`]'s first step, and all of [`Later::read`]).
 fn tree(of: &'static str, json: &str) -> Result<Value, Box<Unreadable>> {
-    serde_json::from_str(json).map_err(|e| {
-        Box::new(Unreadable {
-            of,
-            what: of.to_owned(),
-            code: Code::Malformed,
-            why: if e.is_eof() { "cut short".to_owned() } else { format!("not JSON: {e}") },
-            session: None,
-            waits: None,
-        })
+    serde_json::from_str(json).map_err(|e| not_json(of, &e))
+}
+
+/// `json`, what a message of variant `of` carries, read as JSON and kept as the text it came as, with no tree made of it
+/// (`FromRunner::HeadroomStatus`; goal 9, plan 01a1a87b2cec step 5): what isn't JSON is refused as `malformed`, saying why, as
+/// [`tree`] refuses it.
+fn json_text(of: &'static str, json: String) -> Result<String, Box<Unreadable>> {
+    match serde_json::from_str::<serde::de::IgnoredAny>(&json) {
+        Ok(_) => Ok(json),
+        Err(e) => Err(not_json(of, &e)),
+    }
+}
+
+/// What a message of variant `of` carried that isn't JSON, refused as `malformed`, saying why.
+fn not_json(of: &'static str, e: &serde_json::Error) -> Box<Unreadable> {
+    Box::new(Unreadable {
+        of,
+        what: of.to_owned(),
+        code: Code::Malformed,
+        why: if e.is_eof() { "cut short".to_owned() } else { format!("not JSON: {e}") },
+        session: None,
+        waits: None,
     })
 }
 
@@ -916,8 +929,11 @@ pub enum FromRunner {
     /// `Observe`: its replica's word in observe's group (docs/observe.md §5), and what it carries.
     Observe { msg: Box<crate::observe::wire::Msg>, bytes: Vec<u8> },
     /// `HeadroomStatus`: how its machine's headroom does (docs/headroom.md), kept and shown as it
-    /// came: of it, the server reads only the fingerprint of the settings in use.
-    HeadroomStatus(Value),
+    /// came: of it, the server reads only the fingerprint of the settings in use. Its text, read as
+    /// JSON with no tree made ([`json_text`]): a tree of each, and the last one's compared with it
+    /// key by key, held the hub's loop past 0.1 ms 4 times a second in train 16's lab, 0.13 ms on
+    /// average (g9p16fp; goal 9, plan 01a1a87b2cec step 5).
+    HeadroomStatus(String),
     /// `LegResults`: a leg's records, signed as the leg at its end (docs/ci.md W27-R05): Sigstore
     /// bundles, each checked as it's taken.
     LegResults { job: String, bundles: Vec<Value> },
@@ -973,7 +989,7 @@ impl Carries for AgentMsg {
             AgentMsg::AgentLimit { json } => FromRunner::AgentLimit(payload_owned(W, "AgentLimit", json)?),
             AgentMsg::Identity { json } => FromRunner::Identity(payload_owned(W, "Identity", json)?),
             AgentMsg::Observe { json, bytes } => FromRunner::Observe { msg: payload_owned(W, "Observe", json)?, bytes },
-            AgentMsg::HeadroomStatus { json } => FromRunner::HeadroomStatus(payload_owned(W, "HeadroomStatus", json)?),
+            AgentMsg::HeadroomStatus { json } => FromRunner::HeadroomStatus(json_text("HeadroomStatus", json)?),
             AgentMsg::LegResults { job, bundles } => FromRunner::LegResults { job, bundles: payload_owned(W, "LegResults", bundles)? },
             AgentMsg::LegSignature { job, nonce, bundle, error } => {
                 let bundle = match bundle {
