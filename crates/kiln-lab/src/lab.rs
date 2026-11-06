@@ -477,7 +477,7 @@ fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u1
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None, arrived_us: None }
 }
 
 /// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
@@ -540,7 +540,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None, arrived_us: None });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -557,7 +557,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None, arrived_us: None });
         if !opened {
             continue;
         }
@@ -567,10 +567,11 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
             match sock.next() {
                 Ok(Frame::Text(text)) if brings_events(&text) => {
-                    let now = now_us();
+                    // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
+                    let (now, arrived_us) = (now_us(), sock.arrived());
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None });
+                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
                             watch.frames.push((stamp, now.saturating_sub(stamp)));
                         }
                     }
@@ -635,15 +636,16 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             18 => ("plans", format!("/api/plans?session={id}")),
             _ => ("goals", format!("/api/harness/sessions/{id}/goals")),
         };
-        let (mut retry_after, mut server) = (None, None);
+        let (mut retry_after, mut server, mut arrived_us) = (None, None, None);
         let sample = timed(Class::ApiRead, what, || {
             http.send("GET", &path, None).map(|a| {
                 retry_after = a.retry_after;
                 server = a.server;
+                arrived_us = a.arrived_us;
                 a.status
             })
         });
-        out.push(Sample { server, ..sample });
+        out.push(Sample { server, arrived_us, ..sample });
         if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.read_think_ms)), retry_after)) {
             break;
         }
@@ -1019,6 +1021,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let seen = measure::seen(&in_window);
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     splits(&mut numbers, &in_window);
+    arrivals(&mut numbers, &in_window);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
     let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
@@ -1073,6 +1076,25 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
     }
 }
 
+/// The window's API reads and frames split at their arrival on the lab's socket ([`measure::arrivals`]; goal 10, plan
+/// 01a1a87b2dae step 5), where the socket stamps arrivals (Linux): `<class>.arrived_{p50,p99,p999}_ms`, to the arrival
+/// (the server's part and its way's; an agent's and its runner's too, for a frame), and `<class>.lab_read_{p50,p99,p999}_ms`,
+/// from it (the lab's own: its thread's wake onto its CPU, its read and its reading). The class's own figures are
+/// the two together, each sample's: what's the lab's is told from what's the server's.
+fn arrivals(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
+    for class in [Class::ApiRead, Class::Websocket] {
+        let Some((to, from)) = measure::arrivals(window, class) else { continue };
+        let name = class.name();
+        for (part, seen) in [("arrived", to), ("lab_read", from)] {
+            for (q, v) in [("p50", seen.p50_ms), ("p99", seen.p99_ms), ("p999", seen.p999_ms)] {
+                if let Some(v) = v {
+                    n.insert(format!("{name}.{part}_{q}_ms"), v);
+                }
+            }
+        }
+    }
+}
+
 /// The legs of a runner's message at the server that a round reports (`kiln_runner_wait_leg_seconds`), each by
 /// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
 /// each event it took; and step 5's `runner` and `server`, of each agent session's update whose runner said how
@@ -1083,6 +1105,15 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
 /// alone, which tells the session loops' wait from it; and `net`, the net thread's hold of a frame before it handed it
 /// to its loop, which tells that thread's part of `to_loop` from the queue's and the loop's wake.
 const RUNNER_LEGS: [&str; 9] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"];
+
+/// The legs of an agent session's live frame at the server past its runner's wait that a round reports
+/// (`kiln_frame_leg_seconds`; goal 10, plan 01a1a87b2dae step 5), each by its `leg` label: `apply`, its session's owner's
+/// time with the runner's update, its frames published; `woken`, a frame's wait from its publish for its viewer's task to
+/// take it up where the viewer runs on its session's owner's shard, and `woken_other` where it runs on another (a wake
+/// across threads); and `write`, the viewer's write of its batch to its socket. Set against `server.runner.server` (the
+/// runner's update's arrival to its owner done) and a frame's whole time (`websocket`), they tell where a frame's time
+/// past its runner goes.
+const FRAME_LEGS: [&str; 4] = ["apply", "woken", "woken_other", "write"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1171,6 +1202,24 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
                 n.insert(format!("server.runner.{leg}_{q}_us"), v * 1e6);
             }
         }
+    }
+    // A live frame's legs past its runner's wait, to the microsecond, where the build has them (`kiln_frame_leg_seconds`;
+    // goal 10, plan 01a1a87b2dae step 5): its owner's apply, its viewer's wake on the owner's shard and across shards,
+    // and the write; with how many frames took each wake, so a run says how often a viewer was woken across threads.
+    for leg in FRAME_LEGS {
+        let d = measure::delta(&before.buckets("kiln_frame_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_frame_leg_seconds", &[("leg", leg)]));
+        for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            if let Some(v) = measure::histogram_quantile(at, &d) {
+                n.insert(format!("server.frame.{leg}_{q}_us"), v * 1e6);
+            }
+        }
+    }
+    // A histogram's count is its `+Inf` bucket's, the last.
+    let woken = |leg: &str| measure::delta(&before.buckets("kiln_frame_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_frame_leg_seconds", &[("leg", leg)])).last().map(|(_, count)| *count);
+    if let (Some(own), Some(other)) = (woken("woken"), woken("woken_other"))
+        && own + other > 0.0
+    {
+        n.insert("server.frame.woken_other_share".into(), other / (own + other));
     }
     // The requests the server shed, by class (`kiln_shed_total`, goal 6), where the build counts them.
     for class in ["background", "normal"] {
@@ -1530,6 +1579,37 @@ mod tests {
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a live frame's legs past its runner's wait are reported each to the
+    /// microsecond, from the server's histogram between the window's two scrapes, with the share of the frames whose
+    /// viewer was woken across threads; a build without them reports none.
+    #[test]
+    fn g10_s5_a_frames_legs_past_its_runner_are_reported() {
+        assert_eq!(FRAME_LEGS, ["apply", "woken", "woken_other", "write"], "the server's `crate::route_latency::FrameLeg`, by name");
+        // `woken_other` took three frames in four.
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for leg in FRAME_LEGS {
+                let k = if leg == "woken_other" { 3.0 } else { 1.0 };
+                // Half the leg's observations at or under 0.1 ms, all of them at or under 0.2 ms.
+                for (le, c) in [("0.0001", k * n / 2.0), ("0.0002", k * n), ("+Inf", k * n)] {
+                    t.push_str(&format!("kiln_frame_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for leg in FRAME_LEGS {
+            let p50 = n.get(&format!("server.frame.{leg}_p50_us")).copied();
+            let p99 = n.get(&format!("server.frame.{leg}_p99_us")).copied();
+            assert!(p50.is_some_and(|v| (v - 100.0).abs() < 1.0), "{leg}: p50 {p50:?}");
+            assert!(p99.is_some_and(|v| (v - 198.0).abs() < 1.0), "{leg}: p99 {p99:?}");
+        }
+        assert_eq!(n.get("server.frame.woken_other_share").copied(), Some(0.75));
+        assert_eq!(crate::lab::better("server.frame.woken_other_share"), crate::stats::Better::Lower, "fewer wakes across threads is better");
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
+        assert!(!n.keys().any(|k| k.starts_with("server.frame.")), "a build without the legs, or a window with no frames, reports none: {:?}", n.keys().collect::<Vec<_>>());
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 5: a round reports what the allocator holds at the window's end, by kind and its
     /// slack (`active` less `allocated`), in MB, so the A/B of jemalloc's settings compares each; a build whose
     /// allocator says nothing (glibc's malloc, musl's) reports none of them.
@@ -1587,7 +1667,7 @@ mod tests {
     /// a window whose reads the server didn't time reports none.
     #[test]
     fn g10_s5_a_round_reports_its_slowest_reads_split() {
-        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server };
+        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server, arrived_us: None };
         let told = |wait_us, took_us| Some(crate::client::ServerTime { wait_us: Some(wait_us), took_us });
         // 1,000 reads, the slowest two (the 999th and 1,000th by nearest rank) 4 ms, the server's share 1.5 ms of each.
         let window: Vec<Sample> = (0..998).map(|_| read(200, told(10, 10))).chain([read(4_000, told(1_000, 500)), read(4_000, told(1_000, 500))]).collect();
@@ -1598,6 +1678,27 @@ mod tests {
         assert!(get("split.api_read.p99.n").is_some_and(|c| c >= 1.0), "{n:?}");
         let mut none = BTreeMap::new();
         splits(&mut none, &[read(200, None)]);
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports its API reads and frames split at their arrival on the lab's
+    /// socket where it was stamped: the part to it and the lab's own after it (its thread's wake and its read), each at
+    /// p50, p99 and p99.9; a sample without an arrival is left out, an arrival past a sample's end counts at its end, and a
+    /// window with none stamped (off Linux) reports nothing of it.
+    #[test]
+    fn g10_s5_a_round_reports_its_reads_and_frames_split_at_their_arrival() {
+        // A thousand frames each 600 µs from the agent's write to the lab's read, 450 µs of it to their arrival.
+        let frame = |i: u64| Sample { class: Class::Websocket, at_us: 1_000_000 + i, took_us: 600, ok: true, what: "", server: None, arrived_us: Some(1_000_000 + i + 450) };
+        let mut window: Vec<Sample> = (0..1000).map(frame).collect();
+        let read = |took_us: u64, arrived_us: Option<u64>| Sample { class: Class::ApiRead, at_us: 50, took_us, ok: true, what: "", server: None, arrived_us };
+        window.extend([read(200, Some(260)), read(999, None)]);
+        let mut n = BTreeMap::new();
+        arrivals(&mut n, &window);
+        let get = |k: &str| n.get(k).copied();
+        assert_eq!((get("websocket.arrived_p50_ms"), get("websocket.arrived_p999_ms"), get("websocket.lab_read_p999_ms")), (Some(0.45), Some(0.45), Some(0.15)));
+        assert_eq!((get("api_read.arrived_p50_ms"), get("api_read.lab_read_p50_ms")), (Some(0.2), Some(0.0)), "past its end: at its end, and the read not stamped left out");
+        let mut none = BTreeMap::new();
+        arrivals(&mut none, &[Sample { arrived_us: None, ..frame(0) }]);
         assert!(none.is_empty(), "{none:?}");
     }
 

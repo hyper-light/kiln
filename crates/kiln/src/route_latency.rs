@@ -235,6 +235,91 @@ pub fn observe_leg(leg: RunnerLeg, took: Duration) {
     legs().observe(leg, took);
 }
 
+/// The legs of an agent session's live frame at the server past its runner's wait ([`RunnerLeg`]), from its update's
+/// take by the session's owner to its write on a viewer's socket, each to the microsecond (goal 10, plan 01a1a87b2dae
+/// step 5: g9p16's calm frames took 0.59 ms at the median from the agent's write to the lab's read, where the bus's
+/// delivery and the socket's write, the frame's legs past its owner, were timed only to 50 µs (the `websocket` class's
+/// [`STALL_BUCKETS`]), the owner's own time with the update wasn't told from its wait, and nothing said whether a
+/// viewer was woken on its owner's thread or across threads). On `/metrics` as `kiln_frame_leg_seconds`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameLeg {
+    /// From a session's owner taking a runner's update to being done with it: its copy changed and its viewers' frames
+    /// published, but for a frame long to write, which the compute pool writes after (`crate::harness::copies`).
+    Apply,
+    /// From a frame's publish to its viewer's task taking it up, the viewer on its session's owner's shard: no other
+    /// thread between them, only the rest of the owner's turn and the shard's other ready work.
+    Woken,
+    /// The same, the viewer on another shard than its session's owner: a wake across threads, its shard kicked where it
+    /// was parked. A wake onto a CPU that's busy waits up to a tick on a kernel that preempts lazily, as fedora's does
+    /// at 1000 Hz (docs/runtime-lab.md, "Why: fedora's kernel, read").
+    WokenOther,
+    /// From a viewer's read of its batch off the bus to the batch written to its socket, each of its frames'.
+    Write,
+}
+
+impl FrameLeg {
+    pub const ALL: [FrameLeg; 4] = [FrameLeg::Apply, FrameLeg::Woken, FrameLeg::WokenOther, FrameLeg::Write];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FrameLeg::Apply => "apply",
+            FrameLeg::Woken => "woken",
+            FrameLeg::WokenOther => "woken_other",
+            FrameLeg::Write => "write",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            FrameLeg::Apply => 0,
+            FrameLeg::Woken => 1,
+            FrameLeg::WokenOther => 2,
+            FrameLeg::Write => 3,
+        }
+    }
+}
+
+/// Each frame leg's histogram, in [`FrameLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
+/// runner's legs are ([`Legs`]).
+pub struct FrameLegs([PerShard; FrameLeg::ALL.len()]);
+
+impl FrameLegs {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| PerShard::new(crate::shard_health::DELAY_BUCKETS)))
+    }
+
+    /// `n` frames each spent `took` on `leg`.
+    pub fn observe_n(&self, leg: FrameLeg, took: Duration, n: u64) {
+        if let Some(h) = self.0.get(leg.index()) {
+            h.observe_n(took.as_secs_f64(), n);
+        }
+    }
+
+    pub fn of(&self, leg: FrameLeg) -> Option<&PerShard> {
+        self.0.get(leg.index())
+    }
+}
+
+/// The server's frame legs, made by the first frame it times: as [`LEGS`], none in a runner's process.
+static FRAME_LEGS: OnceLock<FrameLegs> = OnceLock::new();
+
+/// The server's.
+pub fn frame_legs() -> &'static FrameLegs {
+    FRAME_LEGS.get_or_init(FrameLegs::new)
+}
+
+/// A frame spent `took` on `leg`, on the server's histograms.
+pub fn observe_frame(leg: FrameLeg, took: Duration) {
+    frame_legs().observe_n(leg, took, 1);
+}
+
+/// `n` frames each spent `took` on `leg` (a batch written at once), on the server's histograms.
+pub fn observe_frames(leg: FrameLeg, took: Duration, n: u64) {
+    if n > 0 {
+        frame_legs().observe_n(leg, took, n);
+    }
+}
+
 /// Work of `class` that waited `wait` and took `took`, on the server's histograms.
 pub fn observe(class: Class, wait: Option<Duration>, took: Duration) {
     routes().observe(class, wait, took);
@@ -348,14 +433,14 @@ fn runners(segs: &[&str]) -> bool {
     )
 }
 
-/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`]).
+/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`], [`FRAME_LEGS`]).
 pub fn render(o: &mut String) {
-    render_of(o, ROUTES.get(), LEGS.get());
+    render_of(o, ROUTES.get(), LEGS.get(), FRAME_LEGS.get());
 }
 
-/// The families of `routes` and `legs`: each said, with its TYPE, whether or not it's made (as every family of
-/// the registry is, before anything happened), and its series where it's made, so a runner's process renders none.
-fn render_of(o: &mut String, routes: Option<&Routes>, legs: Option<&Legs>) {
+/// The families of `routes`, `legs` and `frames`: each said, with its TYPE, whether or not it's made (as every family
+/// of the registry is, before anything happened), and its series where it's made, so a runner's process renders none.
+fn render_of(o: &mut String, routes: Option<&Routes>, legs: Option<&Legs>, frames: Option<&FrameLegs>) {
     let _ = writeln!(
         o,
         "# HELP kiln_route_wait_seconds How long the server's work waited before its handler started, by class (page, api_read, api_write, websocket, runner).\n# TYPE kiln_route_wait_seconds histogram"
@@ -378,6 +463,15 @@ fn render_of(o: &mut String, routes: Option<&Routes>, legs: Option<&Legs>) {
     for leg in RunnerLeg::ALL {
         if let Some(h) = legs.and_then(|l| l.of(leg)) {
             h.render(o, "kiln_runner_wait_leg_seconds", &format!("leg=\"{}\"", leg.name()));
+        }
+    }
+    let _ = writeln!(
+        o,
+        "# HELP kiln_frame_leg_seconds An agent session's live frame at the server past its runner's wait, by leg: apply (its session's owner taking the runner's update to being done with it, its frames published), woken (a frame's publish to its viewer's task taking it up, the viewer on its session's owner's shard), woken_other (the same, the viewer on another shard: a wake across threads), write (a viewer's read of its batch to the batch written to its socket).\n# TYPE kiln_frame_leg_seconds histogram"
+    );
+    for leg in FrameLeg::ALL {
+        if let Some(h) = frames.and_then(|f| f.of(leg)) {
+            h.render(o, "kiln_frame_leg_seconds", &format!("leg=\"{}\"", leg.name()));
         }
     }
 }
@@ -565,22 +659,57 @@ mod tests {
     #[test]
     fn g11_s5_heap_a_process_that_times_none_of_the_servers_work_renders_none_of_it() {
         let mut none = String::new();
-        render_of(&mut none, None, None);
+        render_of(&mut none, None, None, None);
         assert!(none.lines().all(|l| l.starts_with('#')), "series of nothing made: {none}");
-        for family in ["kiln_route_wait_seconds", "kiln_route_seconds", "kiln_runner_wait_leg_seconds"] {
+        for family in ["kiln_route_wait_seconds", "kiln_route_seconds", "kiln_runner_wait_leg_seconds", "kiln_frame_leg_seconds"] {
             assert!(none.contains(&format!("# TYPE {family} histogram")), "{family} said with its TYPE");
         }
         let mut made = String::new();
-        render_of(&mut made, Some(&Routes::new()), Some(&Legs::new()));
+        render_of(&mut made, Some(&Routes::new()), Some(&Legs::new()), Some(&FrameLegs::new()));
         // A histogram's series: a bucket each bound, `+Inf`, `_sum` and `_count`.
         let routes = Class::ALL.len() * 2 * (STALL_BUCKETS.len() + 3);
         let legs = RunnerLeg::ALL.len() * (crate::shard_health::DELAY_BUCKETS.len() + 3);
+        let frames = FrameLeg::ALL.len() * (crate::shard_health::DELAY_BUCKETS.len() + 3);
         let series = made.lines().filter(|l| !l.starts_with('#')).count();
         // Goal 10, plan 01a1a87b2dae step 4: the legs `order`, `to_control` and `net` added 141 (3 legs of 47) to the 282
-        // there were.
-        assert_eq!((series, routes, legs), (routes + legs, 220, 423), "every class's and leg's, zeros and all");
+        // there were; step 5: the frame's four legs, 188 more.
+        assert_eq!((series, routes, legs, frames), (routes + legs + frames, 220, 423, 188), "every class's and leg's, zeros and all");
         for c in Class::ALL {
             assert!(made.contains(&format!("kiln_route_wait_seconds_count{{class=\"{}\"}} 0", c.name())), "{}", c.name());
         }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a live frame's legs at the server past its runner's wait are each its own, to
+    /// the microsecond: the owner's apply, the viewer's wake on its owner's shard and across shards, and the socket's
+    /// write (a batch's frames each observed); each rendered, its family beside the runner's legs, in a set order the
+    /// lab reads by name.
+    #[test]
+    fn g10_s5_a_frames_legs_past_its_owner_are_each_its_own() {
+        assert_eq!(FrameLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["apply", "woken", "woken_other", "write"]);
+        assert_eq!(FrameLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        let f = FrameLegs::new();
+        f.observe_n(FrameLeg::Apply, Duration::from_micros(40), 1);
+        f.observe_n(FrameLeg::Woken, Duration::from_micros(8), 1);
+        f.observe_n(FrameLeg::WokenOther, Duration::from_micros(180), 1);
+        f.observe_n(FrameLeg::WokenOther, Duration::from_micros(1_100), 1);
+        // A batch of three frames written at once: each frame's.
+        f.observe_n(FrameLeg::Write, Duration::from_micros(30), 3);
+        let counts: Vec<u64> = FrameLeg::ALL.iter().map(|leg| f.of(*leg).map_or(0, PerShard::count)).collect();
+        assert_eq!(counts, vec![1, 1, 2, 3]);
+        // Finer than the route classes' first bucket (50 µs): 8 µs and 40 µs apart from 180 µs, and a wake past a
+        // millisecond (a tick behind a busy CPU) from one under it.
+        let under = |leg: FrameLeg, bound: f64| f.of(leg).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
+        assert_eq!((under(FrameLeg::Woken, 0.00001), under(FrameLeg::Apply, 0.00005)), (Some(1), Some(1)));
+        assert_eq!((under(FrameLeg::WokenOther, 0.0002), under(FrameLeg::WokenOther, 0.001)), (Some(1), Some(1)), "180 µs under 0.2 ms, 1.1 ms past a millisecond");
+        let mut o = String::new();
+        observe_frame(FrameLeg::Woken, Duration::from_micros(8));
+        observe_frames(FrameLeg::Write, Duration::from_micros(30), 2);
+        observe_frames(FrameLeg::Write, Duration::from_micros(30), 0);
+        render(&mut o);
+        for leg in FrameLeg::ALL {
+            assert!(o.contains(&format!("kiln_frame_leg_seconds_count{{leg=\"{}\"}}", leg.name())), "{} rendered", leg.name());
+        }
+        assert!(o.contains("kiln_frame_leg_seconds_bucket{leg=\"woken\",le=\"0.00001\"}"), "the shards' delay buckets");
+        assert!(o.find("# TYPE kiln_runner_wait_leg_seconds").is_some_and(|runner| o.find("# TYPE kiln_frame_leg_seconds").is_some_and(|frame| runner < frame)), "after the runner's legs");
     }
 }

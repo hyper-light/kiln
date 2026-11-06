@@ -3126,6 +3126,9 @@ impl Hub {
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
+        // The owner's own time with it, its frames published, to the microsecond: the first of a live frame's legs past
+        // its runner's wait (goal 10, plan 01a1a87b2dae step 5).
+        crate::route_latency::observe_frame(crate::route_latency::FrameLeg::Apply, done.saturating_duration_since(began));
         // Its runner's hold of it, as its runner said it, and the server's time with it, from its frame's arrival
         // to its owner done with it: each read on one clock, its own side's (goal 10, plan 01a1a87b2dae step 5).
         if let Some(t) = taken {

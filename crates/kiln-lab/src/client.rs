@@ -1,7 +1,7 @@
 //! The lab's clients, on blocking sockets: HTTP/1.1 with keep-alive, and a WebSocket. Each worker
 //! of the load owns its own, so nothing is shared while the lab measures.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -9,13 +9,15 @@ use std::time::Duration;
 /// means to see (a minute: `kiln_route_seconds`' last bucket), so a stall is measured, not cut.
 pub const PATIENCE: Duration = Duration::from_secs(90);
 
-/// An answer: its status and body, its `Retry-After` (whole seconds) where it has one, and what the server said of
-/// its own time with the request, where it was asked ([`Http::timed`]).
+/// An answer: its status and body, its `Retry-After` (whole seconds) where it has one, what the server said of
+/// its own time with the request, where it was asked ([`Http::timed`]), and when its last bytes arrived at the lab's
+/// socket, microseconds since the epoch, where the socket stamps arrivals (`crate::rx`; goal 10, plan 01a1a87b2dae step 5).
 pub struct Answer {
     pub status: u16,
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
     pub server: Option<ServerTime>,
+    pub arrived_us: Option<u64>,
 }
 
 /// What the server said of its time with a request (kiln's `Server-Timing`: `wait;dur=…, took;dur=…`, milliseconds):
@@ -82,6 +84,7 @@ impl Http {
             let s = TcpStream::connect(("127.0.0.1", self.port))?;
             s.set_nodelay(true)?;
             s.set_read_timeout(Some(PATIENCE))?;
+            crate::rx::stamp_arrivals(&s);
             self.buf.clear();
             self.conn = Some(s);
         }
@@ -137,11 +140,11 @@ impl Http {
         if let Some(b) = body {
             s.write_all(b).map_err(|_| Closed)?;
         }
-        let (status, close, body, retry_after, server) = read_response(s, buf)?;
+        let (status, close, body, retry_after, server, arrived_us) = read_response(s, buf)?;
         if close {
             *conn = None;
         }
-        Ok(Answer { status, body, retry_after, server })
+        Ok(Answer { status, body, retry_after, server, arrived_us })
     }
 }
 
@@ -157,11 +160,15 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-/// Reads more into `buf`: how many bytes came (0: the peer closed).
-fn fill(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<usize> {
+/// Reads more into `buf`: how many bytes came (0: the peer closed), and when the last of them arrived at the socket
+/// where it stamps arrivals (`crate::rx`), into `arrived`.
+fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, arrived: &mut Option<u64>) -> anyhow::Result<usize> {
     let mut chunk = [0u8; 64 << 10];
-    let n = s.read(&mut chunk)?;
+    let (n, at) = crate::rx::read(s, &mut chunk)?;
     buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    if at.is_some() {
+        *arrived = at;
+    }
     Ok(n)
 }
 
@@ -170,15 +177,17 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// One response off `s` (what's left over stays in `buf`): its status, whether the server closes
-/// the connection after it, its body (chunks joined), its `Retry-After` in whole seconds and its
-/// `Server-Timing` ([`ServerTime`]).
+/// the connection after it, its body (chunks joined), its `Retry-After` in whole seconds, its
+/// `Server-Timing` ([`ServerTime`]) and when the last of it arrived at the socket, where it stamps arrivals
+/// (`crate::rx`): what was read of it before it came, whatever the read that brought it.
 #[allow(clippy::type_complexity)]
-fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>, Option<Duration>, Option<ServerTime>)> {
+fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>, Option<Duration>, Option<ServerTime>, Option<u64>)> {
+    let mut arrived = None;
     let head_end = loop {
         if let Some(i) = find(buf, b"\r\n\r\n") {
             break i;
         }
-        if fill(s, buf)? == 0 {
+        if fill(s, buf, &mut arrived)? == 0 {
             return Err(if buf.is_empty() { anyhow::Error::new(Closed) } else { anyhow::anyhow!("the connection ended in a response's head") });
         }
     };
@@ -206,13 +215,13 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
                 if let Some(i) = find(buf, b"\r\n") {
                     break i;
                 }
-                anyhow::ensure!(fill(s, buf)? > 0, "the connection ended in a chunk's size");
+                anyhow::ensure!(fill(s, buf, &mut arrived)? > 0, "the connection ended in a chunk's size");
             };
             let size_text = String::from_utf8_lossy(buf.get(..line_end).unwrap_or_default()).into_owned();
             let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)?;
             buf.drain(..line_end + 2);
             while buf.len() < size + 2 {
-                anyhow::ensure!(fill(s, buf)? > 0, "the connection ended in a chunk");
+                anyhow::ensure!(fill(s, buf, &mut arrived)? > 0, "the connection ended in a chunk");
             }
             out.extend_from_slice(buf.get(..size).unwrap_or_default());
             buf.drain(..size + 2);
@@ -223,24 +232,26 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
         out
     } else if let Some(n) = length {
         while buf.len() < n {
-            anyhow::ensure!(fill(s, buf)? > 0, "the connection ended in a body");
+            anyhow::ensure!(fill(s, buf, &mut arrived)? > 0, "the connection ended in a body");
         }
         buf.drain(..n).collect()
     } else if status == 204 || status == 304 || (100..200).contains(&status) {
         Vec::new()
     } else {
         // To the close.
-        while fill(s, buf)? > 0 {}
+        while fill(s, buf, &mut arrived)? > 0 {}
         close = true;
         std::mem::take(buf)
     };
-    Ok((status, close, body, retry_after, server))
+    Ok((status, close, body, retry_after, server, arrived))
 }
 
-/// A WebSocket to the server (RFC 6455): frames out masked, as a client's are.
+/// A WebSocket to the server (RFC 6455): frames out masked, as a client's are; and when what it read last arrived
+/// at its socket, where the socket stamps arrivals (`crate::rx`).
 pub struct Socket {
     s: TcpStream,
     buf: Vec<u8>,
+    arrived: Option<u64>,
 }
 
 /// What a socket brought.
@@ -259,23 +270,31 @@ impl Socket {
         let mut s = TcpStream::connect(("127.0.0.1", port))?;
         s.set_nodelay(true)?;
         s.set_read_timeout(Some(PATIENCE))?;
+        crate::rx::stamp_arrivals(&s);
         write!(
             s,
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )?;
-        let mut buf = Vec::new();
+        let (mut buf, mut arrived) = (Vec::new(), None);
         let end = loop {
             if let Some(i) = find(&buf, b"\r\n\r\n") {
                 break i;
             }
-            anyhow::ensure!(fill(&mut s, &mut buf)? > 0, "no answer to the upgrade");
+            anyhow::ensure!(fill(&mut s, &mut buf, &mut arrived)? > 0, "no answer to the upgrade");
             anyhow::ensure!(buf.len() < 64 << 10, "no end to the upgrade's answer");
         };
         let head = String::from_utf8_lossy(buf.get(..end).unwrap_or_default()).into_owned();
         anyhow::ensure!(head.starts_with("HTTP/1.1 101"), "not upgraded: {}", head.lines().next().unwrap_or(""));
         buf.drain(..end + 4);
         s.set_read_timeout(Some(tick))?;
-        Ok(Self { s, buf })
+        Ok(Self { s, buf, arrived })
+    }
+
+    /// When the last bytes it read arrived at its socket, microseconds since the epoch, where the socket stamps
+    /// arrivals (`crate::rx`): those of the message [`Socket::next`] gave last, which came whole with them or before
+    /// them (goal 10, plan 01a1a87b2dae step 5).
+    pub fn arrived(&self) -> Option<u64> {
+        self.arrived
     }
 
     /// The next whole message (continuations joined; pings answered), or `Nothing` once a read
@@ -299,7 +318,7 @@ impl Socket {
                     return Ok(if op == 0x2 { Frame::Binary } else { Frame::Text(m) });
                 }
             }
-            match fill(&mut self.s, &mut self.buf) {
+            match fill(&mut self.s, &mut self.buf, &mut self.arrived) {
                 Ok(0) => return Ok(Frame::Closed),
                 Ok(_) => {}
                 Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)) => {
