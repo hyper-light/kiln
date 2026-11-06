@@ -1005,7 +1005,8 @@ impl Shard {
     /// Runs the loop on the calling thread until shutdown completes. When idle within the window a client's
     /// last activity opened, the shard spins out the window checking its inboxes and driver before it parks;
     /// outside every window it parks at once. A step that follows a park or a busy step at once takes the
-    /// reading that ended it as its clock ([`Shard::step_after`]).
+    /// reading that ended it as its clock ([`Shard::step_after`]). A step that did work and left nothing for the
+    /// next to find goes on as an idle one would, with no idle step between ([`Shard::left_nothing`]).
     pub fn run(&mut self) {
         let mut reading = None;
         loop {
@@ -1013,7 +1014,7 @@ impl Shard {
             if outcome.exit {
                 break;
             }
-            if outcome.did_work {
+            if outcome.did_work && !self.left_nothing(last) {
                 reading = last;
                 continue;
             }
@@ -1561,6 +1562,29 @@ impl Shard {
         did_work
     }
 
+    /// Whether a step that did work left nothing for the next to find, as the idle step after it would find it
+    /// ([`Shard::run`]): no task ready, those that woke themselves among them, and no input pending as of `last`,
+    /// the step's last reading of the clock (none: the clock now). Then the loop goes on as after an idle step, to
+    /// the park: half of a server shard's steps were that idle one, each reading its inputs, its wheel and its
+    /// judgments to find nothing (kiln's goal 9, plan 01a1a87b2cec step 5: 44.6 steps to 22.9 parks a request in
+    /// kiln's lab, g9p16). What that step left for the park is left here too: its clock, and the driver owed its
+    /// look where readiness waits are registered ([`Shard::read_inputs`]). The park announces itself and looks at its
+    /// inbox again as it always does, so a wake sent after this look is never lost ([`crate::parking`]).
+    fn left_nothing(&mut self, last: Option<Reading>) -> bool {
+        if !self.core.real_time || self.core.driver_lost || self.core.exited || !self.desk.local.is_empty() {
+            return false;
+        }
+        let now = last.map_or_else(|| self.carried_now_ns(), |reading| reading.ns);
+        if self.inputs_pending_at(now) {
+            return false;
+        }
+        self.desk.now_ns.set(now);
+        if !self.core.waiting.is_empty() {
+            self.core.harvest_owed = true;
+        }
+        true
+    }
+
     /// Whether the inputs may hold work (docs/runtime.md §3.10), from what tells without touching them: an
     /// intent asked, the time against `due_ns`, and the entry's flags for control and wakes from other threads.
     /// The simulation reads every turn, as its harvest does. An idle shard with readiness waits read them all
@@ -1568,9 +1592,14 @@ impl Shard {
     /// shard's steps are the idle one before each park, and each drained nothing, examined its wheel and asked
     /// its driver twice, only to leave the driver to the park ([`Shard::read_inputs`] keeps that).
     fn inputs_pending(&self) -> bool {
+        self.inputs_pending_at(self.desk.now_ns.get())
+    }
+
+    /// [`Shard::inputs_pending`] as of `now_ns`.
+    fn inputs_pending_at(&self, now_ns: u64) -> bool {
         !self.core.real_time
             || self.desk.asked.get()
-            || self.desk.now_ns.get() >= self.desk.due_ns.get()
+            || now_ns >= self.desk.due_ns.get()
             || self
                 .desk
                 .entry
