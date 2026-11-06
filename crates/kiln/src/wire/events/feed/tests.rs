@@ -702,3 +702,184 @@ fn events_burst_costs_fewer_frames_and_bytes() -> anyhow::Result<()> {
     anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
     Ok(())
 }
+
+/// An agent's info frame of `title`, as `Hub::emit_harness` writes one.
+fn info(id: &str, title: &str) -> anyhow::Result<Arc<str>> {
+    let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), title: title.into(), ..Default::default() };
+    Ok(crate::wire::events::harness_frame(&serde_json::to_vec(&info)?))
+}
+
+/// The weights of what `feed`'s places hold, read back: its frames and what stands for those said again.
+fn weighed(feed: &Feed) -> usize {
+    feed.places.iter().filter_map(|p| p.load_full()).map(|f| f.weight()).sum()
+}
+
+/// A frame of 100 bytes and more, its number written in as wide as every other's, so all weigh the same.
+fn padded(i: u64) -> Arc<str> {
+    Arc::from(format!(r#"{{"type":"sample","i":"{i:04}","pad":"{}"}}"#, "x".repeat(100)))
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5: a frame an agent's next info says again whole is let go of once that one is
+/// in, and what stands for it is passed over: a reader after it is sent the newest alone, a page that resumes from
+/// before it too, and the numbers, the head and what's kept of other frames are as they were. A reader that took
+/// it before keeps its text. Its place holds its number alone: the bytes its text took are given back.
+#[test]
+fn g11_s5_a_frame_said_again_whole_is_passed_over() -> anyhow::Result<()> {
+    let feed = Feed::with_capacity(11, 16);
+    let first = feed.push(info("s1", "one")?);
+    let taken = feed.kept();
+    let other = feed.push(Arc::from(r#"{"type":"updates"}"#));
+    let full = feed.held();
+    let second = feed.push_over(info("s1", "two")?, first);
+    anyhow::ensure!((first, other, second, feed.head()) == (1, 2, 3, 3), "numbered {first}, {other}, {second}, head {}", feed.head());
+    anyhow::ensure!(seqs(feed.since(0)) == Some(vec![2, 3]), "since 0: {:?}", seqs(feed.since(0)));
+    anyhow::ensure!(seqs(feed.since(1)) == Some(vec![2, 3]), "since 1: {:?}", seqs(feed.since(1)));
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq([2, 3]), "kept: {:?}", feed.kept().iter().map(|f| f.seq).collect::<Vec<_>>());
+    anyhow::ensure!(feed.kept().iter().all(|f| !f.text.is_empty()), "a reader is never handed what stands for a frame");
+    anyhow::ensure!(feed.resume(Some(&At { epoch: 11, seq: 0 }.to_string())) == (0, false), "a page from before it resumes");
+    anyhow::ensure!(taken.first().is_some_and(|f| f.seq == 1 && f.text.contains(r#""one""#)), "the reader that took it keeps it");
+    let first_weight = taken.first().map_or(0, |f| f.weight());
+    drop(taken);
+    let (over, newest) = (Frame::over(first).weight(), Frame::new(second, info("s1", "two")?).weight());
+    anyhow::ensure!(feed.held() == full - first_weight + over + newest, "held {} of {full}", feed.held());
+    anyhow::ensure!(feed.held() == weighed(&feed), "held {} against its places' {}", feed.held(), weighed(&feed));
+    anyhow::ensure!(over * 4 < first_weight, "what stands for it ({over} bytes) is a fraction of what it took ({first_weight})");
+    // Said over again: the newest alone stays whole.
+    let third = feed.push_over(info("s1", "three")?, second);
+    anyhow::ensure!(seqs(feed.since(0)) == Some(vec![2, third]), "{:?}", seqs(feed.since(0)));
+    // No number, or one that isn't an earlier frame's, lets go of nothing.
+    let before = feed.kept().len();
+    feed.push_over(Arc::from(r#"{"type":"places"}"#), 0);
+    feed.push_over(Arc::from(r#"{"type":"places"}"#), 99);
+    anyhow::ensure!(feed.kept().len() == before + 2, "{} kept of {}", feed.kept().len(), before + 2);
+    Ok(())
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5: what a later frame says again is let go of only where its place still holds
+/// it: a place a newer frame took (the ring went round) keeps that one.
+#[test]
+fn g11_s5_a_frame_said_again_after_its_place_went_round_takes_nothing() -> anyhow::Result<()> {
+    let feed = Feed::with_capacity(12, 2);
+    let first = feed.push(info("s1", "one")?);
+    feed.push(Arc::from(r#"{"type":"updates"}"#));
+    let lapped = feed.push(Arc::from(r#"{"type":"places"}"#));
+    let newest = feed.push_over(info("s1", "two")?, first);
+    anyhow::ensure!(seqs(feed.since(lapped - 1)) == Some(vec![lapped, newest]), "{:?}", seqs(feed.since(lapped - 1)));
+    anyhow::ensure!(feed.held() == weighed(&feed), "held {} against its places' {}", feed.held(), weighed(&feed));
+    Ok(())
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5: the feed's places hold at most its bytes ([`BYTES`] in a server's): past
+/// them the oldest go as past its frames, a reader after them is told of the gap and a page from before them
+/// resyncs, while the newest frame stays, alone if it's larger than all of them.
+#[test]
+fn g11_s5_the_feed_keeps_at_most_its_bytes() -> anyhow::Result<()> {
+    let each = Frame::new(1, padded(1)).weight();
+    let feed = Feed::with_room(13, 16, 3 * each);
+    for i in 1..=10 {
+        feed.push(padded(i));
+        anyhow::ensure!(feed.held() <= 3 * each, "held {} past {} after {i}", feed.held(), 3 * each);
+        anyhow::ensure!(feed.held() == weighed(&feed), "held {} against its places' {}", feed.held(), weighed(&feed));
+    }
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq(8..=10), "kept: {:?}", feed.kept().iter().map(|f| f.seq).collect::<Vec<_>>());
+    anyhow::ensure!(seqs(feed.since(7)) == Some(vec![8, 9, 10]), "{:?}", seqs(feed.since(7)));
+    anyhow::ensure!(seqs(feed.since(6)).is_none(), "7 is gone: {:?}", seqs(feed.since(6)));
+    anyhow::ensure!(feed.resume(Some("13.3")) == (10, true), "a page from before what's kept resyncs");
+    anyhow::ensure!(feed.resume(Some("13.7")) == (7, false), "one after it resumes");
+    // One larger than the bytes alone: kept until the next.
+    let big: Arc<str> = Arc::from(format!(r#"{{"type":"sample","pad":"{}"}}"#, "y".repeat(10 * each)));
+    let at = feed.push(big);
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq([at]), "kept: {:?}", feed.kept().iter().map(|f| f.seq).collect::<Vec<_>>());
+    let next = feed.push(padded(12));
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq([next]) && feed.held() <= 3 * each, "held {} after the large one", feed.held());
+    anyhow::ensure!(feed.head() == next && next == 12, "numbered on: head {}", feed.head());
+    anyhow::ensure!(feed.held() == weighed(&feed), "held {} against its places' {}", feed.held(), weighed(&feed));
+    Ok(())
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5: a push held up between its number and its place while the feed let go of that
+/// number for its bytes doesn't put its frame there late: it's gone, as a lapped one.
+#[test]
+fn g11_s5_a_frame_put_after_its_number_was_let_go_is_gone() -> anyhow::Result<()> {
+    let each = Frame::new(1, padded(1)).weight();
+    let feed = Feed::with_room(14, 16, 2 * each);
+    feed.push(padded(1));
+    let held_up = feed.next.fetch_add(1, Ordering::AcqRel);
+    for i in 3..=6 {
+        feed.push(padded(i));
+    }
+    let held = feed.held();
+    feed.put(Arc::new(Frame::new(held_up, padded(held_up))));
+    anyhow::ensure!(feed.held() == held && feed.held() == weighed(&feed), "the late frame went in: held {} of {held}", feed.held());
+    anyhow::ensure!(seqs(feed.since(held_up - 1)).is_none(), "a reader before it is told of the gap: {:?}", seqs(feed.since(held_up - 1)));
+    anyhow::ensure!(feed.kept().iter().map(|f| f.seq).eq(5..=6), "kept: {:?}", feed.kept().iter().map(|f| f.seq).collect::<Vec<_>>());
+    Ok(())
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5, with goal 5's rule (plan 01a1a59c2aae: no lock): while threads push past the
+/// feed's bytes and each says its own last frame again every other push, a reader passes over only frames said
+/// again (every number it skips without being told of a gap is one), never takes what stands for one, and the
+/// places hold what the feed counts, within its bytes but for the frames of the pushes then under way.
+#[test]
+fn g11_s5_readers_and_the_bytes_floor_agree_while_threads_push() -> anyhow::Result<()> {
+    let (threads, each) = (4_usize, 3_000_u64);
+    let total = u64::try_from(threads)? * each;
+    let one = Frame::new(1, padded(1)).weight();
+    let feed = Arc::new(Feed::with_room(15, 1024, 64 * one));
+    let pushers: Vec<_> = (0..threads)
+        .map(|_| {
+            let feed = Arc::clone(&feed);
+            std::thread::spawn(move || {
+                let (mut was, mut over) = (0, Vec::new());
+                for i in 0..each {
+                    if i % 2 == 0 && was > 0 {
+                        over.push(was);
+                        was = feed.push_over(padded(i), was);
+                    } else {
+                        was = feed.push(padded(i));
+                    }
+                }
+                over
+            })
+        })
+        .collect();
+    let (mut at, mut skipped, mut gaps, deadline) = (0_u64, Vec::new(), 0_usize, std::time::Instant::now() + std::time::Duration::from_secs(120));
+    while at < total {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "stuck at {at} of {total}, head {}", feed.head());
+        match feed.since(at) {
+            Since::Frames(frames) => {
+                for f in frames {
+                    anyhow::ensure!(f.seq > at && !f.text.is_empty(), "after {at} it took {} ({:?})", f.seq, f.text);
+                    skipped.extend(at + 1..f.seq);
+                    at = f.seq;
+                }
+            }
+            Since::Gap => {
+                gaps += 1;
+                at = at.max(feed.head().saturating_sub(1));
+            }
+        }
+        std::thread::yield_now();
+    }
+    let mut over = std::collections::HashSet::new();
+    for p in pushers {
+        over.extend(p.join().map_err(|_| anyhow::anyhow!("a pusher ended early"))?);
+    }
+    let unsaid: Vec<u64> = skipped.iter().copied().filter(|s| !over.contains(s)).take(5).collect();
+    anyhow::ensure!(unsaid.is_empty(), "skipped without a gap, never said again: {unsaid:?} ({} skipped, {gaps} gaps)", skipped.len());
+    anyhow::ensure!(at == total, "ended at {at} of {total}");
+    anyhow::ensure!(feed.held() == weighed(&feed), "held {} against its places' {}", feed.held(), weighed(&feed));
+    anyhow::ensure!(feed.held() <= 64 * one, "held {} past {}", feed.held(), 64 * one);
+    anyhow::ensure!(crate::memory::owners::EVENTS_FEED.bytes() >= feed.held(), "the owner counts what it holds");
+    Ok(())
+}
+
+/// Goal 11, plan 01a1a87b2e56 step 5: what a frame takes is its text and its own room; what stands for a frame said
+/// again takes its room alone, and a frame's meta is no longer in it (made only for one a socket reads).
+#[test]
+fn g11_s5_a_frames_weight_is_its_text_and_its_room() {
+    let f = Frame::new(1, Arc::from("x".repeat(1000)));
+    assert_eq!(f.weight(), Frame::over(1).weight() + 1000);
+    assert!(Frame::over(1).weight() <= 96, "{} bytes for a frame said again", Frame::over(1).weight());
+    assert!(size_of::<Frame>() < size_of::<Meta>(), "its meta's room is no longer in each frame");
+}

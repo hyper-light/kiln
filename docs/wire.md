@@ -922,5 +922,9 @@ goes on as it did:
   newest 4,096, the size of the broadcast behind it, under an epoch drawn as the server starts.
   A page that reconnects is sent what it missed, coalesced; when the epoch isn't this server's, or
   the ring no longer has it, its first batch starts with `resync`, and the page loads what it shows
-  again. A socket that falls more than the ring behind is told `resync` too, as before.
+  again. A socket that falls more than the ring behind is told `resync` too, as before. The ring
+  holds at most 64 MiB of frames as well, as many bytes as a listener of the hub's events holds,
+  past which its oldest go as past its 4,096. An agent's `harness` frame lets go of that agent's
+  last one (it says the agent whole): readers pass over what's let go of so, with no gap and no
+  `resync`, and are sent the newest (goal 11, plan 01a1a87b2e56 step 5).
 
