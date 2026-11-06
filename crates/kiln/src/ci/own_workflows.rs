@@ -31,6 +31,7 @@ const WORKFLOWS: &[(&str, &str, &str)] = &[
     ("ci.yaml", "push", "main"),
     ("custody-lab.yaml", "workflow_dispatch", "main"),
     ("e2e.yaml", "push", "e2e/check"),
+    ("h3-fuzz.yaml", "workflow_dispatch", "main"),
     ("image.yaml", "push", "main"),
     ("release.yaml", "push", "main"),
     ("sim.yaml", "workflow_dispatch", "main"),
