@@ -2252,7 +2252,17 @@ impl Mirror {
     /// in it, in place in the copy's (`super::registry::merge_changes`). The files that didn't change stay as they
     /// were, shared with what viewers were last sent.
     pub fn take_changes(&mut self, set: Vec<Value>, gone: Vec<Value>, whole: bool) {
-        self.take_change_entries(set.into_iter().map(|f| Arc::new(Entry::new(f))).collect(), gone, whole);
+        let mut files: Vec<Arc<Entry>> = match self.changes.take() {
+            // Its own, or (shared with its views) a list of the same files.
+            Some(all) => Arc::try_unwrap(all).unwrap_or_else(|shared| (*shared).clone()),
+            None => Vec::new(),
+        };
+        if whole {
+            let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(super::registry::file_ref).collect();
+            files.retain(|f| kept.contains(&f.file()));
+        }
+        super::registry::merge_changes(&mut files, set, if whole { &[] } else { gone.as_slice() });
+        self.changes = Some(Arc::new(files));
     }
 
     /// [`Mirror::take_changes`] of files written out already (`set`, each its entry: off its owner's shard,
@@ -2943,6 +2953,26 @@ impl Shard {
                 }
             }
             Msg::Run(job) => job(self),
+            Msg::Each(mut each) => {
+                if each.left.is_none() {
+                    each.left = Some(self.mirrors.iter().filter(|(id, m)| (each.pick)(id, m)).map(|(id, _)| id.clone()).collect());
+                }
+                // A session at a time, the turn asked between them: the rest first at the next, nothing else between. Each is
+                // looked at again as it's taken, and passed over should it no longer be picked.
+                loop {
+                    let Some(id) = each.left.as_mut().and_then(Vec::pop) else {
+                        (each.step)(self, None);
+                        break;
+                    };
+                    if self.mirrors.get(&id).is_some_and(|m| (each.pick)(&id, m)) {
+                        (each.step)(self, Some(&id));
+                    }
+                    if each.left.as_ref().is_some_and(|l| !l.is_empty()) && over(0) {
+                        rest = Some(Msg::Each(each));
+                        break;
+                    }
+                }
+            }
             Msg::Runner(r) => {
                 if let Some(h) = hub {
                     rest = h.runner_update(self, *r, over).map(|i| Msg::Update(Box::new(i)));
@@ -3007,6 +3037,18 @@ pub struct RunnerUpdate {
 
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 
+/// A sweep of an owner's copies ([`Copies::on_each_session`]): each session `pick` picks taken by `step` in turn, then `step`
+/// once more with none, as it ends. Its owner takes it a session at a time across its turns, what's left of it first at its
+/// next turn, nothing else between (goal 9, plan 01a1a87b2cec step 3), where one job over every session of a shard held the
+/// shard for all of them: a machine's sessions said disconnected as it went, each one's info and state copied, encoded and
+/// published, tens of µs a session.
+pub struct Each {
+    /// The sessions picked as its owner first took it, those it hasn't taken yet: none picked until then.
+    left: Option<Vec<String>>,
+    pick: Box<dyn Fn(&str, &Mirror) -> bool + Send>,
+    step: Box<dyn FnMut(&mut Shard, Option<&str>) + Send>,
+}
+
 /// What an owner takes from its inbox.
 pub enum Msg {
     Update(Box<Ingest>),
@@ -3014,6 +3056,8 @@ pub enum Msg {
     Run(Job),
     /// An update from a session's runner, to judge and take ([`RunnerUpdate`]).
     Runner(Box<RunnerUpdate>),
+    /// A sweep of its copies, a session at a time ([`Each`]).
+    Each(Box<Each>),
 }
 
 impl crate::memory::queue::Weigh for Msg {
@@ -3023,6 +3067,7 @@ impl crate::memory::queue::Weigh for Msg {
         size_of::<Msg>().saturating_add(match self {
             Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
             Msg::Run(job) => size_of_val(&**job),
+            Msg::Each(each) => size_of::<Each>().saturating_add(size_of_val(&*each.pick)).saturating_add(size_of_val(&*each.step)).saturating_add(each.left.as_ref().map_or(0, |l| l.iter().map(|id| size_of::<String>().saturating_add(id.len())).fold(0, usize::saturating_add))),
             Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
         })
     }
@@ -3288,6 +3333,38 @@ impl Copies {
         out
     }
 
+    /// `f` of each session `pick` picks, as a sweep of every owner's copies ([`Each`]): each owner takes its own after what was
+    /// sent it before, a session at a time across its turns, nothing else between, so no turn holds its shard for all of them
+    /// (goal 9, plan 01a1a87b2cec step 3: [`Copies::on_each`]'s job did). What it adds to a board or takes off it is published
+    /// before it answers. Its answers, every owner's, in no set order.
+    pub async fn on_each_session<R: Send + 'static>(&self, pick: impl Fn(&str, &Mirror) -> bool + Clone + Send + 'static, f: impl Fn(&mut Shard, &str) -> Option<R> + Clone + Send + 'static) -> Vec<R> {
+        let mut answers = Vec::with_capacity(self.inboxes.len());
+        for inbox in &self.inboxes {
+            let (tx, rx) = futures::channel::oneshot::channel::<Vec<R>>();
+            let (f, mut tx, mut out) = (f.clone(), Some(tx), Vec::new());
+            let step = move |s: &mut Shard, id: Option<&str>| match id {
+                Some(id) => out.extend(f(s, id)),
+                None => {
+                    s.publish_board();
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(std::mem::take(&mut out));
+                    }
+                }
+            };
+            let each = Each { left: None, pick: Box::new(pick.clone()), step: Box::new(step) };
+            if inbox.send(Msg::Each(Box::new(each))).await.is_ok() {
+                answers.push(rx);
+            }
+        }
+        let mut out = Vec::new();
+        for rx in answers {
+            if let Ok(r) = rx.await {
+                out.extend(r);
+            }
+        }
+        out
+    }
+
     /// Back once every owner has applied what was sent it before this.
     pub async fn settled(&self) {
         self.on_each(|_| ()).await;
@@ -3307,7 +3384,7 @@ fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     match msg {
         Msg::Update(i) => crate::wire::update_label(&i.u),
         Msg::Runner(r) => crate::wire::update_label(&r.update),
-        Msg::Run(_) => &WORK,
+        Msg::Run(_) | Msg::Each(_) => &WORK,
     }
 }
 
@@ -3433,7 +3510,7 @@ impl Costs {
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
-            Msg::Run(_) => return start,
+            Msg::Run(_) | Msg::Each(_) => return start,
         };
         match u {
             Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(self.tail.expected()),
@@ -5868,6 +5945,55 @@ mod tests {
             let paths: Vec<Option<String>> = got.iter().map(|t| serde_json::from_str::<Value>(t).ok().and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_owned))).collect();
             anyhow::ensure!(got == want, "taken as the shard takes them: {paths:?}");
             anyhow::ensure!(paths == [Some("big.rs".to_owned()), Some("b.rs".to_owned())], "the whole one's files, the patch's in its place, the gone one let go of: {paths:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a sweep of an owner's copies (a machine's sessions said disconnected, an inventory's
+    /// removed) is taken a session at a time across the owner's turns: each session it picks once and no other, its turns
+    /// each a quantum at the median by its own clock, the shard given up between them, and nothing else between: a job sent
+    /// right behind it finds every step taken. One job over all of them held the shard for all of them.
+    #[test]
+    fn g9_s3_a_sweep_of_an_owners_copies_is_taken_in_turns_with_nothing_between() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            let n = 48u64;
+            for k in 0..n {
+                let id = format!("s{k}");
+                let i = id.clone();
+                copies.on(&id, move |s| s.insert(i.clone(), Mirror::new(Info { id: i, ..Info::default() }, Location::Local, sim_bus()))).await;
+            }
+            let turned = copies.on("s0", |s| s.turns.len()).await.unwrap_or_default();
+            // Every session but one, each step an eighth of a quantum, as a session said disconnected takes some.
+            let (steps, quantum) = (Arc::new(AtomicU64::new(0)), Duration::from_nanos(crate::rt::STEP_BUDGET_NS));
+            let taken = Arc::clone(&steps);
+            let sweep = copies.on_each_session(
+                |id, _| id != "s1",
+                move |s, id| {
+                    let began = Instant::now();
+                    while began.elapsed() < quantum / 8 {
+                        std::hint::spin_loop();
+                    }
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    s.get(id).map(|m| m.info.id.clone())
+                },
+            );
+            // A job sent right behind it.
+            let behind = {
+                let (copies, steps) = (Arc::clone(&copies), Arc::clone(&steps));
+                async move { copies.on("s0", move |s| (steps.load(Ordering::SeqCst), s.turns.len())).await }
+            };
+            let (mut swept, after) = futures::join!(sweep, behind);
+            swept.sort();
+            let mut want: Vec<String> = (0..n).map(|k| format!("s{k}")).filter(|id| id != "s1").collect();
+            want.sort();
+            anyhow::ensure!(swept == want, "each session it picked, once: {} of {}", swept.len(), want.len());
+            let Some((stepped, turned_after)) = after else { anyhow::bail!("the job behind it never ran") };
+            anyhow::ensure!(stepped == n - 1, "the job behind it ran after {stepped} of its {} steps", n - 1);
+            let mut held = copies.on("s0", move |s| s.turns.get(turned..turned_after).map(<[Duration]>::to_vec)).await.flatten().unwrap_or_default();
+            held.sort();
+            let median = held.get(held.len() / 2).copied().unwrap_or_default();
+            anyhow::ensure!(held.len() >= 2 && median <= quantum, "{} turns said ended over the sweep, {median:?} at the median, the quantum {quantum:?}", held.len());
             Ok(())
         })
     }

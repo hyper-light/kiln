@@ -1858,24 +1858,20 @@ impl Registry {
     /// driver): each one that changes told to every viewer.
     pub async fn set_held(&self, hub: &Hub, held: &HashMap<String, Held>) {
         let held = Arc::new(held.clone());
+        let now = Arc::clone(&held);
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let changed: Vec<Info> = self
             .sessions
-            .on_each(move |s| {
-                let mut changed = Vec::new();
-                for (id, m) in s.mirrors_mut() {
-                    let now = held.get(id).cloned();
-                    if m.info.held != now {
-                        Arc::make_mut(&mut m.info).held = now;
-                        m.commit(|_| None);
-                        changed.push(Info::clone(&m.info));
-                    }
-                }
-                changed
-            })
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+            .on_each_session(
+                move |id, m| m.info.held.as_ref() != now.get(id),
+                move |s, id| {
+                    let m = s.get_mut(id)?;
+                    Arc::make_mut(&mut m.info).held = held.get(id).cloned();
+                    m.commit(|_| None);
+                    Some(Info::clone(&m.info))
+                },
+            )
+            .await;
         for info in changed {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
@@ -2001,16 +1997,14 @@ impl Registry {
             }
             made.push((u.id, m, info));
         }
-        // To their owners, each shard's at once.
-        let mut by_shard: HashMap<usize, Vec<(String, Mirror, Info)>> = HashMap::new();
-        for (id, m, info) in made {
-            by_shard.entry(self.sessions.owner_of(&id)).or_default().push((id, m, info));
-        }
-        let mut infos = Vec::new();
-        for (shard, batch) in by_shard {
-            let put = self.sessions.on_shard(shard, move |s| batch.into_iter().filter_map(|(id, m, info)| s.insert(id, m).then_some(info)).collect::<Vec<_>>()).await;
-            infos.extend(put.unwrap_or_default());
-        }
+        // To their owners, each a message of its own, so an owner's turns take as many as its quantum holds (goal 9, plan
+        // 01a1a87b2cec step 3: a shard's were one job, every copy published in it). One there already stays as it is.
+        let put = futures::future::join_all(made.into_iter().map(|(id, m, info)| {
+            let at = id.clone();
+            async move { self.sessions.on(&at, move |s| s.insert(id, m).then_some(info)).await.flatten() }
+        }))
+        .await;
+        let infos: Vec<Info> = put.into_iter().flatten().collect();
         if !infos.is_empty() {
             tracing::info!(sessions = infos.len(), "agent sessions on machines that are away, from the conversation store");
         }
@@ -2933,26 +2927,16 @@ impl Registry {
             self.sessions_lost(hub, &away).await;
         }
         let (keep, others) = (Arc::new(keep), Arc::new(others));
+        // Not one this server opened there that the machine hasn't announced yet: the report was made before the open got
+        // there. Its viewers are told, and its feed's topic goes with the last of them. A session at a time, as its owner's
+        // turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let gone: Vec<String> = self
             .sessions
-            .on_each(move |s| {
-                // Not one this server opened there that the machine hasn't announced yet: the report
-                // was made before the open got there.
-                let gone: Vec<String> = s
-                    .mirrors()
-                    .filter(|(id, m)| *m.location == at && !keep.contains(*id) && !others.contains(*id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE))
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                // Its viewers are told, and its feed's topic goes with the last of them.
-                for id in &gone {
-                    s.remove(id);
-                }
-                gone
-            })
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+            .on_each_session(
+                move |id, m| *m.location == at && !keep.contains(id) && !others.contains(id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE),
+                |s, id| s.remove(id).map(|_| id.to_owned()),
+            )
+            .await;
         let kinds = inv.kinds;
         self.kinds.update(|k| k.insert(format!("agent:{machine}"), kinds.clone()));
         self.forget_holders(&gone);
@@ -3124,26 +3108,21 @@ impl Registry {
     /// `to`, finds them its own.
     pub async fn move_machine(&self, hub: &Hub, from: &str, to: &str) -> Vec<String> {
         let (at, now) = (Location::Machine(from.to_owned()), Location::Machine(to.to_owned()));
-        let (was, there) = (at.clone(), now.clone());
+        let (was, there) = (at.clone(), Arc::new(now.clone()));
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let moved: Vec<Info> = self
             .sessions
-            .on_each(move |s| {
-                let at = &was;
-                let there = Arc::new(there.clone());
-                s.mirrors_mut()
-                    .filter(|(_, m)| *m.location == *at)
-                    .map(|(_, m)| {
-                        m.location = Arc::clone(&there);
-                        Arc::make_mut(&mut m.info).target = there.target();
-                        m.commit(|_| None);
-                        Info::clone(&m.info)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+            .on_each_session(
+                move |_, m| *m.location == was,
+                move |s, id| {
+                    let m = s.get_mut(id)?;
+                    m.location = Arc::clone(&there);
+                    Arc::make_mut(&mut m.info).target = there.target();
+                    m.commit(|_| None);
+                    Some(Info::clone(&m.info))
+                },
+            )
+            .await;
         self.kinds.update(|k| {
             if let Some(v) = k.remove(&at.target()) {
                 k.entry(now.target()).or_insert(v);
@@ -3168,20 +3147,9 @@ impl Registry {
         let ask = self.still_disconnected(machine, &mine);
         let at = Location::Machine(machine.to_owned());
         let away = Arc::new(moved.iter().filter(|id| !held.contains(*id)).cloned().collect::<Vec<String>>());
-        let gone: Vec<String> = self
-            .sessions
-            .on_each(move |s| {
-                let gone: Vec<String> = s.mirrors().filter(|(id, m)| *m.location == at && away.contains(*id)).map(|(id, _)| id.clone()).collect();
-                // Its viewers are told, and its feed's topic goes with the last of them.
-                for id in &gone {
-                    s.remove(id);
-                }
-                gone
-            })
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+        // Its viewers are told, and its feed's topic goes with the last of them.
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
+        let gone: Vec<String> = self.sessions.on_each_session(move |id, m| *m.location == at && away.iter().any(|a| a == id), |s, id| s.remove(id).map(|_| id.to_owned())).await;
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
@@ -3195,13 +3163,8 @@ impl Registry {
         self.streams.machine_lost(machine, &hub.shown(machine));
         self.ports.machine_lost(machine);
         let at = Location::Machine(machine.to_owned());
-        let infos: Vec<Info> = self
-            .sessions
-            .on_each(move |s| s.mirrors_mut().filter(|(_, m)| *m.location == at).map(|(_, m)| disconnected(m)).collect::<Vec<_>>())
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
+        let infos: Vec<Info> = self.sessions.on_each_session(move |_, m| *m.location == at, |s, id| s.get_mut(id).map(disconnected)).await;
         self.kinds.update(|k| k.remove(&format!("agent:{machine}")));
         for info in infos {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
@@ -3211,14 +3174,9 @@ impl Registry {
     /// One runner process of a machine went away while another of the machine stays connected
     /// (see `crate::instances`): the sessions it held keep running there and come back with it.
     pub async fn sessions_lost(&self, hub: &Hub, ids: &[String]) {
-        let ids: Arc<[String]> = ids.into();
-        let infos: Vec<Info> = self
-            .sessions
-            .on_each(move |s| ids.iter().filter_map(|id| s.get_mut(id).map(disconnected)).collect::<Vec<_>>())
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+        let ids: Arc<std::collections::HashSet<String>> = Arc::new(ids.iter().cloned().collect());
+        // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
+        let infos: Vec<Info> = self.sessions.on_each_session(move |id, _| ids.contains(id), |s, id| s.get_mut(id).map(disconnected)).await;
         for info in infos {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
