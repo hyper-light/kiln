@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { shipApi, type ShipCommit, type ShipDetail, type ShipJob, type ShipJobDone, type ShipScope, type ShipVerb } from "@/api/ship";
+import { DETAIL_OPTS, shipCommit } from "./live";
 import { whoSaid } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
@@ -132,7 +133,7 @@ function Line({
  * action goes to `POST /api/ship/jobs`, and the strip says what came of it.
  */
 export function JobsPane({ commit, output }: { commit: ShipCommit; output: (picked: string) => React.ReactNode }) {
-  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
+  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipCommit(commit.repo, commit.sha, s), DETAIL_OPTS);
   const stations = React.useMemo(() => stationsOf(detail.data), [detail.data]);
   const byLane = React.useMemo(() => jobsByLane(detail.data.jobs ?? []), [detail.data.jobs]);
   const phone = useMediaQuery("(max-width: 700px)");

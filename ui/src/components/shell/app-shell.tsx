@@ -39,8 +39,7 @@ const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigat
 
 function useRunFailureToasts() {
   const seen = React.useRef(new Map<string, Status>());
-  useServerEvents((ev) => {
-    if (ev.type !== "run") return;
+  useServerEvents(["run"], (ev) => {
     const { run } = ev;
     const prev = seen.current.get(run.id);
     seen.current.set(run.id, run.status);

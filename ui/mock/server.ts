@@ -32,11 +32,11 @@ import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
-import { handleShip } from "./ship.ts";
+import { handleShip, shipFrames, shipLive } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
@@ -1045,6 +1045,12 @@ for (let i = 0; i < 25; i++) tick();
  * stand still while it's on, so a measurement sees only what it sends itself (ship-perf's keystrokes). */
 let quiet = false;
 setInterval(() => quiet || tick(), 1000);
+// The server's `ship` frames (W21-R15): what changed of Ship's rows, looked at as often as the
+// server's read model may be old (ship.rs's FRESH_MS), while a page listens.
+setInterval(() => {
+  if (quiet || !shipLive() || eventClients.size === 0) return;
+  for (const f of shipFrames({ json, liveJob, liveRun })) emit(f as unknown as ServerEvent);
+}, 250);
 setInterval(() => quiet || emitQueue(), 1000);
 setInterval(() => quiet || emitQueue(true), 5000);
 setInterval(() => quiet || sampleAll(), 5000);
@@ -1679,6 +1685,7 @@ const server = http.createServer(async (req, res) => {
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
+    if (handleLongTimeline(p, url, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
     const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
     if (live) {
@@ -2152,7 +2159,10 @@ server.on("upgrade", (req, socket, head) => {
         handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
-        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state", {
+          window: url.searchParams.get("window") === "1",
+          lean: url.searchParams.get("lean") === "1",
+        }))
     )
       return;
     ws.close(1008, "no such socket");
