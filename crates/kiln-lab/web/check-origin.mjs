@@ -114,7 +114,7 @@ export async function check(payloads, cataloguePath) {
       if (recorded === false) pass = false;
       const texts = { sse: "", "fetch-stream": "" };
       const reqs = [await open(pub, `/stream/${kind}`, (d) => (texts.sse += d)), await open(pub, `/fetch-stream/${kind}`, (d) => (texts["fetch-stream"] += d))];
-      const r = await post(ctl, "/replay", { kind, events: frames.length, every_ms: 0 });
+      const r = await post(ctl, "/replay", { kind, frames: frames.length, every_ms: 0 });
       if (r.status !== 200) throw new Error(`replay of ${kind}: ${r.status} ${r.body}`);
       const read = () => ({ sse: sseEvents(texts.sse), "fetch-stream": lines(texts["fetch-stream"]) });
       // The origin sends a frame a timer tick (about 1 ms): read until every frame is there, or until
@@ -183,7 +183,7 @@ export async function served(originUrl, ctl, payloads) {
         if ((JSON.parse(o.body || "{}").open || 0) >= 2) break;
         await wait(100);
       }
-      const r = await post(ctl, "/replay", { kind, events: frames.length, every_ms: 0 });
+      const r = await post(ctl, "/replay", { kind, frames: frames.length, every_ms: 0 });
       if (r.status !== 200) throw new Error(`replay of ${kind}: ${r.status} ${r.body}`);
       const read = () => ({ sse: sseEvents(texts.sse), "fetch-stream": lines(texts["fetch-stream"]) });
       let last = -1;

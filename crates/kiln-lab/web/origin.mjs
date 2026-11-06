@@ -7,9 +7,14 @@
 //   POST /api/...                a write: its recorded answer
 //   GET  /__lab/probe.js|html    the probe page, cross-origin isolated
 // and, on a second socket only kiln-lab reaches (never through a server):
-//   POST /replay {kind, events, every_ms, from?}  send `events` of the kind's recorded frames
+//   POST /replay {kind, events, every_ms, from?}  send `events` of the kind's recorded events
 //        to every open stream of it, `every_ms` apart, each stamped `@lab:<µs>` as it goes out,
-//        the stamp keeping its length so every frame is the size kiln's was.
+//        the stamp keeping its length so every frame is the size kiln's was. An event is a frame
+//        with a stamp; the recorded frames between two (a session's state, an entity's patch) go
+//        with the event after them, as kiln sends them, so `events` here are as many as kiln's
+//        stand-ins write (plan 01a1a832e9cc step 8: counting frames instead gave the baselines
+//        about 65% of kiln's events). Answers `frames`, how many recorded frames that took (the
+//        next replay's `from`). `frames: N` in place of `events` sends N recorded frames as they are.
 //   node origin.mjs PAYLOADS_DIR PUBLIC_SOCK CONTROL_SOCK
 import { createServer } from "node:http";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
@@ -19,8 +24,11 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const [payloads, publicSock, controlSock] = process.argv.slice(2);
 const replay = JSON.parse(readFileSync(join(payloads, "replay.json"), "utf8"));
+// The kinds whose frames carry stamps (each stamped frame is an event), found once, not per replay.
+const stampedKinds = new Set(Object.entries(replay.streams || {}).filter(([, fs]) => fs.some((f) => /@lab:\d{16}/.test(f))).map(([k]) => k));
 const nowUs = () => Math.round((performance.timeOrigin + performance.now()) * 1000);
 const STAMP = /@lab:\d{16}/g;
+const STAMPED = /@lab:\d{16}/;
 const streams = new Map();
 
 const stamp = (frame) => {
@@ -93,17 +101,33 @@ const ctl = createServer((req, res) => {
       res.writeHead(400);
       return res.end(`no frames for ${r.kind}`);
     }
+    // Each event's frames: the unstamped ones before it, then it (a kind with no stamp at all
+    // sends a frame an event).
+    const groups = [];
+    let at = r.from || 0;
+    // `frames` instead of `events`: exactly that many recorded frames, one a tick (check-origin's
+    // replay of the whole recording).
+    const anyStamped = r.frames === undefined && stampedKinds.has(r.kind);
+    while (groups.length < (r.frames ?? r.events)) {
+      const g = [];
+      for (;;) {
+        const f = frames[at % frames.length];
+        at += 1;
+        g.push(f);
+        if (!anyStamped || STAMPED.test(f)) break;
+      }
+      groups.push(g);
+    }
     let i = 0;
-    const from = r.from || 0;
     const tick = () => {
-      if (i >= r.events) return;
-      send(r.kind, stamp(frames[(from + i) % frames.length]));
+      if (i >= groups.length) return;
+      for (const f of groups[i]) send(r.kind, stamp(f));
       i += 1;
-      if (i < r.events) setTimeout(tick, r.every_ms);
+      if (i < groups.length) setTimeout(tick, r.every_ms);
     };
     tick();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ kind: r.kind, events: r.events, open: (streams.get(r.kind) || new Set()).size }));
+    res.end(JSON.stringify({ kind: r.kind, events: r.events, frames: at - (r.from || 0), open: (streams.get(r.kind) || new Set()).size }));
   });
 });
 

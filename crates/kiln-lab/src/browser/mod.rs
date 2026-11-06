@@ -132,6 +132,14 @@ pub enum Cmd {
         /// (`stream,webkit,50k/1,8`), as often as needed (step 7's K check lowers K by cell).
         #[arg(long)]
         drop: Vec<String>,
+        /// A file of jobs to leave out, one `started_us` a line (`#` comments): jobs a machine
+        /// freeze overlapped, measured again by a later part.
+        #[arg(long)]
+        drop_jobs: Option<PathBuf>,
+        /// A target's jobs left out, as often as needed: the pilot's extra rows (`kiln-today-b`, the
+        /// A/A, and `h2o-h3-reno`, the controller not chosen) out of the matrix's best baseline.
+        #[arg(long)]
+        drop_target: Vec<String>,
         /// For the repository (docs/browser-lab/<date>/): each job's per-operation counts (`op/...`)
         /// left out (the raw run files under ~/.cache keep them), written without indentation.
         #[arg(long)]
@@ -174,6 +182,10 @@ pub struct RunArgs {
         cases: String,
         #[arg(long, default_value_t = 5)]
         rounds: usize,
+        /// The round to start from: a round dropped from a run (a machine freeze overlapped it) runs
+        /// again on its own seeds, numbered as it was (`--first-round 3 --rounds 1`).
+        #[arg(long, default_value_t = 0)]
+        first_round: usize,
         #[arg(long, default_value_t = 4)]
         k: usize,
         #[arg(long, default_value_t = 1)]
@@ -269,14 +281,19 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             print!("{}", report::tables(&r));
             Ok(())
         }
-        Cmd::Merge { out, drop, slim, runs } => {
+        Cmd::Merge { out, drop, drop_jobs, drop_target, slim, runs } => {
             let drops = drop.iter().map(|d| parse_drop(d)).collect::<anyhow::Result<Vec<_>>>()?;
+            let job_drops = match &drop_jobs {
+                Some(p) => parse_drop_jobs(&std::fs::read_to_string(p)?)?,
+                None => std::collections::BTreeSet::new(),
+            };
             let mut merged: Option<report_run::BrowserRun> = None;
             let mut dropped = 0;
             for p in &runs {
                 let mut r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(p)?)?;
                 let before = r.jobs.len();
-                r.jobs.retain(|j| !drops.iter().any(|d| d.matches(j)));
+                r.jobs.retain(|j| !drops.iter().any(|d| d.matches(j)) && !job_drops.contains(&j.started_us) && !drop_target.contains(&j.target));
+                r.settings.targets.retain(|t| !drop_target.contains(&t.name));
                 dropped += before - r.jobs.len();
                 match merged.as_mut() {
                     None => merged = Some(r),
@@ -294,7 +311,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             let mut m = merged.ok_or_else(|| anyhow::anyhow!("no run files to merge"))?;
             m.command = format!(
                 "kiln-lab browser merge{} of {} runs: {}",
-                drop.iter().map(|d| format!(" --drop {d}")).collect::<String>(),
+                drop.iter().map(|d| format!(" --drop {d}")).chain(drop_jobs.iter().map(|p| format!(" --drop-jobs {} ({} jobs)", p.display(), job_drops.len()))).chain(drop_target.iter().map(|t| format!(" --drop-target {t}"))).collect::<String>(),
                 runs.len(),
                 runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" ")
             );
@@ -361,7 +378,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
 
 /// A run's settings from its arguments (paths made absolute: the lab runs itself again elsewhere).
 fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
-    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall, logs } = args;
+    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, first_round, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall, logs } = args;
     let settings = report_run::Settings {
         targets: target_list(&t)?,
         profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
@@ -369,6 +386,7 @@ fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
         browsers: list(&browsers),
         cases: list(&cases),
         rounds,
+        first_round,
         k,
         seed,
         duration_s: duration,
@@ -497,6 +515,11 @@ impl DropCell {
     }
 }
 
+/// A `merge --drop-jobs` file: each job's `started_us`, a line each, `#` comments.
+fn parse_drop_jobs(s: &str) -> anyhow::Result<std::collections::BTreeSet<u64>> {
+    s.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty()).map(|l| l.parse().map_err(|e| anyhow::anyhow!("--drop-jobs line {l}: {e}"))).collect()
+}
+
 /// `CASE,BROWSER,CONDITION,K`: `stream,webkit,50k/1,8`.
 fn parse_drop(s: &str) -> anyhow::Result<DropCell> {
     let parts: Vec<&str> = s.split(',').map(str::trim).collect();
@@ -531,5 +554,13 @@ mod merge_tests {
         assert!(job("webkit", 8).is_some_and(|j| d.matches(&j)));
         assert!(job("webkit", 4).is_some_and(|j| !d.matches(&j)));
         assert!(job("chromium", 8).is_some_and(|j| !d.matches(&j)));
+    }
+
+    /// plan 01a1a832e9cc step 8: the jobs a memory freeze overlapped are named by when they ended.
+    #[test]
+    fn g1_s8_drop_jobs_reads_a_file_of_job_ends() {
+        let got = parse_drop_jobs("# frozen\n17939 # m-100k-0-burst\n\n18000\n");
+        assert!(got.is_ok_and(|g| g.len() == 2 && g.contains(&17939) && g.contains(&18000)));
+        assert!(parse_drop_jobs("not a number").is_err());
     }
 }

@@ -56,6 +56,9 @@ pub struct Settings {
     pub browsers: Vec<String>,
     pub cases: Vec<String>,
     pub rounds: usize,
+    /// The first round's number (a dropped round run again keeps its number and its seeds).
+    #[serde(default)]
+    pub first_round: usize,
     pub k: usize,
     pub seed: u64,
     /// Seconds each job runs, if not the workload's own.

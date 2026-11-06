@@ -233,8 +233,10 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
                         }
                     }
                     (None, Some(sock)) => {
-                        servers::replay(sock, "session", w.burst_events, w.burst_every_ms, from)?;
-                        from += w.burst_events;
+                        // The origin answers how many recorded frames the turn's events took (an
+                        // event's state frames go with it): the next turn starts after them.
+                        let sent = servers::replay(sock, "session", w.burst_events, w.burst_every_ms, from)?;
+                        from += sent.get("frames").and_then(serde_json::Value::as_u64).unwrap_or(w.burst_events);
                     }
                     _ => {}
                 }
@@ -389,7 +391,7 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
     let mut job_n: u64 = 0;
     for p in &s.profiles {
         for loss in &s.losses {
-            for round in 0..s.rounds {
+            for round in s.first_round..s.first_round + s.rounds {
                 let name = format!("{}/{}", p.name, loss.name());
                 let seed = round_seed(s.seed, &name, round);
                 for i in 0..s.k {
