@@ -1325,7 +1325,7 @@ mod tests {
                 tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
             }
             drop(tx);
-            let route = |m: u32| (m % 3 != 0).then_some((u64::from(m % 5), m));
+            let route = |m: u32| (!m.is_multiple_of(3)).then_some((u64::from(m % 5), m));
             let made_on_a_shard = Arc::new(AtomicBool::new(false));
             let make = {
                 let on = Arc::clone(&made_on_a_shard);
@@ -1362,7 +1362,7 @@ mod tests {
                 })
                 .await;
             }
-            let expected: Vec<(PeerId, Vec<u8>)> = (0..n).filter(|m| m % 3 != 0).flat_map(|m| [(u64::from(m % 5), m.to_be_bytes().to_vec()), (u64::from(m % 5), vec![0xff])]).collect();
+            let expected: Vec<(PeerId, Vec<u8>)> = (0..n).filter(|m| !m.is_multiple_of(3)).flat_map(|m| [(u64::from(m % 5), m.to_be_bytes().to_vec()), (u64::from(m % 5), vec![0xff])]).collect();
             anyhow::ensure!(sent == expected, "sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
             anyhow::ensure!(!made_on_a_shard.load(Ordering::SeqCst), "frames were made on a shard");
             let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(send_ns).saturating_sub(1).max(1);
