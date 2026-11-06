@@ -367,6 +367,9 @@ async fn forward_ws(live: &Live, mut req: Request, grant: &str, base: &str) -> a
     headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
     *up.headers_mut() = headers;
     let tcp = crate::http::io::connect_out(&live.host, live.port, live.https).await?;
+    // The peer's bytes wait at the peer, not megabytes deep in this relay's kernel (goal 3 of the
+    // browser protocol program, step 5).
+    crate::frontdoor::proxy::relay_upstream_side(&tcp);
     let mut sender = if live.https {
         let stream = TlsStream::connect(RtFuturesIo::new(tcp), live.tls.config()?, crate::http::tls::server_name(&live.host)?).await.map_err(|e| anyhow::anyhow!("TLS to {}: {e}", live.host))?;
         let (sender, conn) = kiln_http::client::http1::handshake::<_, srv::Body>(stream).await?;

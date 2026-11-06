@@ -162,6 +162,17 @@ pub struct Server {
     /// "Opt-in automation"); macOS and Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE`
     /// overrides it, and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
     pub nudge: bool,
+    /// The browser protocol over one WebSocket (`GET /api/live`, `crate::live`; goal 3 of the browser
+    /// protocol program, docs/browser-protocol.md): served beside today's sockets when true. Off until
+    /// declared, as the plan's open call leaves it until goal 9 moves the UI onto it. `KILN_LIVE`
+    /// overrides it.
+    pub live: bool,
+    /// The TCP congestion control the protocol's sockets ask for (`bbr`, say), on Linux, where the host
+    /// allows it: loaded, and listed in `net.ipv4.tcp_allowed_congestion_control` (the host's
+    /// administrator's step). Each socket says what it got, or why it was refused, on `/metrics` and
+    /// `GET /api/live/sockets`; nothing falls back silently. Unset (the default): the host's own.
+    /// `KILN_BROWSER_CONGESTION` overrides it.
+    pub browser_congestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +486,8 @@ impl Default for Server {
             cores: None,
             realtime: false,
             nudge: false,
+            live: false,
+            browser_congestion: None,
         }
     }
 }
@@ -671,6 +684,13 @@ impl Config {
         // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`).
         if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
             cfg.server.nudge = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] live` and `browser_congestion`, as a lab's server takes its settings.
+        if let Ok(v) = std::env::var("KILN_LIVE") {
+            cfg.server.live = !matches!(v.trim(), "0" | "false" | "off" | "no" | "");
+        }
+        if let Ok(v) = std::env::var("KILN_BROWSER_CONGESTION") {
+            cfg.server.browser_congestion = Some(v.trim().to_owned()).filter(|v| !v.is_empty());
         }
         // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
         if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {

@@ -50,7 +50,18 @@ pub enum Event {
     Resize { sub: u32, cols: u16, rows: u16 },
     /// The connection is over (closed by either side, or its session expired).
     Closed { code: CloseCode, why: String },
+    /// An acknowledgement the carrier asked for (`Server::ask_ack`) came back: the bytes the browser had
+    /// received when it answered (`got`), the probe's round trip (`rtt`), and when the probe went (`at`),
+    /// on the caller's clock. A carrier's window and rate are made from these (goal 3, plan
+    /// `01a1a832eb2f711f9c6f51d88effe89d` step 4).
+    Acked { got: u64, rtt: u64, at: u64 },
 }
+
+/// The bit that marks a probe the carrier asked for, an acknowledgement, apart from liveness's probes.
+pub const ACK_NONCE: u32 = 1 << 31;
+
+/// How many acknowledgements may be out at once.
+pub const ACKS_OUT: usize = 8;
 
 /// The server half's settings.
 #[derive(Debug, Clone)]
@@ -299,6 +310,10 @@ pub struct Server {
     compress: Option<Compressors>,
     /// Requests this connection waits on, by id.
     waiting: BTreeMap<u64, ()>,
+    /// An acknowledgement to ask for, and those out (their nonce and when each went).
+    ack_want: bool,
+    acks_out: VecDeque<(u32, u64)>,
+    ack_nonce: u32,
 }
 
 impl Server {
@@ -335,7 +350,24 @@ impl Server {
             nonce: 0,
             compress: None,
             waiting: BTreeMap::new(),
+            ack_want: false,
+            acks_out: VecDeque::new(),
+            ack_nonce: 0,
         }
+    }
+
+    /// Asks the browser to say how many bytes it has received: a probe goes ahead of everything at the
+    /// next transmit, and its answer is `Event::Acked`. Liveness's own probes are apart from these.
+    /// At most `ACKS_OUT` are out at once; asking while that many are is a no-op.
+    pub fn ask_ack(&mut self) {
+        if self.phase == Phase::Open && self.acks_out.len() < ACKS_OUT {
+            self.ack_want = true;
+        }
+    }
+
+    /// Acknowledgements asked for and not yet answered (or about to go).
+    pub fn acks_out(&self) -> usize {
+        self.acks_out.len().saturating_add(usize::from(self.ack_want))
     }
 
     pub fn id(&self) -> u64 {
@@ -376,6 +408,21 @@ impl Server {
     /// Bytes waiting for this client.
     pub fn queued(&self) -> usize {
         self.subs.values().map(|s| s.queued.saturating_add(s.pending.iter().map(|(_, b)| b.len()).sum::<usize>())).sum::<usize>().saturating_add(self.control.iter().map(|(_, b, _)| b.len()).sum::<usize>())
+    }
+
+    /// Bytes waiting for this client by priority class (control, interactive, state, stream, bulk):
+    /// what a carrier shows per socket (goal 3, plan `01a1a832eb2f711f9c6f51d88effe89d` step 3).
+    pub fn queued_by_prio(&self) -> [usize; 5] {
+        let mut out = [0usize; 5];
+        if let Some(c) = out.get_mut(Prio::Control as usize) {
+            *c = self.control.iter().map(|(_, b, _)| b.len()).sum::<usize>();
+        }
+        for s in self.subs.values() {
+            if let Some(q) = out.get_mut(s.prio() as usize) {
+                *q = q.saturating_add(s.queued.saturating_add(s.pending.iter().map(|(_, b)| b.len()).sum::<usize>()));
+            }
+        }
+        out
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -536,7 +583,13 @@ impl Server {
             Frame::Idle(_) => {}
             Frame::Probe(p) => self.acks.push_back(ProbeAck { nonce: p.nonce, got: self.got }),
             Frame::ProbeAck(a) => {
-                if let Some((n, at)) = self.probe_out
+                if a.nonce & ACK_NONCE != 0 {
+                    if let Some(i) = self.acks_out.iter().position(|(n, _)| *n == a.nonce)
+                        && let Some((_, at)) = self.acks_out.remove(i)
+                    {
+                        self.events.push_back(Event::Acked { got: a.got, rtt: now.saturating_sub(at), at });
+                    }
+                } else if let Some((n, at)) = self.probe_out
                     && n == a.nonce
                 {
                     self.live.round_trip(now.saturating_sub(at));
@@ -824,6 +877,18 @@ impl Server {
                 self.probe_want = false;
                 self.probe_out = Some((nonce, now));
                 self.live.probe_sent(now);
+                used = used.saturating_add(b.len());
+                parts.push(Part { kind: Kind::Probe, lane: Lane::Datagram, prio: Prio::Control, bytes: b, trust: Trust::Secret, urgent: true });
+            }
+        }
+        // An acknowledgement the carrier asked for, beside liveness's probe.
+        if self.ack_want && self.phase == Phase::Open {
+            let nonce = (self.ack_nonce.wrapping_add(1) & !ACK_NONCE) | ACK_NONCE;
+            let b = Frame::Probe(Probe { nonce }).encode(self.version);
+            if used.saturating_add(b.len()) <= room {
+                self.ack_nonce = nonce;
+                self.ack_want = false;
+                self.acks_out.push_back((nonce, now));
                 used = used.saturating_add(b.len());
                 parts.push(Part { kind: Kind::Probe, lane: Lane::Datagram, prio: Prio::Control, bytes: b, trust: Trust::Secret, urgent: true });
             }

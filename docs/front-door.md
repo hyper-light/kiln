@@ -75,6 +75,16 @@ a page saying how to trust that root, with a link on to the domain.
 Set the port to 0 for no redirect. The server knows each front door's names: a sign-in through one gets a `Secure` cookie,
 and `https://kiln.dev` counts as one of the server's own origins.
 
+### Its buffers
+
+The front door pipes a browser's bytes through sockets of its own, so it keeps them small (goal 3 of
+the browser protocol program, docs/browser-protocol.md, "Relays"): the browser-facing socket holds
+at most 16 KiB it hasn't sent (`TCP_NOTSENT_LOWAT`), the upstream socket's receive buffer is 128 KiB,
+and each direction's pipe 16 KiB. Without them Linux lets a slow browser's backlog grow to 4 MiB in the
+front door's kernel and its upstream socket's to `tcp_rmem`'s most, where no priority reaches it.
+`KILN_BROWSER_CONGESTION` in the runner's environment (`bbr`, say) asks for that congestion control on
+the browser-facing sockets where the host allows it; refused, the runner says so once in its log.
+
 ## Certificates
 
 Each runner's HTTPS has its own certificate, of one of two kinds:
