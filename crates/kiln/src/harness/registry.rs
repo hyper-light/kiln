@@ -2665,15 +2665,17 @@ impl Registry {
             }
             None => (None, None),
         };
-        // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below).
-        let row_began = std::time::Instant::now();
+        // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below). What's learned
+        // here is timed on the CPU where the shard's thread says, as a turn's hold is (`super::copies::Timer`; goal 9, plan
+        // 01a1a87b2cec step 3).
+        let row_began = super::copies::Timer::start();
         if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
             match written_off.as_mut() {
                 Some(made) => store.put(made.take_rows()),
                 None => store.send(id, &u),
             }
         }
-        let row_took = row_began.elapsed();
+        let row_took = row_began.took();
         // The event of this update its owner wrote out off the shard, or tried, for that event as it's taken (below; goal 9,
         // plan 01a1a87b2cec step 3).
         let mut written = s.take_written(id);
@@ -2862,9 +2864,9 @@ impl Registry {
                     // that the session's states are short, so the next one that changed was written on the shard however long
                     // (step 3).
                     _ if !same => {
-                        let began = std::time::Instant::now();
+                        let began = super::copies::Timer::start();
                         m.state = Arc::new(StateDoc::made(&**state, &m.state));
-                        m.said_took(&u, row_took.saturating_add(began.elapsed()), &said);
+                        m.said_took(&u, row_took.saturating_add(began.took()), &said);
                     }
                     _ => {}
                 }
@@ -2928,14 +2930,14 @@ impl Registry {
                     _ if same => meta_same = true,
                     // Made, and timed, only where it changed, as a state is (above).
                     _ => {
-                        let began = std::time::Instant::now();
+                        let began = super::copies::Timer::start();
                         let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
                         if *m.meta == meta {
                             meta_same = true;
                         } else {
                             m.meta = Arc::new(meta);
                         }
-                        m.said_took(&u, row_took.saturating_add(began.elapsed()), &said);
+                        m.said_took(&u, row_took.saturating_add(began.took()), &said);
                     }
                 }
             }
@@ -2947,9 +2949,9 @@ impl Registry {
                     m.long_to_free = true;
                 }
                 _ => {
-                    let began = std::time::Instant::now();
+                    let began = super::copies::Timer::start();
                     m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true);
-                    super::copies::wrote_changes(&u, began.elapsed());
+                    super::copies::wrote_changes(&u, began.took());
                 }
             },
             Update::ChangesPatch { set, gone } => {
@@ -2959,9 +2961,9 @@ impl Registry {
                         m.long_to_free = true;
                     }
                     _ => {
-                        let began = std::time::Instant::now();
+                        let began = super::copies::Timer::start();
                         m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
-                        super::copies::wrote_changes(&u, began.elapsed());
+                        super::copies::wrote_changes(&u, began.took());
                     }
                 }
                 if self.convo.is_some() && !shipped {
@@ -3000,7 +3002,7 @@ impl Registry {
                             (made.entry, made.mentions)
                         }
                         None => {
-                            let began = std::time::Instant::now();
+                            let began = super::copies::Timer::start();
                             let entry = Arc::new(if store.is_some() {
                                 Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
                             } else {
@@ -3012,7 +3014,7 @@ impl Registry {
                             // long on the CPU as writing them out (42 µs to 36 µs, g9-owners3's measure of the lab's mix in a test
                             // build), so its turns were judged by half of what their events took.
                             let mentioned = mentions(id, &m.info.cwd, &m.location, e);
-                            super::copies::wrote(e, began.elapsed());
+                            super::copies::wrote(e, began.took());
                             (entry, mentioned)
                         }
                     };

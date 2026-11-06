@@ -2991,6 +2991,30 @@ impl Took {
     }
 }
 
+/// When a piece of an owner's work began, to learn what its kind takes as the shard's quantum holds a turn to (goal 9, plan
+/// 01a1a87b2cec step 3): on the CPU where its shard's thread says (`hyper_rt::futures::thread_run_ns`, as a turn's hold is
+/// told: `Turn::held`), else on the clock. On the clock, a state written in 30 µs while the host held the thread was learned
+/// as long, and the session's next states went off the shard for nothing (a test build at the lowest CPU weight, beside
+/// production and the agents' builds, had a 1 KB state's at past 100 µs).
+pub(super) struct Timer {
+    at: Instant,
+    cpu: Option<u64>,
+}
+
+impl Timer {
+    pub(super) fn start() -> Self {
+        Self { at: Instant::now(), cpu: hyper_rt::futures::thread_run_ns() }
+    }
+
+    /// What it took since it started: on the CPU where the thread said both then and now, else on the clock.
+    pub(super) fn took(&self) -> Duration {
+        match (self.cpu, hyper_rt::futures::thread_run_ns()) {
+            (Some(from), Some(now)) => Duration::from_nanos(now.saturating_sub(from)),
+            _ => self.at.elapsed(),
+        }
+    }
+}
+
 /// Whole nanoseconds of `d`.
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
