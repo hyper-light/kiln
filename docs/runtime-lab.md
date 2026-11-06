@@ -11,21 +11,45 @@ benchmarking under realistic usage decide). Goal 1 of the API runtime program bu
 
 ### Each shard's health (`kiln_shard_*`, `crate::shard_health`)
 
-A probe pinned to each of hyper-rt's shards (`crate::rt::spawn_on`) sleeps a period on the shard's
-own timers and notes, as it wakes, how late it ran: work that was ready on that shard waited that
-long. Node measures its loop the same way (`monitorEventLoopDelay`, sampling every 10 ms by default:
+A probe pinned to each of hyper-rt's shards (`crate::rt::spawn_on`) sleeps a period on the shard (a quiet
+sleep from goal 9 step 5 on: below) and notes, as it runs, how late ready work ran: work that was ready on
+that shard waited that long. Node measures its loop the same way (`monitorEventLoopDelay`, sampling every 10 ms by default:
 research f8). The period (`shard_health::PERIOD`, 17.07 ms; `KILN_SHARD_PROBE_MS`, `0`: no probes) is the longest
 that still sees what the probe must (goal 9, plan 01a1a87b2cec step 5): hyper-rt's watchdog's limit, a step's
 worth of polls each a quantum (64 × 266.7 µs), so a probe is due inside every hold the watchdog reports; and within
 the lab's tail, ten probes or more past a round's p99.9 of the shards' delay (60 s × 4 shards at up to 24 ms). 10 ms
-woke each shard 100 times a second for it, about 0.001 of its busy share; 17.07 ms, 59. Each wake the probe
+woke each shard 100 times a second for it, about 0.001 of its busy share; 17.07 ms, 59. Each run the probe
 also copies, on the shard itself, what hyper-rt counts there, and its thread's CPU time, into atomics
 of its own; `/metrics` reads only those, so reading never touches a shard.
 
+**The shard-delay instrument, from the quiet probe on** (goal 9, plan 01a1a87b2cec step 5, Ada's word of
+2026-11-06). The probe's sleep is a quiet one (`hyper_rt::quiet`): a shard that work wakes within the period is
+never woken for it, and a shard parked a whole period with no wake at all is, by the probe's own timer. Its 59
+timer wakes a second on each shard were 234 of the ~457 the four shards took a second in the lab (g9p16), each a
+park and a wake the busy share counts. So what's sampled changed, and the delay before and after are different
+instruments:
+
+- **Before** (every tree without `kiln_shard_delay_by_seconds` on `/metrics`): the probe's timer, due every period,
+  against when the probe ran, however busy or idle the shard.
+- **From the quiet probe on** (every tree with it: the commit that brought `hyper_rt::quiet`, on main after
+  e144811a934): two kinds of samples, kept apart in `kiln_shard_delay_by_seconds{shard,by}` and together in
+  `kiln_shard_delay_seconds`. `by="work"`: the probe fell due while the shard was parked and a wake by the shard's
+  own work came first, timed from that wake's start, where the shard knows it (a kick from its sender's stamp,
+  another timer from its deadline), to the probe's run; or the shard was awake as the probe fell due, and it's the
+  probe's own lateness, as before. `by="probe"`: the probe's own timer, after a period with no wake at all, from
+  its deadline to the probe's run: an idle shard's delay, read on its own there. A wake whose start the shard
+  doesn't know (a socket's readiness, a completion) gives no sample. A parked shard's probe can wait up to a period
+  more for a wake, so `kiln_shard_stalled_seconds` reaches about two periods on an idle shard; placement's delay and
+  `/healthz/delay`'s hold count no parked shard as held.
+
+The lab reports the shards' delay p99.9 both ways (`shards.delay_*` and, from the quiet probe on,
+`shards.by_work.*` and `shards.by_probe.*`): an A/B across the change compares two instruments, and says so.
+
 | series | what it says |
 | --- | --- |
-| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) and the thread's timer slack (the tick again) is by design. Its buckets are 25 µs apart to 250 µs and 50 µs apart to 1 ms (`shard_health::DELAY_BUCKETS`, goal 9), so its quantiles read to tens of microseconds below a millisecond. |
-| `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. |
+| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: both kinds of the quiet probe's samples together (above; before it, a probe's timer against when the probe ran). Up to a tick of the timer wheel (100 µs) and the thread's timer slack (the tick again) is by design in a timer's. Its buckets are 25 µs apart to 250 µs and 50 µs apart to 1 ms (`shard_health::DELAY_BUCKETS`, goal 9), so its quantiles read to tens of microseconds below a millisecond. |
+| `kiln_shard_delay_by_seconds{shard,by}` (histogram) | The same samples apart by where each came from (goal 9 step 5's quiet probe): `work`, a wake by the shard's work, or the probe's lateness on a shard awake as it fell due; `probe`, the probe's own timer waking a shard idle a whole period. Its presence says the build samples this way. |
+| `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. A parked shard's quiet probe waits up to a period more for a wake: about two periods on an idle shard. |
 | `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. Read at each probe from hyper-rt's task clock with no system call where the shard has one (Linux, where the OS opens the event; it counts from the shard's start, its system calls' time included), else from the OS's clock for the thread, the one chosen at the probe's first wake kept (`shard_health::CpuClock`; goal 9, plan 01a1a87b2cec step 5). |
 | `kiln_shard_polls_total{shard}` | Task polls. |
 | `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (266.7 µs, `rt::STEP_BUDGET_NS`, derived in goal 9's step 3: so past 533 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
@@ -209,7 +233,9 @@ rest.
 
 The shards' delay is reported to the microsecond (goal 9): all shards together and each shard
 (`shards.delay_p50_us`, `_p99_us`, `_p999_us`, `_max_us`, and `shard<N>.delay_*_us`), the max being
-the top bucket the window reached; each shard's busy share (`shard<N>.busy_share`) beside their
+the top bucket the window reached; where the build has `kiln_shard_delay_by_seconds` (the quiet probe), its
+samples apart, all shards together (`shards.by_work.delay_*_us`, `shards.by_probe.delay_*_us`: another
+instrument than a build without it, whose `shards.delay_*` is the probe's timer alone); each shard's busy share (`shard<N>.busy_share`) beside their
 mean; and the worst shard's p99.9 and busy share (`shards.worst_delay_p999_us`,
 `shards.worst_busy_share`). What held the shards past 100 µs (`kiln_shard_held_*`) is each round's
 too, in the window and over the fill (`held`, `fill_held` in `run.json`), and the report lists it by

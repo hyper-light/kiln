@@ -77,6 +77,7 @@ pub mod park_spin;
 pub mod parking;
 mod prioritysys;
 pub mod queue;
+pub mod quiet;
 pub mod readiness;
 pub mod registry;
 mod retire;
