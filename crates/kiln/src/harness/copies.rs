@@ -6324,13 +6324,13 @@ mod tests {
         let mut cleared = filled(n);
         cleared.clear();
         let mut kept = filled(n);
-        let through = kept.keep_first(|m| m.seq.is_some_and(|q| q <= 10));
+        let through = kept.keep_first(|m| m.seq().is_some_and(|q| q <= 10));
         let mut whole = filled(n);
         let all = whole.keep_first(|_| true);
         let mut inserted = filled(n);
         inserted.insert(5, Ev { entry: entry("x", 5), at: 1 });
         let mut retained = filled(n);
-        retained.retain(|m| m.seq.is_some_and(|q| q % 2 == 0));
+        retained.retain(|m| m.seq().is_some_and(|q| q % 2 == 0));
         anyhow::ensure!(cut.took_out && cleared.took_out && inserted.took_out && retained.took_out, "a cut, let go of, made again with one in, made again of some");
         anyhow::ensure!(through == Some(10) && kept.took_out && all == Some(CHUNK * 4 + 9) && !whole.took_out, "kept through a number; kept whole, nothing taken out");
         // Packed and kept compact: a compaction, a cut in a compact chunk and its trim, a compact chunk read back.
