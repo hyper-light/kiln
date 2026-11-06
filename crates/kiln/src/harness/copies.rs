@@ -1977,8 +1977,9 @@ impl Slot {
     }
 }
 
-/// A shard's sessions as its owner published them, by id: swapped in whole as one comes or goes.
-type Board = HashMap<Arc<str>, Arc<Slot>>;
+/// A shard's sessions as its owner published them, by id: swapped in whole as one comes or goes. Keyed by session ids,
+/// which kiln makes (`crate::util::new_id`'s UUIDv7s, on the server or a runner's kiln): a [`crate::util::FastMap`].
+type Board = crate::util::FastMap<Arc<str>, Arc<Slot>>;
 
 /// A frame of `text` (one of the session socket's, or the feed's own marker) as a payload, said at
 /// revision `rev`.
@@ -2823,7 +2824,8 @@ pub struct Shard {
     me: usize,
     /// Its own inbox, held weakly: what its copies' packed chunks come back through.
     inbox: crate::memory::queue::WeakSender<Msg>,
-    mirrors: HashMap<String, Mirror>,
+    /// By session id, which kiln makes ([`Board`]'s keys): a [`crate::util::FastMap`].
+    mirrors: crate::util::FastMap<String, Mirror>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
     /// A session came or went since its board was last published.
@@ -3781,7 +3783,7 @@ impl Copies {
     /// it fills: `crate::memory::owners::SESSION_INBOXES`).
     pub fn start_with(bus: Arc<dyn kiln_seams::Bus>, shards: usize, inbox: usize) -> Self {
         let shards = shards.max(1);
-        let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::new())).collect::<Vec<_>>().into();
+        let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::default())).collect::<Vec<_>>().into();
         let hub = Arc::new(OnceLock::new());
         let spill = Arc::new(OnceLock::new());
         let said = Arc::new(Said::default());
@@ -3791,7 +3793,7 @@ impl Copies {
             let shard = Shard {
                 me,
                 inbox: tx.downgrade(),
-                mirrors: HashMap::new(),
+                mirrors: crate::util::FastMap::default(),
                 boards: Arc::clone(&boards),
                 bus: Arc::clone(&bus),
                 board_changed: false,

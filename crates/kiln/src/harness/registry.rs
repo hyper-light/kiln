@@ -1612,8 +1612,9 @@ pub struct Registry {
     /// Names people gave sessions, by id (the "rename" control), kept in `names.json`: a session
     /// takes its name here at once, whatever its machine's runner knows of names (one from before
     /// kiln named sessions never reports it), and keeps it across restarts. Read on every state a
-    /// session's machine sends.
-    names: Rcu<HashMap<String, String>>,
+    /// session's machine sends: by session id, which kiln makes (`crate::util::new_id`), a
+    /// [`crate::util::FastMap`] (goal 9, plan 01a1a87b2cec step 5).
+    names: Rcu<crate::util::FastMap<String, String>>,
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in `keep-off.json` so it holds across restarts.
     keep_off: Rcu<std::collections::HashSet<String>>,
@@ -1634,8 +1635,9 @@ pub struct Registry {
     changes_to_store: Arc<Rcu<HashMap<String, Files>>>,
     changes_storing: Arc<std::sync::atomic::AtomicBool>,
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
-    /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
-    epochs: Rcu<HashMap<String, u64>>,
+    /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it. Read
+    /// on every update: by session id, a [`crate::util::FastMap`] as [`Registry::names`] is.
+    epochs: Rcu<crate::util::FastMap<String, u64>>,
     /// The plan each session last proposed (plan mode), not yet kept as one of kiln's plans: the
     /// goals' driver keeps it ([`Self::take_proposed`], `crate::plans::keep_proposed`).
     proposed: Rcu<HashMap<String, String>>,

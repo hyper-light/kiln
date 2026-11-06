@@ -244,8 +244,11 @@ what it was, a code, and why. Where it came from is a runner and its instance (b
 its certificate and address), a person, an agent session, or an address. What it was is a
 variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
 message isn't refused: that's how peers of different versions work together. It's taken, counted
-in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each message), and logged
-once an hour for each wire and field; it's never audited.
+in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each payload looked at), and
+logged once an hour for each wire and field; it's never audited. At most one payload of a kind (a
+message's variant) is looked at every 100 ms, and every message of a kind that comes less often:
+a field every message of a kind carries is in one looked at within 100 ms of its first.
+`kiln_wire_checked_payloads_total{wire}` counts the payloads looked at.
 
 What a runner's or the server's frame carries as JSON is read once, where the frame is read
 (`crate::wire::payload_of`): each variant that carries JSON names its type there, and its handler
