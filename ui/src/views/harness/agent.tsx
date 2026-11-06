@@ -243,11 +243,15 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const thread = React.useMemo(() => (subId ? sessionStore(subId) : store), [subId, store]);
   const findEvents = useSession(thread, (s) => (findOpen ? s.events : NO_EVENTS));
   const dropped = useSession(thread, (s) => (findOpen ? (s.state?.dropped ?? 0) : 0));
+  // Events before what the page holds (a window, docs/wire.md "Windows"): found as dropped ones are, in the conversation store.
+  const more = useSession(thread, (s) => findOpen && s.more);
   const q = React.useDeferredValue(findQ);
   const matches = React.useMemo(() => (findOpen ? findIn(findEvents, subId ? undefined : (task ?? undefined), q) : []), [findOpen, findEvents, subId, task, q]);
   const [searched, setSearched] = React.useState("");
   if (findOpen && q !== searched) {
     setSearched(q);
+    // What lean calls held back (a command's output, an edit's lines) is what's looked through too: asked for once, as find begins.
+    if (q.trim()) void thread.whole();
     const newest = matches.at(-1);
     setFindAt(newest ? { id: newest, n: (findAt?.n ?? 0) + 1 } : null);
   }
@@ -332,7 +336,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           inputRef={findInput}
         />
       )}
-      {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
+      {findOpen && (dropped > 0 || more) && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
       {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} panel={panel} onPanel={(p) => setPanelFor(p && { panel: p, thread: threadKey })} onClose={mainThread} />}
       {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} webWhole={webWhole} asked={asked} />}
       {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}

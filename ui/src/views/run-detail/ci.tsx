@@ -2,7 +2,7 @@
  * leaves behind (summaries, annotations, artifacts, the actions it pinned). */
 import * as React from "react";
 import { RotateCcw, Square } from "lucide-react";
-import { ci, reviewOf, waitSentence, type CiAnnotation, type CiMetric, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
+import { ci, reviewOf, waitSentence, type CiAnnotation, type CiFlow, type CiMetric, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { labelOf, useLabels } from "@/lib/data";
@@ -10,12 +10,13 @@ import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useActions, useHold } from "@/lib/action";
 import { formatBytes, formatDuration } from "@/lib/format";
-import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
+import { invalidate, preload, useSuspenseResource, type ResourceOptions } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { DataFlow } from "./flow";
 
-/** The data flow's values come as legs end: it's read again as the run moves. */
-const FLOW_OPTS = { on: ["run"], pollMs: 30_000 } as const;
+/** The data flow's values come as legs end: it's read again as the run moves; another run's moving
+ * changes nothing here (W21-R15: it read every run's events as its own). */
+const flowOpts = (id: string): ResourceOptions<CiFlow> => ({ on: ["run"], pollMs: 30_000, apply: (d, ev) => (ev.type === "run" && ev.run.id !== id ? d : undefined) });
 
 const Markdown = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
 const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
@@ -241,13 +242,13 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
   preload(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s));
   preload(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s));
   preload(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s));
-  preload(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS);
+  preload(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), flowOpts(id));
   const summaries = useSuspenseResource(`ci-run/${id}/summary/${a}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
   const annotations = useSuspenseResource(`ci-run/${id}/annotations/${a}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
   const artifacts = useSuspenseResource(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s)).data.artifacts;
   const tests = useSuspenseResource(`ci-run/${id}/tests/${a}`, (s) => ci.tests(id, attempt, s)).data;
   const metrics = useSuspenseResource(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s)).data.metrics;
-  const flow = useSuspenseResource(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), FLOW_OPTS).data;
+  const flow = useSuspenseResource(`ci-run/${id}/flow/${a}`, (s) => ci.flow(id, attempt, s), flowOpts(id)).data;
   return (
     <div className="mt-6 flex flex-col gap-4">
       {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}

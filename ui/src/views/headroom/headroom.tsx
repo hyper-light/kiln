@@ -79,7 +79,7 @@ export function HeadroomSection({ agents, index }: { agents: Agent[]; index: str
 
 function HeadroomPanel({ runner }: { runner: string }) {
   const view = useSuspenseResource(`headroom/${runner}`, (s) => headroomApi.get(runner, s));
-  useServerEvents((ev) => {
+  useServerEvents(["headroom", "agent"], (ev) => {
     if ((ev.type === "headroom" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner && ev.agent.connected !== view.data.connected)) view.reload();
   });
   const v = view.data;

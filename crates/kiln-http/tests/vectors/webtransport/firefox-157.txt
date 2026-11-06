@@ -1,0 +1,23 @@
+# Lines are in the order they arrived.
+# What Firefox 157.0 (Playwright's build, macOS arm64, headless) sent to open a WebTransport
+# session, decrypted per stream as the lab's QUIC server (aioquic 1.7.2 at the QUIC layer alone,
+# crates/kiln-http/lab/wt-capture) received it, 2026-11-04, the server sending the door's SETTINGS.
+# Firefox spoke draft-02: SETTINGS_ENABLE_WEBTRANSPORT 0x2b603742 = 1, and no later dialect. It
+# needs from the server before it sends CONNECT: 0x2b603742 = 1 and H3_DATAGRAM = 1 (either id).
+# Then the page echoed a bidi stream, a uni stream and a datagram, and closed (code 7, "bye").
+browser firefox 157.0
+draft draft-02
+# The control stream: SETTINGS (QPACK table 65,536, 20 blocked streams, ENABLE_WEBTRANSPORT,
+# H3_DATAGRAM both ids, ENABLE_CONNECT_PROTOCOL 1, GREASE).
+stream 2 00041501800100000714ab6037420180ffd2770133010801f5457d2634f29d1d031e64a5
+# Its QPACK encoder and decoder streams, empty past their types.
+stream 6 02
+stream 10 03
+# The CONNECT (HEADERS, 303 bytes).
+stream 0 01412f0000cfd7508b089d5c0b8170dc0bcd34cf51a463c27fc4989d4a981294a5294a5294a5294a5294a5294a5294a5294a5294a5294a5294ff2f00b95d8749c87a3f89f058d360ea4567b13f5f50bed07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e28102e16fed4b3bdc0b6eae0fed4c452753b02004000802a61358594fe580b6eae0dd5f398b2d4b70ddf45abefb4005df5f10929bd9abfa5242cb40d25fa523b3e94f684c9f2f0e4148b782c69b07522b3d895a74a6b65692c1ca900b810f5f4b909d29aee30c044eae05c0b86e05e69e072f034148b4a549275a42a13f89f058d360ea4567b13f2f034148b4a549275a93c85f85a8eb10f6232f034148b4a549275906497f8640e92ac8324b2eaec31ec327d783b606bf2daec1cd48ff86a8eb10649cbfe7
+stream 4 404100
+stream 4 68656c6c6f2d62696469 fin
+stream 14 40540068656c6c6f2d756e69 fin
+datagram 0068656c6c6f2d646772616d
+# Last, on the CONNECT stream, WT_CLOSE_SESSION (code 7, "bye") in a DATA frame, and its FIN.
+stream 0 000a68430700000007627965 fin

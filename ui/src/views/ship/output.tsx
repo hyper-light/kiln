@@ -10,7 +10,8 @@
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
 import { api } from "@/api/client";
-import { shipApi, type ShipCommit } from "@/api/ship";
+import type { ShipCommit } from "@/api/ship";
+import { DETAIL_OPTS, shipCommit } from "./live";
 import { toast } from "@/components/ui/toast";
 import { sendingProps, useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
@@ -26,7 +27,7 @@ import { partOf, pickPart, stationsOf } from "./jobs";
 const OUTPUT_ROWS = 14;
 
 export function ShipOutput({ commit, picked }: { commit: ShipCommit; picked: string | null }) {
-  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
+  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipCommit(commit.repo, commit.sha, s), DETAIL_OPTS);
   // The job picked in Jobs, else the one Jobs shows picked by its rule (plan
   // 01a1856fe81375b1bd1d1d86f270a45b, step 8): one that ran has its job's output.
   const stations = stationsOf(detail.data);
@@ -50,7 +51,8 @@ export function ShipOutput({ commit, picked }: { commit: ShipCommit; picked: str
 }
 
 function JobOutput({ job, title, state }: { job: string; title: string; state: string }) {
-  const j = useSuspenseResource(`ship/job/${job}`, (s) => api.job(job, s), { on: ["job"] });
+  // Its own leg's event is the job as GET /api/jobs/:id has it, but its spec: taken in place; another's changes nothing here (W21-R15).
+  const j = useSuspenseResource(`ship/job/${job}`, (s) => api.job(job, s), { on: ["job"], apply: (d, ev) => (ev.type === "job" ? (ev.job.id === job ? { ...ev.job, spec: d.spec } : d) : undefined) });
   const step = stepToShow(j.data.steps) ?? 0;
   const [copied, setCopied] = React.useState(false);
   // Copy (step 4): the step's whole output as the REST log has it, asked for in the tap itself

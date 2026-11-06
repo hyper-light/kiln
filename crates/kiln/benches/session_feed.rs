@@ -332,7 +332,7 @@ fn main() -> anyhow::Result<()> {
     // A viewer watching from here on, as a page watches (states and changesets as patches): the
     // updates below go out to it.
     let takes = kiln::harness::registry::Patches { state: true, changes: true };
-    let viewer = hub.harness.attach_from(ID, None, takes).expect("the session");
+    let viewer = hub.harness.attach_from(ID, None, takes, kiln::harness::registry::View::default()).expect("the session");
     let topic = viewer.topic.clone();
     let mut at = viewer.at.unwrap_or_default();
     let rev_before = viewer.rev;
@@ -394,7 +394,7 @@ fn main() -> anyhow::Result<()> {
         let h = Arc::clone(&hub);
         let m = measure(runs, || {
             // Taken and written out, as a viewer's catch-up is (the server writes it on the blocking pool).
-            let _ = h.harness.frames_since(ID, &viewer.viewer, rev_before.saturating_add(1)).map(|(s, ..)| s.frames());
+            let _ = h.harness.frames_since(ID, &viewer.viewer, rev_before.saturating_add(1), kiln::harness::registry::View::default()).map(|(s, ..)| s.frames());
         });
         row("catch up", 1, &m, "past every update above");
     }

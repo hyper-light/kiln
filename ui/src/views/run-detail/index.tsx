@@ -93,7 +93,7 @@ function RunBody({ id }: { id: string }) {
   const [firstPick, setFirstPick] = React.useState(() => (res.data ? pickDefaultJob(res.data.jobs)?.id : undefined));
   if (firstPick === undefined && res.data?.jobs.length) setFirstPick(pickDefaultJob(res.data.jobs)?.id);
 
-  useServerEvents((ev) => {
+  useServerEvents(["run", "job"], (ev) => {
     if (ev.type === "run" && ev.run.id === id) res.setData((d) => (d ? { ...d, run: ev.run } : d));
     if (ev.type === "job" && ev.job.run_id === id) res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, { ...ev.job, spec: d.jobs.find((j) => j.id === ev.job.id)?.spec }, (j) => j.id, false) } : d));
   });
