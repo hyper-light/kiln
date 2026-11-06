@@ -1660,7 +1660,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
     let mut out: Vec<RunnerInfo> = Vec::with_capacity(listed.len());
     // Outposts aren't installed, so there's nothing of them to upgrade.
     for a in listed.into_iter().filter(|a| !a.ephemeral && !a.outpost) {
-        turns.yield_after().await;
+        turns.end().await;
         out.push({
             let instances = hub.runner_processes(&a.name);
             let newest = instances.iter().find(|i| i.newest);
