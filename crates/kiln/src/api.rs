@@ -2926,7 +2926,7 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     if let Some(owner) = caller.as_ref().filter(|c| c.is_owner() && c.user.is_none())
         && let Ok(made) = hub.harness.views.me.answer(me_key(hub), |_| crate::reads::encode(&me_json(hub, Some(owner), Vec::new())))
     {
-        return pre_encoded(made);
+        return pre_named(made);
     }
     // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
     // name for an app (docs/deploy-api.md §3.1).
@@ -3004,7 +3004,7 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     // what's kept is behind it.
     hub.harness.views.start(hub);
     if let Some(made) = overview_key(hub).and_then(|key| hub.harness.views.overview.answer(key, |k| overview_made(hub, k)).ok()) {
-        return Ok(pre_encoded(made));
+        return Ok(pre_named(made));
     }
     let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
@@ -3133,7 +3133,7 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     {
         let was = v.overview.now();
         match overview_made(hub, &key) {
-            Ok(made) => v.overview.keep(&was, key, made),
+            Ok(made) => v.overview.keep(&was, key, crate::reads::Made::of(made)),
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
         }
     }
@@ -3151,10 +3151,10 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
         hub.harness.views.start(hub);
         if let Some(key) = agents_key(hub) {
             if let Some(made) = hub.harness.views.agents.held(&key) {
-                return pre_encoded(made);
+                return pre_named(made);
             }
             match agents_making(hub, key).await {
-                Ok(made) => return pre_encoded(made),
+                Ok(made) => return pre_named(made),
                 Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made off the shard: the store's answers"),
             }
         }
@@ -3165,11 +3165,11 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
 /// encoded) and kept for the reads after it, unless a making begun after this one's was kept meanwhile (goal 10,
 /// plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
-async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<Bytes> {
+async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<crate::reads::Made> {
     let was = hub.harness.views.agents.now();
     let h = Arc::clone(hub);
     let (key, made) = crate::rt::compute(move || {
-        let made = crate::reads::encode(&agents_made(&h, &key));
+        let made = crate::reads::encode(&agents_made(&h, &key)).map(crate::reads::Made::of);
         (key, made)
     })
     .await?;
@@ -5684,6 +5684,16 @@ async fn harness_history(hub: &Hub, caller: &crate::authz::Caller, q: &HashMap<S
 /// JSON encoded before it was asked for (a view's, encoded once per change of it): sent as it is.
 fn pre_encoded(json: bytes::Bytes) -> Response {
     srv::response(StatusCode::OK, "application/json", srv::full(json))
+}
+
+/// A read kept ahead as it answers ([`crate::reads::Made`]): its JSON as it is, with the weak ETag made with it, which
+/// `crate::http::compress::finish` takes as the answer's validator, digesting nothing (goal 9, plan 01a1a87b2cec step 3).
+fn pre_named(made: crate::reads::Made) -> Response {
+    let mut r = pre_encoded(made.json);
+    if let Some(etag) = made.etag {
+        r.headers_mut().insert(header::ETAG, etag);
+    }
+    r
 }
 
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
@@ -8666,6 +8676,50 @@ mod tests {
             })
             .await;
             anyhow::ensure!(out == 8 && pending, "after a yield: {out}, waited {pending}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the reads kept ahead (`GET /api/agents`, `/api/overview`, the owner's `/api/me`)
+    /// are answered named by their handlers, with the weak ETag made once with them (`crate::reads::Made`): the very
+    /// one `crate::http::compress::finish` made of their bodies at each read before. Through the API the validator is
+    /// as it was, and a revalidation with it is answered 304.
+    #[test]
+    fn g9_s3_reads_kept_ahead_are_named_as_finish_named_them() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let owner = crate::authz::Caller::owner();
+            // The first reads make what's kept (the maker too, beside them); the uptime the overview says may turn a
+            // second between two reads: read again.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            for path in ["/api/agents", "/api/overview", "/api/me"] {
+                loop {
+                    let answered = match path {
+                        "/api/agents" => agents_read(&hub, &owner).await,
+                        "/api/overview" => overview(&hub, &owner).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?,
+                        _ => me(&hub, lab_get(path)?.headers()).await,
+                    };
+                    let named = answered.headers().get(header::ETAG).cloned();
+                    let body = body_of(answered).await?;
+                    if let Some(named) = named {
+                        anyhow::ensure!(named.to_str()? == crate::http::compress::etag_of(&body), "{path}: named {named:?}, where its body's digest names it otherwise");
+                        let r = Arc::clone(&api).handle(lab_get(path)?).await;
+                        let etag = r.headers().get(header::ETAG).cloned();
+                        if body_of(r).await? == body {
+                            anyhow::ensure!(etag.as_ref() == Some(&named), "{path}: validated {etag:?} through the API");
+                            let mut asked = lab_get(path)?;
+                            asked.headers_mut().insert(header::IF_NONE_MATCH, named.clone());
+                            if Arc::clone(&api).handle(asked).await.status() == StatusCode::NOT_MODIFIED {
+                                break;
+                            }
+                        }
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "{path} wasn't answered named, nor revalidated");
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            }
             Ok(())
         })
     }

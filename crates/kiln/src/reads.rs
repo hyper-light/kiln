@@ -141,11 +141,30 @@ impl<T: Send + Sync + 'static> Kept<T> {
 /// while it says what a read made now would. Its maker ([`Views::start`]) makes it again as soon as
 /// something it's made of changes, off the request path; a read that comes between the change and
 /// that making has it made, once, for the reads after it: where it's cheap, on its own shard ([`Ahead::answer`],
-/// counted: [`trace`]), else on the compute pool ([`Ahead::held`], then [`Ahead::keep`]).
+/// counted: [`trace`]), else on the compute pool ([`Ahead::held`], then [`Ahead::keep`]). Each is held named
+/// ([`Made`]).
 pub struct Ahead<K> {
-    now: arc_swap::ArcSwapOption<(K, bytes::Bytes)>,
+    now: arc_swap::ArcSwapOption<(K, Made)>,
     /// It's been read: its maker keeps it made.
     asked: AtomicBool,
+}
+
+/// A read kept ahead as it answers: its JSON, and the weak ETag that names it (`crate::http::compress::weak_etag` of
+/// its digest, the very one `crate::http::compress::finish` makes of a body), made once with it, so the reads that
+/// find it as it was aren't digested again each (goal 9, plan 01a1a87b2cec step 3: `GET /api/agents`, its runners'
+/// records and facts, was digested whole on the request's shard at every read).
+#[derive(Debug, Clone)]
+pub struct Made {
+    pub json: bytes::Bytes,
+    pub etag: Option<http::HeaderValue>,
+}
+
+impl Made {
+    /// `json`, named.
+    pub fn of(json: bytes::Bytes) -> Self {
+        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&json));
+        Self { json, etag }
+    }
 }
 
 impl<K> Default for Ahead<K> {
@@ -155,14 +174,14 @@ impl<K> Default for Ahead<K> {
 }
 
 impl<K: PartialEq> Ahead<K> {
-    /// What it holds, made of `key`; else what `make` makes of `key` now, kept for the reads after this
-    /// one.
-    pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
+    /// What it holds, made of `key`; else what `make` makes of `key` now, named and kept for the reads after
+    /// this one.
+    pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<Made> {
         self.asked.store(true, Ordering::Relaxed);
         if let Some(now) = self.now.load_full().filter(|now| now.0 == key) {
             return Ok(now.1.clone());
         }
-        let made = make(&key)?;
+        let made = Made::of(make(&key)?);
         self.now.store(Some(Arc::new((key, made.clone()))));
         Ok(made)
     }
@@ -174,7 +193,7 @@ impl<K: PartialEq> Ahead<K> {
 
     /// What it holds, when it's made of `key`: making nothing (goal 10, plan 01a1a87b2dae step 5: a read that
     /// finds it behind has it made off its shard). Counted as read, so its maker keeps it made.
-    pub fn held(&self, key: &K) -> Option<bytes::Bytes> {
+    pub fn held(&self, key: &K) -> Option<Made> {
         self.asked.store(true, Ordering::Relaxed);
         match &*self.now.load() {
             Some(now) if now.0 == *key => Some(now.1.clone()),
@@ -188,13 +207,13 @@ impl<K: PartialEq> Ahead<K> {
     }
 
     /// What it holds now: what its maker makes over ([`Ahead::keep`]).
-    pub fn now(&self) -> Option<Arc<(K, bytes::Bytes)>> {
+    pub fn now(&self) -> Option<Arc<(K, Made)>> {
         self.now.load_full()
     }
 
     /// What its maker made of `key`, in place of `was` (what it held when it began): unless a read
     /// made it meanwhile, which is as new.
-    pub fn keep(&self, was: &Option<Arc<(K, bytes::Bytes)>>, key: K, made: bytes::Bytes) {
+    pub fn keep(&self, was: &Option<Arc<(K, Made)>>, key: K, made: Made) {
         let _ = self.now.compare_and_swap(was, Some(Arc::new((key, made))));
     }
 }
