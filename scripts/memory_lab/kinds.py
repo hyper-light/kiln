@@ -6,6 +6,7 @@ stacks, turso's arenas and the C libraries' malloc, beside jemalloc's own word f
 g9p16's calm medians, main's tree: 173.7 MB of it beside 145.2 MB of the process's anonymous memory in all).
 
     python3 -I kinds.py <pid>
+    python3 -I kinds.py <a copy of /proc/<pid>/smaps> [<the executable's path as it names it>]
 
 One line a kind, in this order, then `total` (every mapping's, the process's Rss as smaps_rollup says it):
     <kind> rss_kb=<resident> anon_kb=<of it, the process's own pages> huge_kb=<of it, in transparent huge pages>
@@ -20,16 +21,17 @@ The kinds:
     stacks        threads' stacks: an anonymous mapping with guard pages in it (VmFlags `gu`: glibc's stacks on a kernel
                   with MADV_GUARD_INSTALL, adjacent ones merged into one mapping); an anonymous mapping of at least
                   STACK_LEAST just above an inaccessible one of at most GUARD_MOST (the guard musl's pthread_create
-                  maps below a stack), and where kiln advised that stack `MADV_NOHUGEPAGE` (`nh`), the unadvised
-                  mapping of at most TOP_MOST just above it that continues it (the thread's control block and TLS,
-                  split from it by the advice); and the main thread's [stack]
+                  maps below a stack; a smaller one there is a signal stack, other-anon), and where kiln advised that
+                  stack `MADV_NOHUGEPAGE` (`nh`), the unadvised mapping of at most TOP_MOST just above it that
+                  continues it (the thread's control block and TLS, split from it by the advice); and the main
+                  thread's [stack]
     thp-advised   anonymous mappings advised `MADV_HUGEPAGE` (VmFlags `hg`): turso's buffer pools' arenas
     allocator     anonymous mappings advised `MADV_NOHUGEPAGE` (VmFlags `nh`) that aren't stacks: jemalloc's, on a
                   kernel that gives huge pages (`always` or `madvise`; `thp:never` has jemalloc mark each mapping it
                   makes). On a kernel set to `never` they count as other-anon
     heap          [heap]: the C library's brk heap (glibc's main arena; musl's first groups)
-    other-anon    every other anonymous mapping: the C libraries' malloc (glibc's other arenas, musl's groups), and
-                  mappings made directly (a thread's signal stack among them)
+    other-anon    every other anonymous mapping: the C libraries' malloc (glibc's other arenas, musl's groups),
+                  mappings made directly (a thread's signal stack among them), and inaccessible ones (guards, reserves)
     kernel        [vdso], [vvar] and the like
 
 Reading another process's smaps takes ptrace's read access to it: the same user.
@@ -52,11 +54,11 @@ TOP_MOST = 1 << 20
 KINDS = ["binary-code", "binary-ro", "binary-rw", "files", "stacks", "thp-advised", "allocator", "heap", "other-anon", "kernel"]
 
 
-def mappings(pid: int) -> list[dict]:
-    """Each of the process's mappings as smaps has it: its range, permissions, path, Rss, Anonymous and
-    AnonHugePages (KiB) and VmFlags."""
+def mappings(smaps: str) -> list[dict]:
+    """Each of a process's mappings as its smaps (`smaps`, a path: /proc/<pid>/smaps or a copy of it) has it: its
+    range, permissions, path, Rss, Anonymous and AnonHugePages (KiB) and VmFlags."""
     out: list[dict] = []
-    with open(f"/proc/{pid}/smaps") as f:
+    with open(smaps) as f:
         for line in f:
             head = line.split(None, 5)
             if len(head) >= 5 and "-" in head[0] and ":" not in head[0]:
@@ -103,13 +105,18 @@ def classify(maps: list[dict], exe: str) -> list[str]:
             # Guard pages installed in the mapping itself (MADV_GUARD_INSTALL, Linux 6.13): glibc's thread stacks
             # where the kernel has them (VmFlags `gu`), adjacent ones merged into one mapping.
             kinds[i] = "stacks"
+        elif m["perms"].startswith("---"):
+            # Inaccessible: a guard, or address space reserved (glibc's arenas' reserves). Never resident.
+            kinds[i] = "other-anon"
+        elif below is not None and anonymous(below) and below["perms"].startswith("---") and below["hi"] == m["lo"] and below["hi"] - below["lo"] <= GUARD_MOST and m["hi"] - m["lo"] < STACK_LEAST:
+            # A signal stack above its guard (Rust's, a few pages; `nh` where it was mapped MAP_STACK): not a thread's.
+            kinds[i] = "other-anon"
         elif (
             below is not None
             and anonymous(below)
             and below["perms"].startswith("---")
             and below["hi"] == m["lo"]
             and below["hi"] - below["lo"] <= GUARD_MOST
-            and m["hi"] - m["lo"] >= STACK_LEAST
             and m["perms"].startswith("rw")
         ):
             kinds[i] = "stacks"
@@ -151,16 +158,27 @@ def line(name: str, r: dict) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
-        print("usage: kinds.py <pid>", file=sys.stderr)
+    args = sys.argv[1:]
+    if len(args) == 1 and args[0].isdigit():
+        pid = int(args[0])
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+            maps = mappings(f"/proc/{pid}/smaps")
+        except OSError as e:
+            print(f"kinds.py: process {pid}: {e}", file=sys.stderr)
+            return 1
+    elif args and len(args) <= 2 and not args[0].isdigit():
+        try:
+            maps = mappings(args[0])
+        except OSError as e:
+            print(f"kinds.py: {e}", file=sys.stderr)
+            return 1
+        # The executable is what the process mapped first, at its lowest address (a static binary's fixed one, a
+        # PIE's below the libraries'), unless said.
+        exe = args[1] if len(args) == 2 else next((m["path"] for m in maps if m["path"].startswith("/")), "")
+    else:
+        print("usage: kinds.py <pid> | kinds.py <saved smaps> [<the executable's path in it>]", file=sys.stderr)
         return 2
-    pid = int(sys.argv[1])
-    try:
-        exe = os.readlink(f"/proc/{pid}/exe")
-        maps = mappings(pid)
-    except OSError as e:
-        print(f"kinds.py: process {pid}: {e}", file=sys.stderr)
-        return 1
     rows = tally(maps, classify(maps, exe))
     for k in KINDS:
         print(line(k, rows[k]))

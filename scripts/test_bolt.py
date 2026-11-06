@@ -466,6 +466,30 @@ class Hook(unittest.TestCase):
             # And the whole process's by kind (goal 11 step 5, part 6), the binary's among them.
             self.assertEqual(kinds[0].split()[0], "binary-code", kinds)
             self.assertTrue(kinds[-1].startswith("total rss_kb="), kinds)
+            # Neither of a profiling round's gdb calls without its switch.
+            self.assertFalse(Path(d, "r.hook", "heap-dump.log").exists())
+            self.assertFalse(Path(d, "r.hook", "purge.txt").exists())
+
+    def test_g11_s5_a_profiling_round_dumps_the_heap_and_probes_a_purge_at_the_window_end(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            calls = Path(d, "gdb.calls")
+            # A gdb that says what it was asked, as gdb -batch would run it.
+            gdb = script(Path(d, "gdb"), f'printf "%s\\n" "$*" >> {calls}\n')
+            p = subprocess.Popen(["sleep", "30"])
+            try:
+                time.sleep(0.2)
+                r = run([str(HOOK), "window-end", str(p.pid), str(Path(d, "r.hook"))], env={"BOLT_RECORD": "none", "HEAP_DUMP": "1", "PURGE_PROBE": "1", "GDB": str(gdb)})
+            finally:
+                p.kill()
+                p.wait()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            asked = calls.read_text().splitlines()
+            self.assertEqual(len(asked), 2, asked)
+            self.assertIn(f"-p {p.pid} -batch -nx -q -ex call (int)_rjem_mallctl(\"prof.dump\"", asked[0])
+            self.assertIn("_rjem_mallctl(\"arena.4096.purge\"", asked[1])
+            purge = Path(d, "r.hook", "purge.txt").read_text().splitlines()
+            self.assertEqual([l.split(":")[0] for l in purge], ["before", "Rss", "Anonymous", "after", "Rss", "Anonymous"], purge)
+            self.assertEqual(Path(d, "r.hook", "hook.log").read_text() if Path(d, "r.hook", "hook.log").exists() else "", "")
 
 
     def test_g11_s5_an_instrumented_window_is_its_last_dump_less_its_first(self) -> None:
@@ -639,6 +663,8 @@ class Kinds(unittest.TestCase):
             m(4 * MiB, flags="rd wr mr mw me ac sd nh", rss=4096),  # jemalloc's extents
             m(4 * KiB, "---p", flags="mr mw me sd", rss=0),  # a signal stack's guard,
             m(12 * KiB, rss=0),  # the signal stack: not a thread's
+            m(4 * KiB, "---p", flags="mr mw me sd nh", rss=0),  # one mapped MAP_STACK (`nh`) on a newer kernel,
+            m(8 * KiB, flags="rd wr mr mw me ac sd nh", rss=4),  # and its stack: not the allocator's either
             m(6164 * KiB, flags="rd wr mr mw me ac sd hg", rss=5760),  # turso's arenas
             m(4 * KiB, "---p", flags="mr mw me sd", rss=0),  # a thread the runtime didn't start: its guard,
             m(16 * MiB, rss=20),  # its stack (no advice),
@@ -655,18 +681,48 @@ class Kinds(unittest.TestCase):
         got = kinds.classify(maps, "/x/kiln")
         self.assertEqual(
             got,
-            ["other-anon", "stacks", "stacks", "allocator", "other-anon", "other-anon", "thp-advised", "other-anon", "stacks", "other-anon", "other-anon", "other-anon", "other-anon", "binary-code", "binary-ro", "binary-rw", "stacks", "kernel"],
+            ["other-anon", "stacks", "stacks", "allocator", "other-anon", "other-anon", "other-anon", "other-anon", "thp-advised", "other-anon", "stacks", "other-anon", "other-anon", "other-anon", "other-anon", "binary-code", "binary-ro", "binary-rw", "stacks", "kernel"],
         )
         rows = kinds.tally(maps, got)
         self.assertEqual(rows["stacks"]["rss"], 88 + 12 + 20 + 200)
         self.assertEqual(rows["allocator"]["rss"], 4096)
         self.assertEqual(rows["thp-advised"]["rss"], 5760)
 
+    def test_g11_s5_a_saved_smaps_is_read_as_the_live_process_is(self) -> None:
+        # The lab keeps a round's smaps at the window's end (smaps.window-end): kinds.py reads a copy as it reads the
+        # process, the executable the first file it maps unless said.
+        p = subprocess.Popen([sys.executable, "-I", "-c", HOLDER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                self.assertEqual(p.stdout.readline().strip() if p.stdout else "", "ready")
+                copy = Path(d, "smaps.window-end")
+                copy.write_text(Path(f"/proc/{p.pid}/smaps").read_text())
+                exe = os.readlink(f"/proc/{p.pid}/exe")
+                live = run([sys.executable, "-I", str(KINDS), str(p.pid)])
+            finally:
+                if p.stdin:
+                    p.stdin.close()
+                p.wait(timeout=30)
+                if p.stdout:
+                    p.stdout.close()
+            said = run([sys.executable, "-I", str(KINDS), str(copy), exe])
+            guessed = run([sys.executable, "-I", str(KINDS), str(copy)])
+        self.assertEqual(said.returncode, 0, said.stderr)
+        # The same mappings, but for what changed between the two reads (a page or two of the live process's heap).
+        live_rows, said_rows = dict(self.fields(l) for l in live.stdout.splitlines()), dict(self.fields(l) for l in said.stdout.splitlines())
+        for kind in ("binary-code", "stacks", "thp-advised", "allocator"):
+            self.assertLessEqual(abs(live_rows[kind]["rss_kb"] - said_rows[kind]["rss_kb"]), 64, kind)
+        self.assertEqual(guessed.stdout, said.stdout, "the first file mapped is the executable")
+        bad = run([sys.executable, "-I", str(KINDS), str(Path(d, "gone"))])
+        self.assertEqual(bad.returncode, 1)
+
     def test_g11_s5_a_process_that_isnt_there_is_said(self) -> None:
         r = run([sys.executable, "-I", str(KINDS), "999999999"])
         self.assertEqual(r.returncode, 1)
         self.assertIn("process 999999999", r.stderr)
-        r = run([sys.executable, "-I", str(KINDS), "self"])
+        r = run([sys.executable, "-I", str(KINDS)])
+        self.assertEqual(r.returncode, 2)
+        r = run([sys.executable, "-I", str(KINDS), "1", "2", "3"])
         self.assertEqual(r.returncode, 2)
 
 
