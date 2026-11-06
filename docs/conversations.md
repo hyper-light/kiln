@@ -78,8 +78,9 @@ C, no SIMD, no FTS.
   it did without one.
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
   commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  batch reaches `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
-  never by lock.
+  flush brings `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
+  never by lock. While a batch gathers, what's flushed waits for it without waking the writer; a
+  read, a take, a close or a flush of `COMMIT_ROWS` rouses it.
 - **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
   came after a number (see Replication). Each reset of a session's events is a row of its own in
   `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line

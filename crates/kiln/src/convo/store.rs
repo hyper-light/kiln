@@ -328,6 +328,9 @@ pub struct Queue {
     /// The most any sender may let wait past [`Queue::bound`] before it waits itself ([`Store::room_within`]),
     /// for what `/metrics` says the queue may hold.
     within: AtomicUsize,
+    /// The writer's wakes from a wait (a test's).
+    #[cfg(test)]
+    woke: AtomicU64,
 }
 
 impl Queue {
@@ -402,6 +405,8 @@ pub struct Store {
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
+    /// The writer's thread, roused for what can't wait for its batch ([`Store::rouse`]); none where it has stopped.
+    writer: Option<std::thread::Thread>,
 }
 
 impl Store {
@@ -414,8 +419,17 @@ impl Store {
         let hold = Arc::new(AtomicI64::new(i64::MAX));
         let queue: Arc<Queue> = Arc::default();
         let (w, m, h, q) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue));
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?;
-        Ok(Self { tx, queue, id, meter, watchers, hold })
+        let thread = std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?.thread().clone();
+        Ok(Self { tx, queue, id, meter, watchers, hold, writer: Some(thread) })
+    }
+
+    /// Rouses the writer for what was just sent and can't wait for the batch under way to be due (a job, a close, a
+    /// batch's worth of rows): while a batch is under way it's parked on its thread, not waiting on its channel, so a
+    /// row sent wakes nothing (goal 9, plan 01a1a87b2cec step 5). Where it isn't parked, a flag set: nothing to wake.
+    fn rouse(&self) {
+        if let Some(w) = &self.writer {
+            w.unpark();
+        }
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -438,6 +452,7 @@ impl Store {
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
         self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        self.rouse();
         rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
     }
 
@@ -464,7 +479,7 @@ impl Store {
         if rows.is_empty() {
             return;
         }
-        let bytes = rows.iter().map(Row::bytes).sum();
+        let (bytes, count) = (rows.iter().map(Row::bytes).sum(), rows.len());
         self.queue.took(bytes);
         if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
             self.queue.let_go(bytes, None);
@@ -472,6 +487,17 @@ impl Store {
             if (n - 1).is_power_of_two() {
                 tracing::warn!(dropped = n, "conversation store: its writer has stopped; updates were dropped");
             }
+            return;
+        }
+        self.sent_rows(count);
+    }
+
+    /// `n` rows were just sent: the writer roused where they make a commit at once ([`COMMIT_ROWS`]), as one that waited on its
+    /// channel took them at once; the rest go with the batch under way, when it's due. (Rows sent a few at a time that come to
+    /// [`COMMIT_ROWS`] before it's due go then too, within [`COMMIT_MS`], in one commit.)
+    fn sent_rows(&self, n: usize) {
+        if n >= COMMIT_ROWS {
+            self.rouse();
         }
     }
 
@@ -483,12 +509,13 @@ impl Store {
         if rows.is_empty() {
             return true;
         }
-        let bytes = rows.iter().map(Row::bytes).sum();
+        let (bytes, count) = (rows.iter().map(Row::bytes).sum(), rows.len());
         self.queue.took(bytes);
         if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
             self.queue.let_go(bytes, None);
             return false;
         }
+        self.sent_rows(count);
         let until = Instant::now() + READ_WAIT;
         while !self.queue.has_room() && Instant::now() < until {
             let listener = self.queue.room.listen();
@@ -540,6 +567,7 @@ impl Store {
                 let _ = rtx.send(f(e));
             })))
             .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        self.rouse();
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -752,8 +780,33 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     };
     loop {
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
-        let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
-        let got = rx.recv_timeout(wait);
+        let got = match since {
+            // A batch under way: what's sent meanwhile waits in the channel for its time, the writer parked on its thread
+            // alone, so the rows sent wake nothing; what can't wait for it rouses the writer ([`Store::rouse`]: a job, a
+            // close, a batch's worth). It waited on the channel, woken by every row sent to it, each a futex's wake on the
+            // sender's shard and a switch to this thread and back, only to add the row to the batch (goal 9, plan
+            // 01a1a87b2cec step 5).
+            Some(t) => match rx.try_recv() {
+                Ok(m) => Ok(m),
+                Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+                Err(mpsc::TryRecvError::Empty) => {
+                    let left = Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed());
+                    if !left.is_zero() {
+                        std::thread::park_timeout(left);
+                        #[cfg(test)]
+                        queue.woke.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                }
+            },
+            None => {
+                let got = rx.recv_timeout(idle);
+                #[cfg(test)]
+                queue.woke.fetch_add(1, Ordering::Relaxed);
+                got
+            }
+        };
         let began = Instant::now();
         match got {
             Ok(Msg::Rows(rows, bytes)) => {
@@ -993,7 +1046,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), writer: None }
 }
 
 #[cfg(test)]
@@ -1025,6 +1078,50 @@ mod tests {
         anyhow::ensure!(took.applied > 0 && server.grown() == brought, "a batch taken in: {} against {brought}", server.grown());
         let again = server.take("runner", Some("box"), took.rev, Changes { rows: Vec::new(), upto: took.rev })?;
         anyhow::ensure!(again.applied == 0 && server.grown() == brought, "a batch that brings nothing: {}", server.grown());
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: rows sent while the writer's batch is under way wake it for none of them (it waited
+    /// on its channel, woken by each row: a futex's wake on the sender's shard and a switch to its thread and back), and go
+    /// in with the batch; a read sent meanwhile rouses it, answered before the batch would have been due, seeing them all. Do:
+    /// a row, then twenty more a millisecond apart, counting the writer's wakes; then a row, 10 ms, and a read, until three
+    /// reads were answered before their batch's COMMIT_MS was up (none would be, waiting for it), ten tries at the most.
+    /// Expect: a couple of wakes for each batch's time the rows took (its first row's, its end's) and none a row; every row
+    /// read; three reads answered before their batch was due.
+    #[test]
+    fn g9_s5_rows_sent_while_a_batch_is_under_way_wake_its_writer_for_none_of_them() -> anyhow::Result<()> {
+        const ROWS: u64 = 20;
+        let (_d, st) = scratch()?;
+        st.sync()?;
+        let (first, before) = (Instant::now(), st.queue.woke.load(Ordering::Relaxed));
+        for i in 1..=ROWS + 1 {
+            st.send("a1", &said(&format!("m{i}"), i, "the deadline"));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (took, woke) = (first.elapsed(), st.queue.woke.load(Ordering::Relaxed).saturating_sub(before));
+        // Each batch's time the rows took: its first row's wake and its end's; and two more, for an idle wait's end (its upkeep's
+        // look, every SQUEEZE_EVERY) and the rousing the sync left (a thread's unpark kept for its next park).
+        let batches = u64::try_from(took.as_millis() / u128::from(COMMIT_MS)).unwrap_or(u64::MAX).saturating_add(1);
+        let most = batches.saturating_mul(2).saturating_add(2);
+        anyhow::ensure!(most < ROWS, "the rows took {took:?}: too long to tell a wake a row from a batch's");
+        anyhow::ensure!(woke <= most, "the writer woke {woke} times for {} rows sent over {took:?} (at most {most})", ROWS + 1);
+        let kept = st.kept("a1", 100)?.map_or(0, |k| k.events.len());
+        anyhow::ensure!(kept == usize::try_from(ROWS + 1)?, "{kept} of {} rows read", ROWS + 1);
+        // A read can't be answered before its batch is due unless it rouses the writer; a commit held up by the disk can
+        // make one late anyway, so it's tried up to ten times for three.
+        let (mut before_due, mut tried) = (0u64, 0u64);
+        while before_due < 3 && tried < 10 {
+            tried += 1;
+            let sent = Instant::now();
+            st.send("a2", &said(&format!("r{tried}"), tried, "a read's"));
+            std::thread::sleep(Duration::from_millis(10));
+            let read = st.kept("a2", 100)?.map_or(0, |k| k.events.len());
+            anyhow::ensure!(read == usize::try_from(tried)?, "the read saw {read} rows of {tried}");
+            if sent.elapsed() < Duration::from_millis(COMMIT_MS) {
+                before_due += 1;
+            }
+        }
+        anyhow::ensure!(before_due >= 3, "{before_due} of {tried} reads answered before their batch was due: not roused");
         Ok(())
     }
 
