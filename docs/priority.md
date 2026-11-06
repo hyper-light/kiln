@@ -422,10 +422,9 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 
 `[server] nudge` is what a shard has in the real-time class's place where that's refused, needing no privilege
 (goal 8, plan `01a1a59c2b29` step 7; goal 6, plan `01a1a59c2abe` step 3; `hyper_rt::compute::nudge_current_thread`,
-`crate::nudge`). It's off until declared (docs/ci.md §0.3, "Opt-in automation"): `"off"` (or `false`) is the
-default; `"auto"` is the mode a config declares, and `"on"` (or `true`, as it was before it had a mode) the other.
-`KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any other value is on, as the flag read it), and
-`KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+`crate::nudge`). It's off until declared (docs/ci.md §0.3, "Opt-in automation"): `"off"` is the default;
+`"auto"` is the mode a config declares, and `"on"` the other. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`,
+or a flag's word, `1` or `0`; any other is refused), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 
 - **What a nudge is.** A nudged shard's waits in its driver end by its period, the step quantum less the timers'
   tick (166.7 µs; goal 9, plan `01a1a87b2cec` step 4: `crate::rt::nudge_period_ns`), so with its timer slack (that
