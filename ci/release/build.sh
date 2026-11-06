@@ -38,7 +38,9 @@
 #   <target dir>/bolt/x86_64-unknown-linux-musl/release/kiln) and the A/B's side without BOLT;
 # - a profile's path (perf2bolt's or an instrumented window's .fdata, of that very build; or a .yaml, which BOLT
 #   matches to a nearby build's code): dist/kiln-x86_64-unknown-linux-musl is the build laid out by it
-#   (bolt.sh optimize) and stripped.
+#   (bolt.sh optimize) and stripped, once bolt.sh same says it's the same program (one build, one `--version`);
+#   what the profile covered beside BOLT's log (<target dir>/bolt/x86_64-unknown-linux-musl/release/kiln.bolt.txt).
+#   BOLT failing fails the build: nothing ships laid out otherwise than asked.
 # - an order's path (a .order file, `bolt.sh order`'s: the functions a profile saw run, hottest first): the build
 #   linked with those functions first, in that order (LLD's --symbol-ordering-file, through zig-relocs.sh), and
 #   stripped. The layout without BOLT: whole functions, none split.
@@ -193,15 +195,30 @@ for t in "${targets[@]}"; do
           rm -f "$input"
         fi
         rm -f "$built/kiln.linked-order"
+        # cargo-zigbuild's cache of its own (CARGO_ZIGBUILD_CACHE_DIR): the linker wrapper it writes there exports the
+        # zig it runs, and its name says the target, not that zig, so in the shared cache (~/.cache/cargo-zigbuild) any
+        # other build of this target on the machine rewrites it with the plain zig while this one builds, and the link
+        # skips zig-relocs.sh (2026-11-06 on adacachy: another x86_64 musl build did, at 07:28:38, mid-build: no .rela.text,
+        # which bolt.sh check refused).
         KILN_LINK_ORDER=$order KILN_ZIG_REAL="$zig_home/zigbin/zig" CARGO_ZIGBUILD_ZIG_COMMAND="$root/ci/release/zig-relocs.sh" \
-          CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR="$target_dir/bolt" \
+          CARGO_ZIGBUILD_CACHE_DIR="$target_dir/bolt/zigbuild" CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR="$target_dir/bolt" \
           "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
         # Relinked through zig-relocs.sh (its relocations say so), so in the order asked: marked as such.
         ci/release/bolt.sh check "$input"
         echo "$mark" > "$built/kiln.linked-order"
         case $bolt in
           relocs | *.order) "${KILN_STRIP:-strip}" --strip-all -o "$dist/kiln-$t" "$input" ;;
-          *) ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t" ;;
+          *)
+            ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t"
+            # The layout ships only as the same program: one build (its id, BOLT flipping its last bit), one `--version`,
+            # its code moved (bolt.sh same), where this machine runs an x86-64 build; elsewhere the release's own smoke
+            # runs it.
+            if [ "$(uname -m)" = x86_64 ]; then
+              ci/release/bolt.sh same "$input" "$dist/kiln-$t" || { rm -f "$dist/kiln-$t"; exit 1; }
+            else
+              echo "build.sh: $(uname -m) can't run $dist/kiln-$t: bolt.sh same left to the release's smoke" >&2
+            fi
+            ;;
         esac
       else
         "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
