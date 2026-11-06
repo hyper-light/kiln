@@ -1496,7 +1496,6 @@ pub fn render() -> String {
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
-    crate::placement::render(&mut o);
     // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
     // count, and the most it can hold with what it holds, never past [bus] memory.
     let bus = bus_memory(bus_gauges());

@@ -1024,11 +1024,6 @@ impl Shard {
                 reading = last;
                 continue;
             }
-            // Idle: movable tasks waiting in the shared queues or a sibling's take this shard's turn first
-            // (`crate::movable`, kiln's goal 7).
-            if self.desk.movable.look(&self.desk) {
-                continue;
-            }
             // A spinning shard is awake: a quiet sleep falling due ends its spin as a timer would ([`crate::quiet`]).
             let awake_deadline_ns = self.awake_deadline(outcome.next_deadline_ns);
             if self.spin_after_activity(awake_deadline_ns) {
@@ -1372,7 +1367,6 @@ impl Shard {
                 .desk
                 .entry
                 .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-            || self.desk.movable.shared_waiting()
     }
 
     /// One loop iteration without blocking.
@@ -1704,16 +1698,8 @@ impl Shard {
         // halved every shard's batch (`benchmark-results/rtloop-async-fill-bisect-20261010`).
         let mut cpu_before = None;
         let pending = self.has_inbound();
-        // Movable tasks a sibling or a thread off the runtime put on the shared queues, re-read after the announcement
-        // as the entry's flags are (`crate::movable`, kiln's goal 7).
-        let movable = self.desk.movable.pool();
         let parked = entry.parking.park_unless_pending(
-            || {
-                pending
-                    || entry.wakes.is_pending()
-                    || entry.control_pending.is_pending()
-                    || movable.as_ref().is_some_and(|pool| pool.shared_waiting())
-            },
+            || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
             || {
                 if learns {
                     switches_before_wait = attribution::voluntary_switches_now();

@@ -369,13 +369,6 @@ pub(crate) fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
     registry::RegisterKick::Kick(Kick::None)
 }
 
-/// A shard's movable queues, as its worker takes them: its runtime's pool, its place there and its own queues.
-type Movable = Option<(
-    std::sync::Arc<crate::movable::Pool>,
-    usize,
-    crate::movable::Queues,
-)>;
-
 /// One shard's worker: its id and the thread running it, whose result is the shard's counters or why it
 /// could not run.
 struct Worker {
@@ -411,8 +404,6 @@ pub struct Runtime {
     /// The thread that watches the shards for one held in a poll past its limit (`crate::watch`), stopped before
     /// the workers are.
     watchdog: Option<crate::watch::Watchdog>,
-    /// The shards' movable queues (`crate::movable`, kiln's goal 7).
-    movable: std::sync::Arc<crate::movable::Pool>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -452,7 +443,6 @@ fn run_worker(
     seed: ShardSeed,
     core: Option<u32>,
     ready: std::sync::mpsc::SyncSender<(u16, Result<(), RtError>)>,
-    movable: Movable,
 ) -> Result<Counters, RtError> {
     let id = seed.id;
     let pinned = core.map(|core| (core, crate::machine::probes::pin_current_thread(core)));
@@ -463,15 +453,6 @@ fn run_worker(
             return Err(error);
         }
     };
-    // Its movable queues, before the runtime is told it runs (`crate::movable`).
-    if let Some((pool, index, queues)) = movable
-        && let Err(error) = shard.context().movable.install(pool, index, queues)
-    {
-        let _ = ready.send((id, Err(error.clone())));
-        drop(shard);
-        registry::note_reclaimed();
-        return Err(error);
-    }
     // The shard's CPU clock, for observers that count their budget in its own time.
     registry::record_cpu_clock(id);
     let _ = ready.send((id, Ok(())));
@@ -593,12 +574,6 @@ impl Runtime {
         let mut notes = Vec::new();
         let seeds = register_seeds(config, prepare, &mut notes)?;
         let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
-        // The movable queues (`crate::movable`, kiln's goal 7): each shard's bound at its step's poll batch.
-        let (movable, queues) = crate::movable::Pool::new(
-            seeds.iter().map(|seed| seed.holder).collect(),
-            config.batch,
-        );
-        let mut queues = queues.into_iter();
         let (ready, acknowledged) = std::sync::mpsc::sync_channel(seeds.len().max(1));
         let mut workers = Vec::with_capacity(seeds.len());
         let mut seeds = seeds.into_iter().enumerate();
@@ -611,16 +586,13 @@ impl Runtime {
             let id = seed.id;
             let holder = seed.holder;
             let ready = ready.clone();
-            let own = queues
-                .next()
-                .map(|queues| (std::sync::Arc::clone(&movable), index, queues));
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the runtime owns one thread per shard (docs/runtime.md §3)"
             )]
             let spawned = std::thread::Builder::new()
                 .name(format!("hyper-rt-shard-{id}"))
-                .spawn(move || run_worker(seed, core, ready, own));
+                .spawn(move || run_worker(seed, core, ready));
             match spawned {
                 Ok(thread) => workers.push(Worker { id, holder, thread }),
                 Err(error) => {
@@ -644,7 +616,6 @@ impl Runtime {
         let watchdog = match crate::watch::Watchdog::start(
             workers.iter().map(|worker| worker.holder).collect(),
             config,
-            Some(std::sync::Arc::clone(&movable)),
         ) {
             Ok(watchdog) => watchdog,
             Err(error) => {
@@ -659,25 +630,7 @@ impl Runtime {
             retirement: Vec::new(),
             retirement_capacity,
             watchdog: Some(watchdog),
-            movable,
         })
-    }
-
-    /// Spawns `future` as a movable task of `class` from off the runtime's shards (`crate::movable`, kiln's goal 7):
-    /// on the shared queue, a parked shard kicked; whichever shard looks first runs it. On a shard,
-    /// [`crate::movable::spawn`] queues it on that shard.
-    #[track_caller]
-    pub fn spawn_movable<F: Future<Output = ()> + Send + 'static>(
-        &self,
-        class: crate::coop::Class,
-        future: F,
-    ) {
-        self.movable.spawn_shared(class, future);
-    }
-
-    /// What the runtime's movable tasks did so far (`crate::movable`, kiln's goal 7).
-    pub fn movable_stats(&self) -> crate::movable::Stats {
-        self.movable.stats()
     }
 
     /// Prepares exactly these native worker groups on the cold caller. Their handles are

@@ -23,8 +23,8 @@ pub fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     rustix::io::ioctl_fionbio(fd, true).map_err(io::Error::from)
 }
 
-/// Wait until `fd` is readable (or writable), under the task's own waker however it is polled (a
-/// movable task's poll: goal 7, `crate::rt::native`). A refused wait degrades to a short sleep, so
+/// Wait until `fd` is readable (or writable), under the task's own waker however it is polled (through a
+/// combinator's own waker: `crate::rt::native`). A refused wait degrades to a short sleep, so
 /// callers keep making progress (just more slowly) rather than fail.
 async fn ready(fd: &OwnedFd, write: bool) {
     let raw = fd.as_raw_fd();

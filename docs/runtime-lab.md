@@ -1145,8 +1145,11 @@ busy share of the A/B against census16's tree no worse.
 
 Goal 7 of the API runtime program (plan `01a1a59c2aea73e487fb6fcfe90c5fcc`, research
 `01a1a59c2aeb70e9824606865d6762ca`) built three more ways for the server to place its work on kiln-rt's
-shards beside today's. `[server] placement` picks one, and `KILN_RT_PLACEMENT` overrides it, so each runs
-from the setting alone, with no rebuild (`crate::placement`):
+shards beside today's. `[server] placement` picked one, and `KILN_RT_PLACEMENT` overrode it, so each ran
+from the setting alone, with no rebuild (`crate::placement`). Its A/B (below) kept `round-robin`, and on
+2026-11-06 the other three went with the setting, kiln-rt's movable tasks and `scripts/placement_lab` (the
+legacy audit: no switch kept for what an A/B decided against). What follows is the record; the code and the
+scripts are at `f2524b34921`.
 
 | placement | a new connection | a request on a connection | a held shard's queued work |
 | --- | --- | --- | --- |
@@ -1200,7 +1203,8 @@ layout, without losing throughput or CPU per request beyond noise:
 
 ### Running it
 
-On a Linux machine with systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
+As it was run (the scripts are at `f2524b34921`, the last tree with the placements). On a Linux machine with
+systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
 
 ```sh
 mkdir -p ~/.cache/g7-lab/bin && cp scripts/placement_lab/*.sh scripts/placement_lab/merge.py ~/.cache/g7-lab/
@@ -1264,8 +1268,8 @@ per request differs beyond noise.
 
 **By the rule, `round-robin` stays the default.** No placement's people's p99 is better beyond noise: `page`
 p99 and `api_write` p99 went -19.7% and +4.2% under `steer`, -22.3% and +5.6% under `steal`, -33.7% and
-+6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stay behind the setting for
-later A/B tests.
++6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stayed behind the setting
+until 2026-11-06, when they were taken out (above).
 
 **The shared layout and calm, partial** (22:10 to 23:50 UTC; the same build, CPUs and profile). In `shared`
 the server, its runners, the lab and 16 of kiln-lab's own hogs share the lab's cgroup at one weight; in `calm`
@@ -1323,8 +1327,8 @@ What it says:
 - **What placing costs is a sub-millisecond hop** before each handler, the one difference beyond noise; it
   bought nothing measurable here.
 - **Production's load may differ.** These rounds, as goal 8's, ran with the machine shared with other agents'
-  builds; a quieter machine narrows the noise, and the setting lets the A/B be run again on one build
-  (`scripts/placement_lab/driver.sh`).
+  builds; a quieter machine narrows the noise. The setting that let the A/B run again on one build
+  (`scripts/placement_lab/driver.sh`) is gone with the placements it chose between (2026-11-06).
 - **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
   queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
   shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.

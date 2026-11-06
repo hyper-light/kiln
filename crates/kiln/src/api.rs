@@ -178,8 +178,8 @@ impl srv::Handler for Api {
         // How its answer goes out (compressed, validated): read before the route takes the request (W21-R15).
         let asked = crate::http::compress::Asked::of(&req);
         // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2). The
-        // router's state is boxed once, so the layers it's carried in (its label, its placement, the
-        // connection's slot for its handler) each hold a pointer to it, not a copy of it: each took the whole
+        // router's state is boxed once, so the layers it's carried in (its label, the connection's slot for
+        // its handler) each hold a pointer to it, not a copy of it: each took the whole
         // of what it carried as its own, and a request's future, which kiln-http boxes anew for each request
         // on a connection that idled between them (the lab's readers'), was three times the router's (goal
         // 10, plan 01a1a87b2dae step 5).
@@ -9025,10 +9025,10 @@ mod tests {
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a request's future holds its router's state by a pointer, not a copy
-    /// of it in each layer it's carried in (its label, its placement): the future kiln-http keeps for each
-    /// request, boxed anew when its connection idled between requests, is smaller than the router's. In this
-    /// (test) build it was 54,816 bytes, three times a router's 8,808; now 2,064, the router's 2,840 boxed
-    /// apart once (its inline awaits of Observe's boxed too).
+    /// of it in each layer it's carried in (its label): the future kiln-http keeps for each request, boxed anew
+    /// when its connection idled between requests, is smaller than the router's. In this (test) build it was
+    /// 54,816 bytes, three times a router's 8,808; now 2,064, the router's 2,840 boxed apart once (its inline
+    /// awaits of Observe's boxed too).
     #[test]
     fn g10_s5_a_requests_future_holds_its_router_by_pointer() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -9036,10 +9036,9 @@ mod tests {
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let router = route(Arc::clone(&hub), lab_get("/api/me")?);
             let handled = crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?);
-            let placed = crate::placement::request(crate::overload::Class::Normal, false, crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?));
-            let (router_b, handled_b, placed_b) = (size_of_val(&router), size_of_val(&handled), size_of_val(&placed));
-            drop((router, handled, placed));
-            anyhow::ensure!(handled_b < router_b && placed_b < router_b, "the router's {router_b} bytes, a request's {handled_b}, placed {placed_b}");
+            let (router_b, handled_b) = (size_of_val(&router), size_of_val(&handled));
+            drop((router, handled));
+            anyhow::ensure!(handled_b < router_b, "the router's {router_b} bytes, a request's {handled_b}");
             Ok(())
         })
     }

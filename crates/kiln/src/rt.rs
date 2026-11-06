@@ -3,13 +3,12 @@
 //! of primitives the rest of kiln uses.
 //!
 //! * One process-wide [`hyper_rt::Runtime`], started on first use with the sizing chosen by
-//!   [`configure`] (server, agent or CLI). There is no preemption, and shards take each other's work
-//!   only where the server's placement makes its requests movable tasks (goal 7, `crate::placement`),
-//!   so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and
-//!   below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
+//!   [`configure`] (server, agent or CLI). There is no preemption, and shards don't take each other's
+//!   admitted work, so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the
+//!   shards and below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
-//!   registered); spawns from outside the runtime are spread round-robin over the shards. Accepted
-//!   connections go where the placement says ([`spawn_connection`]).
+//!   registered); spawns from outside the runtime and accepted connections ([`spawn_connection`]) are
+//!   spread round-robin over the shards.
 //! * A task gives up its shard on time with no hand-placed yields: hyper-rt charges its leaf futures
 //!   (sockets, timers, its channels) to the polling task, and the cross-task primitives here charge
 //!   the same budget (`hyper_rt::coop`, kiln's goal 6), so a loop whose waits are always ready yields
@@ -1103,11 +1102,6 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
-/// What the runtime's movable tasks did so far (goal 7, `crate::placement`); `None` when it couldn't start.
-pub fn movable_stats() -> Option<hyper_rt::movable::Stats> {
-    rt().ok().map(|rt| rt.runtime.movable_stats())
-}
-
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -1303,17 +1297,14 @@ where
     JoinHandle { rx, abort }
 }
 
-/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
-/// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
-/// task starting Critical: its first request's head must be read before the request's class is known, and
-/// reading a head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does (goal 7's A/B kept
+/// round-robin, docs/runtime-lab.md, "Goal 7: placement"); its task starting Critical: its first request's head
+/// must be read before the request's class is known, and reading a head costs little
+/// (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
 #[track_caller]
 pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
-    let critical = hyper_rt::coop::Class::Critical;
-    let steered = crate::placement::get().steers()
-        && crate::placement::connection_shard().is_some_and(|holder| hyper_rt::runtime::submit_movable_as(holder, critical, bootstrap(&slot)).is_ok());
-    if steered || submit_spread_as(&slot, critical) || submit(&slot) {
+    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -1941,9 +1932,9 @@ impl<T: Send + 'static> Bridge<T> {
 
 impl<T: Send + 'static> Drop for Bridge<T> {
     fn drop(&mut self) {
-        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another shard than its
-        // helper's (a movable task's bridge, the task moved since: goal 7, `hyper_rt::movable`), it is cancelled
-        // there by a message, so its wait doesn't outlive what it waited for.
+        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another thread than its
+        // helper's shard (a future that held it, dropped there), it is cancelled there by a message, so its wait
+        // doesn't outlive what it waited for.
         if hyper_rt::futures::shard_id().is_some_and(|here| here.0 == self.task.0.shard()) {
             let _ = hyper_rt::futures::cancel(self.task);
         } else {
@@ -1954,8 +1945,8 @@ impl<T: Send + 'static> Drop for Bridge<T> {
 
 /// `fut` polled under its own task's waker, which hyper-rt's leaves need (a connect, a socket's readiness wait):
 /// as it is where its caller's poll is native, else in a helper task on this shard ([`Bridge`]) that wakes the
-/// caller when it ends: a movable task's poll (goal 7, `hyper_rt::movable`), or one through a combinator's own
-/// waker. Refused (`NotOnShardThread`) off the runtime's shards.
+/// caller when it ends: a poll through a combinator's own waker. Refused (`NotOnShardThread`) off the runtime's
+/// shards.
 pub async fn native<F>(fut: F) -> Result<F::Output, RtError>
 where
     F: Future + 'static,

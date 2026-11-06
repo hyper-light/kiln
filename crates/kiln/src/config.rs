@@ -127,13 +127,6 @@ pub struct Server {
     /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
     /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
     pub shed: bool,
-    /// How the server places its work on its runtime's shards (goal 7 of the API runtime program,
-    /// `crate::placement`): `round-robin` (connections dealt in turn, requests served in their
-    /// connection's task), `steer` (connections and requests to the less delayed of two shards), `steal`
-    /// (requests as tasks an idle shard takes from a busy one) or `both`. `round-robin` by default, as the
-    /// lab's A/B picked it (docs/runtime-lab.md, "Goal 7: placement"); the others stay for later A/B tests.
-    /// `KILN_RT_PLACEMENT` overrides it.
-    pub placement: crate::placement::Placement,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
     /// these alone (`AllowedCPUs=`, where the service manager has the cpuset controller) and,
@@ -490,7 +483,6 @@ impl Default for Server {
             h3_cert: None,
             h3_key: None,
             shed: false,
-            placement: crate::placement::Placement::default(),
             cores: None,
             realtime: false,
             nudge: crate::nudge::Mode::Off,
@@ -699,11 +691,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_BROWSER_CONGESTION") {
             cfg.server.browser_congestion = Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        }
-        // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
-        if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {
-            cfg.server.placement = crate::placement::Placement::parse(&v)
-                .ok_or_else(|| anyhow::anyhow!("KILN_RT_PLACEMENT={v}: round-robin, steer, steal or both"))?;
         }
         Ok(cfg)
     }
