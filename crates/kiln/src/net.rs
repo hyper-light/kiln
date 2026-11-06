@@ -584,8 +584,9 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
-/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
+/// The bytes of transport events the net thread hands its owner (the server's hub loops, `crate::wire::fan`;
+/// a runner's one loop) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`WINDOW`]), what the
 /// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
 /// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
 /// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
