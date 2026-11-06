@@ -18,6 +18,9 @@ hot = [
   "crates/kiln/src/api.rs",
   "crates/kiln/src/overload.rs",
   "crates/kiln/src/ui.rs",
+  # The HTTP/3 door: POST /api/me/door, and the door's CONNECTs (goal 4 of the browser protocol program).
+  "crates/kiln/src/h3door.rs",
+  "crates/kiln/src/h3door",
   "crates/kiln/src/authz",
   "crates/kiln/src/mcp/mod.rs",
   "crates/kiln/src/route_latency.rs",
@@ -31,6 +34,9 @@ hot = [
   # Agent sessions' events (every change of a session's info) out of each owner shard to their readers:
   # the events sockets, push and agents.wait (goal 4, plan 01a1a59c2a9c step 5).
   "crates/kiln/src/memory/lanes.rs",
+  # The events sockets' feed (W21-R15): every frame the hub emits, pushed from the shard that emits it (an
+  # agent session's change from its owner's) and read by every page's socket, numbered so a page resumes.
+  "crates/kiln/src/wire/events/feed.rs",
   # Queues bounded in bytes: each session owner's inbox (every runner's update), the net thread's queues to
   # and from the hub, and the rest of kiln's that runners' messages pass through (goal 4, plan 01a1a59c2a9c
   # step 5).
@@ -75,6 +81,10 @@ hot = [
   # The ship model, and the CI state the API reads.
   "crates/kiln/src/ship.rs",
   "crates/kiln/src/store.rs",
+  # The browser protocol (goal 2 of the browser protocol program): its sans-IO core, which every
+  # protocol connection runs, and kiln's topics fed from the hub and the bus.
+  "crates/kiln-bp/src",
+  "crates/kiln/src/bp",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
   # Turns with no lock: gates, batons, reads and writes, keyed and once (goal 5, plan 01a1a59c2aae, its top goal).

@@ -1422,7 +1422,88 @@ impl View {
             meta_bytes: self.meta_bytes,
             state_bytes: self.state_bytes,
             rev: self.rev,
+            lean: false,
+            window: None,
+            from: 0,
         }
+    }
+
+    /// A snapshot for a viewer that takes the session as `view` says (W21-R15, docs/wire.md,
+    /// "Windows"): all of it, or its newest events alone, as many as a window holds
+    /// (`super::window::start`), and where they begin. `older`: events before what the copy holds may
+    /// be kept elsewhere (the server's conversation store), so a window that begins at the copy's
+    /// first may still have more before it.
+    pub fn parts_for(&self, view: super::registry::View, older: bool) -> Parts {
+        let from = if view.window { self.window_start(self.events.len(), super::window::TURNS, view.lean) } else { 0 };
+        Parts { lean: view.lean, window: view.window.then(|| self.window_at(from, older)), from, ..self.parts() }
+    }
+
+    /// What a viewer that had revision `after` (None: nothing) and takes the session as `view` says
+    /// is sent: what it lacks when the copy can say, else a snapshot. To a viewer that takes a window,
+    /// what changed since is sent only while it's no more than a window holds; past that it's sent a
+    /// window: a resume never costs more than a first load.
+    pub fn parts_after(&self, after: Option<u64>, view: super::registry::View, older: bool) -> Parts {
+        let since = after.and_then(|rev| self.parts_since(rev)).filter(|p| !view.window || self.fits(p.since.unwrap_or_default(), view.lean));
+        match since {
+            Some(p) => Parts { lean: view.lean, ..p },
+            None => self.parts_for(view, older),
+        }
+    }
+
+    /// Whether the events changed after revision `after` fit a window's bounds.
+    fn fits(&self, after: u64, lean: bool) -> bool {
+        let (mut rows, mut bytes) = (0usize, 0usize);
+        for (i, m) in self.events.metas().enumerate() {
+            if m.at <= after {
+                continue;
+            }
+            rows += 1;
+            bytes = bytes.saturating_add(if lean { self.events.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.len });
+            if rows > super::window::ROWS || bytes > super::window::BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Where a window of the events before `end` begins, holding at most `turns` turns.
+    fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
+        super::window::start_at(end, turns, |i| self.events.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
+    }
+
+    /// The number its timeline begins at: where a clear began it again (`State::cleared`, read from the state's own
+    /// field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
+    fn floor(&self) -> u64 {
+        self.state.get::<u64>("cleared").unwrap_or(1).max(1)
+    }
+
+    /// A window (or a page) that begins at event `begin`: that event's number, and whether there's
+    /// more before it, in the copy or (`older`) perhaps in the conversation store.
+    pub(super) fn window_at(&self, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
+        let before = self.events.meta(begin).and_then(|m| m.seq);
+        crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > self.floor())) }
+    }
+
+    /// An older page of its events, for a viewer that has them from number `before` on: those just
+    /// before it, as many as a page holds (`super::window::PAGE_TURNS`), as `lean` says, oldest
+    /// first. [`super::registry::Paged::Store`] when the copy has none before it.
+    pub fn page(&self, before: u64, lean: bool, older: bool) -> super::registry::Paged {
+        use super::registry::Paged;
+        let end = self.events.partition_point(|m| m.seq.is_some_and(|s| s < before));
+        if end == 0 {
+            let floor = self.floor();
+            return if older && before > floor { Paged::Store { before, floor } } else { Paged::Page { events: Vec::new(), window: crate::wire::ui::EventsWindow { before: None, more: false } } };
+        }
+        let begin = self.window_start(end, super::window::PAGE_TURNS, lean);
+        let events = (begin..end).filter_map(|i| self.events.get(i)).map(|e| e.entry.sent(lean).to_owned()).collect();
+        Paged::Page { events, window: self.window_at(begin, older) }
+    }
+
+    /// Event `event`, whole, as the copy has it: what a lean one held back (`super::window::lean`).
+    pub fn event_text(&self, event: &str) -> Option<String> {
+        // Its meta's id, kept in the meta (goal 11, plan 01a1a87b2e56 step 5).
+        let i = self.events.metas().position(|m| m.id() == event)?;
+        self.events.get(i).map(|e| e.entry.text().to_owned())
     }
 
     /// What brings a viewer that has this copy through revision `after` up to now: its info and
@@ -1491,7 +1572,7 @@ impl View {
     /// 10, plan 01a1a87b2dae step 5: the lab's events reads, at p99 1.1 to 2.0 ms on rt5 calm, inflated a
     /// whole chunk's segment each, on the request's shard).
     pub fn events_page(&self, before: Option<u64>, limit: usize) -> Option<Vec<Bytes>> {
-        self.page(before, limit, true).ok()
+        self.events_page_with(before, limit, true).ok()
     }
 
     /// [`View::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
@@ -1499,11 +1580,11 @@ impl View {
     /// and [`View::events_page`] makes them, off the shard (the reads after take them as kept); [`Unread::Cannot`]
     /// where `events_page` says none.
     pub fn events_page_kept(&self, before: Option<u64>, limit: usize) -> Result<Vec<Bytes>, Unread> {
-        self.page(before, limit, false)
+        self.events_page_with(before, limit, false)
     }
 
     /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
-    fn page(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
+    fn events_page_with(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
             Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
             None => self.events.len(),
@@ -1604,6 +1685,9 @@ pub struct Mirror {
     pub(super) reset_at: u64,
     /// The Open being taken starts the copy over (a whole snapshot follows it).
     pub(super) started_over_pending: bool,
+    /// The events socket's feed's number of its info's last `harness` frame (0: none yet), which its next lets
+    /// go of (`crate::hub::Hub::emit_harness`; goal 11, plan 01a1a87b2e56 step 5).
+    pub(super) harness_at: u64,
     /// When this server opened it, until its machine announces it: a report from the machine
     /// that left it out was made before its open got there, and doesn't end it.
     pub(super) opened_at: Option<std::time::Instant>,
@@ -1697,6 +1781,7 @@ impl Mirror {
             rev: 0,
             reset_at: 0,
             started_over_pending: false,
+            harness_at: 0,
             opened_at: None,
             slot,
             info_json: encoding,

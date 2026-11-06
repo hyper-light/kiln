@@ -340,6 +340,8 @@ pub static ROUTES: &[Rule] = &[
     // A person's own notification rules (W19-R06).
     r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
     r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
+    // The HTTP/3 door's URL, hashes and a ticket (goal 4 step 6).
+    r("POST", "/api/me/door", SIGNED_IN, At::Server),
     // W10: one's own passkeys and password.
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),

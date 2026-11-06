@@ -105,6 +105,9 @@ scheduler assigns the oldest matching job. A lost agent (missed heartbeats) requ
 3. **Job**: retries, agent-loss requeue, timeouts, cancellation that kills the whole process group.
 4. **State**: SQLite in WAL mode with `synchronous=NORMAL`; recovery on start marks orphaned runs.
 
+Browsers can also reach kiln over WebTransport on the HTTP/3 door's own UDP address, when
+`[server] h3_addr` turns it on (docs/browser-protocol.md, "The HTTP/3 door"; docs/http.md).
+
 ## Agent transport
 
 Agents keep one QUIC connection to the server (hyper-transport, mutual TLS: the agent checks the

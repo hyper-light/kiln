@@ -1015,8 +1015,8 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a changed verdict's event is written out on the compute pool, as `Hub::emit`
-    /// wrote it on its caller's shard, and goes to the hub's listeners as it would have: `refresh` writes none on its
-    /// shard.
+    /// wrote it on its caller's shard, and goes to the hub's listeners as it would have, and to the events sockets'
+    /// feed (W21-R15) as `Hub::emit`'s goes: `refresh` writes none on its shard.
     #[test]
     fn g9_s3_a_verdicts_event_is_written_off_the_shard_as_emit_wrote_it() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -1027,11 +1027,18 @@ mod tests {
             let lane = ("kiln".to_owned(), "ci".to_owned(), "main".to_owned());
             let written = crate::rt::compute(move || event_written(&lane, sha(1), Kind::Culprit, "app::tests main fails here first".into(), verdict)).await?;
             anyhow::ensure!(*written == *event.text(), "{written}");
+            let from = hub.feed.head();
             hub.emit_written(Arc::clone(&written));
             hub.emit(&event);
             let off = crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??;
             let on = crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??;
             anyhow::ensure!(off == written && on == written, "the same to its listeners: {off} / {on}");
+            // The events sockets read the feed alone: both numbered there, the same text.
+            let fed = match hub.feed.since(from) {
+                crate::wire::events::feed::Since::Frames(frames) => frames.iter().filter(|f| *f.text == *written).count(),
+                crate::wire::events::feed::Since::Gap => 0,
+            };
+            anyhow::ensure!(fed == 2, "the same to the events sockets' feed: {fed} of 2");
             let code = include_str!("verdict.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
             let body = code.split("async fn refresh_with(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
             anyhow::ensure!(!body.is_empty() && body.contains("hub.emit_written(") && !body.contains("hub.emit(&"), "refresh writes its verdicts' events off its shard");

@@ -1,0 +1,27 @@
+# Lines are in the order they arrived.
+# What Safari 26.4 (macOS 26.4, opened with `open -g`: its WebDriver needs "Allow remote
+# automation", which is off) sent to open a WebTransport session, decrypted per stream as the
+# lab's QUIC server (aioquic 1.7.2 at the QUIC layer alone, crates/kiln-http/lab/wt-capture)
+# received it, 2026-11-04, the server sending the door's SETTINGS (every dialect).
+# Safari spoke draft-14: its SETTINGS carry SETTINGS_WT_MAX_SESSIONS 0x14e9cd29 = 1 and drafts
+# 07-12's 0xc671706a = 1 (and no 0x2b603742), with draft-14's flow-control settings
+# (WT_INITIAL_MAX_DATA 0x2b61 = 8 MiB, WT_INITIAL_MAX_STREAMS_UNI 0x2b64 and _BIDI 0x2b65 = 100);
+# the door sends none of them and WT_MAX_SESSIONS = 1, so flow control stays off (draft-14 §5.1).
+# Its CONNECT has no sec-webtransport-http3-draft02 header. It needs from the server before it
+# sends CONNECT: WT_MAX_SESSIONS (0x14e9cd29) or 0xc671706a > 0, and H3_DATAGRAM = 1. It opened no
+# QPACK encoder or decoder stream.
+# Then the page echoed a bidi stream, a uni stream and a datagram, and closed (code 7, "bye").
+browser safari 26.4
+draft draft-14
+# The control stream: SETTINGS (QPACK table 16,383, 100 blocked streams, H3_DATAGRAM, GREASE,
+# both later dialects, the flow-control settings).
+stream 2 000434017fff0740643301c0000009266daffbc000000084187532c0000000c671706a0194e9cd29016b61808000006b6440646b654064
+# The CONNECT (HEADERS, 112 bytes).
+stream 0 0140700000cfd7508b089d5c0b8170dc0bcd34cf51a463c27fc4989d4a981294a5294a5294a5294a5294a5294a5294a5294a5294a5294a5294ff2f00b95d8749c87a3f89f058d360ea4567b13f5f4b909d29aee30c044eae05c0b86e05e69e072f09f09587dc66a071d055abb0e9390f423f00
+# A bidi stream (signal 0x41 in two bytes, session 0, payload) and a uni stream (0x54, session 0).
+stream 4 40410068656c6c6f2d62696469 fin
+stream 6 40540068656c6c6f2d756e69 fin
+datagram 0068656c6c6f2d646772616d
+# Last, on the CONNECT stream, WT_CLOSE_SESSION (code 7, "bye") in a DATA frame, then its FIN.
+stream 0 000a68430700000007627965
+stream 0 - fin

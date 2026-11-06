@@ -175,6 +175,8 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
+        // How its answer goes out (compressed, validated): read before the route takes the request (W21-R15).
+        let asked = crate::http::compress::Asked::of(&req);
         // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2). The
         // router's state is boxed once, so the layers it's carried in (its label, its placement, the
         // connection's slot for its handler) each hold a pointer to it, not a copy of it: each took the whole
@@ -187,6 +189,11 @@ impl srv::Handler for Api {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
+        // Boxed as the route is (goal 10, plan 01a1a87b2dae step 5): the layers a request is carried in
+        // hold a pointer to it, not its compressing. An answer it leaves as it is (a tiny answer to a POST, a
+        // type that doesn't compress, a stream) makes no future (goal 9, plan 01a1a87b2cec step 5).
+        let resp = if crate::http::compress::untouched(&asked, &resp) { resp } else { boxed(|| crate::http::compress::finish(asked, resp)).await };
+        // Its compressing counted in what it took, as W21-R15 observed it, for its class and its own timing alike.
         let took = began.elapsed();
         if let Some(class) = class {
             crate::route_latency::observe(class, waited, took);
@@ -717,6 +724,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let rest: Vec<&str> = rest.to_vec();
             boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
         }
+        // The HTTP/3 door's URL, pinned hashes and a single-use ticket for the caller (goal 4 step 6).
+        (&Method::POST, ["api", "me", "door"]) => Ok(srv::json(StatusCode::OK, &crate::h3door::info(&caller.name))),
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
         (&Method::POST, ["api", "me", "passkeys", "options"]) => {
@@ -1038,7 +1047,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             // And of agents, the ones it sees (docs/agents.md, "Whose agents").
             let everyone = caller.agent.is_none() && (caller.is_owner() || caller.can("agents.manage", &crate::authz::Scope::Server));
             let agents = (!everyone).then(|| AgentsSeen { caller: caller.clone(), seen: HashMap::new() });
-            events_ws(hub.clone(), req, narrow, agents)
+            events_ws(hub.clone(), req, Asked::of(&q), narrow, agents)
         }
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub, &caller)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub, &caller)),
@@ -1435,6 +1444,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::GET, ["api", "harness", "history"]) => boxed(|| harness_history(&hub, &caller, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events(&hub, id, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events", event]) => boxed(|| harness_event(&hub, id, event, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "timeline"]) => boxed(|| harness_timeline(&hub, id, &q)).await,
         (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
         (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
@@ -5088,18 +5099,15 @@ struct AgentsSeen {
 }
 
 impl AgentsSeen {
-    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
-        if !(text.contains("\"type\":\"harness") || text.contains("\"type\":\"agent_change\"")) {
-            return true;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
-        let id = match v.get("type").and_then(serde_json::Value::as_str) {
-            Some("harness") => v.pointer("/info/id"),
-            Some("harness_closed") => v.get("id"),
-            Some("agent_change") => v.get("agent"),
-            _ => return true,
+    /// Read from what the feed read of the frame once for every socket (`feed::Meta`), not from
+    /// its text again.
+    async fn lets(&mut self, hub: &Hub, m: &crate::wire::events::feed::Meta) -> bool {
+        use crate::wire::events::feed::Agent;
+        let id = match &m.agent {
+            Agent::Free => return true,
+            Agent::Of(None) => return false,
+            Agent::Of(Some(id)) => id,
         };
-        let Some(id) = id.and_then(serde_json::Value::as_str) else { return false };
         if let Some(&ok) = self.seen.get(id) {
             return ok;
         }
@@ -5113,41 +5121,54 @@ impl AgentsSeen {
 }
 
 impl Narrow {
-    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
-        let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
-        match kind {
+    async fn lets(&mut self, hub: &Hub, m: &crate::wire::events::feed::Meta) -> bool {
+        if !m.parsed {
+            return false;
+        }
+        match m.kind.as_str() {
             "resync" => return true,
-            "inbox" => return v.get("person").and_then(serde_json::Value::as_str) == Some(self.person.as_str()),
+            "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
-        let named = v
-            .get("repo")
-            .and_then(|r| r.as_str().map(str::to_owned).or_else(|| r.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)))
-            .or_else(|| v.pointer("/run/repo_name").and_then(serde_json::Value::as_str).map(str::to_owned));
-        if let Some(r) = named {
-            return self.repos.contains(&r);
+        if let Some(r) = &m.repo {
+            return self.repos.contains(r);
         }
-        let Some(run) = v.pointer("/job/run_id").and_then(serde_json::Value::as_str).map(str::to_owned) else { return false };
-        if !self.runs.contains_key(&run) {
+        let Some(run) = &m.job_run else { return false };
+        if !self.runs.contains_key(run) {
             if self.runs.len() > 10_000 {
                 self.runs.clear();
             }
             let repo = hub.store.run(run.clone()).await.ok().flatten().map(|r| r.repo_name);
             self.runs.insert(run.clone(), repo);
         }
-        self.runs.get(&run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
+        self.runs.get(run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
     }
 }
 
-fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
+/// How an events socket's page asked to be sent (docs/wire.md, "The events socket"): batched
+/// (`?batch=1`, or `?after=`), only some types (`?topics=a,b`), from where it was (`?after=<at>`).
+/// A page that asks for none of it is sent every frame as it comes, as before.
+struct Asked {
+    batch: bool,
+    topics: Option<std::collections::HashSet<String>>,
+    after: Option<String>,
+}
+
+impl Asked {
+    fn of(q: &HashMap<String, String>) -> Asked {
+        let after = q.get("after").filter(|a| !a.is_empty()).cloned();
+        Asked { batch: after.is_some() || q.get("batch").is_some_and(|b| b == "1"), topics: q.get("topics").map(|t| crate::wire::events::feed::topics(t)), after }
+    }
+}
+
+fn events_ws(hub: Arc<Hub>, req: Request, asked: Asked, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
     let sock = ui::Socket::of(Wire::EventsUp, Wire::EventsDown, &caller_name(&req), None);
     let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        if let Err(e) = pump_events(&hub, socket, &sock, narrow, agents).await {
+        if let Err(e) = pump_events(&hub, socket, &sock, asked, narrow, agents).await {
             tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
@@ -5160,92 +5181,180 @@ fn caller_name(req: &Request) -> String {
     req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone())
 }
 
-async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
+/// Whether frame `f` goes to this socket: a type it asked for, about what its caller may see.
+async fn events_let(hub: &Hub, out: &crate::wire::events::feed::Outbox, narrow: &mut Option<Narrow>, agents: &mut Option<AgentsSeen>, f: &crate::wire::events::feed::Frame) -> bool {
+    let m = f.meta();
+    if !out.wants(&m.kind) {
+        return false;
+    }
+    (match narrow.as_mut() {
+        Some(n) => n.lets(hub, m).await,
+        None => true,
+    }) && match agents.as_mut() {
+        Some(a) => a.lets(hub, m).await,
+        None => true,
+    }
+}
+
+/// The events socket (docs/wire.md, "The events socket"): what the feed has after where the page
+/// is, as it comes. A page that asked for batches gets them a window at a time ([`feed::WINDOW`]),
+/// coalesced, each saying where the feed is; one that didn't gets each frame as it comes. Either
+/// that falls further behind than the feed keeps is told `resync`.
+///
+/// [`feed::WINDOW`]: crate::wire::events::feed::WINDOW
+async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked: Asked, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
+    use crate::wire::events::feed::{self, At, Since};
     use futures::FutureExt as _;
     let (mut tx, rx_ws) = socket.split();
     // The page's own messages are asked for only once its socket woke (`ws::Gated`; goal 9, plan 01a1a87b2cec
-    // step 5): every event wakes this task, and each ask zero-filled the socket's read buffer and read nothing.
+    // step 5): every frame the feed takes wakes this task, and each ask zero-filled the socket's read buffer and
+    // read nothing.
     let mut rx_ws = ws::Gated::new(rx_ws);
-    // The hub's events, and agent sessions' own on their owners' lanes (`Hub::events`, `Hub::harness_events`;
-    // goal 4, plan 01a1a59c2a9c step 5): no lock between this socket's shard and their senders'. The socket
-    // sends both, each as it comes, holding as many of each as the hub's ring held for a socket
-    // ([`crate::hub::EVENTS`], in all its lanes).
-    let mut rx = hub.subscribe_events()?;
-    let mut sessions = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes()))?;
+    // The hub's events and agent sessions' own, both numbered in the feed (W21-R15), which no push or read
+    // takes a lock of (`crate::wire::events::feed`; goal 4, plan 01a1a59c2a9c step 5, and goal 5's rule): no
+    // lock between this socket's shard and their senders'.
+    let fd = &hub.feed;
+    // Listened to before the first look, for as long as the socket's open: a frame pushed while it looks
+    // wakes its next wait.
+    let woke = fd.listen();
+    let batch = asked.batch;
+    let (mut cursor, missed) = if batch { fd.resume(asked.after.as_deref()) } else { (fd.head(), false) };
+    let mut out = feed::Outbox::new(asked.topics);
+    if missed {
+        out.resync();
+    }
+    // Lets the filters pass a frame without reading it when there are none.
+    let everything = out.wants("") && narrow.is_none() && agents.is_none() && !batch;
     hub.emit_queue();
+    // The first batch goes at once, saying where the feed is.
+    let mut first = batch;
+    let mut sent_at: Option<Instant> = None;
+    let mut due: Option<Instant> = None;
     loop {
-        let first = futures::select_biased! {
-            ev = rx.recv().fuse() => ev,
-            ev = sessions.recv().fuse() => ev,
-            msg = rx_ws.next().fuse() => {
-                if hub.unread_only(sock, &mut tx, ui::came(msg), |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
-                    return Ok(());
+        cursor = take_since(hub, &mut tx, cursor, &mut out, batch, everything, &mut narrow, &mut agents).await?;
+        if batch && (first || !out.is_empty()) {
+            let now = Instant::now();
+            let when = if first || out.len() >= feed::MAX_BATCH { now } else { due.unwrap_or_else(|| sent_at.map_or(now, |s| (s + feed::WINDOW).max(now))) };
+            if when <= now {
+                if let Some(text) = out.flush(At { epoch: fd.epoch(), seq: cursor }, first) {
+                    tx.send(ws::text(text)).await?;
                 }
+                first = false;
+                sent_at = Some(now);
+                due = None;
                 continue;
             }
+            due = Some(when);
+        }
+        let window = async move {
+            match due {
+                Some(d) => crate::rt::sleep_until(d).await,
+                None => futures::future::pending::<()>().await,
+            }
         };
-        if !send_ready(hub, &mut tx, first, &mut [&mut rx, &mut sessions], &mut narrow, &mut agents).await? {
-            return Ok(());
+        futures::select_biased! {
+            () = woke.woken().fuse() => {}
+            _ = window.fuse() => {}
+            msg = rx_ws.next().fuse() => {
+                let came = ui::came(msg);
+                if let Came::Text(t) = &came
+                    && let Some(up) = events_topics(t.as_str())
+                {
+                    match up {
+                        Ok(crate::wire::events::EventsUp::Topics { topics, since }) => {
+                            let added = out.set_topics(topics.map(|t| t.into_iter().collect()));
+                            // Of the types new to it, what came since the page last heard: what it
+                            // loaded as it asked for them misses none of their changes.
+                            if let Some(s) = since.as_deref().and_then(At::parse).filter(|s| s.epoch == fd.epoch() && !added.is_empty()) {
+                                let kept = match fd.since(s.seq) {
+                                    Since::Frames(f) => f,
+                                    Since::Gap => fd.kept(),
+                                };
+                                let mut earlier = Vec::new();
+                                for f in kept {
+                                    if f.seq <= cursor && added.contains(&f.meta().kind) && events_let(hub, &out, &mut narrow, &mut agents, &f).await {
+                                        earlier.push(f);
+                                    }
+                                }
+                                out.add_earlier(earlier);
+                            }
+                        }
+                        Err(r) => {
+                            hub.note_refused(sock, &r).await;
+                            tx.send(ws::text(crate::wire::events::ServerEvent::Refused(r).text())).await?;
+                        }
+                    }
+                } else if hub.unread_only(sock, &mut tx, came, |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
 
-/// An events socket's hub events: `first`, then every one ready after it from its `sources`, each sent unless
-/// the socket's filters keep it off, written as one: fed, then flushed once (goal 4, plan 01a1a59c2a9c step 5;
-/// as goal 9 step 5 found, an event a flush was a write to the connection an event). At most one ring's
-/// worth goes in one flush ([`crate::hub::EVENTS`]), so what comes while it writes waits for the next. A
-/// source that let some go before the socket took them says `Resync`; false once a source is gone.
-async fn send_ready<S>(
+/// What came on the feed after `cursor` for an events socket (W21-R15), and where it then is: to a
+/// batched one, into its outbox; to one that isn't, each frame its filters let through, as the feed's
+/// own text (one allocation however many sockets send it), and `Resync` when some are gone, written as
+/// one: fed, then flushed once (goal 4, plan 01a1a59c2a9c step 5; as goal 9 step 5 found, a flush an
+/// event was a write to the connection an event).
+#[allow(clippy::too_many_arguments)]
+async fn take_since<S>(
     hub: &Hub,
     tx: &mut S,
-    first: Result<Arc<str>, async_broadcast::RecvError>,
-    sources: &mut [&mut crate::memory::lanes::Reader<Arc<str>>],
+    cursor: u64,
+    out: &mut crate::wire::events::feed::Outbox,
+    batch: bool,
+    everything: bool,
     narrow: &mut Option<Narrow>,
     agents: &mut Option<AgentsSeen>,
-) -> anyhow::Result<bool>
+) -> anyhow::Result<u64>
 where
     S: futures::Sink<ws::Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
+    use crate::wire::events::feed::Since;
     use futures::SinkExt as _;
-    let (mut next, mut taken) = (Some(first), 0usize);
-    while let Some(ev) = next.take() {
-        match ev {
-            Ok(text) => {
-                let keep = match narrow.as_mut() {
-                    Some(n) => n.lets(hub, text.as_ref()).await,
-                    None => true,
-                } && match agents.as_mut() {
-                    Some(a) => a.lets(hub, text.as_ref()).await,
-                    None => true,
-                };
-                if keep {
-                    tx.feed(ws::shared_text(&text)).await?;
+    let fd = &hub.feed;
+    if fd.head() <= cursor {
+        return Ok(cursor);
+    }
+    let (mut at, mut wrote) = (cursor, false);
+    match fd.since(cursor) {
+        Since::Gap => {
+            at = fd.head();
+            if batch {
+                out.resync();
+            } else {
+                tx.feed(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
+                wrote = true;
+            }
+        }
+        Since::Frames(frames) => {
+            for f in frames {
+                at = f.seq;
+                if !everything && !events_let(hub, out, narrow, agents, &f).await {
+                    continue;
+                }
+                if batch {
+                    out.add(f);
+                } else {
+                    tx.feed(ws::shared_text(&f.text)).await?;
+                    wrote = true;
                 }
             }
-            Err(async_broadcast::RecvError::Overflowed(_)) => tx.feed(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?,
-            Err(async_broadcast::RecvError::Closed) => {
-                tx.flush().await?;
-                return Ok(false);
-            }
-        }
-        taken += 1;
-        if taken < crate::hub::EVENTS {
-            next = sources.iter_mut().find_map(|source| ready(source));
         }
     }
-    tx.flush().await?;
-    Ok(true)
+    if wrote {
+        tx.flush().await?;
+    }
+    Ok(at)
 }
 
-/// The next of `source`'s events that's ready now, if one is: what its `recv` would have said at once.
-fn ready(source: &mut crate::memory::lanes::Reader<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
-    match source.try_recv() {
-        Ok(text) => Some(Ok(text)),
-        Err(async_broadcast::TryRecvError::Overflowed(n)) => Some(Err(async_broadcast::RecvError::Overflowed(n))),
-        Err(async_broadcast::TryRecvError::Closed) => Some(Err(async_broadcast::RecvError::Closed)),
-        Err(async_broadcast::TryRecvError::Empty) => None,
-    }
+/// `text`, when it's a `topics` frame (`crate::wire::events::EventsUp`), read; or why it
+/// couldn't be. Anything else is every socket's (`unread`).
+fn events_topics(text: &str) -> Option<Result<crate::wire::events::EventsUp, ui::Refused>> {
+    let v = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (v.get("t").and_then(serde_json::Value::as_str) == Some("topics")).then(|| serde_json::from_value(v).map_err(|e| ui::Refused::malformed("topics", e.to_string())))
 }
 
 // ------------------------------------------------------------------ terminal ws
@@ -5608,6 +5717,63 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
 fn stored_events(rows: &[crate::convo::rows::EventRow]) -> anyhow::Result<Bytes> {
     let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
     crate::reads::encode(&json!({ "events": events }))
+}
+
+/// `GET /api/harness/sessions/:id/timeline?before=<seq>&lean=1`: the page of a session's events
+/// just before number `before`, for a viewer whose window (or last page) begins there (docs/wire.md,
+/// "Windows"): `{events, before?, more}`, oldest first, whole turns where they fit, at most a page's
+/// bounds (`crate::harness::window`); `before` where it begins, to ask for the one before it. From
+/// the server's copy of the session, and past what that holds, from its conversation store. Pages
+/// asked for one after another meet with no gap and nothing twice: each is the events numbered
+/// from where it begins up to where the last began, and new events are numbered after them all.
+async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    use crate::harness::registry::Paged;
+    use crate::wire::ui::{EventsWindow, TimelinePage};
+    let Some(before) = q.get("before").and_then(|b| b.parse::<u64>().ok()) else { return Err(err(StatusCode::BAD_REQUEST, "before is the number of the first event the viewer has")) };
+    let lean = q.get("lean").is_some_and(|v| v == "1");
+    let page = match hub.harness.page(id, before, lean).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
+        Paged::Page { events, window } => TimelinePage { events: events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect(), window },
+        Paged::Store { before, floor } => {
+            let Some(store) = hub.harness.convo.clone() else { return Ok(srv::json(StatusCode::OK, &TimelinePage { events: Vec::new(), window: EventsWindow::default() })) };
+            let session = id.to_owned();
+            // As many as a page holds at most, by number; the page is cut from them as the copy's are.
+            let rows = crate::rt::blocking(move || store.events(&session, Some(before), crate::harness::window::ROWS)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+            let read = rows.len();
+            let events: Vec<serde_json::Value> = rows.iter().filter(|r| r.seq >= floor).filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok()).map(|e| if lean { crate::harness::window::lean(&e).unwrap_or(e) } else { e }).collect();
+            store_page(events, read, floor)
+        }
+    };
+    Ok(srv::json(StatusCode::OK, &page))
+}
+
+/// A page cut from `events`, the newest the conversation store keeps before a viewer's (oldest
+/// first, `read` of them asked for, the timeline beginning at `floor`): as many as a page holds,
+/// whole turns where they fit. More before it when it left some of them out, or the store had
+/// as many as were asked for (it may have more).
+fn store_page(events: Vec<serde_json::Value>, read: usize, floor: u64) -> crate::wire::ui::TimelinePage {
+    use crate::harness::window;
+    let begin = window::start(&events, events.len(), window::PAGE_TURNS, |e| serde_json::to_string(e).map_or(0, |t| t.len()), window::begins_turn);
+    let before = events.get(begin).and_then(|e| e.get("seq")).and_then(serde_json::Value::as_u64);
+    let more = begin > 0 || (read >= window::ROWS && before.is_some_and(|s| s > floor));
+    crate::wire::ui::TimelinePage { events: events.into_iter().skip(begin).collect(), window: crate::wire::ui::EventsWindow { before, more } }
+}
+
+/// `GET /api/harness/sessions/:id/events/:event?seq=`: one event of a session, whole: what a lean
+/// one (`?lean=1` on its socket or its pages) held back, asked for when a person opens it. From the
+/// server's copy, else (`seq`: its number) the conversation store.
+async fn harness_event(hub: &Hub, id: &str, event: &str, q: &HashMap<String, String>) -> R {
+    if let Some(text) = hub.harness.event_text(id, event) {
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
+    let (Some(store), Some(seq)) = (hub.harness.convo.clone(), q.get("seq").and_then(|s| s.parse::<u64>().ok())) else { return Err(err(StatusCode::NOT_FOUND, "no such event")) };
+    let session = id.to_owned();
+    let rows = crate::rt::blocking(move || store.events(&session, Some(seq.saturating_add(1)), 1)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let found = rows.into_iter().find(|r| r.id == event && r.seq == seq).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such event"))?;
+    let v: serde_json::Value = serde_json::from_str(&found.body).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 #[derive(Deserialize)]
@@ -6381,6 +6547,9 @@ struct Takes {
     /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
     /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
     after: Option<(u64, u64)>,
+    /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
+    /// settled tool calls without their bodies (docs/wire.md, "Windows").
+    view: crate::harness::registry::View,
 }
 
 impl Takes {
@@ -6390,7 +6559,12 @@ impl Takes {
             .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
             .and_then(|v| v.split_once('.'))
             .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
-        Self { packed: has("z=gzip"), patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") }, after }
+        Self {
+            packed: has("z=gzip"),
+            patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
+            after,
+            view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+        }
     }
 }
 
@@ -6730,7 +6904,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     hyper_rt::futures::label(&VIEWER_ATTACH);
     crate::harness::kept::warm(&hub, &id).await;
     hyper_rt::futures::label(&VIEWER_ATTACH);
-    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches, takes.view) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
@@ -6911,7 +7085,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             hyper_rt::futures::label(&VIEWER_CATCH_UP);
             crate::harness::kept::warm(&hub, &id).await;
             hyper_rt::futures::label(&VIEWER_CATCH_UP);
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have, takes.view) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -7127,27 +7301,27 @@ mod tests {
         }
     }
 
-    /// Goal 4, plan 01a1a59c2a9c step 5 (as goal 9 step 5 found): an events socket sends every hub event
-    /// that's ready, from both of the hub's rings, written as one (one flush, not one an event); a ring that
-    /// let some go says `Resync` among them; and two sockets sending the same event send one allocation, the
-    /// event's own text, not a copy each.
+    /// Goal 4, plan 01a1a59c2a9c step 5 (as goal 9 step 5 found), on the feed the sockets read since
+    /// W21-R15: an events socket sends every event that's ready, the hub's and the sessions' own, written
+    /// as one (one flush, not one an event); a feed that let some go says `Resync`, in one write; and two
+    /// sockets sending the same event send one allocation, the event's own text, not a copy each.
     #[test]
     fn g4_s5_an_events_socket_writes_whats_ready_at_once_its_bytes_shared() -> anyhow::Result<()> {
         use crate::wire::events::{ServerEvent, kind_of};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(16)?);
-            let (mut rx2, mut sessions2) = (hub.subscribe_events()?, hub.harness_events.subscribe(16)?);
+            let from = hub.feed.head();
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
-            hub.emit_harness("s1", &serde_json::to_vec(&info)?);
+            hub.emit_harness("s1", &serde_json::to_vec(&info)?, 0);
             hub.emit(&ServerEvent::Terminals);
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());
-            let first = rx.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx, &mut sessions], &mut None, &mut None).await?, "the rings are there");
-            let first = rx2.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2, &mut sessions2], &mut None, &mut None).await?, "the rings are there");
+            for w in [&mut one, &mut two] {
+                let mut out = crate::wire::events::feed::Outbox::new(None);
+                let at = take_since(&hub, w, from, &mut out, false, true, &mut None, &mut None).await?;
+                anyhow::ensure!(at >= from + 4, "it read on past ours: {at} from {from}");
+            }
             let text = |m: &ws::Message| match m {
                 ws::Message::Text(t) => Some(t.as_str().to_owned()),
                 _ => None,
@@ -7170,23 +7344,23 @@ mod tests {
             };
             let (a, b) = (ours(&one), ours(&two));
             anyhow::ensure!(a.len() == 4 && a == b, "not the same bytes: {a:?} and {b:?}");
-            // A source that let some go: `Resync`, in the same write.
-            let small = crate::memory::lanes::Lanes::<Arc<str>>::new(&crate::memory::owners::UI_EVENTS, 1, 1 << 10);
-            let mut behind = small.subscribe(2)?;
-            for k in 0..4 {
-                small.send(0, Arc::from(format!(r#"{{"type":"updates","n":{k}}}"#)));
+            // A feed that let some go past where a socket was: `Resync`, in one write.
+            let behind = hub.feed.head();
+            for k in 0..=crate::wire::events::feed::RING {
+                hub.feed.push(Arc::from(format!(r#"{{"type":"updates","n":{k}}}"#)));
             }
             let mut three = Written::default();
-            let first = behind.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind], &mut None, &mut None).await?);
+            let mut out = crate::wire::events::feed::Outbox::new(None);
+            let at = take_since(&hub, &mut three, behind, &mut out, false, true, &mut None, &mut None).await?;
             let said: Vec<String> = three.sent.iter().filter_map(text).collect();
-            // It starts over from after what it missed: `Resync`, and nothing from before the gap.
+            // It starts over from where the feed is: `Resync`, and nothing from before the gap.
             anyhow::ensure!(said == [ServerEvent::Resync.text()] && three.flushes == 1, "{said:?}");
-            small.send(0, Arc::from(r#"{"type":"updates","n":4}"#));
+            let after = r#"{"type":"updates","n":"after"}"#;
+            hub.feed.push(Arc::from(after));
             let mut four = Written::default();
-            let first = behind.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut four, first, &mut [&mut behind], &mut None, &mut None).await?);
-            anyhow::ensure!(four.sent.iter().filter_map(text).collect::<Vec<_>>() == [r#"{"type":"updates","n":4}"#.to_owned()], "then what comes after it");
+            take_since(&hub, &mut four, at, &mut out, false, true, &mut None, &mut None).await?;
+            let said: Vec<String> = four.sent.iter().filter_map(text).collect();
+            anyhow::ensure!(said.iter().any(|s| s == after) && !said.iter().any(|s| s.starts_with(r#"{"type":"updates","n":"#) && s != after), "then what comes after it: {said:?}");
             Ok(())
         })
     }
@@ -7374,6 +7548,31 @@ mod tests {
         // A changeset as what changed in it, asked for on its own or with a state's.
         assert_eq!(Takes::of(Some("z=gzip&patch=state&patch=changes")).patches, Patches { state: true, changes: true });
         assert_eq!(Takes::of(Some("patch=changes")).patches, Patches { state: false, changes: true });
+        // A window and lean events, each its own (docs/wire.md, "Windows"); one from before neither.
+        use crate::harness::registry::View;
+        assert_eq!(Takes::of(Some("z=gzip&window=1&lean=1")).view, View { window: true, lean: true });
+        assert_eq!(Takes::of(Some("window=1")).view, View { window: true, lean: false });
+        assert_eq!(Takes::of(Some("patch=state&window=2&leanest=1")).view, View::default());
+    }
+
+    /// W21-R15: a page from the conversation store is cut as the copy's are (whole turns, a page's
+    /// bounds), and says there's more when it left some out or the store may have more.
+    #[test]
+    fn w21_r15_a_store_page_is_cut_as_the_copys_are() {
+        let ev = |seq: u64, kind: &str| json!({"id": format!("e{seq}"), "seq": seq, "at": 0, "kind": kind, "text": "x"});
+        // Thirty turns of three: a page holds twenty, from a prompt.
+        let events: Vec<serde_json::Value> = (1..=90u64).map(|s| ev(s, if s % 3 == 1 { "user" } else { "assistant" })).collect();
+        let p = store_page(events.clone(), 90, 1);
+        assert_eq!(p.events.len(), 60);
+        assert_eq!(p.window, crate::wire::ui::EventsWindow { before: Some(31), more: true });
+        // All of what was read fits, fewer than asked for: nothing more.
+        let few = store_page(events.get(..9).unwrap_or_default().to_vec(), 9, 1);
+        assert_eq!((few.events.len(), few.window), (9, crate::wire::ui::EventsWindow { before: Some(1), more: false }));
+        // As many as asked for: there may be more, unless it reached where the timeline begins.
+        let full: Vec<serde_json::Value> = (11..11 + crate::harness::window::ROWS as u64).map(|s| ev(s, "assistant")).collect();
+        assert!(store_page(full.clone(), crate::harness::window::ROWS, 1).window.more);
+        assert!(!store_page(full, crate::harness::window::ROWS, 11).window.more);
+        assert_eq!(store_page(Vec::new(), 0, 1).window, crate::wire::ui::EventsWindow::default());
     }
 
     #[test]
