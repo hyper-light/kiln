@@ -5465,12 +5465,7 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
         // Read after subscribing: a resize from here on also arrives as a live size frame.
         tx.send(ws::text(TerminalDown::Session { session: session.info() }.text())).await?;
         if !attachment.replay.is_empty() {
-            // In frames of at most what the socket writes at a time, as a packed snapshot goes: sent whole, its
-            // socket's writer kept the replay's size (up to `termsess`'s 256 KiB backlog) for as long as the page is
-            // open (goal 11, plan 01a1a87b2e56 step 5).
-            for frame in pieces_of(attachment.replay, true, true) {
-                tx.send(frame).await?;
-            }
+            tx.send(ws::binary(attachment.replay)).await?;
         }
         if let Some((code, error)) = attachment.ended {
             let msg = match error {
@@ -5501,9 +5496,7 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
                         // This viewer fell behind; repaint it from the session's state.
                         let a = session.attach();
                         session.detach();
-                        for frame in pieces_of(a.replay, true, true) {
-                            tx.send(frame).await?;
-                        }
+                        tx.send(ws::binary(a.replay)).await?;
                     }
                     Err(async_broadcast::RecvError::Closed) => return Ok(()),
                 },
