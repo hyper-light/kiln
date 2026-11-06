@@ -836,8 +836,8 @@ fn lane_main(addr: SocketAddr, job: &Job<'_>, plan: Plan, index: usize, conns: u
     };
     g.run();
     let mut out = std::mem::take(&mut g.out);
-    out.seen = std::mem::take(&mut g.lane.seen);
     out.unsent = g.lane.unsent();
+    out.seen = std::mem::take(&mut g.lane.seen);
     out.punctual = punctual.to_owned();
     out
 }
