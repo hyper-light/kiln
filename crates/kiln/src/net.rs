@@ -588,19 +588,49 @@ pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Rec
 /// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
 /// two windows of frames).
 pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
+    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
+    Ok((start_with(spec, out, Box::new(etx))?, erx))
+}
+
+/// [`start`], what comes in handed to `hand`: the server's hub loops, one a shard (`crate::wire::fan`; goal 10,
+/// plan 01a1a87b2dae step 4). Its commands bounded at `out` bytes.
+pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result<NetHandle> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
     let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
-    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
-    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
-    Ok((NetHandle { tx }, erx))
+    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, hand))?;
+    Ok(NetHandle { tx })
 }
 
 /// An event being handed to the loop's owner: kept across turns of the loop, as a send dropped
 /// before it's done loses what it carried. True once taken; false when the owner is gone.
-type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+pub type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+
+/// Who takes what the net thread hands over: its owner's one queue ([`start`]), or the server's hub
+/// loops, each event to the loop that takes it (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4).
+pub trait Hand: Send {
+    /// `ev`, handed over now if there's room for it; else its handing once there is, or none when
+    /// whoever takes it is gone.
+    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>>;
+}
+
+impl Hand for crate::memory::queue::Sender<NetEvent> {
+    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>> {
+        match self.try_send(ev) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Full(ev)) => {
+                let tx = self.clone();
+                Err(Some(Box::pin(async move { tx.send(ev).await.is_ok() })))
+            }
+            Err(async_channel::TrySendError::Closed(_)) => Err(None),
+        }
+    }
+}
+
+/// What the net thread hands its events to, kept across its loop's incarnations: the thread's alone.
+type Owner = std::rc::Rc<std::cell::RefCell<Box<dyn Hand>>>;
 
 /// What an event takes of memory: its place and, a frame, its bytes.
 fn weight(ev: &NetEvent) -> usize {
@@ -632,17 +662,16 @@ impl crate::memory::queue::Weigh for Out {
 
 /// Hands `held` to the owner in order: as many as it has room for, the next one waiting in
 /// `handing` when it has no more. False when the owner is gone.
-fn hand_over(etx: &crate::memory::queue::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+fn hand_over(owner: &Owner, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+    // Taken here alone, on this thread, and never across an await: what's held waits a turn should it be.
+    let Ok(mut hand) = owner.try_borrow_mut() else { return true };
     while handing.is_none() {
         let Some(ev) = held.pop_front() else { break };
         *held_bytes = held_bytes.saturating_sub(weight(&ev));
-        match etx.try_send(ev) {
+        match hand.hand(ev) {
             Ok(()) => {}
-            Err(async_channel::TrySendError::Full(ev)) => {
-                let etx = etx.clone();
-                *handing = Some(Box::pin(async move { etx.send(ev).await.is_ok() }));
-            }
-            Err(async_channel::TrySendError::Closed(_)) => return false,
+            Err(Some(h)) => *handing = Some(h),
+            Err(None) => return false,
         }
     }
     true
@@ -693,8 +722,9 @@ impl Carry {
     }
 }
 
-fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::memory::queue::Sender<NetEvent>) {
+fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, hand: Box<dyn Hand>) {
     let spec = Arc::new(spec);
+    let owner: Owner = std::rc::Rc::new(std::cell::RefCell::new(hand));
     let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
@@ -706,7 +736,7 @@ fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial), std::mem::take(&mut carry)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), std::rc::Rc::clone(&owner), Arc::clone(&last_dial), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
@@ -980,7 +1010,7 @@ where
 async fn run_loop(
     spec: Arc<Spec>,
     rx: crate::memory::queue::Receiver<Out>,
-    etx: crate::memory::queue::Sender<NetEvent>,
+    owner: Owner,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
     carry: Carry,
 ) -> anyhow::Result<Exit> {
@@ -1030,7 +1060,7 @@ async fn run_loop(
     }
 
     loop {
-        if !hand_over(&etx, &mut held, &mut held_bytes, &mut handing) {
+        if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
             return Ok(Exit::Closed);
         }
         let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };

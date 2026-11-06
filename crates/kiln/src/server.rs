@@ -103,14 +103,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
     // Revoked keys are refused from the first handshake on (W27-R01).
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
-    let (net, net_events) = crate::net::start(crate::net::Spec {
-        bind: quic_bind,
-        ca_der: pki.ca_der.clone(),
-        leaf: leaf.clone(),
-        server: true,
-        dial_deadline: crate::net::DIAL_DEADLINE,
-        revoked_keys,
-    })?;
+    // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
+    // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+    let net = crate::net::start_with(
+        crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
+        crate::net::OUT_BYTES,
+        Box::new(fan),
+    )?;
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -163,12 +163,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // its sessions' copies with it, before any runner's message is taken in.
     hub.one_record_a_machine().await;
 
-    // Transport events. Each message is handled in isolation; the stream itself never ends while
-    // the net thread lives (it restarts its endpoint internally).
-    {
-        let hub = hub.clone();
-        sup::spawn_guarded("net-events", async move { hub.net_loop(net_events).await });
-    }
+    // Transport events, on the hub's loops (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): the control loop placed
+    // as the one loop was, and each shard's session loop on that shard, beside its owner of agent sessions' copies. Each
+    // message is handled in isolation; the streams themselves never end while the net thread lives (it restarts its
+    // endpoint internally). A loop that ends is said, and nothing waits for it any more (`Marks::ending`).
+    hub.net_loops(net_events);
 
     let reg = registry();
     macro_rules! child {

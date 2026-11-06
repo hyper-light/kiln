@@ -436,9 +436,21 @@ pub fn unbounded<T>(owner: &'static Owner) -> (Sender<T>, Receiver<T>) {
 
 /// A queue's two ends, about `room`, its items counted by `weigh`.
 fn made<T>(room: Room, weigh: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
+    made_in(Arc::new(room), weigh)
+}
+
+/// A queue's two ends about `room`, which other queues may share ([`bounded_in`]), its items counted by `weigh`.
+fn made_in<T>(room: Arc<Room>, weigh: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
     let chan = Arc::new(Chan { items: ConcurrentQueue::unbounded(), takers: Waiters::new(), senders: AtomicUsize::new(1), weigh });
-    let room = Arc::new(room);
     (Sender { chan: Arc::clone(&chan), room: Arc::clone(&room) }, Receiver { inner: Arc::new(Taking { chan, room }), own: Own::new() })
+}
+
+/// A queue of its own channel whose bytes count against `room` with those of every other queue made in it:
+/// together they hold at most its bound, as one queue would (goal 10, plan 01a1a87b2dae step 4: the hub's
+/// loops, one a shard, each take what the net thread hands them from one window of what runners sent, as
+/// the one loop did, `crate::wire::fan`). The last receiver of any of them to go closes the room for all.
+pub fn bounded_in<T: Weigh>(room: &Arc<Room>) -> (Sender<T>, Receiver<T>) {
+    made_in(Arc::clone(room), counted::<T>)
 }
 
 /// A queue's sending end: cheap to clone, usable from any thread.
@@ -1135,6 +1147,24 @@ mod tests {
         assert_eq!(tx.len(), 1 + small);
         drop((tx, rx));
         assert_eq!((OWNER.bytes(), OWNER.bound()), (0, None), "a queue's bytes and bound go with it");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: queues made in one room hold its bound together, as one queue of
+    /// it would, each taking from its own channel; room one of them makes is room for the others.
+    #[test]
+    fn g10_s4_queues_in_one_room_hold_its_bound_together() {
+        static OWNER: Owner = Owner::new("test_queue_room");
+        let room = Arc::new(Room::new(&OWNER, 4 * PLACE));
+        let (a, ra) = bounded_in::<Item>(&room);
+        let (b, rb) = bounded_in::<Item>(&room);
+        assert!(a.try_send(Item(2 * PLACE)).is_ok() && b.try_send(Item(2 * PLACE)).is_ok());
+        assert!(a.try_send(Item(PLACE)).is_err() && b.try_send(Item(PLACE)).is_err(), "full together");
+        assert_eq!((OWNER.bytes(), OWNER.bound()), (4 * PLACE, Some(4 * PLACE)), "one bound, the queues' bytes together");
+        assert!(ra.try_recv().is_ok());
+        assert!(b.try_send(Item(PLACE)).is_ok(), "what one took is room for the other");
+        assert!(rb.try_recv().is_ok() && rb.try_recv().is_ok() && ra.try_recv().is_err());
+        drop((a, b, ra, rb, room));
+        assert_eq!((OWNER.bytes(), OWNER.bound()), (0, None));
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: an item larger than the whole bound still goes, alone, into an
