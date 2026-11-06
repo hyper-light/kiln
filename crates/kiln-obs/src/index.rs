@@ -4,12 +4,35 @@
 //! the same batches in the same order. Postings — for each metric and each `key:value` tag, the ids
 //! of its series — stay sorted for free: ids only grow. A selection intersects them smallest first
 //! with galloping search (Bentley and Yao 1976; Demaine, López-Ortiz and Munro, SODA 2000).
+//!
+//! A series' key isn't kept (kiln's goal 11, plan 01a1a87b2e56 step 5): it's its metric and tags written
+//! canonically ([`crate::batch::put_canonical`]), which the symbols and the series' tags hold, so it's written again
+//! as it's asked for ([`Index::key_into`]). In the lab's realistic profile the server's index held 13,779 series
+//! whose keys were 1,898,546 bytes in a 2 MiB column, more than half its 4 MB, for 17,266 bytes of distinct strings.
+//! A key whose bytes aren't its canonical writing (a varint longer than it need be, which a sender may send and a
+//! key's reader takes) is kept as sent, so every key reads back byte for byte as it was defined. The columns that
+//! grow with the series grow by a quarter at a time ([`grow`]), not doubling.
 
 use hashbrown::HashTable;
 
-use crate::batch::{BatchError, Kind, fingerprint, parse_key};
+use crate::batch::{BatchError, Kind, fingerprint, parse_key, put_canonical, put_canonical_head, put_canonical_tag};
 use crate::hash::Keyed;
 use crate::symbols::{Sym, Symbols, SymbolsFull};
+
+/// The least a column grows by, in elements: std's own least for elements of 2 to 1,024 bytes (`RawVec`'s
+/// `MIN_NON_ZERO_CAP`), as many as a posting list's first allocation holds.
+const LEAST_GROWTH: usize = 4;
+
+/// Room in `v` for `more` past its length: where it has none, a quarter more than it holds (at the least `more`, and
+/// [`LEAST_GROWTH`]). jemalloc's size classes are four to a doubling (its large ones 16, 20, 24, 28, 32 KiB and so
+/// on), so a column grown by a quarter takes the class its length needs and leaves at most a quarter of it unused
+/// (an eighth on average), where `Vec`'s doubling leaves up to half (a quarter on average). Each element is still
+/// copied a bounded number of times as the column grows: at most 1 / (1 - 1/1.25) = 5, against doubling's 2.
+fn grow<T>(v: &mut Vec<T>, more: usize) {
+    if v.len().saturating_add(more) > v.capacity() {
+        v.reserve_exact((v.len() / 4).max(more).max(LEAST_GROWTH));
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IndexError {
@@ -65,13 +88,16 @@ struct Posting {
 #[derive(Debug, Default)]
 pub struct Index {
     hash: Keyed,
-    keys: Vec<u8>,
-    key_ends: Vec<u32>,
     /// Each series' fingerprint, and the table that finds a series by it.
     fps: Vec<u64>,
     fp_table: HashTable<u32>,
     series: Vec<SeriesInfo>,
     tag_pairs: Vec<(Sym, Sym)>,
+    /// The keys that aren't their metric and tags written canonically, as they were sent, by series id in order:
+    /// every other key is written again as it's asked for.
+    odd_keys: Vec<(u32, Box<[u8]>)>,
+    /// A key written for a check ([`Index::define`]), its room kept for the next.
+    scratch: Vec<u8>,
     post_table: HashTable<u32>,
     posts: Vec<Posting>,
     /// Each tag key's values, for wildcards and listing.
@@ -94,21 +120,41 @@ impl Index {
         }
     }
 
-    fn key_of(&self, id: u32) -> Option<&[u8]> {
-        let i = id as usize;
-        let end = *self.key_ends.get(i)? as usize;
-        let start = if i == 0 { 0 } else { *self.key_ends.get(i - 1)? as usize };
-        self.keys.get(start..end)
-    }
-
     /// Series `id`'s fingerprint.
     pub fn fp(&self, id: u32) -> Option<u64> {
         self.fps.get(id as usize).copied()
     }
 
-    /// Series `id`'s canonical key.
-    pub fn key(&self, id: u32) -> Option<&[u8]> {
-        self.key_of(id)
+    /// Series `id`'s canonical key written into `out` (cleared first), byte for byte as it was defined: its metric
+    /// and tags from `symbols` (the table its definition interned them in), or the key as sent where that isn't
+    /// their canonical writing. False, and `out` empty, for no such series (or symbols not its own).
+    pub fn key_into(&self, symbols: &Symbols, id: u32, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        if let Ok(at) = self.odd_keys.binary_search_by_key(&id, |(i, _)| *i)
+            && let Some((_, key)) = self.odd_keys.get(at)
+        {
+            out.extend_from_slice(key);
+            return true;
+        }
+        let Some(info) = self.series.get(id as usize) else { return false };
+        let text = |s: Sym| (s.0 < u32::try_from(symbols.len()).unwrap_or(u32::MAX)).then(|| symbols.get(s));
+        let Some(metric) = text(info.metric) else { return false };
+        let tags = self.tags(info);
+        put_canonical_head(out, metric, tags.len());
+        for &(k, v) in tags {
+            let (Some(k), Some(v)) = (text(k), text(v)) else {
+                out.clear();
+                return false;
+            };
+            put_canonical_tag(out, k, v);
+        }
+        true
+    }
+
+    /// Series `id`'s canonical key, as [`Index::key_into`] writes it.
+    pub fn key(&self, symbols: &Symbols, id: u32) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.key_into(symbols, id, &mut out).then_some(out)
     }
 
     /// The series with fingerprint `fp`.
@@ -118,8 +164,16 @@ impl Index {
     }
 
     /// The series with canonical key `key`.
-    pub fn find(&self, key: &[u8]) -> Option<u32> {
-        self.by_fp(fingerprint(key)).filter(|&id| self.key_of(id) == Some(key))
+    pub fn find(&self, symbols: &Symbols, key: &[u8]) -> Option<u32> {
+        self.by_fp(fingerprint(key)).filter(|&id| self.key(symbols, id).as_deref() == Some(key))
+    }
+
+    /// Whether series `id`'s key is `key`, byte for byte: written into the scratch room, kept for the next.
+    fn has_key(&mut self, symbols: &Symbols, id: u32, key: &[u8]) -> bool {
+        let mut written = std::mem::take(&mut self.scratch);
+        let same = self.key_into(symbols, id, &mut written) && written == key;
+        self.scratch = written;
+        same
     }
 
     /// Defines series `fp` with canonical key `key`, if new. A new definition's fingerprint is
@@ -127,7 +181,7 @@ impl Index {
     /// known one's key must be the one it has.
     pub fn define(&mut self, symbols: &mut Symbols, fp: u64, key: &[u8], kind: Kind) -> Result<Defined, IndexError> {
         if let Some(id) = self.by_fp(fp) {
-            if self.key_of(id) != Some(key) {
+            if !self.has_key(symbols, id, key) {
                 return Err(IndexError::Collision(fp));
             }
             if self.series.get(id as usize).is_some_and(|s| s.kind != kind) {
@@ -140,18 +194,23 @@ impl Index {
         }
         let parsed = parse_key(key)?;
         let id = u32::try_from(self.series.len()).map_err(|_| IndexError::Full)?;
-        let end = u32::try_from(self.keys.len() + key.len()).map_err(|_| IndexError::Full)?;
         let tags_at = u32::try_from(self.tag_pairs.len()).map_err(|_| IndexError::Full)?;
         let metric = symbols.intern(parsed.metric)?;
         let mut pairs = Vec::with_capacity(parsed.tags.len());
         for (k, v) in &parsed.tags {
             pairs.push((symbols.intern(k)?, symbols.intern(v)?));
         }
-        self.keys.extend_from_slice(key);
-        self.key_ends.push(end);
+        // Kept only where it isn't what its metric and tags write: nearly never, kiln's senders' keys being
+        // `SeriesKey::new`'s.
+        put_canonical(&mut self.scratch, parsed.metric, parsed.tags.iter().copied());
+        if self.scratch.as_slice() != key {
+            self.odd_keys.push((id, key.into()));
+        }
+        grow(&mut self.fps, 1);
         self.fps.push(fp);
         let (fps, hash) = (&self.fps, &self.hash);
         self.fp_table.insert_unique(hash.word(fp), id, |&id| fps.get(id as usize).map_or(0, |&f| hash.word(f)));
+        grow(&mut self.series, 1);
         self.series.push(SeriesInfo { metric, tags_at, tags_len: pairs.len() as u32, kind });
         if self.post(Owner::Metric(metric), id) {
             self.metrics.push(metric);
@@ -161,6 +220,7 @@ impl Index {
                 self.add_value(k, v);
             }
         }
+        grow(&mut self.tag_pairs, pairs.len());
         self.tag_pairs.extend_from_slice(&pairs);
         Ok(Defined::New(id))
     }
@@ -170,6 +230,7 @@ impl Index {
         let h = self.owner_hash(owner);
         if let Some(&i) = self.post_table.find(h, |&i| self.posts.get(i as usize).is_some_and(|p| p.owner == owner)) {
             if let Some(p) = self.posts.get_mut(i as usize) {
+                grow(&mut p.ids, 1);
                 p.ids.push(id);
             }
             return false;
@@ -381,8 +442,9 @@ impl Index {
 
     /// Bytes held by the index's own structures (symbols apart).
     pub fn heap_bytes(&self) -> usize {
-        self.keys.capacity()
-            + self.key_ends.capacity() * 4
+        self.odd_keys.capacity() * std::mem::size_of::<(u32, Box<[u8]>)>()
+            + self.odd_keys.iter().map(|(_, key)| key.len()).sum::<usize>()
+            + self.scratch.capacity()
             + self.fps.capacity() * 8
             + self.fp_table.capacity() * 4
             + self.series.capacity() * std::mem::size_of::<SeriesInfo>()
@@ -718,7 +780,112 @@ mod tests {
         let info = idx.info(a).unwrap();
         let tags: Vec<(&str, &str)> = idx.tags(&info).iter().map(|&(k, v)| (sym.get(k), sym.get(v))).collect();
         assert_eq!(tags, vec![("a", "1"), ("b", "2")]);
-        assert_eq!(idx.find(&key("m", &[("a", "1"), ("b", "2")]).key), Some(a));
+        assert_eq!(idx.find(&sym, &key("m", &[("a", "1"), ("b", "2")]).key), Some(a));
+    }
+
+    /// A key written as `put_canonical` writes it, but with each length's varint `pad` bytes longer than it need be
+    /// (a continuation byte of nothing more): what `parse_key` takes, and a sender may send.
+    fn padded_key(metric: &str, tags: &[(&str, &str)], pad: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let put = |out: &mut Vec<u8>, b: &[u8]| {
+            let n = b.len();
+            out.push((n as u8 & 0x7f) | 0x80);
+            for _ in 1..pad {
+                out.push(0x80);
+            }
+            out.push(0);
+            out.extend_from_slice(b);
+        };
+        put(&mut out, metric.as_bytes());
+        out.push(tags.len() as u8);
+        for (k, v) in tags {
+            put(&mut out, k.as_bytes());
+            put(&mut out, v.as_bytes());
+        }
+        out
+    }
+
+    /// Kiln's goal 11, plan 01a1a87b2e56 step 5: the index keeps no key, yet every series' key reads back byte for
+    /// byte as it was defined: written again from its metric and tags, or, where its bytes aren't their canonical
+    /// writing, kept as sent. It's found by it, a known fingerprint with other bytes is still a collision, and a
+    /// series defined again with its own key is known.
+    #[test]
+    fn g11_s5_every_key_reads_back_as_it_was_defined_though_none_is_kept() {
+        let h = Keyed::with_keys(1, 2);
+        let mut idx = Index::new(h);
+        let mut sym = Symbols::new(h);
+        let canonical = key("cpu", &[("host", "web-1"), ("env", "prod")]);
+        let odd = padded_key("mem", &[("host", "web-1")], 2);
+        assert!(parse_key(&odd).is_ok(), "a padded varint reads");
+        let fp_odd = fingerprint(&odd);
+        let a = idx.define(&mut sym, canonical.fp, &canonical.key, Kind::Gauge).unwrap().id();
+        let b = idx.define(&mut sym, fp_odd, &odd, Kind::Gauge).unwrap().id();
+        assert_eq!(idx.key(&sym, a).as_deref(), Some(&canonical.key[..]));
+        assert_eq!(idx.key(&sym, b).as_deref(), Some(&odd[..]), "kept as sent");
+        assert_eq!(idx.odd_keys.len(), 1, "only the odd one is kept");
+        assert_eq!(idx.key(&sym, 2), None);
+        assert_eq!(idx.find(&sym, &canonical.key), Some(a));
+        assert_eq!(idx.find(&sym, &odd), Some(b));
+        assert_eq!(idx.define(&mut sym, canonical.fp, &canonical.key, Kind::Gauge), Ok(Defined::Known(a)));
+        assert_eq!(idx.define(&mut sym, fp_odd, &odd, Kind::Gauge), Ok(Defined::Known(b)));
+        // The odd key's canonical writing names the same series' strings, but isn't its bytes: a collision, as it was
+        // when the bytes were kept.
+        let same_strings = key("mem", &[("host", "web-1")]);
+        assert_eq!(idx.define(&mut sym, fp_odd, &same_strings.key, Kind::Gauge), Err(IndexError::Collision(fp_odd)));
+        // Symbols that aren't the index's own say no key, rather than another.
+        assert_eq!(idx.key(&Symbols::new(h), a), None);
+    }
+
+    /// Kiln's goal 11, plan 01a1a87b2e56 step 5: a column grows by a quarter of what it holds, never less than
+    /// asked or than std's least, and not at all while it has room.
+    #[test]
+    fn g11_s5_a_column_grows_by_a_quarter() {
+        let mut v: Vec<u32> = Vec::new();
+        grow(&mut v, 1);
+        assert_eq!(v.capacity(), LEAST_GROWTH);
+        v.extend(0..4);
+        grow(&mut v, 1);
+        assert_eq!(v.capacity(), 8, "4 more: its least");
+        let mut v: Vec<u64> = (0..1000).collect();
+        v.shrink_to_fit();
+        grow(&mut v, 1);
+        assert_eq!(v.capacity(), 1250);
+        grow(&mut v, 1);
+        assert_eq!(v.capacity(), 1250, "room left: no growth");
+        let mut v: Vec<u8> = vec![0; 100];
+        v.shrink_to_fit();
+        grow(&mut v, 300);
+        assert_eq!(v.capacity(), 400, "at the least what's asked");
+    }
+
+    /// Kiln's goal 11, plan 01a1a87b2e56 step 5: an index of the lab's shape (13,779 series of the server's, its keys
+    /// 138 bytes on average, 233 metrics, 489 tag pairs; train 4's realistic profile, alloc's arena5 round 16) holds
+    /// less than half what it held with its keys and doubling columns: these, keys of 164 bytes, 1.07 MB, where the
+    /// keys' column alone took 4 MiB (the lab's 1.9 MB of keys, 2 MiB).
+    #[test]
+    fn g11_s5_the_labs_index_holds_less_than_half_what_it_did() {
+        let h = Keyed::with_keys(1, 2);
+        let mut idx = Index::new(h);
+        let mut sym = Symbols::new(h);
+        let mut key_bytes = 0;
+        for i in 0..13_779_u32 {
+            // The lab's tag keys of most values: a runner's host, a container, a code site (233, 5, 90 and 40 are
+            // coprime enough that no two series share a key).
+            let host = format!("{:032x}", i % 5);
+            let container = format!("{:064x}", i % 90);
+            let site = format!("crates/kiln/src/site_{}.rs", i % 40);
+            let tags: Vec<(&str, &str)> = vec![("host", host.as_str()), ("container_id", container.as_str()), ("site", site.as_str())];
+            let k = key(&format!("kiln.metric_{}", i % 233), &tags);
+            key_bytes += k.key.len();
+            idx.define(&mut sym, k.fp, &k.key, Kind::Gauge).unwrap();
+        }
+        assert!(key_bytes > 1_800_000, "keys as long as the lab's: {key_bytes}");
+        let held = idx.heap_bytes();
+        // What it held before: the keys' column at doubling (2 MiB for these), the ids' and fingerprints' columns
+        // beside it, and the rest as now.
+        let before = key_bytes.next_power_of_two() + 16_384 * 4 + held;
+        assert!(held < 2_000_000, "the index holds {held} bytes");
+        assert!(held * 2 < before, "{held} against {before}");
     }
 
     #[test]

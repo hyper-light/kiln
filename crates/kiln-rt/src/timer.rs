@@ -77,6 +77,14 @@ pub struct Wheel {
     armed: usize,
     /// Ticks the wheel has examined (`expire_tick` calls) — the cost witness of `advance`.
     visits: u64,
+    /// The next tick with work ([`Wheel::next_event_tick`]) while no slot's occupancy has changed since it was
+    /// found, `None` once one has (kiln's goal 9, plan 01a1a87b2cec step 5). The shard asks for it after every
+    /// input read and every applied intent (its `due_ns`), at every step's end and at every advance across a tick,
+    /// most of them with nothing armed or disarmed between: each was a pass over the levels. The wheel's moving
+    /// on to a tick before it leaves it as it was, since no slot's boundary lies between.
+    next_event: std::cell::Cell<Option<u64>>,
+    /// Passes over the levels for the next tick with work — the cost witness of [`Wheel::next_event`].
+    scans: std::cell::Cell<u64>,
 }
 
 impl Wheel {
@@ -94,12 +102,20 @@ impl Wheel {
             occupied: [0; LEVELS],
             armed: 0,
             visits: 0,
+            next_event: std::cell::Cell::new(None),
+            scans: std::cell::Cell::new(0),
         }
     }
 
     /// Ticks examined so far — what `advance` cost, in the unit its work is done in.
     pub const fn visits(&self) -> u64 {
         self.visits
+    }
+
+    /// Passes made over the levels to find the next tick with work: one after each change to a slot's
+    /// occupancy that something then asks about, none for the asks in between.
+    pub fn scans(&self) -> u64 {
+        self.scans.get()
     }
 
     /// Nanoseconds per tick.
@@ -134,6 +150,7 @@ impl Wheel {
             ..Entry::IDLE
         };
         self.link(id, deadline);
+        self.next_event.set(None);
         self.armed = self.armed.saturating_add(1);
         Ok(())
     }
@@ -145,6 +162,7 @@ impl Wheel {
             return Err(RtError::TimerState { id, armed: false });
         }
         self.unlink(id, entry);
+        self.next_event.set(None);
         if let Ok(entry) = self.entry_mut(id) {
             *entry = Entry::IDLE;
         }
@@ -159,34 +177,58 @@ impl Wheel {
         if self.armed == 0 {
             return None;
         }
-        let tick = self.next_event_tick(u64::MAX);
+        let tick = self.next_event_tick();
         (tick != u64::MAX).then(|| tick.saturating_mul(self.tick_ns))
     }
 
     /// Advances to `now_ns`, collecting `(id, word)` of every expired timer into `fired` in deadline order
     /// within a tick; a fired timer is disarmed. Each step jumps straight to the next tick that has work
     /// ([`Wheel::next_event_tick`]), so the cost is per timer event, never per idle tick (slates measured a
-    /// shard idle for 66,600 ticks examining 66,595 of them before, 2026-09-27).
+    /// shard idle for 66,600 ticks examining 66,595 of them before, 2026-09-27); and a tick with no work
+    /// is not examined at all, the target's included (kiln's goal 9, plan 01a1a87b2cec step 5: a shard
+    /// advances its wheel at each input read past a tick, most of them with no timer due, and each examined
+    /// the target's slots, writing each empty head and occupancy bit back as it found them).
     pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<(u32, u64)>) {
         // Before the next tick begins the target is the tick the wheel is at: nothing to do.
         if now_ns < self.next_tick_ns {
             return;
         }
         let target = now_ns.checked_div(self.tick_ns).unwrap_or(0);
-        while self.now_tick < target {
-            self.now_tick = self.next_event_tick(target);
+        // Each event lies past the tick the wheel is at, so the ticks examined rise and stop at the target. A
+        // tick with no event has nothing to fire or cascade at any level: a level-0 entry lies within a
+        // rotation ahead, so its slot's boundary is its own tick, and a higher level's slot is examined only at
+        // its boundary, which is an event.
+        loop {
+            let next = self.next_event_tick();
+            if next > target {
+                break;
+            }
+            self.now_tick = next;
             self.expire_tick(fired);
         }
+        // No boundary lies between the last tick examined and the target, so the next event found stands.
+        self.now_tick = self.now_tick.max(target);
         self.next_tick_ns = self.now_tick.saturating_add(1).saturating_mul(self.tick_ns);
     }
 
-    /// The next tick after `now_tick`, at most `target`, at which some level has an occupied slot to process:
-    /// for level `L`, the boundaries of its slots after `now_tick` fall every `64^L` ticks, and the first
-    /// occupied one is the occupancy word rotated to start just past the current slot, its trailing zeros
-    /// counting the boundaries skipped. An entry at level `L` lies less than one rotation of that level ahead
-    /// (`level_and_slot`), so one rotation always meets it.
-    fn next_event_tick(&self, target: u64) -> u64 {
-        let mut best = target;
+    /// The next tick after `now_tick` at which some level has an occupied slot to process, `u64::MAX` with
+    /// none: kept from its last pass while no slot's occupancy has changed ([`Wheel::next_event`]).
+    fn next_event_tick(&self) -> u64 {
+        if let Some(tick) = self.next_event.get() {
+            return tick;
+        }
+        let tick = self.scan_next_event();
+        self.next_event.set(Some(tick));
+        tick
+    }
+
+    /// One pass over the levels for [`Wheel::next_event_tick`]: for level `L`, the boundaries of its slots after
+    /// `now_tick` fall every `64^L` ticks, and the first occupied one is the occupancy word rotated to start just
+    /// past the current slot, its trailing zeros counting the boundaries skipped. An entry at level `L` lies less
+    /// than one rotation of that level ahead (`level_and_slot`), so one rotation always meets it.
+    fn scan_next_event(&self) -> u64 {
+        self.scans.set(self.scans.get().saturating_add(1));
+        let mut best = u64::MAX;
         for (level, occupied) in self.occupied.iter().enumerate() {
             if *occupied == 0 {
                 continue;
@@ -207,6 +249,8 @@ impl Wheel {
 
     fn expire_tick(&mut self, fired: &mut Vec<(u32, u64)>) {
         self.visits = self.visits.saturating_add(1);
+        // The slots this tick processes empty, and what cascades lands lower: the next event is looked for again.
+        self.next_event.set(None);
         let tick = self.now_tick;
         // The level-0 slot for this tick fires; a higher level's slot that this tick enters cascades.
         for level in 0..LEVELS {
@@ -488,6 +532,134 @@ mod tests {
             visited <= 2 * LEVELS as u64,
             "{visited} ticks examined to reach one timer {far} ticks away"
         );
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a shard advances its wheel at each input read past a tick, most of
+    /// them with no timer due. Do: arm one timer 1,000 ticks out, then advance ten ticks at a time to 950, then to
+    /// 1,000. Expect: no tick examined on the way (each advance examined its target before), then two: the level-1
+    /// slot's cascade at 960 and the fire at 1,000, on time.
+    #[test]
+    fn g9_s5_a_tick_with_nothing_due_is_not_examined() {
+        let mut wheel = Wheel::new(1, 8, 0);
+        wheel.arm(0, 1_000, 7).unwrap();
+        let mut fired = Vec::new();
+        for now in (10..=950).step_by(10) {
+            wheel.advance(now, &mut fired);
+        }
+        assert!(fired.is_empty());
+        assert_eq!(wheel.visits(), 0, "ticks with nothing to fire or cascade were examined");
+        wheel.advance(1_000, &mut fired);
+        assert_eq!(fired, vec![(0, 7)]);
+        assert_eq!(wheel.visits(), 2, "the cascade at 960 and the fire at 1,000");
+        assert_eq!(wheel.next_deadline_ns(), None);
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: the shard asks for the next deadline after every input read and
+    /// applied intent and at every step's end. Do: arm a timer within the finest level's rotation; ask three times
+    /// and advance three times short of it; arm another, ask twice; disarm it, ask; advance through the first.
+    /// Expect: one pass over the levels for each change asked about after it, none for the asks between, and the
+    /// answers a fresh pass gives.
+    #[test]
+    fn g9_s5_the_next_event_is_looked_for_once_between_changes() {
+        let mut wheel = Wheel::new(10, 8, 0);
+        wheel.arm(0, 500, 1).unwrap();
+        let mut fired = Vec::new();
+        for now in [100, 200, 300] {
+            assert_eq!(wheel.next_deadline_ns(), Some(500));
+            wheel.advance(now, &mut fired);
+        }
+        assert!(fired.is_empty());
+        assert_eq!(wheel.scans(), 1, "nothing changed after the first pass");
+        wheel.arm(1, 400, 2).unwrap();
+        assert_eq!(wheel.next_deadline_ns(), Some(400));
+        assert_eq!(wheel.next_deadline_ns(), Some(400));
+        assert_eq!(wheel.scans(), 2, "an arm is looked at once");
+        wheel.disarm(1).unwrap();
+        assert_eq!(wheel.next_deadline_ns(), Some(500));
+        assert_eq!(wheel.scans(), 3, "a disarm is looked at once");
+        wheel.advance(500, &mut fired);
+        assert_eq!(words(&fired), vec![1]);
+        assert_eq!(wheel.next_deadline_ns(), None);
+    }
+
+    /// The wheel against a plain list of deadlines (kiln's goal 9, plan 01a1a87b2cec step 5: what keeps the next
+    /// event between changes and skips the ticks with nothing due must fire exactly what the list says, when it
+    /// says). Do: random arms (a tick to past a level-3 rotation out), disarms and advances (within a tick, a few
+    /// ticks, past a rotation), 20,000 of them. Expect: each advance fires exactly the armed timers whose tick it
+    /// reached (a deadline's tick, or the tick after the wheel's at its arming if that is later), each fired once;
+    /// and the next deadline is never after the earliest armed one, nor at or before the wheel's tick.
+    #[test]
+    fn g9_s5_the_wheel_fires_what_a_plain_list_of_deadlines_says() {
+        const TICK: u64 = 100;
+        const CAPACITY: usize = 64;
+        fn below(rng: &mut Xorshift, bound: u64) -> u64 {
+            u64::try_from(rng.below(usize::try_from(bound).unwrap())).unwrap()
+        }
+        let mut wheel = Wheel::new(TICK, CAPACITY, 0);
+        let mut rng = Xorshift::new(Xorshift::SEED);
+        // Each timer's id → (its tick, its word), while armed.
+        let mut armed: std::collections::BTreeMap<u32, (u64, u64)> = std::collections::BTreeMap::new();
+        let (mut now, mut word) = (0u64, 0u64);
+        let mut fired = Vec::new();
+        for op in 0..20_000 {
+            let wheel_tick = now / TICK;
+            match rng.below(10) {
+                0..=3 => {
+                    let id = u32::try_from(rng.below(CAPACITY)).unwrap();
+                    if armed.contains_key(&id) {
+                        continue;
+                    }
+                    // Past one rotation of level 3 (64^4 ticks) at the far end.
+                    let ahead = match rng.below(4) {
+                        0 => below(&mut rng, TICK * 64),
+                        1 => below(&mut rng, TICK * 4_096),
+                        2 => below(&mut rng, TICK * 262_144),
+                        _ => below(&mut rng, TICK * 20_000_000),
+                    };
+                    let deadline = now + ahead;
+                    word += 1;
+                    wheel.arm(id, deadline, word).unwrap();
+                    armed.insert(id, (deadline.div_ceil(TICK).max(wheel_tick + 1), word));
+                }
+                4 => {
+                    if let Some(&id) = armed.keys().nth(rng.below(armed.len().max(1))) {
+                        wheel.disarm(id).unwrap();
+                        armed.remove(&id);
+                    }
+                }
+                _ => {
+                    now += match rng.below(4) {
+                        0 => below(&mut rng, TICK),
+                        1 => below(&mut rng, TICK * 8),
+                        2 => below(&mut rng, TICK * 64 * 3),
+                        _ => below(&mut rng, TICK * 300_000),
+                    };
+                    fired.clear();
+                    wheel.advance(now, &mut fired);
+                    let reached = now / TICK;
+                    let mut expected: Vec<(u32, u64)> = armed
+                        .iter()
+                        .filter(|(_, (tick, _))| *tick <= reached)
+                        .map(|(id, (_, word))| (*id, *word))
+                        .collect();
+                    let mut got = fired.clone();
+                    expected.sort_unstable();
+                    got.sort_unstable();
+                    assert_eq!(got, expected, "op {op}: advance to {now} fired these");
+                    for (id, _) in &got {
+                        armed.remove(id);
+                    }
+                }
+            }
+            assert_eq!(wheel.armed(), armed.len(), "op {op}");
+            if let Some(earliest) = armed.values().map(|(tick, _)| *tick).min() {
+                let next = wheel.next_deadline_ns().unwrap();
+                assert!(next <= earliest * TICK, "op {op}: next {next} after the earliest tick {earliest}");
+                assert!(next > (now / TICK) * TICK, "op {op}: next {next} not ahead of the wheel at {now}");
+            } else {
+                assert_eq!(wheel.next_deadline_ns(), None, "op {op}");
+            }
+        }
     }
 
     /// The next event is found from the occupancy words, never by visiting entries: with every timer armed at

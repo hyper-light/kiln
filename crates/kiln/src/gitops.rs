@@ -107,10 +107,13 @@ fn has_commits(refs: &BTreeMap<String, String>) -> bool {
 /// has shares it. git writes a small fetch's objects (fewer than `fetch.unpackLimit`) one by one,
 /// a commit before its tree and a tree before what's in it, so a commit seen while a fetch runs
 /// may lack its files yet (W03-R08: a change request's checks read its workflows while the poller
-/// fetched them, and git couldn't read `.github`).
-fn mirror_lock(repo: &str) -> Arc<async_lock::RwLock<()>> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::RwLock<()>>>>> = std::sync::OnceLock::new();
-    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+/// fetched them, and git couldn't read `.github`). Each in the order it came, a fetch waiting keeping
+/// the looks after it out: one per repository while it's used, gone with its last (`crate::turn::Keyed`
+/// of `crate::turn::ReadWrite`, no lock; goal 5, plan 01a1a59c2aae, its top goal: a change request's
+/// diff, a webhook's push and a fleet's look waited on async-lock's RwLock, its waits event-listener's).
+fn mirror_lock(repo: &str) -> crate::turn::Entry<'static, String, crate::turn::ReadWrite> {
+    static LOCKS: std::sync::LazyLock<crate::turn::Keyed<String, crate::turn::ReadWrite>> = std::sync::LazyLock::new(crate::turn::Keyed::new);
+    LOCKS.of(&repo.to_owned())
 }
 
 /// Create or refresh the bare mirror. Concurrent callers for one repo are serialised.
@@ -642,7 +645,8 @@ where
     P: Fn(Arc<Hub>, Repo) -> F + Clone + Send + Sync + 'static,
     F: std::future::Future<Output = anyhow::Result<usize>> + Send + 'static,
 {
-    let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
+    // `git_concurrency` polls at once, each in the order it was started (`crate::turn::Gate`, no lock; goal 5).
+    let sem = Arc::new(crate::turn::Gate::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     // Asked for while their poll ran (a push meanwhile): asked for again as that poll ends.
     let again = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
@@ -677,7 +681,7 @@ where
             inflight.lock().insert(repo.id.clone());
             let (hub, sem, inflight, again, failing, poll) = (hub.clone(), sem.clone(), inflight.clone(), again.clone(), failing.clone(), poll.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
-                let _permit = sem.acquire().await;
+                let _permit = sem.turn().await;
                 let r = poll(Arc::clone(&hub), repo.clone()).await;
                 let err = r.as_ref().err().map(|e| format!("{e:#}"));
                 let result = match &r {
@@ -827,7 +831,7 @@ pub async fn report_status(hub: &Hub, run: &Run, status: Status) {
 }
 
 /// `git archive` of a commit, for pods that build without git. Returns a tar stream.
-pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let mut cmd = git(hub);
     cmd.arg("-C").arg(path).args(["archive", "--format=tar", sha]);

@@ -225,6 +225,17 @@ fn followed(text: &str) -> Option<Followed> {
     }
 }
 
+/// [`followed`], a `harness` frame parsed on the compute pool: its whole info, every subagent, approval and limit of
+/// it, parsed on the listener's shard for every change of every session, held it 1 to 6 ms in g9p7 (goal 9, plan
+/// 01a1a87b2cec step 3). Other frames' kinds are read off their fronts here, and those few parsed here too. Each is
+/// waited for, so the listener still takes them in the order they came.
+async fn follow(text: Arc<str>) -> Option<Followed> {
+    if crate::wire::events::kind_of(&text) == Some("harness") {
+        return crate::rt::compute(move || followed(&text)).await.ok().flatten();
+    }
+    followed(&text)
+}
+
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
 /// server runs, and says what each calls for.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
@@ -259,7 +270,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
             }
             Err(async_broadcast::RecvError::Closed) => return Ok(()),
         };
-        let Some(what) = followed(&text) else { continue };
+        let Some(what) = follow(text).await else { continue };
         match what {
             Followed::Harness(info) => {
                 let due = hub.push.watch.lock().heard(*info);
@@ -499,6 +510,26 @@ mod tests {
         let Some(Followed::Closed(id)) = followed(r#"{ "type": "harness_closed", "id": "s1" }"#) else { anyhow::bail!("a frame read whole, not read") };
         anyhow::ensure!(id == "s1");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the listener reads a `harness` frame's info on the compute pool and the
+    /// rest where it is, each as `followed` reads it: the same info, either way it's sent; a session gone; and
+    /// nothing of a frame it passes over.
+    #[test]
+    fn g9_s3_a_harness_frame_is_read_off_the_shard_as_followed_reads_it() -> anyhow::Result<()> {
+        use crate::harness::session::Info;
+        use crate::wire::events::{ServerEvent, harness_frame};
+        crate::rt::block_on(async {
+            let info = Info { id: "s1".into(), kind: "claude".into(), summary: "a \"quoted\" word".into(), ..Info::default() };
+            for text in [harness_frame(&serde_json::to_vec(&info)?), Arc::from(ServerEvent::Harness { info: Box::new(info.clone()) }.text())] {
+                let Some(Followed::Harness(read)) = follow(Arc::clone(&text)).await else { anyhow::bail!("not read: {text}") };
+                anyhow::ensure!(*read == info, "{text}");
+            }
+            let Some(Followed::Closed(id)) = follow(Arc::from(ServerEvent::HarnessClosed { id: "s1".into() }.text())).await else { anyhow::bail!("a session gone, not read") };
+            anyhow::ensure!(id == "s1");
+            anyhow::ensure!(follow(Arc::from(ServerEvent::Terminals.text())).await.is_none(), "a frame it passes over");
+            Ok(())
+        })
     }
 
     #[test]

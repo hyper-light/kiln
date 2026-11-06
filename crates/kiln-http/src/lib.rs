@@ -22,6 +22,7 @@ pub(crate) mod h1;
 pub(crate) mod h2;
 pub mod h3;
 mod io;
+mod maps;
 pub(crate) mod rt;
 pub mod service;
 pub mod upgrade;

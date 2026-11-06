@@ -34,8 +34,8 @@ const MAX_PART: u64 = 256 << 20;
 /// What's left on this machine for reads or by an upload never finished goes after this.
 const KEPT: std::time::Duration = std::time::Duration::from_secs(86_400);
 
-/// One artifact finishing at a time: a matrix's legs can finish one together.
-static FINISHING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One artifact finishing at a time: a matrix's legs can finish one together. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static FINISHING: crate::turn::Gate = crate::turn::Gate::one();
 
 /// The service's refusal, as its clients read one: a status, and a message they show.
 fn message(status: StatusCode, msg: &str) -> Response {
@@ -294,7 +294,7 @@ fn zip_up(files: &Path, prior: Option<&Path>, out: &Path) -> anyhow::Result<Vec<
 }
 
 async fn finish(hub: &Hub, c: &Claims, origin: &str, name: &str) -> Result<Response, Fail> {
-    let _one = FINISHING.lock().await;
+    let _one = FINISHING.turn().await;
     let (run, n) = (c.run.clone(), name.to_owned());
     let row: Option<(i64, bool, Option<String>, Option<i64>)> = hub
         .store

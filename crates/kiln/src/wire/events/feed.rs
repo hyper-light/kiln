@@ -6,10 +6,14 @@
 //! last told. Pure: no clock (the socket's loop keeps time), no disk, no network. No lock on any path
 //! ([`Feed`]: goal 5's rule, plan 01a1a59c2aae): every emit pushes, from whichever shard emits, and
 //! every socket reads, on its own.
+//!
+//! What it keeps is `crate::memory::owners::EVENTS_FEED` on `/metrics` (goal 11, plan 01a1a87b2e56 step 5):
+//! at most [`RING`] frames and [`BYTES`] of them, and a frame an agent's next one says again whole is let go
+//! of as that one comes ([`Feed::push_over`]).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwapOption;
@@ -20,6 +24,13 @@ use serde_json::Value;
 /// such a listener would start over, and a page that was away for no more than that many frames
 /// resumes instead.
 pub const RING: usize = crate::hub::EVENTS;
+
+/// The most the feed's places hold, its frames' texts and their own room ([`Frame::weight`]): as many bytes
+/// of the texts as a listener of the hub's events holds before it starts over (`crate::net::EVENTS_BYTES`,
+/// `crate::memory::owners::UI_EVENTS`), as [`RING`] is as many frames. Past it the oldest go as past [`RING`]
+/// (a socket after them is told `resync`), never the newest: a frame larger than this alone is kept until the
+/// next (goal 11, plan 01a1a87b2e56 step 5).
+pub const BYTES: usize = crate::net::EVENTS_BYTES;
 
 /// How long a socket that asked for batches gathers frames before it sends them: T3 Code's
 /// `Stream.groupedWithin(512, Duration.millis(50))` (`apps/server/src/ws.ts`, its shell stream).
@@ -140,17 +151,37 @@ fn key_of(kind: &str, v: &Value, text: &str) -> Option<Key> {
 pub struct Frame {
     pub seq: u64,
     pub text: Arc<str>,
-    meta: OnceLock<Meta>,
+    /// Boxed, made by the first socket that reads it: most of a ring's frames are never read whole (an
+    /// agent's said again, [`Frame::over`]), and each kept a [`Meta`]'s room, about 180 bytes, regardless
+    /// (goal 11, plan 01a1a87b2e56 step 5).
+    meta: OnceLock<Box<Meta>>,
+    /// What stands in its place for a frame said again whole by a later one ([`Feed::push_over`]): readers
+    /// pass over it, and its text is none.
+    over: bool,
 }
 
 impl Frame {
     pub fn new(seq: u64, text: Arc<str>) -> Frame {
-        Frame { seq, text, meta: OnceLock::new() }
+        Frame { seq, text, meta: OnceLock::new(), over: false }
+    }
+
+    /// What stands for frame `seq` once a later frame said it again whole: its number alone, so readers
+    /// pass over it and the numbers, gaps and resumes are as they were.
+    fn over(seq: u64) -> Frame {
+        Frame { seq, text: Arc::from(""), meta: OnceLock::new(), over: true }
     }
 
     /// What's read of it, read the first time it's asked.
     pub fn meta(&self) -> &Meta {
-        self.meta.get_or_init(|| Meta::of(&self.text))
+        self.meta.get_or_init(|| Box::new(Meta::of(&self.text)))
+    }
+
+    /// What it takes in a place of the feed: its text and its own room, each allocation's with its
+    /// reference counts (an `Arc`'s two words). What's read of it ([`Frame::meta`], made only when a socket
+    /// reads it: its kind, key and names, parts of its text) isn't counted.
+    pub fn weight(&self) -> usize {
+        const COUNTS: usize = 2 * size_of::<usize>();
+        size_of::<Frame>() + COUNTS + self.text.len() + COUNTS
     }
 }
 
@@ -208,10 +239,30 @@ pub enum Since {
 ///   A push wakes each. A wake is Notify's to make: where Notify still waits on event-listener, its list
 ///   of waiters is behind a lock of that one socket's, not one every push and every socket take, as the
 ///   one wake this had was; where Notify waits on a lock-free list, the wake takes no lock at all.
+///
+/// What it holds (goal 11, plan 01a1a87b2e56 step 5), counted as `crate::memory::owners::EVENTS_FEED`:
+///
+/// - **Said again whole.** Most of what's pushed is an agent's info (`harness`), each change of it whole, so
+///   a ring of them held one agent's info hundreds of times over, every copy but its newest one no socket
+///   is sent (a batch sends a thing's newest alone, [`coalesce`]; a page that resumes is sent what's after
+///   where it was, where its newest is too). Its pusher says the number of the frame it says again
+///   ([`Feed::push_over`]): once the new one is in its place, that one's place takes a frame of its number
+///   alone ([`Frame::over`]), which readers pass over. Numbers, gaps and resumes are as they were.
+/// - **Bytes.** Its places hold at most [`BYTES`] of frames ([`Frame::weight`]): past it the oldest go, as past
+///   [`RING`]. `floor` is the oldest number it may still have; a push past the bytes raises it a frame at a
+///   time (a compare-and-swap, so each is let go of by one push alone) and empties that frame's place.
+///   Readers check `floor` before a place and again after one that holds nothing yet, so a frame let go of as
+///   they look is gone to them, never one they wait for; a push held up past its frame's floor takes it out
+///   again itself, so whichever of the two comes second lets it go.
 pub struct Feed {
     epoch: u64,
     /// The number the next push claims (the first is 1).
     next: AtomicU64,
+    /// The oldest number the feed may still have: those before it were let go of for its bytes ([`BYTES`]).
+    floor: AtomicU64,
+    /// What its places hold ([`Frame::weight`]), and the most they may.
+    held: AtomicUsize,
+    most: usize,
     /// Frame `seq`'s place is `seq % places.len()`: each holds the newest frame put in it, or none yet.
     places: Box<[ArcSwapOption<Frame>]>,
     /// The sockets listening, each its own wake.
@@ -222,10 +273,19 @@ pub struct Feed {
 enum Look {
     /// That frame.
     Frame(Arc<Frame>),
+    /// What stands for it, said again whole by a later frame ([`Frame::over`]): passed over.
+    Over,
     /// Not that frame yet: its push is still putting it there (or nothing's been put there yet).
     NotYet,
-    /// A newer one: that frame's gone.
+    /// A newer one, or let go of for the feed's bytes: that frame's gone.
     Gone,
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        crate::memory::owners::EVENTS_FEED.sub(*self.held.get_mut());
+        crate::memory::owners::EVENTS_FEED.bound_sub(self.most);
+    }
 }
 
 /// Whether two of a place's values are the same frame (or both none).
@@ -245,8 +305,32 @@ impl Feed {
     }
 
     pub fn with_capacity(epoch: u64, cap: usize) -> Feed {
+        Feed::with_room(epoch, cap, BYTES)
+    }
+
+    /// A feed keeping `cap` frames and `bytes` of them at the most ([`Frame::weight`]).
+    pub fn with_room(epoch: u64, cap: usize, bytes: usize) -> Feed {
         let places = (0..cap.max(1)).map(|_| ArcSwapOption::empty()).collect();
-        Feed { epoch, next: AtomicU64::new(1), places, listeners: crate::rcu::Rcu::default() }
+        crate::memory::owners::EVENTS_FEED.bound_add(bytes);
+        Feed { epoch, next: AtomicU64::new(1), floor: AtomicU64::new(1), held: AtomicUsize::new(0), most: bytes, places, listeners: crate::rcu::Rcu::default() }
+    }
+
+    /// What its places hold now ([`Frame::weight`]).
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    fn hold(&self, n: usize) {
+        self.held.fetch_add(n, Ordering::AcqRel);
+        crate::memory::owners::EVENTS_FEED.add(n);
+    }
+
+    fn let_hold(&self, n: usize) {
+        let mut now = self.held.load(Ordering::Acquire);
+        while let Err(seen) = self.held.compare_exchange_weak(now, now.saturating_sub(n), Ordering::AcqRel, Ordering::Acquire) {
+            now = seen;
+        }
+        crate::memory::owners::EVENTS_FEED.sub(n);
     }
 
     pub fn epoch(&self) -> u64 {
@@ -264,21 +348,37 @@ impl Feed {
         self.places.get(i)
     }
 
-    /// The oldest number a feed whose head is `head` keeps: the window of [`RING`] behind it.
+    /// The oldest number a feed whose head is `head` keeps: the window of [`RING`] behind it, and none let
+    /// go of for its bytes.
     fn oldest(&self, head: u64) -> u64 {
-        head.saturating_add(1).saturating_sub(self.cap()).max(1)
+        head.saturating_add(1).saturating_sub(self.cap()).max(1).max(self.floor.load(Ordering::SeqCst))
     }
 
-    /// Numbers `text` and keeps it (the oldest goes past [`RING`]), and wakes the sockets.
+    /// Numbers `text` and keeps it (the oldest goes past [`RING`] or [`BYTES`]), and wakes the sockets.
     pub fn push(&self, text: Arc<str>) -> u64 {
+        self.push_over(text, 0)
+    }
+
+    /// [`Feed::push`] of a frame that says again whole what frame `was` said (the same thing's: an agent's
+    /// info, its last frame's number as its pusher kept it; 0 for none): once this one's in its place, `was`
+    /// is let go of ([`Frame::over`]), and readers pass over it. Its number.
+    pub fn push_over(&self, text: Arc<str>, was: u64) -> u64 {
         let seq = self.next.fetch_add(1, Ordering::AcqRel);
         self.put(Arc::new(Frame::new(seq, text)));
+        if was > 0 && was < seq {
+            self.pass_over(was);
+        }
+        self.trim(seq);
         self.wake();
         seq
     }
 
-    /// Puts `frame` in its place, unless a newer frame is there already.
+    /// Puts `frame` in its place, unless a newer frame is there already, or its number was let go of for the
+    /// feed's bytes before it came.
     fn put(&self, frame: Arc<Frame>) {
+        if frame.seq < self.floor.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(place) = self.place(frame.seq) else { return };
         let mut there = place.load();
         loop {
@@ -288,10 +388,67 @@ impl Feed {
             }
             let was = place.compare_and_swap(&there, Some(Arc::clone(&frame)));
             if same(&was, &there) {
+                self.hold(frame.weight());
+                if let Some(old) = &*there {
+                    self.let_hold(old.weight());
+                }
+                // Let go of for the bytes as it went in (its floor rose past it after the check above): taken out
+                // again, by this push or by the one that raised the floor, whichever saw it second.
+                if frame.seq < self.floor.load(Ordering::SeqCst) {
+                    self.let_go(frame.seq);
+                }
                 return;
             }
             // Another push's put went in first (a frame a window before or after this one): looked at again.
             there = was;
+        }
+    }
+
+    /// Frame `seq`, said again whole by a later frame, let go of: its place takes what stands for it
+    /// ([`Frame::over`]), unless it holds a newer frame, none, or that already.
+    fn pass_over(&self, seq: u64) {
+        let Some(place) = self.place(seq) else { return };
+        let there = place.load();
+        let Some(old) = there.as_ref().filter(|f| f.seq == seq && !f.over) else { return };
+        let (old_weight, over) = (old.weight(), Arc::new(Frame::over(seq)));
+        let was = place.compare_and_swap(&there, Some(Arc::clone(&over)));
+        // Else a push of a newer frame, or the bytes' trim, took the place first: nothing of it to let go of here.
+        if same(&was, &there) {
+            self.hold(over.weight());
+            self.let_hold(old_weight);
+        }
+    }
+
+    /// The oldest frames let go of while its places hold more than [`BYTES`], up to `newest` (the frame just
+    /// pushed, which stays).
+    fn trim(&self, newest: u64) {
+        // Those a window of [`RING`] behind are gone already, their places taken by newer frames.
+        let lapped = newest.saturating_add(1).saturating_sub(self.cap()).max(1);
+        let mut floor = self.floor.load(Ordering::SeqCst);
+        while self.held() > self.most {
+            let oldest = floor.max(lapped);
+            if oldest >= newest {
+                return;
+            }
+            match self.floor.compare_exchange(floor, oldest + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    self.let_go(oldest);
+                    floor = oldest + 1;
+                }
+                Err(seen) => floor = seen,
+            }
+        }
+    }
+
+    /// Frame `seq`'s place emptied, if it holds that frame (or what stands for it): its number is below the floor.
+    fn let_go(&self, seq: u64) {
+        let Some(place) = self.place(seq) else { return };
+        let there = place.load();
+        let Some(old) = there.as_ref().filter(|f| f.seq == seq) else { return };
+        let weight = old.weight();
+        let was = place.compare_and_swap(&there, None::<Arc<Frame>>);
+        if same(&was, &there) {
+            self.let_hold(weight);
         }
     }
 
@@ -304,10 +461,16 @@ impl Feed {
 
     /// What frame `want`'s place holds of it.
     fn look(&self, want: u64) -> Look {
+        if want < self.floor.load(Ordering::SeqCst) {
+            return Look::Gone;
+        }
         let Some(place) = self.place(want) else { return Look::Gone };
         match &*place.load() {
+            Some(f) if f.seq == want && f.over => Look::Over,
             Some(f) if f.seq == want => Look::Frame(Arc::clone(f)),
             Some(f) if f.seq > want => Look::Gone,
+            // Not in yet, or let go of for the bytes as it looked (the floor rises before its place empties).
+            _ if want < self.floor.load(Ordering::SeqCst) => Look::Gone,
             _ => Look::NotYet,
         }
     }
@@ -323,7 +486,8 @@ impl Feed {
     }
 
     /// Every frame after `after`, up to the first a push is still putting in its place (that push wakes the
-    /// listeners once it's in), or [`Since::Gap`] when some of them are gone.
+    /// listeners once it's in), or [`Since::Gap`] when some of them are gone. Those said again whole by a later
+    /// one are passed over: that one's among them, or still to come.
     pub fn since(&self, after: u64) -> Since {
         let head = self.head();
         if after > head || after.saturating_add(1) < self.oldest(head) {
@@ -333,6 +497,7 @@ impl Feed {
         for want in after.saturating_add(1)..=head {
             match self.look(want) {
                 Look::Frame(f) => frames.push(f),
+                Look::Over => {}
                 Look::NotYet => break,
                 Look::Gone => return Since::Gap,
             }
@@ -341,7 +506,7 @@ impl Feed {
     }
 
     /// Every frame it has, oldest first: those of the window behind the head in their places, up to the
-    /// first a push is still putting in its place.
+    /// first a push is still putting in its place, passing over those said again whole.
     pub fn kept(&self) -> Vec<Arc<Frame>> {
         let head = self.head();
         let mut frames = Vec::new();
@@ -350,7 +515,7 @@ impl Feed {
                 Look::Frame(f) => frames.push(f),
                 Look::NotYet => break,
                 // Gone as pushes went on while it looked: the newer ones are still kept.
-                Look::Gone => {}
+                Look::Over | Look::Gone => {}
             }
         }
         frames

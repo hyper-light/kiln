@@ -37,7 +37,8 @@ impl Class {
 
 /// One timed thing: its class, when it began (µs since the epoch), how long it took (µs), whether it
 /// went as it should (an answer under 400; a socket that opened), and what it was, finer than its
-/// class (an API read's route: `sessions`, `events`…; empty where its class says it all).
+/// class (an API read's route: `sessions`, `events`…; empty where its class says it all); and what the
+/// server said of its own time with it, where it was asked (an API read: [`split`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub class: Class,
@@ -45,6 +46,42 @@ pub struct Sample {
     pub took_us: u64,
     pub ok: bool,
     pub what: &'static str,
+    pub server: Option<crate::client::ServerTime>,
+}
+
+/// Where the slowest of a class's samples went ([`split`]), in milliseconds, each the mean over them, so the three
+/// add up to their mean as the lab saw it: the server's wait before its handler started (from the request's head's
+/// arrival off its socket), its handler's time, and the rest (the request's way to the server and its answer's
+/// back, the answer's transfer, the client's own reading of it); and how many samples they were.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Split {
+    pub n: usize,
+    pub wait_ms: f64,
+    pub took_ms: f64,
+    pub rest_ms: f64,
+}
+
+/// The samples of `class` that went as they should and that the server told its time with, at or past their
+/// `q`-quantile as the lab saw them, split ([`Split`]); none without such samples. Goal 10, plan 01a1a87b2dae step
+/// 5: the server's wait and took at p99.9 are each the class's, and percentiles don't add up, so only each slow
+/// read's own split says what its time went to.
+pub fn split(samples: &[Sample], class: Class, q: f64) -> Option<Split> {
+    let mut told: Vec<(u64, crate::client::ServerTime)> = samples.iter().filter(|s| s.class == class && s.ok).filter_map(|s| Some((s.took_us, s.server?))).collect();
+    told.sort_unstable_by_key(|(took, _)| *took);
+    let sorted: Vec<u64> = told.iter().map(|(took, _)| *took).collect();
+    let at = quantile(&sorted, q)?;
+    let slow: Vec<(u64, u64, u64)> = told
+        .iter()
+        .filter(|(took, _)| *took >= at)
+        .map(|(seen, t)| {
+            let wait = t.wait_us.unwrap_or(0);
+            (wait, t.took_us, seen.saturating_sub(wait).saturating_sub(t.took_us))
+        })
+        .collect();
+    let n = slow.len();
+    #[allow(clippy::cast_precision_loss)]
+    let mean = |part: fn(&(u64, u64, u64)) -> u64| slow.iter().map(part).fold(0u64, u64::saturating_add) as f64 / n.max(1) as f64 / 1000.0;
+    Some(Split { n, wait_ms: mean(|s| s.0), took_ms: mean(|s| s.1), rest_ms: mean(|s| s.2) })
 }
 
 /// `q` of sorted `v` by the nearest rank (the smallest value with at least `q` of them at or under
@@ -310,12 +347,37 @@ mod tests {
     /// class's.
     #[test]
     fn g10_s1_each_route_is_seen_to_the_microsecond() {
-        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what };
+        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what, server: None };
         let by = seen_by_what(&[s("sessions", 1_234, true), s("sessions", 17, true), s("events", 999, true), s("events", 5, false), s("", 3, true)]);
         assert_eq!(by.keys().cloned().collect::<Vec<_>>(), vec!["api_read.events".to_owned(), "api_read.sessions".to_owned()]);
         let sessions = by.get("api_read.sessions").cloned().unwrap_or_default();
         assert_eq!((sessions.n, sessions.p50_ms, sessions.max_ms), (2, Some(0.017), Some(1.234)));
         assert_eq!(by.get("api_read.events").map(|e| (e.n, e.errors)), Some((1, 1)));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the slowest of a class's reads, as the lab saw them, are split into the
+    /// server's wait, its handler's time and the rest, each the mean over them, the three adding up to their mean;
+    /// reads the server didn't time, failed ones and other classes' aren't among them.
+    #[test]
+    fn g10_s5_the_slowest_reads_are_split_into_the_servers_wait_took_and_the_rest() {
+        use crate::client::ServerTime;
+        let read = |took_us: u64, server: Option<(Option<u64>, u64)>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server: server.map(|(wait_us, took_us)| ServerTime { wait_us, took_us }) };
+        // 1,000 reads of 200 µs, the server's share 50 µs of each; the slowest two, 3 ms and 5 ms, its share 2 ms and 1 ms.
+        let mut v: Vec<Sample> = (0..998).map(|_| read(200, Some((Some(30), 20)))).collect();
+        v.push(read(3_000, Some((Some(1_500), 500))));
+        v.push(read(5_000, Some((None, 1_000))));
+        // Not among them: one not timed, one failed, another class's.
+        v.push(read(9_000, None));
+        v.push(Sample { ok: false, ..read(9_000, Some((Some(1), 1))) });
+        v.push(Sample { class: Class::Page, ..read(9_000, Some((Some(1), 1))) });
+        let s = split(&v, Class::ApiRead, 0.999);
+        assert_eq!(s, Some(Split { n: 2, wait_ms: 0.75, took_ms: 0.75, rest_ms: 2.5 }), "(3 + 5) / 2 = 4 ms: 0.75 + 0.75 + 2.5");
+        let all = split(&v, Class::ApiRead, 0.0).map(|s| (s.n, s.wait_ms + s.took_ms + s.rest_ms));
+        assert!(all.is_some_and(|(n, sum)| n == 1000 && (sum - (998.0 * 0.2 + 8.0) / 1000.0).abs() < 1e-9), "{all:?}");
+        assert_eq!(split(&v, Class::Websocket, 0.999), None, "none timed");
+        assert_eq!(ServerTime::parse("wait;dur=1.234, took;dur=0.056"), Some(ServerTime { wait_us: Some(1_234), took_us: 56 }));
+        assert_eq!(ServerTime::parse("took;dur=0.5"), Some(ServerTime { wait_us: None, took_us: 500 }));
+        assert_eq!(ServerTime::parse("wait;dur=1"), None, "no took");
     }
 
     #[test]

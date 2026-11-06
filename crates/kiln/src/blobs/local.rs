@@ -97,7 +97,7 @@ pub struct LocalBlobs {
     presign: Presign,
     following: super::Following,
     /// [`LocalBlobs::reconcile`] has run this start.
-    ready: async_lock::OnceCell<()>,
+    ready: crate::turn::Once<()>,
 }
 
 /// What a collection let go.
@@ -296,7 +296,7 @@ impl Presign {
 
 impl LocalBlobs {
     pub fn new(store: Store, root: PathBuf, clock: Arc<dyn Clock>, limits: Limits, presign: Presign) -> Self {
-        Self { store, root, clock, limits, presign, following: super::Following::default(), ready: async_lock::OnceCell::new() }
+        Self { store, root, clock, limits, presign, following: super::Following::default(), ready: crate::turn::Once::new() }
     }
 
     /// Waits for [`LocalBlobs::reconcile`] to have run this start; the first to ask runs it.

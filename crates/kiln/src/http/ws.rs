@@ -68,8 +68,10 @@ pub fn accept_limited(
 /// whole: tungstenite's reader grows its buffer to the frame's length as the frame comes.
 const COMMANDS_READ: usize = 16 << 10;
 
-/// [`accept`] for a socket whose peer sends people's commands (an agent's page), reading
-/// [`COMMANDS_READ`] bytes at a time.
+/// [`accept`] for a socket whose peer sends little, reading [`COMMANDS_READ`] bytes at a time: people's commands
+/// (an agent's page), a terminal's keystrokes and resizes, a page's notes of what it couldn't read (the events
+/// socket, a job's and a deployment's logs). Each such socket saves 112 KiB of tungstenite's 128 KiB, made up
+/// front for as long as it's open (goal 11, plan 01a1a87b2e56 step 5).
 pub fn accept_commands(
     req: Request,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
@@ -598,6 +600,27 @@ mod tests {
         let mut server = tungstenite::WebSocket::from_raw_socket(Cursor::new(wire), tungstenite::protocol::Role::Server, Some(config));
         let got = server.read()?.into_text()?;
         anyhow::ensure!(got.as_str() == big, "{} bytes came of {}", got.len(), big.len());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: the sockets whose peers send little read [`COMMANDS_READ`] at a time,
+    /// not tungstenite's 128 KiB: the events socket, a job's logs, both terminals and a deployment's logs.
+    #[test]
+    fn g11_s5_the_sockets_whose_peers_send_little_read_16_kib() -> anyhow::Result<()> {
+        let body = |source: &'static str, head: &str| -> anyhow::Result<&'static str> {
+            let at = source.find(head).ok_or_else(|| anyhow::anyhow!("no {head}"))?;
+            let rest = source.get(at..).unwrap_or_default();
+            // To the function's closing brace, the first at the line's start.
+            let end = rest.find("\n}\n").ok_or_else(|| anyhow::anyhow!("{head} has no end"))?;
+            Ok(rest.get(..end).unwrap_or(rest))
+        };
+        let api = include_str!("../api.rs");
+        let cd = include_str!("../cd/api.rs");
+        for (source, head) in [(api, "\nfn job_logs_ws("), (api, "\nfn events_ws("), (api, "\nasync fn terminal_ws("), (api, "\nasync fn leg_terminal_ws("), (cd, "\nfn follow_logs(")] {
+            let handler = body(source, head)?;
+            anyhow::ensure!(handler.contains("ws::accept_commands(req)"), "{head} reads 16 KiB at a time");
+            anyhow::ensure!(!handler.contains("ws::accept(req)"), "{head} takes tungstenite's 128 KiB");
+        }
         Ok(())
     }
 

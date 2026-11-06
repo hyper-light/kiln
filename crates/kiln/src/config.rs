@@ -153,15 +153,20 @@ pub struct Server {
     /// declares it in a new server's config wherever the systemd unit it writes grants it, saying why
     /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
     pub realtime: bool,
-    /// Each of the server's shards nudges its CPU while it waits (docs/priority.md, "A nudge for the
-    /// shards"; goal 8, plan 01a1a59c2b29 step 7): its waits end at least every timer tick (100 µs), so
-    /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within
-    /// two ticks, not at the kernel's next tick (up to 1 ms at 1000 Hz). Needs no privilege; in the
-    /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge). It
-    /// costs a wake of each waiting shard every period, so it's off until declared (docs/ci.md §0.3,
-    /// "Opt-in automation"); macOS and Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE`
-    /// overrides it, and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
-    pub nudge: bool,
+    /// How the server's shards nudge their CPUs while they wait (docs/priority.md, "A nudge for the
+    /// shards"; goal 8, plan 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3): a nudged shard's waits
+    /// end at least every step quantum less the timers' tick (166.7 µs; goal 9, plan 01a1a87b2cec step 4), so
+    /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within a
+    /// quantum, the timer slack added (266.7 µs), not at the kernel's next tick (up to 1 ms at 1000 Hz).
+    /// `"off"` (or `false`), the default: never; it's off until declared (docs/ci.md §0.3, "Opt-in
+    /// automation"). `"auto"`, the mode a config declares, nudges a shard only while its host holds its
+    /// wakes, as its probe reads each period from the kernel's count of its wait for a CPU (`crate::nudge`),
+    /// so a calm server pays nothing and says when and why a shard nudged; `"on"` (or `true`, as before it
+    /// had a mode) nudges every wait, a wake of each waiting shard every period. Needs no privilege; in the
+    /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge); macOS and
+    /// Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any
+    /// other value on, as it was read before), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+    pub nudge: crate::nudge::Mode,
     /// The browser protocol over one WebSocket (`GET /api/live`, `crate::live`; goal 3 of the browser
     /// protocol program, docs/browser-protocol.md): served beside today's sockets when true. Off until
     /// declared, as the plan's open call leaves it until goal 9 moves the UI onto it. `KILN_LIVE`
@@ -485,7 +490,7 @@ impl Default for Server {
             placement: crate::placement::Placement::default(),
             cores: None,
             realtime: false,
-            nudge: false,
+            nudge: crate::nudge::Mode::Off,
             live: false,
             browser_congestion: None,
         }
@@ -681,9 +686,9 @@ impl Config {
         if let Ok(v) = std::env::var("KILN_RT_REALTIME") {
             cfg.server.realtime = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
-        // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`).
+        // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`, `=auto`, `=off`).
         if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
-            cfg.server.nudge = !matches!(v.trim(), "0" | "false" | "off" | "no");
+            cfg.server.nudge = crate::nudge::Mode::from_env(&v);
         }
         // `[server] live` and `browser_congestion`, as a lab's server takes its settings.
         if let Ok(v) = std::env::var("KILN_LIVE") {

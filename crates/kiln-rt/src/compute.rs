@@ -56,6 +56,7 @@ use std::thread::Thread;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
 use crate::error::RtError;
+use crate::idle::Cold;
 use crate::machine::clock::shard_clock_ns;
 use crate::machine::facts::CpuBudget;
 use crate::sync::{OneshotReceiver, OneshotSender, oneshot};
@@ -637,14 +638,35 @@ fn spawn_workers(
     (stealers, slots)
 }
 
-/// A worker: lowers its own priority to `rank` and says what the OS took, waits for the pool, then serves it
-/// until it stops.
+/// Parks while `state` says the worker is idle, until a submitter claims it: parked `cold.after` first, then, still
+/// idle, cold once (`cold.then`, on this thread), then for as long as it takes (kiln's goal 11, plan 01a1a87b2e56
+/// step 5: [`crate::idle`]). A park that returns early, its wait not yet past, parks again for the whole wait.
+fn wait_while_idle(state: &AtomicU8, mut cold: Option<Cold>) {
+    while state.load(Ordering::Acquire) == IDLE {
+        let Some(wait) = cold else {
+            std::thread::park();
+            continue;
+        };
+        let since = shard_clock_ns();
+        std::thread::park_timeout(wait.after);
+        let waited = shard_clock_ns().saturating_sub(since);
+        let after = u64::try_from(wait.after.as_nanos()).unwrap_or(u64::MAX);
+        if waited >= after && state.load(Ordering::Acquire) == IDLE {
+            (wait.then)();
+            cold = None;
+        }
+    }
+}
+
+/// A worker: does what the process said a worker does as it starts ([`crate::idle::started`]), lowers its own
+/// priority to `rank` and says what the OS took, waits for the pool, then serves it until it stops.
 fn work(
     index: usize,
     rank: Rank,
     local: &Worker<Job>,
     report: &SyncSender<Result<Priority, Refusal>>,
 ) {
+    crate::idle::started(crate::idle::Pool::Compute);
     let _ = report.send(crate::prioritysys::lower_current_thread(rank));
     let pool = loop {
         match POOL.get() {
@@ -741,9 +763,7 @@ impl Pool {
         // Counted once a rest that found nothing, however its park returns (a claim that came first, a
         // spurious return parked again).
         PARKS.fetch_add(1, Ordering::Relaxed);
-        while slot.state.load(Ordering::Acquire) == IDLE {
-            std::thread::park();
-        }
+        wait_while_idle(&slot.state, crate::idle::cold());
         true
     }
 
@@ -1209,5 +1229,38 @@ mod tests {
         assert_eq!(UNPARKS.load(Ordering::Relaxed) - unparks, 1, "one unpark woke it");
         assert_eq!(PARKS.load(Ordering::Relaxed) - parks, 1, "it parked once");
         assert_eq!(rt.counters().threads_woken, 1, "counted on the shard whose task woke it");
+    }
+
+    static WENT_COLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn went_cold() {
+        WENT_COLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Kiln's goal 11, plan 01a1a87b2e56 step 5: a worker claimed within its wait runs on as before; one idle
+    /// past it goes cold once, on its own thread, and still runs once claimed.
+    #[test]
+    fn g11_s5_an_idle_worker_goes_cold_once_past_its_wait() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let cold = Cold {
+            after: Duration::from_millis(20),
+            then: went_cold,
+        };
+        let idle_for = |held: Duration| {
+            let state = Arc::new(AtomicU8::new(IDLE));
+            let waiting = Arc::clone(&state);
+            let worker = std::thread::spawn(move || wait_while_idle(&waiting, Some(cold)));
+            std::thread::sleep(held);
+            state.store(RUNNING, Ordering::Release);
+            worker.thread().unpark();
+            worker.join().unwrap();
+        };
+        idle_for(Duration::ZERO);
+        // A claim within the wait can still come after it on a loaded machine: then the worker went cold, once.
+        assert!(WENT_COLD.load(Ordering::SeqCst) <= 1);
+        let before = WENT_COLD.load(Ordering::SeqCst);
+        idle_for(Duration::from_millis(300));
+        assert_eq!(WENT_COLD.load(Ordering::SeqCst) - before, 1, "cold once in an idle past 20 ms");
     }
 }

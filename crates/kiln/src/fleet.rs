@@ -236,7 +236,11 @@ fn builds_path(hub: &Hub) -> PathBuf {
 }
 
 fn load_builds(hub: &Hub) -> BTreeMap<String, Known> {
-    std::fs::read(builds_path(hub)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    read_builds(&builds_path(hub))
+}
+
+fn read_builds(path: &std::path::Path) -> BTreeMap<String, Known> {
+    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 /// Remember that `build` (a binary for `target`) is `commit`.
@@ -255,18 +259,12 @@ pub fn remember(hub: &Hub, build: &str, target: &str, commit: &str) {
         let Some(oldest) = map.iter().min_by_key(|(_, k)| k.at).map(|(b, _)| b.clone()) else { break };
         map.remove(&oldest);
     }
-    let path = builds_path(hub);
-    let write = || -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.part");
-        std::fs::write(&tmp, serde_json::to_vec(&*map)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        tracing::warn!(error = %format!("{e:#}"), "couldn't remember a build's commit");
+    // Written by the kept files' writer, off the shards, whole (`<file>.part`, then renamed over it), in the order
+    // kept: written here, a runner's facts (on the hub's loop) and the fleet's loop waited on the disk, under this
+    // lock (goal 9, plan 01a1a87b2cec step 3).
+    match serde_json::to_vec(&*map) {
+        Ok(b) => crate::keep::later(builds_path(hub), b),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "couldn't remember a build's commit"),
     }
 }
 
@@ -830,6 +828,16 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     // thread (`updates::binaries`, `updates::runners`), where a debug build's gigabyte held the
     // shard, and the HTTP listener on it, back 30 to 60 s.
     let build = crate::rt::blocking(crate::updates::own_build).await?;
+    // The builds kiln knows read on the blocking pool too, before anything asks them on a shard (goal 9, plan
+    // 01a1a87b2cec step 3); one asked first (a runner's facts as it connects) reads them where it is, once.
+    let path = builds_path(&hub);
+    let known = crate::rt::blocking(move || read_builds(&path)).await?;
+    {
+        let mut kept = hub.updates.fleet.builds.lock();
+        if kept.is_none() {
+            *kept = Some(known);
+        }
+    }
     // What this server runs is remembered, so runners on it are known after it is replaced.
     if is_commit(crate::api::COMMIT) {
         remember(&hub, &build, crate::api::TARGET, crate::api::COMMIT);
@@ -927,7 +935,7 @@ pub fn building_commit(hub: &Hub, job: &str) -> Option<String> {
 }
 
 /// The source of the commit build job `job` builds: the server's archive of it (tar).
-pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let commit = building_commit(hub, job).ok_or_else(|| anyhow::anyhow!("no such build"))?;
     let repo = release_repo(hub).await.ok_or_else(|| anyhow::anyhow!("kiln doesn't build {}", hub.cfg.updates.release_repo))?;
     crate::gitops::archive(hub, &repo, &commit).await
@@ -1622,6 +1630,29 @@ mod tests {
             let j = ended(&hub, &job.id).await?;
             assert_eq!(j.error.as_deref(), Some("the build it waited for ended without a binary of 0123456789ab: kiln did not build"));
             Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a build's commit, remembered (as a runner says its facts, on the hub's loop),
+    /// is known at once and written by the kept files' writer, off the caller's thread, as it was written before: the
+    /// whole map at `binaries/builds.json`.
+    #[test]
+    fn g9_s3_a_builds_commit_is_kept_off_the_callers_thread() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let commit = "0123456789abcdef0123456789abcdef01234567";
+            remember(&hub, "b1", "x86_64-unknown-linux-musl", commit);
+            let path = builds_path(&hub);
+            anyhow::ensure!(crate::keep::kept_through(&path) == Some(false), "through the kept files' writer");
+            let known = hub.updates.fleet.builds.lock().as_ref().and_then(|m| m.get("b1").map(|k| k.commit.clone()));
+            anyhow::ensure!(known.as_deref() == Some(commit), "known at once: {known:?}");
+            for _ in 0..500 {
+                if read_builds(&path).get("b1").is_some_and(|k| k.commit == commit && k.target == "x86_64-unknown-linux-musl") {
+                    return Ok(());
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("{} was never written", path.display())
         })
     }
 }

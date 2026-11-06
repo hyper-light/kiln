@@ -70,7 +70,21 @@ fn signed_expiring(hub: &Hub, purpose: &str, ttl: i64) -> String {
 fn verify_expiring(hub: &Hub, purpose: &str, value: &str) -> bool {
     let Some((exp, sig)) = value.split_once('.') else { return false };
     let Ok(e) = exp.parse::<i64>() else { return false };
-    e > crate::util::now_unix() && crate::util::ct_eq(sig.as_bytes(), sign(hub, purpose, exp).as_bytes())
+    e > crate::util::now_unix() && signed(hub, purpose, exp, sig)
+}
+
+/// Whether `sig` is [`sign`]'s signature of `payload` for `purpose`, worked out as the signature is made (the HMAC of
+/// `purpose:payload` under the admin token, in hex) but on the stack: checking a session's cookie, which every request
+/// a signed-in browser sends does, made a string to sign, the signature's hex and a copy of the cookie (goal 9, plan
+/// 01a1a87b2cec step 5: authorization's work a request).
+fn signed(hub: &Hub, purpose: &str, payload: &str, sig: &str) -> bool {
+    use hmac::{KeyInit as _, Mac as _};
+    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(hub.admin_token.as_bytes()) else { return false };
+    mac.update(purpose.as_bytes());
+    mac.update(b":");
+    mac.update(payload.as_bytes());
+    let mut hexed = [0u8; 64];
+    hex::encode_to_slice(mac.finalize().into_bytes(), &mut hexed).is_ok() && crate::util::ct_eq(sig.as_bytes(), &hexed)
 }
 
 pub fn otp_url(hub_admin_token: &str, public_url: &str) -> String {
@@ -83,15 +97,9 @@ pub fn job_token(admin_token: &str, job: &str) -> String {
     crate::util::hmac_hex(admin_token.as_bytes(), format!("job:{job}").as_bytes())
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_owned())
+/// Cookie `name`'s value, as the request carries it.
+fn cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).filter_map(|kv| kv.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -104,7 +112,7 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
     {
         return true;
     }
-    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
+    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", c))
 }
 
 /// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
@@ -119,13 +127,13 @@ fn cookie_for(value: &str, secure: bool) -> String {
 }
 
 /// Who a request is: the owner (the admin token, the owner's session), else a token or a user's
-/// session (docs/ci.md W10-R01).
+/// session (docs/ci.md W10-R01). The owner is told at once; only a check past that is a future boxed
+/// apart (goal 9, plan 01a1a87b2cec step 5: the router boxed a future for every request's check).
 async fn caller_of(hub: &Hub, headers: &HeaderMap) -> Option<crate::authz::Caller> {
     if authed(hub, headers) {
         return Some(crate::authz::Caller::owner());
     }
-    let session = cookie(headers, SESSION_COOKIE);
-    crate::authz::gate::caller(hub, bearer(headers), session.as_deref()).await
+    boxed(|| crate::authz::gate::caller(hub, bearer(headers), cookie(headers, SESSION_COOKIE))).await
 }
 
 /// A `Host` header without its port (IPv6 literals keep their brackets).
@@ -142,7 +150,7 @@ fn host_only(h: &str) -> &str {
 /// or a public URL that says https (TLS ends in front of kiln).
 fn is_secure(hub: &Hub, req: &Request) -> bool {
     hub.cfg.server.public_url.starts_with("https")
-        || req.extensions().get::<srv::Secure>().is_some()
+        || srv::secure(req)
         || srv::header_str(req, &header::HOST).is_some_and(|h| hub.front_doors.serves(host_only(h)))
 }
 
@@ -176,18 +184,54 @@ impl srv::Handler for Api {
         // on a connection that idled between them (the lab's readers'), was three times the router's (goal
         // 10, plan 01a1a87b2dae step 5).
         let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
+        let timing = req.headers().contains_key(ASK_TIMING);
         let resp = match crate::rt::labeled(label, boxed(|| route(hub, req))).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
         // Boxed as the route is (goal 10, plan 01a1a87b2dae step 5): the layers a request is carried in
-        // hold a pointer to it, not its compressing.
-        let resp = boxed(|| crate::http::compress::finish(asked, resp)).await;
+        // hold a pointer to it, not its compressing. An answer it leaves as it is (a tiny answer to a POST, a
+        // type that doesn't compress, a stream) makes no future (goal 9, plan 01a1a87b2cec step 5).
+        let resp = if crate::http::compress::untouched(&asked, &resp) { resp } else { boxed(|| crate::http::compress::finish(asked, resp)).await };
+        // Its compressing counted in what it took, as W21-R15 observed it, for its class and its own timing alike.
+        let took = began.elapsed();
         if let Some(class) = class {
-            crate::route_latency::observe(class, waited, began.elapsed());
+            crate::route_latency::observe(class, waited, took);
         }
-        resp
+        if timing { with_timing(resp, waited, took) } else { resp }
     }
+}
+
+/// The request header that asks for the request's own timing on its answer: [`with_timing`]'s `Server-Timing`.
+/// Only a request that asks is told (kiln-lab's readers: its `split` numbers), so every other answer is as it was.
+/// Goal 10, plan 01a1a87b2dae step 5: the server's wait and took at p99.9 are each a class's, and say nothing of
+/// what one slow read spent where; one read's own split tells the server's share of it from the hops' and the
+/// transfer's.
+pub const ASK_TIMING: &str = "kiln-timing";
+
+/// `resp` saying how long its request waited before its handler started (`wait`, from its head's arrival off its
+/// socket, where the connection said that) and how long the handler then took (`took`), as `crate::route_latency`
+/// observes them: W3C Server-Timing, `wait;dur=0.123, took;dur=0.045`, milliseconds to the microsecond.
+fn with_timing(mut resp: Response, waited: Option<Duration>, took: Duration) -> Response {
+    use std::io::Write as _;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    // Said on the stack, its one copy the header's own (goal 9, plan 01a1a87b2cec step 5: a string was made for it
+    // first). Room for two of the longest durations, in milliseconds (`u64::MAX` seconds: 23 digits, the point and 3
+    // more), and the words between.
+    let mut said = [0u8; 2 * 27 + 32];
+    let room = said.len();
+    let mut out = &mut said[..];
+    let wrote = match waited {
+        Some(w) => write!(out, "wait;dur={:.3}, took;dur={:.3}", ms(w), ms(took)),
+        None => write!(out, "took;dur={:.3}", ms(took)),
+    };
+    let len = room.saturating_sub(out.len());
+    if wrote.is_ok()
+        && let Some(v) = said.get(..len).and_then(|s| header::HeaderValue::from_bytes(s).ok())
+    {
+        resp.headers_mut().insert(header::HeaderName::from_static("server-timing"), v);
+    }
+    resp
 }
 
 /// `path`'s segments, each percent-decoded (and `+` a space) where it has anything to decode, else as it
@@ -195,6 +239,20 @@ impl srv::Handler for Api {
 /// each request split its path twice, two copies a segment each time).
 fn segments(path: &str) -> Vec<Cow<'_, str>> {
     path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(|s| if s.contains(['%', '+']) { Cow::Owned(srv::decode(s)) } else { Cow::Borrowed(s) }).collect()
+}
+
+/// `seg` as the router matches them, in `room` when they fit ([`srv::ROUTE_DEPTH`]: every route's own do), else in a
+/// vector of their own (goal 9, plan 01a1a87b2cec step 5: the router and its authorized half each made one a request).
+fn strs<'r>(seg: &'r [Cow<'_, str>], room: &'r mut [&'r str; srv::ROUTE_DEPTH]) -> Cow<'r, [&'r str]> {
+    match room.get_mut(..seg.len()) {
+        Some(slots) => {
+            for (slot, s) in slots.iter_mut().zip(seg) {
+                *slot = &**s;
+            }
+            Cow::Borrowed(slots)
+        }
+        None => Cow::Owned(seg.iter().map(|s| &**s).collect()),
+    }
 }
 
 async fn route(hub: Arc<Hub>, req: Request) -> R {
@@ -213,13 +271,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         return Ok(boxed(|| f.serve_path(&slug, req, secure)).await);
     }
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let seg = segments(&path);
-    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
+    // The request's target, shared: its path is the bytes the request came in, counted once more, not copied
+    // (goal 9, plan 01a1a87b2cec step 5).
+    let target = req.uri().clone();
+    let path = target.path();
+    let seg = segments(path);
+    let mut room = [""; srv::ROUTE_DEPTH];
+    let s = strs(&seg, &mut room);
 
     // Pages' own address (`[server] pages_url`): pages agents show, and nothing of kiln's.
     if pages_site(&hub).is_some_and(|site| asks_for(&req, &site)) {
-        return match (&method, s.as_slice()) {
+        return match (&method, &*s) {
             (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => Ok(page_font(name)),
             (&Method::GET | &Method::HEAD, ["v", id, ..]) => boxed(|| page(&hub, id, &req)).await,
             // An agent's app opened on a person's device (`crate::harness::opened`): its link's
@@ -235,17 +297,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
     // of its own (an upload streams for as long as it takes).
-    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
+    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(path) {
         let h = Arc::clone(&hub);
         return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::proxy::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
     }
-    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
+    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(path) {
         let h = Arc::clone(&hub);
         return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
     }
 
     // Open routes (their own auth, if any).
-    match (&method, s.as_slice()) {
+    match (&method, &*s) {
         (&Method::POST, ["api", "mcp"]) => {
             // The owner, by the admin token, its session or an MCP token kiln minted; else a
             // user's session or token, whose operations the route table judges one by one.
@@ -445,7 +507,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
+        (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers()).await),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         // The browser protocol's lab page, on a lab's server alone (`KILN_LIVE_LAB`, `crate::live`).
         (&Method::GET, ["__live", file]) if crate::live::lab_dir().is_some() => return Ok(boxed(|| crate::live::lab_file(file)).await),
@@ -488,7 +550,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     if !is_api {
         return Ok(boxed(|| crate::uiserver::serve(req)).await);
     }
-    let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else {
+    let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
     if method == Method::GET || method == Method::HEAD {
@@ -498,7 +560,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // its handlers record on the way.
     let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
     let h = Arc::clone(&hub);
-    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, boxed(|| authorized(hub, caller, req, seg)), |r: &R| match r {
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path, q: &q, ip }, boxed(|| authorized(hub, caller, req, seg)), |r: &R| match r {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.0.as_u16(),
     })
@@ -552,7 +614,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
     {
         *name = Cow::Owned(id);
     }
-    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
+    let mut room = [""; srv::ROUTE_DEPTH];
+    let s = strs(&seg, &mut room);
     let q = srv::query(&req);
     if !caller.is_owner() {
         boxed(|| crate::authz::gate::check(&hub, &caller, &method, &s, &q)).await.map_err(|(c, m)| err(c, m))?;
@@ -561,7 +624,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
     req.extensions_mut().insert(caller.clone());
     // An agent session answers only to whoever reaches it (docs/agents.md, "Whose agents"): one the
     // caller doesn't see isn't found, and one it sees but doesn't act on refuses every change.
-    if let ["api", "harness", "sessions", id, ..] = s.as_slice() {
+    // Whoever sees every session (the owner, a manager) reaches each: told at once, with no future made to ask
+    // (goal 9, plan 01a1a87b2cec step 5: one was boxed for every read of an agent's page).
+    if let ["api", "harness", "sessions", id, ..] = &*s
+        && !crate::harness::lineage::sees_all(&caller)
+    {
         let reached = if matches!(method, Method::GET | Method::HEAD) {
             boxed(|| crate::harness::lineage::may_see(&hub, &caller, id)).await
         } else {
@@ -575,7 +642,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
         };
     }
-    match (&method, s.as_slice()) {
+    match (&method, &*s) {
         (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION"), &crate::ops::all(&hub)))),
         (&Method::GET, ["api", "peers"]) => boxed(|| crate::peers::list(&hub)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
@@ -2105,8 +2172,10 @@ fn sync_machine(hub: &Hub, req: &Request) -> String {
     srv::query(req).get("machine").filter(|m| !m.is_empty()).map(|m| hub.machine_of(m)).unwrap_or_default()
 }
 
-/// Copies of kiln.db for learners are made one at a time (each reads the whole database).
-static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
+/// Copies of kiln.db for learners are made one at a time (each reads the whole database), in the order asked for:
+/// a gate with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where async-lock's semaphore waited
+/// on event-listener's `Mutex`.
+static CLUSTER_COPIES: crate::turn::Gate = crate::turn::Gate::one();
 
 /// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
 /// machine (`?machine=`), or the admin token. The copy goes once sent. kiln hands it on by its
@@ -2121,7 +2190,7 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
     }
     let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.acquire().await;
+    let _one = CLUSTER_COPIES.turn().await;
     // Copies a stop left behind.
     if let Ok(old) = std::fs::read_dir(&dir) {
         for e in old.flatten() {
@@ -2750,8 +2819,10 @@ fn otp_problem(hub: &Hub, code: &str) -> &'static str {
 }
 
 static PASSWORD_THROTTLE: std::sync::LazyLock<crate::password::Throttle> = std::sync::LazyLock::new(Default::default);
-/// One password check at a time, so the throttle cannot be outrun by parallel guesses.
-static PASSWORD_GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One password check at a time, so the throttle cannot be outrun by parallel guesses: in the order they came, with
+/// no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where async-lock's mutex waited on
+/// event-listener's `Mutex`.
+static PASSWORD_GATE: crate::turn::Gate = crate::turn::Gate::one();
 
 /// Which sign-in methods the login page should offer (public).
 async fn auth_methods(hub: &Hub) -> Response {
@@ -2778,7 +2849,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
         let (id, _, epoch) = crate::authz::passwords::sign_in(hub, name, &l.password).await.map_err(|(c, m)| err(c, m))?;
         return Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)));
     }
-    let gate = PASSWORD_GATE.lock().await;
+    let gate = PASSWORD_GATE.turn().await;
     if let Err(wait) = PASSWORD_THROTTLE.check() {
         let secs = wait.as_secs().max(1);
         let r = srv::json(
@@ -3369,7 +3440,7 @@ async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
 
 fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
     let sock = ui::Socket::of(Wire::LogUp, Wire::LogDown, &caller_name(&req), None);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         match upgrade.await {
             Ok(socket) => {
@@ -5048,7 +5119,7 @@ impl Asked {
 
 fn events_ws(hub: Arc<Hub>, req: Request, asked: Asked, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
     let sock = ui::Socket::of(Wire::EventsUp, Wire::EventsDown, &caller_name(&req), None);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
@@ -5322,7 +5393,7 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     // What it can't read shows on the page of the runner it's on.
     let on = existing.as_deref().and_then(|s| hub.terminals.get(s)).map_or_else(|| target.clone(), |t| t.target.clone());
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller_name(&req), terminal_page(&on));
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let cmd = q.get("cmd").cloned();
@@ -5365,7 +5436,7 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
     }
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller.name, Some(Page::Runner(agent.clone())));
@@ -6699,6 +6770,16 @@ where
     Ok(came_to)
 }
 
+/// What a viewer's socket is doing, for the shards' table of what held them (`hyper_rt::slow`; goal 10, plan
+/// 01a1a87b2dae step 5: g9p7's calm lab named the socket's task by its spawn site alone, held 6.3 ms, and not which
+/// of its parts held it): its attach (what's kept of its files, its place among the viewers, the view), its
+/// snapshot's pieces, a catch-up after it fell behind, its live frames, a command it sent.
+static VIEWER_ATTACH: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer attach" };
+static VIEWER_SNAPSHOT: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer snapshot" };
+static VIEWER_CATCH_UP: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer catch-up" };
+static VIEWER_LIVE: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer live" };
+static VIEWER_COMMAND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer command" };
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
@@ -6719,6 +6800,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
+    // What's kept of its files read and its frame made off the shards (`crate::harness::kept::warm`): the attach
+    // copies that frame.
+    hyper_rt::futures::label(&VIEWER_ATTACH);
+    crate::harness::kept::warm(&hub, &id).await;
+    hyper_rt::futures::label(&VIEWER_ATTACH);
     let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches, takes.view) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
@@ -6726,7 +6812,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     {
         // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
         let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
-        send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+        crate::rt::labeled(&VIEWER_SNAPSHOT, send_snapshot(&mut tx, att.snapshot, takes.packed)).await?;
     }
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
@@ -6780,12 +6866,12 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 }
             }
             w = live.fuse() => match w {
-                Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
+                Live::Ready => match crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await {
                     Ok(batch) => {
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
-                        match write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at).await? {
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
@@ -6832,6 +6918,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // it comes, and answered on this socket once, `ack` or `nack`.
                     Ok(SessionUp::Under { id: cmd, c, .. }) => {
                         use crate::harness::asked::{Taken, frame};
+                        hyper_rt::futures::label(&VIEWER_COMMAND);
                         let kind = hub.harness.kind_of(&hub, &id, &c);
                         match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
                             (kind, Taken::New(rx)) => {
@@ -6846,6 +6933,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // As clients from before ids send them: refusals said as errors, nothing for
                     // the rest.
                     Ok(SessionUp::Bare(c)) => {
+                        hyper_rt::futures::label(&VIEWER_COMMAND);
                         audit_command(&hub, &mut audit, &who, &id, &c).await;
                         let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
                         let (h, session) = (Arc::clone(&hub), id.clone());
@@ -6889,14 +6977,18 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             }
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
-            // can't tell (it begins with "open"); and the feed from where that is.
+            // can't tell (it begins with "open"); and the feed from where that is. What's kept of its
+            // files made off the shards first, as for an attach.
+            hyper_rt::futures::label(&VIEWER_CATCH_UP);
+            crate::harness::kept::warm(&hub, &id).await;
+            hyper_rt::futures::label(&VIEWER_CATCH_UP);
             let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have, takes.view) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
             {
                 let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
-                send_snapshot(&mut tx, snapshot, takes.packed).await?;
+                crate::rt::labeled(&VIEWER_CATCH_UP, send_snapshot(&mut tx, snapshot, takes.packed)).await?;
             }
             caught_up = Some((Instant::now(), began.elapsed()));
             at = from;
@@ -6937,13 +7029,20 @@ async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R
 
 // ------------------------------------------------------------------ misc
 
-fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
+async fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     if !hub.cfg.server.metrics_public && !authed(hub, headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
     // The bus's figures as its node states them now.
     hub.bus.observe();
-    srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(crate::metrics::render()))
+    // Written out on the blocking pool, not on the request's shard: every family's every series, hundreds of
+    // kilobytes, in one call, held a shard 2.5 ms in g9p7's calm lab (goal 10, plan 01a1a87b2dae step 5). What it
+    // reads is the process's, not a shard's.
+    let text = match crate::rt::blocking(crate::metrics::render).await {
+        Ok(text) => text,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("the figures couldn't be written out: {e:#}")).into_response(),
+    };
+    srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(text))
 }
 
 async fn readyz(hub: &Hub) -> Response {
@@ -6963,9 +7062,17 @@ async fn readyz(hub: &Hub) -> Response {
         let v = o.view();
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
     }
-    match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => srv::text(StatusCode::OK, &format!("ready{note}")),
-        Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
+    // The store, from what the server knows of it (goal 6, plan 01a1a59c2abe step 3): readiness is Critical, and the
+    // `SELECT 1` it sent through kiln.db's one writer waited behind every write before it (the lab's writer line, 0.7 s
+    // at p99; a deploy rolled back on it, 2026-10-30). Ready while its writer runs and keeps up; not once its thread has
+    // stopped, or while calls wait and it has finished none for as long as kiln's longest prober waits
+    // (`crate::pool_health::WRITER_STUCK`), so no prober sees it unready where the call would have answered in time.
+    if !hub.store.writer_running() {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "store: its writer has stopped");
+    }
+    match crate::pool_health::store_writer_stuck() {
+        Some((waiting, still)) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {waiting} calls wait for its writer, which has finished none for {} s", still.as_secs())),
+        None => srv::text(StatusCode::OK, &format!("ready{note}")),
     }
 }
 
@@ -7035,9 +7142,9 @@ fn server_health(hub: &Hub) -> Response {
             // Its place on its machine (docs/priority.md; goal 8, plan 01a1a59c2b29 step 7): its shards'
             // real-time class as they took it, or why not (`[server] realtime`), their nudge in its place
             // (`[server] nudge`), and where the legs and agents its own runner starts run beside its cores
-            // (`[server] cores`); its cores, its shards' and the partition they're in, if any (goal 9, plan
-            // 01a1a87b2cec step 4).
-            "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status() },
+            // (`[server] cores`); its cores, its shards' and the partition they're in, if any; the spin before each
+            // park its shards were asked for (`KILN_RT_SPIN`, the lab's; goal 9, plan 01a1a87b2cec step 4).
+            "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status(), "spin": crate::rt::spin_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
@@ -7101,7 +7208,7 @@ mod tests {
             let from = hub.feed.head();
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
-            hub.emit_harness("s1", &serde_json::to_vec(&info)?);
+            hub.emit_harness("s1", &serde_json::to_vec(&info)?, 0);
             hub.emit(&ServerEvent::Terminals);
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());
@@ -8130,6 +8237,59 @@ mod tests {
         })
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a request that asks (`kiln-timing`) is told its own wait before its handler
+    /// started, from its head's arrival, and its handler's time, as Server-Timing, in milliseconds to the
+    /// microsecond; one that doesn't ask is answered as before, without it.
+    #[test]
+    fn g10_s5_a_request_that_asks_is_told_its_own_wait_and_took() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        assert_eq!(with_timing(srv::status(StatusCode::OK), Some(Duration::from_micros(1_234)), Duration::from_micros(56)).headers().get("server-timing").map(|v| v.as_bytes().to_vec()), Some(b"wait;dur=1.234, took;dur=0.056".to_vec()));
+        assert_eq!(with_timing(srv::status(StatusCode::OK), None, Duration::from_micros(56)).headers().get("server-timing").map(|v| v.as_bytes().to_vec()), Some(b"took;dur=0.056".to_vec()));
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let dur = |v: &str, name: &str| v.split(',').find_map(|m| m.trim().strip_prefix(name)?.strip_prefix(";dur=")?.parse::<f64>().ok());
+            // Its head came 2 ms before its handler started.
+            let mut asks = lab_get("/api/me")?;
+            asks.headers_mut().insert(ASK_TIMING, header::HeaderValue::from_static("1"));
+            asks.extensions_mut().insert(kiln_http::Received(Instant::now().checked_sub(Duration::from_millis(2)).unwrap_or_else(Instant::now)));
+            let resp = Arc::clone(&api).handle(asks).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let said = resp.headers().get("server-timing").and_then(|v| v.to_str().ok()).map(str::to_owned).unwrap_or_default();
+            let (wait, took) = (dur(&said, "wait"), dur(&said, "took"));
+            anyhow::ensure!(wait.is_some_and(|w| w >= 2.0) && took.is_some_and(|t| t >= 0.0), "{said:?}");
+            // As it was for a request that doesn't ask.
+            let resp = Arc::clone(&api).handle(lab_get("/api/me")?).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK && !resp.headers().contains_key("server-timing"), "{:?}", resp.headers());
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the server's figures are written out off the request's shard and answered
+    /// whole, every family there (the routes', the runner's legs with the loop's hold); without the owner's token,
+    /// refused as before.
+    #[test]
+    fn g10_s5_the_figures_are_written_out_off_the_shard_and_answered_whole() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let resp = Arc::clone(&api).handle(lab_get("/metrics")?).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let body = http_body_util::BodyExt::collect(resp.into_body()).await.map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();
+            let text = String::from_utf8_lossy(&body);
+            for family in ["kiln_route_seconds", "kiln_runner_wait_leg_seconds_count{leg=\"held\"}", "kiln_memory_bytes"] {
+                anyhow::ensure!(text.contains(family), "{family} missing from {} bytes", text.len());
+            }
+            if !hub.cfg.server.metrics_public {
+                let anyone = http::Request::builder().method(Method::GET).uri("/metrics").body(srv::Incoming::empty())?;
+                let resp = Arc::clone(&api).handle(anyone).await;
+                anyhow::ensure!(resp.status() == StatusCode::UNAUTHORIZED, "{}", resp.status());
+            }
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: a path's segments, split once by the router, are each the path's
     /// own bytes where there's nothing to decode in it (no copy made), decoded where there is.
     #[test]
@@ -8145,5 +8305,190 @@ mod tests {
             }
         }
         assert!(segments("/").is_empty());
+    }
+
+    /// What `f` allocated on this thread, and its output.
+    fn allocating<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = crate::os::counted::made().blocks;
+        let out = f();
+        (out, crate::os::counted::made().blocks.saturating_sub(before))
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the router's segments are matched from the stack, as many as a route names,
+    /// with no allocation; a path of more has them in a vector.
+    #[test]
+    fn g9_s5_the_routers_segments_are_matched_from_the_stack() {
+        let seg = segments("/api/harness/sessions/a%2Fb/events");
+        let mut room = [""; srv::ROUTE_DEPTH];
+        let (said, made) = allocating(|| match strs(&seg, &mut room) {
+            Cow::Borrowed(s) => matches!(s, ["api", "harness", "sessions", "a/b", "events"]),
+            Cow::Owned(_) => false,
+        });
+        assert!(said && made == 0, "matched from the stack: {made} allocations");
+        let seg = segments("/api/harness/sessions/a/files/src/kiln/lib/http/server.rs");
+        let mut room = [""; srv::ROUTE_DEPTH];
+        let s = strs(&seg, &mut room);
+        assert!(matches!(s, Cow::Owned(_)));
+        assert_eq!(s.join("/"), "api/harness/sessions/a/files/src/kiln/lib/http/server.rs");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (authorization's work a request): a session's cookie is checked with nothing
+    /// allocated (it was a copy of the cookie, the string signed and the signature's hex), and says what the
+    /// signature's own comparison says: the owner's own, yes; one whose signature or expiry was changed, or one past
+    /// its expiry, no.
+    #[test]
+    fn g9_s5_a_sessions_cookie_is_checked_without_allocating() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let value = signed_expiring(&hub, "session", SESSION_TTL);
+            let with = |v: &str| -> anyhow::Result<HeaderMap> {
+                let mut h = HeaderMap::new();
+                h.insert(header::COOKIE, header::HeaderValue::from_str(&format!("theme=dark; {SESSION_COOKIE}={v}"))?);
+                Ok(h)
+            };
+            let theirs = with(&value)?;
+            let (yes, made) = allocating(|| authed(&hub, &theirs));
+            anyhow::ensure!(yes && made == 0, "the owner's session: {yes}, {made} allocations");
+            let (exp, sig) = value.split_once('.').ok_or_else(|| anyhow::anyhow!("no signature in {value}"))?;
+            anyhow::ensure!(crate::util::ct_eq(sig.as_bytes(), sign(&hub, "session", exp).as_bytes()), "the signature as it's made");
+            let flipped = if sig.ends_with('0') { "1" } else { "0" };
+            let changed = format!("{exp}.{}{flipped}", sig.get(..sig.len().saturating_sub(1)).unwrap_or_default());
+            let later = format!("{}.{sig}", exp.parse::<i64>()? + 1);
+            let past = format!("{}.{}", crate::util::now_unix() - 1, sign(&hub, "session", &(crate::util::now_unix() - 1).to_string()));
+            for (v, why) in [(changed, "its signature changed"), (later, "its expiry changed"), (past, "past its expiry")] {
+                anyhow::ensure!(!authed(&hub, &with(&v)?), "{why}: refused");
+                anyhow::ensure!(!verify_expiring(&hub, "session", &v), "{why}: refused");
+            }
+            anyhow::ensure!(!verify_expiring(&hub, "otp", &value), "another purpose's");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a request's own timing is said with one allocation, its header's own, where a
+    /// string was made for it first; the words as before.
+    #[test]
+    fn g9_s5_a_requests_timing_is_said_in_one_allocation() {
+        let resp = srv::text(StatusCode::OK, "ok");
+        let (resp, made) = allocating(|| with_timing(resp, Some(Duration::from_micros(1500)), Duration::from_micros(250)));
+        assert_eq!(made, 1);
+        assert_eq!(resp.headers().get("server-timing").and_then(|v| v.to_str().ok()), Some("wait;dur=1.500, took;dur=0.250"));
+        let resp = with_timing(srv::text(StatusCode::OK, "ok"), None, Duration::from_secs(u64::MAX));
+        assert!(resp.headers().get("server-timing").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("took;dur=18446744073709551")), "the longest fits");
+    }
+
+    /// What each request cost the server: the allocations its connection's polls made, their bytes, and the polls'
+    /// time, by path, the median of its repeats.
+    type Costs = Vec<(&'static str, crate::os::counted::Made, Duration)>;
+
+    /// One kept-alive connection to kiln's API on a port of its own, over HTTP/1.1 or HTTP/2, the server's side of it
+    /// counted (`crate::os::counted`): what each of `paths`, asked `reps` times as the lab's readers ask it (the
+    /// owner's token, nothing packed, its own timing asked), cost the server once the connection had gone idle after
+    /// the request before, as theirs does (goal 9, plan 01a1a87b2cec step 5).
+    async fn served(api: Arc<Api>, h2: bool, paths: &[&'static str], reps: usize) -> anyhow::Result<Costs> {
+        use crate::os::counted::{Made, Tally, counted_into};
+        use http_body_util::{BodyExt as _, Empty};
+        let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tally = Arc::new(Tally::default());
+        let counting = Arc::clone(&tally);
+        crate::rt::spawn(async move {
+            if let Ok(stream) = tcp.accept().await {
+                let remote = stream.peer_addr().ok();
+                counted_into(&counting, crate::http::server::serve_accepted(stream, api, remote, None)).await;
+            }
+        });
+        let io = crate::http::io::TcpIo::new(hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?);
+        enum Client {
+            One(kiln_http::client::http1::SendRequest<Empty<Bytes>>),
+            Two(kiln_http::client::http2::SendRequest<Empty<Bytes>>),
+        }
+        let mut client = if h2 {
+            let (send, conn) = kiln_http::client::http2::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::Two(send)
+        } else {
+            let (send, conn) = kiln_http::client::http1::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::One(send)
+        };
+        let mut costs = Vec::new();
+        for path in paths {
+            let mut each = Vec::new();
+            for _ in 0..reps {
+                let uri = if h2 { format!("http://127.0.0.1:{}{path}", addr.port()) } else { (*path).to_owned() };
+                let req = http::Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, format!("127.0.0.1:{}", addr.port()))
+                    .header(header::AUTHORIZATION, "Bearer test-admin-token")
+                    .header(header::ACCEPT, "*/*")
+                    .header(header::ACCEPT_ENCODING, "identity")
+                    .header(ASK_TIMING, "1")
+                    .body(Empty::<Bytes>::new())?;
+                let before = tally.now();
+                let resp = match &mut client {
+                    Client::One(send) => send.send_request(req).await?,
+                    Client::Two(send) => send.send_request(req).await?,
+                };
+                let status = resp.status();
+                let body = resp.into_body().collect().await?.to_bytes();
+                anyhow::ensure!(status == StatusCode::OK, "{path}: {status} {}", String::from_utf8_lossy(&body));
+                // The server's polls for it ended: its connection is idle again.
+                crate::rt::sleep(Duration::from_millis(3)).await;
+                let after = tally.now();
+                each.push((after.0.blocks.saturating_sub(before.0.blocks), after.0.bytes.saturating_sub(before.0.bytes), after.1.saturating_sub(before.1)));
+            }
+            let mid = |mut v: Vec<u64>| {
+                v.sort_unstable();
+                v.get(v.len() / 2).copied().unwrap_or_default()
+            };
+            let made = Made { blocks: mid(each.iter().map(|e| e.0).collect()), bytes: mid(each.iter().map(|e| e.1).collect()) };
+            costs.push((*path, made, Duration::from_nanos(mid(each.iter().map(|e| e.2).collect()))));
+        }
+        Ok(costs)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (a tenth of the CPU): what serving each read the lab makes of an agent's
+    /// pages costs the server, over HTTP/1.1 and HTTP/2, once what's kept for them is made: the allocations a request
+    /// makes on its connection's polls (request, router, handler, answer and write, for the median of its repeats),
+    /// their bytes and the polls' time, said for the hand-over and held under what the serve path's cuts left.
+    #[test]
+    fn g9_s5_what_a_read_costs_the_server_route_by_route() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
+            crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let paths = ["/healthz", "/api/me", "/api/harness/sessions", "/api/harness/sessions/a", "/api/harness/sessions/a/events?limit=50", "/api/harness/sessions/a/goals", "/api/plans?session=a"];
+            // What's kept for these reads made (the first reads of each make it, off the request path).
+            for h2 in [false, true] {
+                served(Arc::clone(&api), h2, &paths, 2).await?;
+            }
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            let one = served(Arc::clone(&api), false, &paths, 15).await?;
+            let two = served(Arc::clone(&api), true, &paths, 15).await?;
+            for ((path, a, t), (_, b, u)) in one.iter().zip(&two) {
+                eprintln!("g9_s5 {path}: HTTP/1.1 {} allocations, {} bytes, {:.1} us; HTTP/2 {} allocations, {} bytes, {:.1} us", a.blocks, a.bytes, t.as_secs_f64() * 1e6, b.blocks, b.bytes, u.as_secs_f64() * 1e6);
+            }
+            // The serve path's own, under the least a handler does (`/healthz`'s "ok"): 26 allocations over HTTP/1.1
+            // and 22 over HTTP/2 before step 5's cuts of it, 16 and 13 after (a request's headers in a map an answer
+            // gave back, its arrival one extension, its path matched from the stack, its timing said in place, its
+            // answer's body unboxed again; HTTP/2's frame head in place). What's left: kiln-http's read buffer and its
+            // share, the request's extensions (their table, kiln-http's arrival time, the connection's), the slot an
+            // idle connection makes again, the handler's and the router's futures, the path's segments, the answer's
+            // body and its box, its header map and its timing. Two more allow for another test's request on the same
+            // shard taking the map given back between two of these.
+            let fixed = |costs: &Costs| costs.iter().find(|(p, _, _)| *p == "/healthz").map_or(u64::MAX, |(_, m, _)| m.blocks);
+            anyhow::ensure!(fixed(&one) <= 16 + 2 && fixed(&two) <= 13 + 2, "the serve path's own: {} allocations over HTTP/1.1, {} over HTTP/2", fixed(&one), fixed(&two));
+            Ok(())
+        })
     }
 }

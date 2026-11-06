@@ -435,7 +435,7 @@ pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::loc
 }
 
 /// The binary kept for `target` as a stream, with what kiln knows of it.
-pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, async_channel::Receiver<bytes::Bytes>)> {
+pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, crate::memory::queue::Receiver<bytes::Bytes>)> {
     let b = stored(hub, target)?;
     let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), Some(b.sha256.clone()), 0, b.size.saturating_sub(1));
     Some((b, rx))
@@ -2722,7 +2722,7 @@ mod tests {
     /// next one can start.
     #[test]
     fn an_upgrade_neither_waits_on_a_full_uplink_nor_outlives_itself() -> anyhow::Result<()> {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
         let up = crate::exec::Uplink(tx);
         let line = |l: &str| AgentMsg::UpgradeLog { job: "j".into(), line: l.into() };
         up.say(line("downloading"));

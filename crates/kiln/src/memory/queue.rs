@@ -142,15 +142,21 @@ impl<A: Weigh, B: Weigh> Weigh for (A, B) {
 }
 
 /// One wait's place among a queue's waiters: what wakes it (its task, or its thread parked in a blocking
-/// call), and whether it's in the list now (listed once a wait, however often the wait is polled).
-struct Place {
+/// call), and whether it's in the list now (listed once a wait, however often the wait is polled). Also
+/// `crate::rt::Notify`'s and `crate::rt::Shutdown`'s (goal 5, plan 01a1a59c2aae, its top goal).
+pub(crate) struct Place {
     waker: AtomicWaker,
     listed: AtomicBool,
 }
 
 impl Place {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self { waker: AtomicWaker::new(), listed: AtomicBool::new(false) })
+    }
+
+    /// Its wait is over: the waker it held goes, so a wake that finds it listed still wakes no one.
+    pub(crate) fn let_go(&self) {
+        drop(self.waker.take());
     }
 }
 
@@ -159,17 +165,23 @@ impl Place {
 /// fence on each side (a Dekker handshake) means one of the two sees the other, so no wake is lost. A place
 /// listed by a wait that found what it waited for at its look again stays until the next wake, which polls
 /// its task for nothing: each wait lists one place at a time, and every wake takes them all.
-struct Waiters {
+pub(crate) struct Waiters {
     list: ConcurrentQueue<Arc<Place>>,
 }
 
 impl Waiters {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { list: ConcurrentQueue::unbounded() }
     }
 
+    /// How many places are listed now (a test's).
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> usize {
+        self.list.len()
+    }
+
     /// `place` waits, woken by `waker`; what the waiter looks at next is looked at after this.
-    fn wait(&self, place: &Arc<Place>, waker: &Waker) {
+    pub(crate) fn wait(&self, place: &Arc<Place>, waker: &Waker) {
         place.waker.register(waker);
         if !place.listed.swap(true, Ordering::AcqRel) {
             // Unbounded and never closed: the push always goes.
@@ -179,7 +191,7 @@ impl Waiters {
     }
 
     /// Wakes every place listed now: what the waker made (an item in, room let go) is seen by each.
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         fence(Ordering::SeqCst);
         for _ in 0..self.list.len() {
             let Ok(place) = self.list.pop() else { break };
@@ -190,8 +202,8 @@ impl Waiters {
 }
 
 /// A waker that unparks the thread that made it: a blocking call's wait, on a thread of its own (never the
-/// runtime's).
-fn thread_waker() -> Waker {
+/// runtime's). Also `crate::rt::Listen::wait_deadline`'s (goal 5, plan 01a1a59c2aae, its top goal).
+pub(crate) fn thread_waker() -> Waker {
     struct Unpark(std::thread::Thread);
     impl futures::task::ArcWake for Unpark {
         fn wake_by_ref(this: &Arc<Self>) {
@@ -845,6 +857,21 @@ mod tests {
         }
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: these server paths' queues are
+    /// this module's, none an async-channel's: every live command to a runner, a terminal's keystrokes among them
+    /// (`wire/commands.rs`), each frame reach's relay passes between runners (`reach/relay.rs`), and WebRTC's
+    /// loop and what it tells its viewers' sockets (`harness/webrtc.rs`).
+    #[test]
+    fn g5_the_servers_command_relay_and_webrtc_paths_make_no_async_channel() {
+        let files = [("wire/commands.rs", include_str!("../wire/commands.rs")), ("reach/relay.rs", include_str!("../reach/relay.rs")), ("harness/webrtc.rs", include_str!("../harness/webrtc.rs"))];
+        for (file, src) in files {
+            let code = code_of(src);
+            for made in ["async_channel::bounded", "async_channel::unbounded"] {
+                assert!(!code.contains(made), "{file} makes an async-channel, whose waits take a lock ({made})");
+            }
+        }
+    }
+
     /// An item of a test's: its sender, its number, and `n` bytes counted.
     struct Tagged(usize, usize, usize);
 
@@ -1196,5 +1223,44 @@ mod tests {
         assert_eq!(OWNER.bytes(), 150);
         drop((b, rb));
         assert_eq!((OWNER.bytes(), OWNER.bound()), (130, Some(100)));
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side, run by kiln's CI with every test: the runner
+    /// process's queues on its paths are this module's, none an async-channel's, whose waits take
+    /// event-listener's `Mutex` on the sender's shard (or thread) and the taker's: its loop's uplink, its own
+    /// words, its jobs' results, its terminals' and sessions' output and its blue/green words (`agent.rs`,
+    /// `exec.rs`), its sessions' lanes and hand-overs (`harness/host.rs`, `harness/handing.rs`), its
+    /// harnesses' and steps' pipes on every platform (`os/proc_unix.rs`, `os/proc_windows.rs`), its terminals
+    /// on every platform (`terminal.rs`, `os/pty_unix.rs`, `os/pty_windows.rs`, `runner/kept.rs`), its ports'
+    /// bytes (`browser/ports.rs`), its sessions' control and outputs (`harness/session.rs`), and reach's side of
+    /// it: every frame between runners into the node, what the node tells the server, a run's output, stdin
+    /// and events, syncs, and `kiln run`'s and MCP `run`'s requests and events (`reach/node.rs`,
+    /// `reach/serve.rs`, `reach/local.rs`, `reach/reuse.rs`).
+    #[test]
+    fn g5_the_runners_paths_make_no_async_channel() {
+        let files = [
+            ("agent.rs", include_str!("../agent.rs")),
+            ("exec.rs", include_str!("../exec.rs")),
+            ("harness/host.rs", include_str!("../harness/host.rs")),
+            ("harness/session.rs", include_str!("../harness/session.rs")),
+            ("harness/handing.rs", include_str!("../harness/handing.rs")),
+            ("reach/node.rs", include_str!("../reach/node.rs")),
+            ("reach/serve.rs", include_str!("../reach/serve.rs")),
+            ("reach/local.rs", include_str!("../reach/local.rs")),
+            ("reach/reuse.rs", include_str!("../reach/reuse.rs")),
+            ("os/proc_unix.rs", include_str!("../os/proc_unix.rs")),
+            ("os/proc_windows.rs", include_str!("../os/proc_windows.rs")),
+            ("terminal.rs", include_str!("../terminal.rs")),
+            ("os/pty_unix.rs", include_str!("../os/pty_unix.rs")),
+            ("os/pty_windows.rs", include_str!("../os/pty_windows.rs")),
+            ("runner/kept.rs", include_str!("../runner/kept.rs")),
+            ("browser/ports.rs", include_str!("../browser/ports.rs")),
+        ];
+        for (file, src) in files {
+            let code = code_of(src);
+            for made in ["async_channel::bounded", "async_channel::unbounded"] {
+                assert!(!code.contains(made), "{file} makes an async-channel, whose waits take a lock ({made})");
+            }
+        }
     }
 }

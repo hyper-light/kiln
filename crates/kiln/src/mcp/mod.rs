@@ -580,7 +580,15 @@ pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::
         }
     };
     match answer(hub, caller, &bytes).await {
-        Some(a) => srv::json(StatusCode::OK, &a),
+        // Encoded in a turn of the shard's of its own: a tool's result is made, written out as its text, and then
+        // encoded again with that text in the answer, each a long computation for a long result, and in one poll
+        // they held the shard 1.2 ms a call at the mean in g11alloc2's calm rounds (`agents_list`'s), every read on
+        // that shard waiting behind them. Past its turn, with something else wanting the shard, the call gives it
+        // up between them (goal 10, plan 01a1a87b2dae step 5; `crate::rt::consume_budget`).
+        Some(a) => {
+            crate::rt::consume_budget().await;
+            srv::json(StatusCode::OK, &a)
+        }
         None => srv::status(StatusCode::ACCEPTED),
     }
 }
@@ -651,6 +659,12 @@ pub fn tool_name(op: &str) -> String {
     op.replace('.', "_")
 }
 
+/// Whether `tool` is operation `op`'s MCP name ([`tool_name`]), compared without making it (goal 9, plan 01a1a87b2cec
+/// step 5: each call made every operation's name until it found its own, twice).
+fn is_tool(op: &str, tool: &str) -> bool {
+    op.len() == tool.len() && op.bytes().zip(tool.bytes()).all(|(o, t)| (if o == b'.' { b'_' } else { o }) == t)
+}
+
 struct Server {
     hub: Arc<Hub>,
     caller: Caller,
@@ -702,7 +716,7 @@ impl Server {
             "tools/call" => {
                 let p: rpc::ToolsCall = req.params()?;
                 // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's.
-                if !matches!(p.name.as_str(), "code_search" | "code_run") && !crate::ops::all(&self.hub).iter().any(|o| tool_name(o.name) == p.name) {
+                if !matches!(p.name.as_str(), "code_search" | "code_run") && crate::ops::find(&self.hub, |op| is_tool(op, &p.name)).is_none() {
                     return Err(Box::new(req.unknown_tool(&p.name)));
                 }
                 self.call_tool(&p.name, Value::Object(p.arguments.unwrap_or_default())).await
@@ -811,7 +825,7 @@ impl Server {
                 }
             }
             _ => {
-                let Some(op) = crate::ops::all(&self.hub).into_iter().find(|o| tool_name(o.name) == name) else {
+                let Some(op) = crate::ops::find(&self.hub, |op| is_tool(op, name)) else {
                     return tool_error(&format!("no tool {name}"));
                 };
                 // An input that doesn't fit the operation: a tool error saying where and why, so
@@ -820,7 +834,12 @@ impl Server {
                     return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
                 }
                 match crate::ops::call(cx, op.name, args).await {
-                    Ok(v) => tool_ok(v),
+                    // Its text, the result written out whole, made in a turn of the shard's of its own
+                    // (`respond`'s notes).
+                    Ok(v) => {
+                        crate::rt::consume_budget().await;
+                        tool_ok(v)
+                    }
                     Err((_, e)) => tool_error(&e),
                 }
             }
@@ -965,6 +984,23 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a tool is found by its name with no operation's name made: for every operation,
+    /// the one `tool_name` finds; none for a name that differs in a character or in length.
+    #[test]
+    fn g9_s5_a_tool_is_found_without_making_every_name() {
+        let ops = crate::ops::listed(true);
+        for op in &ops {
+            let tool = tool_name(op.name);
+            assert!(is_tool(op.name, &tool), "{tool}");
+            let found = ops.iter().find(|o| is_tool(o.name, &tool)).map(|o| o.name);
+            assert_eq!(found, ops.iter().find(|o| tool_name(o.name) == tool).map(|o| o.name), "{tool}");
+        }
+        assert!(is_tool("agents.list", "agents_list"));
+        for not in ["agents.list", "agents_lis", "agents_listx", "agents-list", ""] {
+            assert!(!is_tool("agents.list", not), "{not}");
+        }
+    }
 
     /// The operations docs/ci.md §4.1 names, each once: a row's `.x` is the last full name's
     /// area's `x` (`ci.caches.list`, `.delete`).
@@ -1315,5 +1351,34 @@ mod tests {
         assert!(told.starts_with(INSTRUCTIONS) && told.contains("You are kiln agent 01a14ab9693976deb6ff6825f7da1c42") && told.contains("goals_add") && told.contains("plans_run"), "{told}");
         assert_eq!(instructions(&Caller::owner()), INSTRUCTIONS);
         assert!(skills::list().iter().any(|s| s.get("name").and_then(Value::as_str) == Some("kiln-plans")), "the skill the instructions name is there");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `agents_list` through `/api/mcp`, its briefs and its JSON made in turns of the
+    /// shard's (goal 10's), answers whole: its text is its structured result's JSON, which lists every agent the caller
+    /// sees, in the registry's order, each one's brief; and the answer is that, as JSON.
+    #[test]
+    fn g9_s3_agents_list_through_mcp_is_answered_whole() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for id in ["s1", "s2", "s3"] {
+                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+            }
+            let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}"#);
+            let r = respond(&hub, Caller::owner(), Ok(body)).await;
+            anyhow::ensure!(r.status() == StatusCode::OK && r.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) == Some("application/json"), "{:?}", r.headers());
+            let answer: Value = serde_json::from_slice(&r.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default())?;
+            anyhow::ensure!(answer.get("id") == Some(&json!(7)) && answer.pointer("/result/isError") == Some(&json!(false)), "{answer}");
+            let structured = answer.pointer("/result/structuredContent").cloned().unwrap_or_default();
+            let text: Value = serde_json::from_str(answer.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default())?;
+            anyhow::ensure!(text == structured, "its text is its result's JSON: {text} against {structured}");
+            let want: Vec<Value> = hub.harness.list().iter().filter(|i| i.helper.is_none()).map(crate::harness::wait::brief).collect();
+            anyhow::ensure!(structured.get("agents") == Some(&Value::Array(want)) && want_len(&structured) == 3, "{structured}");
+            Ok(())
+        })
+    }
+
+    fn want_len(v: &Value) -> usize {
+        v.get("agents").and_then(Value::as_array).map_or(0, Vec::len)
     }
 }

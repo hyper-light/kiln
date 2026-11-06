@@ -83,6 +83,16 @@ pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 /// again (`Resync`), and kiln's own listeners are told how many they missed.
 pub static UI_EVENTS: Owner = Owner::new("ui_events");
 
+/// The events socket's feed (`crate::wire::events::feed::Feed`, W21-R15): every frame the hub emits, numbered
+/// and kept so a page that reconnects takes up where it was, and a socket that falls behind reads on from where
+/// it is. What its places hold, each frame's text and its own room (`Frame::weight`; what a socket read of one,
+/// a few of its parts, isn't counted): at most `RING` frames, as many as a listener of [`UI_EVENTS`] holds, and
+/// `feed::BYTES`, as many bytes as one does ([`crate::net::EVENTS_BYTES`]), the oldest going past either (a
+/// page after them loads what it shows again: `resync`). An agent's info said again whole lets go of what it
+/// said before (`Feed::push_over`): most of what's pushed, an agent's info at each change (goal 11, plan
+/// 01a1a87b2e56 step 5). The texts are the ones [`UI_EVENTS`] counts while its listeners hold them.
+pub static EVENTS_FEED: Owner = Owner::new("events_feed");
+
 /// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
 /// it (`crate::memory::ring`): each job's at most `FEED` pieces, and `FEED` x [`crate::proto::LOG_CHUNK`]
 /// of their bytes, what the job's writer tells its viewers at once (`FEED` pieces a batch) of the largest
@@ -178,7 +188,10 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// 01a1a59c2a9c step 5): a terminal's keystrokes and its output from its machine (`crate::termsess`), a
 /// conversation feed's links, its parts to send and its intake's answers (`crate::convo::feed`), a live job's
 /// writes (`crate::logs`), the sealed chunks waiting for the packer (`crate::harness::copies`), files read ahead
-/// of their requests and a socket's audit rows (`crate::api`). Each item is counted at its place alone
+/// of their requests and a socket's audit rows (`crate::api`); and the runner process's own (goal 5, plan
+/// 01a1a59c2aae): its uplink and what its loop takes (`crate::agent`, `crate::exec::Uplink`), its sessions'
+/// lanes, control and updates (`crate::harness`, `crate::convo::store::tee`), its harnesses' and steps'
+/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");
@@ -190,7 +203,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 26] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

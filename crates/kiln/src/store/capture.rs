@@ -151,6 +151,19 @@ pub fn cache_used(conn: &Connection) -> usize {
     if rc == ffi::SQLITE_OK { usize::try_from(now).unwrap_or(0) } else { 0 }
 }
 
+/// The pages `conn` wrote to its WAL since this was last asked (`SQLITE_DBSTATUS_CACHE_WRITE`, its
+/// pager's own count, taken back to zero as it's read): what the store's writer counts toward its
+/// WAL's next checkpoint (goal 5, plan 01a1a59c2aae), as SQLite's own checkpoint counts the WAL's
+/// frames (https://www.sqlite.org/c3ref/c_dbstatus_options.html).
+pub fn pages_written(conn: &Connection) -> u64 {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: `conn.handle()` is the connection's open handle, alive for this borrow; `sqlite3_db_status`
+    // reads its pagers' counts (under the connection's own mutex) into the two ints it's given, and,
+    // asked to (the last argument), sets the count back to zero.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_CACHE_WRITE, &mut now, &mut most, 1) };
+    if rc == ffi::SQLITE_OK { u64::try_from(now).unwrap_or(0) } else { 0 }
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

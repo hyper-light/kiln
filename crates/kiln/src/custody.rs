@@ -194,28 +194,35 @@ async fn take_read(store: &Store, root: &[u8], org: &str, bundle: std::sync::Arc
             Looked::Again(digest) => return Ok(Ok(Taken { digest, again: true, broke: None })),
             Looked::New { taken, wanted, waiting } => (taken, wanted, waiting),
         };
-        let broke = match own {
-            Own::Unchecked => None,
-            Own::Alone(found) => found,
-            Own::Waits { checked, wanted } => {
-                let (root, revocations, org, d) = (std::sync::Arc::clone(&root), std::sync::Arc::clone(&revoked.list), org.to_owned(), taken.clone());
-                crate::rt::compute(move || broken(&d, *checked, checked_rows(wanted_rows, &root, &revocations), &wanted, &org)).await?
-            }
-        };
-        let broke = match broke {
-            Some((b, around, relay)) => {
-                record_break(store, &taken, &b, &around, &relay, at).await?;
-                Some(b.to_string())
-            }
-            None => None,
-        };
-        // The records that waited for it: a custody record's followers, or, a delegation, the records taken for
-        // someone under it (they come from other machines, in any order), each checked now.
-        for waiting in waiting {
-            check(store, &root, org, &waiting, &revoked.list, at).await?;
-        }
-        return Ok(Ok(Taken { digest: taken, again: false, broke }));
+        return settle(store, &root, org, &revoked, own, None, taken, wanted_rows, waiting, at).await.map(Ok);
     }
+}
+
+/// What follows a record kept new ([`take`]): its own hop, checked as `own` leaves it (or `found`, checked already with the
+/// records it follows as read: [`take_batch`]), with `wanted_rows` the rows of the records it needs that kiln has; a break
+/// recorded; then the records that waited for it (`waiting`: a custody record's followers, or, a delegation, the records
+/// taken for someone under it, which come from other machines in any order), each checked now.
+#[allow(clippy::too_many_arguments)]
+async fn settle(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, revoked: &crate::identities::Revoked, own: Own, found: Option<Option<Broken>>, taken: String, wanted_rows: Vec<(String, String, i64)>, waiting: Vec<String>, at: i64) -> anyhow::Result<Taken> {
+    let broke = match (found, own) {
+        (Some(found), _) | (None, Own::Alone(found)) => found,
+        (None, Own::Unchecked) => None,
+        (None, Own::Waits { checked, wanted }) => {
+            let (root, revocations, org, d) = (std::sync::Arc::clone(root), std::sync::Arc::clone(&revoked.list), org.to_owned(), taken.clone());
+            crate::rt::compute(move || broken(&d, *checked, checked_rows(wanted_rows, &root, &revocations), &wanted, &org)).await?
+        }
+    };
+    let broke = match broke {
+        Some((b, around, relay)) => {
+            record_break(store, &taken, &b, &around, &relay, at).await?;
+            Some(b.to_string())
+        }
+        None => None,
+    };
+    for waiting in waiting {
+        check(store, root, org, &waiting, &revoked.list, at).await?;
+    }
+    Ok(Taken { digest: taken, again: false, broke })
 }
 
 /// A statement as [`take`] reads it ([`read`]): its digest ("" when it can't be read), and what kiln makes of it.
@@ -268,17 +275,190 @@ type Broken = (Break, Vec<String>, String);
 /// store.
 async fn read(bundle: &std::sync::Arc<Value>, root: &std::sync::Arc<[u8]>, revocations: &std::sync::Arc<[Revocation]>, came_from: &str, at: i64, org: &str) -> anyhow::Result<Read> {
     let (bundle, root, revocations, came_from, org) = (std::sync::Arc::clone(bundle), std::sync::Arc::clone(root), std::sync::Arc::clone(revocations), came_from.to_owned(), org.to_owned());
-    crate::rt::compute(move || read_now(&bundle, &root, &revocations, came_from, at, &org)).await
+    crate::rt::compute(move || with_recent_hop(read_now(&bundle, &root, &revocations, came_from, at, &org), &org)).await
+}
+
+/// `read`, its own hop checked now where every record it needs is one of kiln's own kept moments ago ([`recent`]: a
+/// mirror's receipt of kiln's hand-on of a batch), with those as they checked when kiln signed them (goal 9, plan
+/// 01a1a87b2cec step 5). Its keeping call then reads no row for the hop, and no job of its own reads them back and
+/// checks them again: the same hop as those rows give (the same records, checked as kiln took them).
+fn with_recent_hop(mut read: Read, org: &str) -> Read {
+    let found = match &read.verdict {
+        Verdict::Custody { own: Own::Waits { checked, wanted }, .. } => recent::hop(checked, wanted, org),
+        _ => None,
+    };
+    if let (Some(found), Verdict::Custody { own, .. }) = (found, &mut read.verdict) {
+        *own = Own::Alone(found);
+        recent::served();
+    }
+    read
+}
+
+/// kiln's own records kept moments ago, as they checked when it signed them (its hand-ons of its store's batches to
+/// mirrors: [`sign_and_take`]), found by digest (goal 9, plan 01a1a87b2cec step 5): a mirror's receipt of one, taken
+/// soon after, has its hop checked with it as it's read ([`with_recent_hop`]). A ring of slots, each swapped whole,
+/// no lock; one found in none (older, another process's) is read back from the store, as before.
+pub(crate) mod recent {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    use arc_swap::ArcSwapOption;
+    use kiln_ci::identity::statement::Checked;
+
+    struct Ring {
+        slots: Box<[ArcSwapOption<Checked>]>,
+        next: AtomicUsize,
+    }
+
+    static RING: OnceLock<Ring> = OnceLock::new();
+    /// Hops checked with records found here: what a lab and the tests read.
+    static SERVED: AtomicU64 = AtomicU64::new(0);
+
+    /// Keeps them for `mirrors` mirrors (`[conversations] mirrors`), once a process: each mirror's feed has at most
+    /// `crate::convo::feed::WINDOW` batches sent ahead of its answers, and a batch's receipt can still be on its way as
+    /// the window moves on, so twice that a mirror, one at the least.
+    pub fn keep_for(mirrors: usize) {
+        let slots = 2 * crate::convo::feed::WINDOW * mirrors.max(1);
+        let _ = RING.get_or_init(|| Ring { slots: (0..slots).map(|_| ArcSwapOption::empty()).collect(), next: AtomicUsize::new(0) });
+    }
+
+    /// `c`, one of kiln's own records just kept, in the place of the oldest.
+    pub fn keep(c: Checked) {
+        let Some(ring) = RING.get() else { return };
+        let at = ring.next.fetch_add(1, Ordering::Relaxed).checked_rem(ring.slots.len());
+        if let Some(slot) = at.and_then(|i| ring.slots.get(i)) {
+            slot.store(Some(Arc::new(c)));
+        }
+    }
+
+    /// Record `digest`, if it's here.
+    pub fn find(digest: &str) -> Option<Arc<Checked>> {
+        RING.get()?.slots.iter().find_map(|s| s.load_full().filter(|c| c.digest == digest))
+    }
+
+    /// The hop of `mine` (a record as read), which needs the records `wanted`, checked with them here ([`super::broken`]),
+    /// when every one is; else none (read back as before).
+    pub fn hop(mine: &Checked, wanted: &[String], org: &str) -> Option<Option<super::Broken>> {
+        let map: BTreeMap<String, Checked> = wanted.iter().map(|w| find(w).map(|c| (w.clone(), Checked::clone(&c)))).collect::<Option<_>>()?;
+        Some(super::broken(&mine.digest, mine.clone(), map, wanted, org))
+    }
+
+    pub fn served() {
+        SERVED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hops checked with records kept here, so far.
+    pub fn served_so_far() -> u64 {
+        SERVED.load(Ordering::Relaxed)
+    }
 }
 
 /// [`read`], on the thread it's called on: a compute job's.
 fn read_now(bundle: &Value, root: &[u8], revocations: &[Revocation], came_from: String, at: i64, org: &str) -> Read {
+    read_keeping(bundle, root, revocations, came_from, at, org, false).0
+}
+
+/// [`read_now`], and with `keep`, the statement as it checked, when it did (what the next record's hop needs of it, when
+/// both are taken together: [`take_batch`]).
+fn read_keeping(bundle: &Value, root: &[u8], revocations: &[Revocation], came_from: String, at: i64, org: &str, keep: bool) -> (Read, Option<Checked>) {
     let (digest, envelope) = (digest_of(bundle), bundle.to_string());
+    let mut checked = None;
     let verdict = match statement::verify(bundle, root, revocations, at) {
-        Ok(c) => verdict_of(c, envelope, came_from, org),
+        Ok(c) => {
+            if keep {
+                checked = Some(c.clone());
+            }
+            verdict_of(c, envelope, came_from, org)
+        }
         Err(e) => Verdict::Unsigned { why: e.to_string(), signer: statement::verify(bundle, root, &[], at).map(|c| c.custodian).unwrap_or_default(), envelope },
     };
-    Read { digest, verdict }
+    (Read { digest, verdict }, checked)
+}
+
+/// What [`take`] made of a record ([`take_batch`]'s each).
+pub type TakeOutcome = anyhow::Result<Result<Taken, Refused>>;
+
+/// A conversation feed's batch as kiln's intake keeps its two records (goal 9, plan 01a1a87b2cec step 5): the runner's
+/// hand-on `given`, as it came over `came_from`, then kiln's receipt of it, `receipt`, signed here; each taken as [`take`]
+/// takes it, in that order. Both are read in one job on the compute pool (the receipt signed in it, and its hop checked
+/// with the hand-on as it was read, which is what kiln keeps of it, kept now), and kept in one call to the store's thread,
+/// one write: two waits for the shard where [`take`] and [`sign_and_take`] made five, and one write where they made two
+/// (each write a cluster group entry for every learner). What isn't the usual goes one at a time, as [`take`] has it: either
+/// refused, a revocation added since, the receipt's hop needing more than the hand-on, or the hand-on kept before (its
+/// copy kiln keeps may be signed apart). Each one's outcome, the receipt's an error when it couldn't be signed (the hand-on
+/// taken all the same); an error for both only when the store's revocations couldn't be read.
+pub async fn take_batch(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>, given: Value, came_from: &str, receipt: statement::Statement, at: i64) -> anyhow::Result<(TakeOutcome, anyhow::Result<TakeOutcome>)> {
+    let revoked = crate::identities::revoked(store).await?;
+    let org = pki.organization();
+    let given = std::sync::Arc::new(given);
+    let (signer, revocations, came, of, hand_on) = (std::sync::Arc::clone(pki), std::sync::Arc::clone(&revoked.list), came_from.to_owned(), org.clone(), std::sync::Arc::clone(&given));
+    let (read_given, signed) = crate::rt::compute(move || {
+        let (read_given, given_checked) = read_keeping(&hand_on, &signer.ca_der, &revocations, came, at, &of, true);
+        let signed = server_signed(&signer, &receipt).map(|b| {
+            let signed = std::sync::Arc::new(b);
+            let read_receipt = read_now(&signed, &signer.ca_der, &revocations, "kiln".to_owned(), at, &of);
+            // The receipt's hop with the hand-on as it checked: what kiln keeps of it once kept now, read back.
+            let together = match (&read_receipt.verdict, given_checked) {
+                (Verdict::Custody { own: Own::Waits { checked, wanted }, .. }, Some(g)) if wanted.len() == 1 && wanted.first() == Some(&g.digest) => {
+                    let map = BTreeMap::from([(g.digest.clone(), g)]);
+                    Some(broken(&checked.digest, (**checked).clone(), map, wanted, &of))
+                }
+                _ => None,
+            };
+            (signed, read_receipt, together)
+        });
+        (read_given, signed)
+    })
+    .await?;
+    let root = std::sync::Arc::<[u8]>::from(&*pki.ca_der);
+    let (signed, read_receipt, together) = match signed {
+        Ok(signed) => signed,
+        // Not signed: the hand-on is taken alone, as before kiln signed its receipt in the same job.
+        Err(e) => return Ok((take_read(store, &root, &org, given, Some((read_given, revoked)), came_from, at).await, Err(e))),
+    };
+    let (given_read, receipt_read) = match (read_given, read_receipt) {
+        (Read { digest: d1, verdict: Verdict::Custody { kind: k1, rows: r1, own: o1 } }, Read { digest: d2, verdict: Verdict::Custody { kind: k2, rows: r2, own: o2 } }) => ((d1, k1, r1, o1), (d2, k2, r2, o2)),
+        // Either refused: each taken alone, as `take` takes it, from what was read.
+        (read_given, read_receipt) => {
+            let first = take_read(store, &root, &org, given, Some((read_given, std::sync::Arc::clone(&revoked))), came_from, at).await;
+            let second = take_read(store, &root, &org, signed, Some((read_receipt, revoked)), "kiln", at).await;
+            return Ok((first, Ok(second)));
+        }
+    };
+    let ((given_digest, given_kind, given_rows, given_own), (receipt_digest, receipt_kind, receipt_rows, receipt_own)) = (given_read, receipt_read);
+    let first = Keeping { digest: given_digest, rows: *given_rows, wanted: given_own.wanted().to_vec(), delegation: given_kind.is_none() };
+    let second = Keeping { digest: receipt_digest, rows: *receipt_rows, wanted: receipt_own.wanted().to_vec(), delegation: receipt_kind.is_none() };
+    let stamp = revoked.stamp;
+    let both = match store.call(move |c| keep_both(c, stamp, first, second)).await {
+        Ok(both) => both,
+        Err(e) => {
+            let second = anyhow::anyhow!("{e:#}");
+            return Ok((Err(e), Ok(Err(second))));
+        }
+    };
+    let Some((given_looked, receipt_looked)) = both else {
+        // A revocation was added since they were read: each read again and taken alone, as `take` takes it.
+        let first = take_read(store, &root, &org, given, None, came_from, at).await;
+        let second = take_read(store, &root, &org, signed, None, "kiln", at).await;
+        return Ok((first, Ok(second)));
+    };
+    // The hand-on kept just now is what the receipt's hop was checked with; one kept before is read back, as `take` reads it.
+    let together = together.filter(|_| matches!(given_looked, Looked::New { .. }));
+    let first = taken_now(store, &root, &org, &revoked, given_own, None, given_looked, at).await;
+    let second = taken_now(store, &root, &org, &revoked, receipt_own, together, receipt_looked, at).await;
+    Ok((first, Ok(second)))
+}
+
+/// What became of one record [`keep_both`] kept or found ([`take_batch`]): settled when new ([`settle`]).
+#[allow(clippy::too_many_arguments)]
+async fn taken_now(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, revoked: &crate::identities::Revoked, own: Own, found: Option<Option<Broken>>, looked: Looked, at: i64) -> TakeOutcome {
+    match looked {
+        Looked::New { taken, wanted, waiting } => settle(store, root, org, revoked, own, found, taken, wanted, waiting, at).await.map(Ok),
+        Looked::Again(digest) => Ok(Ok(Taken { digest, again: true, broke: None })),
+        // Not one `keep_both` says of a record: it looks at the revocations for both, first.
+        Looked::Stale => Err(anyhow::anyhow!("its keeping found the revocations stale")),
+    }
 }
 
 /// kiln's server's own record `s` (a receipt of a feed's batch, a hand-on of one), signed and read for [`take`] in one
@@ -289,13 +469,17 @@ pub async fn sign_and_take(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>,
     let revoked = crate::identities::revoked(store).await?;
     let org = pki.organization();
     let (signer, revocations, came, of) = (std::sync::Arc::clone(pki), std::sync::Arc::clone(&revoked.list), came_from.to_owned(), org.clone());
-    let (bundle, read) = crate::rt::compute(move || -> anyhow::Result<(std::sync::Arc<Value>, Read)> {
+    let (bundle, read, checked) = crate::rt::compute(move || -> anyhow::Result<(std::sync::Arc<Value>, Read, Option<Checked>)> {
         let bundle = std::sync::Arc::new(server_signed(&signer, &s)?);
-        let read = read_now(&bundle, &signer.ca_der, &revocations, came, at, &of);
-        Ok((bundle, read))
+        let (read, checked) = read_keeping(&bundle, &signer.ca_der, &revocations, came, at, &of, true);
+        Ok((bundle, read, checked))
     })
     .await??;
     let taken = take_read(store, &pki.ca_der, &org, std::sync::Arc::clone(&bundle), Some((read, revoked)), came_from, at).await;
+    // Kept (or kept before), as it checked: what a receipt of it, soon after, has its hop checked with (`recent`).
+    if let (Ok(Ok(_)), Some(checked)) = (&taken, checked) {
+        recent::keep(checked);
+    }
     Ok((std::sync::Arc::unwrap_or_clone(bundle), taken))
 }
 
@@ -348,20 +532,59 @@ enum Looked {
 /// read, and the records that waited for it found: a custody record's followers, or a `delegation`'s records under it.
 fn keep_and_look(c: &mut rusqlite::Connection, stamp: Option<crate::identities::Stamp>, digest: &str, rows: Rows, wanted: &[String], delegation: bool) -> anyhow::Result<Looked> {
     // One kiln has is answered as such first, whatever the revocations now (as it was judged when taken).
-    if !digest.is_empty() && kept_on(c, digest)? {
+    if has(c, digest)? {
         return Ok(Looked::Again(digest.to_owned()));
     }
-    if let Some(s) = stamp
-        && crate::identities::revoked_stamp(c)? != s
-    {
+    if stale(c, stamp)? {
         return Ok(Looked::Stale);
     }
+    keep_looking(c, rows, wanted, delegation)
+}
+
+/// Whether kiln has the statement by `digest` ("": one that couldn't be read, which it hasn't).
+fn has(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<bool> {
+    Ok(!digest.is_empty() && kept_on(c, digest)?)
+}
+
+/// Whether a revocation was added since the revocations stamped `stamp` were read (none: not looked at).
+fn stale(c: &rusqlite::Connection, stamp: Option<crate::identities::Stamp>) -> rusqlite::Result<bool> {
+    Ok(match stamp {
+        Some(s) => crate::identities::revoked_stamp(c)? != s,
+        None => false,
+    })
+}
+
+/// `rows` kept, then what [`Looked::New`] says of them: the rows of `wanted`, and the records that waited for it.
+fn keep_looking(c: &rusqlite::Connection, rows: Rows, wanted: &[String], delegation: bool) -> anyhow::Result<Looked> {
     let taken = rows.digest.clone();
     if !keep_on(c, rows)? {
         return Ok(Looked::Again(taken));
     }
     let waiting = if delegation { under_on(c, &taken)? } else { followers_on(c, &taken)? };
     Ok(Looked::New { wanted: rows_on(c, wanted)?, waiting, taken })
+}
+
+/// One record as [`keep_both`] keeps it: the digest it's read by, its rows, the records its hop needs, and whether it's a
+/// delegation.
+struct Keeping {
+    digest: String,
+    rows: Rows,
+    wanted: Vec<String>,
+    delegation: bool,
+}
+
+/// [`keep_and_look`] for two records in turn, in one call and one write ([`take_batch`]): each one kiln has is answered as
+/// such; then, if either is new, none is kept when a revocation was added since `stamp` (none returned); else each new one
+/// kept and looked around in turn, the first's followers found before the second is kept.
+fn keep_both(c: &mut rusqlite::Connection, stamp: crate::identities::Stamp, first: Keeping, second: Keeping) -> anyhow::Result<Option<(Looked, Looked)>> {
+    let (had_first, had_second) = (has(c, &first.digest)?, has(c, &second.digest)?);
+    if !(had_first && had_second) && stale(c, Some(stamp))? {
+        return Ok(None);
+    }
+    let keep = |had: bool, k: Keeping| if had { Ok(Looked::Again(k.digest)) } else { keep_looking(c, k.rows, &k.wanted, k.delegation) };
+    let first = keep(had_first, first)?;
+    let second = keep(had_second, second)?;
+    Ok(Some((first, second)))
 }
 
 /// The records that act under delegation `digest`.
@@ -412,7 +635,11 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
     if let Some(r) = bundle.get("refused_word") {
         let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         let word: Option<Value> = r.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str(w).ok());
-        let signer = word.as_ref().and_then(|w| statement::verify(w, &hub.pki.ca_der, &[], crate::util::now_unix()).ok()).map(|c| c.custodian).unwrap_or_default();
+        // Who signed it, read on the compute pool (goal 9, plan 01a1a87b2cec step 3).
+        let signer = match &word {
+            Some(w) => verify_off(w, &hub.pki.ca_der, Vec::new(), crate::util::now_unix()).await.ok().and_then(Result::ok).map(|c| c.custodian).unwrap_or_default(),
+            None => String::new(),
+        };
         let why = format!("session {}: {}", text("session"), text("why"));
         let refusal = Refusal { digest: word.as_ref().map(digest_of).unwrap_or_default(), act: "a hand-over's word".into(), signer, why: why.clone(), envelope: word.map(|w| w.to_string()).unwrap_or_default(), came_from, at: crate::util::now_unix(), ..Refusal::default() };
         if let Err(e) = refuse(&hub.store, refusal).await {
@@ -459,6 +686,13 @@ pub fn cd_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Res
     own_signed_as(pki, "cd", &cd_uri(&pki.organization()), PAYLOAD_CUSTODY, s)
 }
 
+/// [`cd_signed`] on the compute pool, off the shards, as [`server_signed_off`] (goal 9, plan 01a1a87b2cec step 3): CD's
+/// key and certificate read from their files, and the signature, for each sync's records and each image it holds.
+pub async fn cd_signed_off(pki: &std::sync::Arc<crate::pki::Pki>, s: statement::Statement) -> anyhow::Result<Value> {
+    let pki = std::sync::Arc::clone(pki);
+    crate::rt::compute(move || cd_signed(&pki, &s)).await?
+}
+
 /// `s` signed as `payload_type` with the key of kiln's own identity `kind` (`server`, `cd`), whose
 /// URI is `by`, its body naming it.
 fn own_signed_as(pki: &crate::pki::Pki, kind: &str, by: &str, payload_type: &str, s: &statement::Statement) -> anyhow::Result<Value> {
@@ -483,6 +717,13 @@ fn own_signed_as(pki: &crate::pki::Pki, kind: &str, by: &str, payload_type: &str
 /// before reads the command alone. What's signed is the command as [`unworded`] writes it.
 pub fn word(pki: &crate::pki::Pki, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
     word_signed(&|payload_type, s| server_signed_as(pki, payload_type, s), session, command, machine, instance, epoch)
+}
+
+/// [`word`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the server's key and certificate
+/// read from their files, and the signature, for each hand-over's word kiln sends a runner process.
+pub async fn word_off(pki: &std::sync::Arc<crate::pki::Pki>, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
+    let (pki, session, command, machine, instance) = (std::sync::Arc::clone(pki), session.to_owned(), command.to_owned(), machine.to_owned(), instance.to_owned());
+    crate::rt::compute(move || word(&pki, &session, &command, &machine, &instance, epoch)).await?
 }
 
 /// [`word`], signed by `sign` (kiln's server's key: a payload type and a statement to its bundle),
@@ -581,8 +822,13 @@ pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, si
         return Ok(Err(why));
     };
     let what = signed_part(ask);
+    // Checked on the compute pool, against every revocation read now, which is let go of there: a signed act's two
+    // signature checks (one again without the revocations when it's refused) and the whole list's free were each of a
+    // runner's agents' signed asks' on its shard (goal 9, plan 01a1a87b2cec step 3).
     let revocations = crate::identities::revocations(&hub.store).await?;
-    match act_check(&act, &hub.pki.ca_der, &revocations, &held, what.as_bytes(), at) {
+    let (pki, holder) = (std::sync::Arc::clone(&hub.pki), held.clone());
+    let (checked, act) = crate::rt::compute(move || (act_check(&act, &pki.ca_der, &revocations, &holder, what.as_bytes(), at), act)).await?;
+    match checked {
         Ok(()) => Ok(Ok(())),
         Err((signer, why)) => {
             refuse(&hub.store, record(signer.clone(), epoch_of(&signer), why.clone(), Some(&act))).await?;
@@ -634,7 +880,11 @@ pub async fn refused_work_act(hub: &crate::hub::Hub, machine: &str, instance: &s
 #[allow(clippy::too_many_arguments)]
 async fn refused_act_of(hub: &crate::hub::Hub, machine: &str, instance: &str, session: &str, ask: &Value, why: &str, transfer: Option<String>, at: i64) -> anyhow::Result<String> {
     let act = ask.get("act").and_then(Value::as_str).and_then(|a| serde_json::from_str::<Value>(a).ok());
-    let signer = act.as_ref().and_then(|a| statement::verify(a, &hub.pki.ca_der, &[], at).ok()).map(|c| c.custodian).unwrap_or_default();
+    // Who signed it, revocations aside, read on the compute pool (goal 9, plan 01a1a87b2cec step 3).
+    let signer = match &act {
+        Some(a) => verify_off(a, &hub.pki.ca_der, Vec::new(), at).await.ok().and_then(Result::ok).map(|c| c.custodian).unwrap_or_default(),
+        None => String::new(),
+    };
     // The epoch it's from: the one it's signed at, or, unsigned, the newest kiln certified this
     // process for the session at.
     let epoch = match epoch_of(&signer) {
@@ -714,15 +964,19 @@ async fn issued_at(store: &Store, subject: &str) -> anyhow::Result<Option<i64>> 
 /// when): to the session at the next epoch, whichever process takes it, following that process's
 /// receipt of it if kiln has one. Kept here at once, and carried in the session's package: its
 /// receipt follows it as a hand-on's does (docs/ci.md W27-R08). None if kiln never certified the
-/// session at that epoch: it goes on unsigned, as before.
-pub async fn take_for(store: &Store, pki: &crate::pki::Pki, session: &str, epoch: u64, events: &[crate::harness::model::Event], why: &str) -> anyhow::Result<Option<Value>> {
+/// session at that epoch: it goes on unsigned, as before. `timeline` is the session's timeline as it leaves that epoch
+/// ([`timeline`]), worked out where its package is made, off the shards: it's every event's digest (goal 9, plan
+/// 01a1a87b2cec step 3).
+pub async fn take_for(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>, session: &str, epoch: u64, timeline: statement::Subject, why: &str) -> anyhow::Result<Option<Value>> {
     let Some(holder) = crate::identities::holder_at(store, session, epoch).await? else { return Ok(None) };
     let org = pki.organization();
     let to = at_epoch(&holder, epoch.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("{holder} isn't an agent session's identity"))?;
     let body = custody::Body { taken_for: Some(holder.clone()), to: Some(to), why: why.to_owned(), epoch: Some(epoch.saturating_add(1)), ..custody::Body::new(Kind::Taken, &server_uri(&org)) };
     let follows = receipt_of(store, &holder).await?.into_iter().collect();
-    let s = statement::Statement { subject: vec![timeline(session, epoch, events)], follows, ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(pki, &s)?;
+    let s = statement::Statement { subject: vec![timeline], follows, ..statement::Statement::new(custody::to_value(&body)) };
+    // Signed on the compute pool: the server's key and certificate read from their files, and the signature, were the
+    // owner's shard's as a session's machine stayed away (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(pki, s).await?;
     match take(store, &pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(_) => Ok(Some(bundle)),
         Err(why) => anyhow::bail!("kiln refused its own take: {why}"),
@@ -775,7 +1029,9 @@ pub async fn hand_work(hub: &crate::hub::Hub, thing: statement::Subject, to: &st
     };
     let body = custody::Body { to: Some(to.to_owned()), why: why.to_owned(), acts_for, taken_for, ..custody::Body::new(kind, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows, ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards: the server's key and certificate read from their files, and the
+    // signature (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok((t.digest, bundle)),
         Err(why) => anyhow::bail!("kiln refused its own hand-on: {why}"),
@@ -797,7 +1053,8 @@ pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: sta
     let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: {missing}");
     let body = custody::Body { from: Some(giver.to_owned()), taken_for: Some(person.to_owned()), why, ..custody::Body::new(Kind::Received, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok(t.digest),
         Err(why) => anyhow::bail!("kiln refused its own receipt for {person}: {why}"),
@@ -810,7 +1067,8 @@ pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: sta
 pub async fn person_receipt(hub: &crate::hub::Hub, person: &str, hand_on: &str, bundle: &Value, came_from: &str) -> anyhow::Result<Result<String, String>> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let c = match statement::verify(bundle, &hub.pki.ca_der, &revocations, at) {
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = match verify_off(bundle, &hub.pki.ca_der, revocations, at).await? {
         Ok(c) => c,
         Err(e) => return Ok(Err(format!("the receipt doesn't verify: {e}"))),
     };
@@ -830,7 +1088,8 @@ pub async fn person_receipt(hub: &crate::hub::Hub, person: &str, hand_on: &str, 
 pub async fn person_hand_on(hub: &crate::hub::Hub, person: &str, to: &str, thing: &statement::Subject, bundle: &Value, came_from: &str) -> anyhow::Result<Result<String, String>> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let c = match statement::verify(bundle, &hub.pki.ca_der, &revocations, at) {
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = match verify_off(bundle, &hub.pki.ca_der, revocations, at).await? {
         Ok(c) => c,
         Err(e) => return Ok(Err(format!("the hand-on doesn't verify: {e}"))),
     };
@@ -865,7 +1124,8 @@ pub async fn pass_on(hub: &crate::hub::Hub, things: Vec<statement::Subject>, han
     let org = hub.pki.organization();
     let body = custody::Body { from: Some(from.to_owned()), to: Some(to.to_owned()), why: why.to_owned(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
     let s = statement::Statement { subject: things, follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
-    let bundle = server_signed(&hub.pki, &s)?;
+    // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = server_signed_off(&hub.pki, s).await?;
     match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
         Ok(t) => Ok((t.digest, bundle)),
         Err(why) => anyhow::bail!("kiln refused its own pass of {hand_on}: {why}"),
@@ -1215,8 +1475,9 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
         Ok(t) => t.digest,
         Err(why) => return Ok(Err(format!("its hand-on was refused: {why}"))),
     };
-    // Kept, so checked when kiln took it: read again, revocations aside.
-    let b = statement::verify(&given, root, &[], at).map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
+    // Kept, so checked when kiln took it: read again, revocations aside, on the compute pool (goal 9, plan 01a1a87b2cec
+    // step 3: a hand-over's two checks were the hub's loop's, as it answered the runner's ask for its identity).
+    let b = verify_off(&given, root, Vec::new(), at).await?.map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
     if let Err(why) = hands_on_to(&b, issued, epoch) {
         return Ok(Err(why));
     }
@@ -1233,7 +1494,7 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
     if let Some(broke) = &got.broke {
         tracing::warn!(target: "kiln.custody", record = %got.digest, %broke, "a hand-over's receipt breaks its chain");
     }
-    let follows = statement::verify(&bundle, root, &[], at).map(|c| c.statement.follows).unwrap_or_default();
+    let follows = verify_off(&bundle, root, Vec::new(), at).await?.map(|c| c.statement.follows).unwrap_or_default();
     if !follows.contains(&handed) {
         return Ok(Err(format!("its receipt doesn't follow its hand-on {handed}")));
     }
@@ -1318,17 +1579,19 @@ fn followers_on(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<Vec<
 
 /// The records kiln has among `digests`, each checked as of when kiln took it (a revocation
 /// since doesn't undo it).
-async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation]) -> anyhow::Result<BTreeMap<String, Checked>> {
+async fn load(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>) -> anyhow::Result<BTreeMap<String, Checked>> {
     load_with(store, root, digests, revocations, |records| records).await
 }
 
 /// [`load`], with `then` made of the records in the same job on the compute pool, off the shards, and the records let
-/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]).
-async fn load_with<T: Send + 'static>(store: &Store, root: &[u8], digests: &[String], revocations: &[Revocation], then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
+/// go there (goal 9, plan 01a1a87b2cec step 3): what a check reads of them and the hop it walks ([`check`]). The root and
+/// the revocations go to it shared, not copied: each of a waiting record's two loads copied every revocation on its
+/// shard (goal 9, plan 01a1a87b2cec step 3).
+async fn load_with<T: Send + 'static>(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>, then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
     let wanted = digests.to_vec();
     let rows = store.call(move |c| Ok(rows_on(c, &wanted)?)).await?;
     // Each checked again as of when kiln took it, on the compute pool, off the shards (`read`).
-    let (root, revocations) = (root.to_vec(), revocations.to_vec());
+    let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
     crate::rt::compute(move || then(checked_rows(rows, &root, &revocations))).await
 }
 
@@ -1394,7 +1657,7 @@ fn broken(d: &str, mine: Checked, mut map: BTreeMap<String, Checked>, needed: &[
 /// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
 /// delegation it acts under (W27-R08: another machine's, which comes in any order). Its records are
 /// read and its hop walked on the compute pool, with their loads ([`load_with`]).
-async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
+async fn check(store: &Store, root: &std::sync::Arc<[u8]>, org: &str, digest: &str, revocations: &std::sync::Arc<[Revocation]>, at: i64) -> anyhow::Result<Option<String>> {
     let d = digest.to_owned();
     let wants = load_with(store, root, std::slice::from_ref(&d), revocations, {
         let d = d.clone();
@@ -1615,13 +1878,14 @@ pub async fn carry(hub: &crate::hub::Hub, diff: &str, verdict: &str, from: &Side
     let (server, came_from) = (server_uri(&org), format!("kiln's review of {diff}"));
     let version = |v: &Side<'_>| format!("v{} at {} on base {}", v.n, short(v.commit), short(v.base));
     let b = custody::Body { to: Some(server.clone()), component: Some(version(from)), why: why.clone(), ..custody::Body::new(Kind::HandedOn, "") };
-    let hand_on = server_signed(&hub.pki, &statement::Statement { subject: things.clone(), ..statement::Statement::new(custody::to_value(&b)) })?;
+    // Each record signed on the compute pool, off the shards, in turn (goal 9, plan 01a1a87b2cec step 3).
+    let hand_on = server_signed_off(&hub.pki, statement::Statement { subject: things.clone(), ..statement::Statement::new(custody::to_value(&b)) }).await?;
     let handed = match take(&hub.store, &hub.pki.ca_der, &org, &hand_on, &came_from, at).await? {
         Ok(t) => t.digest,
         Err(why) => return Ok(Err(format!("its hand-on wasn't kept: {why}"))),
     };
     let b = custody::Body { from: Some(server), component: Some(version(to)), why: why.clone(), ..custody::Body::new(Kind::Received, "") };
-    let receipt = server_signed(&hub.pki, &statement::Statement { subject: things, follows: vec![handed], ..statement::Statement::new(custody::to_value(&b)) })?;
+    let receipt = server_signed_off(&hub.pki, statement::Statement { subject: things, follows: vec![handed], ..statement::Statement::new(custody::to_value(&b)) }).await?;
     Ok(match take(&hub.store, &hub.pki.ca_der, &org, &receipt, &came_from, at).await? {
         Ok(t) => Ok((t.digest, why)),
         Err(why) => Err(format!("its receipt wasn't kept: {why}")),
@@ -1696,7 +1960,8 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
 /// [`chain`], and the digests of the records it read.
 async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) -> anyhow::Result<Option<(Value, Vec<String>)>> {
     let Some(from) = start(store, digest).await? else { return Ok(None) };
-    let revocations = crate::identities::revocations(store).await?;
+    let (root, revocations): (std::sync::Arc<[u8]>, std::sync::Arc<[Revocation]>) = (root.into(), crate::identities::revocations(store).await?.into());
+    let root = &root;
     let mut map: BTreeMap<String, Checked> = BTreeMap::new();
     let mut frontier = vec![from.clone()];
     while !frontier.is_empty() && map.len() < WALK_MAX {
@@ -1777,19 +2042,28 @@ async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) ->
 
 /// A walk's break at a record kiln doesn't have, when kiln keeps it but it no longer checks as kiln
 /// took it (changed where it's kept): a break at that record, saying so, not a record missing.
-async fn unchecked(store: &Store, root: &[u8], revocations: &[Revocation], b: Break) -> anyhow::Result<Break> {
+async fn unchecked(store: &Store, root: &std::sync::Arc<[u8]>, revocations: &std::sync::Arc<[Revocation]>, b: Break) -> anyhow::Result<Break> {
     let Break::NoRecord { record, .. } = &b else { return Ok(b) };
     let d = record.clone();
     let kept: Option<(String, i64)> = store.call(move |c| Ok(c.query_row("SELECT envelope, taken_at FROM custody WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
     let Some((envelope, at)) = kept else { return Ok(b) };
-    let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
-    let checked = serde_json::from_str::<Value>(&envelope).map_err(|e| e.to_string()).and_then(|bundle| statement::verify(&bundle, root, &before, at).map_err(|e| e.to_string()));
+    // Checked again on the compute pool, off the shards, with the walk's root and revocations shared, not copied (goal 9,
+    // plan 01a1a87b2cec step 3).
+    let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
+    let checked = crate::rt::compute(move || checked_as_taken(&envelope, &root, &revocations, at)).await?;
     let why = match checked {
         Ok(c) if c.digest == *record => return Ok(b),
         Ok(c) => format!("what kiln keeps as it is another record, {}", c.digest),
         Err(e) => format!("what kiln keeps as it no longer checks as kiln took it: {e}"),
     };
     Ok(Break::Unreadable { record: record.clone(), why })
+}
+
+/// A record as kiln keeps it (`envelope`, taken at `at`) checked again as of then, against kiln's root `root` and the
+/// revocations before then ([`unchecked`]): on the thread it's called on, a compute job's.
+fn checked_as_taken(envelope: &str, root: &[u8], revocations: &[Revocation], at: i64) -> Result<Checked, String> {
+    let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
+    serde_json::from_str::<Value>(envelope).map_err(|e| e.to_string()).and_then(|bundle| statement::verify(&bundle, root, &before, at).map_err(|e| e.to_string()))
 }
 
 /// A thing's chain of custody walked for whoever audits it (docs/ci.md W27-R08; the Transfers
@@ -2109,6 +2383,81 @@ mod tests {
     use rcgen::SigningKey as _;
 
     const ORG: &str = "hyper-light";
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what custody checks or signs as runners' agents act, refuse and hand over, and as
+    /// kiln takes a session it resumes, is done off the shards: no signature is checked or made in those functions' own
+    /// code, only in the compute or blocking pool's jobs they hand it to (`verify_off`, `server_signed_off`, `act_check`
+    /// in a job). What each finds is the W27 tests'.
+    #[test]
+    fn g9_s3_custodys_signatures_are_checked_and_made_off_the_shards() {
+        let code: String = include_str!("custody.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let body = |head: &str| code.split(head).nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default().to_owned();
+        for f in ["pub async fn act_counts(", "async fn refused_act_of(", "pub async fn take_for(", "pub async fn transfer(", "pub async fn on_runner("] {
+            let b = body(f);
+            assert!(!b.is_empty(), "{f} not found");
+            assert!(!b.contains("statement::verify(") && !b.contains("server_signed(pki"), "{f} checks or signs on its shard: {b}");
+        }
+        assert!(body("pub async fn act_counts(").contains("crate::rt::compute(move || (act_check("), "act_counts checks in a job");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a record that waited for this one is checked with kiln's root and every
+    /// revocation handed to its loads' compute jobs as they're shared, not copied on its shard for each of its two
+    /// loads (a list that grows by one with each certificate kiln supersedes). What the check finds is the W27 tests'.
+    #[test]
+    fn g9_s3_a_checks_loads_share_the_root_and_revocations() {
+        let code: String = include_str!("custody.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let load_with = code.split("async fn load_with<").nth(1).and_then(|rest| rest.split("\nfn rows_on(").next()).unwrap_or_default();
+        assert!(load_with.contains("Arc::clone(root)") && load_with.contains("Arc::clone(revocations)"), "{load_with}");
+        assert!(!load_with.contains("root.to_vec()") && !load_with.contains("revocations.to_vec()"), "{load_with}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the rarer paths that sign or check a statement as they go (kiln's own hand-ons,
+    /// receipts, passes and carried approvals; a person's own receipt or hand-on; a walk's break at a record kiln keeps;
+    /// a review's signed verdicts; a leg's inputs; KilnCD's records; the store of bytes'; a commit kiln makes) hand it
+    /// to the compute or blocking pool: none signs or checks in its own code. What each finds is the W27 tests'.
+    #[test]
+    fn g9_s3_the_rare_signing_paths_sign_and_check_off_the_shards() {
+        // A file's code outside its tests (all of it, with none), each line without its comment.
+        let code = |file: &str| file.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let (custody, verdicts, signed, cd, blobs, revision) = (code(include_str!("custody.rs")), code(include_str!("ci/verdicts.rs")), code(include_str!("ci/signed.rs")), code(include_str!("cd/custody.rs")), code(include_str!("custody/blobs.rs")), code(include_str!("ci/revision.rs")));
+        let promotion = code(include_str!("deploy/promotion.rs"));
+        let (vsa, lands, handovers) = (code(include_str!("verify.rs")), code(include_str!("ci/lands.rs")), code(include_str!("handovers.rs")));
+        // Where a function's body ends: a free function's brace, or a method's in its `impl`.
+        let (free, method) = ("\n}\n", "\n    }\n");
+        let moved = [
+            (custody.as_str(), "pub async fn hand_work(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn receive_for_because(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn pass_on(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn carry(", free, "server_signed_off(&hub.pki, "),
+            (custody.as_str(), "pub async fn person_receipt(", free, "verify_off(bundle, "),
+            (custody.as_str(), "pub async fn person_hand_on(", free, "verify_off(bundle, "),
+            (custody.as_str(), "async fn unchecked(", free, "crate::rt::compute(move || checked_as_taken("),
+            (verdicts.as_str(), "pub async fn take(", free, "crate::custody::verify_off(bundle, "),
+            (verdicts.as_str(), "pub async fn holding(", free, "crate::rt::compute_map(rows, "),
+            (signed.as_str(), "async fn hand_to_runner(", free, "crate::custody::server_signed_off(&hub.pki, "),
+            (cd.as_str(), "async fn as_cd(", free, "crate::custody::cd_signed_off(&hub.pki, "),
+            (cd.as_str(), "async fn as_server(", free, "crate::custody::server_signed_off(&hub.pki, "),
+            (blobs.as_str(), "async fn keep(", method, "super::server_signed_off(&self.pki, "),
+            (revision.as_str(), "pub(crate) async fn sign_as_kiln(", free, "crate::rt::blocking(move || signed_by_kiln("),
+            (signed.as_str(), "async fn take(", free, "a.check(&pki.ca_der, b, at)"),
+            (signed.as_str(), "pub async fn judged(", free, "a.check(&pki.ca_der, &b, r.taken_at)"),
+            (signed.as_str(), "async fn receipt(", free, "crate::rt::blocking(move || crate::identities::sign_as(&pki, "),
+            (promotion.as_str(), "pub async fn hand_on(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
+            (promotion.as_str(), "pub async fn receipt(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
+            (vsa.as_str(), "pub async fn vsa(", free, "crate::identities::sign_as_off(&hub.pki, "),
+            (lands.as_str(), "async fn keep(", free, "crate::identities::sign_as_off(&hub.pki, "),
+            (handovers.as_str(), "pub(crate) async fn worded(", method, "crate::custody::word_off(&self.pki, "),
+        ];
+        for (src, head, end, off) in moved {
+            let b = src.split(head).nth(1).and_then(|rest| rest.split(end).next()).unwrap_or_default();
+            assert!(!b.is_empty(), "{head} not found");
+            for on_shard in ["statement::verify(", "server_signed(&", "cd_signed(&", "sign_own(", "against.check(hub", "sign_as(&hub.pki", "custody::word(&self.pki"] {
+                assert!(!b.contains(on_shard), "{head} calls {on_shard} on its shard: {b}");
+            }
+            assert!(b.contains(off), "{head} doesn't hand its signature or check to a pool ({off}): {b}");
+        }
+    }
+
     const FEDORA: &str = "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed";
     const JUPITER: &str = "kiln://hyper-light/person/ada/machine/jupiter/instance/01a18b00";
     const LEFT: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/0/machine/fedora/instance/01a14c4f";
@@ -2281,6 +2630,51 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: a mirror's receipt of kiln's hand-on, taken while kiln keeps the hand-on beside the
+    /// store as it checked ([`recent`]), has its hop checked with it as the receipt is read, and comes out as taking it with
+    /// the hand-on read back from the store does: the same digests, the same break (none for a hop that holds; the same
+    /// one for a hop that doesn't), the same rows.
+    #[test]
+    fn g9_s5_a_receipts_hop_with_kilns_hand_on_kept_beside_it_is_as_read_back() -> anyhow::Result<()> {
+        // Room enough that other tests' hand-ons kept meanwhile don't push this one's out.
+        recent::keep_for(16);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            let (root, org) = (pki.ca_der.clone(), pki.organization());
+            let at = crate::util::now_unix();
+            let server = server_uri(&org);
+            let (fedora_uri, jupiter_uri) = (FEDORA.replace(ORG, &org), JUPITER.replace(ORG, &org));
+            let (kiln, fedora) = (Signer::new(&pki, &server)?, Signer::new(&pki, &fedora_uri)?);
+            // A hand-on to fedora (its receipt's hop holds) and one to jupiter (fedora's receipt of it breaks).
+            for (n, to) in [(1, &fedora_uri), (2, &jupiter_uri)] {
+                let batch = thing(&format!("conversation store s1 batch {n}"), 'e');
+                let hand_on = kiln.sign(&record(Kind::HandedOn, &batch, Some(to.as_str()), None, &[], "feed", n))?;
+                let receipt = fedora.sign(&record(Kind::Received, &batch, None, Some(&server), &[&digest_of(&hand_on)], "feed", n))?;
+                let mut outcomes = Vec::new();
+                for beside in [false, true] {
+                    let store = Store::in_memory()?;
+                    crate::identities::record(&store, "runner", &fedora_uri, &fedora.pem).await?;
+                    crate::identities::revoked(&store).await?;
+                    let given = kiln_or(take(&store, &root, &org, &hand_on, "kiln", at).await?)?;
+                    if beside {
+                        recent::keep(statement::verify(&hand_on, &root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    let served = recent::served_so_far();
+                    let took = kiln_or(take(&store, &root, &org, &receipt, "runner fedora-2", at).await?)?;
+                    anyhow::ensure!(!beside || recent::served_so_far() > served, "{n}: its hop checked with the hand-on kept beside the store");
+                    outcomes.push((given.digest, took.digest, took.broke, count(&store, "custody").await?, count(&store, "custody_breaks").await?));
+                }
+                anyhow::ensure!(outcomes.first() == outcomes.get(1), "{n}: read back, then beside the store: {outcomes:?}");
+                let broke = outcomes.first().and_then(|o| o.2.clone());
+                anyhow::ensure!(broke.is_some() == (n == 2), "{n}: {broke:?}");
+            }
+            // One not kept beside the store: none found, its hop read back as before.
+            anyhow::ensure!(recent::find("f".repeat(64).as_str()).is_none());
+            Ok(())
+        })
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: kiln's own record (a receipt or a hand-on of a feed's batch) is signed and read
     /// in one job and kept in one call to the store's thread: the bundle it signed is the one kept, and it checks.
     #[test]
@@ -2299,6 +2693,53 @@ mod tests {
             assert_eq!((store.asked() - before, taken.again, taken.broke.as_deref()), (1, false, None));
             assert_eq!(digest_of(&bundle), taken.digest, "the bundle it signed is the one kept");
             assert!(kept(&store, &taken.digest).await?);
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a feed's batch's two records (the runner's hand-on, kiln's receipt of it) are read
+    /// in one job and kept in one call to the store's thread, and come out as taking them one at a time does: the same
+    /// digests and breaks (the receipt's hop checked with the hand-on as it was read), the same rows; taken again, both again.
+    #[test]
+    fn g9_s5_a_batchs_two_records_are_one_call_and_come_out_as_one_at_a_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            let org = pki.organization();
+            let (server, fedora_uri, jupiter_uri) = (server_uri(&org), FEDORA.replace(ORG, &org), JUPITER.replace(ORG, &org));
+            let fedora = Signer::new(&pki, &fedora_uri)?;
+            let at = crate::util::now_unix();
+            // A batch handed on to kiln (its receipt's hop holds), and one handed on to jupiter that kiln took (it breaks).
+            for (to, breaks) in [(&server, false), (&jupiter_uri, true)] {
+                let batch = thing("conversation store s1 after 0 through 9", 'f');
+                let given = fedora.sign(&record(Kind::HandedOn, &batch, Some(to.as_str()), None, &[], "feed", 1))?;
+                let receipt = || {
+                    let b = Body { from: Some(fedora_uri.clone()), why: "a test".into(), ..Body::new(Kind::Received, &server) };
+                    Statement { subject: vec![batch.clone()], follows: vec![digest_of(&given)], ..Statement::new(to_value(&b)) }
+                };
+                let (one, two) = (Store::in_memory()?, Store::in_memory()?);
+                for s in [&one, &two] {
+                    crate::identities::own_identities(s, &pki).await?;
+                    crate::identities::revoked(s).await?;
+                }
+                let before = one.asked();
+                let (g, r) = take_batch(&one, &pki, given.clone(), "runner fedora-2", receipt(), at).await?;
+                let (g, r) = (kiln_or(g?)?, kiln_or(r??)?);
+                if !breaks {
+                    assert_eq!(one.asked() - before, 1, "both kept in one call");
+                }
+                let g2 = kiln_or(take(&two, &pki.ca_der, &org, &given, "runner fedora-2", at).await?)?;
+                let r2 = kiln_or(sign_and_take(&two, &pki, receipt(), "kiln", at).await?.1?)?;
+                assert_eq!((&g, &r), (&g2, &r2), "as taking them one at a time");
+                assert_eq!((g.broke.is_some(), r.broke.is_some()), (false, breaks), "{r:?}");
+                for s in [&one, &two] {
+                    assert_eq!((count(s, "custody").await?, count(s, "custody_follows").await?, count(s, "custody_breaks").await?), (2, 1, i64::from(breaks)));
+                }
+                // The same batch again: both again, nothing more kept.
+                let (g, r) = take_batch(&one, &pki, given.clone(), "runner fedora-2", receipt(), at).await?;
+                assert!(kiln_or(g?)?.again && kiln_or(r??)?.again);
+                assert_eq!(count(&one, "custody").await?, 2);
+            }
             Ok(())
         })
     }
@@ -2349,6 +2790,40 @@ mod tests {
             assert!(check(&command, "main", Some(3)).is_err_and(|w| w.contains("isn't signed")), "unsigned, from a server that signs words");
             assert_eq!(word_for_me("s1", &command, false, &root, "fedora", "main", Some(3)), Ok(()), "unsigned, from a server from before");
             assert_eq!(check(&serde_json::to_string(&Command::Interrupt)?, "01a17502", None), Ok(()), "not a hand-over's word");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a hand-over's word and a statement kiln signs as its server, made on the pools
+    /// (`word_off`, `identities::sign_as_off`), are what the caller's thread made: the same command and word for the same
+    /// process at the same epoch, a statement over the same payload, each verifying to kiln's root as its server.
+    #[test]
+    fn g9_s3_words_and_statements_signed_off_the_shards_are_as_before() -> anyhow::Result<()> {
+        use crate::harness::model::Command;
+        use crate::runner::custody::word_for_me;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            crate::identities::own_identities(&store, &pki).await?;
+            let root = pki.ca_der.clone();
+            let command = serde_json::to_string(&Command::HandedOver { error: None, unsure: false, by_newest: false, none_newer: false })?;
+            let (here, off) = (word(&pki, "s1", &command, "fedora", "main", 3)?, word_off(&pki, "s1", &command, "fedora", "main", 3).await?);
+            let (here_v, off_v): (Value, Value) = (serde_json::from_str(&here)?, serde_json::from_str(&off)?);
+            anyhow::ensure!(unworded(&here_v) == unworded(&off_v), "the same command");
+            anyhow::ensure!(word_for_me("s1", &off, true, &root, "fedora", "main", Some(3)) == Ok(()), "for that process at its epoch");
+            let said = |v: &Value| -> anyhow::Result<(String, statement::Statement, String)> {
+                let bundle: Value = serde_json::from_str(v.get("word").and_then(Value::as_str).unwrap_or_default())?;
+                let c = statement::verify(&bundle, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok((c.digest, c.statement, c.custodian))
+            };
+            anyhow::ensure!(said(&here_v)? == said(&off_v)?, "the same word, by kiln's server");
+            let payload = statement::payload(&statement::Statement::new(json!({"why": "a land of kiln's"}))).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let signed = crate::identities::sign_as_off(&pki, "server", PAYLOAD_CUSTODY, payload.clone()).await?;
+            let c = statement::verify(&signed, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let inline = crate::identities::sign_as(&pki, "server", PAYLOAD_CUSTODY, &payload)?;
+            let d = statement::verify(&inline, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(c.digest == d.digest && c.custodian == d.custodian && c.payload_type == d.payload_type, "the same statement, by kiln's server");
             Ok(())
         })
     }

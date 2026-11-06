@@ -389,8 +389,8 @@ pub enum Ask {
 /// frame without waiting, and no shard waits on another for it. What the directory reads of it, each
 /// runner's announcement, is a copy swapped in whole as one changes.
 pub struct Owner {
-    tx: async_channel::Sender<Ask>,
-    rx: async_channel::Receiver<Ask>,
+    tx: crate::memory::queue::Sender<Ask>,
+    rx: crate::memory::queue::Receiver<Ask>,
     started: std::sync::atomic::AtomicBool,
     announced: crate::rcu::Rcu<HashMap<String, Announce>>,
 }
@@ -399,8 +399,10 @@ impl Default for Owner {
     fn default() -> Self {
         // Unbounded, as the runners' commands' owner's (`crate::wire::commands::Owner`): refused only
         // once its owner has stopped (the server's going). The hub's loop hands it a frame for each
-        // runner's message it takes, so it holds what that loop took and the owner hasn't yet.
-        let (tx, rx) = async_channel::unbounded();
+        // runner's message it takes, so it holds what that loop took and the owner hasn't yet. Lock-free
+        // (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
+        // event-listener's `Mutex`, the hub's loop sending on its shard and the owner waiting on its own.
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         Self { tx, rx, started: std::sync::atomic::AtomicBool::new(false), announced: crate::rcu::Rcu::default() }
     }
 }
@@ -408,7 +410,7 @@ impl Default for Owner {
 impl Owner {
     /// What its owner takes, to the first caller only: its owner starts then, given what it needs to
     /// send what it passes on (what was sent before waits for it).
-    pub fn starting(&self) -> Option<async_channel::Receiver<Ask>> {
+    pub fn starting(&self) -> Option<crate::memory::queue::Receiver<Ask>> {
         (!self.started.swap(true, std::sync::atomic::Ordering::AcqRel)).then(|| self.rx.clone())
     }
 
@@ -454,6 +456,43 @@ mod tests {
 
     fn frame(to: &str, link: &str, open: bool, data: &[u8]) -> Frame {
         Frame { to: to.into(), link: link.into(), open, data: data.to_vec(), close: None }
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): the relay's owner takes what it's sent on a lock-free queue
+    /// now. Its taker goes to the first caller alone; what's sent from every shard at once (the hub's loop
+    /// hands it each runner's frame) reaches it once, each sender's in the order sent, none refused.
+    #[test]
+    fn g5_the_relays_owner_takes_what_every_shard_sends_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let owner = std::sync::Arc::new(Owner::default());
+            let rx = owner.starting().ok_or_else(|| anyhow::anyhow!("its taker went to no one"))?;
+            anyhow::ensure!(owner.starting().is_none(), "its taker went twice");
+            let (senders, per) = (8u64, 500u64);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let owner = std::sync::Arc::clone(&owner);
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        let to = format!("{s}/{n}");
+                        owner.send(Ask::Frame { from: s.to_string(), peer: s, frame: frame(&to, "l", false, &n.to_le_bytes()) });
+                    }
+                }));
+            }
+            for t in sending {
+                t.await.map_err(|_| anyhow::anyhow!("a sender ended before its frames"))?;
+            }
+            let mut got: Vec<Vec<u64>> = vec![Vec::new(); usize::try_from(senders)?];
+            while let Ok(ask) = rx.try_recv() {
+                let Ask::Frame { from, peer, frame } = ask else { anyhow::bail!("a message no sender of the test's sent") };
+                anyhow::ensure!(from == peer.to_string() && frame.to.starts_with(&format!("{peer}/")), "a frame from {from} on {peer} to {}", frame.to);
+                let n = u64::from_le_bytes(frame.data.as_slice().try_into()?);
+                got.get_mut(usize::try_from(peer)?).ok_or_else(|| anyhow::anyhow!("no sender {peer}"))?.push(n);
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     fn sole(out: Vec<(PeerId, ServerMsg)>) -> anyhow::Result<(PeerId, ServerMsg)> {

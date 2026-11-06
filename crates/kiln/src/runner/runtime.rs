@@ -594,7 +594,9 @@ type BgFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = BgDone> +
 /// A leg's background steps (W06-R17): running beside the steps that follow them, folded into
 /// the leg when waited for.
 struct Background<'a> {
-    turns: &'a async_lock::Semaphore,
+    /// [`MAX_BACKGROUND`] at once, each in the order it started, with no lock (`crate::turn::Gate`; goal 5, plan
+    /// 01a1a59c2aae, its top goal).
+    turns: &'a crate::turn::Gate,
     running: futures::stream::FuturesUnordered<BgFuture<'a>>,
     /// Each started step's declaration order and stop.
     started: BTreeMap<String, (u32, Shutdown)>,
@@ -604,7 +606,7 @@ struct Background<'a> {
 }
 
 impl<'a> Background<'a> {
-    fn new(turns: &'a async_lock::Semaphore) -> Self {
+    fn new(turns: &'a crate::turn::Gate) -> Self {
         Background { turns, running: futures::stream::FuturesUnordered::new(), started: BTreeMap::new(), finished: BTreeMap::new(), folded: std::collections::BTreeSet::new() }
     }
 
@@ -794,7 +796,7 @@ impl State {
 
 /// `rx.recv()` while `enabled`, else a future that never completes: a closed channel answers at
 /// once, and polled first in a `select` it would starve the step's exit.
-async fn recv_if(rx: &async_channel::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
+async fn recv_if(rx: &crate::memory::queue::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
     if enabled { rx.recv().await.ok() } else { futures::future::pending().await }
 }
 
@@ -1591,7 +1593,7 @@ impl Leg {
         // The OOM killer's count before any step runs, so a step it kills shows (W05-R15).
         let _ = self.oom_rose(&mut st).await;
         self.pre_steps(&mut st, deadline).await;
-        let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
+        let turns = crate::turn::Gate::new(MAX_BACKGROUND);
         let mut bg = Background::new(&turns);
         // Once the leg is cancelled, the steps whose `if` holds under cancellation (`always()`,
         // `cancelled()`) run to their end, not cut short by the cancel they follow, bounded as the
@@ -1944,7 +1946,7 @@ impl Leg {
             // Its turn, unless it is cancelled first.
             let permit = futures::select_biased! {
                 () = stop.cancelled().fuse() => None,
-                p = turns.acquire().fuse() => Some(p),
+                p = turns.turn().fuse() => Some(p),
             };
             let end = match permit {
                 Some(_turn) => self.step(&mut s, idx, step, deadline, false).await,
@@ -3537,12 +3539,15 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
     Ok((format!("{base}/{version}/{file}"), file, sha))
 }
 
-/// One Node runtime download at a time (they share `<work>/_externals`).
-static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One Node runtime download at a time (they share `<work>/_externals`), in the order asked for, with no
+/// lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static NODE_LOCK: crate::turn::Gate = crate::turn::Gate::one();
 /// Beside an action kept under `<work>/_actions`: its tarball's SHA-256 (hex), for the receipts of
 /// the legs that use it (docs/ci.md W27-R05).
 const ACTION_SHA256: &str = ".kiln-sha256";
-static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One action download at a time (they share `<work>/_actions`), in the order asked for, with no lock
+/// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static ACTION_LOCK: crate::turn::Gate = crate::turn::Gate::one();
 
 /// How many times a step asks the internet for what it needs (a Node build) before it fails, as
 /// GitHub's runner asks for an action's archive: three times, a random 10–30 s apart, and a 404
@@ -3634,7 +3639,7 @@ impl Leg {
             self.got_action(r, &dir, crate::runner::signed::Giver::Runner);
             return Ok(dir);
         }
-        let _g = ACTION_LOCK.lock().await;
+        let _g = ACTION_LOCK.turn().await;
         if done.exists() {
             self.got_action(r, &dir, crate::runner::signed::Giver::Runner);
             return Ok(dir);
@@ -3698,7 +3703,7 @@ impl Leg {
         if bin.exists() {
             return Ok(bin);
         }
-        let _g = NODE_LOCK.lock().await;
+        let _g = NODE_LOCK.turn().await;
         if bin.exists() {
             return Ok(bin);
         }
@@ -5484,7 +5489,7 @@ mod tests {
         };
         tweak(&mut a);
         use crate::exec::Up;
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
@@ -5772,7 +5777,7 @@ runs:
     fn w07_r07_an_actions_path_is_where_the_machine_has_it() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let leg = |executor: kiln_ci::wire::ExecutorSpec, job_container: Option<kiln_ci::wf::ir::Container>| -> anyhow::Result<Leg> {
-            let (tx, _rx) = async_channel::unbounded();
+            let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             let a = AssignmentV2 { job_id: "leg-1".into(), repo: "acme/app".into(), executor, job_container, ..AssignmentV2::default() };
             Ok(Leg {
                 a,
@@ -5984,7 +5989,7 @@ jobs:
     fn job_containers_have_the_workspace_parent() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
-        let (tx, _rx) = async_channel::unbounded();
+        let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
         let map = leg.container_map(&l);
@@ -6004,7 +6009,7 @@ jobs:
             let mut a = AssignmentV2 { job_id: "leg-h".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
             a.executor.kind = "docker".into();
             a.executor.image = Some(image.to_owned());
-            let (tx, _rx) = async_channel::unbounded();
+            let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             Ok(Leg {
                 a,
                 work_dir: tmp.path().to_path_buf(),
@@ -6075,7 +6080,7 @@ jobs:
         std::fs::create_dir_all(&bin)?;
         std::os::unix::fs::symlink(&node, bin.join("node"))?;
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let cancel = Shutdown::new();
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move {
@@ -6515,7 +6520,7 @@ jobs:
                 contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
                 ..AssignmentV2::default()
             };
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();
@@ -6563,7 +6568,7 @@ jobs:
                 contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
                 ..AssignmentV2::default()
             };
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();

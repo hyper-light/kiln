@@ -26,7 +26,7 @@ impl AsRawFd for RawNumber {
 pub struct PtyIo {
     fd: Arc<OwnedFd>,
     /// Stops reading its output (the session went to another process).
-    stop: (async_channel::Sender<()>, async_channel::Receiver<()>),
+    stop: (crate::memory::queue::Sender<()>, crate::memory::queue::Receiver<()>),
 }
 
 impl PtyIo {
@@ -38,7 +38,7 @@ impl PtyIo {
         let file = dup.as_file().map_err(|e| anyhow::anyhow!("PTY master as file: {e}"))?;
         let fd = OwnedFd::from(file);
         nonblocking(&fd).context("non-blocking PTY master")?;
-        Ok(Self { fd: Arc::new(fd), stop: async_channel::bounded(1) })
+        Ok(Self { fd: Arc::new(fd), stop: stopper() })
     }
 
     /// What it takes to hand this session to a re-executed kiln: the master and the shell's pid.
@@ -47,7 +47,7 @@ impl PtyIo {
     }
 
     /// Pump PTY output (then the exit status) into `out`, and `input` into the PTY.
-    pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
+    pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) {
         pump(&self.fd, &out, input, self.stop.1.clone());
         // The exit status, after the last output has had a moment to drain.
         let pid = child.process_id();
@@ -60,6 +60,12 @@ impl PtyIo {
             let _ = out.send(PtyOut::Exit(code)).await;
         });
     }
+}
+
+/// What stops a session's reader (one word, as the channel it was held), with no lock (goal 5, plan
+/// 01a1a59c2aae): its reader waits on it beside each read.
+fn stopper() -> (crate::memory::queue::Sender<()>, crate::memory::queue::Receiver<()>) {
+    crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1)
 }
 
 /// The code a program exited with; None when a signal ended it, as for an adopted session.
@@ -75,7 +81,7 @@ fn exit_code(pid: u32, st: &portable_pty::ExitStatus) -> Option<i32> {
 
 /// PTY → `out` (until EOF/EIO: the shell exited or the master closed, or `stop`: the session went
 /// to another process, which reads on) and `input` → PTY.
-fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>, stop: async_channel::Receiver<()>) {
+fn pump(fd: &Arc<OwnedFd>, out: &crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>, stop: crate::memory::queue::Receiver<()>) {
     {
         let fd = Arc::clone(fd);
         let out = out.clone();
@@ -110,7 +116,7 @@ fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_cha
 pub struct Handle {
     fd: Arc<OwnedFd>,
     pid: u32,
-    stop: async_channel::Sender<()>,
+    stop: crate::memory::queue::Sender<()>,
 }
 
 impl Handle {
@@ -156,11 +162,11 @@ impl Handle {
 /// runner before this one), so its exit is seen without a status. `foreign`: another runner of
 /// this machine still reaps it (a blue/green handover), so its exit is only watched. Output and
 /// the exit flow as for a spawned session.
-pub fn adopt(fd: OwnedFd, pid: u32, foreign: bool, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) -> Handle {
+pub fn adopt(fd: OwnedFd, pid: u32, foreign: bool, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) -> Handle {
     // Nothing this process starts (a job, another shell) may inherit this terminal.
     let _ = crate::os::close_on_exec(&fd);
     let fd = Arc::new(fd);
-    let stop = async_channel::bounded(1);
+    let stop = stopper();
     pump(&fd, &out, input, stop.1.clone());
     crate::rt::spawn(async move {
         let code = if foreign {

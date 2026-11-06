@@ -265,31 +265,55 @@ fn work(body: &[u8], tag: bool, validators: Option<&str>, coding: Option<Coding>
     Ok(Done::Answer { etag, packed })
 }
 
-/// The API's answer to a request that asked `asked`, compressed and validated as the module says.
-pub async fn finish(asked: Asked, resp: Response) -> Response {
+/// What [`finish`] does to an answer, read from its head and its body's length alone, before its body is read.
+struct Plan {
+    /// It gets a weak validator.
+    tag: bool,
+    len: usize,
+    /// At least [`MIN_BODY`].
+    big: bool,
+    /// The coding it goes out in, if any.
+    coding: Option<Coding>,
+}
+
+/// [`finish`]'s plan for `resp`, the answer to a request that asked `asked`: None where it goes as it is.
+fn plan(asked: &Asked, resp: &Response) -> Option<Plan> {
     if asked.leave {
-        return resp;
+        return None;
     }
     let status = resp.status();
     if status.is_informational() || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT | StatusCode::SWITCHING_PROTOCOLS) {
-        return resp;
+        return None;
     }
     let h = resp.headers();
     // A validator of the handler's own (a file's, a package proxy's) is strong, for this body as it is:
     // compressed, it would name another (RFC 9110 §8.8.3), so that answer goes as it is.
     if h.contains_key(header::CONTENT_ENCODING) || h.contains_key(header::CONTENT_RANGE) || h.contains_key(header::ACCEPT_RANGES) || h.contains_key(header::ETAG) || has_token(h, header::CACHE_CONTROL, "no-transform") {
-        return resp;
+        return None;
     }
     if !h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(compressible) {
-        return resp;
+        return None;
     }
     let tag = asked.get && status == StatusCode::OK && !h.contains_key(header::SET_COOKIE) && !has_token(h, header::CACHE_CONTROL, "no-store");
-    let Some(len) = resp.body().size_hint().exact().and_then(|n| usize::try_from(n).ok()) else { return resp };
+    let len = resp.body().size_hint().exact().and_then(|n| usize::try_from(n).ok())?;
     let big = len >= MIN_BODY;
     let coding = asked.coding.filter(|_| big);
     if len == 0 || (!tag && coding.is_none() && !big) {
-        return resp;
+        return None;
     }
+    Some(Plan { tag, len, big, coding })
+}
+
+/// Whether [`finish`] leaves `resp`, the answer to a request that asked `asked`, as it is: told from its head and its
+/// body's length before any future is made for it, so `crate::api`'s handler makes none for an answer nothing changes
+/// (goal 9, plan 01a1a87b2cec step 5: a boxed future a request on the serve path).
+pub fn untouched(asked: &Asked, resp: &Response) -> bool {
+    plan(asked, resp).is_none()
+}
+
+/// The API's answer to a request that asked `asked`, compressed and validated as the module says.
+pub async fn finish(asked: Asked, resp: Response) -> Response {
+    let Some(Plan { tag, len, big, coding }) = plan(&asked, &resp) else { return resp };
     let (mut parts, body) = resp.into_parts();
     let bytes = match whole(body, len) {
         Ok(b) => b,
@@ -613,6 +637,50 @@ pub(crate) mod tests {
             let r = finish(Asked::of(&get(&br)), srv::with_header(json(), header::CACHE_CONTROL, "private, max-age=5")).await;
             assert_eq!(header(&r, header::CACHE_CONTROL), Some("private, max-age=5"));
             assert!(header(&r, header::ETAG).is_some());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: [`untouched`] tells, from an answer's head and length alone, exactly the
+    /// answers [`finish`] leaves as they are, so the API makes no future for them; one it changes (a validator, a
+    /// coding, `Vary`) is never among them, however small.
+    #[test]
+    fn g9_s5_what_finish_leaves_as_it_is_is_told_before_its_future() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let body = runners_list()?;
+            let br = [("accept-encoding", "gzip, br")];
+            let json = || srv::response(StatusCode::OK, "application/json", srv::full(body.clone()));
+            let tiny = || srv::json(StatusCode::OK, &serde_json::json!({"ok": true}));
+            let post = |headers: &[(&str, &str)]| {
+                let mut r = get(headers);
+                *r.method_mut() = Method::POST;
+                r
+            };
+            let streamed = || {
+                let frames = futures::stream::iter([Ok::<_, io::Error>(Frame::data(Bytes::from(body.clone())))]);
+                srv::response(StatusCode::OK, "application/json", http_body_util::StreamBody::new(frames).boxed())
+            };
+            // Each request, its answer, and whether finish leaves that answer as it is.
+            let cases = [
+                ("a tiny GET answer: its validator", get(&br), tiny(), false),
+                ("a GET answer: compressed and validated", get(&br), json(), false),
+                ("a GET answer to a client taking no coding: validated", get(&[]), json(), false),
+                ("a POST answer: compressed", post(&br), json(), false),
+                ("a POST answer to a client taking no coding: Vary", post(&[]), json(), false),
+                ("a tiny POST answer", post(&br), tiny(), true),
+                ("a packed type", get(&br), srv::response(StatusCode::OK, "image/png", srv::full(body.clone())), true),
+                ("a streamed body", get(&br), streamed(), true),
+                ("no content", get(&br), srv::status(StatusCode::NO_CONTENT), true),
+                ("encoded already", get(&br), srv::with_header(json(), header::CONTENT_ENCODING, "gzip"), true),
+                ("a range asked", get(&[("accept-encoding", "br"), ("range", "bytes=0-9")]), json(), true),
+            ];
+            for (what, req, resp, leaves) in cases {
+                let asked = Asked::of(&req);
+                anyhow::ensure!(untouched(&asked, &resp) == leaves, "{what}: untouched should be {leaves}");
+                let before = (resp.status(), resp.headers().clone());
+                let after = finish(asked, resp).await;
+                anyhow::ensure!(((after.status(), after.headers().clone()) == before) == leaves, "{what}: finish should {} it", if leaves { "leave" } else { "change" });
+            }
             Ok(())
         })
     }
