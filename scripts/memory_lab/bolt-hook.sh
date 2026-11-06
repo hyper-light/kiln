@@ -17,7 +17,9 @@
 # build's hot .text against the .bolt.org.text its profile missed, .rodata, .eh_frame and .gcc_except_table (read
 # only as a panic unwinds), .data; and kinds.txt, the whole process's resident memory by kind (kinds.py: the
 # binary's, threads' stacks, turso's huge-page-advised arenas, the allocator's mappings, the C heap's), which
-# splits the anonymous memory jemalloc's own figures overstate (goal 11 step 5, part 6).
+# splits the anonymous memory jemalloc's own figures overstate (goal 11 step 5, part 6). For a profiling round of a
+# jemalloc-prof build, also: HEAP_DUMP=1, its heap profile dumped as the window ends (heap-dump.log says how it went);
+# PURGE_PROBE=1, purge.txt, its Rss and Anonymous before and after jemalloc purges its dirty pages (GDB, gdb's path).
 # BOLT_RECORD says what else, from the event BOLT_FROM says to the window's end (the lab waits for the hook, so
 # what lasts runs in the background):
 #   none          nothing more (the default: an A/B's rounds)
@@ -111,6 +113,21 @@ case "$event" in
     ;;
   window-end)
     pages
+    # A jemalloc-prof build's heap profile, dumped by the server itself as the window ends (HEAP_DUMP=1; its
+    # _RJEM_MALLOC_CONF's prof_prefix says where); then what its allocator's dirty pages hold resident, the process's
+    # rollup before and after jemalloc purges every arena (PURGE_PROBE=1; arena 4096 is all of them). Both stop the
+    # server a moment (gdb, by its symbols: an unstripped build), and the purge moves the lab's own scrape after it: a
+    # profiling round's, never an A/B's. Goal 11 step 5, part 6.
+    if [ "${HEAP_DUMP:-0}" = 1 ]; then
+      "${GDB:-gdb}" -p "$pid" -batch -nx -q -ex 'call (int)_rjem_mallctl("prof.dump", (void*)0, (void*)0, (void*)0, 0)' > "$dir/heap-dump.log" 2>&1 ||
+        echo "bolt-hook: gdb's heap dump failed (heap-dump.log)" >> "$dir/hook.log"
+    fi
+    if [ "${PURGE_PROBE:-0}" = 1 ]; then
+      { echo before; grep -E '^(Rss|Anonymous):' "/proc/$pid/smaps_rollup"; } > "$dir/purge.txt" 2>> "$dir/hook.log"
+      "${GDB:-gdb}" -p "$pid" -batch -nx -q -ex 'call (int)_rjem_mallctl("arena.4096.purge", (void*)0, (void*)0, (void*)0, 0)' > "$dir/purge.log" 2>&1 ||
+        echo "bolt-hook: gdb's purge failed (purge.log)" >> "$dir/hook.log"
+      { echo after; grep -E '^(Rss|Anonymous):' "/proc/$pid/smaps_rollup"; } >> "$dir/purge.txt" 2>> "$dir/hook.log"
+    fi
     if [ -s "$dir/perf.pid" ]; then
       p=$(cat "$dir/perf.pid")
       kill -INT "$p" 2> /dev/null

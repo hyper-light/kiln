@@ -1077,8 +1077,12 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
 /// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
 /// each event it took; and step 5's `runner` and `server`, of each agent session's update whose runner said how
 /// long it held it: that hold, on the runner's clock, and the server's time from its frame's arrival to its owner
-/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's.
-const RUNNER_LEGS: [&str; 6] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server"];
+/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's. And step
+/// 4's `order`, with a loop a shard: a frame's wait for its runner's earlier ones on the hub's other loops, of the frames
+/// that had any (its count against `to_loop`'s is how often); `to_control`, `to_loop` of the control loop's frames
+/// alone, which tells the session loops' wait from it; and `net`, the net thread's hold of a frame before it handed it
+/// to its loop, which tells that thread's part of `to_loop` from the queue's and the loop's wake.
+const RUNNER_LEGS: [&str; 9] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1504,7 +1508,7 @@ mod tests {
     #[test]
     fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
         let legs = RUNNER_LEGS;
-        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs");
+        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs; step 4: a frame's wait for its runner's earlier ones on the other loops, and the control loop's own wait");
         let scrape = |n: f64| {
             let mut t = String::new();
             for leg in legs {
