@@ -705,13 +705,16 @@ pub struct Hub {
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
     /// any S3.
     pub blobs: crate::blobs::Opened,
-    /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
+    /// The bus kiln's events ride: its sessions' live feeds, and its CI and deploy events on the
+    /// persisted class (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
     /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
     /// cache (`crate::ci::search`).
     pub search: Arc<dyn kiln_seams::Search>,
     /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
     pub flight: crate::ci::services::memo::Flights,
+    /// What wakes the relay of kiln's events from their outbox to the bus (`crate::events`).
+    pub relay: crate::events::Relay,
 }
 
 impl Hub {
@@ -749,8 +752,9 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
-        // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
-        let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The bus every session's live feed rides, and kiln's CI and deploy events (docs/bus.md):
+        // Quiver's node, in this process, the one node of a cluster of one for the persisted class.
+        let bus = crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))?;
         // The search across a change (W26-R07): an index per tree in the server's cache.
         let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
@@ -848,6 +852,7 @@ impl Hub {
             bus,
             search,
             flight: Default::default(),
+            relay: crate::events::Relay::default(),
         });
         // What each agent session's owner shard tells the rest of kiln goes through the hub
         // (`crate::harness::copies`).
@@ -1100,6 +1105,10 @@ impl Hub {
         if self.harness_events.receiver_count() > 0 {
             self.harness_events.send(crate::harness::copies::owner_of(id, self.harness_events.lanes()), text);
         }
+        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
+        // what outgoing webhooks take of it besides is recorded (crate::events).
+        self.relay.heard(v);
+        self.relay.kick();
     }
 
     pub async fn emit_job(&self, job_id: &str) {
@@ -5285,6 +5294,17 @@ pub(crate) mod tests {
 
     /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
     pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_in(clock, None, f).await
+    }
+
+    /// A scratch hub whose kiln.db is the file `db` and whose bus keeps its data in `bus`: a
+    /// second one on them takes up where the first stopped (a restart).
+    pub(crate) async fn restartable_hub(clock: Arc<dyn kiln_seams::Clock>, db: &std::path::Path, bus: &std::path::Path) -> anyhow::Result<Arc<Hub>> {
+        let bus = bus.to_string_lossy().into_owned();
+        scratch_hub_in(clock, Some(db.to_path_buf()), move |cfg| cfg.bus.data = bus).await
+    }
+
+    async fn scratch_hub_in(clock: Arc<dyn kiln_seams::Clock>, db: Option<std::path::PathBuf>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
@@ -5296,7 +5316,10 @@ pub(crate) mod tests {
         // keys are throwaway: written without waiting for the disk.
         let pki_dir = dir.join("pki");
         let (store, keys) = futures::join!(
-            crate::rt::blocking(Store::in_memory),
+            crate::rt::blocking(move || match db {
+                Some(db) => Store::open(&db),
+                None => Store::in_memory(),
+            }),
             crate::rt::blocking(move || -> anyhow::Result<_> {
                 let pki = crate::pki::Pki::open_scratch(&pki_dir)?;
                 let leaf = pki.server_leaf(&[])?;

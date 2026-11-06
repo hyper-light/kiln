@@ -121,12 +121,6 @@ pub static TERMINAL_FEEDS: Owner = Owner::new("terminal_feeds");
 /// picture.
 pub static STREAM_VIEWERS: Owner = Owner::new("stream_viewers");
 
-/// Outgoing webhooks' deliveries waiting for their subscriber's worker (`crate::ci::webhooks`), every
-/// subscriber's together: each at most 1,000 events and [`crate::net::EVENTS_BYTES`] of them, as much as the
-/// hub's events ring they're taken from holds. At the bound a delivery is logged as dropped, its body kept
-/// in its row, to send again (`POST /api/ci/webhooks/deliveries/:id/redeliver`).
-pub static WEBHOOK_QUEUES: Owner = Owner::new("webhook_queues");
-
 /// Syslog records received and not yet offered to the observe node (`crate::observe::collect::syslog`),
 /// each source's queue together: each at most [`crate::observe::ingest::WAITING_LOG_BYTES`], what the node
 /// takes waiting to be written before it refuses more, where they go next. At the bound a datagram is
@@ -218,7 +212,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {
