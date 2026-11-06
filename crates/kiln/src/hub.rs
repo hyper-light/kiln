@@ -5092,6 +5092,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// The test runtime's shards, as its tests share them (goal 4, plan 01a1a59c2a9c step 5). A test that keeps them busy
+    /// (tasks that always want a shard, a shard held, an owner given more than a turn takes) holds this shared, beside
+    /// others such; a test that times how a shard's tasks take turns holds it alone, so it times its own tasks and no
+    /// other test's. Each takes it on its own thread before its work on the runtime begins, never on a shard. Beside step
+    /// 5's busy tests, the turns test (`harness::copies::tests::g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up`)
+    /// found its other task 1.4 to 3.1 ms apart at the median, past its four quanta (1.07 ms), in each of five runs; alone,
+    /// within them in each.
+    static SHARDS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+    /// Held by a test that keeps the runtime's shards busy ([`SHARDS`]).
+    pub(crate) fn shards_kept_busy() -> parking_lot::RwLockReadGuard<'static, ()> {
+        SHARDS.read()
+    }
+
+    /// Held by a test that times how a shard's tasks take turns ([`SHARDS`]).
+    pub(crate) fn shards_timed() -> parking_lot::RwLockWriteGuard<'static, ()> {
+        SHARDS.write()
+    }
+
     /// A hub of its own for a test: its data in a folder that lives as long as the process (tests
     /// end with it), a QUIC endpoint on a free loopback port, no runners, its agents off unless a
     /// test turns terminals on.
