@@ -68,6 +68,15 @@ fn fmt(v: f64) -> String {
     }
 }
 
+/// The CPU measure's floor in a target's cell (µs): the background's noise a second (each job's
+/// record) over its CPU readings' typical length (`cpu_us.window_ms.p50`), the median of its rounds.
+/// A per-operation CPU percentile at or under it is the background's, not the operation's.
+pub fn cpu_floor_us(jobs: &[&JobRecord]) -> Option<f64> {
+    let mut v: Vec<f64> = jobs.iter().filter_map(|j| j.numbers.get("cpu_us.window_ms.p50").map(|w| j.noise_us_per_s * w / 1000.0)).filter(|f| f.is_finite()).collect();
+    v.sort_by(f64::total_cmp);
+    super::cells::quantile(&v, 0.5)
+}
+
 /// The run's tables, in Markdown: one for each case and browser, a row for each condition,
 /// measure and quantile, a column for each target, and the best baseline.
 pub fn tables(run: &BrowserRun) -> String {
@@ -92,8 +101,21 @@ pub fn tables(run: &BrowserRun) -> String {
                 for (qname, q) in QUANTILES {
                     let k = key(stem, q);
                     let n_key = format!("{stem}.n");
-                    let nums: Vec<Option<Number>> = targets.iter().map(|t| per.get(t).and_then(|js| number(js, &k, &n_key))).collect();
-                    let best = targets.iter().zip(&nums).filter_map(|(t, n)| n.as_ref().map(|n| (t, n.median))).min_by(|a, b| a.1.total_cmp(&b.1));
+                    let mut nums: Vec<Option<Number>> = targets.iter().map(|t| per.get(t).and_then(|js| number(js, &k, &n_key))).collect();
+                    // A CPU percentile at or under the background's noise over a reading's length
+                    // gives the cell's mean instead, and says so (step 4).
+                    let mut floors: Vec<Option<f64>> = vec![None; targets.len()];
+                    if stem == "cpu_us" {
+                        for ((t, n), f) in targets.iter().zip(nums.iter_mut()).zip(floors.iter_mut()) {
+                            let (Some(js), Some(v)) = (per.get(t), n.as_ref()) else { continue };
+                            let Some(floor) = cpu_floor_us(js) else { continue };
+                            if v.median <= floor {
+                                *n = number(js, "cpu_us.mean", &n_key);
+                                *f = Some(floor);
+                            }
+                        }
+                    }
+                    let best = targets.iter().zip(&nums).zip(&floors).filter_map(|((t, n), f)| n.as_ref().map(|n| (t, n.median, f.is_some()))).min_by(|a, b| a.1.total_cmp(&b.1));
                     // A p99.9 of time also carries its within-round band (the median round's).
                     let band = |t: &String| {
                         let js = per.get(t)?;
@@ -104,9 +126,22 @@ pub fn tables(run: &BrowserRun) -> String {
                     let cellv: Vec<String> = targets
                         .iter()
                         .zip(&nums)
-                        .map(|(t, n)| n.as_ref().map_or_else(|| "-".to_owned(), |n| format!("{} ({}–{}) n={}{}", fmt(n.median), fmt(n.lo), fmt(n.hi), fmt(n.n), if stem == "time" && q == "p999" { band(t).unwrap_or_default() } else { String::new() })))
+                        .zip(&floors)
+                        .map(|((t, n), floor)| {
+                            n.as_ref().map_or_else(
+                                || "-".to_owned(),
+                                |n| {
+                                    let tail = match floor {
+                                        Some(f) => format!(" (mean: the {qname} is under the noise floor, {} µs)", fmt(*f)),
+                                        None if stem == "time" && q == "p999" => band(t).unwrap_or_default(),
+                                        None => String::new(),
+                                    };
+                                    format!("{} ({}–{}) n={}{tail}", fmt(n.median), fmt(n.lo), fmt(n.hi), fmt(n.n))
+                                },
+                            )
+                        })
                         .collect();
-                    let _ = writeln!(o, "| {} | {m} {qname} ({unit}) | {} | {} |", c.condition, cellv.join(" | "), best.map_or_else(|| "-".to_owned(), |(t, v)| format!("{t} {}", fmt(v))));
+                    let _ = writeln!(o, "| {} | {m} {qname} ({unit}) | {} | {} |", c.condition, cellv.join(" | "), best.map_or_else(|| "-".to_owned(), |(t, v, mean)| format!("{t} {}{}", fmt(v), if mean { " (mean)" } else { "" })));
                 }
             }
         }
@@ -306,6 +341,41 @@ mod tests {
         assert!((calibration_limit_us(Some(1000.0)) - 1000.0).abs() < f64::EPSILON);
         assert!((calibration_limit_us(None) - 200.0).abs() < f64::EPSILON);
         assert!((calibration_limit_us(Some(f64::INFINITY)) - 200.0).abs() < f64::EPSILON);
+    }
+
+    fn cpu_job(round: usize, p50: f64, mean: f64, noise_us_per_s: f64, window_ms: f64) -> Option<JobRecord> {
+        let v = serde_json::json!({
+            "condition": "50k/1", "profile": "50k", "loss": "1", "seed": 7, "round": round, "target": "kiln-today",
+            "browser": "chromium", "case": "stream", "k": 8,
+            "numbers": { "cpu_us.p50": p50, "cpu_us.p99": 50_000.0, "cpu_us.p999": 90_000.0, "cpu_us.n": 100.0, "cpu_us.mean": mean, "cpu_us.window_ms.p50": window_ms },
+            "protocols": {}, "calibration_p99_us": null, "background_us_per_s": 0.0, "noise_us_per_s": noise_us_per_s,
+            "errors": [], "machine": {}, "started_us": 0
+        });
+        serde_json::from_value(v).ok()
+    }
+
+    /// plan 01a1a832e9cc step 4 (and step 7's pilot, where kiln today's CPU p50 at 50k/1 came out
+    /// negative): a CPU percentile at or under the background's noise over a reading's length gives
+    /// the cell's mean instead, and says so; one above it stays the percentile.
+    #[test]
+    fn g1_s4_cpu_under_the_noise_floor_gives_the_mean() {
+        // 20,000 µs a second of noise over 250 ms readings: a floor of 5,000 µs.
+        let jobs: Vec<JobRecord> = [-150.0, -90.0, -20.0, 40.0, 900.0].into_iter().enumerate().filter_map(|(r, p50)| cpu_job(r, p50, 1_200.0, 20_000.0, 250.0)).collect();
+        assert_eq!(jobs.len(), 5);
+        let refs: Vec<&JobRecord> = jobs.iter().collect();
+        assert!(cpu_floor_us(&refs).is_some_and(|f| (f - 5_000.0).abs() < 1e-9));
+        let run: Result<BrowserRun, _> = serde_json::from_value(serde_json::json!({
+            "command": "", "started_us": 0, "certs_spki": "", "failures": [], "network": [],
+            "settings": { "targets": [], "profiles": [], "losses": [], "browsers": [], "cases": [], "rounds": 5, "k": 8, "seed": 7, "window_ms": 25, "background_s": 5, "web": "web" },
+            "jobs": serde_json::to_value(&jobs).unwrap_or_default()
+        }));
+        let Ok(run) = run else { return assert!(run.is_ok(), "{run:?}") };
+        let t = tables(&run);
+        let p50 = t.lines().find(|l| l.contains("cpu p50")).unwrap_or_default();
+        assert!(p50.contains("1200 (1200–1200) n=500.0 (mean: the p50 is under the noise floor, 5000 µs)"), "{p50}");
+        assert!(p50.ends_with("kiln-today 1200 (mean) |"), "{p50}");
+        let p99 = t.lines().find(|l| l.contains("cpu p99 ")).unwrap_or_default();
+        assert!(p99.contains("50000 (50000–50000) n=500.0 |"), "{p99}");
     }
 
     /// plan 01a1a832e9cc step 10: docs/browser-lab.md's tables are the run files' it names

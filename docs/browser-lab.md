@@ -214,6 +214,11 @@ and fetch for kiln today; Server-Sent Events, streaming fetch and fetch for the 
   before the job, and one after it; its rate is the mean of before and after, and the larger of the
   two windows' difference and the before's and after's is the CPU measure's noise floor, kept with
   every job. kiln's runner (the agents' machine) is in a scope of its own and isn't the server's.
+  A per-operation CPU percentile at or under that noise over a reading's length (the noise a
+  second times `cpu_us.window_ms.p50`, the median of the cell's rounds) is the background's, not
+  the operation's: there the tables give the cell's mean instead, and the cell says so ("mean: the
+  p50 is under the noise floor, F µs"; `report::cpu_floor_us`). Step 7's pilot found it in most of
+  kiln today's p50s ("Where the run stands").
 
 ### The probe's checks
 
@@ -419,7 +424,8 @@ a budget of 120 h:
 | 8 | 109.6 | none |
 | 16 | 73.4 | none |
 
-The matrix runs at **K = 8**, in both browsers (WebKit in Playwright's image), on the recording's
+The matrix runs at **K = 8** (but for the 50 kbit/s streams in WebKit, at K = 2 with 13 rounds:
+step 7's K check, "Where the run stands"), in both browsers (WebKit in Playwright's image), on the recording's
 seed (`--seed 7`, so the baselines' replay is what the run's kiln sends). Each case's pace on each
 profile is `runfile::workload`: a stream case opens an agent's session (its events at 5 a second
 on the good link, 0.5 at 100 kbit/s and 0.25 at 50), a terminal (its lines at 20, 2 and 1 a second)
@@ -549,6 +555,67 @@ comparisons.
   slower than 1 s or failing, the lab's unit is frozen and that is logged, and thawed after five
   good minutes. The jobs a freeze overlapped are left out of the report; the freezes' count and
   minutes are in the run's notes. If adacachy's share falls far behind, its parts move to fedora.
+
+**Where pass 1 ran, in the end: fedora alone.** adacachy's share never ran there: production's
+host went deep into swap on 2026-11-05 and each thaw of the guarded unit slowed production's
+`/readyz` again, so its parts moved to fedora at 20:13Z (`pass1/fedora-moved.parts`, taken from the
+list's end by `run-pass-tail.sh` in the unit `kiln-bp-g1-lab-moved`, beside `kiln-bp-g1-lab` and
+`kiln-bp-g1-lab-tail` on `fedora.parts`, two parts at a time each). Every pilot cell (good/0 and
+50k/1), the K-links check and the cross-machine cell's fedora half (`xm-50k-stream`) ran on fedora;
+the cross-machine A/A has no adacachy half. fedora's load (one-minute) during the pilot's jobs:
+median 33, at most 114, CPU pressure (some, avg10) median 9%; every job records its own.
+
+### Step 7: the pilot's checks
+
+`pass1/step7.sh` (on the lab machine, after the pilot's parts and `pass1/fedora-kcheck.parts`):
+
+- **The A/A**: kiln today against itself (`kiln-today-b`), interleaved on the same seeds, in both
+  browsers, good/0 and 50k/1, each case: **0 of 108** numbers differ beyond noise (each held so all
+  108 hold together at 95%, Bonferroni). The bar is 5%.
+- **Every number has its interval and sample count**: the pilot's tables (120 rows,
+  `kiln-lab browser report` of the merged pilot) give each target's median of its rounds, its 95%
+  interval and n, and each time p99.9 its within-round band.
+- **Report and compare read the run files back**: for each pilot part, the tables `report` prints
+  from its `run.json` are the ones the part printed as it ran (the script compares part folders
+  only: `<part>.take` and `<part>.skip` beside them are the parts' claim markers, which an earlier
+  glob took for parts).
+- **h2o's QUIC controller**: at 50k/1, the median p99 of every h2o-h3 job is 3,841 ms with Cubic
+  (15 jobs) against 5,040 ms with Reno (15 jobs), so h2o's HTTP/3 rows run with **Cubic**
+  (`h2o-h3`).
+- **CPU under the background's noise.** kiln today's server at rest is noisy: two background
+  windows before a job differ by 5,000 to 250,000 µs of CPU a second (h2o's by 20 to 8,000), so
+  over a reading (25 ms on the good link; 75 to 330 ms at 50 kbit/s, where a reading with no
+  operation carries on to the next) its floor is 180 to 10,600 µs. kiln today's per-operation CPU
+  p50 is at or under it in most pilot cells: at 50k/1 it even comes out negative (requests in
+  Chromium -1,852 µs, bursts -136 µs; the background's rate taken from readings that held little
+  else), and on the good link its streams' and requests' p50 in Chromium (1,213 and 2,343 µs under
+  floors of 3,655 and 3,717). Some of h2o's 50k/1 p50s are under theirs too (bursts -4.2 µs,
+  requests 297 µs under 457). Those cells give the CPU's mean and say so; the p99 and p99.9 clear
+  the floor in every pilot cell. Where even the mean is negative (kiln-today-b's 50k/1 burst in
+  Chromium, -746 µs), the operation's CPU is below what the lab resolves under that background.
+- **K links against one** (kiln today, the same cell with K links and with one, each set of rounds
+  against the other, Bonferroni over its 18 numbers): good/0 requests at K = 8 (the pilot) against
+  K = 1, 0 of 18 differ, so **K = 8 stands** there and for every cell but one kind. 50k/1 streams:
+  the pilot's K = 8 cell against K = 1, 0 of 18; but fedora's second K = 8 cell (`xm-50k-stream`)
+  against K = 1, 2 of 18, both WebKit (bytes p99.9 46,910 against 29,173 B; CPU p99.9 56,998 against
+  295,419 µs). Lowered per the step (`pass1/fedora-kcheck.parts`, beside the pass's six parts):
+  K = 4 against K = 1, 3 of 18, all WebKit (time p99 30,254 against 35,870 ms, p99.9 37,153 against
+  42,333 ms, bytes p50 1,786 against 2,921 B); **K = 2 against K = 1, 0 of 18**, and against K = 1
+  measured again beside it (`k1b`), 0 of 18; K = 1 against K = 1 again, 0 of 18 (the cell itself is
+  steady). Chromium's numbers differ at no K. So **the 50 kbit/s stream cells in WebKit run at
+  K = 2** (each link runs its own WebKit, in a container of its own; what makes 4 or 8 of them
+  interfere, and Chromium's not, the lab doesn't show), with
+  13 rounds (810 operations a round, 10,530 in all), every other cell at K = 8. fedora's load during
+  the K = 4, 2 and 1-again parts was lower than the pilot's (one-minute median 7.7, at most 12.5,
+  against the pilot's 33 and K = 1's first cell's 25): the K = 2 cell agreed with K = 1 under both.
+  The parts this changed (`pass1/fedora-k2.parts`, unit `kiln-bp-g1-lab-k2`, from 2026-11-06
+  01:31Z): `m2-50k-{0,1,5}-stream-wk` (kiln today, h2o and Caddy over HTTP/2 in WebKit at K = 2);
+  `m-50k-0-stream` and `m-50k-5-stream`, not yet started, were marked `.skip` and run as their
+  Chromium half at K = 8 (`m-50k-{0,5}-stream-cr`). **Superseded**: the K = 8 WebKit stream jobs
+  at 50k/1 of `pilot-50k-stream` (kiln today, kiln-today-b and h2o-h2), `xm-50k-stream` and
+  `m-50k-1-stream` (Caddy): the merge leaves them out (`kiln-lab browser merge --drop
+  stream,webkit,50k/1,8`). The K check covered the pilot's two cells only; 100 kbit/s streams in
+  WebKit run at K = 8, unchecked against K = 1.
 
 ## What the lab leaves out
 

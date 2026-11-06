@@ -128,6 +128,10 @@ pub enum Cmd {
     Merge {
         #[arg(long)]
         out: PathBuf,
+        /// Jobs a later part measured again at another K, left out: `CASE,BROWSER,CONDITION,K`
+        /// (`stream,webkit,50k/1,8`), as often as needed (step 7's K check lowers K by cell).
+        #[arg(long)]
+        drop: Vec<String>,
         runs: Vec<PathBuf>,
     },
     /// Target `a` against target `b`, cell by cell, in one run (an A/A) or, with `--b-run`, in two.
@@ -261,10 +265,15 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             print!("{}", report::tables(&r));
             Ok(())
         }
-        Cmd::Merge { out, runs } => {
+        Cmd::Merge { out, drop, runs } => {
+            let drops = drop.iter().map(|d| parse_drop(d)).collect::<anyhow::Result<Vec<_>>>()?;
             let mut merged: Option<report_run::BrowserRun> = None;
+            let mut dropped = 0;
             for p in &runs {
-                let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(p)?)?;
+                let mut r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(p)?)?;
+                let before = r.jobs.len();
+                r.jobs.retain(|j| !drops.iter().any(|d| d.matches(j)));
+                dropped += before - r.jobs.len();
                 match merged.as_mut() {
                     None => merged = Some(r),
                     Some(m) => {
@@ -279,9 +288,14 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let mut m = merged.ok_or_else(|| anyhow::anyhow!("no run files to merge"))?;
-            m.command = format!("kiln-lab browser merge of {} runs: {}", runs.len(), runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "));
+            m.command = format!(
+                "kiln-lab browser merge{} of {} runs: {}",
+                drop.iter().map(|d| format!(" --drop {d}")).collect::<String>(),
+                runs.len(),
+                runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" ")
+            );
             std::fs::write(&out, serde_json::to_vec_pretty(&m)?)?;
-            println!("{}: {} jobs from {} runs, {} failures", out.display(), m.jobs.len(), runs.len(), m.failures.len());
+            println!("{}: {} jobs from {} runs, {} failures, {dropped} jobs left out by --drop", out.display(), m.jobs.len(), runs.len(), m.failures.len());
             Ok(())
         }
         Cmd::Compare { run, a, b, b_run } => {
@@ -456,4 +470,56 @@ fn start_stop_cmd(s: &report_run::Settings, out: &std::path::Path, times: usize)
 #[cfg(not(target_os = "linux"))]
 fn start_stop_cmd(_s: &report_run::Settings, _out: &std::path::Path, _times: usize) -> anyhow::Result<()> {
     refuse()
+}
+
+/// One `merge --drop`: the jobs of a cell measured at a K a later part replaced.
+#[derive(Debug, PartialEq, Eq)]
+struct DropCell {
+    case: String,
+    browser: String,
+    condition: String,
+    k: usize,
+}
+
+impl DropCell {
+    fn matches(&self, j: &report_run::JobRecord) -> bool {
+        j.case == self.case && j.browser == self.browser && j.condition == self.condition && j.k == self.k
+    }
+}
+
+/// `CASE,BROWSER,CONDITION,K`: `stream,webkit,50k/1,8`.
+fn parse_drop(s: &str) -> anyhow::Result<DropCell> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [case, browser, condition, k] = parts.as_slice() else {
+        anyhow::bail!("--drop {s}: want CASE,BROWSER,CONDITION,K (stream,webkit,50k/1,8)");
+    };
+    let k = k.parse().map_err(|e| anyhow::anyhow!("--drop {s}: K {k}: {e}"))?;
+    Ok(DropCell { case: (*case).to_owned(), browser: (*browser).to_owned(), condition: (*condition).to_owned(), k })
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// plan 01a1a832e9cc step 7: a cell whose K check failed at K = 8 is measured again at a lower
+    /// K; the merge leaves the K = 8 jobs of that cell out (and only those).
+    #[test]
+    fn g1_s7_merge_drop_leaves_out_one_cell_at_one_k() {
+        let d = parse_drop("stream,webkit,50k/1,8");
+        assert!(matches!(&d, Ok(d) if *d == DropCell { case: "stream".into(), browser: "webkit".into(), condition: "50k/1".into(), k: 8 }));
+        assert!(parse_drop("stream,webkit,50k/1").is_err());
+        assert!(parse_drop("stream,webkit,50k/1,eight").is_err());
+        let job = |browser: &str, k: usize| -> Option<report_run::JobRecord> {
+            serde_json::from_value(serde_json::json!({
+                "condition": "50k/1", "profile": "50k", "loss": "1", "seed": 7, "round": 0, "target": "kiln-today",
+                "browser": browser, "case": "stream", "k": k, "numbers": {}, "protocols": {}, "calibration_p99_us": null,
+                "background_us_per_s": 0.0, "noise_us_per_s": 0.0, "errors": [], "machine": {}, "started_us": 0
+            }))
+            .ok()
+        };
+        let Ok(d) = d else { return };
+        assert!(job("webkit", 8).is_some_and(|j| d.matches(&j)));
+        assert!(job("webkit", 4).is_some_and(|j| !d.matches(&j)));
+        assert!(job("chromium", 8).is_some_and(|j| !d.matches(&j)));
+    }
 }
