@@ -958,8 +958,9 @@ const Prompt = React.memo(function Prompt({
             </span>
           )}
           {e.attachments?.length ? (
-            <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
-              · {e.attachments.join(", ")}
+            <span className="hx-dim hx-trunc hx-prompt-files" title={e.attachments.join(", ")}>
+              <span className="hx-prompt-files-sep">· </span>
+              {e.attachments.join(", ")}
             </span>
           ) : e.images ? (
             <span className="hx-dim">
@@ -1030,8 +1031,9 @@ const Sending = React.memo(function Sending({
               </span>
             </span>
             {m.attachments.length > 0 && (
-              <span className="hx-dim hx-trunc" title={m.attachments.join(", ")}>
-                · {m.attachments.join(", ")}
+              <span className="hx-dim hx-trunc hx-prompt-files" title={m.attachments.join(", ")}>
+                <span className="hx-prompt-files-sep">· </span>
+                {m.attachments.join(", ")}
               </span>
             )}
           </div>
