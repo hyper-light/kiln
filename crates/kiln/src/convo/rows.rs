@@ -176,27 +176,18 @@ pub fn event(session: &str, e: &Event) -> Option<EventRow> {
 }
 
 /// [`event`], its JSON written out already (`body`, `serde_json::to_string(e)`'s text), not again: a session's
-/// copy writes each event out once, for itself and its row (goal 9, plan 01a1a87b2cec step 5).
+/// copy writes each event out once, for itself and its row (goal 9, plan 01a1a87b2cec step 5). Its search text is
+/// made once, of its words as they're added, at most [`SEARCH_TEXT_MAX`] of them ([`searched`]): each was copied
+/// whole first, then clipped into another copy, on its copy's shard.
 pub fn event_written(session: &str, e: &Event, body: String) -> EventRow {
     let (kind, level, tool, status, text) = match &e.body {
-        Body::User { text, attachments, .. } => {
-            let mut t = text.clone();
-            for a in attachments {
-                t.push('\n');
-                t.push_str(a);
-            }
-            ("user", None, None, None, t)
-        }
-        Body::Assistant { text, .. } => ("assistant", None, None, None, text.clone()),
-        Body::Thinking { text, .. } => ("thinking", None, None, None, text.clone()),
-        Body::Notice { level, text } => ("notice", Some(level_word(level)), None, None, text.clone()),
+        Body::User { text, attachments, .. } => ("user", None, None, None, searched(std::iter::once(text.as_str()).chain(attachments.iter().flat_map(|a| ["\n", a.as_str()])))),
+        Body::Assistant { text, .. } => ("assistant", None, None, None, searched([text.as_str()])),
+        Body::Thinking { text, .. } => ("thinking", None, None, None, searched([text.as_str()])),
+        Body::Notice { level, text } => ("notice", Some(level_word(level)), None, None, searched([text.as_str()])),
         Body::Tool(t) => {
-            let mut words = t.title.clone();
-            for part in [t.detail.as_deref(), t.output.as_deref()].into_iter().flatten() {
-                words.push('\n');
-                words.push_str(part);
-            }
-            ("tool", Some(json_word(&t.tool)), Some(t.name.clone()), Some(status_word(t.status)), words)
+            let words = std::iter::once(t.title.as_str()).chain([t.detail.as_deref(), t.output.as_deref()].into_iter().flatten().flat_map(|part| ["\n", part]));
+            ("tool", Some(json_word(&t.tool)), Some(t.name.clone()), Some(status_word(t.status)), searched(words))
         }
     };
     EventRow {
@@ -210,9 +201,32 @@ pub fn event_written(session: &str, e: &Event, body: String) -> EventRow {
         level,
         tool,
         status,
-        text: clip(&text, SEARCH_TEXT_MAX),
+        text,
         body,
     }
+}
+
+/// `parts` joined and cut to [`SEARCH_TEXT_MAX`] bytes at a character's start, made in one string of that size: each
+/// part added while there's room, the one that has none left cut at a character's start, the rest left out (earlier
+/// parts end at characters' starts, so where it's cut is where the joined text would be).
+fn searched<'a>(parts: impl IntoIterator<Item = &'a str, IntoIter: Clone>) -> String {
+    let parts = parts.into_iter();
+    let total = parts.clone().map(str::len).fold(0_usize, usize::saturating_add);
+    let mut out = String::with_capacity(total.min(SEARCH_TEXT_MAX));
+    for part in parts {
+        let room = SEARCH_TEXT_MAX.saturating_sub(out.len());
+        if part.len() <= room {
+            out.push_str(part);
+            continue;
+        }
+        let mut end = room;
+        while end > 0 && !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(part.get(..end).unwrap_or_default());
+        break;
+    }
+    out
 }
 
 /// Rows in the order they came, with what a later one replaces dropped: one write per event and
@@ -307,6 +321,9 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
     out.into_iter().flatten().collect()
 }
 
+/// `s` cut to at most `max` bytes at a character's start: what a row's search text is of its words joined (made by
+/// `searched` as they're joined; tests hold it to this).
+#[cfg(test)]
 fn clip(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -426,5 +443,56 @@ mod tests {
         let s = "é".repeat(SEARCH_TEXT_MAX);
         let c = clip(&s, SEARCH_TEXT_MAX);
         assert!(c.len() <= SEARCH_TEXT_MAX && c.chars().all(|ch| ch == 'é'));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a row's search text, made as its words are joined, is their joined text
+    /// clipped, byte for byte (short; the limit to the byte; past it with a two-byte character across the limit; a
+    /// separator at it; parts past it left out), in one string no larger than the limit. A tool's and a user's rows say
+    /// the same as their words joined and clipped.
+    #[test]
+    fn g9_s5_a_rows_search_text_is_its_words_joined_and_clipped_made_once() {
+        let max = SEARCH_TEXT_MAX;
+        let a = "a".repeat(max - 1);
+        let cases: Vec<Vec<String>> = vec![
+            vec!["title".into(), "\n".into(), "out".into()],
+            vec!["x".repeat(max)],
+            vec![a.clone(), "\n".into(), "after".into()],
+            vec![a.clone(), "é".into()],
+            vec![a.clone(), "aé".into(), "\n".into(), "more".into()],
+            vec!["é".repeat(max), "\n".into(), "gone".into()],
+            vec![String::new(), "\n".into(), "y".repeat(2 * max)],
+        ];
+        for parts in &cases {
+            let made = searched(parts.iter().map(String::as_str));
+            assert_eq!(made, clip(&parts.concat(), max), "{:?}", parts.iter().map(String::len).collect::<Vec<_>>());
+            assert!(made.capacity() <= max, "one string of the limit's size at the most: {}", made.capacity());
+        }
+        let call = ToolCall {
+            tool_id: "t".into(),
+            name: "Read".into(),
+            tool: ToolKind::Shell,
+            title: "Read".into(),
+            detail: Some("src/x.rs".into()),
+            input: serde_json::json!({}),
+            status: ToolStatus::Done,
+            output: Some("é".repeat(max)),
+            truncated: false,
+            diffs: vec![],
+            todos: vec![],
+            task: None,
+            exit_code: None,
+            started: 1,
+            ended: Some(2),
+            server: None,
+            tool_short: None,
+            skill: None,
+            runner: None,
+        };
+        let tool = ev("t", 1, Body::Tool(Box::new(call)));
+        let user = ev("u", 2, Body::User { text: "look".into(), images: 0, client_id: None, origin: None, attachments: vec!["a.png".into(), "b.png".into()], reply_to: None });
+        for (e, words) in [(&tool, format!("Read\nsrc/x.rs\n{}", "é".repeat(max))), (&user, "look\na.png\nb.png".to_owned())] {
+            let row = event_written("s", e, String::new());
+            assert_eq!(row.text, clip(&words, max), "{}", e.id);
+        }
     }
 }

@@ -308,6 +308,54 @@ takes about the fill plus 70 s. Stop a run by the unit or run it's in: the lab's
 lead process groups of their own (so each one's harnesses go with it), which a kill of the lab's
 process alone leaves running.
 
+### Fixed rates (`kiln-lab rate`)
+
+Where a round replays a realistic mix, `kiln-lab rate` asks one read at a time at fixed rates (100,
+1,000, 10,000, 100,000 and 1,000,000 a second by default), open loop and without coordinated omission,
+as wrk2 does: each request is sent when the schedule says (or as soon as a connection is free after),
+and its latency runs from when the schedule said, so a stall is charged to every request it held back.
+It measures any server a target file describes, so kiln and another product (T3 Code, for goal 10's
+benchmark) are measured by one generator:
+
+```sh
+kiln-lab rate --target crates/kiln-lab/targets/kiln.toml --kiln new=a/kiln --kiln prod=b/kiln \
+              --target t3code.toml [--rates 100,1k,10k,100k,1m] [--out DIR]
+```
+
+A target file (TOML) names the target, its server and its reads. `[server] kind = "kiln"` starts each
+`--kiln` as a round does (a fresh data dir, the lab's runners and stand-in, `--profile`'s sessions
+filled in; `${token}` is its admin token and `${session}` its sessions, largest first); `kind =
+"command"` runs `command` (with `cwd`, `env`) on a free port of its own, waits until it answers
+(`ready`: the port, or a path's `GET`), and runs `seed`, whose last line of output, a JSON object, gives
+the reads' values. Each `[[workload]]` is `kind = "http"` (method, path, headers and body over
+keep-alive HTTP/1.1, `pipeline` deep where the server takes it, as kiln's does) or `kind = "ws-rpc"`
+(JSON requests over WebSockets, `hello` messages first, each answer matched by its id at a JSON
+pointer, `final` and `ok` tests on it). Strings are templates: `${port}`, `${dir}`, `${token}`, a
+request's `${id}`, and the seed's values. kiln's file has its two reads: the sessions' list and the
+largest session's newest page (`GET /api/harness/sessions/${session}/events`, its newest 100 events).
+
+For each target, each rate (ascending) and each read in turn, the connections open, then a warm-up at
+the rate (5 s, the realistic profile's), the window (the longer of 10 s, wrk's default, and 10,000
+requests, so p99.9 rests on ten samples past it), and the drain (the window's backlog still sent for
+a warm-up's length; each request answered within 90 s, the lab's patience, or timed out). Connections
+follow Little's law: the rate times `--expect-ms` (1 ms, goal 10's bar) times 2 (each busy at most half
+the time), over what a connection carries at once, at least one for each of the generator's threads
+(`--gen-cpus`: a quarter of the CPUs, or all of the lab's with `--server-cpus`). The lab raises its
+open-files limit to kiln's service's (1,048,576 on Linux, 10,240 on macOS) before any server starts,
+so servers run under production's, and holds connections to what it allows, saying so.
+
+Each read at each rate is one line of `results.jsonl` and a row of `report.md`: the rate asked and
+the rates sent and answered, good answers and errors (bad statuses, timeouts, connections cut, requests
+never sent), p50, p99, p99.9 and the most from when each fell due (and the same from each send, what
+coordinated omission would have said), the answers' bytes, the server's CPU (CPUs' worth) and RSS
+through the window (its whole process tree: `/proc` every 100 ms on Linux, `ps` every second on
+macOS; Windows isn't sampled), and the generator's CPU, its busiest thread's work, and its own
+lateness. It says who couldn't keep up: the generator, when its busiest thread worked 90% of the window
+or its lateness at p99 is a tenth of the latency's; the connections, when the rate fell short while
+requests waited for one; the server, when it fell short otherwise (under 99% answered, or over 1%
+errors). Its threads ask their OS to be punctual (Linux's timer slack of 1 ns, macOS's
+user-interactive QoS) and spin through the last of each wait, their own oversleeps' 90th percentile.
+
 ## Main's baseline
 
 Measured on 2026-11-04 (10:00 to 11:56 UTC) on a Linux machine with an Intel Core i9-14900HX (32
@@ -1297,6 +1345,23 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
   past it.
+- **The hub's net loop: a poll is a turn at the most** (`rt::Turns::end`, `before`): told that nothing else
+  wanted the shard (`maybe_yield`), the loop went on into its next turn in the same poll, so a burst of
+  runners' frames could hold the HTTP listener's shard two turns and more a poll (rt9's calm rounds:
+  `runner AgentMsg::Harness` 1.22 ms on the CPU, and in round 1 six more of its labels 0.40 to 0.52 ms,
+  cheap messages' among them: `HeadroomStatus`, `Identity`, whose signing is the compute pool's). Now its turn's end
+  ends its poll (`yield_now`: the shard reads its inputs and comes back to the loop at once when nothing
+  else is ready), and a frame whose read on the shard would take the turn past the quantum
+  (`wire::payload::expected_ns`: its read and its item's message's, each by what reads of its kind took,
+  an agent session's update by its own kind's, `UPDATE_COSTS`) waits for the next turn.
+- **What each runner message costs the hub's loop** (step 5): a channel item's body and a session update's
+  JSON stay in the frame's buffer, moved down in place, not copied out twice (`proto::read_agent_owned`);
+  a payload goes to its unknown-field check as it is, not copied (`wire::payload::payload_owned`); a
+  session's update on the channel goes to its owner without a runner message's whole handling again and
+  nothing boxed for it (`Hub::on_session_update`); a frame's runner is looked up without its name
+  copied (`Hub::said_hello`); and an agent session's event is read without serde's two buffers of it
+  (its flattened body's, then its tagged body's, each text copied into each: `harness::model::Event`'s
+  `Deserialize`, written out as READY 11 wrote `Update`'s).
 - **A runner's Build in pieces, its mirrors' file off the shards** (`hub::build`): the hub's loop took a
   runner process's Build in one poll of ten things (its process, its legs' receipt, its upgrades, its
   front door, sync's, observe's and the cluster's announcements, the conversation store's mirrors and a
@@ -1792,7 +1857,7 @@ connection, the bus 12.2 MB at its busiest second of a 171 MiB bound reckoned fo
 topic 3.7 MB at the most of 5 MiB). `custody_receipts` reached 4.6 MB (a hogs round) of 64 MiB. What's resident and
 unbounded in bytes was the feed (cut above) and the copies' metas, bounded by `MAX_EVENTS` a copy.
 
-**The A/B for jemalloc's share, in order** (the build: rt-next with this step's branches merged, its static
+**The A/B for jemalloc's share, in order** (part 4's arms below replace this order: their values are derived; the build: rt-next with this step's branches merged, its static
 musl build with jemalloc; A without a variant, B with it; 8 rounds calm, a winner again with hogs):
 1. Any A/B first reads `kiln_memory_allocator_bytes{kind}` at the window's end, A's rounds: live =
    `allocated` - `thread_caches`; `thread_caches`; slack = `active` - `allocated`; `dirty`; `metadata`; not
@@ -1831,6 +1896,52 @@ hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' p
 - look for: `wire::events::feed` (est. under 1 MB after the cut), `harness::copies::Meta::of` and
   `Mirror::upsert` (the copies' metas and index), `tungstenite::protocol::WebSocketContext::buffer_frame`,
   and with `prof_accum` the sites whose frees make `dirty`.
+
+### Kiln's own holders, cut largest first (step 5, part 4)
+
+rt9's glibc lab build held 478 MB (anonymous 378): of kiln's own owners on `/metrics` the bus 7.74 MB,
+`session_entries` 6.86, `sqlite` 4.06, `session_segments` 1.66, `ui_events` 0.72. Each cut below is an
+estimate for the realistic profile (8 agent pages' sockets, 4 runners, 32 copies keeping about 47,000
+events, 14,000 observe series), and for production's shape (134 copies, 10 runners) where it differs.
+
+| Cut | Est. MB, lab (production) | Basis |
+| --- | --- | --- |
+| A copy's meta keeps its digest in an `AtomicU64` (0 until made), not a `OnceLock<u64>`: 88 bytes, not 96 | 0.4 (0.7) | 8 bytes for each event a copy keeps |
+| A copy's index: buckets of a `u32` key (half of the id's keyed SipHash) and a `u32` place, hashed by the key's own bits (`copies::Spread`) | 0.6 (1.0) | 8 bytes a bucket, not 16: a 5,000-event copy's table of 8,192 buckets is 72 KiB, not 136 |
+| The UI's sockets write 16 KiB at a time (`http::ws::SOCKET_WRITE`, a TLS record), and a packed snapshot goes in frames of 16 KiB (`api::SNAPSHOT_FRAME`), its pieces still made 128 KiB at a time | 0.85 (more: each page's events socket) | tungstenite's write buffer keeps the most it held: 131 KiB for each agent page after its snapshot, 128 to 256 KiB for an events socket |
+| A runner's process makes none of the server's route and leg histograms (`route_latency::ROUTES`, `LEGS`, made by the first work they time), so its registry renders none of their series | 0.55 to 0.7 (1.4 to 1.8) | 502 series of zeros a runner (10 x 22, 6 x 47), each a series of its own in the server's observe store, about 270 to 350 bytes |
+| observe's head and newest times grow by a quarter (`index::grow`), not doubling | 0 (1.3 after a restart) | a reopen sizes them exactly, and the next new series doubled them: 128 bytes a series |
+
+What each risks, for the lab to say: the socket writes are 8 times as many for a snapshot (a 3 MB one is about
+200 writes of 16 KiB, not 25 of 128 KiB): watch attach p50 and p99 and the CPU a request. A server's very first
+`/metrics` answer, before any request was timed, lacks the route families' series (each family is still said with
+its TYPE).
+
+**What's left of kiln's own, and what it needs:**
+- **The bus** (7.74 MB in rt9, and Quiver's slots beside it): each watched session's topic keeps its newest 2048
+  frames (`live::RETAIN`, from CP-T2.1, not derived), though every viewer has read all but a few: a viewer reads from
+  its snapshot's offset on, and one that joins later reads from the end. Quiver keeps a topic's newest messages by
+  count and bytes alone, and makes each 64 KiB segment's 256 slots (about 96 bytes each by their types, 24 KiB) as it opens it, of which
+  the lab's frames (about 730 bytes framed) fill about 89: about 2.9 MB more than the bus's own count. Not cut:
+  - Letting what every viewer has read go would take Quiver an operation of its own (a topic's messages let go
+    before an offset), which would cost Quiver itself: each call takes the topic's lock that every publish takes, so
+    its publishes wait behind it, and its API, simulator and conformance suite grow. Growing a segment's slots as it
+    fills, for the other 16 KiB a segment, would put an allocation on its publish's path. Quiver holds itself to a
+    tenth of NATS's, Redis's and Kafka's p99 and p99.9, and Ada's word (2026-11-06) is that a change costing Quiver
+    any of its performance isn't made. What it would have given: est. 9 to 10 MB in the lab.
+  - A smaller `RETAIN` is kiln's alone, but it changes what a slow viewer gets: one further behind than the topic
+    keeps takes a catch-up (only what changed since its revision, packed) where it took frames. Not made: Ada's call.
+- **observe's block directories**: 48 bytes a series for each block, about 0.67 MB a block (1 to 3 in a lab round,
+  about 10 with production's retention, 6 to 7 MB): in-memory copies of what each block's file indexes.
+- **The server's own histograms in observe**: every bucket of every histogram is a series, each written every 15 s
+  whether or not it moved (about 1,200 on the server). Dropping a bucket that equals the one below it changes what a
+  query of the buckets sees, so it's observe's query side to agree first.
+- Production only: a terminal's replay (up to 256 KiB, one message) and a snapshot for a client that doesn't ask
+  `z=gzip` (frames up to 256 KiB) still leave their socket's buffer that large; the events socket's two lanes make
+  their 4,096 places each as it subscribes (128 KiB a socket); observe's queue to its peers makes its 16,384 places
+  as it starts (256 KiB); uploads stay in memory up to 30 minutes after their message (up to 512 MiB).
+- To rank the rest, one heap profile round of the merged tree (above), looking also for `quiver::ephemeral::Segment::new`
+  (the slots), `kiln_obs::block` (the directories) and `kiln_http::buf` (the write buffers kept per thread).
 
 ### The binary's pages: what's touched, and the code's layout (step 5)
 
@@ -1999,6 +2110,128 @@ LD_LIBRARY_PATH=$PERF_LIBS $PERF record -e cycles:u -j any,u -o $L/smoke.data --
      `KILN_LINK_ORDER=<kiln.order>`, its executable removed first (`find <TARGET>/x86_64-unknown-linux-gnu/release/deps
      -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete`), since cargo doesn't know an
      order changed.
+
+### The vendored projects' memory as kiln sets it, and the A/B of jemalloc's settings (step 5, part 4)
+
+**What sizes each.** The vendored projects' sites below held about 31 MB of train 4's heap profile (the realistic
+profile, calm), and turso's arenas about 8 MB outside jemalloc. What kiln sets of each, and what it can change:
+
+| What holds it (train 4's heap profile) | MB | Sized by | Kiln's setting | Here |
+| --- | --- | --- | --- | --- |
+| hyper-log's read buffers (`Pool::take` under `device::serve`) | 9.04 | what's read back: an append's entries for a learner the cache no longer holds, read whole; the pool keeps up to two segments of buffers read into (`Pool::new(align, 2 x segment, segment)`) | each group's append (`max_size_per_msg`): kiln.db's cluster group's was `LARGEST` and 64 KiB, so its learners' catch-up read up to 8 MiB at once, the only reads that large in the lab's fresh rounds; the segment itself is fixed for a file made with it (below) | the cluster's appends cut to kiln's groups' 256 KiB (below); a proposal (1) for the pool |
+| hyper-log's zero-fill buffer (`device::serve`) | 7.34 | the largest frame written, up to a segment, kept for the log's life | the same | a proposal (1); made by `vec![0; n]`, so its pages are likely never resident (a direct write reads them as the zero page) |
+| recent entries kept for members (`update_of` under observe's `pump`, and under the cluster's `Driver::drive`) | 3.19, 2.63 | each log's cache over its groups (`cache_bytes`) | yes: no file holds it | cut (below) |
+| QUIC's transmit buffer (`Connection::poll_transmit` under the driver's `send`) | 5.24 | 64 datagrams a transmit (`SEGMENTS_A_TRANSMIT`) at the path's datagram size, reserved whole with a `Vec`'s doubling: about 4 MiB needed on a loopback path, whose MTU discovery reaches about 64 KiB | none: hyper-rt-transport's and hyper-quic's | a proposal (2) |
+| the lanes' queues (`LaneOut::new`) | 1.10 | kiln's `lane_window` (1,024 frames) at 48 bytes a place, made whole as each lane opens | `net::limits` | a proposal (4): its bound is also the lanes' flow control, a lab's question |
+| turso's buffer pools (outside jemalloc) | about 8 | two arenas of 3 MiB a database (pages, WAL frames), `MADV_HUGEPAGE`, for the conversation store and records.db | none: turso's `DEFAULT_ARENA_SIZE` (1 MiB only with `TESTING=true`) | a proposal (3), Kiln DB's |
+| turso's page cache | in its arena (768 pages of 4 KiB), past it the heap | 2,000 pages a connection, turso's default (kiln sets none) | `PRAGMA cache_size` | kept: turso held 2.2 MB of the heap (`Turso::run` 1.08, overflow reads 1.08), its cache within its arena; a cap at the arena's pages would bound a long-running server's growth past it, with a build's A/B |
+
+**Why the segments stay.** A log reopens with the facts it was made with. Each segment's header holds the
+log's segment size, and hyper-log's recovery passes over a segment whose header says another
+(`recover.rs`, `Shape`): a log opened with a new segment would read none of what it holds, observe's samples not
+yet cut or the writes kiln.db's commit lost. A new segment takes a log made anew beside the old one, its entries
+cut or replayed first: a migration, not a setting.
+
+**The caches: one append a group.** hyper-durable's replica keeps, past its log's cache, whatever it has yet to
+apply and whatever a member in step has yet to acknowledge (`Replica::keep`, through `LogStore::keep_after`; focal
+gives a group 64 KiB). So a cache serves only a member out of step: one that dropped and probes, or one the apply
+point has passed, sent nothing past it. Its next append comes from memory, and one further behind takes an
+append's entries from the file at a time, each read that size rather than a segment's, as one further behind than
+the old cache did before. Each log's cache is one append a group:
+
+| Log | Its append (`max_size_per_msg`) | Cache, was | Cache, now |
+| --- | --- | --- | --- |
+| observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | 256 KiB |
+| deployments' (`kiln_cd::store`, a sole voter today) | 4 MiB (`MESSAGE_BYTES`) | 8 MiB a group | 4 MiB a group |
+| repos' sync (`sync::disk`, 32 groups) | 256 KiB (`sync::group::APPEND`) | 8 MiB | 8 MiB, now derived |
+| kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | 512 KiB |
+
+The cluster group's appends were as large as its largest entry: `LARGEST` and 64 KiB, 8 MiB of a learner's
+catch-up in one append, read from the log's file in one read where the server's handle no longer held it, and
+hyper-log's read pool kept those buffers. Its appends are now kiln's other groups' (sync's `APPEND`, observe's
+`APPEND_BYTES`: 256 KiB, which a frame of kiln's control lane carries with room to spare), an entry larger going
+alone as before; a learner catching up is still sent up to 256 appends ahead of its answers (hyper-raft's
+`max_inflight_msgs`), 64 MiB at this size. Only the size of the messages and reads changes, no file and no wire
+format: an older runner's learner takes them as it took the larger.
+
+What the lab says: anonymous memory about 13 MB below the tree without them: observe's cache 2.9 MB (3.19 MB less
+its 256 KiB), the cluster's 2.4 MB (2.63 MB less its 256 KiB), and the read pool's 9.04 MB down to under 1 MB,
+unless a change of more than 256 KiB is read back for a learner (its entry goes alone, read whole). In a heap
+profile: `update_of` under `kiln_obs::group::pump` and under `Driver::drive` under 0.3 MB each, and `Pool::take`
+under `device::serve` under 1 MB.
+
+The risk is the same for both. Observe's 3.19 MB were a round's whole log, about 20 KB a second, so its 256 KiB
+are about 13 s of a learner's lag (the lab's 4 runners are learners of both groups). A learner further behind
+reads the log's file, an append at a time, and the read pool keeps what it read into, up to two segments. If the
+profile's `Pool::take` grew past what the caches gave back, the learners' lag is the lab's to measure (a learner's
+`matched` behind the leader's `applied`), and the caches go back. The reads are on the logs' own threads: no
+latency number the lab takes waits on them, and a read now holds a log's next frame for at most an append's bytes
+(256 KiB), where the cluster's held it for up to 8 MiB before.
+
+**Proposals for the vendored projects' owners.** kiln holds one copy of hyper-raft, and Quiver and Mantle must
+record the same changes to it (`scripts/vendor.py check`'s pins), so a change to it goes upstream first; Turso's
+copy is Kiln DB's to change. Each with its derivation and what it would save in the lab:
+1. hyper-log: the read pool keeps no buffer larger than an append's run. A log reads one run at a time on its I/O
+   thread, a member out of step an append's entries at a time (the caches above); a longer run, as at a start whose
+   replay reads a segment's runs whole, or an entry past an append read alone, takes its buffer and gives it back
+   to jemalloc, which purges it within the decay. What's left of the 9 MB past the cluster's smaller appends. And
+   the zero-fill buffer given back once the file has no slot left to fill (`fill_due` finds none): up to 7.3 MB of
+   jemalloc's `allocated`, little of it resident.
+2. hyper-quic: a transmit holds no more datagrams than one segmented send carries, 65,507 bytes (the largest UDP
+   payload over IPv4, kiln-rt's `SEGMENTED_BYTES`): `max_datagrams` in `Connection::poll_transmit` at most that over
+   the path's datagram size, and at least one. `Batched::send_segments` cuts a larger transmit into sends of that
+   size anyway, so no send is added, only calls of `poll_transmit`. About 4 MiB on loopback paths: the lab's
+   runners, and production's own runners on its host.
+3. turso: its arenas without `MADV_HUGEPAGE`, and their size an option of `DatabaseOpts`. With huge pages an
+   arena's first touch of a 2 MiB range makes all of it resident (the conversation store's 6 MiB were, records.db's
+   2 MB of 6); without, only the pages its page cache and WAL writes use. Up to the 8 MB, less what those use.
+4. hyper-transport: a lane's queue made as it fills (`VecDeque::new`), not at its window: 48 KiB a lane opened.
+
+**The A/B of jemalloc's settings.** Each arm is one environment variable on the build the lab measures, read as
+the server starts, against step 4's settings as compiled in (`os::alloc::JEMALLOC_CONF`), so it needs no rebuild:
+jemalloc's settings as `_RJEM_MALLOC_CONF` (this build's jemalloc is prefixed: it never reads `MALLOC_CONF`, and the
+server's log says so where it's set), and the blocking pool's arena as `KILN_ALLOC_POOL_DECAY_MS`. The arms are
+`os::alloc::ARMS`, whose tests hold each value to its derivation and this table to them:
+
+| Arm | B's environment | Derived from | Moves | Expect |
+| --- | --- | --- | --- | --- |
+| `subsecond-decay` | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500` | twice the realistic profile's slowest sub-second client (MCP calls 250 ms apart; reads 50, pages 100, a turn's events 25): what that work frees waits for its next call, and what attaches and turns free (2.5 to 3 s apart, step 4's basis) goes | `dirty` | about nine tenths of `dirty` off; an attach's snapshot and a turn's packed chunks fault their pages in anew |
+| `pool-subsecond-decay` | `--env-b KILN_ALLOC_POOL_DECAY_MS=500` | the same decay for the blocking pool's arena alone; the shards' arenas keep 5 s, and the pools' workers go cold after it as before | the pool's share of `dirty` | in `subsecond-decay`'s place if that one is worse beyond noise |
+| `slab-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:14336` | jemalloc's largest size cut from a slab with 4 KiB pages (`SC_SMALL_MAXCLASS`): past it each allocation is a run of whole pages, and a thread's cache keeps whole pages a slot (20 of each of 16 to 32 KiB: 2.4 MB a thread that used them) | `thread_caches` | what `thread_caches` holds of 16 to 32 KiB |
+| `page-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:4096` | a page, TUNING.md's memory-first pick: only after `slab-caches`, where `thread_caches` still holds 2 MB or more | `thread_caches` | what it holds of 5 to 14 KiB (20 of each: 1.3 MB a thread) |
+| `one-arena` (a reading) | `--env-b _RJEM_MALLOC_CONF=narenas:1` | the floor of `narenas`: step 4's 5 are the shards and one more | `active - allocated`, and `dirty` kept apart by arena | up to four fifths of the slack; its cost is the shards' waits on one another's arenas |
+| `no-decay` (a reading) | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:0` | the floor of the decay: every free purged at once, on the thread that frees | `dirty` | the floor of `dirty`, and what purging costs a shard's slow polls |
+| `inline-purge` (a reading) | `--env-b _RJEM_MALLOC_CONF=background_thread:false` | step 4's basis for its background threads: without them an arena purges only as it's used | `dirty` (up) | what the background threads purge that the arenas' own ticks don't |
+
+`muzzy_decay_ms` has no arm: 0 by what resident memory counts, which a page given back lazily (`MADV_FREE`) stays in
+until the kernel takes it. A pool's worker goes cold after the decay jemalloc took (`os::alloc::cold_after`), at
+least the 100 ms its background threads sleep at the least, so a decay's arm moves the pools' cold-after with it.
+
+How to run them (the build: production's static musl build with jemalloc; 8 rounds, calm, production's layout):
+
+```sh
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b subsecond-decay --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b pool-subsecond-decay --env-b KILN_ALLOC_POOL_DECAY_MS=500 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b slab-caches --env-b _RJEM_MALLOC_CONF=tcache_max:14336 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b page-caches --env-b _RJEM_MALLOC_CONF=tcache_max:4096 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b one-arena --env-b _RJEM_MALLOC_CONF=narenas:1 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b no-decay --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:0 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b inline-purge --env-b _RJEM_MALLOC_CONF=background_thread:false --server-cpus 16-31 --layout production --rounds 8
+```
+
+In order:
+1. From the first A/B's A rounds, `kiln_memory_allocator_bytes{kind}` at the window's end: `dirty`,
+   `thread_caches`, and `active` less `allocated`. An arm whose part held under 2 MB is skipped.
+2. Each B's server log says what jemalloc took: `jemalloc 5.3 allocates (<settings>: kiln's <step 4's>, then
+   _RJEM_MALLOC_CONF's <the arm>)`, or for `tcache_max` `past kiln's settings, tcache_max:<the arm> (jemalloc's
+   32768)`. A round whose log doesn't say it measured nothing.
+3. A candidate is kept where anonymous memory falls beyond noise and no latency number is worse beyond noise:
+   `subsecond-decay` (or `pool-subsecond-decay` in its place), then `slab-caches` against it, the pick so far on
+   both sides (`--env-a` and `--env-b` both carry it, settings joined by commas), then `page-caches` if it's due.
+4. The readings once each: they say what step 4's settings cost and keep. One that saves beyond noise with no latency
+   number worse beyond noise is a candidate after all, its value the reading's.
+5. The picks together, 8 rounds with hogs (`--hogs 1x`); held there, they go into `os::alloc::JEMALLOC_CONF`,
+   whose test holds the string to what the lab ran.
 
 ## Goal 10: API reads and frames in under a millisecond
 

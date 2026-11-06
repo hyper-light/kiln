@@ -65,7 +65,7 @@ impl Drop for Proc {
 }
 
 /// `cmd` without what it mustn't inherit, in a process group of its own.
-fn clean(mut cmd: Command) -> Command {
+pub(crate) fn clean(mut cmd: Command) -> Command {
     for v in NOT_INHERITED {
         cmd.env_remove(v);
     }
