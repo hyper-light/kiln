@@ -2627,8 +2627,8 @@ server, and a server whose runners are machines of their own); the server's own 
 the machine gives. Its own helpers (git, a render) inherit it. The log says which (`transparent huge pages are off
 for the server's process`, or why they stay). macOS and Windows give no transparent huge pages to turn off.
 
-**The A/B** (one build; `KILN_KEEP_THP=1` keeps them as the machine gives them), 8 rounds calm, production's layout,
-then the same with `--hogs 1x`:
+**The A/B** (one build; `KILN_KEEP_THP=1` kept them as the machine gives them on train 17's build), 8 rounds calm,
+production's layout, then the same with `--hogs 1x`:
 
 ```sh
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a thp --label-b no-thp --env-a KILN_KEEP_THP=1 --server-cpus 16-31 --layout production --rounds 8
@@ -2641,6 +2641,13 @@ move: turso's reads and writes run on its own threads and the blocking pool, and
 TLB reach alone. A round's server (`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host
 the saving is larger and the lab can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and
 after the deploy says it (its kernel makes no huge pages of files: no `READ_ONLY_THP_FOR_FS`, `FileHugePages` 0).
+
+**What it found** (thp17, fedora 2026-11-06 10:59 to 11:43 UTC, train 17's `7faf7aa3163`, the jemalloc build, 8 rounds
+a side interleaved, calm then with 16 hogs; lab-main's report): every round of B said `transparent huge pages are off for
+the server's process`, and its `smaps_rollup` said `AnonHugePages: 0 kB`; A's held 0 to 6 MiB of them (4 MiB the median
+with hogs), all of it turso's advised arenas (`kinds.txt`'s `thp-advised`). B held 3.0 MB (calm) and 3.6 MB (hogs) less
+anonymous memory, within its noise, and no number of kiln-lab's was worse beyond noise, latency included. So huge pages
+stay off, and the switch the A/B ran on (`KILN_KEEP_THP`) is gone from the server.
 
 ### What's resident now, by kind, and what 113 MB takes (step 5, part 6)
 
@@ -2726,7 +2733,8 @@ a build without that layout is the next A/B, two builds, its latency the questio
 **The lab, in order** (each an A/B on one build, 8 rounds calm then 8 with hogs, with `KILN_LAB_HOOK` set to
 `bolt-hook.sh` and `sections.py` and `kinds.py` beside it, so each round writes `kinds.txt`):
 1. Huge pages (above): `--env-a KILN_KEEP_THP=1`. Its proof is `kinds.txt`'s `thp-advised` row, `huge_kb` 4096 on A
-   and 0 on B: 2 to 4 MB is well inside `rss_anon_mb`'s range from round to round (21 MB in g9p16).
+   and 0 on B: 2 to 4 MB is well inside `rss_anon_mb`'s range from round to round (21 MB in g9p16). Done: thp17
+   (above), and the switch is gone.
 2. The arms ("The A/B of jemalloc's settings: the lab plan"): each kind they move held more than that noise in g9p16,
    so all three candidates run, `subsecond-decay` first, then `slab-caches` and `page-caches`, then the readings; the
    arenas' arms where `slab_room` holds more than the noise, a build without the cache-oblivious layout where
