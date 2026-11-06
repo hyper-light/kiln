@@ -1566,14 +1566,14 @@ impl Shard {
     }
 
     /// Whether a step that did work left nothing for the next to find, as the idle step after it would find it
-    /// ([`Shard::run`]): no task ready, those that woke themselves among them, and no input pending as of `last`,
+    /// ([`Shard::run`], `LocalRuntime::block_on`): no task ready, those that woke themselves among them, and no input pending as of `last`,
     /// the step's last reading of the clock (none: the clock now). Then the loop goes on as after an idle step, to
     /// the park: half of a server shard's steps were that idle one, each reading its inputs, its wheel and its
     /// judgments to find nothing (kiln's goal 9, plan 01a1a87b2cec step 5: 44.6 steps to 22.9 parks a request in
     /// kiln's lab, g9p16). What that step left for the park is left here too: its clock, and the driver owed its
     /// look where readiness waits are registered ([`Shard::read_inputs`]). The park announces itself and looks at its
     /// inbox again as it always does, so a wake sent after this look is never lost ([`crate::parking`]).
-    fn left_nothing(&mut self, last: Option<Reading>) -> bool {
+    pub(crate) fn left_nothing(&mut self, last: Option<Reading>) -> bool {
         if !self.core.real_time || self.core.driver_lost || self.core.exited || !self.desk.local.is_empty() {
             return false;
         }

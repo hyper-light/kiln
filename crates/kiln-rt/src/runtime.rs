@@ -950,6 +950,14 @@ impl LocalRuntime {
         // 01a1a87b2cec step 5).
         let mut reading = None;
         loop {
+            let (outcome, last) = self.shard.step_after(reading.take());
+            if outcome.exit {
+                self.shard.context().end_root();
+                self.shard.discard_root_output();
+                return Err(RtError::ShardGone {
+                    shard: self.slot.0.shard(),
+                });
+            }
             if self.shard.context().root_unwound() {
                 // The root's poll unwound inside the shard's boundary and its task ended `Unwound`: no output
                 // will come. What it left running is cancelled and joined as on a return.
@@ -968,15 +976,10 @@ impl LocalRuntime {
                     }
                 });
             }
-            let (outcome, last) = self.shard.step_after(reading.take());
-            if outcome.exit {
-                self.shard.context().end_root();
-                self.shard.discard_root_output();
-                return Err(RtError::ShardGone {
-                    shard: self.slot.0.shard(),
-                });
-            }
-            reading = if outcome.did_work {
+            // A step that did work and left nothing for the next to find goes on to the park, as an idle step would,
+            // with no idle step between (kiln's goal 9, plan 01a1a87b2cec step 5, as `Shard::run`: a net thread's
+            // loop, which every one of kiln's runs on, took two steps a wake).
+            reading = if outcome.did_work && !self.shard.left_nothing(last) {
                 last
             } else {
                 self.shard.park_owned_then(outcome.next_deadline_ns)
