@@ -106,6 +106,14 @@ struct Held {
     segment: usize,
 }
 
+/// Where a turn hands out an event its receives made: after the turn's sends ([`Driver::poll_event`]),
+/// or before them, the caller to make them ([`Driver::poll_received`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandOut {
+    AfterSends,
+    BeforeSends,
+}
+
 /// The kernel's account of a queue, as hyper-transport takes it.
 fn account(charge: QueueCharge) -> Account {
     Account {
@@ -548,27 +556,53 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// arrived, fires the timers due, sends, and hands out the next event, or arms the socket's readiness
     /// and the timer and parks.
     pub fn poll_event(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
+        self.turns(context, HandOut::AfterSends)
+    }
+
+    /// The endpoint's next event, a turn's handed out before that turn's sends, which the caller then
+    /// owes ([`Driver::poll_received`]). Cancel-safe.
+    pub async fn received(&mut self) -> Result<Event<C>, RtError> {
+        poll_fn(|context| self.poll_received(context)).await
+    }
+
+    /// [`Driver::poll_event`] with a turn's events handed out before its sends: each turn takes what
+    /// arrived and fires the timers due, and an event that made goes at once, the turn's sends not yet
+    /// made; a turn that made none sends, and hands out an event its sends made or arms and parks, as
+    /// `poll_event`'s does. For an owner that passes what comes in onward (to another thread) and would
+    /// not have it wait for the turn's sends.
+    ///
+    /// The caller owes those sends: what the turn's receives and timers have the endpoint transmit, the
+    /// acknowledgements due, retransmissions and probes, data a window or the congestion window let go,
+    /// a handshake's next flight. It makes them with [`Driver::flush`] once it has taken the turn's
+    /// events (`endpoint().poll_event()` until none), before it awaits anything else. Until then none
+    /// of them leaves: each moment held is added to the peer's round-trip samples of the packets they
+    /// acknowledge (its smoothed round trip and probe timeout grow, and a hold past that timeout has it
+    /// probe and send again), the peer's congestion window, which these acknowledgements clock, stops
+    /// growing, and this endpoint's own retransmissions wait. A caller that polls again instead has
+    /// them sent only at a turn that makes no event: under a steady stream of events, never.
+    pub fn poll_received(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
+        self.turns(context, HandOut::BeforeSends)
+    }
+
+    /// The turns of [`Driver::poll_event`] and [`Driver::poll_received`], which differ only in where a
+    /// turn hands out an event its receives made (`hand_out`).
+    fn turns(
+        &mut self,
+        context: &mut Context<'_>,
+        hand_out: HandOut,
+    ) -> Poll<Result<Event<C>, RtError>> {
         if let Some(event) = self.endpoint.poll_event() {
             return Poll::Ready(Ok(event));
         }
         for _ in 0..TURNS {
-            if let Err(error) = self.reconcile() {
-                return Poll::Ready(Err(error));
-            }
-            if let Err(error) = self.drain() {
-                return Poll::Ready(Err(error));
-            }
-            let now = match self.now() {
+            let now = match self.receive() {
                 Ok(now) => now,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
-                self.endpoint.handle_timeout(now);
-            }
-            // A connection established in this turn's receives has its socket, and its path's
-            // ceiling, before its first transmission: its first MTU probe is never past the path.
-            if let Err(error) = self.reconcile() {
-                return Poll::Ready(Err(error));
+            if hand_out == HandOut::BeforeSends
+                && let Some(event) = self.endpoint.poll_event()
+            {
+                return Poll::Ready(Ok(event));
             }
             let more = self.send(now);
             if let Some(event) = self.endpoint.poll_event() {
@@ -595,6 +629,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         self.yields = self.yields.saturating_add(1);
         context.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, what arrived
+    /// taken, the timers due fired, and the sockets matched again. Now, for the turn's send half.
+    fn receive(&mut self) -> Result<Instant, RtError> {
+        self.reconcile()?;
+        self.drain()?;
+        let now = self.now()?;
+        if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
+            self.endpoint.handle_timeout(now);
+        }
+        // A connection established in this turn's receives has its socket, and its path's
+        // ceiling, before its first transmission: its first MTU probe is never past the path.
+        self.reconcile()?;
+        Ok(now)
     }
 
     /// Polls the sockets' readiness waits, arming them as needed; whether one fired. The listener's
