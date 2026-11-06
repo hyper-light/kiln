@@ -1707,16 +1707,24 @@ fn nanos(d: Duration) -> u64 {
 
 /// A sleep until a deadline on the shard's timing wheel; under a foreign waker it runs in a
 /// [`Bridge`]. If the runtime refuses the timer it completes rather than hang. `Send + Sync`, so it
-/// also serves as hyper's `Sleep`.
+/// also serves as hyper's `Sleep`. A park its timer ends is counted against where it was asked for
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`; goal 9, plan 01a1a87b2cec step 5).
 pub struct Sleep {
     deadline: Instant,
     native: Option<hyper_rt::futures::Sleep>,
     bridged: Option<Bridge<Result<(), RtError>>>,
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Sleep {
+    #[track_caller]
     pub fn until(deadline: Instant) -> Self {
-        Self { deadline, native: None, bridged: None }
+        Self::until_from(deadline, std::panic::Location::caller())
+    }
+
+    /// [`Sleep::until`] asked for at `site`: a wrapper's, passing its own caller's place on.
+    pub fn until_from(deadline: Instant, site: &'static std::panic::Location<'static>) -> Self {
+        Self { deadline, native: None, bridged: None, site }
     }
 
     fn remaining_ns(&self) -> u64 {
@@ -1735,10 +1743,11 @@ impl Future for Sleep {
             self.bridged = None;
             return Poll::Ready(());
         }
+        let site = self.site;
         if is_native(cx) {
             self.bridged = None;
             let remaining = self.remaining_ns();
-            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep(remaining));
+            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep_from(remaining, site));
             return match Pin::new(sleep).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(_) => Poll::Ready(()),
@@ -1747,7 +1756,7 @@ impl Future for Sleep {
         self.native = None;
         if self.bridged.is_none() {
             let remaining = self.remaining_ns();
-            match Bridge::spawn(hyper_rt::futures::sleep(remaining), cx.waker()) {
+            match Bridge::spawn(hyper_rt::futures::sleep_from(remaining, site), cx.waker()) {
                 Ok(bridge) => self.bridged = Some(bridge),
                 Err(_) => return Poll::Ready(()),
             }
@@ -1762,8 +1771,9 @@ impl Future for Sleep {
     }
 }
 
+#[track_caller]
 pub fn sleep(d: Duration) -> Sleep {
-    Sleep::until(kiln_seams::clock::later(Instant::now(), d))
+    Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), std::panic::Location::caller())
 }
 
 /// Real time, on the runtime's timers, as kiln-seams' [`kiln_seams::Clock`]: what production code
@@ -1788,8 +1798,9 @@ pub fn clock() -> Arc<dyn kiln_seams::Clock> {
     Arc::new(RtClock)
 }
 
+#[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
-    Sleep::until(deadline)
+    Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
 /// The deadline passed before the future finished.
@@ -1896,13 +1907,18 @@ pub async fn each_in_order<T, R, Fut: Future<Output = R>>(items: impl IntoIterat
 }
 
 /// `fut`'s output, or `Err(Elapsed)` once `d` has passed (the future is then dropped). When both are
-/// ready the output wins.
-pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    let fut = pin!(fut);
-    let deadline = pin!(sleep(d));
-    match futures::future::select(fut, deadline).await {
-        futures::future::Either::Left((v, _)) => Ok(v),
-        futures::future::Either::Right(_) => Err(Elapsed),
+/// ready the output wins. Its deadline is counted against the caller's place where it wakes a shard
+/// ([`Sleep`]).
+#[track_caller]
+pub fn timeout<F: Future>(d: Duration, fut: F) -> impl Future<Output = Result<F::Output, Elapsed>> {
+    let site = std::panic::Location::caller();
+    async move {
+        let fut = pin!(fut);
+        let deadline = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+        match futures::future::select(fut, deadline).await {
+            futures::future::Either::Left((v, _)) => Ok(v),
+            futures::future::Either::Right(_) => Err(Elapsed),
+        }
     }
 }
 
@@ -1911,15 +1927,18 @@ pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapse
 pub struct Interval {
     period: Duration,
     next: Instant,
+    /// Where it was made: what its ticks' wakes of a shard are counted against ([`Sleep`]).
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Interval {
+    #[track_caller]
     pub fn new(period: Duration) -> Self {
-        Self { period: period.max(Duration::from_millis(1)), next: Instant::now() }
+        Self { period: period.max(Duration::from_millis(1)), next: Instant::now(), site: std::panic::Location::caller() }
     }
 
     pub async fn tick(&mut self) {
-        sleep_until(self.next).await;
+        Sleep::until_from(self.next, self.site).await;
         let now = Instant::now();
         self.next += self.period;
         if self.next <= now {
@@ -2026,14 +2045,19 @@ impl Shutdown {
         self.0.waits.until(|| self.is_cancelled()).await;
     }
 
-    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first.
-    pub async fn sleep(&self, d: Duration) -> bool {
-        if self.is_cancelled() {
-            return false;
+    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
+    /// against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
         }
-        let cancelled = pin!(self.cancelled());
-        let slept = pin!(sleep(d));
-        matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
     }
 }
 

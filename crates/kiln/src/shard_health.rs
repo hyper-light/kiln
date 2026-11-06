@@ -846,6 +846,35 @@ pub fn render(o: &mut String) {
     render_parks(o, &all.iter().map(|s| (s.parks(), s.wakes().parks)).collect::<Vec<_>>(), &help);
     render_spins(o, &all.iter().map(Shard::spins).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+    render_timer_wakes(o, &help);
+}
+
+/// `kiln_shard_timer_wakes_total{shard,site}`: each shard's parks a timer ended, by where the timer was asked for
+/// (`hyper_rt::timer_sites`: a sleep's, a deadline's or an interval's caller, `file:line:column`; none where no timer
+/// fell due for the wake), read from the shard's table without a lock (goal 9, plan 01a1a87b2cec step 5: what the
+/// shards' timer wakes are, to cut what isn't needed). Their sum is `kiln_shard_wakeups_total{by="timer"}`.
+fn render_timer_wakes(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    // No probes, no runtime asked for (rendering must not start one).
+    if shards().is_empty() {
+        return;
+    }
+    let mut rows: std::collections::BTreeMap<(usize, String), u64> = std::collections::BTreeMap::new();
+    for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
+        for w in hyper_rt::timer_sites::timer_wakes(holder) {
+            let site = w.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            let n = rows.entry((i, site)).or_default();
+            *n = n.saturating_add(w.wakes);
+        }
+    }
+    timer_wakes_series(o, &rows, help);
+}
+
+/// [`render_timer_wakes`]'s family from its rows (each shard and site's wakes).
+fn timer_wakes_series(o: &mut String, rows: &std::collections::BTreeMap<(usize, String), u64>, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_timer_wakes_total", "counter", "Parks a timer ended on each shard, by where the timer was asked for (file:line:column of the sleep, deadline or interval; empty where no timer fell due for the wake): their sum is kiln_shard_wakeups_total by=timer.");
+    for ((i, site), n) in rows {
+        let _ = writeln!(o, "kiln_shard_timer_wakes_total{{shard=\"{i}\",site=\"{}\"}} {n}", escape(site));
+    }
 }
 
 /// The families of what each shard's spin before a park did ([`Spins`]; goal 9, plan 01a1a87b2cec step 4), from `all`,
@@ -1420,6 +1449,26 @@ mod tests {
             anyhow::ensure!(me.runs() == 3 && (s.busy.is_some() || first.is_none()), "three runs noted, with the thread's CPU time: {s:?}");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: each shard's timer wakes are on `/metrics` by the place their timer was asked
+    /// for, a series a shard and site, the wakes no timer fell due for under an empty site.
+    #[test]
+    fn g9_s5_each_shards_timer_wakes_are_on_metrics_by_site() {
+        let rows: std::collections::BTreeMap<(usize, String), u64> =
+            [((0, "crates/kiln/src/hub.rs:10:5".to_owned()), 7), ((0, String::new()), 1), ((2, "crates/kiln-http/src/h2/server.rs:1090:62".to_owned()), 3)].into_iter().collect();
+        let mut o = String::new();
+        timer_wakes_series(&mut o, &rows, &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_timer_wakes_total counter",
+            "kiln_shard_timer_wakes_total{shard=\"0\",site=\"crates/kiln/src/hub.rs:10:5\"} 7",
+            "kiln_shard_timer_wakes_total{shard=\"0\",site=\"\"} 1",
+            "kiln_shard_timer_wakes_total{shard=\"2\",site=\"crates/kiln-http/src/h2/server.rs:1090:62\"} 3",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's arms and socket calls becomes its

@@ -122,7 +122,7 @@ fn hold(span: Duration) {
 /// began; one at 200, after it fell due, at 250.
 #[test]
 fn g9_s5_a_park_ends_for_a_quiet_sleep_no_earlier_than_its_due_time_nor_its_quiet() {
-    let quiet = Quiet { due_ns: 100, quiet_ns: 50, word: 0, came: None };
+    let quiet = Quiet { due_ns: 100, quiet_ns: 50, word: 0, came: None, site: None };
     assert_eq!(deadline(&quiet, 10), 100);
     assert_eq!(deadline(&quiet, 80), 130);
     assert_eq!(deadline(&quiet, 200), 250);
@@ -135,7 +135,7 @@ fn g9_s5_a_park_ends_for_a_quiet_sleep_no_earlier_than_its_due_time_nor_its_quie
 /// lateness and the rest.
 #[test]
 fn g9_s5_a_quiet_sleep_says_how_its_turn_came() {
-    let quiet = Quiet { due_ns: 100, quiet_ns: 50, word: 0, came: None };
+    let quiet = Quiet { due_ns: 100, quiet_ns: 50, word: 0, came: None, site: None };
     let wake = |at_ns, by, waited_ns| Some(Wake { at_ns, by, waited_ns });
     let taken = |last, now_ns| {
         let (came, from_ns) = came(&quiet, last);

@@ -389,6 +389,9 @@ struct Core {
     /// What ended the driver's last blocking wait, as [`Shard::wait_in_driver`] counted it: read once, as the park
     /// notes its wake ([`Shard::note_last_wake`]).
     last_by: Option<crate::quiet::By>,
+    /// A park the wheel's deadline ended, not yet counted against its timer's site: the step after it counts it, by
+    /// the first timer to fall due, or with no site where none had (`crate::timer_sites`).
+    timer_woke: bool,
     /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
@@ -577,6 +580,7 @@ impl Shard {
             last_driver_ns: now_ns,
             harvest_owed: false,
             last_by: None,
+            timer_woke: false,
             real_time: !is_sim,
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
@@ -1421,6 +1425,10 @@ impl Shard {
         }
         let harvests = self.desk.live.harvests.get();
         let mut did_work = self.read_inputs();
+        // A timer's wake whose step fired no timer (a wait that returned before its deadline): counted with no site.
+        if self.core.timer_woke {
+            self.note_timer_wake(None);
+        }
         // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
         // is counted to the second. The first poll starts from the step's reading when the step's drains,
         // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
@@ -2260,12 +2268,27 @@ impl Shard {
             return;
         };
         let by = if by == By::Timer && by_quiet { By::Quiet } else { by };
+        match by {
+            // Counted by the timer that fell due first, as the step after it fires them ([`Shard::expire_timers`]).
+            By::Timer => self.core.timer_woke = true,
+            By::Quiet => self.note_timer_wake(self.desk.quiet.get().and_then(|quiet| quiet.site)),
+            By::Kick | By::Io => {}
+        }
         let waited_ns = match by {
             By::Kick => kick_ns,
             By::Timer | By::Quiet => deadline_ns.map(|deadline| woke.ns.saturating_sub(deadline)),
             By::Io => None,
         };
         self.desk.last_wake.set(Some(crate::quiet::Wake { at_ns: woke.ns, by, waited_ns }));
+    }
+
+    /// Counts a timer's wake of the shard against `site`, where its timer was asked for (none: no timer fell due for
+    /// it), on the shard's table (`crate::timer_sites`; kiln's goal 9, plan 01a1a87b2cec step 5).
+    fn note_timer_wake(&mut self, site: Option<&'static std::panic::Location<'static>>) {
+        self.core.timer_woke = false;
+        if let Some(entry) = self.desk.entry {
+            entry.timer_sites.note(site);
+        }
     }
 
     fn expire_timers(&mut self) -> bool {
@@ -2277,6 +2300,10 @@ impl Shard {
         let mut fired = std::mem::take(&mut self.core.fired);
         self.core.timers.advance(now, &mut fired);
         let any = !fired.is_empty();
+        if self.core.timer_woke && any {
+            let site = fired.first().and_then(|(slot, _)| self.desk.timer(*slot)).and_then(|cell| cell.site.get());
+            self.note_timer_wake(site);
+        }
         for (slot, word) in fired.drain(..) {
             count(&self.desk.live.timers_fired, 1);
             self.wake_word(Encoded::from_word(word));

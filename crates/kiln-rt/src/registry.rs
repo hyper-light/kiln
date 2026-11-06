@@ -128,6 +128,9 @@ pub struct Entry {
     /// The shard's polls past `crate::slow::SLOW_POLL_NS`, by spawn site and label: the shard writes it after
     /// such a poll, any thread reads it (`crate::slow`, kiln's goal 9).
     pub(crate) slow: crate::slow::SlowTable,
+    /// The shard's timer wakes, by where each timer was armed: the shard writes it after a park a timer ended, any
+    /// thread reads it (`crate::timer_sites`, kiln's goal 9).
+    pub(crate) timer_sites: crate::timer_sites::TimerSites,
 }
 
 impl Entry {
@@ -583,6 +586,7 @@ pub(crate) fn register_runtime_slot(
                 .collect(),
             os_thread: AtomicU64::new(0),
             slow: crate::slow::SlowTable::default(),
+            timer_sites: crate::timer_sites::TimerSites::default(),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,
