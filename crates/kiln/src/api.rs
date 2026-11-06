@@ -190,8 +190,9 @@ impl srv::Handler for Api {
             Err(e) => e.into_response(),
         };
         // Boxed as the route is (goal 10, plan 01a1a87b2dae step 5): the layers a request is carried in
-        // hold a pointer to it, not its compressing.
-        let resp = boxed(|| crate::http::compress::finish(asked, resp)).await;
+        // hold a pointer to it, not its compressing. An answer it leaves as it is (a tiny answer to a POST, a
+        // type that doesn't compress, a stream) makes no future (goal 9, plan 01a1a87b2cec step 5).
+        let resp = if crate::http::compress::untouched(&asked, &resp) { resp } else { boxed(|| crate::http::compress::finish(asked, resp)).await };
         // Its compressing counted in what it took, as W21-R15 observed it, for its class and its own timing alike.
         let took = began.elapsed();
         if let Some(class) = class {
