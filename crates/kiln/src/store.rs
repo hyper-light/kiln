@@ -1637,10 +1637,17 @@ impl Store {
     /// Not a job's own pod, which doesn't come back. Read before [`Store::recover`]; how many
     /// return is a deploy's check (`/healthz/server`).
     pub async fn runners_before(&self, within_s: i64) -> anyhow::Result<u64> {
+        Ok(u64::try_from(self.runners_named_before(within_s).await?.len()).unwrap_or(u64::MAX))
+    }
+
+    /// [`Store::runners_before`]'s runners, by name: those that may come back as the server starts, which an attach to
+    /// an agent session it has no copy of yet waits for (`crate::harness::returning`).
+    pub async fn runners_named_before(&self, within_s: i64) -> anyhow::Result<Vec<String>> {
         let since = crate::util::now_unix() - within_s;
         self.read(move |c| {
-            let n: i64 = c.query_row("SELECT COUNT(*) FROM agents WHERE ephemeral = 0 AND (connected = 1 OR last_seen >= ?1)", [since], |r| r.get(0))?;
-            Ok(u64::try_from(n).unwrap_or(0))
+            let mut q = c.prepare("SELECT name FROM agents WHERE ephemeral = 0 AND (connected = 1 OR last_seen >= ?1)")?;
+            let names = q.query_map([since], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
         })
         .await
     }
@@ -3767,6 +3774,10 @@ mod tests {
             s.upsert_agent(runner("asleep-for-hours", false, now - 7_200, false)).await?;
             s.upsert_agent(runner("a-jobs-pod", false, now - 30, true)).await?;
             anyhow::ensure!(s.runners_before(900).await? == 2);
+            // By name, for the attaches that wait for them as the server starts (`crate::harness::returning`).
+            let mut named = s.runners_named_before(900).await?;
+            named.sort();
+            anyhow::ensure!(named == ["gone-at-its-shutdown", "killed-with-its-server"], "{named:?}");
             s.recover().await?;
             anyhow::ensure!(s.runners_before(900).await? == 1, "recovering marks them all gone; read it first");
             anyhow::Ok(())

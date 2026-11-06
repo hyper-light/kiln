@@ -3792,6 +3792,11 @@ impl Hub {
             },
         )
         .await;
+        // One that hosts no agent sessions (no harness: an ephemeral or terminal-less runner) sends no inventory: it's
+        // back holding none, for an attach waiting as the server starts (`crate::harness::returning`).
+        if h.ephemeral || !h.terminal {
+            self.harness.returning.reported(&name, Vec::new());
+        }
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() }).await;
         // Older processes of this machine take no new jobs; what they run, they keep.

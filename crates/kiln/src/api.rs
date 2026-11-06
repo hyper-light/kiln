@@ -7123,6 +7123,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
+    // As the server starts, a session it has no copy of yet may still come back with its runner: the attach waits until
+    // the server can say (`crate::harness::returning`; docs/wire.md, "Restarts"), rather than telling it it's closed.
+    hub.harness.returned(&id).await;
     // What's kept of its files read and its frame made off the shards (`crate::harness::kept::warm`): the attach
     // copies that frame.
     hyper_rt::futures::label(&VIEWER_ATTACH);

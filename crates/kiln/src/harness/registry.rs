@@ -1663,6 +1663,8 @@ pub struct Registry {
     answers: super::answers::Answers,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
+    /// What a viewer's attach waits for while the server starts ([`Registry::returned`]).
+    pub returning: super::returning::Returning,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
     /// there, so no harness ever starts, whatever this machine has installed).
     #[cfg(test)]
@@ -1848,6 +1850,7 @@ impl Registry {
             opened: super::opened::Openings::default(),
             answers: super::answers::Answers::new(WAITING_MAX),
             opening: Rcu::default(),
+            returning: super::returning::Returning::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
         }
@@ -2260,6 +2263,8 @@ impl Registry {
             if let Err(e) = crate::rt::blocking(move || local.restore_from(convo.as_ref())).await {
                 tracing::warn!(error = %format!("{e:#}"), "the server's own agent sessions couldn't be restored");
             }
+            // Each has a copy once this loop takes its Open (below): an attach to one waits for it (`super::returning`).
+            hub.harness.returning.own(hub.harness.local.list().into_iter().map(|i| i.id));
             // The server's own sessions' harness records, followed into its store.
             if let Some(st) = &hub.harness.convo {
                 let local = hub.harness.local.clone();
@@ -2297,6 +2302,8 @@ impl Registry {
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
         }
+        // The store's copies and the server's own sessions are listed: an attach waits no more for that.
+        hub.harness.returning.listed();
         // The server's own sessions' updates, as fast as they come, each to its owner (waited for
         // only while its inbox is full): in bounded turns of the shard.
         let mut turns = crate::rt::Turns::new();
@@ -2720,6 +2727,8 @@ impl Registry {
         let mut hold_for: Option<(String, Option<String>, Option<i64>)> = None;
         // The whole changeset a patch makes, for the store.
         let mut stored_changes: Option<Files> = None;
+        // An Open taken: its copy, published once it's taken, is what an attach may wait for as the server starts.
+        let opened = matches!(u, Update::Open { .. });
         if let Update::Open { info, since } = &u {
             let old = s.get(id);
             // A runner that started again goes on from what this copy has of the same epoch:
@@ -3181,6 +3190,12 @@ impl Registry {
         if let Some(later) = later {
             s.want_frame(id, later);
         }
+        // Its copy on its owner's board now, not as this turn ends: an attach waiting for the session as the server starts
+        // finds it once told (`super::returning`; docs/wire.md, "Restarts").
+        if opened {
+            s.publish_board();
+            self.returning.came();
+        }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
 
@@ -3212,6 +3227,8 @@ impl Registry {
     /// connected (`present`), it is said to be away, as a machine's sessions are when it is.
     pub async fn inventory(&self, hub: &Hub, machine: &str, instance: Option<&str>, present: &[String], inv: Inventory) {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
+        // What it holds, for an attach waiting as the server starts (`super::returning`).
+        self.returning.reported(machine, keep.iter().cloned());
         let (others, away): (std::collections::HashSet<String>, Vec<String>) = match instance {
             Some(me) => {
                 let g = self.holders.load();
@@ -3506,6 +3523,14 @@ impl Registry {
     /// such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
         self.attach_from(id, None, Patches::default(), View::default())
+    }
+
+    /// Back once this server can say whether it has session `id`, which it can't while it starts and the session may
+    /// still come back with its runner (`super::returning`; docs/wire.md, "Restarts"): what an attach waits for before
+    /// it's answered, so one that comes before its runner is back isn't told it's closed. At once in a server up past
+    /// its runners' grace.
+    pub async fn returned(&self, id: &str) {
+        self.returning.wait(id, || self.sessions.slot(id).is_some()).await;
     }
 
     /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`),

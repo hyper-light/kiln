@@ -3739,7 +3739,7 @@ impl Shard {
 
     /// Readers find the sessions as they are now: this shard's board, swapped in whole, when one
     /// came or went.
-    fn publish_board(&mut self) {
+    pub(super) fn publish_board(&mut self) {
         if !std::mem::take(&mut self.board_changed) {
             return;
         }

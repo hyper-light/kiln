@@ -81,7 +81,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
-    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
+    let runners_before = store.runners_named_before(RUNNERS_BEFORE_S).await.unwrap_or_default();
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -128,7 +128,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
     crate::custody::feeds::install(&hub);
-    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    hub.runners_before.store(u64::try_from(runners_before.len()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
+    // Until its agent sessions are listed (`Registry::run_local`, below), and the runners connected before it are back
+    // or past their grace, an attach to a session it has no copy of yet waits for it (`crate::harness::returning`;
+    // docs/wire.md, "Restarts"): armed before any runner's message is taken in. `kiln workflow run`'s own server has
+    // no agent sessions.
+    if !cfg.ci.local {
+        hub.harness.returning.arm(runners_before, hub.started + crate::hub::AGENT_GRACE);
+    }
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;

@@ -481,6 +481,14 @@ any more, and the first `Have` it sends says so. Each stream then starts again a
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
 
+A session the store has none of (the store is off, or no feed had brought any of it yet) has no
+copy until its runner is back and sends it whole. A viewer's attach to such a session waits; it
+isn't told the session is closed. It waits while the store's copies and the server's own sessions
+are still being listed. It also waits while a runner connected just before the start hasn't said
+what it holds, and while one has said it holds that session (its Open is on its way). It waits no
+longer than those runners' grace to come back, the one their jobs get. Once the session's copy is
+there, the viewer gets it as it stands, and the rest of what its runner sends as it comes.
+
 `tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
 every few seconds, watched by four viewers. The lab then:
 - holds one viewer's reading still until it falls behind (a test build's live feeds keep 64
