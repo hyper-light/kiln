@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+use crate::wire::events::{ServerEvent, ShipRows};
 
 pub type Fail = (StatusCode, String);
 
@@ -1419,15 +1420,21 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
 /// The row with `v`: a hash of the JSON it shows (FNV-1a, 64 bits, in hex), the same from memory
 /// and from the store, so the page can keep a row that hasn't changed as it is (W26-R06).
 fn with_version(mut row: Value) -> Value {
+    let v = version_of(&row.to_string());
+    if let Some(o) = row.as_object_mut() {
+        o.insert("v".into(), json!(v));
+    }
+    row
+}
+
+/// FNV-1a, 64 bits, in hex, of `text`: a row's `v` and a detail's `dv`.
+fn version_of(text: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in row.to_string().as_bytes() {
+    for b in text.as_bytes() {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    if let Some(o) = row.as_object_mut() {
-        o.insert("v".into(), json!(format!("{h:016x}")));
-    }
-    row
+    format!("{h:016x}")
 }
 
 /// A commit rendered once for everyone and once for those whose turn it is (when anyone's).
@@ -1438,9 +1445,25 @@ struct Rendered {
     /// Where it stands, and the agent behind it when one is: what the pace line counts.
     stand: journey::Stand,
     agent: Option<String>,
+    /// Its detail's parts and their `dv`, when asked for (`track`): someone reads that detail.
+    tracked: Option<Tracked>,
 }
 
-fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
+/// What a commit's detail shows beyond its row, and its version (`dv`), held for a commit whose
+/// detail a page read (W21-R15): the next refresh says how its parts changed from these.
+#[derive(Debug, Clone, PartialEq)]
+struct Tracked {
+    dv: String,
+    parts: serde_json::Map<String, Value>,
+}
+
+impl Tracked {
+    fn of(parts: serde_json::Map<String, Value>) -> Self {
+        Self { dv: parts_version(&parts), parts }
+    }
+}
+
+fn render(rec: &Records, runners: &[RunnerSeen], now: i64, track: bool) -> Rendered {
     let j = journey_of(rec, runners, now);
     let whose = whose(&j);
     let yours = (!whose.is_empty()).then(|| summary_of(rec, &j, now, true));
@@ -1449,7 +1472,8 @@ fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
         Author::Agent { name, .. } => Some(name.clone()),
         Author::Person(_) => None,
     };
-    Rendered { others: summary_of(rec, &j, now, false), yours, whose, stand, agent }
+    let tracked = track.then(|| Tracked::of(detail_parts(rec, &j, runners)));
+    Rendered { others: summary_of(rec, &j, now, false), yours, whose, stand, agent, tracked }
 }
 
 /// A leg as the detail shows it; `job` and `run` only once it has run (optional new fields).
@@ -1554,10 +1578,62 @@ fn jobs_json(rec: &Records, runners: &[RunnerSeen]) -> Vec<Value> {
         .collect()
 }
 
-/// A commit with every record its stand came from, as `viewer` sees it.
+/// A commit with every record its stand came from, as `viewer` sees it: its row, what the detail
+/// shows beyond it, and `dv`, that part's version (W21-R15: a `ship` frame of the same `dv` changes
+/// only the row's part).
 fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Value {
+    detail_tracked(rec, runners, now, viewer).0
+}
+
+/// [`detail`], and what it shows beyond its row as [`Tracked`].
+fn detail_tracked(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> (Value, Tracked) {
     let j = journey_of(rec, runners, now);
     let mut v = summary_of(rec, &j, now, holds(&whose(&j), viewer));
+    let t = Tracked::of(detail_parts(rec, &j, runners));
+    if let Some(o) = v.as_object_mut() {
+        o.extend(t.parts.clone());
+        o.insert("dv".into(), json!(t.dv));
+    }
+    (v, t)
+}
+
+/// How a detail's parts went from `old` to `new` (W21-R15): the parts that changed, each whole, or,
+/// for a list (its jobs, its checks), its length and the entries that changed, whichever is
+/// shorter. A page holding `old` that lays them over it holds `new`. None when a part went: only
+/// loading it again says that.
+fn parts_delta(old: &serde_json::Map<String, Value>, new: &serde_json::Map<String, Value>) -> Option<(std::collections::BTreeMap<String, Value>, std::collections::BTreeMap<String, crate::wire::events::ShipItems>)> {
+    use crate::wire::events::{ShipItem, ShipItems};
+    if old.keys().any(|k| !new.contains_key(k)) {
+        return None;
+    }
+    let (mut parts, mut items) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+    for (k, v) in new {
+        let was = old.get(k);
+        if was == Some(v) {
+            continue;
+        }
+        if let (Some(Value::Array(a)), Value::Array(b)) = (was, v) {
+            let at: Vec<ShipItem> = b.iter().enumerate().filter(|(i, x)| a.get(*i) != Some(*x)).map(|(i, x)| ShipItem { i, v: x.clone() }).collect();
+            let some = ShipItems { len: b.len(), at };
+            let shorter = serde_json::to_string(&some).map(|t| t.len()).unwrap_or(usize::MAX) < serde_json::to_string(v).map(|t| t.len()).unwrap_or(0);
+            if shorter {
+                items.insert(k.clone(), some);
+                continue;
+            }
+        }
+        parts.insert(k.clone(), v.clone());
+    }
+    Some((parts, items))
+}
+
+/// The version of what a detail shows beyond its row: the same parts, the same `dv`, for every viewer.
+fn parts_version(parts: &serde_json::Map<String, Value>) -> String {
+    version_of(&serde_json::to_string(parts).unwrap_or_default())
+}
+
+/// What a commit's detail shows beyond its row: its review marks, checks, build, deployments,
+/// releases, replant and jobs.
+fn detail_parts(rec: &Records, j: &Journey, runners: &[RunnerSeen]) -> serde_json::Map<String, Value> {
     let checks: Vec<Value> = j
         .checks
         .iter()
@@ -1584,16 +1660,15 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         let at = rec.runs.first().map(|r| r.created_at).unwrap_or_default();
         marks.push(MarkRec { id: format!("push:{}", rec.sha), kind: "push", at, end: Some(at), by: rec.runs.first().map(|r| r.actor.clone()).unwrap_or_default(), revision: None, state: "passed", thread: None, note: None });
     }
-    if let Some(o) = v.as_object_mut() {
-        o.insert("review".into(), json!(marks.iter().map(mark_json).collect::<Vec<_>>()));
-        o.insert("checks".into(), json!(checks));
-        o.insert("build".into(), build);
-        o.insert("deployments".into(), json!(deployments));
-        o.insert("releases".into(), json!(rec.releases.iter().map(|r| json!({ "state": r.state, "message": r.message, "rolled_back": r.rolled_back })).collect::<Vec<_>>()));
-        o.insert("replant".into(), json!(replant));
-        o.insert("jobs".into(), json!(jobs_json(rec, runners)));
-    }
-    v
+    let mut o = serde_json::Map::new();
+    o.insert("review".into(), json!(marks.iter().map(mark_json).collect::<Vec<_>>()));
+    o.insert("checks".into(), json!(checks));
+    o.insert("build".into(), build);
+    o.insert("deployments".into(), json!(deployments));
+    o.insert("releases".into(), json!(rec.releases.iter().map(|r| json!({ "state": r.state, "message": r.message, "rolled_back": r.rolled_back })).collect::<Vec<_>>()));
+    o.insert("replant".into(), json!(replant));
+    o.insert("jobs".into(), json!(jobs_json(rec, runners)));
+    o
 }
 
 /// A repository's commits, newest first, a page at a time (`cursor`: the last page's last
@@ -1630,7 +1705,7 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
     // not on the request's shard.
     let viewer = viewer.cloned();
     let page: Vec<Value> = crate::rt::compute_map(recs.into_iter().take(usize::try_from(limit).unwrap_or(30)).collect(), move |r| {
-        let x = render(&r, &runners, now);
+        let x = render(&r, &runners, now, false);
         if holds(&x.whose, viewer.as_ref()) { x.yours.unwrap_or(x.others) } else { x.others }
     })
     .await
@@ -1723,6 +1798,10 @@ struct Row {
     /// What time moves without a record changing: its guard or its soak runs down. Drawn again at
     /// each refresh, as production's commit is.
     moves: bool,
+    /// Its detail's parts and `dv`, once someone read that detail from memory (W21-R15): from then
+    /// on each row drawn for the commit works them out too, and a `ship` frame says how they
+    /// changed. Unread details cost nothing.
+    tracked: std::sync::OnceLock<Tracked>,
     /// What it holds, in bytes (goal 11, plan 01a1a87b2e56 step 3): its place, its JSON for everyone and
     /// for those whose turn it is, who they are, and its records, counted as large as the JSON for
     /// everyone that renders them.
@@ -1730,23 +1809,50 @@ struct Row {
 }
 
 impl Row {
-    fn of(rec: Records, runners: &[RunnerSeen], now: i64) -> Result<Self, Fail> {
-        let x = render(&rec, runners, now);
+    fn of(rec: Records, runners: &[RunnerSeen], now: i64, track: bool) -> Result<Self, Fail> {
+        let x = render(&rec, runners, now, track);
         let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
         let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
         let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
         let moves = others.contains("\"guard\"") || others.contains("\"soaking\"");
+        let tracked = std::sync::OnceLock::new();
+        if let Some(t) = x.tracked {
+            let _ = tracked.set(t);
+        }
         let whose: usize = x.whose.iter().map(|w| size_of::<String>().saturating_add(w.len())).fold(0, usize::saturating_add);
         let bytes = size_of::<Self>().saturating_add(others.len().saturating_mul(2)).saturating_add(yours.as_ref().map_or(0, String::len)).saturating_add(whose);
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves, bytes })
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves, bytes, tracked })
     }
 
     /// Each commit's row of `items`, drawn on the compute pool, a commit a unit of each piece (goal 3,
     /// plan 01a1a59c2a8e step 5): a render and its JSON each, which drawn on the request's shard held
-    /// every other request on that shard for as long as the drawing took.
-    async fn draw<K: Send + 'static>(items: Vec<(K, Records)>, runners: &[RunnerSeen], now: i64) -> Result<Vec<(K, Row)>, Fail> {
+    /// every other request on that shard for as long as the drawing took. Each says whether its
+    /// detail's `dv` is wanted too.
+    async fn draw<K: Send + 'static>(items: Vec<(K, Records, bool)>, runners: &[RunnerSeen], now: i64) -> Result<Vec<(K, Row)>, Fail> {
         let runners = runners.to_vec();
-        crate::rt::compute_map(items, move |(key, rec)| Row::of(rec, &runners, now).map(|row| (key, row))).await.map_err(internal)?.into_iter().collect()
+        crate::rt::compute_map(items, move |(key, rec, track)| Row::of(rec, &runners, now, track).map(|row| (key, row))).await.map_err(internal)?.into_iter().collect()
+    }
+
+    /// Whether `new`, drawn for the same commit, says anything `self` didn't: its row for anyone,
+    /// or its detail beyond the row where that was followed.
+    fn differs(&self, new: &Row) -> bool {
+        self.others != new.others || self.yours != new.yours || self.whose != new.whose || self.tracked.get().is_some_and(|t| new.tracked.get().map(|n| &n.dv) != Some(&t.dv))
+    }
+
+    /// The row as a `ship` frame carries it, drawn after `was` (the same commit's row before, if
+    /// held): where both followed its detail and that moved, how its parts changed from `was`'s.
+    fn frame(&self, was: Option<&Row>) -> crate::wire::events::ShipRow {
+        let value = |t: &str| serde_json::from_str::<Value>(t).unwrap_or(Value::Null);
+        let mut r = crate::wire::events::ShipRow { row: value(&self.others), yours: self.yours.as_deref().map(value), whose: self.whose.clone(), dv: self.tracked.get().map(|t| t.dv.clone()), ..Default::default() };
+        if let (Some(old), Some(new)) = (was.and_then(|w| w.tracked.get()), self.tracked.get())
+            && old.dv != new.dv
+            && let Some((parts, items)) = parts_delta(&old.parts, &new.parts)
+        {
+            r.base = Some(old.dv.clone());
+            r.parts = parts;
+            r.items = items;
+        }
+        r
     }
 
     fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
@@ -1765,6 +1871,8 @@ struct Held {
     repos: HashMap<String, Arc<HeldRepo>>,
     /// KilnCD's deployments as last read ([`cd_mark`]).
     cd: u64,
+    /// What the pace line counts of each repository (by id), as last drawn ([`pace_mark`]).
+    pace: HashMap<String, String>,
 }
 
 /// What a refresh read from the store, in one snapshot.
@@ -1804,6 +1912,43 @@ impl Default for ShipCache {
 const FRESH_MS: i64 = 250;
 /// The most commits held per repository; older pages come from the store.
 const CAP: usize = 5000;
+
+/// The frame of repository `name` among `said`, made the first time.
+fn said_of<'a>(said: &'a mut HashMap<String, ShipRows>, name: &str) -> &'a mut ShipRows {
+    said.entry(name.to_owned()).or_insert_with(|| ShipRows { repo: name.to_owned(), ..ShipRows::default() })
+}
+
+/// What the pace line counts of one repository ([`ShipCache::pace`]), as text: the line of every
+/// repository in view is made of these, so when none moved, no pace line did.
+fn pace_mark(name: &str, r: &HeldRepo, runners: &[RunnerSeen]) -> String {
+    let (flight, agents, envs, on) = pace_parts(&[(name, r)], runners);
+    json!({ "in_flight": flight, "agents": agents, "envs": envs, "runners": on }).to_string()
+}
+
+/// The pace line's parts for `repos` (by name, in order): the commits in flight, the agents behind
+/// them, what each environment runs, and how many connected runners run the first production commit
+/// any runner runs.
+fn pace_parts<'a>(repos: &[(&str, &'a HeldRepo)], runners: &[RunnerSeen]) -> (usize, std::collections::BTreeSet<&'a str>, Vec<Value>, Value) {
+    let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values().map(|row| &**row)).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
+    let agents: std::collections::BTreeSet<&str> = flight.iter().filter_map(|row| row.agent.as_deref()).collect();
+    let runs = |r: &RunnerSeen, sha: &str| r.commit.as_deref().is_some_and(|c| sha.starts_with(c) || c.starts_with(sha));
+    let mut envs = Vec::new();
+    let mut on = Value::Null;
+    for (name, r) in repos {
+        // Staging before production, as a commit goes.
+        let mut current: Vec<&DeployRec> = r.ctx.current.iter().collect();
+        current.sort_by_key(|d| d.production);
+        for d in current {
+            let behind = d.production.then(|| r.ctx.commits.iter().filter(|(_, f, _)| *f > d.first_row).count());
+            envs.push(json!({ "repo": name, "environment": d.environment, "short": short(&d.sha), "behind": behind }));
+            if d.production && on.is_null() && runners.iter().any(|x| runs(x, &d.sha)) {
+                let live: Vec<&RunnerSeen> = runners.iter().filter(|x| x.connected).collect();
+                on = json!({ "on": live.iter().filter(|x| runs(x, &d.sha)).count(), "of": live.len() });
+            }
+        }
+    }
+    (flight.len(), agents, envs, on)
+}
 
 /// Lets the next refresh start when this one ends, however it ends.
 struct Flight<'a>(&'a std::sync::atomic::AtomicBool);
@@ -1869,10 +2014,16 @@ impl ShipCache {
     /// changed since, the gone dropped. One at a time: while one runs, another returns at once
     /// (its reader gets the model as it is, at most [`FRESH_MS`] old). A failure leaves the last
     /// good model, and the next read tries again.
-    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], deploys: &[CdDeploy], now: i64) -> Result<(), Fail> {
+    ///
+    /// What it changed, a [`ShipRows`] for each repository with rows that read otherwise than
+    /// before (W21-R15): the `ship` frames that let a page take each change in place. Nothing the
+    /// first time (no page has rows from before). None from a refresh that returned at once: the
+    /// one running may have read the store before the change its caller heard of, so a caller that
+    /// must say every change ([`rows_loop`]) tries again.
+    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], deploys: &[CdDeploy], now: i64) -> Result<Option<Vec<ShipRows>>, Fail> {
         use std::sync::atomic::Ordering;
         if self.refreshing.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            return Ok(None);
         }
         let _flight = Flight(&self.refreshing);
         // KilnCD's deployments aren't the store's: when they changed, every commit is read again.
@@ -1883,9 +2034,12 @@ impl ShipCache {
         };
         let deploys = deploys.to_vec();
         let cap = self.cap;
-        let waiting: HashMap<String, Vec<String>> = {
+        // The commits a page has read the detail of: their rows work out its `dv` too.
+        let (waiting, tracked): (HashMap<String, Vec<String>>, HashSet<(String, String)>) = {
             let h = self.held.load();
-            h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, row)| row.rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect()
+            let waiting = h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, row)| row.rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect();
+            let tracked = h.repos.values().flat_map(|r| r.rows.iter().filter(|(_, row)| row.tracked.get().is_some()).map(|(s, _)| (r.ctx.id.clone(), s.clone()))).collect();
+            (waiting, tracked)
         };
         let read = store
             .call(move |c| -> anyhow::Result<Read> {
@@ -1943,7 +2097,10 @@ impl ShipCache {
         let mut items = Vec::new();
         let mut loaded = Vec::with_capacity(read.loaded.len());
         for (i, (ctx, recs, all, drop)) in read.loaded.into_iter().enumerate() {
-            items.extend(recs.into_iter().map(|rec| (i, rec)));
+            items.extend(recs.into_iter().map(|rec| {
+                let track = tracked.contains(&(ctx.id.clone(), rec.sha.clone()));
+                (i, rec, track)
+            }));
             loaded.push((ctx, Vec::new(), all, drop));
         }
         for (i, row) in Row::draw(items, runners, now).await? {
@@ -1956,7 +2113,7 @@ impl ShipCache {
         // from their records as held: the rows a repository's reload doesn't draw afresh.
         let again = {
             let h = self.held.load();
-            let mut again: Vec<((String, String), Records)> = Vec::new();
+            let mut again: Vec<((String, String), Records, bool)> = Vec::new();
             for held in h.repos.values() {
                 let fresh = loaded.iter().find(|(ctx, _, _, _)| ctx.id == held.ctx.id);
                 if fresh.is_some_and(|(_, _, all, _)| *all) {
@@ -1969,7 +2126,7 @@ impl ShipCache {
                         continue;
                     }
                     if prod == Some(sha.as_str()) || row.moves {
-                        again.push(((held.ctx.id.clone(), sha.clone()), row.rec.clone()));
+                        again.push(((held.ctx.id.clone(), sha.clone()), row.rec.clone(), row.tracked.get().is_some()));
                     }
                 }
             }
@@ -1980,47 +2137,94 @@ impl ShipCache {
         // writer swaps one in meanwhile; readers keep the copy they took.
         let mut h = Held::clone(&self.held.get());
         if read.top < h.seq {
-            return Ok(());
+            return Ok(Some(Vec::new()));
         }
-        h.repos.retain(|_, r| !read.gone_repos.contains(&r.ctx.id));
+        // Each repository's frame as it fills, by its name; none the first time.
+        let first = !h.built;
+        let mut said: HashMap<String, ShipRows> = HashMap::new();
+        let gone: Vec<String> = h.repos.iter().filter(|(_, r)| read.gone_repos.contains(&r.ctx.id)).map(|(name, _)| name.clone()).collect();
+        for name in gone {
+            h.repos.remove(&name);
+            said_of(&mut said, &name).whole = true;
+        }
         for (ctx, rows, all, drop) in loaded {
             // A repository renamed: its commits move with it.
             let old = h.repos.iter().find(|(name, r)| r.ctx.id == ctx.id && **name != ctx.name).map(|(name, _)| name.clone());
-            if let Some(r) = old.and_then(|old| h.repos.remove(&old)) {
+            if let Some(old) = old
+                && let Some(r) = h.repos.remove(&old)
+            {
                 h.repos.insert(ctx.name.clone(), r);
+                said_of(&mut said, &old).whole = true;
+                said_of(&mut said, &ctx.name).whole = true;
             }
             let held = Arc::make_mut(h.repos.entry(ctx.name.clone()).or_default());
-            if all {
-                held.rows.clear();
-            }
+            // Read again whole: what it held is what's compared, and what isn't read again is gone.
+            let mut before = if all { std::mem::take(&mut held.rows) } else { HashMap::new() };
+            let mut changed: Vec<crate::wire::events::ShipRow> = Vec::new();
+            let mut went: Vec<String> = Vec::new();
             for sha in drop {
-                held.rows.remove(&sha);
+                if held.rows.remove(&sha).is_some() {
+                    went.push(sha);
+                }
             }
             for (sha, row) in rows {
+                let was = if all { before.remove(&sha) } else { held.rows.remove(&sha) };
+                // The first build sends nothing: no frame is made (each reads its row's JSON again).
+                if !first && was.as_ref().is_none_or(|w| w.differs(&row)) {
+                    changed.push(row.frame(was.as_deref()));
+                }
                 held.rows.insert(sha, Arc::new(row));
             }
+            went.extend(before.into_keys());
             let newest: Vec<(i64, String)> = ctx.commits.iter().take(cap).map(|(s, f, _)| (*f, s.clone())).collect();
             {
                 let keep: std::collections::HashSet<&str> = newest.iter().map(|(_, s)| s.as_str()).collect();
-                held.rows.retain(|sha, _| keep.contains(sha.as_str()));
+                let out: Vec<String> = held.rows.keys().filter(|sha| !keep.contains(sha.as_str())).cloned().collect();
+                for sha in out {
+                    held.rows.remove(&sha);
+                    went.push(sha);
+                }
             }
             held.order = newest.into_iter().filter(|(_, s)| held.rows.contains_key(s)).collect();
             held.total = ctx.commits.len();
             held.ctx = ctx;
+            if !first && (!changed.is_empty() || !went.is_empty()) {
+                let name = held.ctx.name.clone();
+                let f = said_of(&mut said, &name);
+                f.rows.extend(changed);
+                went.sort();
+                went.dedup();
+                f.gone.extend(went);
+            }
         }
         // The rows drawn again, where their commit is still held.
         for ((id, sha), row) in again {
-            if let Some(slot) = h.repos.values_mut().find(|r| r.ctx.id == id).and_then(|r| Arc::make_mut(r).rows.get_mut(&sha)) {
+            if let Some((name, r)) = h.repos.iter_mut().find(|(_, r)| r.ctx.id == id)
+                && let Some(slot) = Arc::make_mut(r).rows.get_mut(&sha)
+            {
+                if !first && slot.differs(&row) {
+                    said_of(&mut said, name).rows.push(row.frame(Some(&**slot)));
+                }
                 *slot = Arc::new(row);
             }
         }
+        // What the pace line counts of each repository: a frame says when it moved.
+        let marks: HashMap<String, (String, String)> = h.repos.iter().map(|(name, r)| (r.ctx.id.clone(), (name.clone(), pace_mark(name, r, runners)))).collect();
+        for (id, (name, mark)) in &marks {
+            if !first && h.pace.get(id) != Some(mark) {
+                said_of(&mut said, name).pace = true;
+            }
+        }
+        h.pace = marks.into_iter().map(|(id, (_, mark))| (id, mark)).collect();
         h.seq = read.top;
         h.built = true;
         h.at_ms = now;
         h.cd = cd;
         self.count(&h);
         self.held.set(h);
-        Ok(())
+        let mut out: Vec<ShipRows> = said.into_values().collect();
+        out.sort_by(|a, b| a.repo.cmp(&b.repo));
+        Ok(Some(out))
     }
 
     /// A page of commits, newest first, from memory: of `repo` (name or id) or every repository,
@@ -2090,27 +2294,10 @@ impl ShipCache {
         if !h.built {
             return None;
         }
-        let mut repos: Vec<(&String, &Arc<HeldRepo>)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        let mut repos: Vec<(&str, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).map(|(n, r)| (n.as_str(), &**r)).collect();
         repos.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values().map(|row| &**row)).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
-        let agents: HashSet<&str> = flight.iter().filter_map(|row| row.agent.as_deref()).collect();
-        let runs = |r: &RunnerSeen, sha: &str| r.commit.as_deref().is_some_and(|c| sha.starts_with(c) || c.starts_with(sha));
-        let mut envs = Vec::new();
-        let mut on = Value::Null;
-        for (name, r) in repos {
-            // Staging before production, as a commit goes.
-            let mut current: Vec<&DeployRec> = r.ctx.current.iter().collect();
-            current.sort_by_key(|d| d.production);
-            for d in current {
-                let behind = d.production.then(|| r.ctx.commits.iter().filter(|(_, f, _)| *f > d.first_row).count());
-                envs.push(json!({ "repo": name, "environment": d.environment, "short": short(&d.sha), "behind": behind }));
-                if d.production && on.is_null() && runners.iter().any(|x| runs(x, &d.sha)) {
-                    let live: Vec<&RunnerSeen> = runners.iter().filter(|x| x.connected).collect();
-                    on = json!({ "on": live.iter().filter(|x| runs(x, &d.sha)).count(), "of": live.len() });
-                }
-            }
-        }
-        Some(json!({ "in_flight": flight.len(), "agents": agents.len(), "envs": envs, "runners": on }))
+        let (flight, agents, envs, on) = pace_parts(&repos, runners);
+        Some(json!({ "in_flight": flight, "agents": agents.len(), "envs": envs, "runners": on }))
     }
 
     /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
@@ -2120,8 +2307,11 @@ impl ShipCache {
             return None;
         }
         let r = h.repos.iter().find(|(name, r)| name.as_str() == repo || r.ctx.id == repo).map(|(_, r)| r)?;
-        let rec = r.rows.get(sha).map(|row| &row.rec).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, row)| &row.rec) } else { None })?;
-        Some(detail(rec, runners, now, viewer))
+        let row = r.rows.get(sha).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, row)| row) } else { None })?;
+        let (v, t) = detail_tracked(&row.rec, runners, now, viewer);
+        // Read: from now on its rows hold its parts, so a `ship` frame says how they change (W21-R15).
+        let _ = row.tracked.set(t);
+        Some(v)
     }
 }
 
@@ -2161,10 +2351,8 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     let c = cache();
     let runners = runners_seen(hub).await;
     let deploys = cd_deploys();
-    if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
-    {
-        tracing::warn!("ship: the read model kept its last good state: {e}");
+    if c.stale(now) {
+        let _ = bring_up(hub, c, &runners, &deploys, now).await;
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(30).clamp(1, 1000);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
@@ -2184,24 +2372,128 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     let held = if heads { c.heads(in_view.as_deref(), &Facets::from_query(q), viewer.as_ref())? } else { c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? };
     match held {
         Some(mut body) => {
-            // The pace line's words go with the page (an optional field).
-            if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok())
-                && body.ends_with('}')
-            {
+            let seen = viewer_json(viewer.as_ref());
+            // The pace line's words go with the page (an optional field), and whom its rows were
+            // picked for.
+            if body.ends_with('}') {
                 body.pop();
-                body.push_str(",\"pace\":");
-                body.push_str(&pace);
+                if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok()) {
+                    body.push_str(",\"pace\":");
+                    body.push_str(&pace);
+                }
+                body.push_str(",\"viewer\":");
+                body.push_str(&seen.to_string());
                 body.push('}');
             }
             Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
         }
         None if heads => {
             let in_view = in_view.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+            // From the store: no `viewer`, so the page loads it again on the next `ship` frame
+            // rather than lay frames, which say what changed of memory, over it.
             Ok(srv::json(StatusCode::OK, &heads_in(&hub.store, q, in_view, viewer.as_ref(), runners, &deploys, now).await?))
         }
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
             Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, &deploys, now).await?))
+        }
+    }
+}
+
+/// Whom a page's rows were picked for (`viewer`, an optional field; W21-R15): the principals a
+/// `ship` frame's `whose` is held against, so the page takes `yours` where the list would. Only on
+/// what memory answered, whose changes the frames say: it marks a page that can take them in
+/// place; a page without it (from the store, or a server that sends no frames) loads again.
+fn viewer_json(viewer: Option<&HashSet<String>>) -> Value {
+    let mut v: Vec<&str> = viewer.into_iter().flatten().map(String::as_str).collect();
+    v.sort_unstable();
+    json!(v)
+}
+
+fn with_viewer(mut v: Value, seen: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("viewer".into(), seen);
+    }
+    v
+}
+
+/// Brings the read model up to date, and sends what changed down the events sockets (W21-R15).
+/// False when another refresh was running ([`ShipCache::refresh`]'s None).
+async fn bring_up(hub: &Hub, c: &ShipCache, runners: &[RunnerSeen], deploys: &[CdDeploy], now: i64) -> bool {
+    match c.refresh(&hub.store, runners, deploys, now).await {
+        Ok(Some(changed)) => {
+            for rows in changed {
+                hub.emit(&ServerEvent::Ship(Box::new(rows)));
+            }
+            true
+        }
+        Ok(None) => false,
+        Err((_, e)) => {
+            tracing::warn!("ship: the read model kept its last good state: {e}");
+            true
+        }
+    }
+}
+
+/// The events a Ship page used to load its lists again on (`ui/src/views/ship`): each says a
+/// record a row shows may have changed, so the read model is brought up to date and what changed
+/// goes down as `ship` frames.
+const MOVES_ROWS: [&str; 9] = ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"];
+
+/// Whether an events frame is one of [`MOVES_ROWS`]: each frame's text begins with its tag.
+fn moves_rows(text: &str) -> bool {
+    text.strip_prefix("{\"type\":\"").and_then(|t| t.split_once('"')).is_some_and(|(tag, _)| MOVES_ROWS.contains(&tag))
+}
+
+/// Ship's rows as they change (W21-R15): after a frame that may move one, once the model has been
+/// built (a page read it) and while any page listens, the model is brought up to date and its
+/// changes sent. A burst is one refresh: what comes within [`FRESH_MS`] of the first frame goes
+/// with it, the freshness a read already promises, and the window the page applies frames in
+/// (`APPLY_MS` in `ui/src/lib/resource.ts`).
+pub async fn rows_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    // A listener of the hub's events' lane (`Hub::subscribe_events`; goal 4, plan 01a1a59c2a9c step 5).
+    let mut rx = hub.subscribe_events()?;
+    let window = std::time::Duration::from_millis(u64::try_from(FRESH_MS).unwrap_or(250));
+    loop {
+        let heard = futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            m = rx.recv().fuse() => match m {
+                Ok(text) => moves_rows(&text),
+                Err(async_broadcast::RecvError::Overflowed(_)) => true,
+                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            },
+        };
+        if !heard {
+            continue;
+        }
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = crate::rt::sleep(window).fuse() => {}
+        }
+        // What came meanwhile is in the refresh already.
+        loop {
+            match rx.try_recv() {
+                Ok(_) | Err(async_broadcast::TryRecvError::Overflowed(_)) => {}
+                Err(async_broadcast::TryRecvError::Empty) => break,
+                Err(async_broadcast::TryRecvError::Closed) => return Ok(()),
+            }
+        }
+        let c = cache();
+        if !c.built() || crate::metrics::global().ws_clients.get() <= 0 {
+            continue;
+        }
+        // Another refresh running may have read the store before what was heard: once it's done
+        // (it takes no longer than a page's read waits for it), this one, so no change goes unsaid.
+        loop {
+            let runners = runners_seen(&hub).await;
+            if bring_up(&hub, c, &runners, &cd_deploys(), crate::util::now_ms()).await {
+                break;
+            }
+            futures::select_biased! {
+                () = hub.shutdown.cancelled().fuse() => return Ok(()),
+                () = crate::rt::sleep(window).fuse() => {}
+            }
         }
     }
 }
@@ -2243,17 +2535,16 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     let c = cache();
     let runners = runners_seen(hub).await;
     let deploys = cd_deploys();
-    if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
-    {
-        tracing::warn!("ship: the read model kept its last good state: {e}");
+    if c.stale(now) {
+        let _ = bring_up(hub, c, &runners, &deploys, now).await;
     }
     let viewer = match caller {
         Some(c) => Some(principals(hub, c).await),
         None => None,
     };
+    // From memory, its `viewer` (W21-R15: `ship` frames say how it changes); from the store, none.
     let v = match c.detail(repo, sha, &runners, now, viewer.as_ref()) {
-        Some(v) => v,
+        Some(v) => with_viewer(v, viewer_json(viewer.as_ref())),
         None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, &deploys, now).await?,
     };
     if !visible(&v, only.as_deref()) {
@@ -3407,6 +3698,179 @@ mod tests {
         })
     }
 
+    /// W21-R15: the `ship` frames a refresh sends carry every change a page shows. Through random
+    /// changes to every table the model reads, a page held from before with each frame's rows put in
+    /// place (by sha, newest first; `yours` where the viewer holds `whose`) and its `gone` taken out
+    /// is the page memory serves after, for a viewer in a change's turn, one out of it and none; the
+    /// pace line moved only where a frame says so; and a detail read before is the detail after
+    /// with its frame's row laid over it when the frame's `dv` is its own, else a frame names it.
+    #[test]
+    fn w21_r15_ship_frames_carry_every_change_a_page_shows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::new();
+            let mut now = NOW_S * 1000;
+            let first = cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(first, Some(Vec::new()), "the first build sends nothing: no page has rows from before it");
+            const REPO: &str = "hyper-light/kiln";
+            let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string(), "github:kim".to_string()].into(), ["user:sam".to_string()].into());
+            let viewers = [None, Some(&kim), Some(&sam)];
+            let rows_of = |cache: &ShipCache, viewer: Option<&HashSet<String>>| -> anyhow::Result<Vec<Value>> {
+                let page = cache.page(Some(REPO), None, &Facets::default(), viewer, i64::MAX, 1000).map_err(|(_, m)| anyhow::anyhow!(m))?.ok_or_else(|| anyhow::anyhow!("memory holds every commit"))?;
+                Ok(serde_json::from_str::<Value>(&page)?.get("commits").and_then(Value::as_array).cloned().unwrap_or_default())
+            };
+            let sha_of = |v: &Value| v.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let pick = |r: &crate::wire::events::ShipRow, viewer: Option<&HashSet<String>>| match &r.yours {
+                Some(y) if holds(&r.whose, viewer) => y.clone(),
+                _ => r.row.clone(),
+            };
+            let details = |cache: &ShipCache, rows: &[Value], viewer: Option<&HashSet<String>>, now: i64| -> HashMap<String, Value> { rows.iter().filter_map(|c| cache.detail(REPO, &sha_of(c), &runners(), now, viewer).map(|d| (sha_of(c), d))).collect() };
+            let mut held: Vec<(Vec<Value>, HashMap<String, Value>)> = Vec::new();
+            for v in viewers {
+                let rows = rows_of(&cache, v)?;
+                let d = details(&cache, &rows, v, now);
+                held.push((rows, d));
+            }
+            let mut pace = cache.pace(Some(REPO), None, &runners());
+            let shas = [C1, C2, C3, "4444444ddddddddddddddddddddddddddddddddd", "5555555eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "6666666fffffffffffffffffffffffffffffffff", "8888888999999999999999999999999999999999"];
+            let mut seed: u64 = 0x00dd_ba11;
+            let mut next = move |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n.max(1)
+            };
+            let (mut sent, mut patched, mut moved, mut reread) = (0usize, 0usize, 0usize, 0usize);
+            for round in 0..80u64 {
+                for k in 0..3 {
+                    let sha = shas.get(usize::try_from(next(7)).unwrap_or(0)).copied().unwrap_or(C1);
+                    let sql = ops(1000 + round * 3 + k, next(33), sha);
+                    store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+                }
+                now += FRESH_MS;
+                let frames = cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?.ok_or_else(|| anyhow::anyhow!("one refresh at a time: none was running"))?;
+                let frame = frames.iter().find(|f| f.repo == REPO);
+                assert!(frames.iter().all(|f| f.repo == REPO && !f.whole), "round {round}: one repository, never renamed: {frames:?}");
+                sent += frame.map_or(0, |f| f.rows.len());
+                for f in &frames {
+                    let mut seen = HashSet::new();
+                    assert!(f.rows.iter().all(|r| seen.insert(sha_of(&r.row))), "round {round}: a row twice in one frame");
+                }
+                let now_pace = cache.pace(Some(REPO), None, &runners());
+                assert!(now_pace == pace || frame.is_some_and(|f| f.pace), "round {round}: the pace line moved without a frame saying so: {pace:?} → {now_pace:?}");
+                pace = now_pace;
+                for (v, (rows, ds)) in viewers.iter().zip(held.iter_mut()) {
+                    let mut got: Vec<Value> = rows.clone();
+                    if let Some(f) = frame {
+                        got.retain(|c| !f.gone.contains(&sha_of(c)));
+                        for r in &f.rows {
+                            let row = pick(r, *v);
+                            match got.iter_mut().find(|c| sha_of(c) == sha_of(&row)) {
+                                Some(slot) => *slot = row,
+                                None => got.push(row),
+                            }
+                        }
+                        got.sort_by_key(|c| std::cmp::Reverse(c.get("cursor").and_then(Value::as_i64).unwrap_or(0)));
+                    }
+                    let want = rows_of(&cache, *v)?;
+                    assert_eq!(got, want, "round {round}: the page held, with the frames put in place, isn't the page after, for {v:?}");
+                    *rows = want;
+                    // Each detail read before: unchanged, or its frame laid over it (its row, and its
+                    // parts where they moved from its `dv`), or named to be read again.
+                    for (sha, before) in ds.iter() {
+                        let Some(after) = cache.detail(REPO, sha, &runners(), now, *v) else { continue };
+                        let named = frame.and_then(|f| f.rows.iter().find(|r| sha_of(&r.row) == *sha));
+                        let was = before.get("dv").and_then(Value::as_str);
+                        match named {
+                            None => assert_eq!(&after, before, "round {round}: {sha}'s detail changed with no frame naming it, for {v:?}"),
+                            Some(r) if r.dv.is_some() && (r.dv.as_deref() == was || r.base.as_deref() == was) => {
+                                let mut laid = before.clone();
+                                if let (Some(o), Value::Object(row)) = (laid.as_object_mut(), pick(r, *v)) {
+                                    o.extend(row);
+                                    if r.dv.as_deref() != was {
+                                        moved += 1;
+                                        o.extend(r.parts.clone());
+                                        for (k, it) in &r.items {
+                                            let mut list = o.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+                                            list.resize(it.len, Value::Null);
+                                            for x in &it.at {
+                                                if let Some(slot) = list.get_mut(x.i) {
+                                                    *slot = x.v.clone();
+                                                }
+                                            }
+                                            o.insert(k.clone(), Value::Array(list));
+                                        }
+                                        o.insert("dv".into(), json!(r.dv));
+                                    }
+                                }
+                                assert_eq!(after, laid, "round {round}: {sha}'s detail isn't its frame laid over the detail before, for {v:?}");
+                                patched += 1;
+                            }
+                            Some(_) => reread += 1,
+                        }
+                    }
+                    *ds = details(&cache, rows, *v, now);
+                }
+            }
+            println!("ship frames: {sent} rows sent; details patched {patched} times ({moved} with their parts), read again {reread}");
+            assert!(sent >= 40 && moved > 0 && patched > reread, "the changes reached too little: {sent} rows, {patched} patched ({moved} with parts), {reread} read again");
+            Ok(())
+        })
+    }
+
+    /// W21-R15: a commit gone from memory is in its frame's `gone`, and a row that reads as it did
+    /// isn't sent: a refresh with nothing changed sends nothing.
+    #[test]
+    fn w21_r15_ship_frames_say_what_went_and_skip_what_holds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let cache = ShipCache::with_cap(3);
+            let now = NOW_S * 1000;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let quiet = cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(quiet, Some(Vec::new()), "nothing changed, nothing sent");
+            // A newer commit: memory holds three, so the oldest goes.
+            let sql = format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES ('r9', 'kiln', 9, 'ci', 'push', 'main', '9999999{z}', 'newest', 'ada', 'queued', {NOW_S}, 1);", z = "a".repeat(33));
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let frames = cache.refresh(&store, &runners(), &[], now + 2 * FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?.unwrap_or_default();
+            let f = frames.first().ok_or_else(|| anyhow::anyhow!("a frame for the new commit"))?;
+            assert_eq!(f.repo, "hyper-light/kiln");
+            assert!(f.rows.iter().any(|r| r.row.get("message").and_then(Value::as_str) == Some("newest")), "{f:?}");
+            assert_eq!(f.gone, vec![C1.to_string()], "the oldest of the four is no longer held");
+            // Its event frame, as the socket sends it.
+            let text = ServerEvent::Ship(Box::new(f.clone())).text();
+            assert!(text.starts_with("{\"type\":\"ship\",\"repo\":\"hyper-light/kiln\""), "{text}");
+            assert!(moves_rows("{\"type\":\"job\",\"job\":{}}") && moves_rows("{\"type\":\"cd_apps\",\"apps\":[]}") && !moves_rows(&text) && !moves_rows("{\"type\":\"harness\"}"));
+            Ok(())
+        })
+    }
+
+    /// W21-R15: a detail's parts that moved go as the entries of a list that changed, or the part
+    /// whole where that's shorter; a part gone can't be said, so it isn't.
+    #[test]
+    fn w21_r15_parts_delta_says_entries_or_wholes() -> anyhow::Result<()> {
+        let map = |v: Value| v.as_object().cloned().unwrap_or_default();
+        let jobs = |n: usize, moved: usize| (0..n).map(|i| json!({ "id": format!("job-{i}"), "verbs": if i == moved { json!(["cancel"]) } else { json!(["retry"]) } })).collect::<Vec<_>>();
+        let old = map(json!({ "jobs": jobs(12, 99), "build": { "image": "a" }, "review": [] }));
+        let new = map(json!({ "jobs": jobs(13, 4), "build": { "image": "b" }, "review": [] }));
+        let (parts, items) = parts_delta(&old, &new).ok_or_else(|| anyhow::anyhow!("every part is still there"))?;
+        assert_eq!(parts.keys().collect::<Vec<_>>(), ["build"], "an object goes whole; what didn't move doesn't go");
+        let it = items.get("jobs");
+        assert_eq!(it.map(|i| (i.len, i.at.iter().map(|x| x.i).collect::<Vec<_>>())), Some((13, vec![4, 12])), "the entry that moved and the one that came");
+        // Every entry moved: the list whole is shorter than its entries with their places.
+        let all = map(json!({ "jobs": (0..12).map(|i| json!(i)).collect::<Vec<_>>() }));
+        let shifted = map(json!({ "jobs": (1..13).map(|i| json!(i)).collect::<Vec<_>>() }));
+        assert!(parts_delta(&all, &shifted).is_some_and(|(p, i)| p.contains_key("jobs") && i.is_empty()));
+        assert!(parts_delta(&old, &map(json!({ "jobs": [] }))).is_none(), "a part gone");
+        Ok(())
+    }
+
     /// Refreshes run one at a time and the change applied never goes back, with writes between
     /// and refreshes side by side; memory still says what the store says.
     #[test]
@@ -3655,7 +4119,7 @@ mod tests {
             anyhow::ensure!(recs.len() == 1000, "{} commits held", recs.len());
             let t = std::time::Instant::now();
             for rec in recs {
-                Row::of(rec, &runners(), now).map_err(|(_, m)| anyhow::anyhow!(m))?;
+                Row::of(rec, &runners(), now, false).map_err(|(_, m)| anyhow::anyhow!(m))?;
             }
             let draw = t.elapsed();
             anyhow::ensure!(longest * 5 < draw, "the refresh held its thread {longest:?} in one poll; drawing the rows takes {draw:?}");

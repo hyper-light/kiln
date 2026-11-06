@@ -3,7 +3,7 @@
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
 import { useState } from "react";
-import type { FileDiff, FilePlace, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
+import type { FileDiff, FilePlace, HEvent, HeldLines, Task, ToolCall, ToolKind } from "@/api/harness";
 import { isShowPage } from "./page-of";
 import { isShowLive } from "./live-of";
 
@@ -309,15 +309,22 @@ export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
   return out;
 }
 
-export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: number; del: number } {
+export function diffStats(diffs: (Pick<FileDiff, "hunks"> & Partial<HeldLines>)[] | undefined): { add: number; del: number } {
   let add = 0;
   let del = 0;
-  for (const d of diffs ?? [])
+  for (const d of diffs ?? []) {
+    // A lean call's diff (docs/wire.md, "Windows"): its lines held back, their counts said.
+    if (d.hunks.length === 0 && (d.add !== undefined || d.del !== undefined)) {
+      add += d.add ?? 0;
+      del += d.del ?? 0;
+      continue;
+    }
     for (const h of d.hunks)
       for (const l of h.lines) {
         if (l.startsWith("+")) add++;
         else if (l.startsWith("-")) del++;
       }
+  }
   return { add, del };
 }
 

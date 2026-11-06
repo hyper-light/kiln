@@ -181,7 +181,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 
   // Live: this app's status or its rollout changed, so read it again (at most twice a second).
   const soon = React.useRef<number | null>(null);
-  useServerEvents((ev) => {
+  useServerEvents(["cd_apps", "cd_rollout", "cd_app_deleted"], (ev) => {
     const mine = (ev.type === "cd_apps" && ev.apps.some((x) => x.app === id)) || (ev.type === "cd_rollout" && ev.app === id);
     if (mine && soon.current === null) {
       soon.current = window.setTimeout(() => {
