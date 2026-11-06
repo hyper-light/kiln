@@ -1239,12 +1239,114 @@ where
     R: Send + 'static,
 {
     rt()?;
-    let (tx, rx) = futures::channel::oneshot::channel::<R>();
+    let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
+    // Handed over from a shard: its round trip, past the job's own run, is what work kept on a shard is weighed against
+    // ([`POOL_TRIP`], [`here`]; consts-audit B1).
+    let handed = on_shard().then(Instant::now);
     let job = move || {
-        let _ = tx.send(f());
+        let began = Instant::now();
+        let out = f();
+        let _ = tx.send((out, nanos_since(began)));
     };
     to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let (out, ran_ns) = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))?;
+    if let Some(handed) = handed {
+        POOL_TRIP.learn(nanos_since(handed).saturating_sub(ran_ns));
+    }
+    Ok(out)
+}
+
+/// Whole nanoseconds since `t`.
+fn nanos_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
+/// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
+/// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
+/// trip ([`POOL_TRIP`]), every session copy's quiet gaps (`crate::harness::copies`).
+pub struct Smoothed {
+    mean: AtomicU64,
+    dev: AtomicU64,
+    learned: AtomicBool,
+}
+
+impl Smoothed {
+    /// A [`Smoothed`] with nothing learned.
+    pub const fn nothing_yet() -> Self {
+        Self { mean: AtomicU64::new(0), dev: AtomicU64::new(0), learned: AtomicBool::new(false) }
+    }
+
+    /// Its mean, nanoseconds: none until a sample was learned.
+    pub fn mean(&self) -> Option<u64> {
+        self.learned.load(Ordering::Relaxed).then(|| self.mean.load(Ordering::Relaxed))
+    }
+
+    /// Its variation, nanoseconds: 0 until a sample was learned.
+    pub fn dev(&self) -> u64 {
+        self.dev.load(Ordering::Relaxed)
+    }
+
+    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none until a sample was
+    /// learned.
+    pub fn bound(&self) -> Option<u64> {
+        self.mean().map(|mean| mean.saturating_add(self.dev().saturating_mul(4)))
+    }
+
+    /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
+    /// it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8.
+    pub fn learn(&self, took: u64) {
+        let (mean, dev) = if self.learned.load(Ordering::Relaxed) {
+            let (mean, dev) = (self.mean.load(Ordering::Relaxed), self.dev.load(Ordering::Relaxed));
+            ((mean - mean / 8).saturating_add(took / 8), (dev - dev / 4).saturating_add(took.abs_diff(mean) / 4))
+        } else {
+            (took, took / 2)
+        };
+        self.mean.store(mean, Ordering::Relaxed);
+        self.dev.store(dev, Ordering::Relaxed);
+        self.learned.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
+/// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
+/// smoothed ([`Smoothed`]). Learned from every job a task on a shard hands the pool; what [`here`] weighs work kept on a
+/// shard against (consts-audit B1: that was a slow poll, `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the pool's
+/// round trip was).
+pub static POOL_TRIP: Smoothed = Smoothed::nothing_yet();
+
+/// The two sides work may be done on, as where it's asked weighs them ([`Sides::take_here`]; consts-audit B1, goal 9, plan
+/// 01a1a87b2cec step 3): the shard's quantum, the most one poll may hold it (none off a shard, where work is done where it
+/// is), and the compute pool's round trip as the shards learned it ([`POOL_TRIP`]; none until learned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sides {
+    pub quantum_ns: Option<u64>,
+    pub trip_ns: Option<u64>,
+}
+
+impl Sides {
+    /// Where it's asked: the calling shard's quantum (`hyper_rt::futures::step_budget_ns`) and the pool's learned round trip.
+    pub fn here() -> Self {
+        Self { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: POOL_TRIP.mean() }
+    }
+
+    /// Whether work expected to take `expected_ns` where it's asked, `bound_ns` at the most, is done there rather than
+    /// handed to the compute pool. Off a shard, always. On one, only where it fits a turn, its bound within the quantum (no
+    /// poll past it: goal 9 step 3), and within that where it's no dearer than the pool's round trip: the cheaper side does
+    /// it. Work past the quantum goes to the pool however long the pool's round trip (or its caller cuts it in pieces), so
+    /// a loaded pool keeps no long poll on a shard. Work expected to cost nothing (nothing learned of it yet, which its
+    /// caller learns as it does it) is done where it's asked; with nothing learned of the pool, other work goes there,
+    /// whose first job teaches it. Whether it fits what's left of the turn is the caller's [`Turns`], which gives the shard
+    /// up first where it doesn't.
+    pub fn take_here(&self, expected_ns: u64, bound_ns: u64) -> bool {
+        let Some(quantum) = self.quantum_ns else { return true };
+        bound_ns <= quantum && (expected_ns == 0 || self.trip_ns.is_some_and(|trip| expected_ns <= trip))
+    }
+}
+
+/// [`Sides::take_here`] where it's asked ([`Sides::here`]).
+pub fn here(expected_ns: u64, bound_ns: u64) -> bool {
+    Sides::here().take_here(expected_ns, bound_ns)
 }
 
 /// Run a job in pieces on the compute pool: `step` is called with `state` and its piece's [`Turn`]
@@ -3373,6 +3475,55 @@ mod tests {
             });
             timeout(Duration::from_secs(5), next).await?;
             timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
+            Ok(())
+        })
+    }
+
+    /// Consts-audit B1 (goal 9, plan 01a1a87b2cec step 3): work stays on its shard only where it fits a turn (the quantum) and
+    /// is no dearer than the compute pool's round trip as learned, with no fixed bound (it was a slow poll, 100 µs). Do: weigh
+    /// 50 µs of work against a round trip learned from a fast pool (20 µs samples), then from a slow one (a millisecond's),
+    /// and back; weigh work past the quantum against a round trip longer still (10 ms, a loaded host's); weigh work nothing's
+    /// been learned of, and work against a pool nothing's been learned of; check RFC 6298's arithmetic; hand a job to the pool
+    /// from a shard. Expect: the fast pool takes the 50 µs, the slow one leaves it on the shard; work past the quantum goes to
+    /// the pool however long its round trip; work expected to cost nothing stays, other work goes to a pool nothing's been
+    /// learned of, whose first job teaches it; off a shard work stays where it is.
+    #[test]
+    fn b1_work_stays_on_its_shard_only_within_the_quantum_and_where_its_cheaper() -> anyhow::Result<()> {
+        const QUANTUM: u64 = 266_666;
+        let trip = Smoothed::nothing_yet();
+        let sides = |trip: &Smoothed| Sides { quantum_ns: Some(QUANTUM), trip_ns: trip.mean() };
+        anyhow::ensure!(trip.mean().is_none() && !sides(&trip).take_here(1, 1), "nothing learned of the pool: there, which teaches it");
+        anyhow::ensure!(sides(&trip).take_here(0, 0), "nothing expected of the work: where it is, which learns it");
+        // RFC 6298's arithmetic: 40 µs, then 8 µs. The first sets the mean and half of it the variation; then the variation
+        // 20 − 20/4 + |8 − 40|/4 = 23 µs, and the mean 40 − 40/8 + 8/8 = 36 µs.
+        trip.learn(40_000);
+        anyhow::ensure!(trip.mean() == Some(40_000) && trip.dev() == 20_000, "the first: {:?}, {}", trip.mean(), trip.dev());
+        trip.learn(8_000);
+        anyhow::ensure!(trip.mean() == Some(36_000) && trip.dev() == 23_000, "the second: {:?}, {}", trip.mean(), trip.dev());
+        // A fast pool takes 50 µs of work; a slow one leaves it on the shard, and moving back, takes it again.
+        for _ in 0..32 {
+            trip.learn(20_000);
+        }
+        let fast = sides(&trip);
+        anyhow::ensure!(!fast.take_here(50_000, 50_000) && fast.take_here(20_000, 20_000), "against a fast pool ({fast:?}): 50 µs goes there, 20 µs stays");
+        for _ in 0..32 {
+            trip.learn(1_000_000);
+        }
+        let slow = sides(&trip);
+        anyhow::ensure!(slow.take_here(50_000, 50_000), "against a slow pool ({slow:?}): 50 µs stays");
+        // Within the quantum the cheaper side does it; past it, the pool, however long its round trip.
+        anyhow::ensure!(slow.take_here(200_000, QUANTUM) && !slow.take_here(200_000, QUANTUM + 1), "a bound past the quantum goes to the pool: {slow:?}");
+        let loaded = Sides { quantum_ns: Some(QUANTUM), trip_ns: Some(10_000_000) };
+        anyhow::ensure!(!loaded.take_here(1_900_000, 1_900_000), "1.9 ms of work against a 10 ms round trip: the pool, never a poll past the quantum");
+        anyhow::ensure!(loaded.take_here(100_000, 150_000), "100 µs, 150 µs at the most, against a 10 ms round trip: the shard");
+        for _ in 0..32 {
+            trip.learn(20_000);
+        }
+        anyhow::ensure!(!sides(&trip).take_here(50_000, 50_000), "fast again ({:?}): 50 µs goes there", sides(&trip));
+        anyhow::ensure!(Sides { quantum_ns: None, trip_ns: None }.take_here(u64::MAX, u64::MAX), "off a shard: where it is, whatever it costs");
+        block_on(async {
+            compute(|| ()).await?;
+            anyhow::ensure!(POOL_TRIP.mean().is_some(), "a job handed to the pool from a shard taught its round trip");
             Ok(())
         })
     }
