@@ -184,6 +184,12 @@ export class Client {
     this.subscribeFrom(sub, topic, null, credit, new TopicState());
   }
 
+  /** Subscribes from a cursor a page already has (another tab's, the shared socket's owner having
+   * changed: goal 3's `shared.ts`): resumed, no snapshot, while the server's log still holds it. */
+  subscribeAt(sub: number, topic: Topic, cursor: Cursor, credit = 0): void {
+    this.subscribeFrom(sub, topic, cursor, credit, new TopicState());
+  }
+
   private subscribeFrom(sub: number, topic: Topic, cursor: Cursor | null, credit: number, state: TopicState): void {
     this.subs.set(sub, { topic, cursor, rev: cursor?.rev ?? 0, born: cursor?.born ?? 0, starting: false, waiting: true, aliases: [], tail: null, credit, received: 0, state, ended: false });
     this.queue({ kind: "Subscribe", body: { sub, topic, cursor, credit } });
@@ -218,10 +224,12 @@ export class Client {
     this.phase = "closed";
   }
 
-  /** The bytes that came (plain: compressed batches already inflated by `Unpacker`), at `now`. */
-  receive(bytes: Uint8Array, now: number): void {
+  /** The bytes that came (plain: compressed batches already inflated by `Unpacker`), at `now`. `wire`:
+   * the bytes they came as on the carrier, which `got` (what the page says it has, in idle frames and
+   * probes' answers) counts, so a server's window over the bytes it sent isn't thrown by inflation. */
+  receive(bytes: Uint8Array, now: number, wire = bytes.length): void {
     if (bytes.length === 0) return;
-    this.got += bytes.length;
+    this.got += wire;
     this.live.arrived(now);
     const frames = new Frames(bytes);
     for (let raw = frames.nextRaw(); raw !== null; raw = frames.nextRaw()) {
