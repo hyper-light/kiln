@@ -964,6 +964,26 @@ textarea.hx-input {
   margin-bottom: 4px;
   font-size: 11px;
 }
+/* On a phone the attachments take a row of their own under the head, so the head's words keep
+   their room and the menu stays at its end; each part of the head stays whole ("being worked on"
+   never breaks over two lines), and only the attachments' names shorten, with an ellipsis. */
+@media (max-width: 560px) {
+  .hx-prompt-meta {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .hx-prompt-meta > :not(.hx-prompt-files, .hx-by) {
+    flex: none;
+    white-space: nowrap;
+  }
+  .hx-prompt-files {
+    order: 1;
+    flex: 1 0 100%;
+  }
+  .hx-prompt-files-sep {
+    display: none;
+  }
+}
 /* In a subagent's thread, what its parent wrote it: under its name and mark, with the way back. */
 .hx-by {
   display: inline-flex;

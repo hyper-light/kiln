@@ -7,6 +7,7 @@ import { harnessApi, useSession, type AgentInfo, type Command, type FileChange a
 import { cn } from "@/lib/utils";
 import { agentLabel, changesetOf, editsOf, runsOf, useSameList } from "./derive";
 import { isBackground } from "./background";
+import { workingNow } from "./tasks";
 import { useReviewWaits } from "@/views/plans/review";
 import { Loadable } from "@/components/ui/loading";
 import { Hold } from "@/components/ui/hold";
@@ -138,8 +139,8 @@ export function Inspector({
   const self = useSession(store, (s) => (s.info ? agentLabel(s.info) : "The agent"));
   const subs = useSubs(state?.tasks);
   const [scope] = useScope();
-  // At work now: the goal under way shimmers.
-  const working = useSession(store, (s) => s.info?.status === "running");
+  // At work now: its turn runs, or subagents it sent off still work (as Mission control has it); the goal under way shimmers.
+  const working = useSession(store, (s) => workingNow(s.info, s.state, kiln));
   const meta = useSession(store, (s) => s.meta);
   // What one who changed its files did alone: its session answers, or its events show it edit by edit.
   const answers = meta?.features.includes("own_edits") ?? false;
