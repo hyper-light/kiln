@@ -28,6 +28,7 @@
 //! | [`server`] | the server half, its send scheduler among it |
 //! | [`client`] | the client half (the browser's is `ui/src/api/bp/client.ts`) |
 //! | [`compress`] | compression by trust class |
+//! | [`window`] | a carrier's end-to-end window, sized from the page's acknowledgements (goal 3) |
 
 pub mod answers;
 pub mod client;
@@ -48,6 +49,7 @@ pub mod tickets;
 pub mod topic;
 pub mod ts;
 pub mod vectors;
+pub mod window;
 pub mod wire;
 
 pub use frames::{Frame, Kind, KINDS, OLDEST, VERSION};

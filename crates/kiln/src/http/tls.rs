@@ -453,6 +453,8 @@ pub trait Side {
     fn alpn_protocol(&self) -> Option<&[u8]>;
     fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]>;
     fn handshake_kind(&self) -> Option<rustls::HandshakeKind>;
+    /// Bounds what the session buffers to send (`None`: unbounded).
+    fn set_buffer_limit(&mut self, limit: Option<usize>);
 }
 
 macro_rules! side {
@@ -491,6 +493,9 @@ macro_rules! side {
             }
             fn handshake_kind(&self) -> Option<rustls::HandshakeKind> {
                 (**self).handshake_kind()
+            }
+            fn set_buffer_limit(&mut self, limit: Option<usize>) {
+                (**self).set_buffer_limit(limit)
             }
         }
     };
@@ -551,6 +556,10 @@ pub struct Stream<S, C: Side> {
     config: C::Config,
     eof: bool,
     closing: bool,
+    /// The bound on what TLS buffers to send, when someone sets it as the session goes (the browser
+    /// protocol's socket sets its chunk: `crate::live`), and the bound last applied (0: TLS's own).
+    send_limit: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    applied: usize,
 }
 
 /// A client TLS session.
@@ -562,7 +571,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ClientConnection> {
     /// Start a connection to `name` over `io` and complete the handshake.
     pub async fn connect(io: S, mut config: ClientConfig, name: ServerName<'static>) -> io::Result<Self> {
         let conn = ClientConnection::new(&mut config, name).map_err(tls_error)?;
-        let mut stream = Self { io, conn, config, eof: false, closing: false };
+        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0 };
         poll_fn(|cx| stream.poll_handshake(cx)).await?;
         Ok(stream)
     }
@@ -572,7 +581,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ServerConnection> {
     /// Answer a client over `io` and complete the handshake.
     pub async fn accept(io: S, config: ServerConfig) -> io::Result<Self> {
         let conn = ServerConnection::new(&config).map_err(tls_error)?;
-        let mut stream = Self { io, conn, config, eof: false, closing: false };
+        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0 };
         poll_fn(|cx| stream.poll_handshake(cx)).await?;
         Ok(stream)
     }
@@ -580,6 +589,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ServerConnection> {
     /// The name the client asked for (SNI), if it sent one.
     pub fn server_name(&self) -> Option<&str> {
         self.conn.server_name()
+    }
+
+    /// Bounds what TLS buffers to send to what `limit` holds whenever it's written to (0: TLS's own,
+    /// 64 KiB): read as the session writes (`crate::live`, the browser protocol's socket).
+    pub fn set_send_limit(&mut self, limit: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.send_limit = Some(limit);
     }
 }
 
@@ -703,10 +718,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
         }
     }
 
+    /// Follows the send bound as it's set (0: TLS's own).
+    fn apply_send_limit(&mut self) {
+        let Some(limit) = self.send_limit.as_ref().map(|l| l.load(std::sync::atomic::Ordering::Relaxed)) else { return };
+        if limit != self.applied {
+            self.applied = limit;
+            self.conn.set_buffer_limit((limit > 0).then_some(limit));
+        }
+    }
+
     fn poll_write_plain(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if self.conn.is_handshaking() {
             ready!(self.poll_handshake(cx))?;
         }
+        self.apply_send_limit();
         let mut taken = 0usize;
         loop {
             let mut blocked = false;

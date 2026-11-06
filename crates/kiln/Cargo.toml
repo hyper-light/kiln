@@ -135,7 +135,10 @@ crc32fast = "1.5.2"
 # cosign's encrypted key files (docs/ci.md W18-R02): scrypt, then NaCl's secretbox.
 scrypt = { version = "0.11", default-features = false }
 crypto_secretbox = "0.1"
-brotli = "8.0.4"
+# 9.1 at least: it refuses the streams that set off CVE-2026-111497 in the C decoder browsers
+# use (docs/http.md "The UI's files"; goal 8 of the browser protocol program, plan 01a1a832ebfd
+# step 5's deltas are Brotli too). The build-dependency below is the same version.
+brotli = "9.1.0"
 # `futures-03-sink` (futures-util, already in the tree): a socket's sender as a `Sink`, so what's ready is fed and
 # flushed once: the events socket's events (goal 4, plan 01a1a59c2a9c step 5) and a viewer's batch of live frames
 # (goal 9, plan 01a1a87b2cec step 5; `api::write_live_batch`), each one write where each was a write of its own.
@@ -177,7 +180,7 @@ workspace = true
 # The UI's files packed with brotli in the build (build.rs, by src/ui_pack.rs; goal 11, plan 01a1a87b2e56 step 5),
 # with the crate's own versions of what the server packs with.
 [build-dependencies]
-brotli = "8.0.4"
+brotli = "9.1.0"
 mime_guess = "2.0.5"
 sha2 = "0.11.1"
 

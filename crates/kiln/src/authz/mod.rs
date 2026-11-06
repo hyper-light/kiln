@@ -366,6 +366,12 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/system", "runners.read", At::Server),
     // Each event narrowed to the repositories the caller may read (W10).
     r("GET", "/api/events", "runs.read", At::Anywhere),
+    // The browser protocol (goal 3 of the browser protocol program, `crate::live`): each topic and read
+    // inside it is checked as its own route is; the socket, its ticket and one's own sockets need what
+    // the events socket does.
+    r("GET", "/api/live", "runs.read", At::Anywhere),
+    r("POST", "/api/live/ticket", "runs.read", At::Anywhere),
+    r("GET", "/api/live/sockets", "runs.read", At::Anywhere),
     r("GET", "/api/metrics/history", "runners.read", At::Server),
     // Every conversation store and its series (docs/conversations.md, "Telemetry").
     r("GET", "/api/conversations/status", "runners.read", At::Server),
