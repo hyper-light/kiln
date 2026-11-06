@@ -2838,7 +2838,11 @@ impl Registry {
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get_mut(id) {
-            m.harness_at = hub.emit_harness(id, m.info_encoded(), m.harness_at);
+            // Its new info's frame in the feed, its text held here; its last one's let go of only now, so a reader
+            // passes over that one once this one's in (goal 9, plan 01a1a87b2cec step 5).
+            let lent = hub.emit_harness(id, m.info_encoded());
+            m.harness_at = lent.seq();
+            m.harness = Some(lent);
         }
         if let Some(c) = thaw {
             s.want_thaw(id, c);
@@ -4888,8 +4892,8 @@ mod tests {
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: each change of a session's info lets go of its last `harness` frame in the
-    /// events socket's feed (`crate::wire::events::feed::Feed::push_over`): its copy keeps the newest frame's number,
-    /// and a page reading the feed from before them all is sent the newest alone.
+    /// events socket's feed (its copy held that frame's text, `crate::wire::events::feed::Feed::push_lent`): its copy
+    /// keeps the newest frame's number, and a page reading the feed from before them all is sent the newest alone.
     #[test]
     fn g11_s5_a_sessions_info_frame_lets_go_of_its_last_in_the_feed() -> anyhow::Result<()> {
         use crate::harness::model::State;

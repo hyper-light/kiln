@@ -1059,14 +1059,15 @@ impl Hub {
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
     /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5), on the session's
     /// lane of [`Hub::harness_events`] (goal 4, plan 01a1a59c2a9c step 5). Made always: the feed keeps it for
-    /// the pages that resume (W21-R15). `was`: the feed's number of the session's last such frame (0: none),
-    /// which this one says again whole, so the feed lets go of it (goal 11, plan 01a1a87b2e56 step 5:
-    /// `crate::wire::events::feed::Feed::push_over`). This one's number, for the next.
-    pub fn emit_harness(&self, id: &str, info_json: &[u8], was: u64) -> u64 {
+    /// the pages that resume (W21-R15). Its text, as the feed lends it ([`crate::wire::events::feed::Lent`]):
+    /// held by the session's copy until its next info's frame is in, then let go of, and the feed's readers pass
+    /// over this one (goal 11, plan 01a1a87b2e56 step 5), with nothing more put in the feed to say so (goal 9, plan
+    /// 01a1a87b2cec step 5).
+    pub fn emit_harness(&self, id: &str, info_json: &[u8]) -> crate::wire::events::feed::Lent {
         let frame = crate::wire::events::harness_frame(info_json);
-        let seq = self.feed.push_over(Arc::clone(&frame), was);
+        let lent = self.feed.push_lent(Arc::clone(&frame));
         self.emit_session(id, frame);
-        seq
+        lent
     }
 
     /// Session `id`'s event `text`, if anyone reads them, on the session's lane: its owner shard's (goal 4,
@@ -4649,7 +4650,7 @@ pub(crate) mod tests {
             for id in ids {
                 let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() };
                 hub.emit(&ServerEvent::Harness { info: Box::new(info.clone()) });
-                hub.emit_harness(id, &serde_json::to_vec(&info)?, 0);
+                drop(hub.emit_harness(id, &serde_json::to_vec(&info)?));
                 hub.emit(&ServerEvent::HarnessClosed { id: id.into() });
             }
             hub.emit(&ServerEvent::Updates);
