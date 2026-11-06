@@ -9,12 +9,12 @@
 //!
 //! What it keeps is `crate::memory::owners::EVENTS_FEED` on `/metrics` (goal 11, plan 01a1a87b2e56 step 5):
 //! at most [`RING`] frames and [`BYTES`] of them, and a frame an agent's next one says again whole is let go
-//! of as that one comes ([`Feed::push_over`]).
+//! of as that one comes: its pusher holds its text ([`Feed::push_lent`], [`Lent`]).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwapOption;
 use serde_json::Value;
@@ -150,38 +150,96 @@ fn key_of(kind: &str, v: &Value, text: &str) -> Option<Key> {
 #[derive(Debug)]
 pub struct Frame {
     pub seq: u64,
+    /// Its text. Empty in a place of a frame whose text its pusher holds ([`Feed::push_lent`]): what a reader is
+    /// handed of that place has it, while its pusher holds it.
     pub text: Arc<str>,
     /// Boxed, made by the first socket that reads it: most of a ring's frames are never read whole (an
-    /// agent's said again, [`Frame::over`]), and each kept a [`Meta`]'s room, about 180 bytes, regardless
+    /// agent's said again, [`Feed::push_lent`]), and each kept a [`Meta`]'s room, about 180 bytes, regardless
     /// (goal 11, plan 01a1a87b2e56 step 5).
     meta: OnceLock<Box<Meta>>,
-    /// What stands in its place for a frame said again whole by a later one ([`Feed::push_over`]): readers
-    /// pass over it, and its text is none.
-    over: bool,
+    /// In a place, a frame of [`Feed::push_lent`]'s: the cell of the text its pusher holds ([`Lent`]), until it's
+    /// said again. A cell of its own, so the text's bytes go as its pusher lets go of it (an `Arc<str>`'s bytes are
+    /// its allocation, kept while any weak reference to it is): the place keeps the cell's room alone.
+    lent: Option<Weak<Arc<str>>>,
+    /// Handed to a reader of a place of [`Feed::push_lent`]'s: that place's frame, which keeps what's read of it
+    /// ([`Frame::meta`]) for every socket that reads it.
+    place: Option<Arc<Frame>>,
 }
 
 impl Frame {
     pub fn new(seq: u64, text: Arc<str>) -> Frame {
-        Frame { seq, text, meta: OnceLock::new(), over: false }
+        Frame { seq, text, meta: OnceLock::new(), lent: None, place: None }
     }
 
-    /// What stands for frame `seq` once a later frame said it again whole: its number alone, so readers
-    /// pass over it and the numbers, gaps and resumes are as they were.
-    fn over(seq: u64) -> Frame {
-        Frame { seq, text: Arc::from(""), meta: OnceLock::new(), over: true }
+    /// Frame `seq` of the text in `cell`, which its pusher holds ([`Feed::push_lent`]): its place holds its number and
+    /// a way to the text alone, so it takes little more than a frame of its number did once said again.
+    fn lent(seq: u64, cell: &Arc<Arc<str>>) -> Frame {
+        Frame { seq, text: Arc::from(""), meta: OnceLock::new(), lent: Some(Arc::downgrade(cell)), place: None }
     }
 
-    /// What's read of it, read the first time it's asked.
+    /// What a reader is handed of this place's frame: itself; for one whose pusher holds its text, a frame of that
+    /// text while it's held, sharing what's read of it with this one, and none once it isn't (said again whole by
+    /// a later one: readers pass over it).
+    fn read(self: &Arc<Frame>) -> Option<Arc<Frame>> {
+        match &self.lent {
+            None => Some(Arc::clone(self)),
+            Some(lent) => lent.upgrade().map(|cell| Arc::new(Frame { seq: self.seq, text: Arc::clone(&cell), meta: OnceLock::new(), lent: None, place: Some(Arc::clone(self)) })),
+        }
+    }
+
+    /// What's read of it, read the first time it's asked (kept by its place's frame, for one read of a place of
+    /// [`Feed::push_lent`]'s, so every socket that reads it shares it).
     pub fn meta(&self) -> &Meta {
-        self.meta.get_or_init(|| Box::new(Meta::of(&self.text)))
+        let of = self.place.as_deref().unwrap_or(self);
+        of.meta.get_or_init(|| Box::new(Meta::of(&self.text)))
     }
 
     /// What it takes in a place of the feed: its text and its own room, each allocation's with its
     /// reference counts (an `Arc`'s two words). What's read of it ([`Frame::meta`], made only when a socket
-    /// reads it: its kind, key and names, parts of its text) isn't counted.
+    /// reads it: its kind, key and names, parts of its text) isn't counted, nor a text its pusher holds
+    /// ([`Lent`] counts that): its place's text is empty, and it keeps that text's cell's room.
     pub fn weight(&self) -> usize {
-        const COUNTS: usize = 2 * size_of::<usize>();
-        size_of::<Frame>() + COUNTS + self.text.len() + COUNTS
+        let cell = if self.lent.is_some() { COUNTS + size_of::<Arc<str>>() } else { 0 };
+        size_of::<Frame>() + COUNTS + self.text.len() + COUNTS + cell
+    }
+}
+
+/// An `Arc`'s reference counts, two words, beside what it holds.
+const COUNTS: usize = 2 * size_of::<usize>();
+
+/// The text of a frame as its pusher holds it ([`Feed::push_lent`]): an agent's info, which its copy holds until its
+/// next is in the feed. The feed's place has the frame's number and a way to the text while this is held; let go of
+/// (its next said, or its copy gone), the text goes with it, and readers pass over the frame, with nothing put in its
+/// place to say so (goal 9, plan 01a1a87b2cec step 5: what stood for it was a second frame put in a place, a second
+/// of arc-swap's walks of every thread's debt slots an info's change). Counted in
+/// `crate::memory::owners::EVENTS_FEED` while held, as the feed's own frames are.
+#[derive(Debug)]
+pub struct Lent {
+    seq: u64,
+    /// The text, in a cell of its own: the feed's place holds a weak reference to the cell, never to the text.
+    cell: Arc<Arc<str>>,
+}
+
+impl Lent {
+    fn new(seq: u64, cell: Arc<Arc<str>>) -> Lent {
+        crate::memory::owners::EVENTS_FEED.add(Lent::weight(&cell));
+        Lent { seq, cell }
+    }
+
+    /// The text's bytes and its counts.
+    fn weight(text: &str) -> usize {
+        text.len() + COUNTS
+    }
+
+    /// The frame's number in the feed.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        crate::memory::owners::EVENTS_FEED.sub(Lent::weight(&self.cell));
     }
 }
 
@@ -245,9 +303,12 @@ pub enum Since {
 /// - **Said again whole.** Most of what's pushed is an agent's info (`harness`), each change of it whole, so
 ///   a ring of them held one agent's info hundreds of times over, every copy but its newest one no socket
 ///   is sent (a batch sends a thing's newest alone, [`coalesce`]; a page that resumes is sent what's after
-///   where it was, where its newest is too). Its pusher says the number of the frame it says again
-///   ([`Feed::push_over`]): once the new one is in its place, that one's place takes a frame of its number
-///   alone ([`Frame::over`]), which readers pass over. Numbers, gaps and resumes are as they were.
+///   where it was, where its newest is too). Its pusher holds its text ([`Feed::push_lent`]: a [`Lent`], which
+///   an agent's copy keeps until its next info is in), and its place a way to that text alone: once the pusher
+///   lets go of it, the text's memory is given back and readers pass over the frame. Nothing is put in its place
+///   to say so (goal 9, plan 01a1a87b2cec step 5: a frame standing for it was, each a second store to the
+///   places an info's change, so a second walk of every thread's debt slots). Numbers, gaps and resumes are as
+///   they were. A text a reader still holds (a socket's batch, a session's lane) stays readable until it lets go.
 /// - **Bytes.** Its places hold at most [`BYTES`] of frames ([`Frame::weight`]): past it the oldest go, as past
 ///   [`RING`]. `floor` is the oldest number it may still have; a push past the bytes raises it a frame at a
 ///   time (a compare-and-swap, so each is let go of by one push alone) and empties that frame's place.
@@ -273,7 +334,8 @@ pub struct Feed {
 enum Look {
     /// That frame.
     Frame(Arc<Frame>),
-    /// What stands for it, said again whole by a later frame ([`Frame::over`]): passed over.
+    /// A frame its pusher held the text of and let go ([`Feed::push_lent`]): said again whole by a later one,
+    /// passed over.
     Over,
     /// Not that frame yet: its push is still putting it there (or nothing's been put there yet).
     NotYet,
@@ -356,21 +418,26 @@ impl Feed {
 
     /// Numbers `text` and keeps it (the oldest goes past [`RING`] or [`BYTES`]), and wakes the sockets.
     pub fn push(&self, text: Arc<str>) -> u64 {
-        self.push_over(text, 0)
-    }
-
-    /// [`Feed::push`] of a frame that says again whole what frame `was` said (the same thing's: an agent's
-    /// info, its last frame's number as its pusher kept it; 0 for none): once this one's in its place, `was`
-    /// is let go of ([`Frame::over`]), and readers pass over it. Its number.
-    pub fn push_over(&self, text: Arc<str>, was: u64) -> u64 {
         let seq = self.next.fetch_add(1, Ordering::AcqRel);
         self.put(Arc::new(Frame::new(seq, text)));
-        if was > 0 && was < seq {
-            self.pass_over(was);
-        }
         self.trim(seq);
         self.wake();
         seq
+    }
+
+    /// [`Feed::push`] of a frame its pusher holds the text of ([`Lent`]): what a later frame of the same thing will
+    /// say again whole (an agent's info). Its place keeps its number and a way to the text; once the pusher lets go
+    /// of it (as its next is pushed, or its copy goes), readers pass over the frame, and its text's memory is given
+    /// back with nothing more put in the feed (goal 9, plan 01a1a87b2cec step 5: an info's change put two frames in
+    /// two places, its own and what stood for its last, each a walk of every thread's debt slots in arc-swap; now
+    /// one). Numbers, gaps and resumes are as for any frame.
+    pub fn push_lent(&self, text: Arc<str>) -> Lent {
+        let seq = self.next.fetch_add(1, Ordering::AcqRel);
+        let cell = Arc::new(text);
+        self.put(Arc::new(Frame::lent(seq, &cell)));
+        self.trim(seq);
+        self.wake();
+        Lent::new(seq, cell)
     }
 
     /// Puts `frame` in its place, unless a newer frame is there already, or its number was let go of for the
@@ -401,21 +468,6 @@ impl Feed {
             }
             // Another push's put went in first (a frame a window before or after this one): looked at again.
             there = was;
-        }
-    }
-
-    /// Frame `seq`, said again whole by a later frame, let go of: its place takes what stands for it
-    /// ([`Frame::over`]), unless it holds a newer frame, none, or that already.
-    fn pass_over(&self, seq: u64) {
-        let Some(place) = self.place(seq) else { return };
-        let there = place.load();
-        let Some(old) = there.as_ref().filter(|f| f.seq == seq && !f.over) else { return };
-        let (old_weight, over) = (old.weight(), Arc::new(Frame::over(seq)));
-        let was = place.compare_and_swap(&there, Some(Arc::clone(&over)));
-        // Else a push of a newer frame, or the bytes' trim, took the place first: nothing of it to let go of here.
-        if same(&was, &there) {
-            self.hold(over.weight());
-            self.let_hold(old_weight);
         }
     }
 
@@ -466,8 +518,10 @@ impl Feed {
         }
         let Some(place) = self.place(want) else { return Look::Gone };
         match &*place.load() {
-            Some(f) if f.seq == want && f.over => Look::Over,
-            Some(f) if f.seq == want => Look::Frame(Arc::clone(f)),
+            Some(f) if f.seq == want => match f.read() {
+                Some(read) => Look::Frame(read),
+                None => Look::Over,
+            },
             Some(f) if f.seq > want => Look::Gone,
             // Not in yet, or let go of for the bytes as it looked (the floor rises before its place empties).
             _ if want < self.floor.load(Ordering::SeqCst) => Look::Gone,

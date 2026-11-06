@@ -38,7 +38,7 @@ use serde_json::Value;
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
 use super::packed::Segment;
-use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, merge_changes, null, write};
+use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, null, write};
 use super::state_doc::StateDoc;
 use super::session::Info;
 use crate::hub::Hub;
@@ -88,21 +88,30 @@ pub fn segments_bound() -> u64 {
 }
 
 /// What a reader needs of one of a copy's events without its text: its id and number, the copy's
-/// revision when it last changed, where its text is among its chunk's texts joined by `,` (as an
-/// `events` frame joins them), and its text's digest (`crate::wire::sums::event_text`). Numbering,
-/// finding, resuming, digests and a snapshot's plan read these alone. Goal 10, plan 01a1a87b2dae step
-/// 3, in the shape agreed with goal 11, whose stored form keeps these and the chunk's [`Segment`] and
-/// decodes an event's text only where it's read.
+/// revision when it last changed, its text's length (where it is among its chunk's texts joined by `,`,
+/// as an `events` frame joins them, is reckoned from the lengths before it: [`Chunk::off`]), and its
+/// text's digest (`crate::wire::sums::event_text`). Numbering, finding, resuming, digests and a
+/// snapshot's plan read these alone. Goal 10, plan 01a1a87b2dae step 3, in the shape agreed with goal 11,
+/// whose stored form keeps these and the chunk's [`Segment`] and decodes an event's text only where it's
+/// read.
+///
+/// 72 bytes (goal 11, plan 01a1a87b2e56 step 5): a copy keeps a meta for each event it keeps, spilled or
+/// not, and a compact chunk its [`CHUNK`] metas in one allocation, which jemalloc's size classes round up
+/// (a quarter of a doubling apart past 4 KiB): 70 metas of 72 bytes take 5,120 bytes, where of 88 they took
+/// 7,168 (and of 96 the same), about 29 bytes an event.
 #[derive(Debug)]
 pub struct Meta {
     /// Empty for an event without one (none the copy takes in: `Mirror::upsert`). Kept in the meta itself
     /// ([`Id`]), not an allocation of its own: a copy keeps a meta for each event it keeps, spilled or not.
     id: Id,
-    pub seq: Option<u64>,
+    /// Its number, when it has one ([`Meta::seq`]: `len`'s top bit says so).
+    seq: u64,
     pub at: u64,
-    /// Its text: from `off`, `len` bytes, in its chunk's texts joined.
-    pub off: usize,
-    pub len: usize,
+    /// Its text's length in bytes, in the low 63 bits (no allocation is 2^63 bytes long: Rust's are at most
+    /// `isize::MAX`), and in the top bit whether it has a number ([`NUMBERED`]), where an `Option<u64>` took 16
+    /// bytes of its own. Where its text begins is reckoned from the lengths before it ([`Chunk::off`]: a chunk
+    /// holds at most [`CHUNK`]), never kept.
+    len: u64,
     /// Its text's digest: made off the owner's shard, a chunk's all as it's packed ([`Chunk::pack`]:
     /// a packed chunk's are all there), or where first asked for ([`Meta::sum`]). Made as the copy
     /// took each event in, it held the owner's shard for a whole fill's text (goal 10's A/B).
@@ -115,24 +124,39 @@ pub struct Meta {
 /// digest made again each time it's asked for, as one not made yet: never another's.
 const NO_SUM: u64 = 0;
 
+/// A meta's `len`'s top bit: its event has a number ([`Meta::seq`]).
+const NUMBERED: u64 = 1 << 63;
+
 impl Clone for Meta {
     fn clone(&self) -> Self {
-        Self { id: self.id.clone(), seq: self.seq, at: self.at, off: self.off, len: self.len, sum: AtomicU64::new(self.sum.load(Ordering::Relaxed)) }
+        Self { id: self.id.clone(), seq: self.seq, at: self.at, len: self.len, sum: AtomicU64::new(self.sum.load(Ordering::Relaxed)) }
     }
 }
 
 /// Metas are equal as a `OnceLock`'s digest was: the same event, and the same digest made (or none).
 impl PartialEq for Meta {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.seq == other.seq && self.at == other.at && self.off == other.off && self.len == other.len && self.sum_made() == other.sum_made()
+        self.id == other.id && self.seq() == other.seq() && self.at == other.at && self.len == other.len && self.sum_made() == other.sum_made()
     }
 }
 
 impl Eq for Meta {}
 
 impl Meta {
-    fn of(ev: &Ev, off: usize) -> Self {
-        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: ev.entry.seq(), at: ev.at, off, len: ev.entry.text().len(), sum: AtomicU64::new(NO_SUM) }
+    fn of(ev: &Ev) -> Self {
+        let seq = ev.entry.seq();
+        let len = u64::try_from(ev.entry.text().len()).unwrap_or(u64::MAX) & !NUMBERED;
+        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: seq.unwrap_or_default(), at: ev.at, len: if seq.is_some() { len | NUMBERED } else { len }, sum: AtomicU64::new(NO_SUM) }
+    }
+
+    /// Its event's number in its session's timeline, if it has one.
+    pub fn seq(&self) -> Option<u64> {
+        (self.len & NUMBERED != 0).then_some(self.seq)
+    }
+
+    /// Its text's length in bytes.
+    pub fn text_len(&self) -> usize {
+        usize::try_from(self.len & !NUMBERED).unwrap_or(usize::MAX)
     }
 
     /// Its event's id (empty: none).
@@ -155,16 +179,11 @@ impl Meta {
     pub fn sum_made(&self) -> Option<u64> {
         Some(self.sum.load(Ordering::Relaxed)).filter(|s| *s != NO_SUM)
     }
-
-    /// Where the next event's text begins: past this one's and the `,` after it.
-    fn end(&self) -> usize {
-        self.off + self.len + 1
-    }
 }
 
 /// The most bytes of an id a meta keeps in itself ([`Id`]): a UUID's 36 with room to spare (kiln's 32, a
-/// harness's `msg_` and `toolu_` ids about 30), so the meta is 96 bytes, against 72 and an allocation of 48 to
-/// 64 for the `Arc<str>` it held.
+/// harness's `msg_` and `toolu_` ids about 30), so the id takes 40 bytes of its meta, against the 16 of the
+/// `Arc<str>` it held and that one's allocation of 48 to 64.
 const ID_INLINE: usize = 38;
 
 /// An event's id as its meta keeps it (goal 11, plan 01a1a87b2e56 step 5): in the meta up to [`ID_INLINE`]
@@ -346,6 +365,13 @@ impl Index {
 /// 11 exports and bounds (`kiln_memory_bytes{owner="session_segments"}`).
 pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// What the reads of its copy's newest page kept of a compact chunk's texts joined ([`Chunk::page_texts`]):
+/// those from byte `from` of them on, the furthest back a read reached (goal 11, plan 01a1a87b2e56 step 5).
+struct PageTexts {
+    from: usize,
+    bytes: Bytes,
+}
+
 /// A chunk of a copy's events: each one's [`Meta`], the events themselves, and, once it's sealed (full,
 /// and not the newest) or a snapshot took it whole, their texts joined as an `events` frame joins them,
 /// deflated once ([`Segment`]): every viewer's packed snapshot takes that as it is (`super::packed`;
@@ -370,7 +396,8 @@ pub struct Chunk {
     /// for the reads after it while it's the newest compact chunk of its copy ([`Chunk::page_texts`]; goal 10,
     /// plan 01a1a87b2dae step 5): the lab's events reads inflated a chunk's whole segment each time, on the
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
-    /// packed chunk (`crate::memory::SESSION_ENTRIES`).
+    /// packed chunk (`crate::memory::SESSION_ENTRIES`). Only those its reads reached back to are kept
+    /// ([`PageTexts`]; goal 11, plan 01a1a87b2e56 step 5).
     ///
     /// Its cell is made by the first read that keeps them, or the compaction that makes them for a copy being
     /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap
@@ -379,7 +406,7 @@ pub struct Chunk {
     /// that three times (its unpack's swap, its drop's, the cell's own), and every event taken in at a copy's
     /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
     /// process, 0.5% of the shards' time, beside the copy's view's own store.
-    texts: OnceLock<ArcSwapOption<Bytes>>,
+    texts: OnceLock<ArcSwapOption<PageTexts>>,
     /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
     /// alone, as chunks are compacted ([`Events::compact`]).
     paged: AtomicBool,
@@ -414,15 +441,7 @@ impl Drop for Chunk {
 
 impl Chunk {
     fn of(evs: Vec<Ev>) -> Self {
-        let mut off = 0;
-        let meta = evs
-            .iter()
-            .map(|e| {
-                let m = Meta::of(e, off);
-                off = m.end();
-                m
-            })
-            .collect();
+        let meta = evs.iter().map(Meta::of).collect();
         Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 
@@ -443,6 +462,26 @@ impl Chunk {
         &self.meta
     }
 
+    /// Where event `k`'s text begins among its texts joined (a `,` between each two, as an `events` frame
+    /// joins them): past the texts before it and their commas, reckoned from their lengths (goal 11, plan
+    /// 01a1a87b2e56 step 5: a meta keeps no offset), at most [`CHUNK`] of them.
+    pub fn off(&self, k: usize) -> usize {
+        self.meta.iter().take(k).map(|m| m.text_len() + 1).sum()
+    }
+
+    /// Its texts joined, in bytes: each one's, and a `,` between each two.
+    pub fn texts_len(&self) -> usize {
+        self.meta.iter().map(Meta::text_len).sum::<usize>() + self.meta.len().saturating_sub(1)
+    }
+
+    /// Where its events `k` to `k + n` (at least one) lie among its texts joined: from the first one's text's
+    /// beginning to the last one's end. None past its events.
+    pub fn span(&self, k: usize, n: usize) -> Option<std::ops::Range<usize>> {
+        let from = self.off(k);
+        let texts = self.meta.get(k..k.checked_add(n)?)?.iter().map(Meta::text_len).sum::<usize>();
+        Some(from..from + texts + n.checked_sub(1)?)
+    }
+
     /// Whether its events are kept in its segment alone (goal 11, plan 01a1a87b2e56 step 2).
     pub fn is_compact(&self) -> bool {
         self.evs.is_empty() && !self.meta.is_empty()
@@ -456,10 +495,13 @@ impl Chunk {
             return Ok(Cow::Borrowed(&self.evs));
         }
         let joined = self.joined()?;
+        let mut off = 0;
         self.meta
             .iter()
             .map(|m| {
-                let text = joined.get(m.off..m.off + m.len).and_then(|b| std::str::from_utf8(b).ok());
+                let (from, len) = (off, m.text_len());
+                off = from + len + 1;
+                let text = joined.get(from..from + len).and_then(|b| std::str::from_utf8(b).ok());
                 let text = text.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a packed event's text isn't where its meta says"))?;
                 Ok(Ev { entry: Arc::new(Entry::from_text(text)), at: m.at })
             })
@@ -477,7 +519,7 @@ impl Chunk {
             let s = self.spilled.as_ref().ok_or_else(|| std::io::Error::other("a compact chunk without its segment"))?;
             return super::packed::inflate(&s.segment()?).map(Cow::Owned);
         }
-        let mut joined = Vec::with_capacity(self.meta.last().map_or(0, |m| m.off + m.len));
+        let mut joined = Vec::with_capacity(self.texts_len());
         for (i, e) in self.evs.iter().enumerate() {
             if i > 0 {
                 joined.push(b',');
@@ -487,29 +529,52 @@ impl Chunk {
         Ok(Cow::Owned(joined))
     }
 
-    /// A compact one's texts joined ([`Chunk::joined`]) as bytes a page's answer takes slices of, none copied:
-    /// as a read of its copy's newest page kept them, else inflated now, and kept for the reads after while
-    /// it's its copy's newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). The first to keep
-    /// them stays; its owner unsetting `paged` lets them go, and so does a read that finds it unset just after
-    /// keeping them (one of the two sees the other). The cell they're kept in is made here, by the first read
-    /// that keeps them (the field's notes).
-    fn page_texts(&self) -> std::io::Result<Bytes> {
-        if let Some(kept) = self.texts.get().and_then(ArcSwapOption::load_full) {
-            return Ok(Bytes::clone(&kept));
+    /// A compact one's texts joined ([`Chunk::joined`]) from byte `from` of them on, as bytes a page's answer
+    /// takes slices of, none copied, and the byte of them they begin at (`from` or before): as a read of its
+    /// copy's newest page kept them, else inflated now, and kept for the reads after while it's its copy's
+    /// newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
+    /// reached back to, no further (goal 11, plan 01a1a87b2e56 step 5): the newest page ends at the copy's
+    /// newest event, so its reads take a compact chunk's last events alone, the fewer the more of the page its
+    /// open chunk holds, and the same page read again takes no more of it. A read that reaches further back
+    /// than what's kept inflates the chunk again and keeps from there; else the longest kept stays. Its owner
+    /// unsetting `paged` lets them go, and so does a read that finds it unset just after keeping them (one of
+    /// the two sees the other). The cell they're kept in is made here, by the first read that keeps them (the
+    /// field's notes).
+    fn page_texts(&self, from: usize) -> std::io::Result<(usize, Bytes)> {
+        if let Some(kept) = self.page_texts_kept(from) {
+            return Ok(kept);
         }
-        let made = Bytes::from(self.joined()?.into_owned());
-        if self.is_compact() && self.paged.load(Ordering::SeqCst) {
-            self.keep_texts(&made);
+        let joined = self.joined()?.into_owned();
+        if !(self.is_compact() && self.paged.load(Ordering::SeqCst)) {
+            return Ok((0, Bytes::from(joined)));
         }
-        Ok(made)
+        // Those it reached back to, alone: a slice of the whole would hold it all.
+        let made = Arc::new(PageTexts { from, bytes: Bytes::copy_from_slice(joined.get(from..).ok_or_else(|| std::io::Error::other("a page's read began past its chunk's texts"))?) });
+        self.keep_texts(&made);
+        Ok((from, made.bytes.clone()))
     }
 
-    /// `made`, its texts, kept for the reads of its copy's newest page unless it keeps some already (the first kept
-    /// stays), its cell made if it's the first to.
-    fn keep_texts(&self, made: &Bytes) {
-        let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
-        if was.is_none() {
-            crate::memory::SESSION_ENTRIES.add(made.len());
+    /// `made`, its texts from `made.from` on, kept for the reads of its copy's newest page unless what it keeps by now
+    /// reaches as far back (a read beside this one kept it meanwhile: the longest kept stays), its cell made if it's the
+    /// first to. What it keeps in its place is counted out.
+    fn keep_texts(&self, made: &Arc<PageTexts>) {
+        let cell = self.texts.get_or_init(ArcSwapOption::empty);
+        let mut now = cell.load_full();
+        while now.as_ref().is_none_or(|k| k.from > made.from) {
+            let was = cell.compare_and_swap(&now, Some(Arc::clone(made)));
+            let swapped = match (&*was, &now) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !swapped {
+                now = Option::clone(&*was);
+                continue;
+            }
+            crate::memory::SESSION_ENTRIES.add(made.bytes.len());
+            if let Some(shorter) = now {
+                crate::memory::SESSION_ENTRIES.sub(shorter.bytes.len());
+            }
             // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
             // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
             // with Acquire alone, where the swaps of a cell always there were all SeqCst).
@@ -517,13 +582,33 @@ impl Chunk {
             if !self.paged.load(Ordering::SeqCst) {
                 self.unpage();
             }
+            break;
         }
     }
 
-    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), if any: what a read on a shard takes
-    /// without inflating anything (goal 10, plan 01a1a87b2dae step 5).
-    fn page_texts_kept(&self) -> Option<Bytes> {
-        self.texts.get().and_then(ArcSwapOption::load_full).map(|kept| Bytes::clone(&kept))
+    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), where they reach back to byte `from` of
+    /// its texts joined, and the byte they begin at: what a read on a shard takes without inflating anything (goal 10,
+    /// plan 01a1a87b2dae step 5).
+    fn page_texts_kept(&self, from: usize) -> Option<(usize, Bytes)> {
+        self.texts.get().and_then(ArcSwapOption::load_full).filter(|k| k.from <= from).map(|k| (k.from, Bytes::clone(&k.bytes)))
+    }
+
+    /// The first of its events whose texts the reads of its copy's newest page took and keep, where a read took them
+    /// ([`Events::pieces_with`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
+    /// 11, plan 01a1a87b2e56 step 5).
+    fn page_reach(&self) -> Option<usize> {
+        if !self.page_read.load(Ordering::Relaxed) {
+            return None;
+        }
+        let from = self.texts.get().and_then(ArcSwapOption::load_full)?.from;
+        let mut off = 0;
+        for (k, m) in self.meta.iter().enumerate() {
+            if off >= from {
+                return Some(k);
+            }
+            off += m.text_len() + 1;
+        }
+        None
     }
 
     /// Its texts as a read of its copy's newest page keeps them ([`Chunk::page_texts`]), made now of `was`'s events
@@ -531,16 +616,25 @@ impl Chunk {
     /// its copy's newest compact chunk and keeps none yet (goal 10, plan 01a1a87b2dae step 5). Its owner asks for it
     /// where its copy's newest page was read since the last compaction ([`Events::compact`]), so the read after this
     /// one finds them made: the first read after each compaction inflated the chunk's whole segment, a few hundred
-    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell.
-    fn warm(&self, was: &Chunk) {
+    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell. Made from
+    /// its event `reach` on, as far back as the reads reached in the chunk before it ([`Chunk::page_reach`]): what they
+    /// keep, no more (goal 11, plan 01a1a87b2e56 step 5).
+    fn warm(&self, was: &Chunk, reach: usize) {
         if !self.is_compact() || was.is_compact() || !self.paged.load(Ordering::SeqCst) || self.page_kept().is_some() {
             return;
         }
-        let Ok(joined) = was.joined() else { return };
-        let made = Bytes::from(joined.into_owned());
+        let Some(evs) = was.evs.get(reach..) else { return };
+        let from = self.off(reach);
+        let mut made = Vec::with_capacity(self.texts_len().saturating_sub(from));
+        for (j, e) in evs.iter().enumerate() {
+            if j > 0 {
+                made.push(b',');
+            }
+            made.extend_from_slice(e.entry.text().as_bytes());
+        }
         // Where its metas say its texts end: else they aren't this chunk's (one changed since it was packed).
-        if self.meta.last().map_or(0, |m| m.off + m.len) == made.len() {
-            self.keep_texts(&made);
+        if from + made.len() == self.texts_len() {
+            self.keep_texts(&Arc::new(PageTexts { from, bytes: Bytes::from(made) }));
         }
     }
 
@@ -549,13 +643,13 @@ impl Chunk {
     fn unpage(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         if let Some(kept) = self.texts.get().and_then(|cell| cell.swap(None)) {
-            crate::memory::SESSION_ENTRIES.sub(kept.len());
+            crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
         }
     }
 
     /// The bytes of its texts a page's read keeps now ([`Chunk::page_texts`]), if any.
     pub fn page_kept(&self) -> Option<usize> {
-        self.texts.get().and_then(|cell| cell.load().as_ref().map(|t| t.len()))
+        self.texts.get().and_then(|cell| cell.load().as_ref().map(|t| t.bytes.len()))
     }
 
     /// It kept compact, once packed: its metas and its segment (which a view of it still taking it shares).
@@ -658,11 +752,12 @@ impl Chunk {
         *self.sealing.get_mut() = false;
         *self.paged.get_mut() = false;
         if let Some(kept) = self.texts.take().and_then(ArcSwapOption::into_inner) {
-            crate::memory::SESSION_ENTRIES.sub(kept.len());
+            crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
         }
     }
 
-    /// Its event `k` changed by `f`, with its meta and where those after it begin.
+    /// Its event `k` changed by `f`, with its meta (where those after it begin is reckoned from the lengths:
+    /// [`Chunk::off`]).
     fn change(&mut self, k: usize, f: impl FnOnce(&mut Ev)) -> bool {
         if !self.thaw() {
             return false;
@@ -670,14 +765,8 @@ impl Chunk {
         self.unpack();
         let Some(ev) = self.evs.get_mut(k) else { return false };
         f(ev);
-        let mut off = self.meta.get(k).map_or(0, |m| m.off);
         if let (Some(m), Some(e)) = (self.meta.get_mut(k), self.evs.get(k)) {
-            *m = Meta::of(e, off);
-            off = m.end();
-        }
-        for m in self.meta.iter_mut().skip(k + 1) {
-            m.off = off;
-            off = m.end();
+            *m = Meta::of(e);
         }
         true
     }
@@ -688,7 +777,7 @@ impl Chunk {
             return;
         }
         self.unpack();
-        self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
+        self.meta.push(Meta::of(&ev));
         self.evs.push(ev);
     }
 }
@@ -719,6 +808,10 @@ pub struct Events {
     len: usize,
     /// The events in the first chunk.
     first: usize,
+    /// It took chunks out since its copy's view was last published (a cut, a compaction, a spill, a trim, a chunk read
+    /// back, the events made again or let go of): the view let go of then is the last to hold them, so its owner lets go
+    /// of that view off its shard ([`Mirror::publish`]; goal 9, plan 01a1a87b2cec step 3).
+    took_out: bool,
 }
 
 /// A copy's chunks in order, the newest last ([`Events::chunks`]): what a slice of them was, made of the older
@@ -784,7 +877,7 @@ impl Events {
             chunks.push(Arc::new(Chunk::of(rest.by_ref().take(CHUNK).collect())));
         }
         let newest = chunks.pop();
-        Self { older: Arc::new(chunks), newest, len, first: len.min(CHUNK) }
+        Self { older: Arc::new(chunks), newest, len, first: len.min(CHUNK), took_out: false }
     }
 
     /// Chunk `c` of [`Events::chunks`].
@@ -889,8 +982,7 @@ impl Events {
                 out.push(b',');
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
-                out.extend_from_slice(chunk.joined().ok()?.get(first.off..last.off + last.len)?);
+                out.extend_from_slice(chunk.joined().ok()?.get(chunk.span(k, n)?)?);
             } else {
                 for (j, e) in chunk.evs.get(k..k + n)?.iter().enumerate() {
                     if j > 0 {
@@ -927,13 +1019,13 @@ impl Events {
                 out.push(Bytes::from_static(b","));
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k).ok_or(Unread::Cannot)?, chunk.meta.get(k + n - 1).ok_or(Unread::Cannot)?);
-                let (from, to) = (first.off, last.off.checked_add(last.len).ok_or(Unread::Cannot)?);
-                let texts = match chunk.page_texts_kept() {
+                let std::ops::Range { start: from, end: to } = chunk.span(k, n).ok_or(Unread::Cannot)?;
+                let (at, texts) = match chunk.page_texts_kept(from) {
                     Some(kept) => kept,
-                    None if inflate => chunk.page_texts().map_err(|_| Unread::Cannot)?,
+                    None if inflate => chunk.page_texts(from).map_err(|_| Unread::Cannot)?,
                     None => return Err(Unread::Unkept),
                 };
+                let (from, to) = (from.checked_sub(at).ok_or(Unread::Cannot)?, to.checked_sub(at).ok_or(Unread::Cannot)?);
                 if from > to || to > texts.len() {
                     return Err(Unread::Cannot);
                 }
@@ -1034,7 +1126,7 @@ impl Events {
     pub(super) fn insert(&mut self, i: usize, ev: Ev) {
         let mut all = self.to_vec();
         all.insert(i.min(all.len()), ev);
-        *self = Self::of(all);
+        *self = Self { took_out: true, ..Self::of(all) };
     }
 
     /// These with `ev` in at `i` ([`Events::insert`]), and their index (`Mirror::reindex`'s), made apart from them: on
@@ -1074,6 +1166,7 @@ impl Events {
         });
         self.len -= n;
         self.first = self.chunks().first().map_or(0, |c| c.len());
+        self.took_out = true;
         (n, remade)
     }
 
@@ -1100,6 +1193,7 @@ impl Events {
         });
         self.len -= now;
         self.first = self.chunks().first().map_or(0, |c| c.len());
+        self.took_out = true;
         Some((now, cut, left))
     }
 
@@ -1109,7 +1203,7 @@ impl Events {
     /// rest. How many it let go of (`left`).
     pub(super) fn trim_first(&mut self, was: &Arc<Chunk>, left: usize, made: Chunk) -> Option<usize> {
         let rest = was.metas().get(left..)?;
-        let same = self.chunks().first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq == b.seq);
+        let same = self.chunks().first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq() == b.seq());
         if !same {
             return None;
         }
@@ -1121,23 +1215,26 @@ impl Events {
         self.len -= left;
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
+        self.took_out = true;
         Some(left)
     }
 
     /// Chunk `was`, still one of these as it was, in `made`'s place: the same events, read back (a compact chunk kept as
     /// its events again, to be changed: [`Shard::want_thaw`]). Whether it was.
     pub(super) fn swap_chunk(&mut self, was: &Arc<Chunk>, made: Chunk) -> bool {
-        if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq == b.seq) {
+        if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq() == b.seq()) {
             return false;
         }
         let Some(at) = self.chunks().iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
-        self.with_list(|chunks| match chunks.get_mut(at) {
+        let swapped = self.with_list(|chunks| match chunks.get_mut(at) {
             Some(slot) => {
                 *slot = Arc::new(made);
                 true
             }
             None => false,
-        })
+        });
+        self.took_out |= swapped;
+        swapped
     }
 
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Meta) -> bool) {
@@ -1149,7 +1246,7 @@ impl Events {
             });
             all.extend(c.meta.iter().zip(evs).filter(|(m, _)| keep(m)).map(|(_, e)| e));
         }
-        *self = Self::of(all);
+        *self = Self { took_out: true, ..Self::of(all) };
     }
 
     /// [`Events::retain`] where those `keeps` keeps are its first events (a copy's go in by number, so a
@@ -1188,11 +1285,12 @@ impl Events {
         self.len = len;
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
+        self.took_out = true;
         Some(len)
     }
 
     pub(super) fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self { took_out: true, ..Self::default() };
     }
 
     /// Every chunk but the newest (which takes the next event) kept compact once it's packed, and those not
@@ -1207,9 +1305,10 @@ impl Events {
         if ready.is_empty() {
             return;
         }
-        // Whether a read of its newest page took the texts of its newest compact chunk until now: then the one this
-        // makes its newest compact chunk has its texts made now, of its events as they were (`Chunk::warm`).
-        let read = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).is_some_and(|c| c.page_read.load(Ordering::Relaxed));
+        // Whether a read of its newest page took the texts of its newest compact chunk until now, and from which of its
+        // events: then the one this makes its newest compact chunk has its texts made now, of its events as they were,
+        // from the same place on (`Chunk::warm`; goal 11, plan 01a1a87b2e56 step 5: what the reads reach, no more).
+        let reach = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).and_then(|c| c.page_reach());
         let chunks = Arc::make_mut(&mut self.older);
         // The newest of those compacted here (they're in order), as it was.
         let mut newest: Option<(usize, Arc<Chunk>)> = None;
@@ -1221,12 +1320,13 @@ impl Events {
             }
         }
         self.page_newest();
-        if read
+        if let Some(reach) = reach
             && let Some((i, was)) = newest
             && let Some(now) = self.older.get(i)
         {
-            now.warm(&was);
+            now.warm(&was, reach);
         }
+        self.took_out = true;
     }
 
     /// Its newest compact chunk in memory is the one whose texts a read of its newest page keeps
@@ -1285,6 +1385,7 @@ impl Events {
                 n += 1;
             }
         }
+        self.took_out |= n > 0;
         n
     }
 
@@ -1301,6 +1402,76 @@ impl Events {
         }
         lo
     }
+
+    /// Its events read by their place one after another ([`Reading`]).
+    pub fn reading(&self) -> Reading<'_> {
+        Reading { events: self, read: None }
+    }
+
+    /// Whether the events changed after revision `after` fit a window's bounds (`super::window`), as a viewer that
+    /// takes them `lean` is sent them: what a window's resume is held to (`super::registry::Parts::resolved`).
+    pub(super) fn fit_since(&self, after: u64, lean: bool) -> bool {
+        let (mut rows, mut bytes) = (0usize, 0usize);
+        let mut reading = self.reading();
+        for (i, m) in self.metas().enumerate() {
+            if m.at <= after {
+                continue;
+            }
+            rows += 1;
+            bytes = bytes.saturating_add(if lean { reading.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.text_len() });
+            if rows > super::window::ROWS || bytes > super::window::BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Where a window of the events before `end` begins, holding at most `turns` turns (`super::window::start_at`),
+    /// as a viewer that takes them `lean` is sent them: read from `end` back, each compact chunk inflated once.
+    pub(super) fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
+        let mut reading = self.reading();
+        super::window::start_at(end, turns, |i| reading.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
+    }
+}
+
+/// A copy's events read by their place one after another (goal 9, plan 01a1a87b2cec step 3; goal 11, plan
+/// 01a1a87b2e56 step 5): each compact chunk among them read again once, for all of its events read in turn.
+/// [`Events::get`] reads a compact chunk again whole (inflated, each of its events parsed) for each event it gives,
+/// so a window over a long session's compact chunks read each of them again once an event: the UI's lean window
+/// (`?window=1&lean=1`), about 400 events over 5 compact chunks, about 330 inflates of a 70-event chunk.
+pub struct Reading<'a> {
+    events: &'a Events,
+    /// The compact chunk read last: where it is among the chunks, and its events read again.
+    read: Option<(usize, Vec<Ev>)>,
+}
+
+impl Reading<'_> {
+    /// Event `i`: as its chunk keeps it, or read again with the rest of its compact chunk, once for them all.
+    pub fn get(&mut self, i: usize) -> Option<&Ev> {
+        let events = self.events;
+        let (c, k) = events.place(i)?;
+        let chunk = events.chunk(c)?;
+        if !chunk.is_compact() {
+            return chunk.evs.get(k);
+        }
+        if self.read.as_ref().is_none_or(|(was, _)| *was != c) {
+            self.read = Some((c, chunk.evs().ok()?.into_owned()));
+        }
+        self.read.as_ref().and_then(|(_, evs)| evs.get(k))
+    }
+}
+
+/// The number a copy's timeline begins at, as its state says: where a clear began it again (`State::cleared`, read
+/// from the state's own field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
+fn floor_of(state: &StateDoc) -> u64 {
+    state.get::<u64>("cleared").unwrap_or(1).max(1)
+}
+
+/// A window (or a page) of `events` that begins at event `begin`: that event's number, and whether there's more before
+/// it, in the copy or (`older`) perhaps in the conversation store, the timeline beginning where `state` says.
+pub(super) fn window_at(events: &Events, state: &StateDoc, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
+    let before = events.meta(begin).and_then(|m| m.seq());
+    crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > floor_of(state))) }
 }
 
 /// A chunk that sealed, waiting to be packed, with its copy's home, whose owner keeps it compact once
@@ -1359,7 +1530,14 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
         };
         if let Some(inbox) = home.inbox.upgrade() {
             let id = Arc::clone(&home.id);
-            let _ = inbox.send(Msg::Run(Box::new(move |s: &mut Shard| s.trimmed(&id, &was, left, made)))).await;
+            let _ = inbox
+                .send(Msg::Run(Box::new(move |s: &mut Shard| {
+                    s.trimmed(&id, &was, left, made);
+                    // The chunk as it was before its trim: let go of off the shard, as the view that held it was
+                    // (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
+                    let_go(was);
+                })))
+                .await;
         }
     }));
 }
@@ -1529,6 +1707,7 @@ impl View {
             lean: false,
             window: None,
             from: 0,
+            find: None,
         }
     }
 
@@ -1536,56 +1715,30 @@ impl View {
     /// "Windows"): all of it, or its newest events alone, as many as a window holds
     /// (`super::window::start`), and where they begin. `older`: events before what the copy holds may
     /// be kept elsewhere (the server's conversation store), so a window that begins at the copy's
-    /// first may still have more before it.
+    /// first may still have more before it. The window is found where the snapshot is written, off the
+    /// shards (`super::registry::Parts::resolved`; goal 9, plan 01a1a87b2cec step 3, and goal 11, plan
+    /// 01a1a87b2e56 step 5): finding it reads its events as the viewer takes them, a lean viewer's each
+    /// made lean, and was done on the socket's shard.
     pub fn parts_for(&self, view: super::registry::View, older: bool) -> Parts {
-        let from = if view.window { self.window_start(self.events.len(), super::window::TURNS, view.lean) } else { 0 };
-        Parts { lean: view.lean, window: view.window.then(|| self.window_at(from, older)), from, ..self.parts() }
+        Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..self.parts() }
     }
 
     /// What a viewer that had revision `after` (None: nothing) and takes the session as `view` says
     /// is sent: what it lacks when the copy can say, else a snapshot. To a viewer that takes a window,
     /// what changed since is sent only while it's no more than a window holds; past that it's sent a
-    /// window: a resume never costs more than a first load.
+    /// window: a resume never costs more than a first load. Which of the two is told where the snapshot
+    /// is written, off the shards, as a window is found ([`View::parts_for`]).
     pub fn parts_after(&self, after: Option<u64>, view: super::registry::View, older: bool) -> Parts {
-        let since = after.and_then(|rev| self.parts_since(rev)).filter(|p| !view.window || self.fits(p.since.unwrap_or_default(), view.lean));
-        match since {
-            Some(p) => Parts { lean: view.lean, ..p },
+        match after.and_then(|rev| self.parts_since(rev)) {
+            Some(p) => Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..p },
             None => self.parts_for(view, older),
         }
-    }
-
-    /// Whether the events changed after revision `after` fit a window's bounds.
-    fn fits(&self, after: u64, lean: bool) -> bool {
-        let (mut rows, mut bytes) = (0usize, 0usize);
-        for (i, m) in self.events.metas().enumerate() {
-            if m.at <= after {
-                continue;
-            }
-            rows += 1;
-            bytes = bytes.saturating_add(if lean { self.events.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.len });
-            if rows > super::window::ROWS || bytes > super::window::BYTES {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Where a window of the events before `end` begins, holding at most `turns` turns.
-    fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
-        super::window::start_at(end, turns, |i| self.events.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
-    }
-
-    /// The number its timeline begins at: where a clear began it again (`State::cleared`, read from the state's own
-    /// field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
-    fn floor(&self) -> u64 {
-        self.state.get::<u64>("cleared").unwrap_or(1).max(1)
     }
 
     /// A window (or a page) that begins at event `begin`: that event's number, and whether there's
     /// more before it, in the copy or (`older`) perhaps in the conversation store.
     pub(super) fn window_at(&self, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
-        let before = self.events.meta(begin).and_then(|m| m.seq);
-        crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > self.floor())) }
+        window_at(&self.events, &self.state, begin, older)
     }
 
     /// An older page of its events, for a viewer that has them from number `before` on: those just
@@ -1593,13 +1746,14 @@ impl View {
     /// first. [`super::registry::Paged::Store`] when the copy has none before it.
     pub fn page(&self, before: u64, lean: bool, older: bool) -> super::registry::Paged {
         use super::registry::Paged;
-        let end = self.events.partition_point(|m| m.seq.is_some_and(|s| s < before));
+        let end = self.events.partition_point(|m| m.seq().is_some_and(|s| s < before));
         if end == 0 {
-            let floor = self.floor();
+            let floor = floor_of(&self.state);
             return if older && before > floor { Paged::Store { before, floor } } else { Paged::Page { events: Vec::new(), window: crate::wire::ui::EventsWindow { before: None, more: false } } };
         }
-        let begin = self.window_start(end, super::window::PAGE_TURNS, lean);
-        let events = (begin..end).filter_map(|i| self.events.get(i)).map(|e| e.entry.sent(lean).to_owned()).collect();
+        let begin = self.events.window_start(end, super::window::PAGE_TURNS, lean);
+        let mut reading = self.events.reading();
+        let events = (begin..end).filter_map(|i| reading.get(i).map(|e| e.entry.sent(lean).to_owned())).collect();
         Paged::Page { events, window: self.window_at(begin, older) }
     }
 
@@ -1644,7 +1798,7 @@ impl View {
             };
             for (i, m) in metas.iter().enumerate().filter(|(_, m)| !m.id().is_empty()) {
                 let sum = m.sum_made().or_else(|| evs.as_ref().and_then(|evs| evs.get(i)).map(|e| m.sum(e)));
-                if let (Some(seq), Some(sum)) = (m.seq, sum) {
+                if let (Some(seq), Some(sum)) = (m.seq(), sum) {
                     events.push((seq, sum));
                 }
             }
@@ -1690,16 +1844,16 @@ impl View {
     /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
     fn events_page_with(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
-            Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
+            Some(b) => self.events.partition_point(|m| m.seq().is_some_and(|s| s < b)),
             None => self.events.len(),
         };
         let start = end.saturating_sub(limit);
-        if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
+        if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq() != Some(1)) {
             return Err(Unread::Cannot);
         }
         for i in start..end {
             let m = self.events.meta(i).ok_or(Unread::Cannot)?;
-            if m.seq.is_none() || m.id().is_empty() {
+            if m.seq().is_none() || m.id().is_empty() {
                 return Err(Unread::Cannot);
             }
         }
@@ -1769,7 +1923,7 @@ pub struct Mirror {
     pub(super) state_bytes: usize,
     pub(super) patch_bytes: usize,
     pub(super) meta_bytes: usize,
-    /// Its changeset (none yet: `None`), as a list taken in by [`merge_changes`]: its viewers take
+    /// Its changeset (none yet: `None`), as a list taken in by `super::registry::merge_changes`: its viewers take
     /// a patch of it the same way, so theirs stays in this one's order.
     pub(super) changes: Option<Files>,
     /// The changeset as its viewers last had it sent (what a changeset's patch is made against).
@@ -1792,6 +1946,9 @@ pub struct Mirror {
     /// The events socket's feed's number of its info's last `harness` frame (0: none yet), which its next lets
     /// go of (`crate::hub::Hub::emit_harness`; goal 11, plan 01a1a87b2e56 step 5).
     pub(super) harness_at: u64,
+    /// That frame's text, which the feed lends it (`crate::wire::events::feed::Lent`): held until its next is in
+    /// the feed, then let go of, so the feed's readers pass over this one (goal 9, plan 01a1a87b2cec step 5).
+    pub(super) harness: Option<crate::wire::events::feed::Lent>,
     /// When this server opened it, until its machine announces it: a report from the machine
     /// that left it out was made before its open got there, and doesn't end it.
     pub(super) opened_at: Option<std::time::Instant>,
@@ -1893,6 +2050,19 @@ pub(super) struct Home {
     id: Arc<str>,
 }
 
+/// `gone` let go of off its owner's shard (goal 9, plan 01a1a87b2cec step 3): dropped on the compute pool, where what it
+/// frees a block at a time holds no shard (a cut's thousand events, each one's entry, texts and head; a compacted chunk's
+/// events; a copy started over or ended, its every chunk), as `crate::goals` lets go of its copies of the sessions' infos.
+/// Dropped where it is off a shard (a test's copy, a pool's thread), and where the pool doesn't take it (at its bound, or
+/// none running).
+pub(super) fn let_go<T: Send + 'static>(gone: T) {
+    if crate::rt::on_shard()
+        && let Err(refused) = hyper_rt::compute::run(move || drop(gone))
+    {
+        drop(refused);
+    }
+}
+
 impl Mirror {
     pub fn new(info: Info, location: Location, bus: Arc<dyn kiln_seams::Bus>) -> Self {
         let feed = Feed::open(bus, &info.id);
@@ -1936,6 +2106,7 @@ impl Mirror {
             reset_at: 0,
             started_over_pending: false,
             harness_at: 0,
+            harness: None,
             opened_at: None,
             slot,
             info_json: encoding,
@@ -1978,7 +2149,14 @@ impl Mirror {
             };
             if let Some(inbox) = home.inbox.upgrade() {
                 let id = Arc::clone(&home.id);
-                let _ = inbox.send(Msg::Run(Box::new(move |s: &mut Shard| s.spilled(&id, &chunks, written)))).await;
+                let _ = inbox
+                    .send(Msg::Run(Box::new(move |s: &mut Shard| {
+                        s.spilled(&id, &chunks, written);
+                        // The chunks as they were before they spilled, each its metas and segment: let go of off the shard, as
+                        // the view that held them was (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
+                        let_go(chunks);
+                    })))
+                    .await;
             }
         }));
     }
@@ -2007,13 +2185,24 @@ impl Mirror {
     /// Its readers take the copy as it is now: its view swapped in whole, its info encoded again
     /// first if it changed ([`info_json_after`]: its last encoding's number changed alone, where that's all
     /// that changed).
+    ///
+    /// Where its events took chunks out since the last view ([`Events::took_out`]: a cut's thousand events, a compacted
+    /// chunk's, a copy started over), that view is the last to hold them, and is let go of off the shard ([`let_go`]):
+    /// each event's entry and texts were freed one by one on the owner's shard as it went, in its commit (goal 9, plan
+    /// 01a1a87b2cec step 3). A reader still holding it lets go of it where it reads.
     pub fn publish(&mut self) {
         if !Arc::ptr_eq(&self.info_json.0, &self.info) {
             let json = info_json_after(&self.info, &self.info_json.0, &self.info_json.1);
             self.info_json = (Arc::clone(&self.info), json);
             self.encodings.info += 1;
         }
-        self.slot.view.store(Arc::new(self.view()));
+        let took_out = std::mem::take(&mut self.events.took_out);
+        let view = Arc::new(self.view());
+        if took_out {
+            let_go(self.slot.view.swap(view));
+        } else {
+            self.slot.view.store(view);
+        }
     }
 
     /// Whether it changed since its view last went out ([`Mirror::publish`]): its revision, or anything its view shares of
@@ -2058,6 +2247,36 @@ impl Mirror {
                 self.changes_sent = None;
             }
         }
+    }
+
+    /// [`Mirror::commit`] of an update's events, `entries` as the copy took them ([`Mirror::frame_of`]'s): their frame
+    /// written here, or, where `off` (its owner wrote one of them out off the shard: [`long_to_write`], a large tool
+    /// output's megabytes, which the frame copies in), handed back for its owner to write off the shard too and send before
+    /// it takes anything else ([`Later`], [`Shard::want_frame`]; goal 9, plan 01a1a87b2cec step 3). Only such a frame is
+    /// long to write: a turn takes the events it can write out within its quantum, and a frame copies what they wrote. Its
+    /// viewers take it in order all the same: a frame of a revision their view has is passed over, as one sent just after
+    /// the view is.
+    ///
+    /// A frame past what the bus takes (`kiln_seams::bus::PAYLOAD_MAX`) isn't written at all: the bus would refuse it, its
+    /// megabytes copied and freed on the shard for nothing, and send its viewers back to the copy, which has its events.
+    /// They're sent back so at once (the feed's resync marker).
+    pub(super) fn commit_events(&mut self, entries: &[Arc<Entry>], off: bool) -> Option<Later> {
+        self.publish();
+        let Some(generation) = self.feed.watched() else {
+            self.sent = super::state_doc::none();
+            self.changes_sent = None;
+            return None;
+        };
+        let bytes = write::envelope("events", Some("events"), Some(self.rev)).saturating_add(write::texts_len(entries.iter().map(|e| &**e)));
+        if bytes > kiln_seams::bus::PAYLOAD_MAX {
+            self.feed.send_payload(generation, payload_of(super::live::RESYNC, 0));
+            return None;
+        }
+        if off {
+            return Some(Later { generation, rev: self.rev, entries: entries.to_vec() });
+        }
+        self.feed.send_payload(generation, events_frame(self.rev, entries));
+        None
     }
 
     /// The state as a frame for its viewers: whole for those that take it so (or when there's
@@ -2114,6 +2333,14 @@ impl Mirror {
             // past that: a few short paths).
             let room = if whole { write::envelope("changes", Some("files"), rev) + write::texts_len(now.iter().map(|f| &**f)) } else { 0 };
             let room = room + patch.as_ref().map_or(0, |(set, _)| write::envelope("changes_patch", None, rev) + r#","set":"#.len() + write::texts_len(set.iter().copied()));
+            // Past what the bus takes, it isn't written: the bus would refuse it (a long session's whole changeset, its
+            // megabytes copied on the owner's shard for nothing) and send its viewers back to the copy, which has it. They're
+            // sent back so at once (goal 9, plan 01a1a87b2cec step 3), from a copy whose viewers have it all.
+            if room > kiln_seams::bus::PAYLOAD_MAX {
+                drop(patch);
+                self.changes_sent = Some(now);
+                return Some(payload_of(super::live::RESYNC, 0));
+            }
             let mut p = Payload::new(self.rev, room);
             if whole {
                 let _ = write::changes(p.text(), now.iter().map(|f| &**f), rev);
@@ -2133,11 +2360,7 @@ impl Mirror {
     pub fn frame_of(&mut self, u: &Update, entries: &[Arc<Entry>]) -> Payload {
         let rev = Some(self.rev);
         let mut p = match u {
-            Update::Events { .. } => {
-                let mut p = Payload::new(self.rev, write::envelope("events", Some("events"), rev) + write::texts_len(entries.iter().map(|e| &**e)));
-                let _ = write::events(p.text(), entries.iter().map(|e| &**e), rev);
-                p
-            }
+            Update::Events { .. } => events_frame(self.rev, entries),
             Update::Stream { id, text } => {
                 // Its id and words as JSON strings, unescaped (escaping makes them longer).
                 let strings = r#""""#.len() + id.len() + r#","text":"#.len() + r#""""#.len() + text.len();
@@ -2165,7 +2388,7 @@ impl Mirror {
     }
 
     /// Takes in a changeset, whole (`whole`: the files it doesn't have are gone) or as what changed
-    /// in it, in place in the copy's ([`merge_changes`]). The files that didn't change stay as they
+    /// in it, in place in the copy's (`super::registry::merge_changes`). The files that didn't change stay as they
     /// were, shared with what viewers were last sent.
     pub fn take_changes(&mut self, set: Vec<Value>, gone: Vec<Value>, whole: bool) {
         let mut files: Vec<Arc<Entry>> = match self.changes.take() {
@@ -2177,7 +2400,23 @@ impl Mirror {
             let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(super::registry::file_ref).collect();
             files.retain(|f| kept.contains(&f.file()));
         }
-        merge_changes(&mut files, set, if whole { &[] } else { gone.as_slice() });
+        super::registry::merge_changes(&mut files, set, if whole { &[] } else { gone.as_slice() });
+        self.changes = Some(Arc::new(files));
+    }
+
+    /// [`Mirror::take_changes`] of files written out already (`set`, each its entry: off its owner's shard,
+    /// [`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
+    pub(super) fn take_change_entries(&mut self, set: Vec<Arc<Entry>>, gone: Vec<Value>, whole: bool) {
+        let mut files: Vec<Arc<Entry>> = match self.changes.take() {
+            // Its own, or (shared with its views) a list of the same files.
+            Some(all) => Arc::try_unwrap(all).unwrap_or_else(|shared| (*shared).clone()),
+            None => Vec::new(),
+        };
+        if whole {
+            let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(|f| f.file()).collect();
+            files.retain(|f| kept.contains(&f.file()));
+        }
+        super::registry::merge_change_entries(&mut files, set, if whole { &[] } else { gone.as_slice() });
         self.changes = Some(Arc::new(files));
     }
 
@@ -2191,7 +2430,7 @@ impl Mirror {
     /// or indexed anew; where those it keeps aren't its first ones (never, as a copy takes them in by number)
     /// its events and index are made again (goal 9, plan 01a1a87b2cec step 3).
     pub fn keep_through(&mut self, n: u64) {
-        let keeps = |m: &Meta| m.seq.is_some_and(|q| q <= n);
+        let keeps = |m: &Meta| m.seq().is_some_and(|q| q <= n);
         match self.events.keep_first(keeps) {
             Some(kept) => self.index.retain(|at| *at < kept),
             None => {
@@ -2207,12 +2446,12 @@ impl Mirror {
         let at = match self.index.get(&self.events, id) {
             Some(at) => at,
             None => {
-                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq())?;
                 if seq > top {
                     return None;
                 }
-                let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
-                self.events.meta(at).filter(|m| m.seq == Some(seq))?;
+                let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < seq));
+                self.events.meta(at).filter(|m| m.seq() == Some(seq))?;
                 at
             }
         };
@@ -2227,12 +2466,12 @@ impl Mirror {
         if self.index.get(&self.events, id).is_some_and(|at| at < self.events.len()) {
             return None;
         }
-        let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+        let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq())?;
         if seq > top {
             return None;
         }
-        let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
-        if self.events.meta(at).is_some_and(|m| m.seq == Some(seq)) {
+        let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < seq));
+        if self.events.meta(at).is_some_and(|m| m.seq() == Some(seq)) {
             return None;
         }
         Some(at)
@@ -2250,24 +2489,27 @@ impl Mirror {
     /// number: true when that one had another id (the timeline went another way), which its viewers
     /// can't see from the event alone.
     pub fn upsert(&mut self, e: Arc<Entry>) -> bool {
-        let Some(id) = e.id().map(str::to_owned) else { return false };
+        // Its id read where the entry keeps it, held by a reference of this call's own (goal 9, plan 01a1a87b2cec step
+        // 5: a copy of it was made for each event taken in).
+        let held = Arc::clone(&e);
+        let Some(id) = held.id() else { return false };
         let ev = Ev { entry: e, at: self.rev };
-        let found = self.index.get(&self.events, &id);
+        let found = self.index.get(&self.events, id);
         if found.is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
             return false;
         }
-        if let (Some(q), Some(top)) = (ev.entry.seq(), self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq))
+        if let (Some(q), Some(top)) = (ev.entry.seq(), self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq()))
             && q <= top
         {
-            let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < q));
-            if let Some(was) = self.events.meta(at).filter(|m| m.seq == Some(q)).map(|m| m.id().to_owned()) {
+            let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < q));
+            if let Some(was) = self.events.meta(at).filter(|m| m.seq() == Some(q)).map(|m| m.id().to_owned()) {
                 // Another id under that number, in its place: the index lets go of that one there and finds this one, the
                 // rest of it as it was (goal 9, plan 01a1a87b2cec step 3: it was made again, every event's id hashed, on the
                 // owner's shard). One that couldn't be changed leaves the copy, and so its index, as they were.
                 let displaced = self.events.change(at, |slot| *slot = ev.clone());
                 if displaced {
                     self.index.forget(&was, at);
-                    self.index.insert(&self.events, &id, at);
+                    self.index.insert(&self.events, id, at);
                 }
                 return displaced;
             }
@@ -2277,7 +2519,7 @@ impl Mirror {
         }
         let at = self.events.len();
         let sealed = self.events.push(ev);
-        self.index.insert(&self.events, &id, at);
+        self.index.insert(&self.events, id, at);
         if let Some(sealed) = sealed {
             seal(&sealed, self.home());
         }
@@ -2285,10 +2527,10 @@ impl Mirror {
             // From where a run of the digests begins, as its machine's timeline lets go of its
             // oldest (`crate::wire::sums::run_after`).
             let over = self.events.len() - MAX_EVENTS;
-            let drop = match self.events.meta(over).and_then(|m| m.seq) {
+            let drop = match self.events.meta(over).and_then(|m| m.seq()) {
                 Some(q) => {
                     let from = crate::wire::sums::run_after(q);
-                    self.events.partition_point(|m| m.seq.is_some_and(|s| s < from))
+                    self.events.partition_point(|m| m.seq().is_some_and(|s| s < from))
                 }
                 None => over,
             };
@@ -2374,9 +2616,28 @@ pub struct Shard {
     write: Option<Writing>,
     /// What was made of the event last written out so, or tried, for the update's next take alone ([`Shard::take_written`]).
     written: Option<Written>,
-    /// Events written out so ([`Shard::written_off`]): its tests' count.
+    /// Events written out so ([`Shard::written_off`]), counted for the tests that read it.
     #[cfg(test)]
     written_off: u64,
+    /// A frame of a session's events long to write (a large tool output's megabytes), with its session: written off the shard
+    /// and sent before anything after it is taken ([`Shard::want_frame`]; goal 9, plan 01a1a87b2cec step 3).
+    frame: Option<(String, Later)>,
+    /// Frames written so ([`Shard::framed_off`]), counted for the tests that read it.
+    #[cfg(test)]
+    framed_off: u64,
+    /// A session's changeset update long to write out ([`long_changes`]), the first of what's left of its messages: written
+    /// out off the shard before it's taken ([`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
+    changes_writing: Option<ChangesWriting>,
+    /// What was made of the changeset update last written out so, or tried, for that update's next take alone
+    /// ([`Shard::take_changes_written`]).
+    changes_written: Option<ChangesWritten>,
+    /// Changeset updates written out so ([`Shard::changes_off`]), counted for the tests that read it.
+    #[cfg(test)]
+    changes_off: u64,
+    /// How long each of its turns that took something held the shard ([`Turn::held`]), for the tests that read an owner's
+    /// turns.
+    #[cfg(test)]
+    turns: Vec<Duration>,
 }
 
 /// What its owner needs to write an event of session `session` out off the shard ([`Shard::want_write`]): whether a row of it
@@ -2479,6 +2740,87 @@ pub(super) fn wrote(e: &super::model::Event, took: Duration) {
     WRITES.learn(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX), nanos(took));
 }
 
+/// What writing a changeset update out takes by its bytes (`super::weigh`'s: its files' hunks), as the owners write them on
+/// their shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
+/// written out as its entry ([`Mirror::take_changes`]). A runner sends one of up to its harness frame's 512 KiB.
+static CHANGES: Rate = Rate::new();
+
+/// `u`'s bytes, as [`CHANGES`] counts them.
+fn changes_bytes(u: &Update) -> u64 {
+    u64::try_from(crate::memory::queue::Weigh::weight(u)).unwrap_or(u64::MAX)
+}
+
+/// Whether `u` is a changeset, or a changeset's patch, expected to hold its owner's shard past a slow poll to write out
+/// (`hyper_rt::slow::SLOW_POLL_NS`, as [`long_to_write`] judges an event): it's written on the compute pool instead
+/// ([`Shard::want_changes`]). None is until one was written: the first is written where it is, and learned.
+pub(super) fn long_changes(u: &Update) -> bool {
+    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && CHANGES.expected(changes_bytes(u)) > hyper_rt::slow::SLOW_POLL_NS
+}
+
+/// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
+pub(super) fn wrote_changes(u: &Update, took: Duration) {
+    CHANGES.learn(changes_bytes(u), nanos(took));
+}
+
+/// What its owner needs to write session `session`'s changeset update out off the shard ([`Shard::want_changes`]): whether its
+/// row for the conversation store is kept.
+struct ChangesWriting {
+    session: String,
+    keep: bool,
+}
+
+/// A session's changeset update written out off its owner's shard ([`Shard::want_changes`]), or tried, for its next take alone
+/// (`Registry::apply`).
+pub(super) struct ChangesWritten {
+    session: String,
+    /// None where it couldn't be written there: it's written where it is, as before, so an update always goes on.
+    pub(super) made: Option<ChangesMade>,
+}
+
+/// A changeset update written out as `Registry::apply` writes it: its files as the copy keeps them (each its entry,
+/// [`Mirror::take_change_entries`]), the keys of those gone, and its row for the conversation store where one is kept.
+pub(super) struct ChangesMade {
+    pub(super) set: Vec<Arc<Entry>>,
+    pub(super) gone: Vec<Value>,
+    pub(super) rows: Vec<crate::convo::rows::Row>,
+}
+
+/// Changeset update `u` of session `session` written out ([`ChangesMade`]), its row made when `keep`; and how long its files
+/// took, as [`CHANGES`] learns it.
+fn changes_made_of(session: &str, u: &Update, keep: bool) -> (ChangesMade, Duration) {
+    let rows = if keep { crate::convo::rows::of(session, u, crate::util::now_ms()) } else { Vec::new() };
+    let began = Instant::now();
+    let values = |files: &[super::model::FileChange]| files.iter().filter_map(|f| serde_json::to_value(f).ok()).map(|v| Arc::new(Entry::new(v))).collect::<Vec<_>>();
+    let (set, gone) = match u {
+        Update::Changes { files } => (values(files), Vec::new()),
+        Update::ChangesPatch { set, gone } => (values(set), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect()),
+        _ => (Vec::new(), Vec::new()),
+    };
+    (ChangesMade { set, gone, rows }, began.elapsed())
+}
+
+/// A frame of events `entries`, the copy's revision `rev`: `{"t":"events","events":[…],"rev":…}`, each event's text as it
+/// was written out once, copied in.
+fn events_frame(rev: u64, entries: &[Arc<Entry>]) -> Payload {
+    let said = Some(rev);
+    let mut p = Payload::new(rev, write::envelope("events", Some("events"), said) + write::texts_len(entries.iter().map(|e| &**e)));
+    let _ = write::events(p.text(), entries.iter().map(|e| &**e), said);
+    p.done();
+    p
+}
+
+/// A frame of a session's events among which its owner wrote one out off the shard ([`long_to_write`]: a large tool
+/// output's megabytes), as its copy went out ([`Mirror::commit_events`]): for its owner to write on the compute pool and
+/// send before it takes anything else, so the session's viewers have its frames in order (goal 9, plan 01a1a87b2cec step
+/// 3).
+pub(super) struct Later {
+    /// The generation of the session's feed whose viewers watched as its copy went out.
+    generation: u32,
+    /// The copy's revision then, and the events it took.
+    rev: u64,
+    entries: Vec<Arc<Entry>>,
+}
+
 impl Shard {
     pub fn bus(&self) -> &Arc<dyn kiln_seams::Bus> {
         &self.bus
@@ -2551,6 +2893,50 @@ impl Shard {
         self.written_off
     }
 
+    /// Session `id`'s update's frame is long to write ([`Mirror::commit_events`]): its owner writes it on the compute pool and
+    /// sends it before it takes anything else ([`own`]), where it was written on this shard, a large tool output's
+    /// megabytes copied in (goal 9, plan 01a1a87b2cec step 3).
+    pub(super) fn want_frame(&mut self, id: &str, later: Later) {
+        self.frame = Some((id.to_owned(), later));
+    }
+
+    /// How many frames of its sessions' events this owner wrote off its shard ([`Shard::want_frame`]).
+    #[cfg(test)]
+    pub(super) fn framed_off(&self) -> u64 {
+        self.framed_off
+    }
+
+    /// Session `id`'s changeset update is long to write out ([`long_changes`]: its files' JSON, a runner's up to 512 KiB of
+    /// hunks), and none of it was taken yet (`Registry::apply`): its owner writes it out on the compute pool before it takes
+    /// it ([`own`]), where each file was made a JSON tree and that written out on this shard (goal 9, plan 01a1a87b2cec step
+    /// 3). `keep`: its row for the conversation store is kept.
+    pub(super) fn want_changes(&mut self, id: &str, keep: bool) {
+        self.changes_writing = Some(ChangesWriting { session: id.to_owned(), keep });
+    }
+
+    /// What was made of session `id`'s changeset update written out off the shard ([`Shard::want_changes`]), or tried, for that
+    /// update as it comes back to it: its owner's next take alone has it.
+    pub(super) fn take_changes_written(&mut self, id: &str) -> Option<ChangesWritten> {
+        self.changes_written.take().filter(|w| w.session == id)
+    }
+
+    /// How many changeset updates this owner wrote out off its shard ([`Shard::want_changes`]).
+    #[cfg(test)]
+    pub(super) fn changes_off(&self) -> u64 {
+        self.changes_off
+    }
+
+    /// A turn ended, as what followed gave the shard up: one that took something held it `held` ([`Turn::held`]), kept for the
+    /// tests that read an owner's turns.
+    fn turned(&mut self, held: Duration, fresh: bool) {
+        #[cfg(test)]
+        if !fresh {
+            self.turns.push(held);
+        }
+        #[cfg(not(test))]
+        let _ = (held, fresh);
+    }
+
     pub fn get(&self, id: &str) -> Option<&Mirror> {
         self.mirrors.get(id)
     }
@@ -2612,7 +2998,12 @@ impl Shard {
     /// meanwhile spilled in turn; refused, they stay in memory as they were, said (goal 11, plan 01a1a87b2e56
     /// step 5). Either way the next spill may go.
     fn spilled(&mut self, id: &str, chunks: &[Arc<Chunk>], written: std::io::Result<(Arc<super::spill::File>, Vec<super::spill::Spilled>)>) {
-        let Some(m) = self.mirrors.get_mut(id) else { return };
+        // Its copy gone meanwhile: what was written is let go of off the shard, its file deleted there with its last chunk
+        // (goal 9, plan 01a1a87b2cec step 3).
+        let Some(m) = self.mirrors.get_mut(id) else {
+            let_go(written);
+            return;
+        };
         m.spilling = false;
         match written {
             Ok((file, spilled)) => {
@@ -2651,10 +3042,16 @@ impl Shard {
     /// Lets go of session `id`'s copy: its last view says it's gone (before its viewers are told,
     /// so one that joins after finds it gone), its viewers' feed ends ([`super::live::closed`]), and it
     /// leaves the board. Its feed's topic goes with its last viewer.
+    ///
+    /// That last view holds none of its events: no reader reads a closed view's (each finds it gone). The view before it,
+    /// the copy's events, its index and its spill file are let go of off the shard ([`let_go`]; goal 9, plan 01a1a87b2cec
+    /// step 3): a long copy's every chunk and event was freed on its owner's shard as the board let go of the closed view,
+    /// and its spill file deleted there.
     pub fn remove(&mut self, id: &str) -> Option<Mirror> {
         let mut m = self.mirrors.remove(id)?;
         self.board_changed = true;
-        m.slot.view.store(Arc::new(View { closed: true, ..m.view() }));
+        let last = m.slot.view.swap(Arc::new(View { closed: true, events: Events::default(), ..m.view() }));
+        let_go((last, std::mem::take(&mut m.events), std::mem::take(&mut m.index), m.spill_file.take()));
         if let Some(generation) = m.feed.watched() {
             m.feed.send_payload(generation, payload_of(super::live::closed(), 0));
         }
@@ -2698,6 +3095,26 @@ impl Shard {
                 }
             }
             Msg::Run(job) => job(self),
+            Msg::Each(mut each) => {
+                if each.left.is_none() {
+                    each.left = Some(self.mirrors.iter().filter(|(id, m)| (each.pick)(id, m)).map(|(id, _)| id.clone()).collect());
+                }
+                // A session at a time, the turn asked between them: the rest first at the next, nothing else between. Each is
+                // looked at again as it's taken, and passed over should it no longer be picked.
+                loop {
+                    let Some(id) = each.left.as_mut().and_then(Vec::pop) else {
+                        (each.step)(self, None);
+                        break;
+                    };
+                    if self.mirrors.get(&id).is_some_and(|m| (each.pick)(&id, m)) {
+                        (each.step)(self, Some(&id));
+                    }
+                    if each.left.as_ref().is_some_and(|l| !l.is_empty()) && over(0) {
+                        rest = Some(Msg::Each(each));
+                        break;
+                    }
+                }
+            }
             Msg::Runner(r) => {
                 if let Some(h) = hub {
                     rest = h.runner_update(self, *r, over).map(|i| Msg::Update(Box::new(i)));
@@ -2762,6 +3179,18 @@ pub struct RunnerUpdate {
 
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 
+/// A sweep of an owner's copies ([`Copies::on_each_session`]): each session `pick` picks taken by `step` in turn, then `step`
+/// once more with none, as it ends. Its owner takes it a session at a time across its turns, what's left of it first at its
+/// next turn, nothing else between (goal 9, plan 01a1a87b2cec step 3), where one job over every session of a shard held the
+/// shard for all of them: a machine's sessions said disconnected as it went, each one's info and state copied, encoded and
+/// published, tens of µs a session.
+pub struct Each {
+    /// The sessions picked as its owner first took it, those it hasn't taken yet: none picked until then.
+    left: Option<Vec<String>>,
+    pick: Box<dyn Fn(&str, &Mirror) -> bool + Send>,
+    step: Box<dyn FnMut(&mut Shard, Option<&str>) + Send>,
+}
+
 /// What an owner takes from its inbox.
 pub enum Msg {
     Update(Box<Ingest>),
@@ -2769,6 +3198,8 @@ pub enum Msg {
     Run(Job),
     /// An update from a session's runner, to judge and take ([`RunnerUpdate`]).
     Runner(Box<RunnerUpdate>),
+    /// A sweep of its copies, a session at a time ([`Each`]).
+    Each(Box<Each>),
 }
 
 impl crate::memory::queue::Weigh for Msg {
@@ -2778,6 +3209,7 @@ impl crate::memory::queue::Weigh for Msg {
         size_of::<Msg>().saturating_add(match self {
             Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
             Msg::Run(job) => size_of_val(&**job),
+            Msg::Each(each) => size_of::<Each>().saturating_add(size_of_val(&*each.pick)).saturating_add(size_of_val(&*each.step)).saturating_add(each.left.as_ref().map_or(0, |l| l.iter().map(|id| size_of::<String>().saturating_add(id.len())).fold(0, usize::saturating_add))),
             Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
         })
     }
@@ -2799,6 +3231,21 @@ struct Listed {
     boards: Vec<Weak<Board>>,
     infos: Vec<Bytes>,
     json: Bytes,
+    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
+    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
+    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
+    /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
+    /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
+    etag: Option<http::HeaderValue>,
+}
+
+/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
+/// could be there), else its digest now.
+fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
+    match prior.and_then(|p| p.digested.get(i)) {
+        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
+        _ => crate::http::compress::digest(info),
+    }
 }
 
 impl Listed {
@@ -2860,8 +3307,32 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None, write: None, written: None, #[cfg(test)]
-                written_off: 0 };
+            let shard = Shard {
+                me,
+                inbox: tx.downgrade(),
+                mirrors: HashMap::new(),
+                boards: Arc::clone(&boards),
+                bus: Arc::clone(&bus),
+                board_changed: false,
+                spill: Arc::clone(&spill),
+                thaw: None,
+                thawed: Weak::new(),
+                insert: None,
+                inserted: None,
+                write: None,
+                written: None,
+                #[cfg(test)]
+                written_off: 0,
+                frame: None,
+                #[cfg(test)]
+                framed_off: 0,
+                changes_writing: None,
+                changes_written: None,
+                #[cfg(test)]
+                changes_off: 0,
+                #[cfg(test)]
+                turns: Vec::new(),
+            };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
@@ -2917,8 +3388,17 @@ impl Copies {
     /// joined or copied (goal 10, plan 01a1a87b2dae steps 2 and 5). A read that finds a session come, gone
     /// or changed since joins it again, for itself and the reads after it.
     pub fn list_json(&self) -> Bytes {
-        if let Some(listed) = self.listed.load().as_ref().filter(|l| l.holds(&self.boards)) {
-            return listed.json.clone();
+        self.list_tagged().0
+    }
+
+    /// [`Copies::list_json`], and its weak ETag (`crate::http::compress::weak_etag`): named once for all the reads
+    /// that find the list as it was, of its infos' digests, each info digested once for every join that finds it
+    /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
+    /// session, while each state its agents send changes one session's info).
+    pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
+        let prior = self.listed.load_full();
+        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
+            return (listed.json.clone(), listed.etag.clone());
         }
         self.joins.fetch_add(1, Ordering::Relaxed);
         let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
@@ -2935,8 +3415,11 @@ impl Copies {
         }
         views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
         let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone() })));
-        json
+        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
+        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
+        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
+        (json, etag)
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
@@ -3019,6 +3502,38 @@ impl Copies {
         out
     }
 
+    /// `f` of each session `pick` picks, as a sweep of every owner's copies ([`Each`]): each owner takes its own after what was
+    /// sent it before, a session at a time across its turns, nothing else between, so no turn holds its shard for all of them
+    /// (goal 9, plan 01a1a87b2cec step 3: [`Copies::on_each`]'s job did). What it adds to a board or takes off it is published
+    /// before it answers. Its answers, every owner's, in no set order.
+    pub async fn on_each_session<R: Send + 'static>(&self, pick: impl Fn(&str, &Mirror) -> bool + Clone + Send + 'static, f: impl Fn(&mut Shard, &str) -> Option<R> + Clone + Send + 'static) -> Vec<R> {
+        let mut answers = Vec::with_capacity(self.inboxes.len());
+        for inbox in &self.inboxes {
+            let (tx, rx) = futures::channel::oneshot::channel::<Vec<R>>();
+            let (f, mut tx, mut out) = (f.clone(), Some(tx), Vec::new());
+            let step = move |s: &mut Shard, id: Option<&str>| match id {
+                Some(id) => out.extend(f(s, id)),
+                None => {
+                    s.publish_board();
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(std::mem::take(&mut out));
+                    }
+                }
+            };
+            let each = Each { left: None, pick: Box::new(pick.clone()), step: Box::new(step) };
+            if inbox.send(Msg::Each(Box::new(each))).await.is_ok() {
+                answers.push(rx);
+            }
+        }
+        let mut out = Vec::new();
+        for rx in answers {
+            if let Ok(r) = rx.await {
+                out.extend(r);
+            }
+        }
+        out
+    }
+
     /// Back once every owner has applied what was sent it before this.
     pub async fn settled(&self) {
         self.on_each(|_| ()).await;
@@ -3038,7 +3553,7 @@ fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     match msg {
         Msg::Update(i) => crate::wire::update_label(&i.u),
         Msg::Runner(r) => crate::wire::update_label(&r.update),
-        Msg::Run(_) => &WORK,
+        Msg::Run(_) | Msg::Each(_) => &WORK,
     }
 }
 
@@ -3048,6 +3563,9 @@ fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
 /// pieces, timed between the looks at them, as `crate::rt::Turns` times a loop's.
 struct Turn {
     began: Instant,
+    /// Its shard's thread's time on the CPU as it began, where the thread can say (`hyper_rt::futures::thread_run_ns`: a
+    /// few loads, no call): what tells the time it held the shard from the time the host held it ([`Turn::held`]).
+    cpu: Option<u64>,
     /// When an update's events were last looked at (the end of the last one taken, or the update's start), and the longest
     /// piece between two looks this turn.
     looked: Cell<Instant>,
@@ -3057,7 +3575,16 @@ struct Turn {
 impl Turn {
     fn new() -> Self {
         let now = Instant::now();
-        Self { began: now, looked: Cell::new(now), longest: Cell::new(Duration::ZERO) }
+        Self { began: now, cpu: hyper_rt::futures::thread_run_ns(), looked: Cell::new(now), longest: Cell::new(Duration::ZERO) }
+    }
+
+    /// How long it's held its shard so far: on the CPU where its thread says (step 3's bar is a poll's time there, the host's
+    /// left out), else on the clock.
+    fn held(&self) -> Duration {
+        match (self.cpu, hyper_rt::futures::thread_run_ns()) {
+            (Some(from), Some(now)) => Duration::from_nanos(now.saturating_sub(from)),
+            _ => self.began.elapsed(),
+        }
     }
 
     /// The shard's step quantum (`hyper_rt::futures::step_budget_ns`): none off a shard, where a turn never ends.
@@ -3152,7 +3679,7 @@ impl Costs {
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
-            Msg::Run(_) => return start,
+            Msg::Run(_) | Msg::Each(_) => return start,
         };
         match u {
             Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(self.tail.expected()),
@@ -3183,6 +3710,7 @@ impl Costs {
         let left = shard.take(msg, hub, &over);
         // What was written out off the shard for this take alone: one it didn't take (its update gone meanwhile) isn't kept.
         shard.written = None;
+        shard.changes_written = None;
         let end = Instant::now();
         self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
         if let Some(at) = ran_out.get() {
@@ -3258,6 +3786,83 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
     gave_up
 }
 
+/// The changeset update `writing` names, the first of what's left of its session's messages (`rest`), written out on the compute
+/// pool while the shard does its other work (goal 9, plan 01a1a87b2cec step 3): taken out of its message, not copied, and what
+/// was made of it kept for its next take ([`Shard::take_changes_written`]). Written, the update is let go of there, its files
+/// freed off the shard; one that couldn't be written goes back in its place, marked so, and is written where it is. Whether
+/// the shard was given up.
+async fn changes_off(shard: &mut Shard, writing: ChangesWriting, rest: &mut Option<Msg>) -> bool {
+    let Some(Msg::Update(i)) = rest.as_mut() else { return false };
+    // The update taken out, an empty one of its kind in its place till it's back.
+    let u = match &mut i.u {
+        Update::Changes { files } => Update::Changes { files: std::mem::take(files) },
+        Update::ChangesPatch { set, gone } => Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) },
+        _ => return false,
+    };
+    let ChangesWriting { session, keep } = writing;
+    let of = session.clone();
+    let (written, gave_up) = waited(crate::rt::compute(move || {
+        // Caught here, so the update comes back whatever.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| changes_made_of(&of, &u, keep))) {
+            Ok((made, took)) => {
+                let bytes = changes_bytes(&u);
+                (Some(made), None, bytes, took)
+            }
+            Err(_) => (None, Some(u), 0, Duration::ZERO),
+        }
+    }))
+    .await;
+    match written {
+        Ok((made, back, bytes, took)) => {
+            if made.is_some() {
+                CHANGES.learn(bytes, nanos(took));
+                #[cfg(test)]
+                {
+                    shard.changes_off = shard.changes_off.saturating_add(1);
+                }
+            }
+            if let Some(u) = back {
+                i.u = u;
+            }
+            shard.changes_written = Some(ChangesWritten { session, made });
+        }
+        Err(err) => {
+            // The pool dropped the job unrun (the process is going), the update with it: the copy keeps the changeset it had,
+            // and its runner sends it again as it changes.
+            tracing::error!(session = %session, error = %format!("{err:#}"), "a session's changeset was lost being written out off its owner's shard");
+            *rest = None;
+        }
+    }
+    gave_up
+}
+
+/// Session `id`'s frame `later` ([`Shard::want_frame`]: a large tool output's megabytes) written on the compute pool while the
+/// shard does its other work, then sent to the viewers who watched as its copy went out (goal 9, plan 01a1a87b2cec step 3):
+/// its entries let go of there too. One the pool couldn't write (its job panicked, or was dropped as the process goes) sends
+/// those viewers back to the copy instead (the feed's resync marker), which has its events: none goes on without them.
+/// Whether the shard was given up.
+async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
+    let Later { generation, rev, entries } = later;
+    let (made, gave_up) = waited(crate::rt::compute(move || events_frame(rev, &entries))).await;
+    let p = match made {
+        Ok(p) => {
+            #[cfg(test)]
+            {
+                shard.framed_off = shard.framed_off.saturating_add(1);
+            }
+            p
+        }
+        Err(e) => {
+            tracing::warn!(session = %id, error = %format!("{e:#}"), "a session's frame couldn't be written off its owner's shard: its viewers start over from its copy");
+            payload_of(super::live::RESYNC, 0)
+        }
+    };
+    if let Some(m) = shard.get_mut(id) {
+        m.feed.send_payload(generation, p);
+    }
+    gave_up
+}
+
 /// A shard's owner: its messages, in the order they came, as fast as they come, in turns of its shard (the HTTP listener may
 /// share it), each a poll of its own within the shard's step quantum ([`Turn`]; goal 9, plan 01a1a87b2cec step 3). It waits on
 /// nothing but its inbox, and ends with it. A turn takes its first piece whatever that's expected to take (so each takes
@@ -3267,6 +3872,9 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
 /// another task wants it: one that went on while none did (`crate::rt::Turns::after`, `maybe_yield`) ran on in the same poll,
 /// which the shards' table counted whole (the lab's g9p9 fill: this owner's polls past 100 µs, 0.7 to 1.6 ms on average by
 /// round, the longest 7 to 53 ms on the CPU, each labeled by a message of its last turn alone).
+///
+/// A turn ends where what follows it gives the shard up: an inbox's wait that pended, a pool's await, a yield; each turn
+/// that took something is said ended there ([`Shard::turned`]), as long as it held the shard ([`Turn::held`]).
 async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut costs = Costs::default();
     let mut turn = Turn::new();
@@ -3283,15 +3891,19 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 // None waiting: waiting for one gives the shard to its other work, so a turn starts afresh once one comes
                 // (else an update after a quiet spell would find its turn spent already). One that came as it asked is this
                 // turn's still.
-                Err(async_channel::TryRecvError::Empty) => match waited(rx.recv()).await {
-                    (Ok(msg), gave_up) => {
-                        if gave_up {
-                            (turn, fresh) = (Turn::new(), true);
+                Err(async_channel::TryRecvError::Empty) => {
+                    let held = turn.held();
+                    match waited(rx.recv()).await {
+                        (Ok(msg), gave_up) => {
+                            if gave_up {
+                                shard.turned(held, fresh);
+                                (turn, fresh) = (Turn::new(), true);
+                            }
+                            msg
                         }
-                        msg
+                        (Err(_), _) => return,
                     }
-                    (Err(_), _) => return,
-                },
+                }
             },
         };
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
@@ -3314,16 +3926,29 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 hyper_rt::futures::label(label);
             }
             rest = left;
-            if rest.is_none() {
+            // Nothing after a frame that waits to be written off the shard (below) goes before it.
+            if rest.is_none() && shard.frame.is_none() {
                 next = rx.try_recv().ok();
             }
         }
         drop(h);
+        // A frame of an update's events long to write (a large tool output's megabytes): written on the compute pool, the
+        // shard given up meanwhile, and sent before anything after it is taken, so its session's viewers have its frames in
+        // order (goal 9, plan 01a1a87b2cec step 3). This owner's next messages wait for it, as they waited for it to be
+        // written here.
+        if let Some((id, later)) = shard.frame.take() {
+            let held = turn.held();
+            if frame_off(&mut shard, &id, later).await {
+                shard.turned(held, fresh);
+                (turn, fresh) = (Turn::new(), true);
+            }
+        }
         // A change to an event of a compact chunk: that chunk read back on the blocking pool, the shard given up meanwhile,
         // before the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3). This owner's next messages wait for it,
         // as they waited for it to be read back here.
         if let Some((id, chunk)) = shard.thaw.take() {
             let c = Arc::clone(&chunk);
+            let held = turn.held();
             let (read, gave_up) = waited(crate::rt::blocking(move || c.evs().map(|evs| Chunk::of(evs.into_owned())))).await;
             match read {
                 Ok(Ok(made)) => {
@@ -3339,6 +3964,7 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 }
             }
             if gave_up {
+                shard.turned(held, fresh);
                 (turn, fresh) = (Turn::new(), true);
             }
         }
@@ -3349,6 +3975,7 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
             shard.inserted = Some((id.clone(), e.id.clone()));
             if let Some(was) = shard.get(&id).map(|m| m.events.clone()) {
                 let from = was.clone();
+                let held = turn.held();
                 let (made, gave_up) = waited(crate::rt::blocking(move || from.inserted(at, Ev { entry: Arc::new(Entry::of_event(&e, None)), at: rev }))).await;
                 match made {
                     Ok((made, index)) => {
@@ -3357,16 +3984,28 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                     Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's events couldn't be made again off its shard: the event goes in where they are"),
                 }
                 if gave_up {
+                    shard.turned(held, fresh);
                     (turn, fresh) = (Turn::new(), true);
                 }
             }
         }
         // An event long to write out (a large tool output): written on the compute pool, the shard given up meanwhile, before
         // the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3).
-        if let Some(writing) = shard.write.take()
-            && write_off(&mut shard, writing, &mut rest).await
-        {
-            (turn, fresh) = (Turn::new(), true);
+        if let Some(writing) = shard.write.take() {
+            let held = turn.held();
+            if write_off(&mut shard, writing, &mut rest).await {
+                shard.turned(held, fresh);
+                (turn, fresh) = (Turn::new(), true);
+            }
+        }
+        // A changeset long to write out (its files' JSON, and its row for the store): written on the compute pool, the shard
+        // given up meanwhile, before its update is taken (goal 9, plan 01a1a87b2cec step 3).
+        if let Some(writing) = shard.changes_writing.take() {
+            let held = turn.held();
+            if changes_off(&mut shard, writing, &mut rest).await {
+                shard.turned(held, fresh);
+                (turn, fresh) = (Turn::new(), true);
+            }
         }
         // The turn spent with more to take: the shard given up, whether or not another task wants it, so each turn is a poll
         // of its own. With nothing to take, the inbox's wait gives it up.
@@ -3377,7 +4016,9 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         // wait in the store's queue instead, as many as would have waited in its inbox, and what hands it updates
         // waits past that (`crate::harness::registry::Registry::from_runner`, `ingest_from`).
         if rest.is_some() && !fresh {
+            let held = turn.held();
             hyper_rt::futures::yield_now().await;
+            shard.turned(held, fresh);
             (turn, fresh) = (Turn::new(), true);
         }
     }
@@ -3465,7 +4106,7 @@ mod tests {
             flat.push(s);
         }
         let seqs = |e: &Events| e.iter().filter_map(|e| e.entry.seq()).collect::<Vec<_>>();
-        let metas = |e: &Events| e.metas().filter_map(|m| m.seq).collect::<Vec<_>>();
+        let metas = |e: &Events| e.metas().filter_map(|m| m.seq()).collect::<Vec<_>>();
         assert_eq!(seqs(&events), flat);
         assert_eq!(metas(&events), flat);
         assert_eq!(events.len(), flat.len());
@@ -3476,7 +4117,7 @@ mod tests {
         assert_eq!(events.get(CHUNK + 1).map(|e| e.at), Some(0));
         assert_eq!(events.meta(CHUNK + 1).map(|m| m.at), Some(0), "its meta with it");
         // In the middle, by number.
-        let at = events.partition_point(|m| m.seq.is_some_and(|s| s < 10));
+        let at = events.partition_point(|m| m.seq().is_some_and(|s| s < 10));
         events.insert(at, Ev { entry: entry("between", 10), at: 0 });
         flat.insert(at, 10);
         assert_eq!(seqs(&events), flat);
@@ -3488,14 +4129,14 @@ mod tests {
         // Each place still finds its event once the first chunk holds fewer.
         for (i, want) in flat.iter().enumerate() {
             assert_eq!(events.get(i).and_then(|e| e.entry.seq()), Some(*want), "event {i}");
-            assert_eq!(events.meta(i).and_then(|m| m.seq), Some(*want), "meta {i}");
+            assert_eq!(events.meta(i).and_then(|m| m.seq()), Some(*want), "meta {i}");
         }
         for s in n + 1..=n + 3 {
             events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
             flat.push(s);
         }
         assert_eq!(seqs(&events), flat);
-        events.retain(|m| m.seq.is_some_and(|s| s % 2 == 0));
+        events.retain(|m| m.seq().is_some_and(|s| s % 2 == 0));
         flat.retain(|s| s % 2 == 0);
         assert_eq!(seqs(&events), flat);
         assert_eq!(events.last().and_then(|e| e.entry.seq()), flat.last().copied());
@@ -3576,9 +4217,9 @@ mod tests {
         let joined = String::from_utf8(super::super::packed::inflate(&seg)?)?;
         assert_eq!(u64::try_from(joined.len()).unwrap_or(0), seg.len);
         assert_eq!(seg.crc, crc32fast::hash(joined.as_bytes()));
-        for (m, e) in chunk.metas().iter().zip(chunk.evs()?.iter()) {
-            assert_eq!(joined.get(m.off..m.off + m.len), Some(e.entry.text()), "{}", m.id());
-            assert_eq!((m.seq, m.sum(e), m.id()), (e.entry.seq(), e.entry.sum(), e.entry.id().unwrap_or_default()));
+        for (k, (m, e)) in chunk.metas().iter().zip(chunk.evs()?.iter()).enumerate() {
+            assert_eq!(chunk.span(k, 1).and_then(|r| joined.get(r)), Some(e.entry.text()), "{}", m.id());
+            assert_eq!((m.seq(), m.sum(e), m.id()), (e.entry.seq(), e.entry.sum(), e.entry.id().unwrap_or_default()));
         }
         Ok(())
     }
@@ -3859,7 +4500,9 @@ mod tests {
         let long = CHUNK + 9 + 5;
         anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
         anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 2, "still not kept: an older chunk's never are");
+        // Made with the older one: the newest compact chunk read again too, as the page reaches back past what its reads kept
+        // (only what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and kept from there.
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 3, "still not kept: an older chunk's never are");
         // An event with no number: the copy can't say the page (the store answers it), kept or not.
         m.rev = n + 1;
         m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
@@ -3956,11 +4599,11 @@ mod tests {
         sealed.pack()?;
         let mut compact = sealed.compacted().ok_or_else(|| anyhow::anyhow!("a packed chunk kept compact"))?;
         compact.paged.store(true, Ordering::SeqCst);
-        let texts = compact.page_texts()?;
+        let (_, texts) = compact.page_texts(0)?;
         anyhow::ensure!(compact.texts.get().is_some() && compact.page_kept() == Some(texts.len()), "a page's read keeps its texts");
         anyhow::ensure!(compact.change(0, |_| {}), "changed in place");
         anyhow::ensure!(compact.texts.get().is_none() && compact.page_kept().is_none(), "changed, its cell let go of whole");
-        anyhow::ensure!(compact.page_texts()? == texts && compact.texts.get().is_none(), "read again: the same texts, no cell made");
+        anyhow::ensure!(compact.page_texts(0)?.1 == texts && compact.texts.get().is_none(), "read again: the same texts, no cell made");
         Ok(())
     }
 
@@ -4408,7 +5051,7 @@ mod tests {
             }
             copies.settled().await;
             for id in &sessions {
-                let got = copies.with(id, |v| v.events.metas().filter_map(|m| m.seq).collect::<Vec<_>>()).unwrap_or_default();
+                let got = copies.with(id, |v| v.events.metas().filter_map(|m| m.seq()).collect::<Vec<_>>()).unwrap_or_default();
                 let want: Vec<u64> = (1..=per).collect();
                 anyhow::ensure!(got == want, "{id}: {} of {per} changes, in order: {}", got.len(), got == want);
                 anyhow::ensure!(copies.with(id, |v| v.rev) == Some(per), "{id}'s revision");
@@ -4529,7 +5172,7 @@ mod tests {
             let mut m = compact_copy(n)?;
             let before = m.events.chunks().to_vec();
             let mut want = m.events.clone();
-            want.retain(|e| e.seq.is_some_and(|q| q <= since));
+            want.retain(|e| e.seq().is_some_and(|q| q <= since));
             let was = inflated();
             m.keep_through(since);
             let read = inflated().saturating_sub(was);
@@ -4544,7 +5187,7 @@ mod tests {
                 m.rev += 1;
                 m.upsert(entry(&format!("e{q}"), q));
             }
-            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq).collect();
+            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq()).collect();
             anyhow::ensure!(seqs == (1..=since + 3).collect::<Vec<_>>(), "going on from {since}, it goes on: {seqs:?}");
             anyhow::ensure!(m.index.get(&m.events, &format!("e{}", since + 3)) == Some(m.events.len().saturating_sub(1)), "the newest indexed where it is");
         }
@@ -4657,7 +5300,7 @@ mod tests {
                     let was = inflated();
                     m.rev += 1;
                     m.upsert(entry(&format!("e{}", bound + 1), bound + 1));
-                    Some((inflated() - was, m.events.len(), m.events.meta(0).and_then(|x| x.seq)))
+                    Some((inflated() - was, m.events.len(), m.events.meta(0).and_then(|x| x.seq())))
                 })
                 .await
                 .flatten();
@@ -4671,7 +5314,7 @@ mod tests {
                 let now = copies
                     .on(&id, move |s| {
                         let m = s.get_mut(&i)?;
-                        let seqs: Vec<u64> = m.events.metas().filter_map(|x| x.seq).collect();
+                        let seqs: Vec<u64> = m.events.metas().filter_map(|x| x.seq()).collect();
                         let index = m.index.clone();
                         m.reindex();
                         Some((seqs, index == m.index, m.index.get(&m.events, &format!("e{}", bound + 1))))
@@ -4810,25 +5453,25 @@ mod tests {
             let kept = Id::of(id);
             assert_eq!(kept.as_str(), id, "read back as it was");
             assert_eq!(matches!(kept, Id::Inline { .. }), id.len() <= ID_INLINE, "{id:?} ({} bytes) kept in the meta", id.len());
-            let m = Meta::of(&Ev { entry: entry(id, 1), at: 0 }, 0);
+            let m = Meta::of(&Ev { entry: entry(id, 1), at: 0 });
             assert_eq!(m.id(), id);
         }
         assert!(size_of::<Id>() <= 40 && size_of::<Meta>() <= 96, "an id {} bytes, a meta {}", size_of::<Id>(), size_of::<Meta>());
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta's digest takes 8 bytes, where a `OnceLock<u64>` took 16:
-    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta is 88
-    /// bytes, against 96: about 0.4 MB less for the lab's realistic profile's 47,000 or so events kept.
+    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta was 88
+    /// bytes then, against 96 (72 now: `g11_s5_heap_a_meta_is_seventy_two_bytes`).
     #[test]
     fn g11_s5_heap_a_metas_digest_takes_eight_bytes() {
         let ev = Ev { entry: entry("e1", 1), at: 0 };
-        let m = Meta::of(&ev, 0);
+        let m = Meta::of(&ev);
         assert_eq!(m.sum_made(), None, "none made as it came in");
         let made = m.sum(&ev);
         assert_eq!((made, m.sum_made()), (ev.entry.sum(), Some(ev.entry.sum())), "made, then kept");
         let copy = m.clone();
         assert!(copy.sum_made() == Some(made) && copy == m, "a clone keeps it");
-        assert_ne!(Meta::of(&ev, 0), m, "one made and one not aren't equal, as with a OnceLock");
+        assert_ne!(Meta::of(&ev), m, "one made and one not aren't equal, as with a OnceLock");
         assert!(size_of::<Meta>() <= 88, "a meta takes {} bytes", size_of::<Meta>());
     }
 
@@ -4855,6 +5498,114 @@ mod tests {
         }
         index.drop_front(1);
         assert_eq!((index.get(&events, "e1"), index.by_hash.len()), (None, 2), "the oldest let go of");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta is 72 bytes. It keeps no offset (where an event's text
+    /// begins is reckoned from the lengths before it), and whether its event has a number in its length's top bit,
+    /// where an `Option<u64>` took 16 bytes. A compact chunk's 70 metas take 5,040 bytes, within jemalloc's
+    /// 5,120-byte size class, where at 88 bytes they took 6,160 (its 7,168-byte class). Numbers (none, 0, the most
+    /// a `u64` holds), lengths, offsets and spans read as the texts joined say.
+    #[test]
+    fn g11_s5_heap_a_meta_is_seventy_two_bytes() -> anyhow::Result<()> {
+        assert_eq!(size_of::<Meta>(), 72, "a meta takes {} bytes", size_of::<Meta>());
+        assert!(CHUNK * size_of::<Meta>() <= 5 << 10, "a chunk's metas take {} bytes", CHUNK * size_of::<Meta>());
+        for seq in [1, 0, u64::MAX] {
+            let ev = Ev { entry: entry("e", seq), at: 3 };
+            let m = Meta::of(&ev);
+            assert_eq!((m.seq(), m.text_len(), m.at), (Some(seq), ev.entry.text().len(), 3), "numbered {seq}");
+        }
+        let bare = Ev { entry: Arc::new(Entry::new(json!({"id": "n", "kind": "notice", "text": "no number"}))), at: 0 };
+        let m = Meta::of(&bare);
+        assert_eq!((m.seq(), m.text_len()), (None, bare.entry.text().len()), "no number");
+        let evs: Vec<Ev> = (1..=5).map(|q| Ev { entry: entry(&format!("e{q}"), q * 1_000), at: q }).collect();
+        let chunk = Chunk::of(evs.clone());
+        let joined = String::from_utf8(chunk.joined()?.into_owned())?;
+        anyhow::ensure!(chunk.texts_len() == joined.len(), "its texts joined: {} bytes, not {}", joined.len(), chunk.texts_len());
+        let texts: Vec<&str> = evs.iter().map(|e| e.entry.text()).collect();
+        for (k, text) in texts.iter().enumerate() {
+            anyhow::ensure!(chunk.off(k) == texts.iter().take(k).map(|t| t.len() + 1).sum::<usize>(), "event {k} begins past those before it");
+            anyhow::ensure!(chunk.span(k, 1).and_then(|r| joined.get(r)) == Some(*text), "event {k}'s text");
+        }
+        anyhow::ensure!(chunk.span(1, 3).and_then(|r| joined.get(r)) == texts.get(1..4).map(|t| t.join(",")).as_deref(), "events 1 to 3 joined");
+        anyhow::ensure!(chunk.span(5, 1).is_none() && chunk.span(0, 0).is_none() && chunk.span(4, 2).is_none(), "nothing past its events");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a copy's events read one after another ([`Reading`]), from the
+    /// newest back as a window reads them, read each compact chunk again once for all of its events, where
+    /// `Events::get` reads it again for each: the same events, and none past them.
+    #[test]
+    fn g11_s5_heap_events_read_in_turn_read_each_compact_chunk_once() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut events = Events::default();
+        let n = CHUNK * 3 + 5;
+        for q in 1..=u64::try_from(n)? {
+            events.push(Ev { entry: entry(&format!("e{q}"), q), at: q });
+        }
+        for c in events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        events.compact(None);
+        let compact = events.chunks().iter().filter(|c| c.is_compact()).count();
+        anyhow::ensure!(compact == 3, "three compact chunks: {compact}");
+        let want: Vec<String> = (0..n).filter_map(|i| events.get(i).map(|e| e.entry.text().to_owned())).collect();
+        let was = inflated();
+        let mut reading = events.reading();
+        let mut got: Vec<String> = (0..n).rev().filter_map(|i| reading.get(i).map(|e| e.entry.text().to_owned())).collect();
+        got.reverse();
+        anyhow::ensure!(got == want && got.len() == n, "the same events");
+        anyhow::ensure!(usize::try_from(inflated() - was)? == compact, "each compact chunk read again once: {}", inflated() - was);
+        anyhow::ensure!(reading.get(n).is_none(), "none past them");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the newest compact chunk keeps of its texts only those its copy's
+    /// newest page's reads reached back to. With nine events in the open chunk, a page of 30 keeps the compact chunk's
+    /// last 21 (inflated once); a page of 20 reaches less far back and takes a slice of them (nothing inflated); a page
+    /// of 50 reaches further, inflates once more and keeps its last 41; a page of 30 again takes a slice of those. Each
+    /// page reads as the events' texts joined, and a page that reaches past the newest compact chunk keeps nothing of
+    /// the older one.
+    #[test]
+    fn g11_s5_heap_a_page_keeps_the_texts_its_reads_reach_back_to() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Two sealed chunks and the newest open with nine.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        let texts: Vec<String> = view.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = |limit: usize| format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(limit)..).unwrap_or_default().join(","));
+        let (older, compact) = (view.events.chunks().first().ok_or_else(|| anyhow::anyhow!("no chunk"))?, view.events.chunks().get(1).ok_or_else(|| anyhow::anyhow!("one chunk"))?);
+        anyhow::ensure!(compact.is_compact() && older.is_compact(), "two compact chunks");
+        // The bytes of the compact chunk's texts joined from its last `events` on.
+        let suffix = |events: usize| -> Option<usize> { Some(compact.texts_len() - compact.off(compact.metas().len().checked_sub(events)?)) };
+        let read = |limit: usize| -> anyhow::Result<()> {
+            let got = view.events_json(None, limit).ok_or_else(|| anyhow::anyhow!("a page of {limit} from memory"))?;
+            anyhow::ensure!(String::from_utf8_lossy(&got) == page(limit), "a page of {limit}: the events' texts joined");
+            Ok(())
+        };
+        let was = inflated();
+        read(30)?;
+        anyhow::ensure!(inflated() == was + 1 && compact.page_kept() == suffix(21), "a page of 30: its last 21 kept ({:?})", compact.page_kept());
+        read(20)?;
+        anyhow::ensure!(inflated() == was + 1 && compact.page_kept() == suffix(21), "a page of 20: a slice of them, nothing inflated");
+        read(50)?;
+        anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 50: inflated once more, its last 41 kept ({:?})", compact.page_kept());
+        read(30)?;
+        anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 30 again: a slice of the longer");
+        anyhow::ensure!(suffix(41) < suffix(70), "less than the whole chunk's texts");
+        // A page into the older compact chunk: it's inflated for that read and keeps nothing.
+        read(100)?;
+        anyhow::ensure!(older.page_kept().is_none() && compact.page_kept() == suffix(70), "the older keeps nothing; the newest compact chunk's whole kept");
+        Ok(())
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: the index finds each id where it is, checked against the id its event's
@@ -4902,7 +5653,7 @@ mod tests {
             m.rev = q;
             m.upsert(entry(&format!("e{q}"), q));
         }
-        assert!(m.events.len() < usize::try_from(n).unwrap_or(0) && m.events.meta(0).and_then(|x| x.seq).is_some_and(|q| q > 1), "its oldest went");
+        assert!(m.events.len() < usize::try_from(n).unwrap_or(0) && m.events.meta(0).and_then(|x| x.seq()).is_some_and(|q| q > 1), "its oldest went");
         assert_eq!(m.index.get(&m.events, "e1"), None, "one let go of isn't found");
         for (at, meta) in m.events.metas().enumerate() {
             assert_eq!(m.index.get(&m.events, meta.id()), Some(at), "{}", meta.id());
@@ -4917,7 +5668,7 @@ mod tests {
 
     /// A turn begun at `t0`, as `Turn::new` begins one.
     fn turn_at(t0: Instant) -> Turn {
-        Turn { began: t0, looked: Cell::new(t0), longest: Cell::new(Duration::ZERO) }
+        Turn { began: t0, cpu: None, looked: Cell::new(t0), longest: Cell::new(Duration::ZERO) }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a turn takes pieces while the next (as long as the longest yet, or as what's expected
@@ -5044,10 +5795,14 @@ mod tests {
         assert!(made_of("s", &e, false, "/work", &Location::Local).row.is_none(), "none where no row is kept");
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: an owner takes a long update in turns that each give its shard up: a task on the same
-    /// shard that always wants it runs between them, about a quantum apart (the median gap within four quanta, whatever the
-    /// host does to a few of them; the update whole took a poll of tens of milliseconds), and a job sent behind the update
-    /// finds every one of its events in the copy, in order, none lost.
+    /// Goal 9, plan 01a1a87b2cec step 3: an owner takes a long update in turns that each give its shard up and each hold it a
+    /// quantum at most: a task on the same shard that always wants it runs between them, the owner's turns took the shard a
+    /// quantum or less at the median by its own clock (on the CPU where its shard's thread says, the host's time left out;
+    /// the update whole took a poll of tens of milliseconds), and a job sent behind the update finds every one of its events
+    /// in the copy, in order, none lost. The other task's runs aren't timed: the unit tests share the runtime's two shards,
+    /// and the tests that keep every shard busy on purpose ran their tasks between the owner's turns too (its runs 1.29 ms
+    /// apart at the median beside them, 11-06), which goal 4's guard (`crate::hub::tests::shards_timed`) keeps apart from
+    /// this one besides.
     #[test]
     fn g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
@@ -5064,46 +5819,57 @@ mod tests {
                     s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
                 })
                 .await;
-            // A task on the owner's shard that always wants it, noting when it runs.
+            // A task on the owner's shard that always wants it, counting its runs.
             let (stop, runs) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
-            let (tx, rx) = futures::channel::oneshot::channel::<Vec<Instant>>();
+            let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let witness = {
                 let (stop, runs) = (Arc::clone(&stop), Arc::clone(&runs));
                 async move {
-                    let mut at = Vec::new();
                     while !stop.load(Ordering::SeqCst) {
-                        at.push(Instant::now());
                         runs.fetch_add(1, Ordering::SeqCst);
                         hyper_rt::futures::yield_now().await;
                     }
-                    let _ = tx.send(at);
+                    let _ = tx.send(());
                 }
             };
             anyhow::ensure!(crate::rt::spawn_on(copies.owner_of(&id), witness), "a task on the owner's shard");
+            // As the owner has them: the copy's revision and events, the other task's runs, and how many of its turns it said ended.
             let read = |copies: Arc<Copies>, id: String, runs: Arc<AtomicU64>| async move {
                 let i = id.clone();
-                copies.on(&id, move |s| s.get(&i).map(|m| (m.rev, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), runs.load(Ordering::SeqCst)))).await.flatten()
+                copies
+                    .on(&id, move |s| {
+                        let turned = s.turns.len();
+                        s.get(&i).map(|m| (m.rev, m.events.metas().filter_map(|x| x.seq()).collect::<Vec<u64>>(), runs.load(Ordering::SeqCst), turned))
+                    })
+                    .await
+                    .flatten()
             };
-            let Some((rev, _, ran)) = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await else { anyhow::bail!("no copy") };
+            let Some((rev, _, ran, turned)) = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await else { anyhow::bail!("no copy") };
             let n = u64::try_from(MAX_EVENTS)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
             let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new() };
             anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(update))).await, "sent");
             let after = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await;
             stop.store(true, Ordering::SeqCst);
-            let at = rx.await?;
-            let Some((now, seqs, ran_after)) = after else { anyhow::bail!("no copy") };
+            rx.await?;
+            let Some((now, seqs, ran_after, turned_after)) = after else { anyhow::bail!("no copy") };
             anyhow::ensure!(seqs == (1..=n).collect::<Vec<u64>>(), "every event, in order: {} of {n}", seqs.len());
             // Each turn of the update took its events in one apply, and counted one revision.
             let turns = now.saturating_sub(rev);
             let between = ran_after.saturating_sub(ran);
             anyhow::ensure!(turns >= 4 && between >= turns / 2, "{turns} turns, the other task run {between} times between them");
-            let during = at.get(usize::try_from(ran)?..usize::try_from(ran_after)?).unwrap_or_default();
-            let mut gaps: Vec<Duration> = during.windows(2).filter_map(|w| Some(w.get(1)?.saturating_duration_since(*w.first()?))).collect();
-            gaps.sort();
-            let median = gaps.get(gaps.len() / 2).copied().unwrap_or_default();
+            // How long the owner held its shard in each of its turns as it took the update (but its last, which the read after
+            // it ended).
+            let mut held = copies.on(&id, move |s| s.turns.get(turned..turned_after).map(<[Duration]>::to_vec)).await.flatten().unwrap_or_default();
+            held.sort();
             let quantum = Duration::from_nanos(hyper_rt::futures::step_budget_ns().unwrap_or(crate::rt::STEP_BUDGET_NS));
-            anyhow::ensure!(median <= quantum * 4, "the other task ran {median:?} apart at the median ({} gaps), the quantum {quantum:?}", gaps.len());
+            let median = held.get(held.len() / 2).copied().unwrap_or_default();
+            anyhow::ensure!(
+                u64::try_from(held.len())?.saturating_add(1) >= turns && median <= quantum,
+                "{turns} turns of the update, {} said ended; they held the shard {median:?} at the median, the longest {:?}, the quantum {quantum:?}",
+                held.len(),
+                held.last()
+            );
             Ok(())
         })
     }
@@ -5137,7 +5903,7 @@ mod tests {
             let now = copies
                 .on(&id, move |s| {
                     let off = s.written_off();
-                    s.get(&i).map(|m| (off, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), m.events.get(9).map(|e| e.entry.text().len()), m.index.get(&m.events, "e10"), m.index.get(&m.events, "e11")))
+                    s.get(&i).map(|m| (off, m.events.metas().filter_map(|x| x.seq()).collect::<Vec<u64>>(), m.events.get(9).map(|e| e.entry.text().len()), m.index.get(&m.events, "e10"), m.index.get(&m.events, "e11")))
                 })
                 .await
                 .flatten();
@@ -5171,7 +5937,7 @@ mod tests {
     /// Whether session `id`'s copy, as its readers find it, took changes 1 to `to` (and none of another's), once each and
     /// in order: what it holds when it didn't.
     fn took_in_order(copies: &Copies, id: &str, to: u64) -> Result<(), String> {
-        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq)).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
+        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq())).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
         let want: Vec<(String, Option<u64>)> = (1..=to).map(|n| (format!("{id}-{n}"), Some(n))).collect();
         if events == want && rev == to {
             return Ok(());
@@ -5359,6 +6125,362 @@ mod tests {
                 }
                 anyhow::ensure!(copies.ids().len() == count, "{owners} owners: {} sessions found of {count}", copies.ids().len());
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a changeset's frame past what the bus takes (`kiln_seams::bus::PAYLOAD_MAX`: a long
+    /// session's whole changeset, with nothing before it to patch) isn't written: its viewers are sent back to the copy (the
+    /// feed's resync marker), where the bus would have refused it, and the next goes as what changed since, a frame the bus
+    /// takes. One the bus takes goes as it went.
+    #[test]
+    fn g9_s3_a_changesets_frame_past_what_the_bus_takes_sends_its_viewers_back_to_the_copy() -> anyhow::Result<()> {
+        let bus = sim_bus();
+        let mut m = Mirror::new(Info::default(), Location::Local, Arc::clone(&bus));
+        let (_viewer, at) = m.feed.attach(super::super::registry::Patches { state: true, changes: true });
+        let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
+        let file = |path: &str, text: String| json!({"path": path, "added": 1, "removed": 0, "hunks": [{"old_start": 1, "old_lines": 0, "new_start": 1, "new_lines": 1, "lines": [text]}], "at": 1});
+        // Two files whose changes together pass what the bus takes.
+        let half = "+x".repeat(kiln_seams::bus::PAYLOAD_MAX / 4 + 1);
+        m.take_changes(vec![file("a.rs", half.clone()), file("b.rs", half)], Vec::new(), true);
+        let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        m.feed.publish_payload(f);
+        // A small change to one of them since: what changed alone.
+        m.take_changes(vec![file("c.rs", "+y".to_owned())], Vec::new(), false);
+        let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        m.feed.publish_payload(f);
+        let read = futures::executor::block_on(bus.read(&m.feed.topic(), at, 100))?;
+        let frames: Vec<super::super::registry::Frame> = read.messages.iter().filter_map(|msg| super::super::live::decode(&msg.payload)).collect();
+        anyhow::ensure!(frames.len() == 2 && m.feed.refusals() == 0, "{} frames, {} refused", frames.len(), m.feed.refusals());
+        anyhow::ensure!(frames.first().is_some_and(|f| &*f.text == super::super::live::RESYNC), "the first: back to the copy");
+        let patch: Value = serde_json::from_str(frames.get(1).and_then(|f| f.patch.as_deref()).unwrap_or_default())?;
+        anyhow::ensure!(patch.get("t") == Some(&json!("changes_patch")) && patch.get("set").and_then(Value::as_array).map(Vec::len) == Some(1), "the next, what changed: {patch}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a changeset long to write out (a runner's hundreds of KB of hunks) is written out by its
+    /// owner off its shard, as the owner counts it, and taken as one written on the shard is: the copy's files the same, in the
+    /// same order, as a copy that took the same updates on its shard has them, the patch after it taken in its place, the file
+    /// it said gone let go of.
+    #[test]
+    fn g9_s3_a_changeset_long_to_write_out_is_written_off_its_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{FileChange, FileKey, Hunk};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "changed".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            let file = |path: &str, lines: usize| FileChange {
+                path: path.into(),
+                tree: None,
+                created: false,
+                deleted: false,
+                added: u32::try_from(lines).unwrap_or(u32::MAX),
+                removed: 0,
+                hunks: vec![Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: u32::try_from(lines).unwrap_or(u32::MAX), lines: vec!["+let x = 1;".to_owned(); lines] }],
+                truncated: false,
+                at: 1,
+                by: Vec::new(),
+                place: None,
+            };
+            let updates = vec![
+                Update::ChangesPatch { set: vec![file("small.rs", 3)], gone: Vec::new() },
+                Update::ChangesPatch { set: vec![file("other.rs", 4)], gone: Vec::new() },
+                Update::Changes { files: vec![file("a.rs", 2), file("big.rs", 40_000), file("b.rs", 2)] },
+                Update::ChangesPatch { set: vec![file("b.rs", 5)], gone: vec![FileKey { path: "a.rs".into(), tree: None }] },
+            ];
+            // The same updates taken by a copy on the test's thread, as its shard takes them.
+            let mut here = Mirror::new(Info { id: "here".into(), ..Info::default() }, Location::Local, sim_bus());
+            for u in &updates {
+                match u {
+                    Update::Changes { files } => here.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
+                    Update::ChangesPatch { set, gone } => here.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false),
+                    _ => {}
+                }
+            }
+            let texts = |m: &Mirror| m.changes.as_ref().map(|c| c.iter().map(|f| f.text().to_owned()).collect::<Vec<_>>()).unwrap_or_default();
+            let want = texts(&here);
+            let mut updates = updates.into_iter();
+            // The small ones first, written on the shard: they teach what writing one out takes.
+            for u in updates.by_ref().take(2) {
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            let was = copies.on(&id, |s| s.changes_off()).await.unwrap_or_default();
+            let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
+            anyhow::ensure!(long_changes(&large), "a changeset of 40,000 lines expected to take past a slow poll to write out");
+            for u in updates {
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            let i = id.clone();
+            let now = copies.on(&id, move |s| (s.changes_off(), s.get(&i).map(texts))).await;
+            let Some((off, Some(got))) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(off == was + 1, "written out off its owner's shard once: {was} then {off}");
+            let paths: Vec<Option<String>> = got.iter().map(|t| serde_json::from_str::<Value>(t).ok().and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_owned))).collect();
+            anyhow::ensure!(got == want, "taken as the shard takes them: {paths:?}");
+            anyhow::ensure!(paths == [Some("big.rs".to_owned()), Some("b.rs".to_owned())], "the whole one's files, the patch's in its place, the gone one let go of: {paths:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a sweep of an owner's copies (a machine's sessions said disconnected, an inventory's
+    /// removed) is taken a session at a time across the owner's turns: each session it picks once and no other, its turns
+    /// each a quantum at the median by its own clock, the shard given up between them, and nothing else between: a job sent
+    /// right behind it finds every step taken. One job over all of them held the shard for all of them.
+    #[test]
+    fn g9_s3_a_sweep_of_an_owners_copies_is_taken_in_turns_with_nothing_between() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            let n = 48u64;
+            for k in 0..n {
+                let id = format!("s{k}");
+                let i = id.clone();
+                copies.on(&id, move |s| s.insert(i.clone(), Mirror::new(Info { id: i, ..Info::default() }, Location::Local, sim_bus()))).await;
+            }
+            let turned = copies.on("s0", |s| s.turns.len()).await.unwrap_or_default();
+            // Every session but one, each step an eighth of a quantum, as a session said disconnected takes some.
+            let (steps, quantum) = (Arc::new(AtomicU64::new(0)), Duration::from_nanos(crate::rt::STEP_BUDGET_NS));
+            let taken = Arc::clone(&steps);
+            let sweep = copies.on_each_session(
+                |id, _| id != "s1",
+                move |s, id| {
+                    let began = Instant::now();
+                    while began.elapsed() < quantum / 8 {
+                        std::hint::spin_loop();
+                    }
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    s.get(id).map(|m| m.info.id.clone())
+                },
+            );
+            // A job sent right behind it.
+            let behind = {
+                let (copies, steps) = (Arc::clone(&copies), Arc::clone(&steps));
+                async move { copies.on("s0", move |s| (steps.load(Ordering::SeqCst), s.turns.len())).await }
+            };
+            let (mut swept, after) = futures::join!(sweep, behind);
+            swept.sort();
+            let mut want: Vec<String> = (0..n).map(|k| format!("s{k}")).filter(|id| id != "s1").collect();
+            want.sort();
+            anyhow::ensure!(swept == want, "each session it picked, once: {} of {}", swept.len(), want.len());
+            let Some((stepped, turned_after)) = after else { anyhow::bail!("the job behind it never ran") };
+            anyhow::ensure!(stepped == n - 1, "the job behind it ran after {stepped} of its {} steps", n - 1);
+            let mut held = copies.on("s0", move |s| s.turns.get(turned..turned_after).map(<[Duration]>::to_vec)).await.flatten().unwrap_or_default();
+            held.sort();
+            let median = held.get(held.len() / 2).copied().unwrap_or_default();
+            anyhow::ensure!(held.len() >= 2 && median <= quantum, "{} turns said ended over the sweep, {median:?} at the median, the quantum {quantum:?}", held.len());
+            Ok(())
+        })
+    }
+
+    /// Says, as it's dropped, whether the thread it's dropped on runs a shard.
+    struct Dropped(std::sync::mpsc::Sender<bool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let _ = self.0.send(crate::rt::on_shard());
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what an owner lets go of off its shard is dropped on the compute pool, never on the
+    /// shard; off a shard (a test's copy, a pool's thread) it's dropped at once, where it is.
+    #[test]
+    fn g9_s3_what_an_owner_lets_go_of_is_dropped_off_its_shard() -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let_go(Dropped(tx.clone()));
+        anyhow::ensure!(rx.try_recv() == Ok(false), "off a shard: dropped at once, where it is");
+        crate::rt::block_on(async move {
+            anyhow::ensure!(crate::rt::on_shard(), "the test's task runs on a shard");
+            let_go(Dropped(tx));
+            let on_shard = crate::rt::blocking(move || rx.recv_timeout(Duration::from_secs(30))).await??;
+            anyhow::ensure!(!on_shard, "dropped on the shard that let go of it");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: each change that takes chunks out of a copy's events says so (a cut, the chunks wholly
+    /// before a cut in a compact chunk and that chunk trimmed, a compaction, a chunk read back, the events kept through a
+    /// number, made again or let go of), and none that only takes events in or changes one does. Its owner's next publish
+    /// lets go of the view that held them, off its shard, and a chunk taken out goes with it: the view held it until then.
+    #[test]
+    fn g9_s3_chunks_taken_out_of_a_copy_go_with_its_last_view_off_its_owners_shard() -> anyhow::Result<()> {
+        let n = u64::try_from(CHUNK * 4 + 9)?;
+        let filled = |n: u64| {
+            let mut events = Events::default();
+            for q in 1..=n {
+                let _ = events.push(Ev { entry: entry(&format!("e{q}"), q), at: q });
+            }
+            events
+        };
+        let mut taken_in = filled(n);
+        anyhow::ensure!(!taken_in.took_out, "events taken in");
+        anyhow::ensure!(taken_in.change(3, |ev| ev.at = 0) && !taken_in.took_out, "an event changed");
+        let mut cut = filled(n);
+        let _ = cut.drain_front(CHUNK + 3);
+        let mut cleared = filled(n);
+        cleared.clear();
+        let mut kept = filled(n);
+        let through = kept.keep_first(|m| m.seq().is_some_and(|q| q <= 10));
+        let mut whole = filled(n);
+        let all = whole.keep_first(|_| true);
+        let mut inserted = filled(n);
+        inserted.insert(5, Ev { entry: entry("x", 5), at: 1 });
+        let mut retained = filled(n);
+        retained.retain(|m| m.seq().is_some_and(|q| q % 2 == 0));
+        anyhow::ensure!(cut.took_out && cleared.took_out && inserted.took_out && retained.took_out, "a cut, let go of, made again with one in, made again of some");
+        anyhow::ensure!(through == Some(10) && kept.took_out && all == Some(CHUNK * 4 + 9) && !whole.took_out, "kept through a number; kept whole, nothing taken out");
+        // Packed and kept compact: a compaction, a cut in a compact chunk and its trim, a compact chunk read back.
+        let mut compact = filled(n);
+        for c in compact.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        compact.compact(None);
+        anyhow::ensure!(compact.took_out, "a compaction");
+        compact.took_out = false;
+        let (_, chunk, left) = compact.drain_whole(CHUNK + 5).ok_or_else(|| anyhow::anyhow!("a cut in a compact chunk"))?;
+        anyhow::ensure!(compact.took_out, "the chunks wholly before a cut");
+        compact.took_out = false;
+        let made = Chunk::of(chunk.evs()?.iter().skip(left).cloned().collect());
+        anyhow::ensure!(compact.trim_first(&chunk, left, made).is_some() && compact.took_out, "the chunk a cut fell in, trimmed");
+        compact.took_out = false;
+        let packed = compact.chunks().iter().find(|c| c.is_compact()).cloned().ok_or_else(|| anyhow::anyhow!("a compact chunk"))?;
+        let thawed = Chunk::of(packed.evs()?.into_owned());
+        anyhow::ensure!(compact.swap_chunk(&packed, thawed) && compact.took_out, "a compact chunk read back");
+        // On its owner's shard: published, then its first chunk taken out.
+        crate::rt::block_on(async move {
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            let id = "out".to_owned();
+            let i = id.clone();
+            let out = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    m.publish();
+                    let first = Arc::downgrade(m.events.chunks().first()?);
+                    let _ = m.events.drain_front(CHUNK);
+                    let held = first.upgrade().is_some();
+                    m.publish();
+                    Some((first, held, m.events.took_out))
+                })
+                .await
+                .flatten();
+            let Some((first, held, took_out)) = out else { anyhow::bail!("no copy") };
+            anyhow::ensure!(held && !took_out, "taken out, its view held it till the next went out; that publish said so: {held} {took_out}");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while first.upgrade().is_some() {
+                anyhow::ensure!(Instant::now() < deadline, "the chunk taken out was never let go of");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a copy let go of leaves a last view that says it's gone and holds none of its events
+    /// (no reader reads a closed view's), and its events go with the view before it, off its owner's shard.
+    #[test]
+    fn g9_s3_a_closed_copys_last_view_holds_none_of_its_events() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            let id = "closed".to_owned();
+            let n = u64::try_from(CHUNK * 2 + 3)?;
+            let i = id.clone();
+            let first = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    m.publish();
+                    m.events.chunks().first().map(Arc::downgrade)
+                })
+                .await
+                .flatten();
+            let (Some(first), Some(slot)) = (first, copies.slot(&id)) else { anyhow::bail!("no copy") };
+            anyhow::ensure!(slot.view().events.len() == usize::try_from(n)?, "its view has its events");
+            let i = id.clone();
+            anyhow::ensure!(copies.on(&id, move |s| s.remove(&i).is_some()).await == Some(true), "let go of");
+            let last = slot.view();
+            anyhow::ensure!(last.closed && last.events.is_empty() && copies.view(&id).is_none(), "its last view: gone, without its events");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while first.upgrade().is_some() {
+                anyhow::ensure!(Instant::now() < deadline, "its events were never let go of");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the frame of a turn that took an event its owner wrote out off its shard (a large tool
+    /// output) is written off the shard too, as its owner counts it, and a viewer has every frame in order: the events
+    /// before it, then it, its event's text whole, then the events after it. One past what the bus takes isn't written at
+    /// all: its viewer is sent back to the copy (the feed's resync marker) where the bus would have refused it, and goes on
+    /// with the events after it.
+    #[test]
+    fn g9_s3_a_large_events_frame_is_written_off_its_owners_shard_in_order() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let bus = sim_bus();
+            let copies = Copies::start_with(Arc::clone(&bus), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "framed".to_owned();
+            let (i, b) = (id.clone(), Arc::clone(&bus));
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, b));
+                })
+                .await;
+            // A viewer, from where the copy's feed ends now.
+            let slot = copies.slot(&id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let viewer = slot.tap().join(super::super::registry::Patches::default());
+            let mut at = viewer.position().ok_or_else(|| anyhow::anyhow!("no feed"))?;
+            let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            // Short ones, written on the shard, teach what writing one out takes.
+            anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
+            let was = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
+            // A large one whose frame the bus takes (half its most), and one past what it takes.
+            let (large, past) = ("x".repeat(kiln_seams::bus::PAYLOAD_MAX / 2), "y".repeat(kiln_seams::bus::PAYLOAD_MAX * 2));
+            anyhow::ensure!(long_to_write(&said(9, large.clone())) && long_to_write(&said(11, past.clone())), "both expected to take past a slow poll to write out");
+            for (q, text) in [(9, large.clone()), (10, "after".to_owned()), (11, past), (12, "after that".to_owned())] {
+                anyhow::ensure!(copies.send(&id, update(vec![said(q, text)])).await, "sent");
+            }
+            let off = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
+            anyhow::ensure!(off == was + 1, "a frame written off its owner's shard once: {was} then {off}");
+            // What the viewer has, frame by frame: each event's id and its text's bytes, and the resync marker.
+            let mut seen: Vec<(String, usize)> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while seen.last().is_none_or(|(e, _)| e != "e12") {
+                anyhow::ensure!(Instant::now() < deadline, "the viewer has {:?}", seen.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>());
+                let batch = bus.read(viewer.topic(), at, 256).await?;
+                at = batch.next;
+                if batch.messages.is_empty() {
+                    crate::rt::sleep(Duration::from_millis(2)).await;
+                }
+                for msg in batch.messages {
+                    let f = super::super::live::decode(&msg.payload).ok_or_else(|| anyhow::anyhow!("a frame the feed didn't make"))?;
+                    if &*f.text == super::super::live::RESYNC {
+                        seen.push(("resync".to_owned(), 0));
+                        continue;
+                    }
+                    let v: Value = serde_json::from_str(&f.text)?;
+                    for e in v.get("events").and_then(Value::as_array).into_iter().flatten() {
+                        seen.push((e.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(), e.get("text").and_then(Value::as_str).map_or(0, str::len)));
+                    }
+                }
+            }
+            let ids: Vec<&str> = seen.iter().map(|(e, _)| e.as_str()).collect();
+            let want: Vec<String> = (1..=10).map(|q| format!("e{q}")).chain(["resync".to_owned(), "e12".to_owned()]).collect();
+            anyhow::ensure!(ids == want, "every frame, in order: {ids:?}");
+            anyhow::ensure!(seen.get(8).is_some_and(|(_, len)| *len == large.len()), "the large one's text whole");
             Ok(())
         })
     }

@@ -2290,6 +2290,69 @@ for: it gives every anonymous mapping huge pages, which step 4's `thp:never` kee
 purge there gives back what it gives back in the lab; and its memory is tight, so the kernel takes `MADV_FREE`'d
 pages there sooner than in the lab, and `lazy-free` costs it less than the lab measures.
 
+### Kiln's own holders, the next cuts (step 5, part 5)
+
+Part 4's holders again, the next largest of each, est. for the realistic profile (32 copies keeping about 47,000
+events, about 670 chunks of 70; 8 of them at work, 24 of 400 events idle; events of 3.6 KB on average, by
+`kiln-lab`'s stand-in) and production's shape (134 copies, about 1,190 chunks) in brackets. The production build's
+allocator is jemalloc, whose size classes are a quarter of a doubling apart past 4 KiB, so what an allocation saves
+there is what it saves of its class: both figures are given where they differ (jemalloc, glibc).
+
+| Cut | Est. MB, lab (production) | Basis |
+| --- | --- | --- |
+| A copy's meta is 72 bytes, not 88: it keeps no offset (where an event's text begins among its chunk's texts is reckoned from the lengths before it, at most 70: `Chunk::off`, `Chunk::span`), and says whether its event has a number in its length's top bit (no text is 2^63 bytes), where an `Option<u64>` took 16 | 1.4 jemalloc, 0.75 glibc (2.4) | A compact or spilled chunk keeps its 70 metas in one allocation: 6,160 bytes at 88, jemalloc's 7,168-byte class (and at 96 the same: part 4's digest cut saved nothing there on jemalloc), 5,040 at 72, its 5,120-byte class: 2 KiB a chunk. glibc: 16 bytes a meta |
+| The newest compact chunk keeps of its texts only those its copy's newest page's reads reached back to (`Chunk::page_texts`), not the whole chunk's; and the texts a compaction makes for a read copy's next compact chunk (goal 10's `Chunk::warm`) begin where the reads reached in the chunk before it (`Chunk::page_reach`) | 0.6 (0.1 to 0.2) | A page of 50 with k events in the open chunk takes the compact chunk's last 50 - k; a page that reaches less far takes a slice of what's kept, one that reaches further inflates it again (off the shard: goal 10's `Unread::Unkept`) and keeps from there. Simulated over the lab's turns (40 events 25 ms apart, then 1.5 to 2.5 s) and reads (12 a second over 32 sessions), before `warm`: 15.8 events kept on average, where the whole chunk's were kept for 36.2, of 70, for each of the 8 copies at work. With `warm`, each read copy keeps texts from compaction on: about 49 of 70 (the first read after a compaction, with a few events in the open chunk, reaches back about 49), where the whole chunk's 70 were kept. The UI's pages of 100 reach further |
+| observe's queue to its peers (16,384 places) and kiln.db's group's to the runners (4,096) make their places as they fill: unbounded, each bound kept by its one sender (`memory::send_within`) | 0.4 (0.4, and as much in each runner process) | A bounded async-channel makes every place as it's made (concurrent-queue writes each one's stamp): 16 bytes each of the first (boxes), 40 of the second, resident however few wait |
+
+What each risks, for the lab to say: a read of the newest page that inflates the compact chunk copies the part it
+keeps (up to the chunk's 250 KB, a memcpy beside the inflate's 0.3 ms): watch the events reads' p99. A meta's offset
+reckoned costs a read at most 70 additions.
+
+**A window found off the shards** (goal 9 step 3's rule, and the idle copies' cut's first part, below). The UI's agent
+page asks its socket for a lean window (`?window=1&lean=1`: `ui/src/api/harness.ts`'s `TAKES`). Finding where that
+window begins (`View::window_start`), and whether a resume fits one (`View::fits`), read each of its events as the
+viewer takes it, lean (its JSON read whole), on the socket's shard as its parts were taken
+(`Registry::attach_from`, `Registry::frames_since`), and so did a packed snapshot's plan (`Snapshot::packing`, taken by
+`api::send_snapshot` on the shard): with `Events::get`, which reads a compact chunk again whole (inflated, each of its
+events parsed) for each event it gives. A window of ten of a long session's turns, about 400 events over 5 compact
+chunks, read them again about 330 times on the shard (est. 100 to 300 ms); kiln-lab's viewers ask for neither, so the
+lab never saw it. Now:
+- the window is found where the snapshot is written, on the blocking pool (`Parts::find`, `Parts::resolved`, called by
+  `Snapshot::plan`), and a packed snapshot is planned with its first piece (`Packing::next_piece`), not where it's taken;
+- each read of events one after another reads each compact chunk again once (`copies::Reading`: a window's start, a
+  resume's fit, a plan's lean sizes, an older page);
+- an older page (`GET .../timeline`) and an event read whole (`GET .../events/{event}`) are read on the blocking pool
+  (`Registry::page`, `Registry::event_text`).
+What the lab would show: its viewers asking as the UI does (`window=1&lean=1` beside `z=gzip&patch=state&patch=changes`,
+`kiln-lab`'s `lab.rs` viewer), A (without) against B (with): attach p50 and p99 and the viewers' sockets' slow polls
+(their snapshot's label) fall with B, and no read or frame number is worse.
+
+**Looked at, and not cut:**
+- **Sessions' copies, the rest.** What the open chunks hold as text (`session_entries`): the 24 idle copies' 50 events
+  each, est. 4.3 MB, the 8 at work about 1 MB. A read of a copy's newest page takes them, and the lab's readers read
+  each copy's every 2.7 s on average, so they stay. Keeping an idle copy's open chunk compact (packed once it took
+  nothing in for `os::alloc::COLD_AFTER`, read back off the shard before its next event, as a change to a compact
+  chunk is) would give est. 17 MB in production's shape (126 idle copies at 35 events on average), 0.3 MB in the lab
+  (its entries' own allocations; the reads keep the texts). It takes the snapshot's newest chunk packed as it's kept,
+  the update's thaw before an event goes in at a compact newest chunk and before a stream into one (off the shard,
+  finished before the next event or stream is taken), and a window found off the shards (below). Next, once the
+  owners' polls' own changes (goal 9 step 3) have landed: production's ~17 MB, with what the lab would measure.
+- **The registry**: its maps (names, holders, epochs, uploads) and each copy's own (about 0.5 KB a copy beside its
+  events): under 0.1 MB in the lab.
+- **The bus**: as in part 4.
+- **Caches.** `sqlite` (4.06 MB): the writer's and the lowest read connection's page caches, both in use all the time
+  in the lab (custody's writes, est. 60 to 90 a second); the read connections past the reads' peak close already. The
+  conversation store's turso cache: the vendored projects' part (above). The replication board (`convo::board`):
+  5,000 log lines and an hour and a day of points, about 2.7 MB in production after an hour, under 0.2 MB in a lab
+  round. kiln.db's capture (`store::capture`): the largest write's rows' set, kept (a few KB in the lab).
+- **Per-connection buffers**: kiln-http's write buffers kept per thread are of 4 KiB, a few a shard; tungstenite's
+  are part 4's. Nothing left in the lab.
+- **observe's batcher and apply buffers** (`observe::ingest`, `kiln_obs::store`'s `pending`): sized to a scrape's
+  points, reused at the next a few seconds later. Freed between scrapes, jemalloc keeps their pages (its decay is 5 s)
+  and the next takes them again: no resident memory saved.
+- **kiln.db's leaves** (`store::group::Leaves`, W27-R08's): 32 bytes an entry applied, up to 65,536 (2 MiB after
+  about 15 minutes of custody's writes; 0.5 MB in a lab round), what a checkpoint runs over: W27's to bound.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
