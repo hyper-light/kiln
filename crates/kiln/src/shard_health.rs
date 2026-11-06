@@ -644,13 +644,13 @@ impl CpuClock {
 /// The CPU time the calling thread has run, nanoseconds (Linux and macOS; elsewhere the OS keeps a
 /// thread's times at its scheduler's tick, or not at all).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn thread_cpu_ns() -> Option<u64> {
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
     let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
     u64::try_from(t.tv_sec()).ok()?.checked_mul(1_000_000_000)?.checked_add(u64::try_from(t.tv_nsec()).ok()?)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_cpu_ns() -> Option<u64> {
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
     None
 }
 

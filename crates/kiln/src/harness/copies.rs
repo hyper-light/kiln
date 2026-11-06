@@ -3005,16 +3005,41 @@ pub(super) struct Timer {
 
 impl Timer {
     pub(super) fn start() -> Self {
-        Self { at: Instant::now(), cpu: hyper_rt::futures::thread_run_ns() }
+        Self { at: Instant::now(), cpu: run_ns() }
     }
 
     /// What it took since it started: on the CPU where the thread said both then and now, else on the clock.
     pub(super) fn took(&self) -> Duration {
-        match (self.cpu, hyper_rt::futures::thread_run_ns()) {
+        match (self.cpu, run_ns()) {
             (Some(from), Some(now)) => Duration::from_nanos(now.saturating_sub(from)),
             _ => self.at.elapsed(),
         }
     }
+}
+
+/// The calling thread's run time for a [`Timer`], nanoseconds: its shard's task clock where the runtime keeps one (Linux's shard
+/// threads: `hyper_rt::futures::thread_run_ns`), else the thread's own CPU clock where the system keeps a fine one ([`own_cpu_ns`]).
+fn run_ns() -> Option<u64> {
+    hyper_rt::futures::thread_run_ns().or_else(own_cpu_ns)
+}
+
+/// macOS keeps no task clock for a shard (hyper-rt's is a Linux perf event) but a fine clock for each thread,
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, a call each read (107 ns on Apple silicon under load: hyper-rt's
+/// `attribution::thread_cpu_now`), read here for every thread. On the clock, the pacer's stops of a runner's work
+/// (headroom's SIGSTOP) were learned as writing: a 1 KB state, a 1 KB reply and a one-line event went off the shard, and
+/// `registry::tests::g9_s3_an_update_is_taken_in_turns` held shard 0 while its hand-off waited (goal 4, plan 01a1a59c2a9c
+/// step 5's macOS runs, 2026-11-06).
+#[cfg(target_os = "macos")]
+fn own_cpu_ns() -> Option<u64> {
+    crate::shard_health::thread_cpu_ns()
+}
+
+/// Linux off a shard thread learns on the clock, as it did. Windows keeps a thread's times only a scheduler tick (15.6 ms)
+/// at a time, and its cycle count isn't convertible to time (hyper-rt's `attribution::thread_cpu_now`): its owners learn
+/// on the clock.
+#[cfg(not(target_os = "macos"))]
+fn own_cpu_ns() -> Option<u64> {
+    None
 }
 
 /// Whole nanoseconds of `d`.
@@ -4214,10 +4239,11 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
     let e = std::mem::replace(slot, taken_out());
     let (id, seq, of) = (e.id.clone(), e.seq, session.clone());
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        let began = Instant::now();
+        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        let began = Timer::start();
         // Caught here, so the event comes back whatever: its update keeps every event.
         let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_of(&of, &e, keep, &cwd, &location))).ok();
-        let took = began.elapsed();
+        let took = began.took();
         (e, made, took)
     }))
     .await;
@@ -4269,11 +4295,12 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     };
     let of = session.clone();
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        let began = Instant::now();
+        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        let began = Timer::start();
         let bytes = changes_bytes(&u);
         // Caught here, so the update comes back whatever.
         let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_off(&of, &u, prior, keep))).ok();
-        let took = began.elapsed();
+        let took = began.took();
         // A changeset written is let go of here; the rest go back.
         let let_go = made.is_some() && matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. });
         let back = (!let_go).then_some(u);
