@@ -5689,11 +5689,21 @@ fn pre_encoded(json: bytes::Bytes) -> Response {
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
 /// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
 /// sees by lineage, found as it reads.
-async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
+async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
     if crate::harness::lineage::sees_all(caller) {
         // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
-        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`).
-        let (json, etag) = hub.harness.list_tagged();
+        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). Found, or joined again, on the
+        // compute pool, not on the request's shard (step 3): a join reads every session's view, copies each one's info
+        // into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work change it between nearly
+        // any two reads) and digests the infos that changed. Where its job is lost (it panicked), here.
+        let h = Arc::clone(hub);
+        let (json, etag) = match crate::rt::compute(move || h.harness.list_tagged()).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
+                hub.harness.list_tagged()
+            }
+        };
         let mut r = pre_encoded(json);
         if let Some(etag) = etag {
             r.headers_mut().insert(header::ETAG, etag);
