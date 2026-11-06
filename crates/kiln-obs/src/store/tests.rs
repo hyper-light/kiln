@@ -1688,3 +1688,29 @@ fn a_snapshot_reads_as_the_store_did_whatever_it_does_after() {
     let after = read(&|id, scratch, ts, vs, rolled, r| if r { s.read_rolled(id, from, to, &roll_of(kinds[&id]), scratch, ts, vs, rolled) } else { s.read_with(id, from, to, scratch, ts, vs) });
     assert_ne!(after, before);
 }
+
+/// Kiln's goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the head and its newest times grow by a quarter of the
+/// series they hold, as the index's columns do, not doubling: sized to its series exactly (a reopen, a retention's
+/// drop), the head doubled at the next new series, 120 bytes a series kept twice (1.7 MB for the lab's 14,000).
+#[test]
+fn g11_s5_heap_the_head_grows_by_a_quarter() {
+    let define = |s: &mut Store, from: usize, n: usize| {
+        let mut b = Builder::new();
+        for i in from..from + n {
+            let k = gauge("m", &format!("h{i}"));
+            b.define(&k);
+            b.run(k.fp, [(0, 1.0)]);
+        }
+        s.apply(&b.finish()).unwrap();
+    };
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    define(&mut s, 0, 1000);
+    // As a reopen leaves them: room for its series alone.
+    s.head.shrink_to_fit();
+    s.last.shrink_to_fit();
+    let held = s.head.len();
+    define(&mut s, 1000, 1);
+    let most = held + held / 4 + 1;
+    assert_eq!((s.head.len(), s.last.len()), (held + 1, held + 1));
+    assert!(s.head.capacity() <= most && s.last.capacity() <= most, "{} and {} places for {} series, not {}", s.head.capacity(), s.last.capacity(), held + 1, 2 * held);
+}
