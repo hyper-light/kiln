@@ -2954,7 +2954,7 @@ impl Hub {
     /// (`crate::route_latency`).
     /// What's left of it when the owner's turn ran out (`over`; goal 9, plan 01a1a87b2cec step 3) comes
     /// back, for the owner to take first at its next turn.
-    pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
+    pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn(u64) -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
         let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken } = r;
         // Its third leg: from the hub's loop handing it over to its owner taking it (goal 10, plan 01a1a87b2dae
@@ -2979,7 +2979,7 @@ impl Hub {
     /// [`Hub::runner_update`]'s judgment, as the hub's loop made it: whether the update counts, which of
     /// its machine's processes holds the session, then the copy takes it.
     #[allow(clippy::too_many_arguments)]
-    fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
+    fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool, over: &dyn Fn(u64) -> bool) -> Option<crate::harness::copies::Ingest> {
         use crate::harness::core::Update;
         match update {
             // A copy of a session that went on elsewhere since (an older epoch): its machine lets go
