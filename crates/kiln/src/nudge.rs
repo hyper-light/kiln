@@ -10,12 +10,12 @@
 //! a config declares (the default is off until then: docs/ci.md §0.3, "Opt-in automation"), has each shard nudge only
 //! while its host holds its wakes ([`Mode`]):
 //!
-//! - **What a shard reads**, once a period of its health probe (`crate::shard_health::PERIOD`, 10 ms), on its own
+//! - **What a shard reads**, once a period of its health probe (`crate::shard_health::PERIOD`, 17.07 ms), on its own
 //!   thread: the kernel's count of how long the thread waited, runnable, for a CPU (the run delay of
 //!   `/proc/thread-self/schedstat`, a file kept open and read again, one system call), and its parks by what ended
 //!   them (`hyper_rt`'s counters): another thread's kick or its I/O, or its own timers. A shard that nudges on no
 //!   judgment of its own (off, or on) only shows its wait, and reads it every `crate::shard_health::COUNTS_EVERY`th
-//!   period (goal 9, plan 01a1a87b2cec step 5: a system call on every shard every 10 ms, which their busy share counts).
+//!   period (goal 9, plan 01a1a87b2cec step 5: a system call on every shard every period, which their busy share counts).
 //! - **Held** ([`Judge`]): the period's wait, less what a calm CPU makes a wake by the thread's own timer wait
 //!   ([`TIMER_WAKE_NS`]), over the wakes others made: how long its host held each of them. At [`HELD_NS`] or more
 //!   the period was held. While the shard nudges, its own timers wake it every period, and on a busy CPU each of
@@ -354,7 +354,7 @@ impl Here {
     /// shard that judges nothing by its wait (off, the default; or on, whatever its host does) only shows it: read at its
     /// first period and every `crate::shard_health::COUNTS_EVERY`th after, as the probe copies the shard's other counts,
     /// and what held it judged over those periods (its counts' differences span them). Each read is a `pread` of procfs:
-    /// kernel time on every shard every 10 ms, which the shards' busy share counts and their user-time profiles don't
+    /// kernel time on every shard every period, which the shards' busy share counts and their user-time profiles don't
     /// show. `auto` reads every period: it acts on each.
     fn reads_wait(&mut self) -> bool {
         let period = self.periods;
