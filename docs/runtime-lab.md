@@ -1297,6 +1297,21 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
   past it.
+- **The hub's net loop: a poll is a turn at the most** (`rt::Turns::end`, `before`): told that nothing else
+  wanted the shard (`maybe_yield`), the loop went on into its next turn in the same poll, so a burst of
+  runners' frames could hold the HTTP listener's shard two turns and more a poll (rt9's calm rounds:
+  `runner AgentMsg::Harness` 1.22 ms on the CPU, and in round 1 eight more of its labels 0.4 to 0.6 ms,
+  a cheap message's among them). Now its turn's end
+  ends its poll (`yield_now`: the shard reads its inputs and comes back to the loop at once when nothing
+  else is ready), and a frame whose read on the shard would take the turn past the quantum
+  (`wire::payload::expected_ns`: its read and its item's message's, each by what reads of its kind took,
+  an agent session's update by its own kind's, `UPDATE_COSTS`) waits for the next turn.
+- **What each runner message costs the hub's loop** (step 5): a channel item's body and a session update's
+  JSON stay in the frame's buffer, moved down in place, not copied out twice (`proto::read_agent_owned`);
+  a payload goes to its unknown-field check as it is, not copied (`wire::payload::payload_owned`); a
+  session's update on the channel goes to its owner without a runner message's whole handling again and
+  nothing boxed for it (`Hub::on_session_update`); and a frame's runner is looked up without its name
+  copied (`Hub::said_hello`).
 - **A runner's Build in pieces, its mirrors' file off the shards** (`hub::build`): the hub's loop took a
   runner process's Build in one poll of ten things (its process, its legs' receipt, its upgrades, its
   front door, sync's, observe's and the cluster's announcements, the conversation store's mirrors and a
