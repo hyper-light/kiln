@@ -88,21 +88,30 @@ pub fn segments_bound() -> u64 {
 }
 
 /// What a reader needs of one of a copy's events without its text: its id and number, the copy's
-/// revision when it last changed, where its text is among its chunk's texts joined by `,` (as an
-/// `events` frame joins them), and its text's digest (`crate::wire::sums::event_text`). Numbering,
-/// finding, resuming, digests and a snapshot's plan read these alone. Goal 10, plan 01a1a87b2dae step
-/// 3, in the shape agreed with goal 11, whose stored form keeps these and the chunk's [`Segment`] and
-/// decodes an event's text only where it's read.
+/// revision when it last changed, its text's length (where it is among its chunk's texts joined by `,`,
+/// as an `events` frame joins them, is reckoned from the lengths before it: [`Chunk::off`]), and its
+/// text's digest (`crate::wire::sums::event_text`). Numbering, finding, resuming, digests and a
+/// snapshot's plan read these alone. Goal 10, plan 01a1a87b2dae step 3, in the shape agreed with goal 11,
+/// whose stored form keeps these and the chunk's [`Segment`] and decodes an event's text only where it's
+/// read.
+///
+/// 72 bytes (goal 11, plan 01a1a87b2e56 step 5): a copy keeps a meta for each event it keeps, spilled or
+/// not, and a compact chunk its [`CHUNK`] metas in one allocation, which jemalloc's size classes round up
+/// (a quarter of a doubling apart past 4 KiB): 70 metas of 72 bytes take 5,120 bytes, where of 88 they took
+/// 7,168 (and of 96 the same), about 29 bytes an event.
 #[derive(Debug)]
 pub struct Meta {
     /// Empty for an event without one (none the copy takes in: `Mirror::upsert`). Kept in the meta itself
     /// ([`Id`]), not an allocation of its own: a copy keeps a meta for each event it keeps, spilled or not.
     id: Id,
-    pub seq: Option<u64>,
+    /// Its number, when it has one ([`Meta::seq`]: `len`'s top bit says so).
+    seq: u64,
     pub at: u64,
-    /// Its text: from `off`, `len` bytes, in its chunk's texts joined.
-    pub off: usize,
-    pub len: usize,
+    /// Its text's length in bytes, in the low 63 bits (no allocation is 2^63 bytes long: Rust's are at most
+    /// `isize::MAX`), and in the top bit whether it has a number ([`NUMBERED`]), where an `Option<u64>` took 16
+    /// bytes of its own. Where its text begins is reckoned from the lengths before it ([`Chunk::off`]: a chunk
+    /// holds at most [`CHUNK`]), never kept.
+    len: u64,
     /// Its text's digest: made off the owner's shard, a chunk's all as it's packed ([`Chunk::pack`]:
     /// a packed chunk's are all there), or where first asked for ([`Meta::sum`]). Made as the copy
     /// took each event in, it held the owner's shard for a whole fill's text (goal 10's A/B).
@@ -115,24 +124,39 @@ pub struct Meta {
 /// digest made again each time it's asked for, as one not made yet: never another's.
 const NO_SUM: u64 = 0;
 
+/// A meta's `len`'s top bit: its event has a number ([`Meta::seq`]).
+const NUMBERED: u64 = 1 << 63;
+
 impl Clone for Meta {
     fn clone(&self) -> Self {
-        Self { id: self.id.clone(), seq: self.seq, at: self.at, off: self.off, len: self.len, sum: AtomicU64::new(self.sum.load(Ordering::Relaxed)) }
+        Self { id: self.id.clone(), seq: self.seq, at: self.at, len: self.len, sum: AtomicU64::new(self.sum.load(Ordering::Relaxed)) }
     }
 }
 
 /// Metas are equal as a `OnceLock`'s digest was: the same event, and the same digest made (or none).
 impl PartialEq for Meta {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.seq == other.seq && self.at == other.at && self.off == other.off && self.len == other.len && self.sum_made() == other.sum_made()
+        self.id == other.id && self.seq() == other.seq() && self.at == other.at && self.len == other.len && self.sum_made() == other.sum_made()
     }
 }
 
 impl Eq for Meta {}
 
 impl Meta {
-    fn of(ev: &Ev, off: usize) -> Self {
-        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: ev.entry.seq(), at: ev.at, off, len: ev.entry.text().len(), sum: AtomicU64::new(NO_SUM) }
+    fn of(ev: &Ev) -> Self {
+        let seq = ev.entry.seq();
+        let len = u64::try_from(ev.entry.text().len()).unwrap_or(u64::MAX) & !NUMBERED;
+        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: seq.unwrap_or_default(), at: ev.at, len: if seq.is_some() { len | NUMBERED } else { len }, sum: AtomicU64::new(NO_SUM) }
+    }
+
+    /// Its event's number in its session's timeline, if it has one.
+    pub fn seq(&self) -> Option<u64> {
+        (self.len & NUMBERED != 0).then_some(self.seq)
+    }
+
+    /// Its text's length in bytes.
+    pub fn text_len(&self) -> usize {
+        usize::try_from(self.len & !NUMBERED).unwrap_or(usize::MAX)
     }
 
     /// Its event's id (empty: none).
@@ -155,16 +179,11 @@ impl Meta {
     pub fn sum_made(&self) -> Option<u64> {
         Some(self.sum.load(Ordering::Relaxed)).filter(|s| *s != NO_SUM)
     }
-
-    /// Where the next event's text begins: past this one's and the `,` after it.
-    fn end(&self) -> usize {
-        self.off + self.len + 1
-    }
 }
 
 /// The most bytes of an id a meta keeps in itself ([`Id`]): a UUID's 36 with room to spare (kiln's 32, a
-/// harness's `msg_` and `toolu_` ids about 30), so the meta is 96 bytes, against 72 and an allocation of 48 to
-/// 64 for the `Arc<str>` it held.
+/// harness's `msg_` and `toolu_` ids about 30), so the id takes 40 bytes of its meta, against the 16 of the
+/// `Arc<str>` it held and that one's allocation of 48 to 64.
 const ID_INLINE: usize = 38;
 
 /// An event's id as its meta keeps it (goal 11, plan 01a1a87b2e56 step 5): in the meta up to [`ID_INLINE`]
@@ -346,6 +365,13 @@ impl Index {
 /// 11 exports and bounds (`kiln_memory_bytes{owner="session_segments"}`).
 pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// What the reads of its copy's newest page kept of a compact chunk's texts joined ([`Chunk::page_texts`]):
+/// those from byte `from` of them on, the furthest back a read reached (goal 11, plan 01a1a87b2e56 step 5).
+struct PageTexts {
+    from: usize,
+    bytes: Bytes,
+}
+
 /// A chunk of a copy's events: each one's [`Meta`], the events themselves, and, once it's sealed (full,
 /// and not the newest) or a snapshot took it whole, their texts joined as an `events` frame joins them,
 /// deflated once ([`Segment`]): every viewer's packed snapshot takes that as it is (`super::packed`;
@@ -370,7 +396,8 @@ pub struct Chunk {
     /// for the reads after it while it's the newest compact chunk of its copy ([`Chunk::page_texts`]; goal 10,
     /// plan 01a1a87b2dae step 5): the lab's events reads inflated a chunk's whole segment each time, on the
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
-    /// packed chunk (`crate::memory::SESSION_ENTRIES`).
+    /// packed chunk (`crate::memory::SESSION_ENTRIES`). Only those its reads reached back to are kept
+    /// ([`PageTexts`]; goal 11, plan 01a1a87b2e56 step 5).
     ///
     /// Its cell is made by the first read that keeps them, or the compaction that makes them for a copy being
     /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap
@@ -379,7 +406,7 @@ pub struct Chunk {
     /// that three times (its unpack's swap, its drop's, the cell's own), and every event taken in at a copy's
     /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
     /// process, 0.5% of the shards' time, beside the copy's view's own store.
-    texts: OnceLock<ArcSwapOption<Bytes>>,
+    texts: OnceLock<ArcSwapOption<PageTexts>>,
     /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
     /// alone, as chunks are compacted ([`Events::compact`]).
     paged: AtomicBool,
@@ -414,15 +441,7 @@ impl Drop for Chunk {
 
 impl Chunk {
     fn of(evs: Vec<Ev>) -> Self {
-        let mut off = 0;
-        let meta = evs
-            .iter()
-            .map(|e| {
-                let m = Meta::of(e, off);
-                off = m.end();
-                m
-            })
-            .collect();
+        let meta = evs.iter().map(Meta::of).collect();
         Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 
@@ -443,6 +462,26 @@ impl Chunk {
         &self.meta
     }
 
+    /// Where event `k`'s text begins among its texts joined (a `,` between each two, as an `events` frame
+    /// joins them): past the texts before it and their commas, reckoned from their lengths (goal 11, plan
+    /// 01a1a87b2e56 step 5: a meta keeps no offset), at most [`CHUNK`] of them.
+    pub fn off(&self, k: usize) -> usize {
+        self.meta.iter().take(k).map(|m| m.text_len() + 1).sum()
+    }
+
+    /// Its texts joined, in bytes: each one's, and a `,` between each two.
+    pub fn texts_len(&self) -> usize {
+        self.meta.iter().map(Meta::text_len).sum::<usize>() + self.meta.len().saturating_sub(1)
+    }
+
+    /// Where its events `k` to `k + n` (at least one) lie among its texts joined: from the first one's text's
+    /// beginning to the last one's end. None past its events.
+    pub fn span(&self, k: usize, n: usize) -> Option<std::ops::Range<usize>> {
+        let from = self.off(k);
+        let texts = self.meta.get(k..k.checked_add(n)?)?.iter().map(Meta::text_len).sum::<usize>();
+        Some(from..from + texts + n.checked_sub(1)?)
+    }
+
     /// Whether its events are kept in its segment alone (goal 11, plan 01a1a87b2e56 step 2).
     pub fn is_compact(&self) -> bool {
         self.evs.is_empty() && !self.meta.is_empty()
@@ -456,10 +495,13 @@ impl Chunk {
             return Ok(Cow::Borrowed(&self.evs));
         }
         let joined = self.joined()?;
+        let mut off = 0;
         self.meta
             .iter()
             .map(|m| {
-                let text = joined.get(m.off..m.off + m.len).and_then(|b| std::str::from_utf8(b).ok());
+                let (from, len) = (off, m.text_len());
+                off = from + len + 1;
+                let text = joined.get(from..from + len).and_then(|b| std::str::from_utf8(b).ok());
                 let text = text.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a packed event's text isn't where its meta says"))?;
                 Ok(Ev { entry: Arc::new(Entry::from_text(text)), at: m.at })
             })
@@ -477,7 +519,7 @@ impl Chunk {
             let s = self.spilled.as_ref().ok_or_else(|| std::io::Error::other("a compact chunk without its segment"))?;
             return super::packed::inflate(&s.segment()?).map(Cow::Owned);
         }
-        let mut joined = Vec::with_capacity(self.meta.last().map_or(0, |m| m.off + m.len));
+        let mut joined = Vec::with_capacity(self.texts_len());
         for (i, e) in self.evs.iter().enumerate() {
             if i > 0 {
                 joined.push(b',');
@@ -487,29 +529,52 @@ impl Chunk {
         Ok(Cow::Owned(joined))
     }
 
-    /// A compact one's texts joined ([`Chunk::joined`]) as bytes a page's answer takes slices of, none copied:
-    /// as a read of its copy's newest page kept them, else inflated now, and kept for the reads after while
-    /// it's its copy's newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). The first to keep
-    /// them stays; its owner unsetting `paged` lets them go, and so does a read that finds it unset just after
-    /// keeping them (one of the two sees the other). The cell they're kept in is made here, by the first read
-    /// that keeps them (the field's notes).
-    fn page_texts(&self) -> std::io::Result<Bytes> {
-        if let Some(kept) = self.texts.get().and_then(ArcSwapOption::load_full) {
-            return Ok(Bytes::clone(&kept));
+    /// A compact one's texts joined ([`Chunk::joined`]) from byte `from` of them on, as bytes a page's answer
+    /// takes slices of, none copied, and the byte of them they begin at (`from` or before): as a read of its
+    /// copy's newest page kept them, else inflated now, and kept for the reads after while it's its copy's
+    /// newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
+    /// reached back to, no further (goal 11, plan 01a1a87b2e56 step 5): the newest page ends at the copy's
+    /// newest event, so its reads take a compact chunk's last events alone, the fewer the more of the page its
+    /// open chunk holds, and the same page read again takes no more of it. A read that reaches further back
+    /// than what's kept inflates the chunk again and keeps from there; else the longest kept stays. Its owner
+    /// unsetting `paged` lets them go, and so does a read that finds it unset just after keeping them (one of
+    /// the two sees the other). The cell they're kept in is made here, by the first read that keeps them (the
+    /// field's notes).
+    fn page_texts(&self, from: usize) -> std::io::Result<(usize, Bytes)> {
+        if let Some(kept) = self.page_texts_kept(from) {
+            return Ok(kept);
         }
-        let made = Bytes::from(self.joined()?.into_owned());
-        if self.is_compact() && self.paged.load(Ordering::SeqCst) {
-            self.keep_texts(&made);
+        let joined = self.joined()?.into_owned();
+        if !(self.is_compact() && self.paged.load(Ordering::SeqCst)) {
+            return Ok((0, Bytes::from(joined)));
         }
-        Ok(made)
+        // Those it reached back to, alone: a slice of the whole would hold it all.
+        let made = Arc::new(PageTexts { from, bytes: Bytes::copy_from_slice(joined.get(from..).ok_or_else(|| std::io::Error::other("a page's read began past its chunk's texts"))?) });
+        self.keep_texts(&made);
+        Ok((from, made.bytes.clone()))
     }
 
-    /// `made`, its texts, kept for the reads of its copy's newest page unless it keeps some already (the first kept
-    /// stays), its cell made if it's the first to.
-    fn keep_texts(&self, made: &Bytes) {
-        let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
-        if was.is_none() {
-            crate::memory::SESSION_ENTRIES.add(made.len());
+    /// `made`, its texts from `made.from` on, kept for the reads of its copy's newest page unless what it keeps by now
+    /// reaches as far back (a read beside this one kept it meanwhile: the longest kept stays), its cell made if it's the
+    /// first to. What it keeps in its place is counted out.
+    fn keep_texts(&self, made: &Arc<PageTexts>) {
+        let cell = self.texts.get_or_init(ArcSwapOption::empty);
+        let mut now = cell.load_full();
+        while now.as_ref().is_none_or(|k| k.from > made.from) {
+            let was = cell.compare_and_swap(&now, Some(Arc::clone(made)));
+            let swapped = match (&*was, &now) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !swapped {
+                now = Option::clone(&*was);
+                continue;
+            }
+            crate::memory::SESSION_ENTRIES.add(made.bytes.len());
+            if let Some(shorter) = now {
+                crate::memory::SESSION_ENTRIES.sub(shorter.bytes.len());
+            }
             // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
             // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
             // with Acquire alone, where the swaps of a cell always there were all SeqCst).
@@ -517,13 +582,33 @@ impl Chunk {
             if !self.paged.load(Ordering::SeqCst) {
                 self.unpage();
             }
+            break;
         }
     }
 
-    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), if any: what a read on a shard takes
-    /// without inflating anything (goal 10, plan 01a1a87b2dae step 5).
-    fn page_texts_kept(&self) -> Option<Bytes> {
-        self.texts.get().and_then(ArcSwapOption::load_full).map(|kept| Bytes::clone(&kept))
+    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), where they reach back to byte `from` of
+    /// its texts joined, and the byte they begin at: what a read on a shard takes without inflating anything (goal 10,
+    /// plan 01a1a87b2dae step 5).
+    fn page_texts_kept(&self, from: usize) -> Option<(usize, Bytes)> {
+        self.texts.get().and_then(ArcSwapOption::load_full).filter(|k| k.from <= from).map(|k| (k.from, Bytes::clone(&k.bytes)))
+    }
+
+    /// The first of its events whose texts the reads of its copy's newest page took and keep, where a read took them
+    /// ([`Events::pieces_with`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
+    /// 11, plan 01a1a87b2e56 step 5).
+    fn page_reach(&self) -> Option<usize> {
+        if !self.page_read.load(Ordering::Relaxed) {
+            return None;
+        }
+        let from = self.texts.get().and_then(ArcSwapOption::load_full)?.from;
+        let mut off = 0;
+        for (k, m) in self.meta.iter().enumerate() {
+            if off >= from {
+                return Some(k);
+            }
+            off += m.text_len() + 1;
+        }
+        None
     }
 
     /// Its texts as a read of its copy's newest page keeps them ([`Chunk::page_texts`]), made now of `was`'s events
@@ -531,16 +616,25 @@ impl Chunk {
     /// its copy's newest compact chunk and keeps none yet (goal 10, plan 01a1a87b2dae step 5). Its owner asks for it
     /// where its copy's newest page was read since the last compaction ([`Events::compact`]), so the read after this
     /// one finds them made: the first read after each compaction inflated the chunk's whole segment, a few hundred
-    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell.
-    fn warm(&self, was: &Chunk) {
+    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell. Made from
+    /// its event `reach` on, as far back as the reads reached in the chunk before it ([`Chunk::page_reach`]): what they
+    /// keep, no more (goal 11, plan 01a1a87b2e56 step 5).
+    fn warm(&self, was: &Chunk, reach: usize) {
         if !self.is_compact() || was.is_compact() || !self.paged.load(Ordering::SeqCst) || self.page_kept().is_some() {
             return;
         }
-        let Ok(joined) = was.joined() else { return };
-        let made = Bytes::from(joined.into_owned());
+        let Some(evs) = was.evs.get(reach..) else { return };
+        let from = self.off(reach);
+        let mut made = Vec::with_capacity(self.texts_len().saturating_sub(from));
+        for (j, e) in evs.iter().enumerate() {
+            if j > 0 {
+                made.push(b',');
+            }
+            made.extend_from_slice(e.entry.text().as_bytes());
+        }
         // Where its metas say its texts end: else they aren't this chunk's (one changed since it was packed).
-        if self.meta.last().map_or(0, |m| m.off + m.len) == made.len() {
-            self.keep_texts(&made);
+        if from + made.len() == self.texts_len() {
+            self.keep_texts(&Arc::new(PageTexts { from, bytes: Bytes::from(made) }));
         }
     }
 
@@ -549,13 +643,13 @@ impl Chunk {
     fn unpage(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         if let Some(kept) = self.texts.get().and_then(|cell| cell.swap(None)) {
-            crate::memory::SESSION_ENTRIES.sub(kept.len());
+            crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
         }
     }
 
     /// The bytes of its texts a page's read keeps now ([`Chunk::page_texts`]), if any.
     pub fn page_kept(&self) -> Option<usize> {
-        self.texts.get().and_then(|cell| cell.load().as_ref().map(|t| t.len()))
+        self.texts.get().and_then(|cell| cell.load().as_ref().map(|t| t.bytes.len()))
     }
 
     /// It kept compact, once packed: its metas and its segment (which a view of it still taking it shares).
@@ -658,11 +752,12 @@ impl Chunk {
         *self.sealing.get_mut() = false;
         *self.paged.get_mut() = false;
         if let Some(kept) = self.texts.take().and_then(ArcSwapOption::into_inner) {
-            crate::memory::SESSION_ENTRIES.sub(kept.len());
+            crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
         }
     }
 
-    /// Its event `k` changed by `f`, with its meta and where those after it begin.
+    /// Its event `k` changed by `f`, with its meta (where those after it begin is reckoned from the lengths:
+    /// [`Chunk::off`]).
     fn change(&mut self, k: usize, f: impl FnOnce(&mut Ev)) -> bool {
         if !self.thaw() {
             return false;
@@ -670,14 +765,8 @@ impl Chunk {
         self.unpack();
         let Some(ev) = self.evs.get_mut(k) else { return false };
         f(ev);
-        let mut off = self.meta.get(k).map_or(0, |m| m.off);
         if let (Some(m), Some(e)) = (self.meta.get_mut(k), self.evs.get(k)) {
-            *m = Meta::of(e, off);
-            off = m.end();
-        }
-        for m in self.meta.iter_mut().skip(k + 1) {
-            m.off = off;
-            off = m.end();
+            *m = Meta::of(e);
         }
         true
     }
@@ -688,7 +777,7 @@ impl Chunk {
             return;
         }
         self.unpack();
-        self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
+        self.meta.push(Meta::of(&ev));
         self.evs.push(ev);
     }
 }
@@ -893,8 +982,7 @@ impl Events {
                 out.push(b',');
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
-                out.extend_from_slice(chunk.joined().ok()?.get(first.off..last.off + last.len)?);
+                out.extend_from_slice(chunk.joined().ok()?.get(chunk.span(k, n)?)?);
             } else {
                 for (j, e) in chunk.evs.get(k..k + n)?.iter().enumerate() {
                     if j > 0 {
@@ -931,13 +1019,13 @@ impl Events {
                 out.push(Bytes::from_static(b","));
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k).ok_or(Unread::Cannot)?, chunk.meta.get(k + n - 1).ok_or(Unread::Cannot)?);
-                let (from, to) = (first.off, last.off.checked_add(last.len).ok_or(Unread::Cannot)?);
-                let texts = match chunk.page_texts_kept() {
+                let std::ops::Range { start: from, end: to } = chunk.span(k, n).ok_or(Unread::Cannot)?;
+                let (at, texts) = match chunk.page_texts_kept(from) {
                     Some(kept) => kept,
-                    None if inflate => chunk.page_texts().map_err(|_| Unread::Cannot)?,
+                    None if inflate => chunk.page_texts(from).map_err(|_| Unread::Cannot)?,
                     None => return Err(Unread::Unkept),
                 };
+                let (from, to) = (from.checked_sub(at).ok_or(Unread::Cannot)?, to.checked_sub(at).ok_or(Unread::Cannot)?);
                 if from > to || to > texts.len() {
                     return Err(Unread::Cannot);
                 }
@@ -1115,7 +1203,7 @@ impl Events {
     /// rest. How many it let go of (`left`).
     pub(super) fn trim_first(&mut self, was: &Arc<Chunk>, left: usize, made: Chunk) -> Option<usize> {
         let rest = was.metas().get(left..)?;
-        let same = self.chunks().first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq == b.seq);
+        let same = self.chunks().first().is_some_and(|c| Arc::ptr_eq(c, was)) && made.metas().len() == rest.len() && made.metas().iter().zip(rest).all(|(a, b)| a.id == b.id && a.seq() == b.seq());
         if !same {
             return None;
         }
@@ -1134,7 +1222,7 @@ impl Events {
     /// Chunk `was`, still one of these as it was, in `made`'s place: the same events, read back (a compact chunk kept as
     /// its events again, to be changed: [`Shard::want_thaw`]). Whether it was.
     pub(super) fn swap_chunk(&mut self, was: &Arc<Chunk>, made: Chunk) -> bool {
-        if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq == b.seq) {
+        if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq() == b.seq()) {
             return false;
         }
         let Some(at) = self.chunks().iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
@@ -1217,9 +1305,10 @@ impl Events {
         if ready.is_empty() {
             return;
         }
-        // Whether a read of its newest page took the texts of its newest compact chunk until now: then the one this
-        // makes its newest compact chunk has its texts made now, of its events as they were (`Chunk::warm`).
-        let read = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).is_some_and(|c| c.page_read.load(Ordering::Relaxed));
+        // Whether a read of its newest page took the texts of its newest compact chunk until now, and from which of its
+        // events: then the one this makes its newest compact chunk has its texts made now, of its events as they were,
+        // from the same place on (`Chunk::warm`; goal 11, plan 01a1a87b2e56 step 5: what the reads reach, no more).
+        let reach = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).and_then(|c| c.page_reach());
         let chunks = Arc::make_mut(&mut self.older);
         // The newest of those compacted here (they're in order), as it was.
         let mut newest: Option<(usize, Arc<Chunk>)> = None;
@@ -1231,11 +1320,11 @@ impl Events {
             }
         }
         self.page_newest();
-        if read
+        if let Some(reach) = reach
             && let Some((i, was)) = newest
             && let Some(now) = self.older.get(i)
         {
-            now.warm(&was);
+            now.warm(&was, reach);
         }
         self.took_out = true;
     }
@@ -1313,6 +1402,76 @@ impl Events {
         }
         lo
     }
+
+    /// Its events read by their place one after another ([`Reading`]).
+    pub fn reading(&self) -> Reading<'_> {
+        Reading { events: self, read: None }
+    }
+
+    /// Whether the events changed after revision `after` fit a window's bounds (`super::window`), as a viewer that
+    /// takes them `lean` is sent them: what a window's resume is held to (`super::registry::Parts::resolved`).
+    pub(super) fn fit_since(&self, after: u64, lean: bool) -> bool {
+        let (mut rows, mut bytes) = (0usize, 0usize);
+        let mut reading = self.reading();
+        for (i, m) in self.metas().enumerate() {
+            if m.at <= after {
+                continue;
+            }
+            rows += 1;
+            bytes = bytes.saturating_add(if lean { reading.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.text_len() });
+            if rows > super::window::ROWS || bytes > super::window::BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Where a window of the events before `end` begins, holding at most `turns` turns (`super::window::start_at`),
+    /// as a viewer that takes them `lean` is sent them: read from `end` back, each compact chunk inflated once.
+    pub(super) fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
+        let mut reading = self.reading();
+        super::window::start_at(end, turns, |i| reading.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
+    }
+}
+
+/// A copy's events read by their place one after another (goal 9, plan 01a1a87b2cec step 3; goal 11, plan
+/// 01a1a87b2e56 step 5): each compact chunk among them read again once, for all of its events read in turn.
+/// [`Events::get`] reads a compact chunk again whole (inflated, each of its events parsed) for each event it gives,
+/// so a window over a long session's compact chunks read each of them again once an event: the UI's lean window
+/// (`?window=1&lean=1`), about 400 events over 5 compact chunks, about 330 inflates of a 70-event chunk.
+pub struct Reading<'a> {
+    events: &'a Events,
+    /// The compact chunk read last: where it is among the chunks, and its events read again.
+    read: Option<(usize, Vec<Ev>)>,
+}
+
+impl Reading<'_> {
+    /// Event `i`: as its chunk keeps it, or read again with the rest of its compact chunk, once for them all.
+    pub fn get(&mut self, i: usize) -> Option<&Ev> {
+        let events = self.events;
+        let (c, k) = events.place(i)?;
+        let chunk = events.chunk(c)?;
+        if !chunk.is_compact() {
+            return chunk.evs.get(k);
+        }
+        if self.read.as_ref().is_none_or(|(was, _)| *was != c) {
+            self.read = Some((c, chunk.evs().ok()?.into_owned()));
+        }
+        self.read.as_ref().and_then(|(_, evs)| evs.get(k))
+    }
+}
+
+/// The number a copy's timeline begins at, as its state says: where a clear began it again (`State::cleared`, read
+/// from the state's own field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
+fn floor_of(state: &StateDoc) -> u64 {
+    state.get::<u64>("cleared").unwrap_or(1).max(1)
+}
+
+/// A window (or a page) of `events` that begins at event `begin`: that event's number, and whether there's more before
+/// it, in the copy or (`older`) perhaps in the conversation store, the timeline beginning where `state` says.
+pub(super) fn window_at(events: &Events, state: &StateDoc, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
+    let before = events.meta(begin).and_then(|m| m.seq());
+    crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > floor_of(state))) }
 }
 
 /// A chunk that sealed, waiting to be packed, with its copy's home, whose owner keeps it compact once
@@ -1548,6 +1707,7 @@ impl View {
             lean: false,
             window: None,
             from: 0,
+            find: None,
         }
     }
 
@@ -1555,56 +1715,30 @@ impl View {
     /// "Windows"): all of it, or its newest events alone, as many as a window holds
     /// (`super::window::start`), and where they begin. `older`: events before what the copy holds may
     /// be kept elsewhere (the server's conversation store), so a window that begins at the copy's
-    /// first may still have more before it.
+    /// first may still have more before it. The window is found where the snapshot is written, off the
+    /// shards (`super::registry::Parts::resolved`; goal 9, plan 01a1a87b2cec step 3, and goal 11, plan
+    /// 01a1a87b2e56 step 5): finding it reads its events as the viewer takes them, a lean viewer's each
+    /// made lean, and was done on the socket's shard.
     pub fn parts_for(&self, view: super::registry::View, older: bool) -> Parts {
-        let from = if view.window { self.window_start(self.events.len(), super::window::TURNS, view.lean) } else { 0 };
-        Parts { lean: view.lean, window: view.window.then(|| self.window_at(from, older)), from, ..self.parts() }
+        Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..self.parts() }
     }
 
     /// What a viewer that had revision `after` (None: nothing) and takes the session as `view` says
     /// is sent: what it lacks when the copy can say, else a snapshot. To a viewer that takes a window,
     /// what changed since is sent only while it's no more than a window holds; past that it's sent a
-    /// window: a resume never costs more than a first load.
+    /// window: a resume never costs more than a first load. Which of the two is told where the snapshot
+    /// is written, off the shards, as a window is found ([`View::parts_for`]).
     pub fn parts_after(&self, after: Option<u64>, view: super::registry::View, older: bool) -> Parts {
-        let since = after.and_then(|rev| self.parts_since(rev)).filter(|p| !view.window || self.fits(p.since.unwrap_or_default(), view.lean));
-        match since {
-            Some(p) => Parts { lean: view.lean, ..p },
+        match after.and_then(|rev| self.parts_since(rev)) {
+            Some(p) => Parts { lean: view.lean, find: view.window.then_some(super::registry::Find { turns: super::window::TURNS, older }), ..p },
             None => self.parts_for(view, older),
         }
-    }
-
-    /// Whether the events changed after revision `after` fit a window's bounds.
-    fn fits(&self, after: u64, lean: bool) -> bool {
-        let (mut rows, mut bytes) = (0usize, 0usize);
-        for (i, m) in self.events.metas().enumerate() {
-            if m.at <= after {
-                continue;
-            }
-            rows += 1;
-            bytes = bytes.saturating_add(if lean { self.events.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.len });
-            if rows > super::window::ROWS || bytes > super::window::BYTES {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Where a window of the events before `end` begins, holding at most `turns` turns.
-    fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
-        super::window::start_at(end, turns, |i| self.events.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
-    }
-
-    /// The number its timeline begins at: where a clear began it again (`State::cleared`, read from the state's own
-    /// field: goal 9, plan 01a1a87b2cec step 5 keeps no tree of it), else 1.
-    fn floor(&self) -> u64 {
-        self.state.get::<u64>("cleared").unwrap_or(1).max(1)
     }
 
     /// A window (or a page) that begins at event `begin`: that event's number, and whether there's
     /// more before it, in the copy or (`older`) perhaps in the conversation store.
     pub(super) fn window_at(&self, begin: usize, older: bool) -> crate::wire::ui::EventsWindow {
-        let before = self.events.meta(begin).and_then(|m| m.seq);
-        crate::wire::ui::EventsWindow { before, more: begin > 0 || (older && before.is_some_and(|s| s > self.floor())) }
+        window_at(&self.events, &self.state, begin, older)
     }
 
     /// An older page of its events, for a viewer that has them from number `before` on: those just
@@ -1612,13 +1746,14 @@ impl View {
     /// first. [`super::registry::Paged::Store`] when the copy has none before it.
     pub fn page(&self, before: u64, lean: bool, older: bool) -> super::registry::Paged {
         use super::registry::Paged;
-        let end = self.events.partition_point(|m| m.seq.is_some_and(|s| s < before));
+        let end = self.events.partition_point(|m| m.seq().is_some_and(|s| s < before));
         if end == 0 {
-            let floor = self.floor();
+            let floor = floor_of(&self.state);
             return if older && before > floor { Paged::Store { before, floor } } else { Paged::Page { events: Vec::new(), window: crate::wire::ui::EventsWindow { before: None, more: false } } };
         }
-        let begin = self.window_start(end, super::window::PAGE_TURNS, lean);
-        let events = (begin..end).filter_map(|i| self.events.get(i)).map(|e| e.entry.sent(lean).to_owned()).collect();
+        let begin = self.events.window_start(end, super::window::PAGE_TURNS, lean);
+        let mut reading = self.events.reading();
+        let events = (begin..end).filter_map(|i| reading.get(i).map(|e| e.entry.sent(lean).to_owned())).collect();
         Paged::Page { events, window: self.window_at(begin, older) }
     }
 
@@ -1663,7 +1798,7 @@ impl View {
             };
             for (i, m) in metas.iter().enumerate().filter(|(_, m)| !m.id().is_empty()) {
                 let sum = m.sum_made().or_else(|| evs.as_ref().and_then(|evs| evs.get(i)).map(|e| m.sum(e)));
-                if let (Some(seq), Some(sum)) = (m.seq, sum) {
+                if let (Some(seq), Some(sum)) = (m.seq(), sum) {
                     events.push((seq, sum));
                 }
             }
@@ -1709,16 +1844,16 @@ impl View {
     /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
     fn events_page_with(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
-            Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
+            Some(b) => self.events.partition_point(|m| m.seq().is_some_and(|s| s < b)),
             None => self.events.len(),
         };
         let start = end.saturating_sub(limit);
-        if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
+        if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq() != Some(1)) {
             return Err(Unread::Cannot);
         }
         for i in start..end {
             let m = self.events.meta(i).ok_or(Unread::Cannot)?;
-            if m.seq.is_none() || m.id().is_empty() {
+            if m.seq().is_none() || m.id().is_empty() {
                 return Err(Unread::Cannot);
             }
         }
@@ -1811,6 +1946,9 @@ pub struct Mirror {
     /// The events socket's feed's number of its info's last `harness` frame (0: none yet), which its next lets
     /// go of (`crate::hub::Hub::emit_harness`; goal 11, plan 01a1a87b2e56 step 5).
     pub(super) harness_at: u64,
+    /// That frame's text, which the feed lends it (`crate::wire::events::feed::Lent`): held until its next is in
+    /// the feed, then let go of, so the feed's readers pass over this one (goal 9, plan 01a1a87b2cec step 5).
+    pub(super) harness: Option<crate::wire::events::feed::Lent>,
     /// When this server opened it, until its machine announces it: a report from the machine
     /// that left it out was made before its open got there, and doesn't end it.
     pub(super) opened_at: Option<std::time::Instant>,
@@ -1975,6 +2113,7 @@ impl Mirror {
             reset_at: 0,
             started_over_pending: false,
             harness_at: 0,
+            harness: None,
             opened_at: None,
             slot,
             info_json: encoding,
@@ -2337,7 +2476,7 @@ impl Mirror {
     /// or indexed anew; where those it keeps aren't its first ones (never, as a copy takes them in by number)
     /// its events and index are made again (goal 9, plan 01a1a87b2cec step 3).
     pub fn keep_through(&mut self, n: u64) {
-        let keeps = |m: &Meta| m.seq.is_some_and(|q| q <= n);
+        let keeps = |m: &Meta| m.seq().is_some_and(|q| q <= n);
         match self.events.keep_first(keeps) {
             Some(kept) => self.index.retain(|at| *at < kept),
             None => {
@@ -2353,12 +2492,12 @@ impl Mirror {
         let at = match self.index.get(&self.events, id) {
             Some(at) => at,
             None => {
-                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq())?;
                 if seq > top {
                     return None;
                 }
-                let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
-                self.events.meta(at).filter(|m| m.seq == Some(seq))?;
+                let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < seq));
+                self.events.meta(at).filter(|m| m.seq() == Some(seq))?;
                 at
             }
         };
@@ -2373,12 +2512,12 @@ impl Mirror {
         if self.index.get(&self.events, id).is_some_and(|at| at < self.events.len()) {
             return None;
         }
-        let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+        let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq())?;
         if seq > top {
             return None;
         }
-        let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
-        if self.events.meta(at).is_some_and(|m| m.seq == Some(seq)) {
+        let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < seq));
+        if self.events.meta(at).is_some_and(|m| m.seq() == Some(seq)) {
             return None;
         }
         Some(at)
@@ -2396,24 +2535,27 @@ impl Mirror {
     /// number: true when that one had another id (the timeline went another way), which its viewers
     /// can't see from the event alone.
     pub fn upsert(&mut self, e: Arc<Entry>) -> bool {
-        let Some(id) = e.id().map(str::to_owned) else { return false };
+        // Its id read where the entry keeps it, held by a reference of this call's own (goal 9, plan 01a1a87b2cec step
+        // 5: a copy of it was made for each event taken in).
+        let held = Arc::clone(&e);
+        let Some(id) = held.id() else { return false };
         let ev = Ev { entry: e, at: self.rev };
-        let found = self.index.get(&self.events, &id);
+        let found = self.index.get(&self.events, id);
         if found.is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
             return false;
         }
-        if let (Some(q), Some(top)) = (ev.entry.seq(), self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq))
+        if let (Some(q), Some(top)) = (ev.entry.seq(), self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq()))
             && q <= top
         {
-            let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < q));
-            if let Some(was) = self.events.meta(at).filter(|m| m.seq == Some(q)).map(|m| m.id().to_owned()) {
+            let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < q));
+            if let Some(was) = self.events.meta(at).filter(|m| m.seq() == Some(q)).map(|m| m.id().to_owned()) {
                 // Another id under that number, in its place: the index lets go of that one there and finds this one, the
                 // rest of it as it was (goal 9, plan 01a1a87b2cec step 3: it was made again, every event's id hashed, on the
                 // owner's shard). One that couldn't be changed leaves the copy, and so its index, as they were.
                 let displaced = self.events.change(at, |slot| *slot = ev.clone());
                 if displaced {
                     self.index.forget(&was, at);
-                    self.index.insert(&self.events, &id, at);
+                    self.index.insert(&self.events, id, at);
                 }
                 return displaced;
             }
@@ -2423,7 +2565,7 @@ impl Mirror {
         }
         let at = self.events.len();
         let sealed = self.events.push(ev);
-        self.index.insert(&self.events, &id, at);
+        self.index.insert(&self.events, id, at);
         if let Some(sealed) = sealed {
             seal(&sealed, self.home());
         }
@@ -2431,10 +2573,10 @@ impl Mirror {
             // From where a run of the digests begins, as its machine's timeline lets go of its
             // oldest (`crate::wire::sums::run_after`).
             let over = self.events.len() - MAX_EVENTS;
-            let drop = match self.events.meta(over).and_then(|m| m.seq) {
+            let drop = match self.events.meta(over).and_then(|m| m.seq()) {
                 Some(q) => {
                     let from = crate::wire::sums::run_after(q);
-                    self.events.partition_point(|m| m.seq.is_some_and(|s| s < from))
+                    self.events.partition_point(|m| m.seq().is_some_and(|s| s < from))
                 }
                 None => over,
             };
@@ -2532,7 +2674,7 @@ pub struct Shard {
     write: Option<Writing>,
     /// What was made of the event last written out so, or tried, for the update's next take alone ([`Shard::take_written`]).
     written: Option<Written>,
-    /// Events written out so ([`Shard::written_off`]): its tests' count.
+    /// Events written out so ([`Shard::written_off`]), counted for the tests that read it.
     #[cfg(test)]
     written_off: u64,
     /// A frame of a session's events long to write (a large tool output's megabytes), with its session: written off the shard
@@ -3202,6 +3344,21 @@ struct Listed {
     boards: Vec<Weak<Board>>,
     infos: Vec<Bytes>,
     json: Bytes,
+    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
+    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
+    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
+    /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
+    /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
+    etag: Option<http::HeaderValue>,
+}
+
+/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
+/// could be there), else its digest now.
+fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
+    match prior.and_then(|p| p.digested.get(i)) {
+        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
+        _ => crate::http::compress::digest(info),
+    }
 }
 
 impl Listed {
@@ -3344,8 +3501,17 @@ impl Copies {
     /// joined or copied (goal 10, plan 01a1a87b2dae steps 2 and 5). A read that finds a session come, gone
     /// or changed since joins it again, for itself and the reads after it.
     pub fn list_json(&self) -> Bytes {
-        if let Some(listed) = self.listed.load().as_ref().filter(|l| l.holds(&self.boards)) {
-            return listed.json.clone();
+        self.list_tagged().0
+    }
+
+    /// [`Copies::list_json`], and its weak ETag (`crate::http::compress::weak_etag`): named once for all the reads
+    /// that find the list as it was, of its infos' digests, each info digested once for every join that finds it
+    /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
+    /// session, while each state its agents send changes one session's info).
+    pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
+        let prior = self.listed.load_full();
+        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
+            return (listed.json.clone(), listed.etag.clone());
         }
         self.joins.fetch_add(1, Ordering::Relaxed);
         let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
@@ -3362,8 +3528,11 @@ impl Copies {
         }
         views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
         let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone() })));
-        json
+        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
+        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
+        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
+        (json, etag)
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
@@ -4070,7 +4239,7 @@ mod tests {
             flat.push(s);
         }
         let seqs = |e: &Events| e.iter().filter_map(|e| e.entry.seq()).collect::<Vec<_>>();
-        let metas = |e: &Events| e.metas().filter_map(|m| m.seq).collect::<Vec<_>>();
+        let metas = |e: &Events| e.metas().filter_map(|m| m.seq()).collect::<Vec<_>>();
         assert_eq!(seqs(&events), flat);
         assert_eq!(metas(&events), flat);
         assert_eq!(events.len(), flat.len());
@@ -4081,7 +4250,7 @@ mod tests {
         assert_eq!(events.get(CHUNK + 1).map(|e| e.at), Some(0));
         assert_eq!(events.meta(CHUNK + 1).map(|m| m.at), Some(0), "its meta with it");
         // In the middle, by number.
-        let at = events.partition_point(|m| m.seq.is_some_and(|s| s < 10));
+        let at = events.partition_point(|m| m.seq().is_some_and(|s| s < 10));
         events.insert(at, Ev { entry: entry("between", 10), at: 0 });
         flat.insert(at, 10);
         assert_eq!(seqs(&events), flat);
@@ -4093,14 +4262,14 @@ mod tests {
         // Each place still finds its event once the first chunk holds fewer.
         for (i, want) in flat.iter().enumerate() {
             assert_eq!(events.get(i).and_then(|e| e.entry.seq()), Some(*want), "event {i}");
-            assert_eq!(events.meta(i).and_then(|m| m.seq), Some(*want), "meta {i}");
+            assert_eq!(events.meta(i).and_then(|m| m.seq()), Some(*want), "meta {i}");
         }
         for s in n + 1..=n + 3 {
             events.push(Ev { entry: entry(&format!("e{s}"), s), at: s });
             flat.push(s);
         }
         assert_eq!(seqs(&events), flat);
-        events.retain(|m| m.seq.is_some_and(|s| s % 2 == 0));
+        events.retain(|m| m.seq().is_some_and(|s| s % 2 == 0));
         flat.retain(|s| s % 2 == 0);
         assert_eq!(seqs(&events), flat);
         assert_eq!(events.last().and_then(|e| e.entry.seq()), flat.last().copied());
@@ -4181,9 +4350,9 @@ mod tests {
         let joined = String::from_utf8(super::super::packed::inflate(&seg)?)?;
         assert_eq!(u64::try_from(joined.len()).unwrap_or(0), seg.len);
         assert_eq!(seg.crc, crc32fast::hash(joined.as_bytes()));
-        for (m, e) in chunk.metas().iter().zip(chunk.evs()?.iter()) {
-            assert_eq!(joined.get(m.off..m.off + m.len), Some(e.entry.text()), "{}", m.id());
-            assert_eq!((m.seq, m.sum(e), m.id()), (e.entry.seq(), e.entry.sum(), e.entry.id().unwrap_or_default()));
+        for (k, (m, e)) in chunk.metas().iter().zip(chunk.evs()?.iter()).enumerate() {
+            assert_eq!(chunk.span(k, 1).and_then(|r| joined.get(r)), Some(e.entry.text()), "{}", m.id());
+            assert_eq!((m.seq(), m.sum(e), m.id()), (e.entry.seq(), e.entry.sum(), e.entry.id().unwrap_or_default()));
         }
         Ok(())
     }
@@ -4464,7 +4633,9 @@ mod tests {
         let long = CHUNK + 9 + 5;
         anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
         anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 2, "still not kept: an older chunk's never are");
+        // Made with the older one: the newest compact chunk read again too, as the page reaches back past what its reads kept
+        // (only what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and kept from there.
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 3, "still not kept: an older chunk's never are");
         // An event with no number: the copy can't say the page (the store answers it), kept or not.
         m.rev = n + 1;
         m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
@@ -4561,11 +4732,11 @@ mod tests {
         sealed.pack()?;
         let mut compact = sealed.compacted().ok_or_else(|| anyhow::anyhow!("a packed chunk kept compact"))?;
         compact.paged.store(true, Ordering::SeqCst);
-        let texts = compact.page_texts()?;
+        let (_, texts) = compact.page_texts(0)?;
         anyhow::ensure!(compact.texts.get().is_some() && compact.page_kept() == Some(texts.len()), "a page's read keeps its texts");
         anyhow::ensure!(compact.change(0, |_| {}), "changed in place");
         anyhow::ensure!(compact.texts.get().is_none() && compact.page_kept().is_none(), "changed, its cell let go of whole");
-        anyhow::ensure!(compact.page_texts()? == texts && compact.texts.get().is_none(), "read again: the same texts, no cell made");
+        anyhow::ensure!(compact.page_texts(0)?.1 == texts && compact.texts.get().is_none(), "read again: the same texts, no cell made");
         Ok(())
     }
 
@@ -5013,7 +5184,7 @@ mod tests {
             }
             copies.settled().await;
             for id in &sessions {
-                let got = copies.with(id, |v| v.events.metas().filter_map(|m| m.seq).collect::<Vec<_>>()).unwrap_or_default();
+                let got = copies.with(id, |v| v.events.metas().filter_map(|m| m.seq()).collect::<Vec<_>>()).unwrap_or_default();
                 let want: Vec<u64> = (1..=per).collect();
                 anyhow::ensure!(got == want, "{id}: {} of {per} changes, in order: {}", got.len(), got == want);
                 anyhow::ensure!(copies.with(id, |v| v.rev) == Some(per), "{id}'s revision");
@@ -5134,7 +5305,7 @@ mod tests {
             let mut m = compact_copy(n)?;
             let before = m.events.chunks().to_vec();
             let mut want = m.events.clone();
-            want.retain(|e| e.seq.is_some_and(|q| q <= since));
+            want.retain(|e| e.seq().is_some_and(|q| q <= since));
             let was = inflated();
             m.keep_through(since);
             let read = inflated().saturating_sub(was);
@@ -5149,7 +5320,7 @@ mod tests {
                 m.rev += 1;
                 m.upsert(entry(&format!("e{q}"), q));
             }
-            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq).collect();
+            let seqs: Vec<u64> = m.events.metas().filter_map(|meta| meta.seq()).collect();
             anyhow::ensure!(seqs == (1..=since + 3).collect::<Vec<_>>(), "going on from {since}, it goes on: {seqs:?}");
             anyhow::ensure!(m.index.get(&m.events, &format!("e{}", since + 3)) == Some(m.events.len().saturating_sub(1)), "the newest indexed where it is");
         }
@@ -5262,7 +5433,7 @@ mod tests {
                     let was = inflated();
                     m.rev += 1;
                     m.upsert(entry(&format!("e{}", bound + 1), bound + 1));
-                    Some((inflated() - was, m.events.len(), m.events.meta(0).and_then(|x| x.seq)))
+                    Some((inflated() - was, m.events.len(), m.events.meta(0).and_then(|x| x.seq())))
                 })
                 .await
                 .flatten();
@@ -5276,7 +5447,7 @@ mod tests {
                 let now = copies
                     .on(&id, move |s| {
                         let m = s.get_mut(&i)?;
-                        let seqs: Vec<u64> = m.events.metas().filter_map(|x| x.seq).collect();
+                        let seqs: Vec<u64> = m.events.metas().filter_map(|x| x.seq()).collect();
                         let index = m.index.clone();
                         m.reindex();
                         Some((seqs, index == m.index, m.index.get(&m.events, &format!("e{}", bound + 1))))
@@ -5415,25 +5586,25 @@ mod tests {
             let kept = Id::of(id);
             assert_eq!(kept.as_str(), id, "read back as it was");
             assert_eq!(matches!(kept, Id::Inline { .. }), id.len() <= ID_INLINE, "{id:?} ({} bytes) kept in the meta", id.len());
-            let m = Meta::of(&Ev { entry: entry(id, 1), at: 0 }, 0);
+            let m = Meta::of(&Ev { entry: entry(id, 1), at: 0 });
             assert_eq!(m.id(), id);
         }
         assert!(size_of::<Id>() <= 40 && size_of::<Meta>() <= 96, "an id {} bytes, a meta {}", size_of::<Id>(), size_of::<Meta>());
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta's digest takes 8 bytes, where a `OnceLock<u64>` took 16:
-    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta is 88
-    /// bytes, against 96: about 0.4 MB less for the lab's realistic profile's 47,000 or so events kept.
+    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta was 88
+    /// bytes then, against 96 (72 now: `g11_s5_heap_a_meta_is_seventy_two_bytes`).
     #[test]
     fn g11_s5_heap_a_metas_digest_takes_eight_bytes() {
         let ev = Ev { entry: entry("e1", 1), at: 0 };
-        let m = Meta::of(&ev, 0);
+        let m = Meta::of(&ev);
         assert_eq!(m.sum_made(), None, "none made as it came in");
         let made = m.sum(&ev);
         assert_eq!((made, m.sum_made()), (ev.entry.sum(), Some(ev.entry.sum())), "made, then kept");
         let copy = m.clone();
         assert!(copy.sum_made() == Some(made) && copy == m, "a clone keeps it");
-        assert_ne!(Meta::of(&ev, 0), m, "one made and one not aren't equal, as with a OnceLock");
+        assert_ne!(Meta::of(&ev), m, "one made and one not aren't equal, as with a OnceLock");
         assert!(size_of::<Meta>() <= 88, "a meta takes {} bytes", size_of::<Meta>());
     }
 
@@ -5460,6 +5631,114 @@ mod tests {
         }
         index.drop_front(1);
         assert_eq!((index.get(&events, "e1"), index.by_hash.len()), (None, 2), "the oldest let go of");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta is 72 bytes. It keeps no offset (where an event's text
+    /// begins is reckoned from the lengths before it), and whether its event has a number in its length's top bit,
+    /// where an `Option<u64>` took 16 bytes. A compact chunk's 70 metas take 5,040 bytes, within jemalloc's
+    /// 5,120-byte size class, where at 88 bytes they took 6,160 (its 7,168-byte class). Numbers (none, 0, the most
+    /// a `u64` holds), lengths, offsets and spans read as the texts joined say.
+    #[test]
+    fn g11_s5_heap_a_meta_is_seventy_two_bytes() -> anyhow::Result<()> {
+        assert_eq!(size_of::<Meta>(), 72, "a meta takes {} bytes", size_of::<Meta>());
+        assert!(CHUNK * size_of::<Meta>() <= 5 << 10, "a chunk's metas take {} bytes", CHUNK * size_of::<Meta>());
+        for seq in [1, 0, u64::MAX] {
+            let ev = Ev { entry: entry("e", seq), at: 3 };
+            let m = Meta::of(&ev);
+            assert_eq!((m.seq(), m.text_len(), m.at), (Some(seq), ev.entry.text().len(), 3), "numbered {seq}");
+        }
+        let bare = Ev { entry: Arc::new(Entry::new(json!({"id": "n", "kind": "notice", "text": "no number"}))), at: 0 };
+        let m = Meta::of(&bare);
+        assert_eq!((m.seq(), m.text_len()), (None, bare.entry.text().len()), "no number");
+        let evs: Vec<Ev> = (1..=5).map(|q| Ev { entry: entry(&format!("e{q}"), q * 1_000), at: q }).collect();
+        let chunk = Chunk::of(evs.clone());
+        let joined = String::from_utf8(chunk.joined()?.into_owned())?;
+        anyhow::ensure!(chunk.texts_len() == joined.len(), "its texts joined: {} bytes, not {}", joined.len(), chunk.texts_len());
+        let texts: Vec<&str> = evs.iter().map(|e| e.entry.text()).collect();
+        for (k, text) in texts.iter().enumerate() {
+            anyhow::ensure!(chunk.off(k) == texts.iter().take(k).map(|t| t.len() + 1).sum::<usize>(), "event {k} begins past those before it");
+            anyhow::ensure!(chunk.span(k, 1).and_then(|r| joined.get(r)) == Some(*text), "event {k}'s text");
+        }
+        anyhow::ensure!(chunk.span(1, 3).and_then(|r| joined.get(r)) == texts.get(1..4).map(|t| t.join(",")).as_deref(), "events 1 to 3 joined");
+        anyhow::ensure!(chunk.span(5, 1).is_none() && chunk.span(0, 0).is_none() && chunk.span(4, 2).is_none(), "nothing past its events");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a copy's events read one after another ([`Reading`]), from the
+    /// newest back as a window reads them, read each compact chunk again once for all of its events, where
+    /// `Events::get` reads it again for each: the same events, and none past them.
+    #[test]
+    fn g11_s5_heap_events_read_in_turn_read_each_compact_chunk_once() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut events = Events::default();
+        let n = CHUNK * 3 + 5;
+        for q in 1..=u64::try_from(n)? {
+            events.push(Ev { entry: entry(&format!("e{q}"), q), at: q });
+        }
+        for c in events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        events.compact(None);
+        let compact = events.chunks().iter().filter(|c| c.is_compact()).count();
+        anyhow::ensure!(compact == 3, "three compact chunks: {compact}");
+        let want: Vec<String> = (0..n).filter_map(|i| events.get(i).map(|e| e.entry.text().to_owned())).collect();
+        let was = inflated();
+        let mut reading = events.reading();
+        let mut got: Vec<String> = (0..n).rev().filter_map(|i| reading.get(i).map(|e| e.entry.text().to_owned())).collect();
+        got.reverse();
+        anyhow::ensure!(got == want && got.len() == n, "the same events");
+        anyhow::ensure!(usize::try_from(inflated() - was)? == compact, "each compact chunk read again once: {}", inflated() - was);
+        anyhow::ensure!(reading.get(n).is_none(), "none past them");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the newest compact chunk keeps of its texts only those its copy's
+    /// newest page's reads reached back to. With nine events in the open chunk, a page of 30 keeps the compact chunk's
+    /// last 21 (inflated once); a page of 20 reaches less far back and takes a slice of them (nothing inflated); a page
+    /// of 50 reaches further, inflates once more and keeps its last 41; a page of 30 again takes a slice of those. Each
+    /// page reads as the events' texts joined, and a page that reaches past the newest compact chunk keeps nothing of
+    /// the older one.
+    #[test]
+    fn g11_s5_heap_a_page_keeps_the_texts_its_reads_reach_back_to() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Two sealed chunks and the newest open with nine.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        let texts: Vec<String> = view.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = |limit: usize| format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(limit)..).unwrap_or_default().join(","));
+        let (older, compact) = (view.events.chunks().first().ok_or_else(|| anyhow::anyhow!("no chunk"))?, view.events.chunks().get(1).ok_or_else(|| anyhow::anyhow!("one chunk"))?);
+        anyhow::ensure!(compact.is_compact() && older.is_compact(), "two compact chunks");
+        // The bytes of the compact chunk's texts joined from its last `events` on.
+        let suffix = |events: usize| -> Option<usize> { Some(compact.texts_len() - compact.off(compact.metas().len().checked_sub(events)?)) };
+        let read = |limit: usize| -> anyhow::Result<()> {
+            let got = view.events_json(None, limit).ok_or_else(|| anyhow::anyhow!("a page of {limit} from memory"))?;
+            anyhow::ensure!(String::from_utf8_lossy(&got) == page(limit), "a page of {limit}: the events' texts joined");
+            Ok(())
+        };
+        let was = inflated();
+        read(30)?;
+        anyhow::ensure!(inflated() == was + 1 && compact.page_kept() == suffix(21), "a page of 30: its last 21 kept ({:?})", compact.page_kept());
+        read(20)?;
+        anyhow::ensure!(inflated() == was + 1 && compact.page_kept() == suffix(21), "a page of 20: a slice of them, nothing inflated");
+        read(50)?;
+        anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 50: inflated once more, its last 41 kept ({:?})", compact.page_kept());
+        read(30)?;
+        anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 30 again: a slice of the longer");
+        anyhow::ensure!(suffix(41) < suffix(70), "less than the whole chunk's texts");
+        // A page into the older compact chunk: it's inflated for that read and keeps nothing.
+        read(100)?;
+        anyhow::ensure!(older.page_kept().is_none() && compact.page_kept() == suffix(70), "the older keeps nothing; the newest compact chunk's whole kept");
+        Ok(())
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: the index finds each id where it is, checked against the id its event's
@@ -5507,7 +5786,7 @@ mod tests {
             m.rev = q;
             m.upsert(entry(&format!("e{q}"), q));
         }
-        assert!(m.events.len() < usize::try_from(n).unwrap_or(0) && m.events.meta(0).and_then(|x| x.seq).is_some_and(|q| q > 1), "its oldest went");
+        assert!(m.events.len() < usize::try_from(n).unwrap_or(0) && m.events.meta(0).and_then(|x| x.seq()).is_some_and(|q| q > 1), "its oldest went");
         assert_eq!(m.index.get(&m.events, "e1"), None, "one let go of isn't found");
         for (at, meta) in m.events.metas().enumerate() {
             assert_eq!(m.index.get(&m.events, meta.id()), Some(at), "{}", meta.id());
@@ -5693,7 +5972,7 @@ mod tests {
                 copies
                     .on(&id, move |s| {
                         let turned = s.turns.len();
-                        s.get(&i).map(|m| (m.rev, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), runs.load(Ordering::SeqCst), turned))
+                        s.get(&i).map(|m| (m.rev, m.events.metas().filter_map(|x| x.seq()).collect::<Vec<u64>>(), runs.load(Ordering::SeqCst), turned))
                     })
                     .await
                     .flatten()
@@ -5757,7 +6036,7 @@ mod tests {
             let now = copies
                 .on(&id, move |s| {
                     let off = s.written_off();
-                    s.get(&i).map(|m| (off, m.events.metas().filter_map(|x| x.seq).collect::<Vec<u64>>(), m.events.get(9).map(|e| e.entry.text().len()), m.index.get(&m.events, "e10"), m.index.get(&m.events, "e11")))
+                    s.get(&i).map(|m| (off, m.events.metas().filter_map(|x| x.seq()).collect::<Vec<u64>>(), m.events.get(9).map(|e| e.entry.text().len()), m.index.get(&m.events, "e10"), m.index.get(&m.events, "e11")))
                 })
                 .await
                 .flatten();
@@ -5791,7 +6070,7 @@ mod tests {
     /// Whether session `id`'s copy, as its readers find it, took changes 1 to `to` (and none of another's), once each and
     /// in order: what it holds when it didn't.
     fn took_in_order(copies: &Copies, id: &str, to: u64) -> Result<(), String> {
-        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq)).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
+        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq())).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
         let want: Vec<(String, Option<u64>)> = (1..=to).map(|n| (format!("{id}-{n}"), Some(n))).collect();
         if events == want && rev == to {
             return Ok(());
@@ -6235,13 +6514,13 @@ mod tests {
         let mut cleared = filled(n);
         cleared.clear();
         let mut kept = filled(n);
-        let through = kept.keep_first(|m| m.seq.is_some_and(|q| q <= 10));
+        let through = kept.keep_first(|m| m.seq().is_some_and(|q| q <= 10));
         let mut whole = filled(n);
         let all = whole.keep_first(|_| true);
         let mut inserted = filled(n);
         inserted.insert(5, Ev { entry: entry("x", 5), at: 1 });
         let mut retained = filled(n);
-        retained.retain(|m| m.seq.is_some_and(|q| q % 2 == 0));
+        retained.retain(|m| m.seq().is_some_and(|q| q % 2 == 0));
         anyhow::ensure!(cut.took_out && cleared.took_out && inserted.took_out && retained.took_out, "a cut, let go of, made again with one in, made again of some");
         anyhow::ensure!(through == Some(10) && kept.took_out && all == Some(CHUNK * 4 + 9) && !whole.took_out, "kept through a number; kept whole, nothing taken out");
         // Packed and kept compact: a compaction, a cut in a compact chunk and its trim, a compact chunk read back.

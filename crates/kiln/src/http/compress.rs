@@ -13,7 +13,9 @@
 //!   SHA-256 and, unless the handler said otherwise, `Cache-Control: private, no-cache`: the browser
 //!   keeps the body and asks again each time (`If-None-Match`), and an unchanged answer costs a `304`
 //!   with no body. `no-cache` means no copy is used without asking, so the UI never sees stale data.
-//!   The ETag is weak (RFC 9110 §8.8.1) because one is shared by the identity and compressed forms.
+//!   The ETag is weak (RFC 9110 §8.8.1) because one is shared by the identity and compressed forms. A
+//!   weak ETag the handler set is taken as that validator, its body not digested again: a read model's,
+//!   made once for what it answers ([`weak_etag`]; goal 9, plan 01a1a87b2cec step 5).
 //!
 //! The work runs on the shard when it fits a step's quantum, else on the compute pool
 //! (`crate::rt::compute`): a large body never holds the shard that serves every other socket on it.
@@ -231,32 +233,59 @@ fn compressible(content_type: &str) -> bool {
     starts("text/") || ends("json") || holds("javascript") || ends("xml") || is("image/svg+xml")
 }
 
+/// Whether an ETag is weak (`W/`, RFC 9110 §8.8.3).
+fn weak(etag: &HeaderValue) -> bool {
+    etag.as_bytes().starts_with(b"W/")
+}
+
 fn has_token(h: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
     h.get_all(name).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(|t| t.trim().eq_ignore_ascii_case(token))
 }
 
 /// The bytes of the SHA-256 a weak ETag names (its first 128 bits), and so twice as many hex digits.
-const ETAG_DIGEST: usize = 16;
+pub const ETAG_DIGEST: usize = 16;
 
 /// A weak ETag's bytes: `W/"`, the digest's hex digits, `"`.
 const ETAG_LEN: usize = r#"W/""#.len() + 2 * ETAG_DIGEST + r#"""#.len();
 
-/// The weak ETag of a body, as its bytes: its SHA-256's first 128 bits. SHA-256 (already kiln's hash) and
-/// not a faster non-cryptographic one: a 304 for a changed body would show a person stale data, and a body
-/// someone else can write to (a run's title) mustn't be made to collide with an older one. Written into one
-/// buffer of its length, which its header value takes as it is (goal 9, plan 01a1a87b2cec step 5: the
-/// digest's hex, then `W/"…"` of it, then the header value's copy, three allocations an answer).
-fn etag_bytes(body: &[u8]) -> Vec<u8> {
+/// What a weak ETag names of `body`: its SHA-256's first 128 bits. SHA-256 (already kiln's hash) and not a
+/// faster non-cryptographic one: a 304 for a changed body would show a person stale data, and a body someone
+/// else can write to (a run's title) mustn't be made to collide with an older one. A read model that keeps
+/// what it answers as parts digests each part once and names the whole by the digest of their digests
+/// ([`weak_etag`]; goal 9, plan 01a1a87b2cec step 5: `crate::harness::copies::Copies::list_tagged`).
+pub fn digest(body: &[u8]) -> [u8; ETAG_DIGEST] {
     use sha2::Digest as _;
     let d = sha2::Sha256::digest(body);
+    let mut first = [0u8; ETAG_DIGEST];
+    if let Some(head) = d.get(..ETAG_DIGEST) {
+        first.copy_from_slice(head);
+    }
+    first
+}
+
+/// The weak ETag naming `digest`, as its bytes: `W/"`, its hex digits, `"`. Written into one buffer of its
+/// length, which its header value takes as it is (goal 9, plan 01a1a87b2cec step 5: the digest's hex, then
+/// `W/"…"` of it, then the header value's copy, three allocations an answer).
+fn etag_bytes_of(digest: &[u8; ETAG_DIGEST]) -> Vec<u8> {
     let mut hexed = [0u8; 2 * ETAG_DIGEST];
-    // The digest's first bytes always fill the room: SHA-256's are 32.
-    let _ = hex::encode_to_slice(d.get(..ETAG_DIGEST).unwrap_or_default(), &mut hexed);
+    // Twice the digest's bytes always fill the room.
+    let _ = hex::encode_to_slice(digest, &mut hexed);
     let mut tag = Vec::with_capacity(ETAG_LEN);
     tag.extend_from_slice(br#"W/""#);
     tag.extend_from_slice(&hexed);
     tag.push(b'"');
     tag
+}
+
+/// The weak ETag of a body, as its bytes ([`digest`], [`etag_bytes_of`]).
+fn etag_bytes(body: &[u8]) -> Vec<u8> {
+    etag_bytes_of(&digest(body))
+}
+
+/// The weak ETag naming `digest` as a header value ([`etag_bytes_of`]): what a read model sets on an answer it
+/// made the digest of, which [`finish`] then takes as the answer's validator, not digesting its body again.
+pub fn weak_etag(digest: &[u8; ETAG_DIGEST]) -> Option<HeaderValue> {
+    HeaderValue::from_maybe_shared(Bytes::from(etag_bytes_of(digest))).ok()
 }
 
 /// The weak ETag of a body ([`etag_bytes`]), as text.
@@ -286,8 +315,11 @@ enum Done {
     Answer { etag: Option<HeaderValue>, packed: Option<(Coding, Vec<u8>)> },
 }
 
-fn work(body: &[u8], tag: bool, validators: Option<&str>, coding: Option<Coding>) -> io::Result<Done> {
-    let etag = if tag { etag_value(body) } else { None };
+/// The answer's validator and coding worked out for `body`: its weak ETag where it gets one (`tag`), the one its
+/// handler gave (`given`, a read model's, [`weak_etag`]) else its body's digest's; a 304 where `validators` (its
+/// request's `If-None-Match`) hold it; else its body compressed in `coding`, where that's smaller.
+fn work(body: &[u8], tag: bool, given: Option<HeaderValue>, validators: Option<&str>, coding: Option<Coding>) -> io::Result<Done> {
+    let etag = if tag { given.or_else(|| etag_value(body)) } else { None };
     let unchanged = match (&etag, validators) {
         (Some(e), Some(v)) => e.to_str().is_ok_and(|e| holds(v, e)),
         _ => false,
@@ -324,9 +356,12 @@ fn plan(asked: &Asked, resp: &Response) -> Option<Plan> {
         return None;
     }
     let h = resp.headers();
-    // A validator of the handler's own (a file's, a package proxy's) is strong, for this body as it is:
-    // compressed, it would name another (RFC 9110 §8.8.3), so that answer goes as it is.
-    if h.contains_key(header::CONTENT_ENCODING) || h.contains_key(header::CONTENT_RANGE) || h.contains_key(header::ACCEPT_RANGES) || h.contains_key(header::ETAG) || has_token(h, header::CACHE_CONTROL, "no-transform") {
+    // A strong validator of the handler's own (a file's, a package proxy's) is for this body as it is: compressed,
+    // it would name another (RFC 9110 §8.8.3), so that answer goes as it is. A weak one (a read model's for what it
+    // answers, [`weak_etag`]) is shared by the identity and compressed forms, as finish's own: the answer's
+    // validator (goal 9, plan 01a1a87b2cec step 5).
+    let strong = h.get(header::ETAG).is_some_and(|v| !weak(v));
+    if h.contains_key(header::CONTENT_ENCODING) || h.contains_key(header::CONTENT_RANGE) || h.contains_key(header::ACCEPT_RANGES) || strong || has_token(h, header::CACHE_CONTROL, "no-transform") {
         return None;
     }
     if !h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(compressible) {
@@ -370,6 +405,7 @@ pub struct Later {
     tag: bool,
     big: bool,
     coding: Option<Coding>,
+    given: Option<HeaderValue>,
     validators: Option<String>,
 }
 
@@ -393,18 +429,20 @@ pub fn finish_here(asked: Asked, resp: Response) -> Finished {
         Some(Coding::Br) => Work::Br,
         _ => Work::Gzip,
     };
+    // A weak validator its handler made for it (a read model's), taken as its own, where it gets one.
+    let given = if tag { parts.headers.remove(header::ETAG) } else { None };
     if !inline(cost, len) {
-        return Finished::Later(Later { parts, bytes, tag, big, coding, validators: asked.validators });
+        return Finished::Later(Later { parts, bytes, tag, big, coding, given, validators: asked.validators });
     }
-    let done = work(&bytes, tag, asked.validators.as_deref(), coding);
+    let done = work(&bytes, tag, given, asked.validators.as_deref(), coding);
     Finished::Now(answered(parts, bytes, big, done))
 }
 
 /// The rest of [`finish`] for an answer [`finish_here`] left: its body's work on the compute pool.
 pub async fn finish_later(later: Later) -> Response {
-    let Later { parts, bytes, tag, big, coding, validators } = later;
+    let Later { parts, bytes, tag, big, coding, given, validators } = later;
     let b = bytes.clone();
-    let done = match crate::rt::compute(move || work(&b, tag, validators.as_deref(), coding)).await {
+    let done = match crate::rt::compute(move || work(&b, tag, given, validators.as_deref(), coding)).await {
         Ok(r) => r,
         Err(e) => Err(io::Error::other(e)),
     };
@@ -806,6 +844,59 @@ pub(crate) mod tests {
         for (t, yes) in [("Application/JSON; charset=utf-8", true), ("application/problem+json", true), ("TEXT/plain", true), ("text/event-stream", false), ("Text/Event-Stream", false), ("application/javascript", true), ("image/svg+xml", true), ("application/xml", true), ("image/png", false), ("", false)] {
             anyhow::ensure!(compressible(t) == yes, "{t}: {}", compressible(t));
         }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a weak ETag its handler set (a read model's, made once for what it answers) is
+    /// the answer's validator: kept as it is (its body isn't digested: it isn't the body's digest here), the body still
+    /// compressed for one that takes a coding, `Cache-Control` and `Vary` as finish's own validator gets them, a 304
+    /// for a request that holds it; finished in one allocation, its body's box. A strong one is left as it is, as
+    /// before; a weak one on an answer that gets no validator (a POST's) too.
+    #[test]
+    fn g9_s5_a_handlers_weak_etag_is_the_answers_validator() -> anyhow::Result<()> {
+        let made = weak_etag(&[7; ETAG_DIGEST]).ok_or_else(|| anyhow::anyhow!("no header value"))?;
+        let named = made.to_str()?.to_owned();
+        anyhow::ensure!(named == format!("W/\"{}\"", "07".repeat(ETAG_DIGEST)), "{named}");
+        let answer = |made: &HeaderValue, b: &[u8]| {
+            let mut r = srv::response(StatusCode::OK, "application/json", srv::full(b.to_vec()));
+            r.headers_mut().insert(header::ETAG, made.clone());
+            r
+        };
+        {
+            let (made, named) = (made.clone(), named.clone());
+            crate::rt::block_on(async move {
+                let body = runners_list()?;
+                let r = finish(Asked::of(&get(&[("accept-encoding", "br")])), answer(&made, &body)).await;
+                anyhow::ensure!(header(&r, header::ETAG) == Some(named.as_str()), "kept: {:?}", header(&r, header::ETAG));
+                anyhow::ensure!(header(&r, header::CONTENT_ENCODING) == Some("br") && header(&r, header::VARY) == Some("Accept-Encoding"), "compressed");
+                anyhow::ensure!(header(&r, header::CACHE_CONTROL) == Some("private, no-cache"), "{:?}", header(&r, header::CACHE_CONTROL));
+                anyhow::ensure!(unbrotli(&body_of(r).await?)? == body, "the body as it was");
+                let r = finish(Asked::of(&get(&[("if-none-match", &named)])), answer(&made, &body)).await;
+                anyhow::ensure!(r.status() == StatusCode::NOT_MODIFIED && header(&r, header::ETAG) == Some(named.as_str()), "a 304: {}", r.status());
+                let r = finish(Asked::of(&get(&[("if-none-match", &etag_of(&body))])), answer(&made, &body)).await;
+                anyhow::ensure!(r.status() == StatusCode::OK, "its body's own digest isn't its validator: {}", r.status());
+                // A strong one: the answer as it was.
+                let mut strong = srv::response(StatusCode::OK, "application/json", srv::full(body.clone()));
+                strong.headers_mut().insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+                let before = strong.headers().clone();
+                let r = finish(Asked::of(&get(&[("accept-encoding", "br")])), strong).await;
+                anyhow::ensure!(r.headers() == &before, "a strong validator's answer as it was");
+                // A POST's answer gets no validator: its handler's stays where it set it, its body compressed.
+                let mut post = get(&[("accept-encoding", "br")]);
+                *post.method_mut() = Method::POST;
+                let r = finish(Asked::of(&post), answer(&made, &body)).await;
+                anyhow::ensure!(header(&r, header::ETAG) == Some(named.as_str()) && header(&r, header::CONTENT_ENCODING) == Some("br"), "a POST's");
+                Ok(())
+            })?;
+        }
+        // A small one finished here: its body's box alone.
+        let resp = answer(&made, br#"{"ok":true}"#);
+        let asked = Asked::of(&get(&[]));
+        let before = crate::os::counted::made().blocks;
+        let done = finish_here(asked, resp);
+        let blocks = crate::os::counted::made().blocks.saturating_sub(before);
+        let Finished::Now(r) = done else { anyhow::bail!("a small answer was left for the compute pool") };
+        anyhow::ensure!(blocks == 1 && header(&r, header::ETAG) == Some(named.as_str()), "{blocks} allocations");
         Ok(())
     }
 

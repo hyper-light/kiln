@@ -14,7 +14,8 @@
 //!   over to the hub starting on it, then to the hub having applied it; and runners' and their jobs'
 //!   own HTTP routes (enrolling, sync's contents, artifacts, CI's runtime services), as requests are.
 //!
-//! Every histogram is atomics only ([`Histogram`]): no lock on any path that times or reads one.
+//! Every histogram is atomics only ([`crate::metrics::Histogram`], a copy for each shard: [`PerShard`]): no lock on any
+//! path that times or reads one.
 //! Time a request waited in its socket while its shard was busy shows in `kiln_shard_delay_seconds`
 //! (`crate::shard_health`): the runtime doesn't say when a task was woken.
 
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use http::Method;
 
-use crate::metrics::{Histogram, STALL_BUCKETS};
+use crate::metrics::{PerShard, STALL_BUCKETS};
 
 /// What the server's work is, as timed here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,15 +61,16 @@ impl Class {
     }
 }
 
-/// Each class's histograms, in [`Class::ALL`]'s order.
+/// Each class's histograms, in [`Class::ALL`]'s order: each shard times its work into copies of its own, summed as
+/// they're read ([`PerShard`]; goal 9, plan 01a1a87b2cec step 5).
 pub struct Routes {
-    wait: [Histogram; 5],
-    took: [Histogram; 5],
+    wait: [PerShard; 5],
+    took: [PerShard; 5],
 }
 
 impl Routes {
     fn new() -> Self {
-        Self { wait: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)), took: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)) }
+        Self { wait: std::array::from_fn(|_| PerShard::new(STALL_BUCKETS)), took: std::array::from_fn(|_| PerShard::new(STALL_BUCKETS)) }
     }
 
     /// Work of `class` that waited `wait` (where it's known) and took `took`.
@@ -95,14 +97,12 @@ impl Routes {
     /// `took`: a batch of frames written with one write.
     pub fn observe_took(&self, class: Class, took: Duration, n: u64) {
         if let Some(h) = self.took.get(class.index()) {
-            for _ in 0..n {
-                h.observe(took.as_secs_f64());
-            }
+            h.observe_n(took.as_secs_f64(), n);
         }
     }
 
     /// `class`'s histograms: how long its work waited, and took.
-    pub fn of(&self, class: Class) -> Option<(&Histogram, &Histogram)> {
+    pub fn of(&self, class: Class) -> Option<(&PerShard, &PerShard)> {
         Some((self.wait.get(class.index())?, self.took.get(class.index())?))
     }
 }
@@ -179,11 +179,11 @@ impl RunnerLeg {
 
 /// Each leg's histogram, in [`RunnerLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
 /// shards' delay is (`crate::shard_health::DELAY_BUCKETS`): a leg's p99 sits about a millisecond.
-pub struct Legs([Histogram; RunnerLeg::ALL.len()]);
+pub struct Legs([PerShard; RunnerLeg::ALL.len()]);
 
 impl Legs {
     fn new() -> Self {
-        Self(std::array::from_fn(|_| Histogram::new(crate::shard_health::DELAY_BUCKETS)))
+        Self(std::array::from_fn(|_| PerShard::new(crate::shard_health::DELAY_BUCKETS)))
     }
 
     /// A runner's message spent `took` on `leg`.
@@ -193,7 +193,7 @@ impl Legs {
         }
     }
 
-    pub fn of(&self, leg: RunnerLeg) -> Option<&Histogram> {
+    pub fn of(&self, leg: RunnerLeg) -> Option<&PerShard> {
         self.0.get(leg.index())
     }
 }
@@ -450,7 +450,7 @@ mod tests {
         l.observe(RunnerLeg::InLoop, Duration::from_micros(40));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
-        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
         assert_eq!(counts, vec![0, 1, 2, 0, 0, 0]);
         // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
         let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
@@ -474,7 +474,7 @@ mod tests {
         let l = Legs::new();
         l.observe(RunnerLeg::Held, Duration::from_micros(150));
         l.observe(RunnerLeg::Held, Duration::from_micros(6_000));
-        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
         assert_eq!(counts, vec![0, 0, 0, 2, 0, 0]);
         let under = |bound: f64| l.of(RunnerLeg::Held).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(0.00025), under(0.001)), (Some(1), Some(1)), "150 µs under a quarter millisecond, 6 ms past a millisecond");
@@ -496,7 +496,7 @@ mod tests {
         l.observe(RunnerLeg::Runner, Duration::from_micros(80));
         l.observe(RunnerLeg::Runner, Duration::from_micros(74_000));
         l.observe(RunnerLeg::Server, Duration::from_micros(900));
-        let count = |leg| l.of(leg).map_or(0, Histogram::count);
+        let count = |leg| l.of(leg).map_or(0, PerShard::count);
         assert_eq!((count(RunnerLeg::Runner), count(RunnerLeg::Server), count(RunnerLeg::Held)), (2, 1, 0), "each its own");
         let under = |leg, bound: f64| l.of(leg).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(RunnerLeg::Runner, 0.0001), under(RunnerLeg::Runner, 0.05)), (Some(1), Some(1)), "80 µs under a tenth of a millisecond, 74 ms past 50");
