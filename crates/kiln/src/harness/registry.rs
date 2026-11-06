@@ -1290,6 +1290,13 @@ fn file_key((path, tree): FileRef<'_>) -> Value {
 /// the one with its key, or after the rest when it's new; each gone goes. A viewer takes a patch
 /// the same way (the UI's `changesPatched`), so its list keeps this one's order.
 pub(super) fn merge_changes(files: &mut Vec<Arc<Entry>>, set: Vec<Value>, gone: &[Value]) {
+    merge_change_entries(files, set.into_iter().map(|f| Arc::new(Entry::new(f))).collect(), gone);
+}
+
+/// [`merge_changes`] of files written out already (`set`, each its entry: where a session's owner wrote them off its shard,
+/// `super::copies::Shard::want_changes`; goal 9, plan 01a1a87b2cec step 3), each keyed by its entry's path and tree as
+/// [`file_ref`] keys its JSON.
+pub(super) fn merge_change_entries(files: &mut Vec<Arc<Entry>>, set: Vec<Arc<Entry>>, gone: &[Value]) {
     if !gone.is_empty() {
         let out: std::collections::HashSet<FileRef<'_>> = gone.iter().map(file_ref).collect();
         files.retain(|f| !out.contains(&f.file()));
@@ -1301,15 +1308,14 @@ pub(super) fn merge_changes(files: &mut Vec<Arc<Entry>>, set: Vec<Value>, gone: 
         let mut next = files.len();
         set.iter()
             .map(|f| {
-                *at.entry(file_ref(f)).or_insert_with(|| {
+                *at.entry(f.file()).or_insert_with(|| {
                     next += 1;
                     next - 1
                 })
             })
             .collect()
     };
-    for (f, i) in set.into_iter().zip(places) {
-        let entry = Arc::new(Entry::new(f));
+    for (entry, i) in set.into_iter().zip(places) {
         match files.get_mut(i) {
             Some(slot) => *slot = entry,
             None => files.push(entry),
@@ -2439,8 +2445,21 @@ impl Registry {
         // A changeset's patch is stored as the whole changeset it makes, once taken in (below); an
         // update's events as they're taken, each written out once for the copy and its row (below).
         let store = self.convo.as_ref().filter(|_| !shipped);
+        // A changeset long to write out (each file a JSON tree, then that written out, and the store's row of it: a runner's
+        // up to 512 KiB of hunks, milliseconds on the shard): written out off the shard first, nothing of it taken yet, then
+        // taken as written there; one its owner tried is taken either way (goal 9, plan 01a1a87b2cec step 3:
+        // `super::copies::Shard::want_changes`).
+        let tried_changes = s.take_changes_written(id);
+        if tried_changes.is_none() && s.get(id).is_some() && super::copies::long_changes(&u) {
+            s.want_changes(id, store.is_some());
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+        }
+        let mut written_changes = tried_changes.and_then(|w| w.made);
         if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
-            store.send(id, &u);
+            match written_changes.as_mut() {
+                Some(made) => store.put(std::mem::take(&mut made.rows)),
+                None => store.send(id, &u),
+            }
         }
         // The event of this update its owner wrote out off the shard, or tried, for that event as it's taken (below; goal 9,
         // plan 01a1a87b2cec step 3).
@@ -2664,9 +2683,25 @@ impl Registry {
                     }
                 }
             }
-            Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
+            // As its owner wrote it out off the shard, or here, timed, so what's long to write is learned (goal 9, plan
+            // 01a1a87b2cec step 3).
+            Update::Changes { files } => match written_changes.take() {
+                Some(made) => m.take_change_entries(made.set, Vec::new(), true),
+                None => {
+                    let began = std::time::Instant::now();
+                    m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true);
+                    super::copies::wrote_changes(&u, began.elapsed());
+                }
+            },
             Update::ChangesPatch { set, gone } => {
-                m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
+                match written_changes.take() {
+                    Some(made) => m.take_change_entries(made.set, made.gone, false),
+                    None => {
+                        let began = std::time::Instant::now();
+                        m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
+                        super::copies::wrote_changes(&u, began.elapsed());
+                    }
+                }
                 if self.convo.is_some() && !shipped {
                     stored_changes.clone_from(&m.changes);
                 }

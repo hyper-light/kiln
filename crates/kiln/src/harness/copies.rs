@@ -38,7 +38,7 @@ use serde_json::Value;
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
 use super::packed::Segment;
-use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, merge_changes, null, write};
+use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, null, write};
 use super::state_doc::StateDoc;
 use super::session::Info;
 use crate::hub::Hub;
@@ -1788,7 +1788,7 @@ pub struct Mirror {
     pub(super) state_bytes: usize,
     pub(super) patch_bytes: usize,
     pub(super) meta_bytes: usize,
-    /// Its changeset (none yet: `None`), as a list taken in by [`merge_changes`]: its viewers take
+    /// Its changeset (none yet: `None`), as a list taken in by `super::registry::merge_changes`: its viewers take
     /// a patch of it the same way, so theirs stays in this one's order.
     pub(super) changes: Option<Files>,
     /// The changeset as its viewers last had it sent (what a changeset's patch is made against).
@@ -2249,19 +2249,25 @@ impl Mirror {
     }
 
     /// Takes in a changeset, whole (`whole`: the files it doesn't have are gone) or as what changed
-    /// in it, in place in the copy's ([`merge_changes`]). The files that didn't change stay as they
+    /// in it, in place in the copy's (`super::registry::merge_changes`). The files that didn't change stay as they
     /// were, shared with what viewers were last sent.
     pub fn take_changes(&mut self, set: Vec<Value>, gone: Vec<Value>, whole: bool) {
+        self.take_change_entries(set.into_iter().map(|f| Arc::new(Entry::new(f))).collect(), gone, whole);
+    }
+
+    /// [`Mirror::take_changes`] of files written out already (`set`, each its entry: off its owner's shard,
+    /// [`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
+    pub(super) fn take_change_entries(&mut self, set: Vec<Arc<Entry>>, gone: Vec<Value>, whole: bool) {
         let mut files: Vec<Arc<Entry>> = match self.changes.take() {
             // Its own, or (shared with its views) a list of the same files.
             Some(all) => Arc::try_unwrap(all).unwrap_or_else(|shared| (*shared).clone()),
             None => Vec::new(),
         };
         if whole {
-            let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(super::registry::file_ref).collect();
+            let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(|f| f.file()).collect();
             files.retain(|f| kept.contains(&f.file()));
         }
-        merge_changes(&mut files, set, if whole { &[] } else { gone.as_slice() });
+        super::registry::merge_change_entries(&mut files, set, if whole { &[] } else { gone.as_slice() });
         self.changes = Some(Arc::new(files));
     }
 
@@ -2467,6 +2473,15 @@ pub struct Shard {
     /// Frames written so ([`Shard::framed_off`]), counted for the tests that read it.
     #[cfg(test)]
     framed_off: u64,
+    /// A session's changeset update long to write out ([`long_changes`]), the first of what's left of its messages: written
+    /// out off the shard before it's taken ([`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
+    changes_writing: Option<ChangesWriting>,
+    /// What was made of the changeset update last written out so, or tried, for that update's next take alone
+    /// ([`Shard::take_changes_written`]).
+    changes_written: Option<ChangesWritten>,
+    /// Changeset updates written out so ([`Shard::changes_off`]), counted for the tests that read it.
+    #[cfg(test)]
+    changes_off: u64,
     /// How long each of its turns that took something held the shard ([`Turn::held`]), for the tests that read an owner's
     /// turns.
     #[cfg(test)]
@@ -2571,6 +2586,65 @@ pub(super) fn long_to_write(e: &super::model::Event) -> bool {
 /// Event `e` was written out in `took`, on its owner's shard ([`WRITES`]).
 pub(super) fn wrote(e: &super::model::Event, took: Duration) {
     WRITES.learn(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX), nanos(took));
+}
+
+/// What writing a changeset update out takes by its bytes (`super::weigh`'s: its files' hunks), as the owners write them on
+/// their shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
+/// written out as its entry ([`Mirror::take_changes`]). A runner sends one of up to its harness frame's 512 KiB.
+static CHANGES: Rate = Rate::new();
+
+/// `u`'s bytes, as [`CHANGES`] counts them.
+fn changes_bytes(u: &Update) -> u64 {
+    u64::try_from(crate::memory::queue::Weigh::weight(u)).unwrap_or(u64::MAX)
+}
+
+/// Whether `u` is a changeset, or a changeset's patch, expected to hold its owner's shard past a slow poll to write out
+/// (`hyper_rt::slow::SLOW_POLL_NS`, as [`long_to_write`] judges an event): it's written on the compute pool instead
+/// ([`Shard::want_changes`]). None is until one was written: the first is written where it is, and learned.
+pub(super) fn long_changes(u: &Update) -> bool {
+    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && CHANGES.expected(changes_bytes(u)) > hyper_rt::slow::SLOW_POLL_NS
+}
+
+/// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
+pub(super) fn wrote_changes(u: &Update, took: Duration) {
+    CHANGES.learn(changes_bytes(u), nanos(took));
+}
+
+/// What its owner needs to write session `session`'s changeset update out off the shard ([`Shard::want_changes`]): whether its
+/// row for the conversation store is kept.
+struct ChangesWriting {
+    session: String,
+    keep: bool,
+}
+
+/// A session's changeset update written out off its owner's shard ([`Shard::want_changes`]), or tried, for its next take alone
+/// (`Registry::apply`).
+pub(super) struct ChangesWritten {
+    session: String,
+    /// None where it couldn't be written there: it's written where it is, as before, so an update always goes on.
+    pub(super) made: Option<ChangesMade>,
+}
+
+/// A changeset update written out as `Registry::apply` writes it: its files as the copy keeps them (each its entry,
+/// [`Mirror::take_change_entries`]), the keys of those gone, and its row for the conversation store where one is kept.
+pub(super) struct ChangesMade {
+    pub(super) set: Vec<Arc<Entry>>,
+    pub(super) gone: Vec<Value>,
+    pub(super) rows: Vec<crate::convo::rows::Row>,
+}
+
+/// Changeset update `u` of session `session` written out ([`ChangesMade`]), its row made when `keep`; and how long its files
+/// took, as [`CHANGES`] learns it.
+fn changes_made_of(session: &str, u: &Update, keep: bool) -> (ChangesMade, Duration) {
+    let rows = if keep { crate::convo::rows::of(session, u, crate::util::now_ms()) } else { Vec::new() };
+    let began = Instant::now();
+    let values = |files: &[super::model::FileChange]| files.iter().filter_map(|f| serde_json::to_value(f).ok()).map(|v| Arc::new(Entry::new(v))).collect::<Vec<_>>();
+    let (set, gone) = match u {
+        Update::Changes { files } => (values(files), Vec::new()),
+        Update::ChangesPatch { set, gone } => (values(set), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect()),
+        _ => (Vec::new(), Vec::new()),
+    };
+    (ChangesMade { set, gone, rows }, began.elapsed())
 }
 
 /// A frame of events `entries`, the copy's revision `rev`: `{"t":"events","events":[…],"rev":…}`, each event's text as it
@@ -2678,6 +2752,26 @@ impl Shard {
     #[cfg(test)]
     pub(super) fn framed_off(&self) -> u64 {
         self.framed_off
+    }
+
+    /// Session `id`'s changeset update is long to write out ([`long_changes`]: its files' JSON, a runner's up to 512 KiB of
+    /// hunks), and none of it was taken yet (`Registry::apply`): its owner writes it out on the compute pool before it takes
+    /// it ([`own`]), where each file was made a JSON tree and that written out on this shard (goal 9, plan 01a1a87b2cec step
+    /// 3). `keep`: its row for the conversation store is kept.
+    pub(super) fn want_changes(&mut self, id: &str, keep: bool) {
+        self.changes_writing = Some(ChangesWriting { session: id.to_owned(), keep });
+    }
+
+    /// What was made of session `id`'s changeset update written out off the shard ([`Shard::want_changes`]), or tried, for that
+    /// update as it comes back to it: its owner's next take alone has it.
+    pub(super) fn take_changes_written(&mut self, id: &str) -> Option<ChangesWritten> {
+        self.changes_written.take().filter(|w| w.session == id)
+    }
+
+    /// How many changeset updates this owner wrote out off its shard ([`Shard::want_changes`]).
+    #[cfg(test)]
+    pub(super) fn changes_off(&self) -> u64 {
+        self.changes_off
     }
 
     /// A turn ended, as what followed gave the shard up: one that took something held it `held` ([`Turn::held`]), kept for the
@@ -3030,6 +3124,10 @@ impl Copies {
                 frame: None,
                 #[cfg(test)]
                 framed_off: 0,
+                changes_writing: None,
+                changes_written: None,
+                #[cfg(test)]
+                changes_off: 0,
                 #[cfg(test)]
                 turns: Vec::new(),
             };
@@ -3366,6 +3464,7 @@ impl Costs {
         let left = shard.take(msg, hub, &over);
         // What was written out off the shard for this take alone: one it didn't take (its update gone meanwhile) isn't kept.
         shard.written = None;
+        shard.changes_written = None;
         let end = Instant::now();
         self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
         if let Some(at) = ran_out.get() {
@@ -3436,6 +3535,56 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
             if events.is_empty() {
                 *rest = None;
             }
+        }
+    }
+    gave_up
+}
+
+/// The changeset update `writing` names, the first of what's left of its session's messages (`rest`), written out on the compute
+/// pool while the shard does its other work (goal 9, plan 01a1a87b2cec step 3): taken out of its message, not copied, and what
+/// was made of it kept for its next take ([`Shard::take_changes_written`]). Written, the update is let go of there, its files
+/// freed off the shard; one that couldn't be written goes back in its place, marked so, and is written where it is. Whether
+/// the shard was given up.
+async fn changes_off(shard: &mut Shard, writing: ChangesWriting, rest: &mut Option<Msg>) -> bool {
+    let Some(Msg::Update(i)) = rest.as_mut() else { return false };
+    // The update taken out, an empty one of its kind in its place till it's back.
+    let u = match &mut i.u {
+        Update::Changes { files } => Update::Changes { files: std::mem::take(files) },
+        Update::ChangesPatch { set, gone } => Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) },
+        _ => return false,
+    };
+    let ChangesWriting { session, keep } = writing;
+    let of = session.clone();
+    let (written, gave_up) = waited(crate::rt::compute(move || {
+        // Caught here, so the update comes back whatever.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| changes_made_of(&of, &u, keep))) {
+            Ok((made, took)) => {
+                let bytes = changes_bytes(&u);
+                (Some(made), None, bytes, took)
+            }
+            Err(_) => (None, Some(u), 0, Duration::ZERO),
+        }
+    }))
+    .await;
+    match written {
+        Ok((made, back, bytes, took)) => {
+            if made.is_some() {
+                CHANGES.learn(bytes, nanos(took));
+                #[cfg(test)]
+                {
+                    shard.changes_off = shard.changes_off.saturating_add(1);
+                }
+            }
+            if let Some(u) = back {
+                i.u = u;
+            }
+            shard.changes_written = Some(ChangesWritten { session, made });
+        }
+        Err(err) => {
+            // The pool dropped the job unrun (the process is going), the update with it: the copy keeps the changeset it had,
+            // and its runner sends it again as it changes.
+            tracing::error!(session = %session, error = %format!("{err:#}"), "a session's changeset was lost being written out off its owner's shard");
+            *rest = None;
         }
     }
     gave_up
@@ -3599,6 +3748,15 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         if let Some(writing) = shard.write.take() {
             let held = turn.held();
             if write_off(&mut shard, writing, &mut rest).await {
+                shard.turned(held, fresh);
+                (turn, fresh) = (Turn::new(), true);
+            }
+        }
+        // A changeset long to write out (its files' JSON, and its row for the store): written on the compute pool, the shard
+        // given up meanwhile, before its update is taken (goal 9, plan 01a1a87b2cec step 3).
+        if let Some(writing) = shard.changes_writing.take() {
+            let held = turn.held();
+            if changes_off(&mut shard, writing, &mut rest).await {
                 shard.turned(held, fresh);
                 (turn, fresh) = (Turn::new(), true);
             }
@@ -5642,6 +5800,76 @@ mod tests {
         let patch: Value = serde_json::from_str(frames.get(1).and_then(|f| f.patch.as_deref()).unwrap_or_default())?;
         anyhow::ensure!(patch.get("t") == Some(&json!("changes_patch")) && patch.get("set").and_then(Value::as_array).map(Vec::len) == Some(1), "the next, what changed: {patch}");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a changeset long to write out (a runner's hundreds of KB of hunks) is written out by its
+    /// owner off its shard, as the owner counts it, and taken as one written on the shard is: the copy's files the same, in the
+    /// same order, as a copy that took the same updates on its shard has them, the patch after it taken in its place, the file
+    /// it said gone let go of.
+    #[test]
+    fn g9_s3_a_changeset_long_to_write_out_is_written_off_its_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{FileChange, FileKey, Hunk};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "changed".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            let file = |path: &str, lines: usize| FileChange {
+                path: path.into(),
+                tree: None,
+                created: false,
+                deleted: false,
+                added: u32::try_from(lines).unwrap_or(u32::MAX),
+                removed: 0,
+                hunks: vec![Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: u32::try_from(lines).unwrap_or(u32::MAX), lines: vec!["+let x = 1;".to_owned(); lines] }],
+                truncated: false,
+                at: 1,
+                by: Vec::new(),
+                place: None,
+            };
+            let updates = vec![
+                Update::ChangesPatch { set: vec![file("small.rs", 3)], gone: Vec::new() },
+                Update::ChangesPatch { set: vec![file("other.rs", 4)], gone: Vec::new() },
+                Update::Changes { files: vec![file("a.rs", 2), file("big.rs", 40_000), file("b.rs", 2)] },
+                Update::ChangesPatch { set: vec![file("b.rs", 5)], gone: vec![FileKey { path: "a.rs".into(), tree: None }] },
+            ];
+            // The same updates taken by a copy on the test's thread, as its shard takes them.
+            let mut here = Mirror::new(Info { id: "here".into(), ..Info::default() }, Location::Local, sim_bus());
+            for u in &updates {
+                match u {
+                    Update::Changes { files } => here.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
+                    Update::ChangesPatch { set, gone } => here.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false),
+                    _ => {}
+                }
+            }
+            let texts = |m: &Mirror| m.changes.as_ref().map(|c| c.iter().map(|f| f.text().to_owned()).collect::<Vec<_>>()).unwrap_or_default();
+            let want = texts(&here);
+            let mut updates = updates.into_iter();
+            // The small ones first, written on the shard: they teach what writing one out takes.
+            for u in updates.by_ref().take(2) {
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            let was = copies.on(&id, |s| s.changes_off()).await.unwrap_or_default();
+            let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
+            anyhow::ensure!(long_changes(&large), "a changeset of 40,000 lines expected to take past a slow poll to write out");
+            for u in updates {
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            let i = id.clone();
+            let now = copies.on(&id, move |s| (s.changes_off(), s.get(&i).map(texts))).await;
+            let Some((off, Some(got))) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(off == was + 1, "written out off its owner's shard once: {was} then {off}");
+            let paths: Vec<Option<String>> = got.iter().map(|t| serde_json::from_str::<Value>(t).ok().and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_owned))).collect();
+            anyhow::ensure!(got == want, "taken as the shard takes them: {paths:?}");
+            anyhow::ensure!(paths == [Some("big.rs".to_owned()), Some("b.rs".to_owned())], "the whole one's files, the patch's in its place, the gone one let go of: {paths:?}");
+            Ok(())
+        })
     }
 
     /// Says, as it's dropped, whether the thread it's dropped on runs a shard.
