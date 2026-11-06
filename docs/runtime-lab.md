@@ -2047,6 +2047,13 @@ and as many bytes, as the frames have had out at once at the most, learned as fr
 before finds its buffer kept (`net_budget`'s `g11_b22_*` count the frames allocated: none after the first of each
 size), and the spares hold no more than the busiest moment's frames did.
 
+**observe's grok rules** (`observe::pipeline::grok::Kept`) are compiled as each pipeline is made, and kept. Compiled
+when a record first reached them (goal 11 step 3, for the 4 MB kiln's own six rules took of an idle heap), the
+first record of each pipeline compiled its rules on the thread that took it, an HTTP intake's shard among them, a
+few milliseconds a pipeline, and every pipeline's rules were compiled twice (once to check them as it was made).
+Now the check's compile is what's kept (goal 11's audit, row B23): no record compiles anything
+(`g11_b23_no_record_compiles_grok_rules_on_the_shard_that_takes_it` counts the compiles on the shard), at the 4 MB.
+
 ### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
 
 What's live, biggest first, from train 4's heap profile (the newest there is, 164.6 MB by its estimate) less
