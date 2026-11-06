@@ -28,7 +28,9 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
 struct Entry {
     /// Set by an admin (else the defaults).
     settings: Option<Settings>,
-    status: Option<serde_json::Value>,
+    /// What its runner last reported, as its text came (`crate::wire::payload::FromRunner::HeadroomStatus`): read
+    /// into a tree only where it's shown ([`view`]; goal 9, plan 01a1a87b2cec step 5).
+    status: Option<String>,
     status_at: i64,
 }
 
@@ -110,14 +112,16 @@ pub async fn on_caps(hub: &Hub, machine: &str, caps: u64) {
 
 /// What a runner process reports (`AgentMsg::HeadroomStatus`, read by `wire::payload`): kept when
 /// it's the machine's newest.
-pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, status: serde_json::Value) {
+pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, status: String) {
     if peers(hub, machine).0 != Some(peer) {
         return;
     }
     let changed = {
         let mut g = hub.headrooms.inner.lock();
         let e = g.entry(machine.to_owned()).or_default();
-        let changed = e.status.as_ref() != Some(&status);
+        // Its text against the last one's: a runner writes the same status the same way (serde_json, its fields in
+        // their order), so it says the same as the trees compared did.
+        let changed = e.status.as_deref() != Some(status.as_str());
         e.status = Some(status);
         e.status_at = crate::util::now_unix();
         changed
@@ -136,6 +140,8 @@ async fn known(hub: &Hub, name: &str) -> bool {
 /// `GET /api/runners/:name/headroom` (and what the others answer with).
 pub fn view(hub: &Hub, name: &str) -> serde_json::Value {
     let (set, status, status_at) = hub.headrooms.inner.lock().get(name).map(|e| (e.settings.is_some(), e.status.clone(), e.status_at)).unwrap_or_default();
+    // Read into a tree here, out of the lock, as it was where it came: the same value, so the same answer.
+    let status: Option<serde_json::Value> = status.and_then(|text| serde_json::from_str(&text).ok());
     let settings = hub.headrooms.settings(name);
     let connected = hub.agents.load().get(name).is_some_and(|a| a.connected);
     let supported = connected.then(|| peers(hub, name).0.is_some());
@@ -186,4 +192,38 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
     push(hub, name).await;
     hub.emit(&crate::wire::events::ServerEvent::Headroom { runner: name.to_string() });
     Ok(srv::json(StatusCode::OK, &view(hub, name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a runner's headroom status is kept as the text it came as and compared as text, with
+    /// no tree made of it where it comes (on the hub's loop): the same text again is no news, another is, each said once;
+    /// and its view reads it into the tree it was read into before, so the answer's bytes, its keys in their order (not
+    /// sorted: serde_json keeps their order here), are as they were.
+    #[test]
+    fn g9_s5_a_status_is_kept_as_its_text_and_shown_as_it_came() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "m1", CAP_HEADROOM).await?;
+            let mut events = hub.subscribe_events()?;
+            let first = r#"{"settings":"f1","enabled":true,"pacing":"none","groups":[{"name":"b","held":2}],"zeta":1,"alpha":[0.1,2e-7]}"#;
+            let second = first.replace(r#""held":2"#, r#""held":3"#);
+            for status in [first, first, second.as_str()] {
+                on_status(&hub, 1, "m1", status.to_owned());
+            }
+            let mut said = 0;
+            while let Ok(text) = events.try_recv() {
+                if text.contains("headroom") && text.contains("m1") {
+                    said += 1;
+                }
+            }
+            anyhow::ensure!(said == 2, "{said} headroom events for a status, the same again, and another");
+            let shown = view(&hub, "m1");
+            let status = shown.get("status").ok_or_else(|| anyhow::anyhow!("no status in {shown}"))?;
+            anyhow::ensure!(serde_json::to_string(status)? == second, "shown as {status}, not as it came: {second}");
+            anyhow::ensure!(shown.get("applied") == Some(&serde_json::json!(Settings::default().fingerprint() == "f1")), "applied: {shown}");
+            Ok(())
+        })
+    }
 }
