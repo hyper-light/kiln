@@ -116,6 +116,31 @@ exit 0
         self.assertEqual(len(self.calls()), 1)
         self.assertIn("keeps no relocations", r.stderr)
 
+    def test_g11_s5_an_order_lays_out_the_link_run_again(self) -> None:
+        order = self.dir / "kiln.order"
+        order.write_text("hot\nwarm\n")
+        r = self.relocs("cc", "a.o", "-o", "out", KILN_LINK_ORDER=str(order))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls()[0], "1|cc a.o -o out", "zig's own link takes no order: it refuses LLD's options")
+        self.assertTrue(
+            self.calls()[1].endswith(f"--emit-relocs --build-id=sha1 --symbol-ordering-file={order} --no-warn-symbol-ordering"),
+            self.calls(),
+        )
+        # A compile has nothing to order: it runs as it is, the order unread.
+        self.log.unlink()
+        r = self.relocs("cc", "-c", "x.c", "-o", "x.o", KILN_LINK_ORDER=str(self.dir / "missing.order"))
+        self.assertEqual((r.returncode, self.calls()), (0, ["|cc -c x.c -o x.o"]))
+
+    def test_g11_s5_an_order_that_isnt_there_stops_the_link_before_zig_runs(self) -> None:
+        for order in (self.dir / "missing.order", self.dir / "empty.order"):
+            if order.name == "empty.order":
+                order.write_text("")
+            self.log.unlink(missing_ok=True)
+            r = self.relocs("cc", "a.o", "-o", "out", KILN_LINK_ORDER=str(order))
+            self.assertEqual(r.returncode, 1, order)
+            self.assertIn("names no order", r.stderr)
+            self.assertEqual(self.calls(), [], "zig never linked")
+
 
 class Window(unittest.TestCase):
     """bolt.sh window: what ran between two dumps of one instrumented process, its counts since it started."""
@@ -227,6 +252,112 @@ class Check(unittest.TestCase):
                 self.assertIn("no .rela.text", r.stderr)
 
 
+def build_id(binary: Path) -> str:
+    for l in run(["readelf", "-n", str(binary)]).stdout.splitlines():
+        if l.split()[:2] == ["Build", "ID:"]:
+            return l.split()[2]
+    return ""
+
+
+@unittest.skipUnless(shutil.which("cc") and shutil.which("readelf") and shutil.which("strip"), "takes cc, readelf and strip")
+class Order(unittest.TestCase):
+    """bolt.sh order: the functions profiles saw run, hottest first, for LLD's --symbol-ordering-file (no BOLT)."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        src = self.dir / "m.c"
+        src.write_text(
+            "__attribute__((noinline)) long hot(long n) { long s = 0; for (long i = 0; i < n; i++) s += i % 7; return s; }\n"
+            "__attribute__((noinline)) long cold(long n) { return n * 3; }\n"
+            "int main(int c, char **v) { (void)v; return (int)(c > 5 ? cold(c) : hot(100000000)) & 1; }\n"
+        )
+        self.bin = self.dir / "m"
+        subprocess.run(["cc", "-O1", "-Wl,--build-id=sha1", "-o", str(self.bin), str(src)], check=True)
+        self.stripped = self.dir / "m.stripped"
+        subprocess.run(["strip", "-o", str(self.stripped), str(self.bin)], check=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+
+    def order(self, *profiles: Path, **env: str) -> subprocess.CompletedProcess[str]:
+        return run([str(BOLT), "order", str(self.bin), str(self.dir / "out.order"), *map(str, profiles)], env={"TMPDIR": str(self.dir), **env})
+
+    def stand_in_perf(self, branches: bool) -> Path:
+        """A perf whose recordings ran /lab/bin/kiln (this test's binary, by its build id) and a library."""
+        calls = self.dir / "perf.calls"
+        return script(
+            self.dir / "perf",
+            f"""printf '%s\\n' "$*" >> {calls}
+case $1 in
+  buildid-list) echo "1111111111111111111111111111111111111111 /usr/lib/libc.so.6"; echo "{build_id(self.bin)} /lab/bin/kiln" ;;
+  evlist) echo "cycles:u: sample_type: IP|TID|TIME{'|BRANCH_STACK' if branches else ''}" ;;
+  report)
+    symfs=$(printf '%s\\n' "$@" | sed -n 's/^--symfs=//p')
+    [ "$(readlink "$symfs/lab/bin/kiln")" = "{self.bin}" ] || {{ echo "no symbols for /lab/bin/kiln under $symfs" >&2; exit 1; }}
+    case " $* " in
+      *" --branch-stack "*) printf '# Samples: 1K\\n#\\n        5000  [.] warm  0.00  [  0.0%%]\\n          40  [.] rarely  0.00  [  0.0%%]\\n' ;;
+      *) printf '# Samples: 3K\\n#\\n         900  [.] hot\\n          20  [.] warm\\n           5  [k] 0xffffffff8b401630\\n           3  [.] 0x0000000000401234\\n          10  [.] hot\\n' ;;
+    esac ;;
+esac
+""",
+        )
+
+    def test_g11_s5_an_order_is_what_perf_saw_run_hottest_first(self) -> None:
+        data = self.dir / "perf.data"
+        data.write_bytes(b"recorded")
+        r = self.order(data, PERF=str(self.stand_in_perf(branches=True)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # warm: 20 samples and 5000 branch records; hot: 900 and 10, one name; the kernel's and an unnamed address out.
+        self.assertEqual((self.dir / "out.order").read_text().splitlines(), ["warm", "hot", "rarely"])
+        reports = [l for l in (self.dir / "perf.calls").read_text().splitlines() if l.startswith("report")]
+        self.assertEqual(len(reports), 2, "the samples, then the branch records")
+        for l in reports:
+            self.assertIn("--dsos /lab/bin/kiln", l, "the binary's functions alone, not its libraries'")
+            self.assertIn("--no-demangle", l, "names as the linker knows them")
+        self.assertEqual(list(self.dir.glob("bolt-order.*")), [], "nothing left behind")
+
+    def test_g11_s5_a_recording_without_branch_records_orders_by_samples(self) -> None:
+        data = self.dir / "perf.data"
+        data.write_bytes(b"recorded")
+        r = self.order(data, PERF=str(self.stand_in_perf(branches=False)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dir / "out.order").read_text().splitlines(), ["hot", "warm"])
+
+    def test_g11_s5_bolts_profiles_order_by_their_counts(self) -> None:
+        lbr, samples = self.dir / "a.fdata", self.dir / "b.fdata"
+        # A branch's ends, a local function's /<n> dropped; an end in no function (0) passed over.
+        lbr.write_text("1 hot/1 10 1 cold/2 0 0 7\n0 [unknown] 7f00 1 entry 0 0 3\n1 entry 4 0 [unknown] 7f00 0 2\n")
+        samples.write_text("no_lbr cycles:u:\n1 hot/1 3 100\n")
+        r = self.order(lbr, samples)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dir / "out.order").read_text().splitlines(), ["hot", "cold", "entry"])
+        self.assertIn("3 functions, hottest first, from 2 profile(s)", r.stdout)
+
+    def test_g11_s5_an_order_takes_the_symbols_of_the_build_that_ran(self) -> None:
+        data = self.dir / "perf.data"
+        data.write_bytes(b"recorded")
+        r = run([str(BOLT), "order", str(self.stripped), str(self.dir / "out.order"), str(data)], env={"PERF": str(self.stand_in_perf(True))})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no symbols", r.stderr)
+        # A recording of another build: no binary with this one's build id.
+        other = self.dir / "other.c"
+        other.write_text("int main(void) { return 0; }\n")
+        subprocess.run(["cc", "-Wl,--build-id=sha1", "-o", str(self.bin), str(other)], check=True)
+        r = self.order(data, PERF=str(self.dir / "perf"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("recorded no binary with", r.stderr)
+        self.assertFalse((self.dir / "out.order").exists())
+
+    def test_g11_s5_an_order_from_a_real_perf_names_a_stripped_runs_functions(self) -> None:
+        data = self.dir / "perf.data"
+        rec = run(["perf", "record", "-q", "-e", "cycles:u", "-o", str(data), "--", str(self.stripped)]) if shutil.which("perf") else None
+        if rec is None or rec.returncode not in (0, 1) or not data.exists() or data.stat().st_size == 0:
+            self.skipTest("no perf that may record here")
+        r = self.order(data)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dir / "out.order").read_text().splitlines()[0], "hot", "named from the unstripped build's symbols")
+
+
 @unittest.skipUnless(
     os.environ.get("KILN_BOLT_BIN") and shutil.which("cc") and shutil.which("readelf") and shutil.which("strip"),
     "takes a real BOLT (KILN_BOLT_BIN), cc, readelf and strip",
@@ -282,6 +413,18 @@ class BuildSwitch(unittest.TestCase):
             self.assertNotIn("is no profile", r.stderr)
             self.assertIn("lays out x86_64-unknown-linux-musl", r.stderr)
 
+    def test_g11_s5_an_order_is_taken_as_a_profile_is(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "kiln.order").write_text("hot\n")
+            r = run([str(BUILD), "aarch64-unknown-linux-musl"], env={"KILN_RELEASE_BOLT": "kiln.order"}, cwd=Path(d))
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn("is no profile", r.stderr)
+            self.assertIn("lays out x86_64-unknown-linux-musl", r.stderr)
+            Path(d, "empty.order").write_text("")
+            r = run([str(BUILD), "x86_64-unknown-linux-musl"], env={"KILN_RELEASE_BOLT": "empty.order"}, cwd=Path(d))
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("relocs, a profile's path or an order's", r.stderr)
+
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the hook reads Linux's /proc")
 class Hook(unittest.TestCase):
@@ -304,6 +447,22 @@ class Hook(unittest.TestCase):
             self.assertTrue(lines[-1].startswith("process rss_file_kb="), lines)
             total = sum(int(l.rsplit("rss_kb=", 1)[1]) for l in maps)
             self.assertEqual(lines[-2], f"binary rss_kb={total}")
+
+    def test_g11_s5_the_window_end_says_the_binarys_pages_by_section(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.Popen(["sleep", "30"])
+            try:
+                time.sleep(0.2)
+                r = run([str(HOOK), "window-end", str(p.pid), str(Path(d, "r.hook"))], env={"BOLT_RECORD": "none"})
+                self.assertEqual(r.returncode, 0, r.stderr)
+                pages = Path(d, "r.hook", "pages.txt").read_text().splitlines()
+                rows = Path(d, "r.hook", "sections.txt").read_text().splitlines()
+            finally:
+                p.kill()
+                p.wait()
+            # The sections' resident pages are the mappings' (smaps says the same pages).
+            self.assertEqual(rows[-1].split()[2], pages[-2].replace("binary rss_kb=", "resident_kb="), (rows, pages))
+
 
     def test_g11_s5_an_instrumented_window_is_its_last_dump_less_its_first(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -336,6 +495,58 @@ class Hook(unittest.TestCase):
                 server.kill()
                 server.wait()
             self.assertEqual(Path(hook, "instr-window.fdata").read_text(), "1 main 4 1 work 0 0 25\n")
+
+
+SECTIONS = ROOT / "scripts" / "memory_lab" / "sections.py"
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "sections.py reads Linux's /proc")
+class Sections(unittest.TestCase):
+    """sections.py: a process's resident pages of its binary, by section, from pagemap."""
+
+    def fields(self, line: str) -> tuple[str, dict[str, int]]:
+        name, *kv = line.split()
+        return name, {k: int(v) for k, v in (f.split("=") for f in kv)}
+
+    def test_g11_s5_every_resident_page_of_the_binary_is_counted_once_by_its_sections(self) -> None:
+        p = subprocess.Popen(["sleep", "30"])
+        try:
+            time.sleep(0.2)
+            r = run([sys.executable, "-I", str(SECTIONS), str(p.pid)])
+            exe = os.readlink(f"/proc/{p.pid}/exe")
+            smaps = Path(f"/proc/{p.pid}/smaps").read_text().splitlines()
+        finally:
+            p.kill()
+            p.wait()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = [self.fields(l) for l in r.stdout.splitlines()]
+        self.assertEqual(rows[-1][0], "total")
+        self.assertEqual(rows[-2][0], "(headers-and-gaps)")
+        sections = dict(rows[:-1])
+        self.assertGreater(sections[".text"]["resident_kb"], 0, "sleep ran its code")
+        self.assertEqual(sections[".text"]["anon_kb"], 0, "its code is the file's own")
+        total = rows[-1][1]
+        # What smaps says the executable's mappings hold.
+        rss, mine = 0, False
+        for l in smaps:
+            if l and l[0] in "0123456789abcdef" and "-" in l.split()[0]:
+                mine = l.split(maxsplit=5)[5:] == [exe]
+            elif mine and l.startswith("Rss:"):
+                rss += int(l.split()[1])
+        self.assertEqual(total["resident_kb"], rss)
+        self.assertEqual(total["resident_kb"], total["file_kb"] + total["anon_kb"])
+        # Each row's bytes rounded up to a KiB, so the rows' sum is the total's, give or take a KiB a row.
+        summed = sum(f["resident_kb"] for _, f in rows[:-1])
+        self.assertTrue(total["resident_kb"] <= summed <= total["resident_kb"] + len(rows), (summed, total))
+        for name, f in rows[:-2]:
+            self.assertLessEqual(f["windows"], f["of"], name)
+
+    def test_g11_s5_a_process_that_isnt_there_is_said(self) -> None:
+        r = run([sys.executable, "-I", str(SECTIONS), "999999999"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("process 999999999", r.stderr)
+        r = run([sys.executable, "-I", str(SECTIONS), "self"])
+        self.assertEqual(r.returncode, 2)
 
 
 if __name__ == "__main__":
