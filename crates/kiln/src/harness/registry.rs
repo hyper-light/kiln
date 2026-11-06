@@ -2805,6 +2805,14 @@ impl Registry {
             s.want_thaw(id, c);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
+        // A stream into an event of an older compact chunk (a long tool's output, a subagent's text): the same, once that
+        // chunk is read back off the shard, before the stream is taken (goal 9, plan 01a1a87b2cec step 3).
+        if let Update::Stream { id: event, .. } = &u
+            && let Some(c) = m.thaw_for_stream(event).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
         // Its first event goes in under an older number than the copy's newest: the same, once the copy's events are made
         // again with it in off the shard (goal 9, plan 01a1a87b2cec step 3).
         if let Update::Events { events } = &u

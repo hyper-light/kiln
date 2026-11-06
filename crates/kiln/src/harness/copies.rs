@@ -54,7 +54,7 @@ pub struct Ev {
 /// The events a chunk of [`Events`] holds: the square root of the most a copy keeps, so a change
 /// once a view shares them copies one chunk and the list of chunks (about two square roots of
 /// references), never every event.
-const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
+pub(crate) const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
 
 /// A session's newest events its copy keeps in memory, whatever else of it is spilled (`super::spill`; goal
 /// 11, plan 01a1a87b2e56 step 5): the events API's page as it's asked for without a `limit` (`GET
@@ -2595,6 +2595,16 @@ impl Mirror {
                 at
             }
         };
+        let (c, _) = self.events.place(at)?;
+        self.events.chunks().get(c).filter(|c| c.is_compact()).cloned()
+    }
+
+    /// The compact chunk that a stream into event `id` would read back to change ([`Mirror::append`]), if it would: an older
+    /// chunk the event is in (a long tool's output or a subagent's text, streaming on while newer events came), which its
+    /// owner reads back off its shard first (`Shard::want_thaw`; goal 9, plan 01a1a87b2cec step 3): taken on the shard,
+    /// each delta into it inflated the chunk there, or read a spilled one's file. The newest chunk is never compact.
+    pub(super) fn thaw_for_stream(&self, id: &str) -> Option<Arc<Chunk>> {
+        let at = self.index.get(&self.events, id)?;
         let (c, _) = self.events.place(at)?;
         self.events.chunks().get(c).filter(|c| c.is_compact()).cloned()
     }
@@ -5798,6 +5808,57 @@ mod tests {
                 .flatten();
             let Some((len, Some(changed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
             anyhow::ensure!(len == CHUNK * 3 + 9 && changed.contains("said again") && next == entry("e6", 6).text(), "{len} {changed} {next}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: deltas streamed into an event of a long copy's older compact chunk (a long tool's
+    /// output, a subagent's text, still streaming while newer events came), taken by its owner, inflate nothing on the
+    /// owner's shard: the first has the chunk read back on the blocking pool first (`Mirror::thaw_for_stream`, the owner
+    /// marking the chunk it read back), and every delta is then taken where the event is, in order, the rest of the copy as
+    /// it was. Taken on the shard, each one inflated the chunk there, or read a spilled one's file (train 16's removal took
+    /// this path out with the idle newest's; copies-lat2 found it). (A count of inflations on the owner's thread would count
+    /// other tests' on that shard too.)
+    #[test]
+    fn g9_s3_a_stream_into_an_older_compact_chunks_event_never_inflates_on_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "streamed".to_owned();
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            let i = id.clone();
+            let first = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.events.chunks().first().filter(|c| c.is_compact()).cloned()
+                })
+                .await
+                .flatten();
+            let Some(first) = first else { anyhow::bail!("its first chunk compact") };
+            // Three deltas into e5, in the first chunk.
+            let deltas = [" one", " two", " three"];
+            for d in deltas {
+                let u = Update::Stream { id: "e5".into(), text: d.into() };
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            copies.settled().await;
+            let (i, was) = (id.clone(), Arc::clone(&first));
+            let read_back = copies.on(&id, move |s| (s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was)), s.get(&i).and_then(|m| m.events.chunks().first().map(|c| !Arc::ptr_eq(c, &was) && !c.is_compact())))).await;
+            anyhow::ensure!(read_back == Some((true, Some(true))), "its chunk read back by its owner off the shard, and in its place: {read_back:?}");
+            let i = id.clone();
+            let now = copies.on(&id, move |s| s.get(&i).map(|m| (m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.get(5).map(|e| e.entry.text().to_owned())))).await.flatten();
+            let Some((len, Some(streamed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
+            anyhow::ensure!(len == CHUNK * 3 + 9 && streamed.contains(&deltas.concat()) && next == entry("e6", 6).text(), "{len} {streamed} {next}");
             Ok(())
         })
     }

@@ -8382,7 +8382,7 @@ mod tests {
     /// bytes, the copy's page byte for byte, its newest `EVENTS_PAGE` events.
     #[test]
     fn g10_s5_an_idle_sessions_newest_page_is_read_on_its_shard() -> anyhow::Result<()> {
-        use crate::harness::copies::{EVENTS_PAGE, PACKED_EVENT_BYTES, PAGE_BYTES, Unread};
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
         use crate::harness::core::Update;
         use crate::harness::model::{Body, Event};
         use crate::http::server::Handler as _;
@@ -8392,9 +8392,9 @@ mod tests {
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
             let opened = Instant::now();
             hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
-            // A chunk's events, from the bound of what a copy keeps packed (two chunks' at a packed event's bytes), and the
-            // open chunk's once the turn is in: past the page's reach into a compact chunk, short of sealing it.
-            let chunk = PAGE_BYTES / (2 * PACKED_EVENT_BYTES);
+            // A chunk's events, and the open chunk's once the turn is in: past the page's reach into a compact chunk, short
+            // of sealing it.
+            let chunk = CHUNK;
             let open = (EVENTS_PAGE.saturating_sub(chunk) + chunk) / 2;
             anyhow::ensure!(open > EVENTS_PAGE.saturating_sub(chunk) && open < chunk, "the page spans one compact chunk: {open} of {chunk}");
             let n = u64::try_from(2 * chunk + open)?;
@@ -8453,7 +8453,7 @@ mod tests {
     /// its newest `EVENTS_PAGE` events.
     #[test]
     fn g10_s5_a_page_across_two_compact_chunks_is_read_on_its_shard() -> anyhow::Result<()> {
-        use crate::harness::copies::{EVENTS_PAGE, PACKED_EVENT_BYTES, PAGE_BYTES, Unread};
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
         use crate::harness::core::Update;
         use crate::harness::model::{Body, Event};
         use crate::http::server::Handler as _;
@@ -8462,9 +8462,9 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
             hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
-            // A chunk's events, from the bound of what a copy keeps packed (two chunks' at a packed event's bytes), and the
-            // open chunk's: half of what the page takes past a compact chunk, so it reaches into the one before that too.
-            let chunk = PAGE_BYTES / (2 * PACKED_EVENT_BYTES);
+            // A chunk's events, and the open chunk's: half of what the page takes past a compact chunk, so it reaches into
+            // the one before that too.
+            let chunk = CHUNK;
             let open = EVENTS_PAGE.saturating_sub(chunk) / 2;
             anyhow::ensure!(open > 0 && open + chunk < EVENTS_PAGE && EVENTS_PAGE < open + 2 * chunk, "the page spans two compact chunks: {open} open of {chunk}");
             let n = u64::try_from(2 * chunk + open)?;
