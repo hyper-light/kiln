@@ -2242,24 +2242,39 @@ fn read_ahead(ahead: usize) -> (crate::memory::queue::Sender<Bytes>, crate::memo
 /// the file opened now. The next copy is made once this one is handed over and clears what a stop
 /// left behind, this copy's name among it: an open file outlives its name (and Windows keeps it).
 fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, crate::memory::queue::Receiver<Bytes>)> {
-    let mut f = std::fs::File::open(&path)?;
+    let f = std::fs::File::open(&path)?;
     let size = f.metadata()?.len();
     let (tx, rx) = read_ahead(COPY_AHEAD);
+    // Read, handed over and removed on the blocking pool, the task only waiting for it (goal 9, plan 01a1a87b2cec step
+    // 3): the copy's removal gives the file system back the whole of kiln.db's copy, and done in the task's last poll,
+    // on its shard, it held that shard 1.9 to 4.0 ms on the CPU in g9p16's calm rounds (`api.rs:2248`, train 16).
     crate::rt::spawn(async move {
-        let _ = crate::rt::blocking(move || -> std::io::Result<()> {
-            use std::io::Read as _;
-            let mut buf = vec![0u8; 256 << 10];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
-                    return Ok(());
-                }
-            }
-        })
-        .await;
-        std::fs::remove_file(&path).ok();
+        let _ = crate::rt::blocking(move || copy_out(f, tx, &path)).await;
     });
     Ok((size, rx))
+}
+
+/// [`copy_body`]'s job, on the blocking pool: `f` read to `tx` until it ends or no one takes what's read, `tx` let go
+/// of (the body ends with that), the file closed, then its name removed (Windows removes an open file's name only once
+/// it's closed). Removed however the reading ended.
+fn copy_out(mut f: std::fs::File, tx: crate::memory::queue::Sender<Bytes>, path: &std::path::Path) -> std::io::Result<()> {
+    let read = read_out(&mut f, &tx);
+    drop(tx);
+    drop(f);
+    std::fs::remove_file(path).ok();
+    read
+}
+
+/// `f` read to `tx` in pieces of 256 KiB, as many waiting in `tx` as it holds, until `f` ends or no one takes them.
+fn read_out(f: &mut std::fs::File, tx: &crate::memory::queue::Sender<Bytes>) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; 256 << 10];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
@@ -7474,6 +7489,37 @@ mod tests {
             anyhow::ensure!(u64::try_from(want.len())? == size && got.as_ref() == want.as_slice(), "streamed {} of {} bytes", got.len(), want.len());
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a learner's copy is read, let go of and removed by its job on the blocking
+    /// pool ([`copy_out`]), however its reading ends, where its task's last poll removed it on a shard (1.9 to 4.0 ms
+    /// on the CPU in g9p16's calm rounds). Read whole: every byte in order, the body ended, its name gone once the job
+    /// returns. Its reader gone first: its name gone all the same.
+    #[test]
+    fn g9_s3_a_learners_copy_is_read_and_removed_by_its_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Three of the pieces it reads at a time, fewer than the places it reads ahead into: no wait for a reader.
+        let want: Vec<u8> = (0..(3_u32 << 18)).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        let path = dir.path().join("whole.db");
+        std::fs::write(&path, &want)?;
+        let (tx, rx) = read_ahead(COPY_AHEAD);
+        copy_out(std::fs::File::open(&path)?, tx, &path)?;
+        anyhow::ensure!(!path.exists(), "the copy's name is still there once its job returned");
+        let mut got = Vec::new();
+        let ended = loop {
+            match rx.try_recv() {
+                Ok(piece) => got.extend_from_slice(&piece),
+                Err(e) => break matches!(e, async_channel::TryRecvError::Closed),
+            }
+        };
+        anyhow::ensure!(ended && got == want, "read {} of {} bytes, the body ended: {ended}", got.len(), want.len());
+        let path = dir.path().join("unread.db");
+        std::fs::write(&path, &want)?;
+        let (tx, rx) = read_ahead(COPY_AHEAD);
+        drop(rx);
+        copy_out(std::fs::File::open(&path)?, tx, &path)?;
+        anyhow::ensure!(!path.exists(), "the copy's name is still there once its reader went");
+        Ok(())
     }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: a socket's audit rows, on a lock-free queue now: with the store held,
