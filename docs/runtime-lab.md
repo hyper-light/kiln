@@ -2408,11 +2408,12 @@ taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a thp --label-b no-thp --e
 ```
 
 Expected: `server.rss_anon_mb` (and `server.rss_mb`) 2 to 4 MB lower on B: the 4 MiB of huge pages less the pages
-turso's caches and writes touch in them (records.db's held 16 kB past its huge page, so nearly all of its 2 MiB goes;
-the conversation store's 3,712 kB past its, so its huge page may be mostly in use). No latency number moved: turso's reads and writes run on its own
-threads and the blocking pool, and its arenas' 4 KiB pages cost them TLB reach alone. A round's server
-(`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host the saving is larger and the lab
-can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and after the deploy says it.
+turso's caches and writes touch in them (records.db's held 16 kB past its huge page, so nearly all of its 2 MiB
+goes; the conversation store's 3,712 kB past its, so its huge page may be mostly in use). No latency number should
+move: turso's reads and writes run on its own threads and the blocking pool, and its arenas' 4 KiB pages cost them
+TLB reach alone. A round's server (`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host
+the saving is larger and the lab can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and
+after the deploy says it (its kernel makes no huge pages of files: no `READ_ONLY_THP_FOR_FS`, `FileHugePages` 0).
 
 ## Goal 10: API reads and frames in under a millisecond
 
