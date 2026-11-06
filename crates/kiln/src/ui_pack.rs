@@ -17,9 +17,11 @@ const QUALITY: u32 = 11;
 /// What brotli's writer packs through at a time, as the server's did.
 const BUFFER: usize = 4096;
 
-/// Whether a file of `mime` compresses: text, scripts, JSON and SVG.
+/// Whether a file of `mime` compresses: text, scripts, JSON, SVG and WebAssembly (the syntax grammars and
+/// web-tree-sitter's runtime, built as plain WebAssembly for the browser to decode: goal 8 of the browser
+/// protocol program, plan 01a1a832ebfd step 3).
 pub fn compressible(mime: &str) -> bool {
-    mime.starts_with("text/") || mime.contains("javascript") || mime.contains("json") || mime.contains("svg")
+    mime.starts_with("text/") || mime.contains("javascript") || mime.contains("json") || mime.contains("svg") || mime == "application/wasm"
 }
 
 /// The type a file called `name` is served as.
@@ -80,7 +82,8 @@ mod tests {
     use super::*;
 
     /// Goal 11, plan 01a1a87b2e56 step 5: the build packs what the server would: text, scripts, JSON and SVG
-    /// past 1 KiB, nothing else.
+    /// past 1 KiB, nothing else; and WebAssembly (goal 8 of the browser protocol program, plan 01a1a832ebfd
+    /// step 3).
     #[test]
     fn g11_s5_the_build_and_the_server_take_the_same_files() {
         assert!(worth(&mime_of("assets/index-a1.js"), 2000));
@@ -88,8 +91,10 @@ mod tests {
         assert!(worth(&mime_of("_shell.html"), 2000));
         assert!(worth(&mime_of("manifest.webmanifest"), 2000));
         assert!(worth(&mime_of("assets/logo.svg"), 2000));
+        assert!(worth(&mime_of("assets/tree-sitter.wasm"), 2000));
+        assert!(worth(&mime_of("assets/typescript-AbCdEfGh.wasm"), 2000));
         assert!(!worth(&mime_of("assets/index-a1.js"), LEAST), "1 KiB or less goes as it is");
-        for raw in ["assets/geist-latin-wght-normal.woff2", "assets/scala.wasm-B.gz", "assets/tree-sitter.wasm", "icon.png"] {
+        for raw in ["assets/geist-latin-wght-normal.woff2", "assets/scala.wasm-B.gz", "icon.png"] {
             assert!(!worth(&mime_of(raw), 1 << 20), "{raw} is packed already, or doesn't compress");
         }
     }

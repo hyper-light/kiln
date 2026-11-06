@@ -2331,16 +2331,33 @@ What the lab would show: its viewers asking as the UI does (`window=1&lean=1` be
 `kiln-lab`'s `lab.rs` viewer), A (without) against B (with): attach p50 and p99 and the viewers' sockets' slow polls
 (their snapshot's label) fall with B, and no read or frame number is worse.
 
+**An idle copy's newest chunk kept compact** (est. up to 17 MB in production's shape, about 0 in the lab). An idle
+session's open chunk kept its events as they are, their texts whole (up to 70 events, ~150 KB at the lab's sizes), for as
+long as it was idle: production's 126 idle copies of its 134 (35 events on average), est. 17 MB. Now:
+- Every `copies::IDLE_AFTER` (`os::alloc::COLD_AFTER`, 5 s, jemalloc's decay: what's idle that long is let go of), each
+  owner sweeps its copies (`Shard::pack_idle`, sent by `pack_idle_every`). One that took nothing in since the last sweep,
+  and whose newest chunk no read took since it last changed (`Chunk::page_read`, cleared by a change), has that chunk
+  sealed: packed on the compute pool as a sealed chunk is, then kept compact by its owner's compaction (`Events::compact`):
+  its metas and segment, about a sixth of its texts. One a read took meanwhile stays as it is, its segment let go of.
+- Its next event, and a stream into one of its events, has it read back off the shard first (`Mirror::thaw_for`,
+  `Mirror::thaw_for_stream`, `Registry::apply`: the owner's read-back on the blocking pool, `Shard::want_thaw`), the
+  update taken once it's back, as a change to a compact chunk is.
+- A read of it on a shard has its texts made off the shard (goal 10's `Unread::Unkept`), kept for the reads after, and the
+  owner's next sweep reads it back as its events (off the shard, one a sweep), marked read, so a copy someone reads isn't
+  packed again until it changes: its texts and a segment beside them would hold more than its events did.
+- A snapshot takes it as it's packed (`Snapshot::part_into`); a spill never takes it (`Events::spillable`).
+What the lab would show (A: origin/main f497602c96b, B: this; realistic profile, 8 rounds calm and 8 with hogs): the lab's
+24 idle copies are packed during the fill, before its readers start; in the warm-up each one's first read is made off the
+shard and the sweeps read them back within about 30 s (one a shard a sweep). So: `session_entries` and `rss_anon` at the
+window's end within noise of A; `api_read` p50/p99/p99.9 within noise (a first read of each idle copy is a few hundred
+microseconds slower, mostly in the warm-up); attach, websocket and runner wait within noise (the copies at work never sit
+idle 5 s). In production's shape the saving is the idle copies no one read since their last event; a profile with idle
+copies its readers don't read (`many` with all but 8 idle, no events reads of those) would show it.
+
 **Looked at, and not cut:**
 - **Sessions' copies, the rest.** What the open chunks hold as text (`session_entries`): the 24 idle copies' 50 events
   each, est. 4.3 MB, the 8 at work about 1 MB. A read of a copy's newest page takes them, and the lab's readers read
-  each copy's every 2.7 s on average, so they stay. Keeping an idle copy's open chunk compact (packed once it took
-  nothing in for `os::alloc::COLD_AFTER`, read back off the shard before its next event, as a change to a compact
-  chunk is) would give est. 17 MB in production's shape (126 idle copies at 35 events on average), 0.3 MB in the lab
-  (its entries' own allocations; the reads keep the texts). It takes the snapshot's newest chunk packed as it's kept,
-  the update's thaw before an event goes in at a compact newest chunk and before a stream into one (off the shard,
-  finished before the next event or stream is taken), and a window found off the shards (below). Next, once the
-  owners' polls' own changes (goal 9 step 3) have landed: production's ~17 MB, with what the lab would measure.
+  each copy's every 2.7 s on average, so they stay: an idle copy that's read keeps its texts as they are (below).
 - **The registry**: its maps (names, holders, epochs, uploads) and each copy's own (about 0.5 KB a copy beside its
   events): under 0.1 MB in the lab.
 - **The bus**: as in part 4.
@@ -2356,6 +2373,117 @@ What the lab would show: its viewers asking as the UI does (`window=1&lean=1` be
   and the next takes them again: no resident memory saved.
 - **kiln.db's leaves** (`store::group::Leaves`, W27-R08's): 32 bytes an entry applied, up to 65,536 (2 MiB after
   about 15 minutes of custody's writes; 0.5 MB in a lab round), what a checkpoint runs over: W27's to bound.
+
+### Transparent huge pages off for the server (step 5, part 6)
+
+A transparent huge page makes 2 MiB of anonymous memory resident at the first touch of any byte of it. kiln keeps
+its own memory off them already (jemalloc's `thp:never`, the runtime threads' stacks `MADV_NOHUGEPAGE`); what's left
+asks for them or takes what the machine gives:
+- **turso's buffer pools** (vendor/turso `core/storage/buffer_pool.rs`): each database it opens (the conversation
+  store, records.db) maps two arenas of 3 MiB and advises them `MADV_HUGEPAGE`. In alloc2's musl-jemalloc rounds
+  (smaps at the window's end) the two mappings (6,164 kB each, `VmFlags` `hg`) held 2,064 and 5,760 kB resident,
+  2,048 kB of each in a huge page: 4 MiB of `AnonHugePages`, the server's only ones on the lab's machine, which gives
+  them only where asked (fedora: `madvise`).
+- **Everything else, on production's host**, which gives them to every anonymous mapping (adacachy: `always`,
+  `max_ptes_none` 409): the C libraries' malloc, the stacks of threads the runtime didn't start (jemalloc's
+  background threads, the vendored crates' own), and any other anonymous mapping. alloc2's tree, before the runtime's
+  own stacks were marked, had 92 anonymous mappings neither marked nor advised that hold a whole 2 MiB-aligned range,
+  8.7 MB resident in all: each such range a fault there may make a whole huge page.
+
+`kiln::os::thp`: the server turns them off for its whole process as it starts (`PR_SET_THP_DISABLE`, prctl(2)),
+whatever a mapping asks, so each of these holds the pages it touches. It's what focal does for a bus node
+(`focal_platform::memory::disable_transparent_huge_pages`: a fault in an advised range entered direct compaction for
+70 to 685 ms on a busy host, and with huge pages off the bus's throughput and p99 were both better) and Redis for
+itself (`disable-thp`); Quiver's memory is jemalloc's, kept off them already. The switch is kept across `fork` and
+`execve`, so only a server that starts no runner of its own turns it (`[local_agent] enabled = false`: the lab's
+server, and a server whose runners are machines of their own); the server's own runner's legs and agents keep what
+the machine gives. Its own helpers (git, a render) inherit it. The log says which (`transparent huge pages are off
+for the server's process`, or why they stay). macOS and Windows give no transparent huge pages to turn off.
+
+**The A/B** (one build; `KILN_KEEP_THP=1` keeps them as the machine gives them), 8 rounds calm, production's layout,
+then the same with `--hogs 1x`:
+
+```sh
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a thp --label-b no-thp --env-a KILN_KEEP_THP=1 --server-cpus 16-31 --layout production --rounds 8
+```
+
+Expected: `server.rss_anon_mb` (and `server.rss_mb`) 2 to 4 MB lower on B: the 4 MiB of huge pages less the pages
+turso's caches and writes touch in them (records.db's held 16 kB past its huge page, so nearly all of its 2 MiB
+goes; the conversation store's 3,712 kB past its, so its huge page may be mostly in use). No latency number should
+move: turso's reads and writes run on its own threads and the blocking pool, and its arenas' 4 KiB pages cost them
+TLB reach alone. A round's server (`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host
+the saving is larger and the lab can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and
+after the deploy says it (its kernel makes no huge pages of files: no `READ_ONLY_THP_FOR_FS`, `FileHugePages` 0).
+
+### What's resident now, by kind, and what 113 MB takes (step 5, part 6)
+
+g9p16 (fedora, 2026-11-06 09:09 to 09:30 UTC): main `e4b39c53f0b` (train 16) as rt16, the lab's glibc build with
+kiln's `jemalloc` feature (jemalloc allocates, SQLite through it, glibc's malloc the other C libraries'; a PIE, so
+its relocated read-only data, about 3 MB, is anonymous where production's static musl build keeps it the file's
+own), the realistic profile in production's layout, 8 rounds calm and 8 with 16 hogs. At the window's end, MB, the
+median (range):
+
+| | calm | hogs |
+| --- | --- | --- |
+| `server.rss_mb`, the bar's | 249.8 (243.4 to 264.7) | 251.4 (225.9 to 262.0) |
+| the binary's and libraries' pages (`rss_file_mb`) | 107.6 | 107.6 |
+| anonymous (`rss_anon_mb`) | 145.2 (138.3 to 159.7) | 145.7 (133.6 to 158.0) |
+| jemalloc: `allocated` | 116.1 | 119.7 |
+| of it, threads' caches | 15.5 | 15.8 |
+| jemalloc: slack (`active` less `allocated`) | 24.8 | 25.4 |
+| jemalloc: `dirty` | 20.9 | 21.3 |
+| jemalloc: `metadata` | 12.8 | 12.7 |
+| jemalloc: `resident`, its own count | 173.7 | 177.1 |
+| owners on `/metrics`: `bus` 6.8, `session_entries` 6.3, `sqlite` 2.2, `session_segments` 1.5, `ui_events` 0.8, `events_feed` 0.6 | 18.6 | 20.0 |
+
+jemalloc's `resident` is 28 MB more than the process's anonymous memory in all. It counts every page of its active
+extents and its metadata, written or not: a `Vec`'s capacity past its length, a zeroed buffer never written
+(hyper-log's zero-fill), its radix tree's leaves (2 MiB for each GiB of address space it has used; `retained` held
+442 MB). So each of its kinds bounds that kind's resident memory from above, and together they can't split the
+anonymous memory. `scripts/memory_lab/kinds.py` does, by mapping (below).
+
+**By kind** (calm), what decides each, and what can take it:
+
+| Kind | MB | What decides it | Lever | Takes at most, est. | Whose |
+| --- | --- | --- | --- | --- | --- |
+| the binary's code (file) | 91 (g11pages: production's build, startup's pages dropped) | every 64 KiB window the steady state touches, about half of `.text`'s | the code laid out by a profile: BOLT, or the linker's order (`KILN_RELEASE_BOLT`) | 75 to 80 (the file pages to 12 to 17 in all) | the BOLT lab ("The binary's pages") |
+| its data, and libraries (file) | 16.6 (read-only data 6.3, RELRO and `.data` 3.0 in production's build; this build's libraries 2.6) | read-only data's windows, vtables | the same order for data symbols | a few | none yet |
+| jemalloc's dirty pages | at most 20.9 | what was freed in about the last 2.5 s of the 5 s decay | `subsecond-decay` (500 ms), or `pool-subsecond-decay` where that's worse | 10 to 19 | the arms (lab) |
+| threads' caches | at most 15.5 | each thread's up to 200 of a small size and 20 of each size to 32 KiB: the shards' and the busy workers' (cold ones flush) | `slab-caches` (14336), then `page-caches` (4096) | 3 to 8 | the arms |
+| slack | at most 24.8 | free regions of slabs over 5 arenas, and size classes' rounding (never written past the request) | `one-arena` (a reading), then `bisect-arenas` | 5 to 10 (the slabs' part) | the arms |
+| metadata | at most 12.8 | the radix tree's leaves, extents' records, threads' cache stacks (about 25 KB a thread) | none | 0 | |
+| the live heap | at most 100.6 (`allocated` less caches) | 18.6 named; part 3's ranking for the rest (QUIC's transmits 5, observe 6, kiln.db's group 3, copies' metas and index 4, ...) | the bus's retention (`live::RETAIN`); the vendored patches (QUIC's transmits, hyper-log's pool and zero-fill, turso's arena size) | 6 to 7 (the bus); 5 to 15 (vendored) | Ada; hyper-raft's and Kiln DB's owners |
+| not jemalloc's (anonymous) | 17 to 22 (alloc2's split: stacks 6.8, turso's arenas 7.6 with 4.0 in huge pages, the C heap; this build's relocated RELRO 2.9) | threads' deepest frames; turso's `MADV_HUGEPAGE` | transparent huge pages off (above, train 17) | 2 to 4 | on main |
+
+**What 113 MB takes** (calm, from g9p16's 249.8):
+- **Counting the binary's pages** (`server.rss_mb`, the bar as written): 137 MB off. The code's layout takes the file
+  pages from 107.6 to est. 12 to 17 (BOLT's lab), so anonymous memory has to fall from 145 to at most 96 to 101: 44
+  to 49 MB. Huge pages off and the arms that hold every latency number take est. 20 to 41 of it; what's left (est. 3
+  to 29) only the bus's retention (Ada's word, est. 6 to 7) and the vendored projects' patches (their owners', est.
+  5 to 15) cover. All of them have to land.
+- **Not counting them** (`server.rss_anon_mb`): 32 MB off the anonymous 145. Huge pages off, the decay arm and one of
+  the caches' or the arenas' arms (est. 15 to 37 together) can do it, if they hold every latency number: the arms'
+  A/Bs say.
+
+**The lab, in order** (each an A/B on one build, 8 rounds calm then 8 with hogs, with `KILN_LAB_HOOK` set to
+`bolt-hook.sh` and `sections.py` and `kinds.py` beside it, so each round writes `kinds.txt`):
+1. Huge pages (above): `--env-a KILN_KEEP_THP=1`. Its proof is `kinds.txt`'s `thp-advised` row, `huge_kb` 4096 on A
+   and 0 on B: 2 to 4 MB is well inside `rss_anon_mb`'s range from round to round (21 MB in g9p16).
+2. The arms ("The A/B of jemalloc's settings: the lab plan"): each kind they move held more than that noise in g9p16,
+   so all three candidates run, `subsecond-decay` first, then `slab-caches` and `page-caches`, then the readings.
+3. The code's layout (BOLT's lab), if Ada's word is that the binary's pages count.
+4. One heap-profile round of main's tree (part 3's "A heap profile of the merged tree"): it ranks the 82 MB of live
+   heap no owner names, and with `prof_accum` the sites whose frees make `dirty`.
+
+**`kinds.py`** (`python3 -I scripts/memory_lab/kinds.py <pid>`, which `bolt-hook.sh` runs at each window's end):
+every mapping in `/proc/<pid>/smaps` by kind, each kind's resident KiB, the process's own pages of it and its
+transparent huge pages, then the total, the process's Rss. The binary's code, read-only and writable mappings; other
+files; threads' stacks (glibc's, with their guard pages in the mapping on a kernel with `MADV_GUARD_INSTALL`; musl's,
+just above their guard mapping, with the control block split from a stack kiln advised; `[stack]`); turso's arenas
+(`MADV_HUGEPAGE`, VmFlags `hg`); the allocator's mappings (`MADV_NOHUGEPAGE`, `nh`: jemalloc's `thp:never` marks each
+it makes on a kernel giving huge pages); `[heap]`; and the rest of the anonymous memory (the C heap, mappings made
+directly). Beside jemalloc's own figures, the `allocator` row says how much of what jemalloc counts is resident: what
+its `resident` counts past that row was never written.
 
 ## Goal 10: API reads and frames in under a millisecond
 

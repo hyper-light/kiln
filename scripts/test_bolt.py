@@ -457,11 +457,15 @@ class Hook(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 pages = Path(d, "r.hook", "pages.txt").read_text().splitlines()
                 rows = Path(d, "r.hook", "sections.txt").read_text().splitlines()
+                kinds = Path(d, "r.hook", "kinds.txt").read_text().splitlines()
             finally:
                 p.kill()
                 p.wait()
             # The sections' resident pages are the mappings' (smaps says the same pages).
             self.assertEqual(rows[-1].split()[2], pages[-2].replace("binary rss_kb=", "resident_kb="), (rows, pages))
+            # And the whole process's by kind (goal 11 step 5, part 6), the binary's among them.
+            self.assertEqual(kinds[0].split()[0], "binary-code", kinds)
+            self.assertTrue(kinds[-1].startswith("total rss_kb="), kinds)
 
 
     def test_g11_s5_an_instrumented_window_is_its_last_dump_less_its_first(self) -> None:
@@ -546,6 +550,123 @@ class Sections(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("process 999999999", r.stderr)
         r = run([sys.executable, "-I", str(SECTIONS), "self"])
+        self.assertEqual(r.returncode, 2)
+
+
+KINDS = ROOT / "scripts" / "memory_lab" / "kinds.py"
+
+# A process holding what kinds.py tells apart: 6 threads waiting (their stacks), 4 MiB advised MADV_HUGEPAGE and
+# 4 MiB advised MADV_NOHUGEPAGE, each written whole, then it says it's ready and waits for its stdin to close.
+HOLDER = """
+import mmap, sys, threading
+done = threading.Event()
+threads = [threading.Thread(target=done.wait) for _ in range(6)]
+for t in threads:
+    t.start()
+held = []
+for advice in (mmap.MADV_HUGEPAGE, mmap.MADV_NOHUGEPAGE):
+    m = mmap.mmap(-1, 4 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    try:
+        m.madvise(advice)
+    except OSError:
+        pass
+    m.write(b"x" * (4 << 20))
+    held.append(m)
+print("ready", flush=True)
+sys.stdin.read()
+done.set()
+"""
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "kinds.py reads Linux's /proc")
+class Kinds(unittest.TestCase):
+    """kinds.py: a process's resident memory by kind, from smaps (goal 11, plan 01a1a87b2e56 step 5)."""
+
+    def fields(self, line: str) -> tuple[str, dict[str, int]]:
+        name, *kv = line.split()
+        return name, {k: int(v) for k, v in (f.split("=") for f in kv)}
+
+    def test_g11_s5_each_kind_is_told_apart_and_the_kinds_sum_to_the_processs_rss(self) -> None:
+        p = subprocess.Popen([sys.executable, "-I", "-c", HOLDER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip() if p.stdout else "", "ready")
+            r = run([sys.executable, "-I", str(KINDS), str(p.pid)])
+            rollup = Path(f"/proc/{p.pid}/smaps_rollup").read_text()
+            flags = Path("/sys/kernel/mm/transparent_hugepage/enabled").read_text() if Path("/sys/kernel/mm/transparent_hugepage/enabled").exists() else ""
+        finally:
+            if p.stdin:
+                p.stdin.close()
+            p.wait(timeout=30)
+            if p.stdout:
+                p.stdout.close()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = dict(self.fields(l) for l in r.stdout.splitlines())
+        self.assertEqual(list(rows), ["binary-code", "binary-ro", "binary-rw", "files", "stacks", "thp-advised", "allocator", "heap", "other-anon", "kernel", "total"])
+        rss = next(int(l.split()[1]) for l in rollup.splitlines() if l.startswith("Rss:"))
+        self.assertEqual(rows["total"]["rss_kb"], rss, "every mapping counted once: the process's Rss")
+        self.assertEqual(sum(f["rss_kb"] for k, f in rows.items() if k != "total"), rss)
+        # The main thread's stack and the six waiting threads' (glibc's, one mapping for adjacent ones where the
+        # kernel puts their guards in them).
+        self.assertGreaterEqual(rows["stacks"]["maps"], 2, rows["stacks"])
+        self.assertGreater(rows["stacks"]["rss_kb"], 0)
+        if "[never]" not in flags and flags:
+            # Each 4 MiB written whole: the advised mappings hold it all (no other mapping of this process is advised).
+            self.assertGreaterEqual(rows["thp-advised"]["rss_kb"], 4096, rows["thp-advised"])
+            self.assertGreaterEqual(rows["allocator"]["rss_kb"], 4096, rows["allocator"])
+            self.assertLess(rows["thp-advised"]["rss_kb"], 8192, rows["thp-advised"])
+        self.assertGreater(rows["binary-code"]["rss_kb"], 0, "python's own code")
+
+    def test_g11_s5_musls_stacks_jemallocs_turso_and_the_c_heap_each_take_their_kind(self) -> None:
+        # The production build's layout (static musl, jemalloc), as its smaps lists it, lowest first.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("kinds", KINDS)
+        assert spec and spec.loader
+        kinds = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(kinds)
+        KiB, MiB = 1 << 10, 1 << 20
+        at = [0x7F0000000000]
+
+        def m(size: int, perms: str = "rw-p", path: str = "", flags: str = "rd wr mr mw me ac sd", rss: int = 4) -> dict:
+            lo = at[0]
+            at[0] += size
+            return dict(lo=lo, hi=lo + size, perms=perms, path=path, rss=rss, anon=rss, huge=0, flags=set(flags.split()))
+
+        maps = [
+            m(4 * KiB, "---p", flags="mr mw me sd", rss=0),  # a runtime thread: musl's guard,
+            m(16 * MiB, flags="rd wr mr mw me ac sd nh", rss=88),  # its stack, advised MADV_NOHUGEPAGE by kiln,
+            m(12 * KiB, rss=12),  # its control block and TLS above it
+            m(4 * MiB, flags="rd wr mr mw me ac sd nh", rss=4096),  # jemalloc's extents
+            m(4 * KiB, "---p", flags="mr mw me sd", rss=0),  # a signal stack's guard,
+            m(12 * KiB, rss=0),  # the signal stack: not a thread's
+            m(6164 * KiB, flags="rd wr mr mw me ac sd hg", rss=5760),  # turso's arenas
+            m(4 * KiB, "---p", flags="mr mw me sd", rss=0),  # a thread the runtime didn't start: its guard,
+            m(16 * MiB, rss=20),  # its stack (no advice),
+            m(256 * KiB, rss=200),  # a C library's malloc group
+            m(132 * KiB, rss=4),  # glibc's arena,
+            m(65404 * KiB, "---p", flags="mr mw me sd", rss=0),  # its reserve,
+            m(132 * KiB, rss=4),  # and the next arena, just above that reserve: not a stack
+            m(180 * MiB, "r-xp", "/x/kiln", "rd ex mr mw me sd", rss=91000),
+            m(30 * MiB, "r--p", "/x/kiln", "rd mr mw me sd", rss=6300),
+            m(3 * MiB, "rw-p", "/x/kiln", "rd wr mr mw me ac sd", rss=3000),
+            m(132 * KiB, path="[stack]", rss=200),
+            m(8 * KiB, "r-xp", "[vdso]", "rd ex mr mw me de sd", rss=8),
+        ]
+        got = kinds.classify(maps, "/x/kiln")
+        self.assertEqual(
+            got,
+            ["other-anon", "stacks", "stacks", "allocator", "other-anon", "other-anon", "thp-advised", "other-anon", "stacks", "other-anon", "other-anon", "other-anon", "other-anon", "binary-code", "binary-ro", "binary-rw", "stacks", "kernel"],
+        )
+        rows = kinds.tally(maps, got)
+        self.assertEqual(rows["stacks"]["rss"], 88 + 12 + 20 + 200)
+        self.assertEqual(rows["allocator"]["rss"], 4096)
+        self.assertEqual(rows["thp-advised"]["rss"], 5760)
+
+    def test_g11_s5_a_process_that_isnt_there_is_said(self) -> None:
+        r = run([sys.executable, "-I", str(KINDS), "999999999"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("process 999999999", r.stderr)
+        r = run([sys.executable, "-I", str(KINDS), "self"])
         self.assertEqual(r.returncode, 2)
 
 

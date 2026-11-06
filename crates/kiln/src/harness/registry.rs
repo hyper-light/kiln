@@ -1161,7 +1161,9 @@ impl Snapshot {
                 gz.deflate(Compression::fast(), loose)?;
                 loose.clear();
                 gz.stored(br#"{"t":"events","events":["#);
-                if *i + 1 == chunks.len() && !chunk.is_full() {
+                // The newest, which the next event changes, deflated now; one kept compact while its copy took nothing in
+                // goes as it's packed (goal 11, plan 01a1a87b2e56 step 5).
+                if *i + 1 == chunks.len() && !chunk.is_full() && !chunk.is_compact() {
                     gz.segment(&chunk.deflate(Compression::fast())?);
                 } else {
                     let packed = match chunk.pack() {
@@ -2769,6 +2771,14 @@ impl Registry {
         // read back off the shard (goal 9, plan 01a1a87b2cec step 3).
         if let Update::Events { events } = &u
             && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
+        // A stream into an event of a compact chunk (the newest, kept compact while its copy took nothing in: goal 11, plan
+        // 01a1a87b2e56 step 5): the same, once that chunk is read back off the shard, before the stream is taken.
+        if let Update::Stream { id: event, .. } = &u
+            && let Some(c) = m.thaw_for_stream(event).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
