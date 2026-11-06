@@ -91,7 +91,7 @@ pub fn segments_bound() -> u64 {
 /// finding, resuming, digests and a snapshot's plan read these alone. Goal 10, plan 01a1a87b2dae step
 /// 3, in the shape agreed with goal 11, whose stored form keeps these and the chunk's [`Segment`] and
 /// decodes an event's text only where it's read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Meta {
     /// Empty for an event without one (none the copy takes in: `Mirror::upsert`). Kept in the meta itself
     /// ([`Id`]), not an allocation of its own: a copy keeps a meta for each event it keeps, spilled or not.
@@ -104,12 +104,33 @@ pub struct Meta {
     /// Its text's digest: made off the owner's shard, a chunk's all as it's packed ([`Chunk::pack`]:
     /// a packed chunk's are all there), or where first asked for ([`Meta::sum`]). Made as the copy
     /// took each event in, it held the owner's shard for a whole fill's text (goal 10's A/B).
-    sum: OnceLock<u64>,
+    /// [`NO_SUM`] until it's made: 8 bytes, where a `OnceLock<u64>` took 16 (goal 11, plan 01a1a87b2e56
+    /// step 5: a copy keeps a meta for each of its events, spilled or not).
+    sum: AtomicU64,
 }
+
+/// A meta's digest not made yet ([`Meta::sum`]). A text whose digest is this itself (one in 2^64) has its
+/// digest made again each time it's asked for, as one not made yet: never another's.
+const NO_SUM: u64 = 0;
+
+impl Clone for Meta {
+    fn clone(&self) -> Self {
+        Self { id: self.id.clone(), seq: self.seq, at: self.at, off: self.off, len: self.len, sum: AtomicU64::new(self.sum.load(Ordering::Relaxed)) }
+    }
+}
+
+/// Metas are equal as a `OnceLock`'s digest was: the same event, and the same digest made (or none).
+impl PartialEq for Meta {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.seq == other.seq && self.at == other.at && self.off == other.off && self.len == other.len && self.sum_made() == other.sum_made()
+    }
+}
+
+impl Eq for Meta {}
 
 impl Meta {
     fn of(ev: &Ev, off: usize) -> Self {
-        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: ev.entry.seq(), at: ev.at, off, len: ev.entry.text().len(), sum: OnceLock::new() }
+        Self { id: Id::of(ev.entry.id().unwrap_or_default()), seq: ev.entry.seq(), at: ev.at, off, len: ev.entry.text().len(), sum: AtomicU64::new(NO_SUM) }
     }
 
     /// Its event's id (empty: none).
@@ -117,14 +138,20 @@ impl Meta {
         self.id.as_str()
     }
 
-    /// Its text's digest, `ev`'s (the event it's the meta of), made now if it wasn't yet.
+    /// Its text's digest, `ev`'s (the event it's the meta of), made now if it wasn't yet. The digest is its
+    /// text's alone, so any thread that makes it makes the same: whichever keeps it last keeps that.
     pub fn sum(&self, ev: &Ev) -> u64 {
-        *self.sum.get_or_init(|| ev.entry.sum())
+        if let Some(made) = self.sum_made() {
+            return made;
+        }
+        let made = ev.entry.sum();
+        self.sum.store(made, Ordering::Relaxed);
+        made
     }
 
     /// Its text's digest, if it's been made.
     pub fn sum_made(&self) -> Option<u64> {
-        self.sum.get().copied()
+        Some(self.sum.load(Ordering::Relaxed)).filter(|s| *s != NO_SUM)
     }
 
     /// Where the next event's text begins: past this one's and the `,` after it.
@@ -174,27 +201,56 @@ impl std::fmt::Debug for Id {
     }
 }
 
-/// Where each of a copy's events is, by its id (goal 11, plan 01a1a87b2e56 step 5): keyed by a hash of the id (a
-/// bucket 16 bytes, against 24 with the id's `Arc<str>`, which metas no longer hold), each place it finds checked
-/// against the id its event's meta keeps (in memory, its chunk spilled or not), and an id whose hash another's
-/// already has kept apart, by the id itself. Its places move as events go from the front of the copy or past a
-/// number ([`Index::retain`]), as the copy's own did.
+/// Where each of a copy's events is, by its id (goal 11, plan 01a1a87b2e56 step 5): keyed by a hash of the id, each
+/// place it finds checked against the id its event's meta keeps (in memory, its chunk spilled or not), and an id
+/// whose hash another's already has kept apart, by the id itself. Its places move as events go from the front of the
+/// copy or past a number ([`Index::retain`]), as the copy's own did.
+///
+/// A bucket is 8 bytes: half of the id's keyed hash and the event's place, each a `u32` (a copy keeps at most
+/// `MAX_EVENTS` and a quarter, and one past a `u32` is kept apart), where a `u64` and a `usize` took 16. The table
+/// hashes its keys by spreading them ([`Spread`]), not with SipHash again: they're a keyed SipHash already.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Index {
-    by_hash: HashMap<u64, usize>,
+    by_hash: HashMap<u32, u32, std::hash::BuildHasherDefault<Spread>>,
     apart: HashMap<Box<str>, usize>,
 }
 
+/// How the index's table hashes a key it's given (goal 11, plan 01a1a87b2e56 step 5): a key is half of a keyed
+/// SipHash ([`Index::hash`]), its bits as random as the hash's, so the key itself is its hash, written in both halves
+/// of the table's `u64`: hashbrown picks a bucket by the low bits and tags it by the top seven, and here each comes
+/// from the key's own bits. A key isn't a runner's to choose: it doesn't know the process's SipHash key.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Spread(u64);
+
+impl std::hash::Hasher for Spread {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u32(&mut self, key: u32) {
+        self.0 = (u64::from(key) << 32) | u64::from(key);
+    }
+
+    /// Only `u32` keys are hashed with it; anything else, as FNV-1a writes bytes (its 64-bit prime), so it still
+    /// hashes as a hasher must.
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
 impl Index {
-    /// The process's own key for ids' hashes: an id's hash isn't another server's, or a runner's to choose.
-    fn hash(id: &str) -> u64 {
+    /// The process's own key for ids' hashes: an id's hash isn't another server's, or a runner's to choose. The
+    /// index keys an id by the high half of its 64-bit SipHash.
+    fn hash(id: &str) -> u32 {
         static KEY: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
-        KEY.get_or_init(std::collections::hash_map::RandomState::new).hash_one(id)
+        u32::try_from(KEY.get_or_init(std::collections::hash_map::RandomState::new).hash_one(id) >> 32).unwrap_or_default()
     }
 
     /// Where event `id` is in `events`.
     pub(super) fn get(&self, events: &Events, id: &str) -> Option<usize> {
-        if let Some(at) = self.by_hash.get(&Self::hash(id)).copied()
+        if let Some(at) = self.by_hash.get(&Self::hash(id)).and_then(|at| usize::try_from(*at).ok())
             && events.meta(at).is_some_and(|m| m.id() == id)
         {
             return Some(at);
@@ -204,13 +260,17 @@ impl Index {
 
     /// Event `id` is at `at` in `events`.
     pub(super) fn insert(&mut self, events: &Events, id: &str, at: usize) {
+        let Ok(place) = u32::try_from(at) else {
+            self.apart.insert(id.into(), at);
+            return;
+        };
         match self.by_hash.entry(Self::hash(id)) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(at);
+                v.insert(place);
             }
             // The same id's, or one no event holds any more: its place.
-            std::collections::hash_map::Entry::Occupied(mut o) if events.meta(*o.get()).is_none_or(|m| m.id() == id) => {
-                o.insert(at);
+            std::collections::hash_map::Entry::Occupied(mut o) if usize::try_from(*o.get()).ok().and_then(|was| events.meta(was)).is_none_or(|m| m.id() == id) => {
+                o.insert(place);
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 self.apart.insert(id.into(), at);
@@ -229,7 +289,18 @@ impl Index {
 
     /// Keeps the places `keep` says to, each as `keep` leaves it (moved down past those let go of).
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&mut usize) -> bool) {
-        self.by_hash.retain(|_, at| keep(at));
+        self.by_hash.retain(|_, place| {
+            let Ok(mut at) = usize::try_from(*place) else { return false };
+            let kept = keep(&mut at);
+            match u32::try_from(at) {
+                Ok(now) => {
+                    *place = now;
+                    kept
+                }
+                // Moved past what a bucket holds (never down): let go, as a place it can't say.
+                Err(_) => false,
+            }
+        });
         self.apart.retain(|_, at| keep(at));
     }
 
@@ -3956,5 +4027,46 @@ mod tests {
         let len = m.events.len();
         m.upsert(entry(&format!("e{n}"), n));
         assert_eq!(m.events.len(), len, "taken again where it is");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta's digest takes 8 bytes, where a `OnceLock<u64>` took 16:
+    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta is 88
+    /// bytes, against 96: about 0.4 MB less for the lab's realistic profile's 47,000 or so events kept.
+    #[test]
+    fn g11_s5_heap_a_metas_digest_takes_eight_bytes() {
+        let ev = Ev { entry: entry("e1", 1), at: 0 };
+        let m = Meta::of(&ev, 0);
+        assert_eq!(m.sum_made(), None, "none made as it came in");
+        let made = m.sum(&ev);
+        assert_eq!((made, m.sum_made()), (ev.entry.sum(), Some(ev.entry.sum())), "made, then kept");
+        let copy = m.clone();
+        assert!(copy.sum_made() == Some(made) && copy == m, "a clone keeps it");
+        assert_ne!(Meta::of(&ev, 0), m, "one made and one not aren't equal, as with a OnceLock");
+        assert!(size_of::<Meta>() <= 88, "a meta takes {} bytes", size_of::<Meta>());
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the index's bucket is 8 bytes (half of an id's keyed hash and its
+    /// event's place, each a `u32`), where it was 16; its table hashes a key by the key's own bits, in both halves of
+    /// the `u64` (a bucket picked by the low ones, tagged by the top seven); a place past a `u32` is kept apart by
+    /// its id; and every id is found where it is. A 5,000-event copy's table of 8,192 buckets is 72 KiB, not 136.
+    #[test]
+    fn g11_s5_heap_the_indexs_bucket_is_eight_bytes() {
+        use std::hash::Hasher as _;
+        assert_eq!(size_of::<(u32, u32)>(), 8);
+        let mut spread = Spread::default();
+        spread.write_u32(0x8000_0001);
+        assert_eq!(spread.finish(), 0x8000_0001_8000_0001, "the key in both halves");
+        let mut events = Events::default();
+        for q in 1..=3 {
+            events.push(Ev { entry: entry(&format!("e{q}"), q), at: 0 });
+        }
+        let mut index = Index::of(&events);
+        index.insert(&events, "far", usize::MAX);
+        assert_eq!((index.apart.get("far"), index.get(&events, "far")), (Some(&usize::MAX), Some(usize::MAX)), "a place past a bucket's, kept apart");
+        for q in 1..=3_u64 {
+            assert_eq!(index.get(&events, &format!("e{q}")), usize::try_from(q - 1).ok(), "e{q}");
+        }
+        index.drop_front(1);
+        assert_eq!((index.get(&events, "e1"), index.by_hash.len()), (None, 2), "the oldest let go of");
     }
 }
