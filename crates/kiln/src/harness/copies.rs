@@ -3144,17 +3144,19 @@ impl Said {
         }
     }
 
-    /// The round trip to the compute pool these owners weigh writing out on their shards against (`crate::rt::here_against`;
-    /// consts-audit B1): the pool's as their shard's tasks learned it (`crate::rt::trip_from_here`), or a test's own.
-    pub(super) fn trip(&self) -> Option<u64> {
+    /// What these owners weigh writing out on their shards against (`crate::rt::Sides`; consts-audit B1): their shard's
+    /// quantum, and the pool's round trip as the shards' tasks learned it, or a test's own.
+    pub(super) fn sides(&self) -> crate::rt::Sides {
+        #[allow(unused_mut)]
+        let mut sides = crate::rt::Sides::here();
         #[cfg(test)]
         {
             let pinned = self.pinned_trip.load(Ordering::Relaxed);
             if pinned > 0 {
-                return Some(pinned);
+                sides.trip_ns = Some(pinned);
             }
         }
-        crate::rt::trip_from_here()
+        sides
     }
 
     /// A test's: these owners weigh their work against a round trip of `ns` (0: the process's), whatever the pool's is in
@@ -3242,12 +3244,13 @@ pub(super) fn write_ns(e: &super::model::Event) -> u64 {
     WRITES.expected(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
 }
 
-/// Whether writing event `e` out is expected to cost its owner's shard more than handing it to the compute pool and back
-/// (`trip`: the pool's round trip, learned, [`Said::trip`]), as a runner's frame that would is read off the shard
-/// (`crate::wire::payload`): it's written on the compute pool instead ([`Shard::want_write`]). Consts-audit B1: it was past
-/// a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs), whatever the pool's round trip was.
-pub(super) fn long_to_write(e: &super::model::Event, trip: Option<u64>) -> bool {
-    !crate::rt::here_against(write_ns(e), trip)
+/// Whether writing event `e` out is expected to take past a turn on its owner's shard (the quantum), or to cost it more than
+/// handing it to the compute pool and back (the pool's round trip, learned: `sides`, [`Said::sides`]), as a runner's frame
+/// that would is read off the shard (`crate::wire::payload`): it's written on the compute pool instead
+/// ([`Shard::want_write`]). Consts-audit B1: it was past a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs).
+pub(super) fn long_to_write(e: &super::model::Event, sides: crate::rt::Sides) -> bool {
+    let ns = write_ns(e);
+    !sides.take_here(ns, ns)
 }
 
 /// Event `e` was written out in `took`, on its owner's shard ([`WRITES`]).
@@ -3265,12 +3268,13 @@ fn changes_bytes(u: &Update) -> u64 {
     u64::try_from(crate::memory::queue::Weigh::weight(u)).unwrap_or(u64::MAX)
 }
 
-/// Whether `u` is a changeset, or a changeset's patch, expected to cost its owner's shard more to write out than the compute
-/// pool's round trip (`trip`, as [`long_to_write`] judges an event): it's written on the compute pool instead
-/// ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where it is once the
-/// pool's round trip is known, and learned.
-pub(super) fn long_changes(u: &Update, trip: Option<u64>) -> bool {
-    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !crate::rt::here_against(CHANGES.expected(changes_bytes(u)), trip)
+/// Whether `u` is a changeset, or a changeset's patch, expected to take past a turn on its owner's shard to write out, or to
+/// cost it more than the compute pool's round trip (`sides`, as [`long_to_write`] judges an event): it's written on the
+/// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
+/// it is, and learned.
+pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
+    let ns = CHANGES.expected(changes_bytes(u));
+    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
 }
 
 /// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
@@ -3278,14 +3282,14 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
     CHANGES.learn(changes_bytes(u), nanos(took));
 }
 
-/// Whether `u`, an update of the session whose copy is `m`, is expected to cost its owner's shard more to write out than the
-/// compute pool's round trip ([`Said::trip`]; consts-audit B1: it was past a slow poll, 100 µs): a changeset by its bytes
+/// Whether `u`, an update of the session whose copy is `m`, is expected to take past a turn on its owner's shard to write out,
+/// or to cost it more than the compute pool's round trip ([`Said::sides`]; consts-audit B1: it was past a slow poll, 100 µs): a changeset by its bytes
 /// ([`long_changes`]), a state or a meta that changed (its caller tells the same one again apart: `Mirror::same_again`) by
 /// what the session's last took, or every session's before it had one ([`Mirror::said`], `all`). It's written out on the
 /// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
 pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
-    let trip = all.trip();
-    long_changes(u, trip) || m.said(u, all).is_some_and(|ns| !crate::rt::here_against(ns, trip))
+    let sides = all.sides();
+    long_changes(u, sides) || m.said(u, all).is_some_and(|ns| !sides.take_here(ns, ns))
 }
 
 /// What its owner needs to write session `session`'s update out off the shard ([`Shard::want_off`]): whether its row for the
@@ -4764,6 +4768,11 @@ mod tests {
     /// ([`Said::pin_trip`]; consts-audit B1): what they write out on their shard and off it then doesn't move with the round
     /// trip the tests' process learns, which a loaded host makes milliseconds.
     const TRIP: u64 = 100_000;
+
+    /// What the owners the placement tests pin weigh their work against: their shard's quantum and [`TRIP`].
+    fn pinned() -> crate::rt::Sides {
+        crate::rt::Sides { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: Some(TRIP) }
+    }
 
     /// What a source file's code says outside its tests, its comments left out. Lines may end in
     /// CRLF, as a Windows checkout writes them (git's autocrlf): read as LF, or the tests' own
@@ -6912,7 +6921,7 @@ mod tests {
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.written_off()).await.unwrap_or_default();
             let large = "x".repeat(8 << 20);
-            anyhow::ensure!(long_to_write(&said(10, large.clone()), Some(TRIP)), "8 MB expected to cost more to write out than the compute pool's round trip");
+            anyhow::ensure!(long_to_write(&said(10, large.clone()), pinned()), "8 MB expected to cost more to write out than the compute pool's round trip");
             anyhow::ensure!(copies.send(&id, update(vec![said(9, "before".into()), said(10, large.clone()), said(11, "after".into())])).await, "sent");
             let i = id.clone();
             let now = copies
@@ -7230,7 +7239,7 @@ mod tests {
             }
             let was = copies.on(&id, |s| s.updates_off()).await.unwrap_or_default();
             let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
-            anyhow::ensure!(long_changes(&large, Some(TRIP)), "a changeset of 40,000 lines expected to cost more to write out than the compute pool's round trip");
+            anyhow::ensure!(long_changes(&large, pinned()), "a changeset of 40,000 lines expected to cost more to write out than the compute pool's round trip");
             for u in updates {
                 anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
             }
@@ -7384,7 +7393,7 @@ mod tests {
             let was = off().await;
             let (states, metas) = learned().await;
             anyhow::ensure!(was == 0, "the first session's first state and meta written on the shard: {was} off it");
-            anyhow::ensure!(!crate::rt::here_against(states, Some(TRIP)) && !crate::rt::here_against(metas, Some(TRIP)), "each taught its owners it's dearer than the round trip ({TRIP} ns): {states} ns, {metas} ns");
+            anyhow::ensure!(!pinned().take_here(states, states) && !pinned().take_here(metas, metas), "each taught its owners it's long to write out against {:?}: {states} ns, {metas} ns", pinned());
             anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
             let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
@@ -7682,7 +7691,7 @@ mod tests {
             let was = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
             // A large one whose frame the bus takes (half its most), and one past what it takes.
             let (large, past) = ("x".repeat(kiln_seams::bus::PAYLOAD_MAX / 2), "y".repeat(kiln_seams::bus::PAYLOAD_MAX * 2));
-            anyhow::ensure!(long_to_write(&said(9, large.clone()), Some(TRIP)) && long_to_write(&said(11, past.clone()), Some(TRIP)), "both expected to cost more to write out than the compute pool's round trip");
+            anyhow::ensure!(long_to_write(&said(9, large.clone()), pinned()) && long_to_write(&said(11, past.clone()), pinned()), "both expected to cost more to write out than the compute pool's round trip");
             for (q, text) in [(9, large.clone()), (10, "after".to_owned()), (11, past), (12, "after that".to_owned())] {
                 anyhow::ensure!(copies.send(&id, update(vec![said(q, text)])).await, "sent");
             }

@@ -922,7 +922,7 @@ impl Hub {
         // Each message's learner found here, its frames (a copy of up to half a mebibyte each, a learner's catch-up
         // many) made on the compute pool and sent in order, in turns (goal 9, plan 01a1a87b2cec step 3: made here
         // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds); a write's few short messages
-        // made here where that's no dearer than the pool's round trip, by their bytes at the rate making is learned to take
+        // made here where that fits a turn and is no dearer than the pool's round trip, by their bytes at the rate making is learned to take
         // (`crate::net::send_made`, step 5; consts-audit R2).
         let route = |(member, bytes): (u64, Vec<u8>)| match self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER)) {
             Some(peer) => Some((peer, (bytes.len(), self.cluster.frames(member, bytes)))),

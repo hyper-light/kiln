@@ -419,9 +419,10 @@ fn nanos_since(t: Instant) -> u64 {
 /// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
 /// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
 /// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
-/// messages is made where it is where that's expected to cost no more than handing it to the compute pool and back, by
-/// what `weigh` says its messages copy at the rate `costs` learned (`crate::wire::payload::Expect::on_shard`,
-/// `crate::rt::here`), its turn ended first if that wouldn't fit it (`rt::Turns::before`), else on the compute pool;
+/// messages is made where it is where that's expected to fit a turn (the shard's quantum) and to cost no more than handing
+/// it to the compute pool and back, by what `weigh` says its messages copy at the rate `costs` learned
+/// (`crate::wire::payload::Expect::on_shard`, `crate::rt::Sides`), its turn ended first if that wouldn't fit what's left of
+/// it (`rt::Turns::before`), else on the compute pool;
 /// either way what it took teaches `costs` (goal 9, plan 01a1a87b2cec step 5; consts-audit R2). The messages waiting
 /// behind one are taken with it while the loop's turn lasts, and between sends the shard is given up once the turn is
 /// over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends within the quantum. Returns
@@ -466,7 +467,8 @@ where
         if !batch.is_empty() {
             let len = u64::try_from(bytes).unwrap_or(u64::MAX);
             let made = match costs.on_shard(len) {
-                // No dearer here than the pool's round trip: made where it is, its turn ended first where it won't fit.
+                // Within a turn and no dearer here than the pool's round trip: made where it is, its turn ended first where it
+                // won't fit what's left.
                 Some(expected) => {
                     turns.before(expected).await;
                     let began = Instant::now();
@@ -1452,9 +1454,9 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R2: a batch is made where it's cheaper, by what making frames is learned
-    /// to take in this process (it was rt9's slowest seen, fixed in code), against the compute pool's round trip as the process
-    /// learned it. Do: hand a job to the pool from the shard, so the round trip is learned; then send 16 messages of 512
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R2: a batch is made on its shard where it fits a turn and is cheaper
+    /// there, by what making frames is learned to take in this process (it was rt9's slowest seen, fixed in code), against the
+    /// shard's quantum and the compute pool's round trip as the process learned it. Do: hand a job to the pool from the shard, so the round trip is learned; then send 16 messages of 512
     /// bytes each three times: with nothing learned of making them, with making learned fast (a mebibyte in a microsecond),
     /// and learned slow (a byte in a millisecond). Expect: with nothing learned, the first goes to the pool and teaches what
     /// making takes; learned fast, every one is made on the shard, no hand-off; learned slow, every one goes to the pool;
@@ -1501,7 +1503,7 @@ mod tests {
                     _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
                 }
             }
-            anyhow::ensure!(fresh.on_shard_against(1, Some(u64::MAX)).is_some(), "the first batch, made on the pool, taught what making takes");
+            anyhow::ensure!(fresh.on_shard_with(1, crate::rt::Sides { quantum_ns: None, trip_ns: None }).is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }

@@ -2827,7 +2827,7 @@ impl Registry {
         // Its first event is long to write out (a large tool output) and wasn't written yet: the same, once its owner wrote it
         // out off the shard (goal 9, plan 01a1a87b2cec step 3: `super::copies::Shard::want_write`).
         if let Update::Events { events } = &u
-            && events.first().is_some_and(|e| written.as_ref().is_none_or(|w| !w.is(id, e)) && super::copies::long_to_write(e, said.trip()))
+            && events.first().is_some_and(|e| written.as_ref().is_none_or(|w| !w.is(id, e)) && super::copies::long_to_write(e, said.sides()))
         {
             let (cwd, location) = (m.info.cwd.clone(), Location::clone(&m.location));
             s.want_write(id, store.is_some(), cwd, location);
@@ -3005,7 +3005,7 @@ impl Registry {
                     // out is written so, it and those after it the rest (goal 9, plan 01a1a87b2cec step 3: a large tool output's
                     // JSON and row, past the step's quantum on the shard). The first was judged so above, once.
                     let tried_write = written.take().filter(|w| w.is(id, e));
-                    if tried_write.is_none() && taken > 0 && super::copies::long_to_write(e, said.trip()) {
+                    if tried_write.is_none() && taken > 0 && super::copies::long_to_write(e, said.sides()) {
                         write = Some((m.info.cwd.clone(), Location::clone(&m.location)));
                         break;
                     }
@@ -3084,9 +3084,9 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| !crate::rt::here_against(ns, said.trip())) && matches!(u, Update::Meta { .. }) {
-            // A meta that changed, its session's metas long to write out (dearer than the compute pool's round trip:
-            // `super::copies::Said::trip`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
+        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) && matches!(u, Update::Meta { .. }) {
+            // A meta that changed, its session's metas long to write out (past a turn, or dearer than the compute pool's round
+            // trip: `super::copies::Said::sides`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
             // 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
             m.commit_meta_off()
         } else {
@@ -5161,12 +5161,12 @@ mod tests {
                             .on("s", move |s| {
                                 let said = s.said();
                                 if let Update::Events { events } = &u
-                                    && events.first().is_some_and(|e| super::super::copies::long_to_write(e, said.trip()))
+                                    && events.first().is_some_and(|e| super::super::copies::long_to_write(e, said.sides()))
                                 {
                                     return None;
                                 }
                                 if let Some(m) = s.get_mut("s") {
-                                    while m.said(&u, &said).is_some_and(|ns| !crate::rt::here_against(ns, said.trip())) {
+                                    while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
                                         m.said_took(&u, std::time::Duration::ZERO, &said);
                                     }
                                 }
