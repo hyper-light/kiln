@@ -843,8 +843,8 @@ macro_rules! with_driver {
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
-    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares as many and as large as its frames have had out at once (goal 11's audit, row B22: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 });
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {

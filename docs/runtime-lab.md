@@ -2038,6 +2038,15 @@ back after a longer quiet than it ever had costs that read an open, once. It sav
 connection past the floor; how many there are is `kiln_memory_bound_bytes{owner="sqlite"}` over a connection's
 bound (4.6 MB, `store::cache_bound`). Watch store-backed numbers' p99 (pages, MCP, fill) after quiets.
 
+**The transport's spares** (`net_budget::Spares`): hyper-transport's `Fixed(1 GiB, 256)` kept every buffer given
+back, each as large as the largest frame it carried, 8.3 to 8.8 MB in the lab. The first cut bound them at the
+Interactive class's largest frame (1 MiB), so every Bulk frame larger than that (a feed's parts, up to 3 MiB;
+transfers; CI logs) was allocated on the net thread, and faulted in there once jemalloc's decay had given its pages
+back, with every runner's frames queued behind it (goal 11's audit, row B22). Now the spares keep as many buffers,
+and as many bytes, as the frames have had out at once at the most, learned as frames come: a frame of a size seen
+before finds its buffer kept (`net_budget`'s `g11_b22_*` count the frames allocated: none after the first of each
+size), and the spares hold no more than the busiest moment's frames did.
+
 ### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
 
 What's live, biggest first, from train 4's heap profile (the newest there is, 164.6 MB by its estimate) less
