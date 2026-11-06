@@ -8442,6 +8442,66 @@ mod tests {
         })
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5, as the fixed-rate benchmark found it on train 15 (`kiln-lab rate`'s `newest`,
+    /// 2026-11-06): a session's newest page as the API gives it unasked for a limit (`EVENTS_PAGE`), where its copy's open
+    /// chunk holds fewer events than the page takes past a compact chunk (`EVENTS_PAGE` less a chunk's), so the page spans
+    /// two compact chunks, is read on the request's shard once a read kept their texts. With the newest compact chunk's kept
+    /// alone, every read inflated the older one on the blocking pool (train 15's largest session: limits 50 to 90 on the
+    /// shard, 100 a blocking job a read). Do: two sealed chunks kept compact and the open one holding half of what the page
+    /// takes past a compact chunk; a read, its texts made off the shard and kept. Expect: three reads after it, each asking
+    /// the blocking pool for nothing and inflating nothing on its shard, all the same bytes, the copy's page byte for byte,
+    /// its newest `EVENTS_PAGE` events.
+    #[test]
+    fn g10_s5_a_page_across_two_compact_chunks_is_read_on_its_shard() -> anyhow::Result<()> {
+        use crate::harness::copies::{EVENTS_PAGE, PACKED_EVENT_BYTES, PAGE_BYTES, Unread};
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            // A chunk's events, from the bound of what a copy keeps packed (two chunks' at a packed event's bytes), and the
+            // open chunk's: half of what the page takes past a compact chunk, so it reaches into the one before that too.
+            let chunk = PAGE_BYTES / (2 * PACKED_EVENT_BYTES);
+            let open = EVENTS_PAGE.saturating_sub(chunk) / 2;
+            anyhow::ensure!(open > 0 && open + chunk < EVENTS_PAGE && EVENTS_PAGE < open + 2 * chunk, "the page spans two compact chunks: {open} open of {chunk}");
+            let n = u64::try_from(2 * chunk + open)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            // Till its chunks are compact, the page is read from the events themselves.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+                anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = || {
+                let api = Arc::clone(&api);
+                async move {
+                    let ((r, inflated), asked) = blocking_asked_in(inflated_in(api.handle(lab_get("/api/harness/sessions/a/events")?))).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, inflated, asked))
+                }
+            };
+            let (status, _, _, _) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK, "the first read: {status}");
+            let mut bodies = Vec::new();
+            for k in 0..3 {
+                let (status, body, inflated, asked) = read().await?;
+                anyhow::ensure!(status == StatusCode::OK && asked == 0 && inflated == 0, "read {k} after the first: {status}, {asked} blocking jobs asked, {inflated} inflated on its shard");
+                bodies.push(body);
+            }
+            let copy = hub.harness.events_json("a", None, EVENTS_PAGE).ok_or_else(|| anyhow::anyhow!("the copy's page"))?;
+            anyhow::ensure!(bodies.iter().all(|b| b == copy.as_ref()), "every read the copy's page, byte for byte");
+            let events: serde_json::Value = serde_json::from_slice(&copy)?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            let page = u64::try_from(EVENTS_PAGE)?;
+            assert_eq!(seqs, (n - page + 1..=n).collect::<Vec<u64>>(), "its newest {page}, oldest first");
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: the conversation store's page of a session's events, now written out on the
     /// blocking pool (`stored_events`), is the bytes the request's shard wrote: each row's body read as JSON, one that
     /// isn't left out, as `srv::json` writes an answer.

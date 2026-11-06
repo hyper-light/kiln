@@ -398,7 +398,7 @@ pub struct Chunk {
     /// memory, its segment read back where it's asked for (a snapshot, on the blocking pool).
     spilled: Option<super::spill::Spilled>,
     /// A compact one's texts, inflated by the first read of its copy's newest page that needed them and kept
-    /// for the reads after it while it's the newest compact chunk of its copy ([`Chunk::page_texts`]; goal 10,
+    /// for the reads after it while its copy's newest page reaches it ([`Chunk::page_texts`]; goal 10,
     /// plan 01a1a87b2dae step 5): the lab's events reads inflated a chunk's whole segment each time, on the
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
     /// packed chunk (`crate::memory::SESSION_ENTRIES`). Only those its reads reached back to are kept
@@ -412,8 +412,8 @@ pub struct Chunk {
     /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
     /// process, 0.5% of the shards' time, beside the copy's view's own store.
     texts: OnceLock<ArcSwapOption<PageTexts>>,
-    /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
-    /// alone, as chunks are compacted ([`Events::compact`]).
+    /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
+    /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
     /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
@@ -536,8 +536,8 @@ impl Chunk {
 
     /// A compact one's texts joined ([`Chunk::joined`]) from byte `from` of them on, as bytes a page's answer
     /// takes slices of, none copied, and the byte of them they begin at (`from` or before): as a read of its
-    /// copy's newest page kept them, else inflated now, and kept for the reads after while it's its copy's
-    /// newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
+    /// copy's newest page kept them, else inflated now, and kept for the reads after while its copy's newest
+    /// page reaches it (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
     /// reached back to, no further (goal 11, plan 01a1a87b2e56 step 5): the newest page ends at the copy's
     /// newest event, so its reads take a compact chunk's last events alone, the fewer the more of the page its
     /// open chunk holds, and the same page read again takes no more of it. A read that reaches further back
@@ -797,8 +797,8 @@ pub enum Unread {
     /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
     Cannot,
     /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
-    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
-    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while its
+    /// copy's newest page reaches it (goal 10, plan 01a1a87b2dae step 5).
     Unkept,
 }
 
@@ -1350,15 +1350,24 @@ impl Events {
         self.took_out = true;
     }
 
-    /// Its newest compact chunk in memory is the one whose texts a read of its newest page keeps
-    /// ([`Chunk::page_texts`]; goal 10, plan 01a1a87b2dae step 5): set so, and the one before it (the newest
-    /// until now, the only other one set) let go of, so a copy keeps one chunk's texts at the most.
+    /// Its compact chunks in memory that hold any of its newest [`EVENTS_PAGE`] events (the page the events API gives
+    /// unasked for a limit) are those whose texts a read of its newest page keeps ([`Chunk::page_texts`]; goal 10, plan
+    /// 01a1a87b2dae step 5): set so as chunks are compacted and cut, and those it no longer reaches let go of then. The
+    /// page holds more events than a chunk ([`CHUNK`]), so wherever the open chunk holds fewer than the rest of it, it
+    /// reaches into two compact chunks. Its newest compact chunk's texts alone were kept: every read of the page inflated
+    /// the other off its shard (`Unread::Unkept`, a blocking job a read), where a copy whose open chunk held more read it
+    /// on its shard (`kiln-lab rate`'s `newest`, 2026-11-06). Each keeps what the reads reach back to in it, no more.
     fn page_newest(&self) {
-        let mut newest = true;
-        for c in self.chunks().iter().rev().filter(|c| c.is_compact() && !c.is_spilled()) {
-            if newest {
+        // The events in the chunks newer than the one looked at: the page reaches it while they're fewer than it holds.
+        let mut after = 0usize;
+        for c in self.chunks().iter().rev() {
+            let reached = after < EVENTS_PAGE;
+            after = after.saturating_add(c.len());
+            if !c.is_compact() || c.is_spilled() {
+                continue;
+            }
+            if reached {
                 c.paged.store(true, Ordering::SeqCst);
-                newest = false;
             } else if c.paged.swap(false, Ordering::SeqCst) {
                 c.unpage();
             } else {
@@ -4812,7 +4821,8 @@ mod tests {
     /// Goal 10, plan 01a1a87b2dae step 5: a copy's newest page read twice inflates its compact chunk once. The
     /// first read keeps the texts of the newest compact chunk (its alone), the second takes a slice of them,
     /// nothing inflated, and both say what the events' texts joined say. A newer chunk compacted, the older's
-    /// texts go; a read of a view from before then inflates and keeps nothing, and one of the new view keeps
+    /// texts stay while the page the API gives unasked for a limit (`EVENTS_PAGE`) reaches it, and go once it
+    /// doesn't; a read of a view from before then inflates and keeps nothing, and one of the new view keeps
     /// the newest's.
     #[test]
     fn g10_s5_a_page_read_twice_inflates_its_chunk_once() -> anyhow::Result<()> {
@@ -4847,29 +4857,37 @@ mod tests {
         let parts = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page again"))?;
         anyhow::ensure!(inflated() == was + 1, "the second read inflates nothing");
         anyhow::ensure!(parts.concat() == first.as_ref(), "the same page");
-        // A newer chunk sealed and compacted: the older's texts go.
-        push(&mut m, n + 1..=n + u64::try_from(CHUNK)?)?;
+        // A newer chunk sealed and compacted: the newest page still reaches the older, whose texts stay.
+        let chunk = u64::try_from(CHUNK)?;
+        push(&mut m, n + 1..=n + chunk)?;
+        anyhow::ensure!(kept(&m.view(), 1).is_some(), "the texts of a chunk the newest page reaches kept");
+        // Another: the page reaches the older no more, and its texts go.
+        push(&mut m, n + chunk + 1..=n + 2 * chunk)?;
         anyhow::ensure!(kept(&m.view(), 1).is_none(), "the older's texts let go of");
         let was = inflated();
         let _ = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the view from before"))?;
         anyhow::ensure!(inflated() == was + 1 && kept(&view, 1).is_none(), "a view from before inflates its own and keeps nothing");
         let now = m.view();
         let newest = now.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page now"))?;
-        anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 2).is_some(), "the newest compact chunk's kept now");
+        anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 3).is_some(), "the newest compact chunk's kept now");
         Ok(())
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a page read on a shard (`View::events_page_kept`) inflates nothing. One
     /// that needs a compact chunk's texts not kept yet says so (`Unread::Unkept`), and the read that makes them (off
     /// the shard: `View::events_page`) keeps the newest compact chunk's, so the shard's read after it answers the same
-    /// bytes from them; a page of the open chunk alone needs none; one that reaches an older compact chunk, whose
-    /// texts no read keeps, says so each time; and one the copy can't say is `Unread::Cannot`, as before.
+    /// bytes from them; a page of the open chunk alone needs none; one that reaches the compact chunk before it, which
+    /// the page the API gives unasked for a limit (`EVENTS_PAGE`) reaches too, has its texts kept by the read that made
+    /// them; one that reaches past that page, into a compact chunk whose texts no read keeps, says so each time; and one
+    /// the copy can't say is `Unread::Cannot`, as before.
     #[test]
     fn g10_s5_a_page_read_on_a_shard_inflates_nothing() -> anyhow::Result<()> {
         let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
         let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
-        // Two sealed chunks, compact, and the newest open with nine: the newest fifty reach into the second.
-        let n = u64::try_from(CHUNK * 2 + 9)?;
+        // Three sealed chunks, compact, and the newest open with nine: the newest fifty reach into the third, the page the
+        // API gives unasked for a limit into the second, and no further.
+        let n = u64::try_from(CHUNK * 3 + 9)?;
+        anyhow::ensure!(EVENTS_PAGE > CHUNK + 9 && EVENTS_PAGE < 2 * CHUNK + 9, "the page reaches the second and no further");
         for q in 1..=n {
             m.rev = q;
             m.upsert(entry(&format!("e{q}"), q));
@@ -4892,13 +4910,19 @@ mod tests {
         let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the kept page: {u:?}"))?;
         anyhow::ensure!(inflated() == was + 1, "the shard's read after it inflates nothing");
         anyhow::ensure!(kept.concat() == made.concat() && made.concat() == page(50).into_bytes(), "the same bytes, the events' texts joined");
-        // Past the open chunk and the newest compact one, into the older: kept by no read, so made off the shard each time.
+        // Past the open chunk and the newest compact one, into the one before, which the API's page reaches too: made off the
+        // shard once, with the newest compact chunk read again (the page reaches back past what its reads kept, and only
+        // what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and both kept from there.
         let long = CHUNK + 9 + 5;
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the compact chunk before's texts aren't kept yet");
         anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
-        // Made with the older one: the newest compact chunk read again too, as the page reaches back past what its reads kept
-        // (only what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and kept from there.
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 3, "still not kept: an older chunk's never are");
+        let kept_long = view.events_page_kept(None, long).map_err(|u| anyhow::anyhow!("the longer kept page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was + 3 && kept_long.concat() == page(long).into_bytes(), "kept: the shard's read after it inflates nothing");
+        // Past the API's page, into the oldest: kept by no read, so made off the shard each time.
+        let far = 2 * CHUNK + 9 + 5;
+        anyhow::ensure!(view.events_page_kept(None, far) == Err(Unread::Unkept), "the oldest compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page(None, far).map(|p| p.concat()) == Some(page(far).into_bytes()), "made off the shard");
+        anyhow::ensure!(view.events_page_kept(None, far) == Err(Unread::Unkept) && inflated() == was + 5, "still not kept: a chunk past the page's never are");
         // An event with no number: the copy can't say the page (the store answers it), kept or not.
         m.rev = n + 1;
         m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
@@ -4940,11 +4964,11 @@ mod tests {
         // A chunk more compacted: the copy's page was read, so the new newest compact chunk's texts are made now.
         push(&mut m, n + 1..=n + chunk)?;
         n += chunk;
-        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_none(), "the newest compact chunk's texts made, the older's let go of");
-        // Another, with no read since: nothing made.
+        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_some(), "the newest compact chunk's texts made, the one before's kept while the page reaches it");
+        // Another, with no read since: nothing made for it, and the one the page no longer reaches let go of.
         push(&mut m, n + 1..=n + chunk)?;
         n += chunk;
-        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 2).is_none(), "no read since: nothing kept");
+        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 1).is_none(), "no read since: nothing made, nothing kept past the page");
         anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Unkept), "a read on a shard has them made off it");
         anyhow::ensure!(m.view().events_page(None, 50).is_some(), "made, and read");
         // Read since: the next compaction makes its texts, and the read after it inflates nothing.
@@ -5959,8 +5983,8 @@ mod tests {
     /// newest page's reads reached back to. With nine events in the open chunk, a page of 30 keeps the compact chunk's
     /// last 21 (inflated once); a page of 20 reaches less far back and takes a slice of them (nothing inflated); a page
     /// of 50 reaches further, inflates once more and keeps its last 41; a page of 30 again takes a slice of those. Each
-    /// page reads as the events' texts joined, and a page that reaches past the newest compact chunk keeps nothing of
-    /// the older one.
+    /// page reads as the events' texts joined, and the page the API gives unasked for a limit (`EVENTS_PAGE`), which
+    /// reaches past the newest compact chunk into the older, keeps of the older what it reaches, and the newest's whole.
     #[test]
     fn g11_s5_heap_a_page_keeps_the_texts_its_reads_reach_back_to() -> anyhow::Result<()> {
         let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
@@ -5998,9 +6022,14 @@ mod tests {
         read(30)?;
         anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 30 again: a slice of the longer");
         anyhow::ensure!(suffix(41) < suffix(70), "less than the whole chunk's texts");
-        // A page into the older compact chunk: it's inflated for that read and keeps nothing.
-        read(100)?;
-        anyhow::ensure!(older.page_kept().is_none() && compact.page_kept() == suffix(70), "the older keeps nothing; the newest compact chunk's whole kept");
+        // The API's page, into the older compact chunk: both inflated once, the older's last events it reaches kept, the newest
+        // compact chunk's whole; read again, nothing inflated.
+        let reach = EVENTS_PAGE.checked_sub(CHUNK + 9).ok_or_else(|| anyhow::anyhow!("the page reaches the older"))?;
+        let older_suffix = Some(older.texts_len() - older.off(older.metas().len().checked_sub(reach).ok_or_else(|| anyhow::anyhow!("past the older"))?));
+        read(EVENTS_PAGE)?;
+        anyhow::ensure!(inflated() == was + 4 && older.page_kept() == older_suffix && compact.page_kept() == suffix(70), "the older keeps its last {reach}, the newest compact chunk its whole ({:?}, {:?})", older.page_kept(), compact.page_kept());
+        read(EVENTS_PAGE)?;
+        anyhow::ensure!(inflated() == was + 4, "the API's page again: nothing inflated");
         Ok(())
     }
 
