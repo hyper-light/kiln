@@ -12,6 +12,10 @@
 # KILN_ZIG_REAL. A link zig didn't run (its cache had the output) says so and keeps zig's output, without
 # relocations; `bolt.sh check` refuses such a binary. zig prints the command as its words joined by spaces, so the
 # build's paths (target dir, zig's cache, TMPDIR) must have none.
+#
+# KILN_LINK_ORDER, a file of function names one a line (`bolt.sh order`'s; build.sh's KILN_RELEASE_BOLT=<file>.order):
+# the link run again lays those functions out first, in that order (LLD's --symbol-ordering-file), and passes over a
+# name it doesn't define (--no-warn-symbol-ordering: the file names every function a profile saw, a library's too).
 set -uo pipefail
 real=${KILN_ZIG_REAL:?KILN_ZIG_REAL names the zig this wraps}
 
@@ -39,6 +43,13 @@ outputs() { case $1 in -o | -o?*) return 0 ;; *) return 1 ;; esac; }
 
 links "$@" || exec "$real" "$@"
 
+# The order, checked before zig links anything.
+order=()
+if [ -n "${KILN_LINK_ORDER:-}" ]; then
+  [ -s "$KILN_LINK_ORDER" ] || { echo "zig-relocs: KILN_LINK_ORDER ($KILN_LINK_ORDER) names no order" >&2; exit 1; }
+  order=(--symbol-ordering-file="$KILN_LINK_ORDER" --no-warn-symbol-ordering)
+fi
+
 said=$(mktemp "${TMPDIR:-/tmp}/zig-relocs.XXXXXX") || exit 1
 trap 'rm -f "$said"' EXIT
 ZIG_VERBOSE_LINK=1 "$real" "$@" 2> "$said"
@@ -52,4 +63,4 @@ if [ -z "$line" ]; then
   exit 0
 fi
 read -r -a cmd <<< "$line"
-"$real" "${cmd[@]}" --emit-relocs --build-id=sha1
+"$real" "${cmd[@]}" --emit-relocs --build-id=sha1 ${order[@]+"${order[@]}"}

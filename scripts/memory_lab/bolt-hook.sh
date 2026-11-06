@@ -11,7 +11,11 @@
 #                                                       same arguments)
 #
 # Every round, as its window ends: pages.txt, each of the server's mappings of its executable (/proc/<pid>/smaps:
-# address range, permissions, file offset, size and resident KiB), their sum, and the process's RssFile.
+# address range, permissions, file offset, size and resident KiB), their sum, and the process's RssFile; and
+# sections.txt, the same by section (sections.py: each section's resident KiB, the file's own pages and the process's
+# copies, and its 64 KiB windows touched), which says which code and data the server touched at all: a BOLTed
+# build's hot .text against the .bolt.org.text its profile missed, .rodata, .eh_frame and .gcc_except_table (read
+# only as a panic unwinds), .data.
 # BOLT_RECORD says what else, from the event BOLT_FROM says to the window's end (the lab waits for the hook, so
 # what lasts runs in the background):
 #   none          nothing more (the default: an A/B's rounds)
@@ -25,7 +29,7 @@
 # end is all the server touched since startup's pages left (resident.rs), early in its start: the runners'
 # connecting and the fill too. A function the profile leaves out costs a 64 KiB window wherever the linker put
 # it, one it takes in that only starting ran costs its own bytes among the hot ones, so the profile starts early.
-# PERF, PERF_LIBS and BOLT_FREQ as bolt.sh takes them; BOLT_SH, bolt.sh (this checkout's ci/release/bolt.sh).
+# PERF, PERF_LIBS, BOLT_FREQ and BOLT_EVENT as bolt.sh takes them; BOLT_SH, bolt.sh (this checkout's ci/release/bolt.sh).
 event=$1 pid=$2 dir=$3
 here=$(cd "$(dirname "$0")" && pwd)
 bolt=${BOLT_SH:-$here/../../ci/release/bolt.sh}
@@ -46,6 +50,7 @@ pages() {
       END { printf "binary rss_kb=%d\n", rss }' "/proc/$pid/smaps"
     awk '/^RssFile:/ { print "process rss_file_kb=" $2 }' "/proc/$pid/status"
   } > "$dir/pages.txt" 2> /dev/null
+  python3 -I "$here/sections.py" "$pid" > "$dir/sections.txt" 2>> "$dir/hook.log" || true
 }
 
 # The instrumented server's dump: its writer's file, the writer a child of the server's.
