@@ -160,7 +160,7 @@ pub fn open_files(want: u64) -> Option<u64> {
 #[cfg(unix)]
 fn ns(t: rustix::time::Timespec) -> Option<u64> {
     let secs = u64::try_from(t.tv_sec).ok()?;
-    let nanos = u64::try_from(i64::from(t.tv_nsec)).ok()?;
+    let nanos = u64::try_from(t.tv_nsec).ok()?;
     secs.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 

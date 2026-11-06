@@ -49,6 +49,11 @@ const GEN_BUSY: f64 = 0.9;
 /// as the server's.
 const LAG_SHARE: f64 = 0.1;
 
+/// A server that, given the CPU it waited for, could have done at least twice the work (its threads, or its neediest
+/// thread, waited for a CPU at least as long as they ran on one) got at most half the CPU it asked for: the host's
+/// other work held it back as much as its own work took.
+const HOST_HELD: f64 = 2.0;
+
 /// Files the lab keeps open besides its connections: each generator thread's poller (three on Linux: epoll, its
 /// timer and its waker) and its own few dozen (its standard streams, logs, the servers' pipes).
 fn files_kept(lanes: usize) -> u64 {
@@ -297,8 +302,8 @@ impl Line {
         self.verdict();
     }
 
-    /// Whether the rate was kept up, and if not (or if the generator's lateness is in the latencies), who
-    /// couldn't keep up, and why.
+    /// Whether the rate was kept up, and if not (or if the generator's lateness, or the host's hold on the server,
+    /// is in the latencies), who couldn't keep up, and why.
     fn verdict(&mut self) {
         #[allow(clippy::cast_precision_loss)]
         let (rate, due) = (self.rate as f64, (self.ok + self.errors) as f64);
@@ -311,15 +316,75 @@ impl Line {
             (Some(lag), Some(p99)) if lag / 1000.0 >= LAG_SHARE * p99 => Some((lag, lag / 1000.0 / p99)),
             _ => None,
         };
+        let s = &self.server;
+        // What the CPU it waited for was worth, as a factor on the work a server busy throughout did: 1 + waited/ran
+        // over all its threads, or over its neediest thread (its likely bottleneck: a single-threaded server's loop),
+        // whichever is more; without bound where that thread waited all the time it wanted a CPU.
+        let factor = [s.run_wait_per_cpu_s.map(|w| 1.0 + w), s.neediest_wait_share.map(|q| if q < 1.0 { 1.0 / (1.0 - q) } else { f64::INFINITY })].into_iter().flatten().reduce(f64::max);
+        let hold = factor.filter(|f| *f >= HOST_HELD);
+        // A server that answered nothing, or whose neediest thread got no CPU at all, can't be scaled: the hold can
+        // account for any shortfall then.
+        let could = hold.map(|f| if f.is_finite() && self.achieved_rps > 0.0 { self.achieved_rps * f } else { f64::INFINITY });
+        let per_answer_ms = s.run_wait_share.map(|q| q / self.achieved_rps.max(f64::MIN_POSITIVE) * 1000.0);
+        // The hold accounts for a shortfall when, given that CPU, the server could have answered the rate. In a rate
+        // kept up it's in the latencies when its wait an answer is a tenth of the latency's p99, as the generator's
+        // lateness is.
+        let host = hold.filter(|_| match (self.kept_up, could, per_answer_ms, self.p99_ms) {
+            (false, Some(c), _, _) => c >= KEPT * rate,
+            (true, _, Some(h), Some(p99)) => h >= LAG_SHARE * p99,
+            _ => false,
+        });
+        let waits = || {
+            let all = s.run_wait_per_cpu_s.map_or_else(String::new, |w| format!(" {w:.1} s for each second they ran"));
+            let share = s.run_wait_share.map_or_else(String::new, |q| format!(" ({q:.2} CPUs' worth through the window)"));
+            let need = s.neediest_wait_share.map_or_else(String::new, |q| format!(", the neediest {:.0}% of the time it wanted one", q * 100.0));
+            let idle = if s.idle_threads > 0 {
+                format!(", {} of its {} threads in SCHED_IDLE, which gets a CPU only when nothing else wants one (a policy the host gave it: ananicy-cpp's rule for node does)", s.idle_threads, s.threads)
+            } else {
+                String::new()
+            };
+            format!("the server's threads waited for a CPU{all}{share}{need}{idle}")
+        };
         let connections = g.waited_share > 1.0 - KEPT;
+        // Whether the connections carried the rate at the server's median answer (timed from its send): then what
+        // waited for one waited on the server's slower answers (a stall, a tail), not on there being too few.
+        #[allow(clippy::cast_precision_loss)]
+        let room = self.conns.max(1) as f64 * f64::from(self.in_flight_per_conn.max(1));
+        let carried = self.service_p50_ms.is_some_and(|p50| p50 > 0.0 && room / (p50 / 1000.0) >= rate);
         let (by, why) = if let Some(b) = busy {
             (Some("generator"), format!("the generator: its busiest thread worked {:.0}% of the window (more --gen-cpus)", b * 100.0))
+        } else if host.is_some() {
+            let cost = match (self.kept_up, could, per_answer_ms, self.p99_ms) {
+                (false, Some(c), _, _) if c.is_finite() => format!(": given that CPU it could have answered up to {c:.0} a second"),
+                (false, Some(_), _, _) => ": it got too little of a CPU to say what it could have answered".to_owned(),
+                (true, _, Some(h), Some(p99)) => format!(": {h:.3} ms of waiting an answer, against a p99 of {p99:.3} ms"),
+                _ => String::new(),
+            };
+            (Some("host"), format!("the host: {}{cost}; the machine's other work came first (measure it where nothing else runs)", waits()))
         } else if let Some((lag, share)) = lag {
             (Some("generator"), format!("the generator: its own lateness at p99, {lag:.0} µs, is {:.0}% of the latency's p99, with no thread past {:.0}% busy: the OS woke its threads late or kept them off the CPU (give the server CPUs of its own: --server-cpus)", share * 100.0, GEN_BUSY * 100.0))
-        } else if !self.kept_up && connections {
+        } else if !self.kept_up && connections && !carried {
             (Some("connections"), format!("every connection was busy for {:.1}% of the requests (they waited {} ms at p99): at {} connections the server's answers took longer than this rate allows (more --conns)", g.waited_share * 100.0, g.wait_p99_ms.map_or("-".to_owned(), |w| format!("{w:.3}")), self.conns))
         } else if !self.kept_up {
-            (Some("server"), format!("the server: answered {:.0} of {} a second, {} errors ({} bad, {} timed out, {} cut off, {} never sent)", self.achieved_rps, self.rate, self.errors, self.bad, self.timeouts, self.closed, self.unsent))
+            let held = match could {
+                Some(c) => format!("; {}, but given that CPU it could have answered only {c:.0} a second", waits()),
+                None => String::new(),
+            };
+            let ms = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.3}"));
+            let slow = if connections {
+                format!(
+                    "; every connection was busy for {:.1}% of the requests (they waited {} ms at p99), held by its slower answers: {} ms from their sends at p99 and {} at p50, where its {} connections carry the rate at answers up to {:.3} ms",
+                    g.waited_share * 100.0,
+                    ms(g.wait_p99_ms),
+                    ms(self.service_p99_ms),
+                    ms(self.service_p50_ms),
+                    self.conns,
+                    room / rate * 1000.0
+                )
+            } else {
+                String::new()
+            };
+            (Some("server"), format!("the server: answered {:.0} of {} a second, {} errors ({} bad, {} timed out, {} cut off, {} never sent){slow}{held}", self.achieved_rps, self.rate, self.errors, self.bad, self.timeouts, self.closed, self.unsent))
         } else if connections {
             (None, format!("{:.1}% of the requests found every connection busy, and their latency counts that wait", g.waited_share * 100.0))
         } else {
@@ -382,20 +447,22 @@ struct Settings {
     warmup: String,
     window: String,
     conns: String,
-    profile: String,
+    /// The profile kiln targets were filled with, where one ran.
+    profile: Option<String>,
 }
 
-/// The run as Markdown: its settings, then each read at each rate, targets side by side.
+/// The run as Markdown: its settings, then each read at each rate, targets side by side, then how each server's
+/// threads were scheduled.
 fn markdown(set: &Settings, lines: &[Line], failures: &[String]) -> String {
     let mut s = format!("# kiln-lab rate: {}\n\n`{}`\n\n", set.started, set.command);
     s.push_str(&format!(
         "On {} ({}, {} CPUs; open files {}). Open loop, without coordinated omission: each request's latency runs from \
 when the schedule said to send it, so a stall is charged to every request it held back. Each rate: a warm-up of {} \
 at the rate, then the measured window ({}), then the drain (the window's backlog still sent for a warm-up's length; \
-each request answered within {} s or timed out), then {} s to settle. Connections: {}. Generator: {} threads. kiln \
-targets filled with the {} profile. Latency: good answers, ms. Server CPU: CPUs' worth through the window (1.00 is \
-one CPU throughout); server RSS: MB, the window's mean; both the server's whole process tree (`/proc` on Linux, `ps` \
-on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
+each request answered within {} s or timed out), then {} s to settle. Connections: {}. Generator: {} threads.{} \
+Latency: good answers, ms. KB/answer: a good answer's mean bytes (its body, or its message). Server CPU: CPUs' worth \
+through the window (1.00 is one CPU throughout); server RSS: MB, the window's mean; both the server's whole process \
+tree (`/proc` on Linux, `ps` on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
         set.host,
         set.os,
         set.cpus,
@@ -406,16 +473,16 @@ on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
         set.settle_s,
         set.conns,
         set.lanes,
-        set.profile
+        set.profile.as_ref().map_or_else(String::new, |p| format!(" kiln targets filled with the {p} profile."))
     ));
     let mut rows: Vec<&Line> = lines.iter().collect();
     rows.sort_by_key(|l| (l.place, l.rate));
-    s.push_str("| read | rate/s | target | achieved/s | ok | errors | p50 | p99 | p99.9 | max | server CPU | server RSS MB | gen CPU | conns | kept up |\n");
-    s.push_str("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    s.push_str("| read | rate/s | target | achieved/s | ok | errors | p50 | p99 | p99.9 | max | KB/answer | server CPU | server RSS MB | gen CPU | conns | kept up |\n");
+    s.push_str("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     let f = |v: Option<f64>, d: usize| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.d$}"));
     for l in &rows {
         if l.failed.is_some() {
-            s.push_str(&format!("| {}. {} | {} | {} | - | - | - | - | - | - | - | - | - | - | - | failed |\n", l.place, l.workload, l.rate, l.who()));
+            s.push_str(&format!("| {}. {} | {} | {} | - | - | - | - | - | - | - | - | - | - | - | - | failed |\n", l.place, l.workload, l.rate, l.who()));
             continue;
         }
         let kept = match (&l.limited_by, l.kept_up) {
@@ -425,7 +492,7 @@ on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
             (None, false) => "no".to_owned(),
         };
         s.push_str(&format!(
-            "| {}. {} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {kept} |\n",
+            "| {}. {} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {kept} |\n",
             l.place,
             l.workload,
             l.rate,
@@ -437,6 +504,7 @@ on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
             f(l.p99_ms, 3),
             f(l.p999_ms, 3),
             f(l.max_ms, 3),
+            f(l.bytes_per_answer.map(|b| b / 1e3), 1),
             f(l.server.cpu_share, 2),
             f(l.server.rss_mb, 1),
             f(l.generator.cpu_share, 2),
@@ -467,6 +535,24 @@ on macOS). Gen CPU: the generator process's CPUs' worth.\n\n",
         s.push_str("\n## Notes\n\n");
         s.push_str(&notes.join("\n"));
         s.push('\n');
+    }
+    // Each server's threads as its last window ended (Linux): a policy the host gave one, or a class one took,
+    // is part of what its numbers mean.
+    let mut servers: Vec<(String, String)> = Vec::new();
+    for l in lines {
+        let Some(sched) = &l.server.sched else { continue };
+        let need = l.server.neediest_wait_share.map_or_else(String::new, |q| format!(", the neediest {:.0}% of the time it wanted one", q * 100.0));
+        let said = format!("{sched}; waited {} s for a CPU for each second on one{need}", f(l.server.run_wait_per_cpu_s, 2));
+        match servers.iter_mut().find(|(who, _)| *who == l.who()) {
+            Some(s) => s.1 = said,
+            None => servers.push((l.who(), said)),
+        }
+    }
+    if !servers.is_empty() {
+        s.push_str("\n## The servers' threads (Linux: policy and nice at the last window's end)\n\n");
+        for (who, said) in &servers {
+            s.push_str(&format!("- {who}: {said}\n"));
+        }
     }
     if !failures.is_empty() {
         s.push_str("\n## Targets that didn't run\n\n");
@@ -632,7 +718,7 @@ pub fn main(a: &Args) -> anyhow::Result<()> {
         warmup: format!("{} s", first.warm.as_secs_f64()),
         window: a.window_s.map_or_else(|| format!("the longer of {MIN_WINDOW_S} s and {TAIL_REQUESTS} requests' worth"), |w| format!("{w} s")),
         conns: a.conns.map_or_else(|| format!("Little's law, the rate x {} ms x {HEADROOM} over the requests a connection carries at once, at least one a thread", a.expect_ms), |c| format!("{c} at every rate")),
-        profile: a.profile.clone(),
+        profile: kiln_targets.then(|| a.profile.clone()),
     };
     let md = markdown(&set, &lines, &failures);
     std::fs::write(out.join("report.md"), &md)?;
@@ -711,15 +797,89 @@ mod tests {
         assert_eq!(late.limited_by.as_deref(), Some("generator"), "60 µs late against a 300 µs p99: {}", late.why);
         let short = line(ran(800, 200, 0.2, 5_000, 300_000, 0));
         assert_eq!((short.kept_up, short.limited_by.as_deref(), short.errors), (false, Some("server"), 200), "{}", short.why);
-        let starved = line(ran(800, 200, 0.2, 5_000, 300_000, 500));
+        // Every answer 5 ms from its send, on one connection: it carries 200 a second, not 1,000.
+        let starved = line(ran(800, 200, 0.2, 5_000, 5_000_000, 500));
         assert_eq!((starved.kept_up, starved.limited_by.as_deref()), (false, Some("connections")), "{}", starved.why);
+        // On 8 connections the same 0.3 ms answers carry 26,000 a second: what waited for a connection waited on the
+        // server's slower answers (T3 Code's stall in the smoke test: p50 17 ms, p99 671 ms, 8 connections, 100 a
+        // second), so the shortfall is the server's.
+        let mut stalled = Line { rate: 1000, window_s: 1.0, conns: 8, in_flight_per_conn: 1, ..Line::default() };
+        stalled.of(&ran(800, 200, 0.2, 5_000, 300_000, 500), sample::Window::default(), Some(0.1));
+        assert_eq!((stalled.kept_up, stalled.limited_by.as_deref()), (false, Some("server")), "{}", stalled.why);
+        assert!(stalled.why.contains("every connection was busy for 62.5% of the requests") && stalled.why.contains("held by its slower answers"), "{}", stalled.why);
         let md = markdown(
-            &Settings { command: "kiln-lab rate".into(), started: "now".into(), host: "h".into(), os: "linux".into(), cpus: 8, lanes: 2, files: Some(1024), timeout_s: 90.0, settle_s: 1.0, warmup: "5 s".into(), window: "10 s".into(), conns: "Little's law".into(), profile: "realistic".into() },
+            &Settings { command: "kiln-lab rate".into(), started: "now".into(), host: "h".into(), os: "linux".into(), cpus: 8, lanes: 2, files: Some(1024), timeout_s: 90.0, settle_s: 1.0, warmup: "5 s".into(), window: "10 s".into(), conns: "Little's law".into(), profile: Some("realistic".into()) },
             &[Line { target: "kiln".into(), build: Some("prod".into()), workload: "sessions".into(), place: 1, ..fine }, Line { target: "t3code".into(), workload: "threads".into(), place: 1, ..short }],
             &["x: didn't start".into()],
         );
         assert!(md.contains("| 1. sessions | 1000 | kiln (prod) | 1000 | 1000 | 0 | 0.300 |"), "{md}");
         assert!(md.contains("| 1. threads | 1000 | t3code | 800 |") && md.contains("no: server |"), "{md}");
         assert!(md.contains("## Targets that didn't run\n\n- x: didn't start"), "{md}");
+        assert!(md.contains("kiln targets filled with the realistic profile."), "{md}");
+    }
+
+    /// Goal 10 (Ada's fixed-rate benchmark; the rate mode's smoke test, 2026-11-06, where adacachy's ananicy-cpp put
+    /// T3 Code's Node in the idle policy and the run blamed the server): a server whose threads, or whose neediest
+    /// thread, waited for a CPU at least as long as they ran was held by its host, and the run says the host, with
+    /// the threads the host put in the idle policy, when that accounts for it: given that CPU it could have answered
+    /// the rate (or it answered nothing, its neediest thread getting no CPU), or, kept up, its wait an answer is a
+    /// tenth of the latency's p99. One too slow even with that CPU is the server, its wait said; one that waited less
+    /// is judged as before; the generator's own limit still comes first. The report gives each good answer's size
+    /// and each server's threads.
+    #[test]
+    fn rate_a_server_its_host_held_is_said_to_be_held_by_the_host() {
+        let line = |r: load::Ran, w: sample::Window| {
+            let mut l = Line { rate: 1000, window_s: 1.0, ..Line::default() };
+            l.of(&r, w, Some(0.1));
+            l
+        };
+        let held = |per: f64, idle: usize| sample::Window {
+            run_wait_share: Some(0.9),
+            run_wait_per_cpu_s: Some(per),
+            sched: Some("11 SCHED_IDLE nice 16, 5 SCHED_OTHER nice 16".into()),
+            threads: 16,
+            idle_threads: idle,
+            ..sample::Window::default()
+        };
+        let starved = line(ran(800, 200, 0.2, 5_000, 300_000, 0), held(8.0, 11));
+        assert_eq!((starved.kept_up, starved.limited_by.as_deref()), (false, Some("host")), "{}", starved.why);
+        assert!(starved.why.contains("waited for a CPU 8.0 s for each second they ran") && starved.why.contains("11 of its 16 threads in SCHED_IDLE"), "{}", starved.why);
+        let kept = line(ran(1000, 0, 0.2, 5_000, 300_000, 0), held(1.5, 0));
+        assert_eq!((kept.kept_up, kept.limited_by.as_deref()), (true, Some("host")), "{}", kept.why);
+        assert!(!kept.why.contains("SCHED_IDLE"), "{}", kept.why);
+        assert!(starved.why.contains("could have answered up to 7200 a second"), "800 a second, 1 + 8 times as many with the CPU it waited for: {}", starved.why);
+        assert!(kept.why.contains("0.900 ms of waiting an answer, against a p99 of 0.300 ms"), "{}", kept.why);
+        let calm = line(ran(800, 200, 0.2, 5_000, 300_000, 0), held(0.2, 11));
+        assert_eq!(calm.limited_by.as_deref(), Some("server"), "waiting a fifth of the time it ran, the shortfall is the server's: {}", calm.why);
+        // Held, but too slow even with the CPU it waited for: 100 a second, 250 at most, of 1,000.
+        let slow = line(ran(100, 900, 0.2, 5_000, 300_000, 0), held(1.5, 0));
+        assert_eq!(slow.limited_by.as_deref(), Some("server"), "{}", slow.why);
+        assert!(slow.why.contains("waited for a CPU 1.5 s for each second they ran") && slow.why.contains("could have answered only 250 a second"), "{}", slow.why);
+        // Its threads together waited half as long as they ran, but its neediest (a single-threaded server's loop)
+        // waited 95% of the time it wanted a CPU: given that, 100 a second could have been 2,000.
+        let loop_held = sample::Window { run_wait_share: Some(0.5), run_wait_per_cpu_s: Some(0.5), neediest_wait_share: Some(0.95), threads: 17, idle_threads: 10, ..sample::Window::default() };
+        let loop_held = line(ran(100, 900, 0.2, 5_000, 300_000, 0), loop_held);
+        assert_eq!(loop_held.limited_by.as_deref(), Some("host"), "{}", loop_held.why);
+        assert!(loop_held.why.contains("the neediest 95% of the time it wanted one") && loop_held.why.contains("up to 2000 a second"), "{}", loop_held.why);
+        // Nothing answered while its neediest thread got no CPU at all: the host, with nothing to scale.
+        let none = sample::Window { run_wait_share: Some(0.9), run_wait_per_cpu_s: Some(0.5), neediest_wait_share: Some(1.0), ..sample::Window::default() };
+        let none = line(ran(0, 1000, 0.2, 5_000, 300_000, 0), none);
+        assert_eq!(none.limited_by.as_deref(), Some("host"), "{}", none.why);
+        assert!(none.why.contains("too little of a CPU"), "{}", none.why);
+        // Kept up, held, but its wait an answer far under the latency: not the host's numbers.
+        let light = sample::Window { run_wait_share: Some(0.01), run_wait_per_cpu_s: Some(3.0), ..sample::Window::default() };
+        let light = line(ran(1000, 0, 0.2, 5_000, 300_000, 0), light);
+        assert_eq!((light.kept_up, light.limited_by.as_deref()), (true, None), "0.01 ms an answer against a 0.3 ms p99: {}", light.why);
+        let busy = line(ran(1000, 0, 0.95, 5_000, 300_000, 0), held(8.0, 0));
+        assert_eq!(busy.limited_by.as_deref(), Some("generator"), "{}", busy.why);
+        let mut sized = ran(1000, 0, 0.2, 5_000, 300_000, 0);
+        sized.seen.bytes = 60_087_000;
+        let t3 = line(sized, held(8.0, 11));
+        let set = Settings { command: "kiln-lab rate".into(), started: "now".into(), host: "h".into(), os: "linux".into(), cpus: 8, lanes: 2, files: Some(1024), timeout_s: 90.0, settle_s: 1.0, warmup: "5 s".into(), window: "10 s".into(), conns: "Little's law".into(), profile: None };
+        let md = markdown(&set, &[Line { target: "t3code".into(), workload: "threads".into(), place: 1, ..t3 }], &[]);
+        assert!(md.contains("| 0.300 | 0.300 | 0.300 | 0.300 | 60.1 | - |"), "a good answer's mean size, KB: {md}");
+        assert!(md.contains("| yes (host late) |"), "{md}");
+        assert!(md.contains("- t3code: 11 SCHED_IDLE nice 16, 5 SCHED_OTHER nice 16; waited 8.00 s for a CPU for each second on one"), "{md}");
+        assert!(!md.contains("profile"), "no kiln target, so no profile: {md}");
     }
 }

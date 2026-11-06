@@ -349,6 +349,7 @@ pub(crate) mod recent {
     }
 
     /// Hops checked with records kept here, so far.
+    #[cfg(test)]
     pub fn served_so_far() -> u64 {
         SERVED.load(Ordering::Relaxed)
     }

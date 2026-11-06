@@ -193,7 +193,7 @@ pub const PAIRED_MUZZY_DECAY_MS: u32 = DIRTY_DECAY_MS;
 /// 01a1a87b2e56 step 5): the `bisect-arenas` arm's, the next count where `one-arena` saves past the lab's noise but
 /// a latency number is worse beyond it. jemalloc gives a thread the arena with the fewest threads as it first
 /// allocates (`arena_choose_hard`), so an arena's threads are the process's in turn, the shards among them.
-pub const BISECT_NARENAS: u32 = (1 + NARENAS) / 2;
+pub const BISECT_NARENAS: u32 = NARENAS.div_ceil(2);
 
 /// The arms: the candidates by what they can save, then the readings; docs/runtime-lab.md's plan ("The A/B of
 /// jemalloc's settings: the lab plan") runs them in its order, three of them only on an earlier arm's result. Each
@@ -1324,7 +1324,7 @@ mod tests {
         // The bisection lies strictly between the floor and step 4's count; the paired muzzy decay is the dirty decay
         // kiln keeps, past step 4's 0.
         let (bisect, paired) = std::hint::black_box((BISECT_NARENAS, PAIRED_MUZZY_DECAY_MS));
-        assert_eq!(bisect, (1 + NARENAS) / 2);
+        assert_eq!(bisect, NARENAS.div_ceil(2));
         assert!(1 < bisect && bisect < NARENAS, "{bisect} between 1 and {NARENAS}");
         assert_eq!(paired, DIRTY_DECAY_MS);
         assert!(paired > MUZZY_DECAY_MS, "the reading changes step 4's {MUZZY_DECAY_MS}");

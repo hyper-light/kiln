@@ -586,6 +586,7 @@ where
 /// The stacks' words that went from their agents' queues before the edit that last changed them
 /// was seen there (it may have come too late, and done nothing): each said again, at `now`, in a
 /// message of its own. The rest gone are forgotten; an agent not known right now keeps its word.
+#[cfg(test)]
 async fn resay<P>(port: &P, now: i64)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
