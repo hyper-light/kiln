@@ -27,6 +27,10 @@
 #                                               the counts between two dumps of one instrumented process
 #   bolt.sh optimize <binary> <profile> <out>   <binary> laid out by <profile> (fdata, or YAML from another
 #                                               build: -infer-stale-profile), stripped, into <out>
+#   bolt.sh order <binary> <out.order> <perf.data|.fdata>...
+#                                               the functions each profile saw run in <binary>, hottest first,
+#                                               for the linker to lay out first (KILN_RELEASE_BOLT=<out.order>):
+#                                               the layout without BOLT, needing perf alone
 #
 # The binary is kiln's release built to keep its relocations and symbols (ci/release/build.sh with
 # KILN_RELEASE_BOLT; zig-relocs.sh links it). From the environment:
@@ -36,6 +40,8 @@
 #                    instrumentation runtime are kept. KILN_BOLT_URL and KILN_BOLT_SHA256 name another copy.
 #   PERF, PERF_LIBS  the perf binary, and a directory of its libraries (as scripts/shard_lab/hook.sh)
 #   BOLT_FREQ        perf's sampling frequency (perf's own default otherwise: 4000 a second)
+#   BOLT_EVENT       the event perf samples on (cycles:u; on a hybrid CPU, fedora's, that's each kind of core's:
+#                    cpu_atom/cycles/u names the E-cores' alone, where the lab's server runs)
 #   KILN_BOLT_ICF    optimize's identical code folding: safe (the default), all or none
 #   KILN_BOLT_ARGS   more llvm-bolt options for instrument and optimize (-thread-count=4, say)
 #   KILN_STRIP       the strip that strips optimize's output (strip)
@@ -114,7 +120,7 @@ check() {
 
 record() {
   local pid=$1 out=$2 kind=${3:-lbr} secs=${4:-} cmd
-  cmd=(record -e cycles:u)
+  cmd=(record -e "${BOLT_EVENT:-cycles:u}")
   case $kind in
     lbr) cmd+=(-j any,u) ;;
     samples) ;;
@@ -214,6 +220,65 @@ optimize() {
   done
 }
 
+# The functions the profiles saw run in $bin, hottest first, one a line, named as its symbol table names them
+# (mangled): what LLD lays out first, in that order (--symbol-ordering-file, zig-relocs.sh's KILN_LINK_ORDER), so the
+# code the server runs lies together with no BOLT, whole functions moved and none split. A function's weight is its
+# samples and the branch records that landed in it, from perf's recordings (with LBR's records where a recording
+# holds them; of $bin or of a stripped copy, perf naming the functions by $bin's symbols, matched by build id), or its
+# counts in BOLT's profiles (.fdata: perf2bolt's, or an instrumented window's, every function that ran), all the
+# profiles' summed. What no profile saw stays after them, where the linker puts it. LLD orders every function of a
+# name (a local one's too), and passes over a name the link doesn't define.
+order() {
+  local bin=$1 out=$2 id data rec n=0 tmp report
+  shift 2
+  [ $# -gt 0 ] || die "order takes <binary> <out.order> <perf.data|.fdata>..."
+  [ -f "$bin" ] || die "$bin: no such file"
+  readelf -SW "$bin" | grep ' \.symtab ' > /dev/null ||
+    die "$bin: no symbols: an order names functions as an unstripped build does (KILN_RELEASE_BOLT=relocs keeps them)"
+  id=$(readelf -n "$bin" | awk '$1 == "Build" && $2 == "ID:" { print $3; exit }')
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/bolt-order.XXXXXX")
+  for data in "$@"; do
+    n=$((n + 1))
+    [ -s "$data" ] || { rm -rf "$tmp"; die "$data: no profile"; }
+    case $data in
+      *.fdata)
+        # BOLT's records: a branch `1 <from> <offset> 1 <to> <offset> <mispredictions> <count>` (0 and an address for
+        # an end in no function), a sample `1 <function> <offset> <count>` (no_lbr's); a local function's name ends
+        # in `/<n>`, which the linker's doesn't.
+        awk 'NF == 8 { if ($1 == 1) w[$2] += $8; if ($4 == 1) w[$5] += $8; next }
+          NF == 4 && $1 == 1 { w[$2] += $4 }
+          END { for (f in w) { s = f; sub(/\/.*/, "", s); printf "%.0f [.] %s\n", w[f], s } }' "$data" >> "$tmp/counts"
+        ;;
+      *)
+        # perf names a recording's functions from the file at its path under --symfs, if its build id is theirs.
+        rec=$(perf_cmd buildid-list -i "$data" 2> /dev/null | awk -v id="$id" 'id != "" && $1 == id { print $2; exit }')
+        [ -n "$rec" ] || { rm -rf "$tmp"; die "$data recorded no binary with $bin's build id (${id:-$bin has none})"; }
+        mkdir -p "$tmp/symfs$n$(dirname "$rec")"
+        ln -sfn "$(realpath "$bin")" "$tmp/symfs$n$rec"
+        report=(report -i "$data" --symfs="$tmp/symfs$n" --dsos "$rec" --stdio --no-children -g none --no-demangle)
+        if ! perf_cmd "${report[@]}" --no-branch-stack --sort sym -F sample,sym >> "$tmp/counts" 2> "$tmp/err"; then
+          tail -n 20 "$tmp/err" >&2
+          rm -rf "$tmp"
+          die "perf report failed on $data"
+        fi
+        # (grep reads it all: -q's early exit would fail the pipe.)
+        if perf_cmd evlist -v -i "$data" 2> /dev/null | grep BRANCH_STACK > /dev/null &&
+          ! perf_cmd "${report[@]}" --branch-stack --sort symbol_to -F sample,symbol_to >> "$tmp/counts" 2> "$tmp/err"; then
+          tail -n 20 "$tmp/err" >&2
+          rm -rf "$tmp"
+          die "perf report failed on $data's branch records"
+        fi
+        ;;
+    esac
+  done
+  # A line of perf's: `<count> [.] <function> ...` ([k]: the kernel's; an address: a function perf couldn't name).
+  awk '$1 ~ /^[0-9]+$/ && $2 == "[.]" && $3 !~ /^0x/ { w[$3] += $1 } END { for (f in w) printf "%.0f %s\n", w[f], f }' "$tmp/counts" |
+    LC_ALL=C sort -k1,1nr -k2,2 | awk '{ print $2 }' > "$out"
+  rm -rf "$tmp"
+  [ -s "$out" ] || die "$out: none of $bin's functions ran in these profiles"
+  echo "$out: $(wc -l < "$out") functions, hottest first, from $n profile(s)"
+}
+
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 case $cmd in
@@ -224,5 +289,6 @@ case $cmd in
   instrument) [ $# -ge 3 ] || die "instrument takes <binary> <out> <dump> [seconds]"; instrument "$@" ;;
   window) [ $# -eq 3 ] || die "window takes <first.fdata> <last.fdata> <out.fdata>"; window "$@" ;;
   optimize) [ $# -eq 3 ] || die "optimize takes <binary> <profile> <out>"; optimize "$@" ;;
+  order) [ $# -ge 3 ] || die "order takes <binary> <out.order> <perf.data|.fdata>..."; order "$@" ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
