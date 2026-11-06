@@ -447,6 +447,10 @@ pub struct ShardContext {
     /// the loop on the shard's own thread as it builds the shard; none off Linux, in a simulation, and where the OS
     /// refused the event.
     pub(crate) task_clock: Option<crate::task_clock::TaskClock>,
+    /// The task waiting in a quiet sleep, if one is ([`crate::quiet`]).
+    pub(crate) quiet: Cell<Option<crate::quiet::Quiet>>,
+    /// The shard's last wake from a park, as its loop saw it ([`crate::quiet::Wake`]).
+    pub(crate) last_wake: Cell<Option<crate::quiet::Wake>>,
 }
 
 impl std::fmt::Debug for ShardContext {
@@ -520,6 +524,8 @@ impl ShardContext {
             sim: None,
             movable: crate::movable::Local::default(),
             task_clock: None,
+            quiet: Cell::new(None),
+            last_wake: Cell::new(None),
         }
     }
 

@@ -299,6 +299,8 @@ impl Future for Idle {
     }
 }
 
+pub use crate::quiet::{Came, SleepQuiet, sleep_quiet};
+
 /// Sleeps for `ns` on the shard's wheel (accuracy: one tick).
 pub fn sleep(ns: u64) -> Sleep {
     Sleep {

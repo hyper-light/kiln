@@ -7438,7 +7438,8 @@ async fn readyz(hub: &Hub) -> Response {
 ///   together and since the server started, so a reader's two reads say how late ready work ran on
 ///   average between them, every probe counted;
 /// - `held_s`: how long past its period a shard held now has gone without a probe (a hold shows
-///   there before any probe can say how late it ran);
+///   there before any probe can say how late it ran; a parked shard isn't held: its probe waits up to
+///   a period more for a wake, `crate::shard_health::Snapshot::held`);
 /// - `period_s`: the probes' period.
 ///
 /// Open, as `/healthz` is; 503 where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't
@@ -7447,7 +7448,7 @@ fn shard_delay() -> Response {
     let Some(period) = crate::shard_health::period_from_env() else {
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
     };
-    let shards: Vec<crate::shard_health::Snapshot> = crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot).collect();
+    let shards = crate::shard_health::snapshots();
     match delay_answer(&shards, period) {
         Some(v) => srv::json(StatusCode::OK, &v),
         None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
@@ -7459,15 +7460,15 @@ fn delay_answer(shards: &[crate::shard_health::Snapshot], period: Duration) -> O
     let worst = worst_delay(shards.iter().copied(), period)?;
     let late: Duration = shards.iter().map(|s| s.late_sum).sum();
     let probes: u64 = shards.iter().map(|s| s.probes).sum();
-    let held = shards.iter().filter_map(|s| s.since_probe).map(|d| d.saturating_sub(period)).max().unwrap_or_default();
+    let held = shards.iter().map(|s| s.held(period)).max().unwrap_or_default();
     Some(json!({ "delay_s": worst.as_secs_f64(), "late_s": late.as_secs_f64(), "probes": probes, "held_s": held.as_secs_f64(), "period_s": period.as_secs_f64() }))
 }
 
 /// The worst of the shards' delay now: each one's latest probe, how late it ran, or, for a shard held
 /// now, how long past its `period` it has gone without one (a hold shows there before its probe can
-/// say how late it ran).
+/// say how late it ran; a parked shard isn't held, `crate::shard_health::Snapshot::held`).
 fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, period: Duration) -> Option<Duration> {
-    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.since_probe.map_or(Duration::ZERO, |d| d.saturating_sub(period)))).max()
+    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.held(period))).max()
 }
 
 /// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
@@ -7640,7 +7641,8 @@ mod tests {
 
     /// Goal 8 (plan 01a1a59c2b29 step 5, docs/priority.md): the server's delay is its worst shard's,
     /// the latest probe's lateness, or a hold under way past the probes' period; a shard not probed
-    /// yet says nothing.
+    /// yet says nothing; a parked one isn't held however long since its probe ran (goal 9, plan
+    /// 01a1a87b2cec step 5: its quiet probe waits up to a period more for a wake).
     #[test]
     fn g8_s5_the_delay_is_the_worst_shards_now() {
         let period = Duration::from_millis(10);
@@ -7657,8 +7659,13 @@ mod tests {
             overrun: Duration::ZERO,
             tasks: 0,
             most_tasks: 0,
+            parked: false,
         };
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
+        // Parked 18 ms since its probe: idle, not held.
+        let parked = crate::shard_health::Snapshot { parked: true, ..shard(9, 80, Some(18)) };
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), parked].into_iter(), period), Some(Duration::from_micros(80)));
+        assert_eq!(parked.held(period), Duration::ZERO);
         // Held now: 1.5 s since its probe, past its 10 ms period.
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 100, Some(1_500))].into_iter(), period), Some(Duration::from_millis(1_490)));
         assert_eq!(worst_delay([shard(0, 0, None)].into_iter(), period), None);
