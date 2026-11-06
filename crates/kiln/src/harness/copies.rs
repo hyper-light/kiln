@@ -2152,7 +2152,10 @@ impl Mirror {
     /// number: true when that one had another id (the timeline went another way), which its viewers
     /// can't see from the event alone.
     pub fn upsert(&mut self, e: Arc<Entry>) -> bool {
-        let Some(id) = e.id().map(str::to_owned) else { return false };
+        // Its id read where the entry keeps it, held by a reference of this call's own (goal 9, plan 01a1a87b2cec step
+        // 5: a copy of it was made for each event taken in).
+        let held = Arc::clone(&e);
+        let Some(id) = held.id() else { return false };
         let ev = Ev { entry: e, at: self.rev };
         let found = self.index.get(&self.events, &id);
         if found.is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {
