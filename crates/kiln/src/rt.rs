@@ -673,6 +673,12 @@ const fn polls_ahead_at_p999(busy_ppm: u64) -> u64 {
 /// for the lab's A/B of quanta.
 pub const STEP_BUDGET_NS: u64 = DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(LAB_BUSY_PPM).saturating_add(1);
 
+/// The most tasks a shard's step polls (hyper-rt's `RuntimeConfig::batch`), as kiln's shards have run since hyper-rt
+/// came in: hyper-rt's watchdog holds a poll to a step's worth of polls each a quantum, this many times
+/// [`STEP_BUDGET_NS`] (`hyper_rt::watch`'s limit, 17.07 ms), and the shards' health probe wakes that often
+/// (`crate::shard_health::PERIOD`; goal 9, plan 01a1a87b2cec step 5).
+pub const STEP_BATCH: usize = 64;
+
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
 /// wheel never runs dry, the step quantum derived from the lab ([`STEP_BUDGET_NS`]), no spin.
 pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
@@ -684,7 +690,7 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
         ring_entries: 1024,
         step_budget_ns: STEP_BUDGET_NS,
         timer_tick_ns: TIMER_TICK_NS,
-        batch: 64,
+        batch: STEP_BATCH,
         pin: false,
         cores: Vec::new(),
         page_bytes: 4096,
