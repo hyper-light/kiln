@@ -275,6 +275,80 @@ fn g9_s5_wakes_and_kicks_are_counted_on_the_shard_whose_thread_sent_them() {
     b_ran.try_recv().expect("B's woken task ran");
 }
 
+/// Kiln's goal 9, plan 01a1a87b2cec step 5: each kick sent a shard is counted by who sent it and whether it found the
+/// shard parked (claimed, a system call) or awake (saved). Do: a shard that doesn't park, its task woken from a thread
+/// off the runtime, from a thread a blocking pool marked as its own, and from a task on another shard; then that shard
+/// parked on the OS's driver, its task woken from another shard's task once it's seen parked. Expect: the three wakes of
+/// the running shard saved, one under each sender; the parked one's claimed under a shard's, or saved there where the
+/// park came and went first; the sums the shard's kicks saved.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn g9_s5_kicks_are_counted_by_who_sent_them_and_whether_they_found_the_shard_parked() {
+    use crate::parking::KickFrom;
+    let (_script, ends) = channel::<End>();
+    let mut rt = scripted(ends, None);
+    let from = |rt: &LocalRuntime| crate::registry::with_entry(rt.shard_id().0, |entry| entry.parking.kicks_from()).unwrap();
+    let (ran_tx, ran) = channel::<()>();
+    let before = from(&rt);
+    let waker = waiting_task(&mut rt, &ran_tx);
+    std::thread::spawn(move || waker.wake()).join().unwrap();
+    while rt.step().did_work {}
+    let waker = waiting_task(&mut rt, &ran_tx);
+    std::thread::spawn(move || {
+        crate::parking::mark_thread(KickFrom::Blocking);
+        waker.wake();
+    })
+    .join()
+    .unwrap();
+    while rt.step().did_work {}
+    let waker = waiting_task(&mut rt, &ran_tx);
+    std::thread::spawn(move || {
+        let (_other_script, other_ends) = channel::<End>();
+        let mut other = scripted(other_ends, None);
+        other.spawn(async move { waker.wake() }).unwrap();
+        while other.step().did_work {}
+    })
+    .join()
+    .unwrap();
+    while rt.step().did_work {}
+    let after = from(&rt);
+    let moved = |kind: KickFrom| {
+        let (b, a) = (before[kind as usize], after[kind as usize]);
+        (a.0 - b.0, a.1 - b.1)
+    };
+    assert_eq!(moved(KickFrom::Thread), (0, 1), "a thread off the runtime: saved");
+    assert_eq!(moved(KickFrom::Blocking), (0, 1), "a blocking pool's thread: saved");
+    assert_eq!(moved(KickFrom::Shard), (0, 1), "another shard's task: saved");
+    assert_eq!(moved(KickFrom::Compute), (0, 0));
+    assert_eq!(after.iter().map(|(_, saved)| saved).sum::<u64>(), rt.counters().kicks_saved, "the shard's kicks saved");
+    for _ in 0..3 {
+        ran.try_recv().expect("each woken task ran");
+    }
+    drop(rt);
+    // Parked on the OS's driver, woken by another shard's task once seen parked.
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let parked = rt.shard_id().0;
+    let before = from(&rt);
+    let waker = waiting_task(&mut rt, &ran_tx);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let (_waker_script, waker_ends) = channel::<End>();
+            let mut waking = scripted(waker_ends, None);
+            while !crate::registry::with_entry(parked, |entry| entry.parking.parked()).unwrap_or(true) {
+                std::hint::spin_loop();
+            }
+            waking.spawn(async move { waker.wake() }).unwrap();
+            while waking.step().did_work {}
+        });
+        rt.park(None);
+    });
+    while rt.step().did_work {}
+    let after = from(&rt);
+    let (claimed, saved) = (after[KickFrom::Shard as usize].0 - before[KickFrom::Shard as usize].0, after[KickFrom::Shard as usize].1 - before[KickFrom::Shard as usize].1);
+    assert_eq!(claimed + saved, 1, "the other shard's one kick, claimed ({claimed}) or saved ({saved})");
+    ran.try_recv().expect("the woken task ran");
+}
+
 /// Shape: parks the OS-driver test makes, each woken from another thread: more than one, so a kick a park left
 /// behind for the next is counted too.
 const OS_ROUNDS: usize = 3;

@@ -52,16 +52,70 @@ const PARKED: u32 = 1;
 /// Format: the shard announced its park and a sender claimed its kick.
 const KICKED: u32 = 2;
 
+/// Who sent a shard a kick (kiln's goal 9, plan 01a1a87b2cec step 5: the shards' ~1,750 kicks a second in kiln's lab,
+/// g9p16, by who sends them, and which find the shard awake): a thread running a shard, a compute pool's worker, a
+/// blocking pool's, or any other thread ([`mark_thread`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KickFrom {
+    /// A thread running a shard: another shard's task.
+    Shard = 0,
+    /// A compute pool's worker: a job done.
+    Compute = 1,
+    /// A blocking pool's worker: a job done.
+    Blocking = 2,
+    /// Any other thread off the runtime.
+    Thread = 3,
+}
+
+impl KickFrom {
+    /// Every sender, in its index's order.
+    pub const ALL: [KickFrom; SENDERS] = [KickFrom::Shard, KickFrom::Compute, KickFrom::Blocking, KickFrom::Thread];
+
+    /// Its name on `/metrics`.
+    pub fn name(self) -> &'static str {
+        match self {
+            KickFrom::Shard => "shard",
+            KickFrom::Compute => "compute",
+            KickFrom::Blocking => "blocking",
+            KickFrom::Thread => "thread",
+        }
+    }
+}
+
+/// Format: the senders [`KickFrom`] tells apart.
+pub const SENDERS: usize = 4;
+
+std::thread_local! {
+    /// What the calling thread is, where it said ([`mark_thread`]): any other thread's otherwise.
+    static THREAD: std::cell::Cell<KickFrom> = const { std::cell::Cell::new(KickFrom::Thread) };
+}
+
+/// The calling thread is a pool's (`KickFrom::Compute`, `KickFrom::Blocking`): said once, as the pool starts it.
+pub(crate) fn mark_thread(from: KickFrom) {
+    THREAD.with(|thread| thread.set(from));
+}
+
+/// Who the calling thread is as a kick's sender: a shard's where it runs one, else what it said ([`mark_thread`]).
+pub(crate) fn sender() -> KickFrom {
+    if crate::registry::current_shard().is_some() {
+        KickFrom::Shard
+    } else {
+        THREAD.with(std::cell::Cell::get)
+    }
+}
+
 /// The shard's announcement that it is parked, the count of kicks the announcement saved, and the
 /// stamp of the kick sent to the current park (the shard's online wake estimate, §4.3).
 #[derive(Debug)]
 pub struct Parking {
     /// [`RUNNING`], [`PARKED`] or [`KICKED`].
     state: AtomicU32,
-    /// Kicks the announcement saved: every wake of a running shard counts one, so the count is alone on its
-    /// line, which the senders keep among themselves; on the registry entry's line it shared with the control
-    /// mark and the exit flag, each wake's count took from the shard the line it reads every step.
-    kicks_skipped: crate::cells::Padded<AtomicU64>,
+    /// Kicks the announcement saved, by who sent them ([`KickFrom`]): every wake of a running shard counts one, so each
+    /// count is alone on its line, which its senders keep among themselves; on the registry entry's line it shared
+    /// with the control mark and the exit flag, each wake's count took from the shard the line it reads every step.
+    kicks_skipped: [crate::cells::Padded<AtomicU64>; SENDERS],
+    /// Kicks claimed, each a system call, by who sent them ([`KickFrom`]; kiln's goal 9, plan 01a1a87b2cec step 5).
+    kicks_claimed: [crate::cells::Padded<AtomicU64>; SENDERS],
     /// When the kick of the current park was sent (the shard's clock, `machine::clock::shard_clock_ns`), 0
     /// when none was; the shard takes it after its wait. A measurement word, outside the protocol: its orders
     /// are `Relaxed`, and a stamp lost to a race costs one sample, never a wake.
@@ -197,7 +251,8 @@ impl Parking {
     pub fn new() -> Self {
         Self {
             state: AtomicU32::new(RUNNING),
-            kicks_skipped: crate::cells::Padded(AtomicU64::new(0)),
+            kicks_skipped: std::array::from_fn(|_| crate::cells::Padded(AtomicU64::new(0))),
+            kicks_claimed: std::array::from_fn(|_| crate::cells::Padded(AtomicU64::new(0))),
             kicked_at: AtomicU64::new(0),
             kick_cpu_ns: AtomicU64::new(0),
             kick_cpu_samples: AtomicU64::new(0),
@@ -228,6 +283,12 @@ impl Parking {
     /// found the park unclaimed. When the shard times its wakes, the claimer stamps when it kicked, so the
     /// woken shard can time its own wake.
     pub fn kick_if_parked(&self, kick: impl FnOnce()) {
+        self.kick_if_parked_from(KickFrom::Thread, kick);
+    }
+
+    /// [`Parking::kick_if_parked`], its kick or its saving counted against `from`, who sent it (kiln's goal 9, plan
+    /// 01a1a87b2cec step 5).
+    pub fn kick_if_parked_from(&self, from: KickFrom, kick: impl FnOnce()) {
         fence(Ordering::SeqCst);
         if self.state.load(Ordering::SeqCst) == PARKED
             && self
@@ -235,6 +296,9 @@ impl Parking {
                 .compare_exchange(PARKED, KICKED, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
+            if let Some(claimed) = self.kicks_claimed.get(from as usize) {
+                claimed.0.fetch_add(1, Ordering::Relaxed);
+            }
             if self.timed.load(Ordering::Relaxed) {
                 self.kicked_at
                     .store(crate::machine::clock::shard_clock_ns(), Ordering::Relaxed);
@@ -253,8 +317,8 @@ impl Parking {
             } else {
                 kick();
             }
-        } else {
-            self.kicks_skipped.0.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(skipped) = self.kicks_skipped.get(from as usize) {
+            skipped.0.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -302,7 +366,16 @@ impl Parking {
 
     /// Kicks skipped because the shard had not announced parking (the saving, counted).
     pub fn kicks_skipped(&self) -> u64 {
-        self.kicks_skipped.0.load(Ordering::Relaxed)
+        self.kicks_skipped.iter().map(|count| count.0.load(Ordering::Relaxed)).fold(0, u64::saturating_add)
+    }
+
+    /// The kicks sent to the shard by who sent them ([`KickFrom::ALL`]'s order): those claimed (each a system call) and
+    /// those the announcement saved (the shard was awake, or another sender had claimed its park's kick).
+    pub fn kicks_from(&self) -> [(u64, u64); SENDERS] {
+        std::array::from_fn(|i| {
+            let read = |counts: &[crate::cells::Padded<AtomicU64>; SENDERS]| counts.get(i).map_or(0, |count| count.0.load(Ordering::Relaxed));
+            (read(&self.kicks_claimed), read(&self.kicks_skipped))
+        })
     }
 
     /// The CPU the measured kicks cost their senders, nanoseconds, and how many were measured: running sums,

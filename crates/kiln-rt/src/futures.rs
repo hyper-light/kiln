@@ -301,12 +301,21 @@ impl Future for Idle {
 
 pub use crate::quiet::{Came, SleepQuiet, sleep_quiet};
 
-/// Sleeps for `ns` on the shard's wheel (accuracy: one tick).
+/// Sleeps for `ns` on the shard's wheel (accuracy: one tick). A park its timer ends is counted against where it was
+/// asked for (`crate::timer_sites`).
+#[track_caller]
 pub fn sleep(ns: u64) -> Sleep {
+    sleep_from(ns, std::panic::Location::caller())
+}
+
+/// [`sleep`] asked for at `site`: a wrapper's, passing its own caller's place on (kiln's goal 9, plan 01a1a87b2cec step
+/// 5: the shards' timer wakes by site, `crate::timer_sites`).
+pub fn sleep_from(ns: u64, site: &'static std::panic::Location<'static>) -> Sleep {
     Sleep {
         ns,
         deadline: None,
         timer: None,
+        site,
     }
 }
 
@@ -320,6 +329,8 @@ pub struct Sleep {
     ns: u64,
     deadline: Option<u64>,
     timer: Option<TimerId>,
+    /// Where it was asked for.
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Future for Sleep {
@@ -362,7 +373,8 @@ impl Future for Sleep {
         if armed {
             return Poll::Pending;
         }
-        let taken = registry::with_current(|ctx| match ctx.arm_timer(deadline, word.word()) {
+        let site = self.site;
+        let taken = registry::with_current(|ctx| match ctx.arm_timer_from(deadline, word.word(), site) {
             Some(id) => Ok(Some(id)),
             None => ctx.wait_for_timer(word).map(|()| None),
         });
@@ -384,10 +396,11 @@ impl Future for Sleep {
 /// `Counters::timer_waits`), so under timer exhaustion it is enforced late, never early; the shard's timer
 /// bound is derived to cover its tasks' concurrent waits, which makes that count an overload tripwire. The one race every timed wait in the workspace uses; before 2026-09-30 each call site raced
 /// a pinned sleep by hand and read a refused sleep's completion as the deadline.
+#[track_caller]
 pub fn within<F: Future>(ns: u64, work: F) -> Within<F> {
     Within {
         work,
-        deadline: sleep(ns),
+        deadline: sleep_from(ns, std::panic::Location::caller()),
         finished: false,
     }
 }
