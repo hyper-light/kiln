@@ -545,9 +545,10 @@ pub enum Frame {
 /// each frame's bytes and of how long its read took where it ran, nanoseconds (the weight of a new
 /// sample 1/8, as RFC 6298 smooths a round trip), and of how far each read on the shard fell from what
 /// was expected of it (the weight 1/4, as RFC 6298 smooths a round trip's variation). One writer, the
-/// hub's loop (its loops: a benign race between them, each a load and a store).
+/// hub's loop (its loops: a benign race between them, each a load and a store). Making frames of
+/// messages learns its cost by their bytes so too (`crate::net::MADE`; consts-audit R2).
 #[derive(Default)]
-struct Expect {
+pub(crate) struct Expect {
     bytes: std::sync::atomic::AtomicU64,
     ns: std::sync::atomic::AtomicU64,
     dev: std::sync::atomic::AtomicU64,
@@ -555,7 +556,7 @@ struct Expect {
 
 impl Expect {
     /// An [`Expect`] with nothing learned.
-    const fn nothing_yet() -> Self {
+    pub(crate) const fn nothing_yet() -> Self {
         Self { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0), dev: std::sync::atomic::AtomicU64::new(0) }
     }
 
@@ -574,19 +575,26 @@ impl Expect {
         (self.bytes.load(Relaxed) > 0).then(|| self.expected(len).saturating_add(self.dev.load(Relaxed).saturating_mul(4)))
     }
 
-    /// Where a frame of `len` bytes is read: on the shard while its read may take a slow poll at the most
-    /// (`hyper_rt::slow::SLOW_POLL_NS`; [`Expect::bound`]), and then what it's expected to take there; off the shard
-    /// (none) past that, and while nothing has been learned of reads like it, the first of each kind (goal 9, plan
-    /// 01a1a87b2cec step 3). Read on the shard by what it was expected to take alone, a read that took three times that
-    /// held it past its quantum, and with nothing learned, the first of a kind was read there whatever its length (an agent
-    /// session's first events, as the lab's fill wrote them, held the hub's loop's shard up to 0.73 ms on the CPU in train
-    /// 16's lab, g9p16).
-    fn on_shard(&self, len: u64) -> Option<u64> {
-        self.bound(len).filter(|b| *b <= hyper_rt::slow::SLOW_POLL_NS).map(|_| self.expected(len))
+    /// Where a frame of `len` bytes is read: on the shard where its bound fits a turn (the shard's quantum) and what it's
+    /// expected to take there costs no more than handing it to the compute pool and back (`crate::rt::Sides`: the pool's
+    /// round trip, learned), and then what it's expected to take there; off the shard (none) past either, and while nothing
+    /// has been learned of reads like it, the first of each kind (goal 9, plan 01a1a87b2cec step 3). With nothing learned,
+    /// the first of a kind was read on the shard whatever its length (an agent session's first events, as the lab's fill
+    /// wrote them, held the hub's loop's shard up to 0.73 ms on the CPU in train 16's lab, g9p16). A read kept on the shard
+    /// gives the shard up first where its bound won't fit what's left of the turn (`crate::rt::Turns`). Consts-audit B1: it
+    /// was on the shard while its bound was within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs).
+    pub(crate) fn on_shard(&self, len: u64) -> Option<u64> {
+        self.on_shard_with(len, crate::rt::Sides::here())
+    }
+
+    /// [`Expect::on_shard`], weighed against `sides`: a shard's quantum and the pool's round trip.
+    pub(crate) fn on_shard_with(&self, len: u64, sides: crate::rt::Sides) -> Option<u64> {
+        let expected = self.expected(len);
+        self.bound(len).filter(|bound| sides.take_here(expected, *bound)).map(|_| expected)
     }
 
     /// A frame of `len` bytes took `took` nanoseconds to read, on the shard (`on_shard`) or off it.
-    fn learn(&self, len: u64, took: u64, on_shard: bool) {
+    pub(crate) fn learn(&self, len: u64, took: u64, on_shard: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         // How far a read on the shard fell from what was expected of it, before what it teaches is taken in, as RFC 6298
         // (§2.3) takes a round trip's variation before its mean: x ← x + (|sample − expected| − x)/4. Only reads on the
@@ -666,17 +674,17 @@ fn costs_of(data: &[u8]) -> &'static Expect {
 /// past its quantum (`crate::rt::Turns::before`; goal 9, plan 01a1a87b2cec step 3): a turn of short pieces took a long
 /// read last, past the quantum, its pieces so far having said nothing of it.
 pub fn expected_ns(data: &[u8]) -> u64 {
-    expected_by(data, costs_of)
+    expected_by(data, costs_of, crate::rt::Sides::here())
 }
 
-/// [`expected_ns`] by the expectations `costs` gives each message.
-fn expected_by<'a>(data: &[u8], costs: impl Fn(&[u8]) -> &'a Expect) -> u64 {
-    expected_of(data, crate::proto::item_at(data).map(|item| item.body), costs)
+/// [`expected_ns`] by the expectations `costs` gives each message, weighed against `sides` ([`Expect::on_shard_with`]).
+fn expected_by<'a>(data: &[u8], costs: impl Fn(&[u8]) -> &'a Expect, sides: crate::rt::Sides) -> u64 {
+    expected_of(data, crate::proto::item_at(data).map(|item| item.body), costs, sides)
 }
 
 /// [`expected_by`] of frame `data`, a channel item's that carries message `body`.
-fn expected_of<'a>(data: &[u8], body: Option<&[u8]>, costs: impl Fn(&[u8]) -> &'a Expect) -> u64 {
-    let on_shard = |data: &[u8]| costs(data).on_shard(u64::try_from(data.len()).unwrap_or(u64::MAX)).unwrap_or(0);
+fn expected_of<'a>(data: &[u8], body: Option<&[u8]>, costs: impl Fn(&[u8]) -> &'a Expect, sides: crate::rt::Sides) -> u64 {
+    let on_shard = |data: &[u8]| costs(data).on_shard_with(u64::try_from(data.len()).unwrap_or(u64::MAX), sides).unwrap_or(0);
     on_shard(data).saturating_add(body.map_or(0, on_shard))
 }
 
@@ -813,10 +821,10 @@ impl Piece {
 
 /// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
 /// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
-/// (`Hello`, `Instance`, `Machine`). On the shard while that may take a slow poll at the most
-/// (`hyper_rt::slow::SLOW_POLL_NS`; [`Expect::on_shard`]), else, and for the first of its kind, on the compute
-/// pool, the caller waiting either way, so its messages are still taken in order (goal 9, plan 01a1a87b2cec
-/// step 3: the hub's net loop read runners' frames on its shard, holding it up to 76 ms).
+/// (`Hello`, `Instance`, `Machine`). On the shard where that fits a turn and costs no more than the compute pool's
+/// round trip ([`Expect::on_shard`]), else, and for the first of its kind, on the compute pool, the caller waiting
+/// either way, so its messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read
+/// runners' frames on its shard, holding it up to 76 ms).
 pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
     read_frame_by(costs_of(&data), data, hello).await
 }
@@ -831,7 +839,7 @@ pub enum Item {
 }
 
 /// Reads the message channel item `body` carries, and what that carries, as [`read_frame`] reads a frame: on
-/// the shard while that may take a slow poll at the most, else on the compute pool, the caller
+/// the shard where that fits a turn and costs no more than the compute pool's round trip, else on the compute pool, the caller
 /// waiting either way, so the items are still taken in order (goal 9, plan 01a1a87b2cec step 3: the channel
 /// carries most of what a runner sends, its sessions' updates among it, which the hub read on its shard
 /// whatever their length; the lab's s7c had its loop's polls under that label held up to 28 ms). An item
@@ -1624,7 +1632,7 @@ mod tests {
             // read off the shard.
             let expect = Expect::default();
             expect.learn(len, 1_000_000_000, false);
-            anyhow::ensure!(expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS, "expected slow");
+            anyhow::ensure!(expect.on_shard(len).is_none(), "expected slow: a second's read costs more than the pool's round trip");
             for _ in 0..64 {
                 let frame = read_frame_by(&expect, data.clone(), true).await;
                 anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
@@ -1744,27 +1752,31 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: what a frame is expected to hold the shard for is its read where that's expected on
-    /// the shard, and a channel item's frame adds the read of the message it carries; a read expected past a slow poll is
-    /// done off the shard, so it adds nothing; nothing's expected of what nothing has been learned of.
+    /// the shard, and a channel item's frame adds the read of the message it carries; a read that costs more than the compute
+    /// pool's round trip is done off the shard, so it adds nothing; nothing's expected of what nothing has been learned of.
     #[test]
     fn g9_s3_a_frames_expected_hold_counts_the_message_its_item_carries() -> anyhow::Result<()> {
         use crate::wire::channel::Frame;
         let body = crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: r#"{"t":"closed"}"#.into() })?;
         let item = crate::proto::encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq: 2, low: 1, body: body.clone() }))?;
         let len = |b: &[u8]| u64::try_from(b.len()).unwrap_or(u64::MAX);
+        // A shard's quantum and the pool's round trip a millisecond (consts-audit B1): reads of a few hundred nanoseconds fit
+        // the one and cost less than the other.
+        let sides = crate::rt::Sides { quantum_ns: Some(266_666), trip_ns: Some(1_000_000) };
         // A frame read at 10 ns a byte, its message at 20.
         let (frames, messages) = (Expect::default(), Expect::default());
         let costs = |data: &[u8]| if crate::proto::harness_at(data).is_some() { &messages } else { &frames };
-        anyhow::ensure!(expected_by(&item, costs) == 0, "nothing learned, nothing expected");
+        anyhow::ensure!(expected_by(&item, costs, sides) == 0, "nothing learned, nothing expected");
         frames.learn(1_000, 10_000, false);
         messages.learn(1_000, 20_000, false);
-        anyhow::ensure!(expected_by(&body, costs) == 20 * len(&body), "a message alone: its own read");
-        anyhow::ensure!(expected_by(&item, costs) == 10 * len(&item) + 20 * len(&body), "an item: its frame's read and its message's");
-        // Its message's read expected past a slow poll: done off the shard, so the item's frame alone holds it.
+        anyhow::ensure!(expected_by(&body, costs, sides) == 20 * len(&body), "a message alone: its own read");
+        anyhow::ensure!(expected_by(&item, costs, sides) == 10 * len(&item) + 20 * len(&body), "an item: its frame's read and its message's");
+        // Its message's read a millisecond a byte, dearer than the round trip: done off the shard, so the item's frame alone
+        // holds it.
         let slow = Expect::default();
-        slow.learn(1, hyper_rt::slow::SLOW_POLL_NS, false);
+        slow.learn(1, 1_000_000, false);
         let off = |data: &[u8]| if crate::proto::harness_at(data).is_some() { &slow } else { &frames };
-        anyhow::ensure!(expected_by(&item, off) == 10 * len(&item), "a message read off the shard adds nothing");
+        anyhow::ensure!(expected_by(&item, off, sides) == 10 * len(&item), "a message read off the shard adds nothing");
         Ok(())
     }
 
@@ -1804,29 +1816,41 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: a read with nothing learned of reads like it goes off the shard; once one is, a read
-    /// goes on the shard while what it's expected to take and four times how far reads there fall from that (RFC 6298's
-    /// bound, §2.3) is within a slow poll, off it past that though its expectation alone isn't. Each read on the shard moves
-    /// the variation a quarter of the way to how far it fell from what was expected of it, before the averages take it in; a
-    /// read off the shard teaches the averages alone.
+    /// Goal 9, plan 01a1a87b2cec step 3; consts-audit B1: a read with nothing learned of reads like it goes off the shard;
+    /// once one is, a read goes on the shard where its bound (RFC 6298's, §2.3: the expectation and four times how far reads
+    /// on the shard fall from it) fits a turn, the shard's quantum, and what it's expected to take costs no more than the
+    /// compute pool's round trip; off it past either. Against a fast pool (a 50 µs round trip) a 75 µs read goes to the pool,
+    /// against a slow one (200 µs) it stays on the shard; a read whose bound is past the quantum goes to the pool however
+    /// long the pool's round trip (10 ms, a loaded host's); with nothing learned of the pool, a read goes there, which
+    /// teaches it. Each read on the shard moves the variation a quarter of the way to how far it fell from what was
+    /// expected of it, before the averages take it in; a read off the shard teaches the averages alone.
     #[test]
-    fn g9_s3_a_read_goes_on_the_shard_while_its_bound_is_within_a_slow_poll() -> anyhow::Result<()> {
+    fn g9_s3_b1_a_read_goes_on_the_shard_within_the_quantum_where_its_no_dearer_than_the_pool() -> anyhow::Result<()> {
+        use crate::rt::Sides;
         use std::sync::atomic::Ordering::Relaxed;
-        let slow = hyper_rt::slow::SLOW_POLL_NS;
-        anyhow::ensure!(slow == 100_000, "the numbers below are for a slow poll of 100 µs, not {slow} ns");
+        const QUANTUM: Option<u64> = Some(266_666);
+        let (fast, slow, loaded) = (Sides { quantum_ns: QUANTUM, trip_ns: Some(50_000) }, Sides { quantum_ns: QUANTUM, trip_ns: Some(200_000) }, Sides { quantum_ns: QUANTUM, trip_ns: Some(10_000_000) });
         let expect = Expect::default();
-        anyhow::ensure!(expect.bound(1).is_none() && expect.on_shard(1).is_none(), "nothing learned: off the shard");
-        anyhow::ensure!(expected_by(&[0x05, 0x00], |_| &expect) == 0, "a read off the shard holds it for nothing");
+        anyhow::ensure!(expect.bound(1).is_none() && expect.on_shard_with(1, slow).is_none(), "nothing learned: off the shard");
+        anyhow::ensure!(expected_by(&[0x05, 0x00], |_| &expect, slow) == 0, "a read off the shard holds it for nothing");
         // The first, off the shard: 1,000 bytes in 10 µs, 10 ns a byte; no variation yet.
         expect.learn(1_000, 10_000, false);
-        anyhow::ensure!(expect.bound(1_000) == Some(10_000) && expect.on_shard(1_000) == Some(10_000), "{:?}", expect.bound(1_000));
+        anyhow::ensure!(expect.bound(1_000) == Some(10_000) && expect.on_shard_with(1_000, fast) == Some(10_000), "{:?}", expect.bound(1_000));
+        anyhow::ensure!(expect.on_shard_with(1_000, Sides { quantum_ns: QUANTUM, trip_ns: None }).is_none(), "nothing learned of the pool: there, which teaches it");
         // On the shard, 1,000 bytes in 30 µs, 20 µs past the 10 expected: the variation 20/4 = 5 µs, then the mean 10 − 10/8 +
         // 30/8 = 12.5 µs (the bytes as they were).
         expect.learn(1_000, 30_000, true);
         anyhow::ensure!(expect.dev.load(Relaxed) == 5_000 && expect.expected(1_000) == 12_500, "variation {} ns, expected {} ns", expect.dev.load(Relaxed), expect.expected(1_000));
-        // 6,000 bytes: 75 µs expected, 95 µs at the most: on the shard. 7,000: 87.5 µs expected, but 107.5 µs at the most: off.
-        anyhow::ensure!(expect.bound(6_000) == Some(95_000) && expect.on_shard(6_000) == Some(75_000), "6,000 bytes: {:?}", expect.bound(6_000));
-        anyhow::ensure!(expect.expected(7_000) == 87_500 && expect.bound(7_000) == Some(107_500) && expect.on_shard(7_000).is_none(), "7,000 bytes: {:?}", expect.bound(7_000));
+        // 6,000 bytes: 75 µs expected, 95 µs at the most. A fast pool takes it; against a slow one it stays.
+        anyhow::ensure!(expect.bound(6_000) == Some(95_000), "6,000 bytes: {:?}", expect.bound(6_000));
+        anyhow::ensure!(expect.on_shard_with(6_000, fast).is_none(), "75 µs against a 50 µs round trip: the pool");
+        anyhow::ensure!(expect.on_shard_with(6_000, slow) == Some(75_000), "75 µs against a 200 µs round trip: the shard");
+        // 4,000 bytes: 50 µs, no dearer than the fast pool's round trip: on the shard against either.
+        anyhow::ensure!(expect.on_shard_with(4_000, fast) == Some(50_000) && expect.on_shard_with(4_000, slow) == Some(50_000), "4,000 bytes");
+        // 20,000 bytes: 250 µs expected, 270 µs at the most, past the quantum: the pool, however long its round trip.
+        anyhow::ensure!(expect.bound(20_000) == Some(270_000), "20,000 bytes: {:?}", expect.bound(20_000));
+        anyhow::ensure!(expect.on_shard_with(20_000, loaded).is_none(), "a bound past the quantum against a 10 ms round trip: the pool");
+        anyhow::ensure!(expect.on_shard_with(16_000, loaded) == Some(200_000), "16,000 bytes, 220 µs at the most, against a 10 ms round trip: the shard");
         // A long frame read off the shard, a millisecond past what was expected: the averages take it, the variation doesn't.
         expect.learn(1_000, 1_012_500, false);
         anyhow::ensure!(expect.dev.load(Relaxed) == 5_000, "a read off the shard moved the variation to {} ns", expect.dev.load(Relaxed));
