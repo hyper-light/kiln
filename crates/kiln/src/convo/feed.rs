@@ -903,6 +903,11 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                     });
                     // Taken: whatever comes next that doesn't follow is told where to go on.
                     taking.remove(&key);
+                    // A test build's `receipts_unkept`: its receipt never kept, so no Ack: its giver's feed holds what its store
+                    // commits after this batch (docs/wire.md, "Restarts").
+                    if crate::runner::chaos::get().is_some_and(|c| c.receipts_unkept) {
+                        return Vec::new();
+                    }
                     let ack = Msg::Ack { store: s, rev: t.rev };
                     match signed {
                         // Said once its receipt is kept, where its custodian keeps it off this thread: the giver's next batch at

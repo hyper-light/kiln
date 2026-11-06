@@ -5964,7 +5964,7 @@ mod tests {
                 }
                 Ok(())
             };
-            let copy = || hub.harness.conclusion("s").map(|(_, _, changes)| changes).unwrap_or_default();
+            let copy = || hub.harness.changes_value("s");
             let mut files = long_changeset();
             let frames = sent.frames("s", &files, true);
             anyhow::ensure!(frames.len() > 1 && frames.first().is_some_and(|f| f.starts_with(r#"{"t":"changes""#)));

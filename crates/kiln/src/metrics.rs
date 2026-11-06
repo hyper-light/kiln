@@ -1508,8 +1508,9 @@ pub fn render() -> String {
     // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
     let search = kiln_search::memory();
     let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
-    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is
-    // (`crate::harness::copies::PAGE_BYTES`; goal 11, plan 01a1a87b2e56 step 3).
+    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is: its
+    // newest page's sealed chunks at the largest segment packed so far (`crate::harness::copies::segments_bound`;
+    // goal 11, plan 01a1a87b2e56 step 3, learned: goal 11 audit A4).
     let segments_bound = Some(crate::harness::copies::segments_bound()).filter(|b| *b > 0);
     crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, segments_bound), ("search_indexes", search.0, search.1)]);
     // What the copies keep on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).
