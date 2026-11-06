@@ -1699,7 +1699,7 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
         if let Some(inbox) = home.inbox.upgrade() {
             let id = Arc::clone(&home.id);
             let _ = inbox
-                .send(work(&kinds::TRIMMED, move |s: &mut Shard| {
+                .send(work(&kinds::TRIMMED, &home.id, move |s: &mut Shard| {
                     s.trimmed(&id, &was, left, made);
                     // The chunk as it was before its trim: let go of off the shard, as the view that held it was
                     // (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
@@ -1887,7 +1887,7 @@ async fn sweep_when_idle(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>, id
 /// the copy's next event, which an idle session may never have.
 fn compact_msg(home: &Home) -> Msg {
     let id = Arc::clone(&home.id);
-    work(&kinds::COMPACT, move |s: &mut Shard| s.compact(&id))
+    work(&kinds::COMPACT, &home.id, move |s: &mut Shard| s.compact(&id))
 }
 
 /// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
@@ -2641,7 +2641,7 @@ impl Mirror {
             if let Some(inbox) = home.inbox.upgrade() {
                 let id = Arc::clone(&home.id);
                 let _ = inbox
-                    .send(work(&kinds::SPILLED, move |s: &mut Shard| {
+                    .send(work(&kinds::SPILLED, &home.id, move |s: &mut Shard| {
                         s.spilled(&id, &chunks, written);
                         // The chunks as they were before they spilled, each its metas and segment: let go of off the shard, as
                         // the view that held them was (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
@@ -3661,7 +3661,8 @@ impl Shard {
 
     /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
     /// owner reads that chunk back on the blocking pool before it takes the rest ([`own`]), where it was read back on
-    /// this shard, its every event inflated and parsed, for each such change (goal 9, plan 01a1a87b2cec step 3).
+    /// this shard, its every event inflated and parsed, for each such change (goal 9, plan 01a1a87b2cec step 3). It goes
+    /// on with its other sessions meanwhile, holding this one's ([`Thawing`]; goal 11 audit A2(b)).
     pub(super) fn want_thaw(&mut self, id: &str, chunk: Arc<Chunk>) {
         self.thaw = Some((id.to_owned(), chunk));
     }
@@ -3685,6 +3686,24 @@ impl Shard {
             }
             swapped
         })
+    }
+
+    /// A chunk read back off the shard for a session's update ([`Thawing`]): taken in where it's still its copy's
+    /// ([`Shard::take_thawed`]). One that couldn't be read is marked tried, and its update changes it where it is.
+    fn thawed_back(&mut self, (id, chunk, read): Back) {
+        match read {
+            Ok(Ok(made)) => {
+                self.take_thawed(&id, &chunk, made);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(session = %id, error = %e, "a session copy's packed events couldn't be read back off its shard: changed where they are");
+                self.thawed = Arc::downgrade(&chunk);
+            }
+            Err(e) => {
+                tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's packed events couldn't be read back off its shard: changed where they are");
+                self.thawed = Arc::downgrade(&chunk);
+            }
+        }
     }
 
     /// Session `id`'s update stopped before event `e`, which goes in at `at` among its copy's events, numbered before its
@@ -4061,6 +4080,8 @@ pub struct Each {
 /// had taught it what a job takes, and the lab's table couldn't tell which held the shard.
 pub struct Work {
     label: &'static hyper_rt::slow::Label,
+    /// The session whose copy it works on: what its owner holds it for while that copy's chunk is read back ([`Thawing`]).
+    session: Option<Arc<str>>,
     job: Job,
 }
 
@@ -4095,9 +4116,9 @@ impl crate::memory::queue::Weigh for Msg {
     }
 }
 
-/// [`Work`] of kind `label`.
-fn work(label: &'static hyper_rt::slow::Label, job: impl FnOnce(&mut Shard) + Send + 'static) -> Msg {
-    Msg::Work(Box::new(Work { label, job: Box::new(job) }))
+/// [`Work`] of kind `label` on session `session`'s copy.
+fn work(label: &'static hyper_rt::slow::Label, session: &Arc<str>, job: impl FnOnce(&mut Shard) + Send + 'static) -> Msg {
+    Msg::Work(Box::new(Work { label, session: Some(Arc::clone(session)), job: Box::new(job) }))
 }
 
 /// The kinds of an owner's own work ([`Work`], [`Each`]), as the shards' table of what held them names them (goal 9, plan
@@ -4237,7 +4258,7 @@ impl Copies {
                 #[cfg(test)]
                 turns: Vec::new(),
             };
-            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
+            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub), inbox));
             inboxes.push(tx);
         }
         drop(crate::rt::spawn(sweep_when_idle(inboxes.iter().map(crate::memory::queue::Sender::downgrade).collect(), Arc::clone(&said.idle))));
@@ -4794,6 +4815,259 @@ async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
     gave_up
 }
 
+/// The session `msg` is about, where it names one: an update's (prepared or to prepare), a runner's update's, the copy's own
+/// work's. A job on the owner's copies, or a sweep of them, names none: it may be about any.
+fn session_of(msg: &Msg) -> Option<&str> {
+    match msg {
+        Msg::Update(i) => Some(&i.id),
+        Msg::Take(t) => Some(&t.id),
+        Msg::Runner(r) => Some(&r.session),
+        Msg::Work(w) => w.session.as_deref(),
+        Msg::Run(_) | Msg::Each(_) => None,
+    }
+}
+
+/// A chunk read back for an update, as it came back ([`Thawing`]): its session, the chunk as the update found it, and its
+/// events read again (or why not).
+type Back = (String, Arc<Chunk>, anyhow::Result<std::io::Result<Chunk>>);
+
+/// A chunk of session `session`'s copy being read back on the blocking pool for an update that changes one of its events.
+struct ReadBack {
+    session: String,
+    chunk: Arc<Chunk>,
+    read: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<std::io::Result<Chunk>>> + Send>>,
+}
+
+/// What an owner's inbox gave it ([`Thawing::next_from`]).
+enum Next {
+    Took(Msg),
+    Empty,
+    Closed,
+}
+
+/// What an owner's wait ended with ([`Thawing::wait`]): a message, or a chunk read back.
+enum Woke {
+    Msg(Result<Msg, async_channel::RecvError>),
+    Back(Back),
+}
+
+/// The compact chunks an owner reads back off its shard for its sessions' updates, and the messages it holds for them
+/// meanwhile (goal 11 audit A2(b); goal 9, plan 01a1a87b2cec step 3). An update that changes an event of a compact chunk (a
+/// subagent's result, a long tool's output, more than a chunk's events after it began) has that chunk read back on the
+/// blocking pool ([`Shard::want_thaw`]) while its owner goes on with its other sessions' messages. That session's update,
+/// and every message after it that's its session's or may be (a job on the owner's copies names none: [`session_of`]),
+/// wait in the order they came until the chunk is back, then go first. The owner awaited each read: every session of its
+/// shard waited a pool round trip and an inflate, and a spill file's read besides (a disk's stall), for one session's
+/// change.
+///
+/// What it holds weighs against its owner's inbox's bound (`crate::memory::queue::Weigh`), where those messages would have
+/// waited: past it, the owner takes nothing more from its inbox until a read is back, as it waited for each before, so what
+/// waits for it stays bounded.
+struct Thawing {
+    reads: Vec<ReadBack>,
+    held: std::collections::VecDeque<Msg>,
+    bytes: usize,
+    bound: usize,
+    /// A read came back since the held messages were last looked over: some may go now.
+    freed: bool,
+}
+
+impl Thawing {
+    fn new(bound: usize) -> Self {
+        Self { reads: Vec::new(), held: std::collections::VecDeque::new(), bytes: 0, bound, freed: false }
+    }
+
+    /// Session `id`'s chunk `chunk` read back on the blocking pool, its events made again as they are; `first`, the update
+    /// that changes it, held first (nothing of its session's came before it, or it would wait too).
+    fn start(&mut self, id: String, chunk: Arc<Chunk>, first: Option<Msg>) {
+        let c = Arc::clone(&chunk);
+        #[cfg(test)]
+        let gate = held_back::gate(&id);
+        let read = crate::rt::blocking(move || {
+            #[cfg(test)]
+            held_back::wait(gate);
+            c.evs().map(|evs| Chunk::of(evs.into_owned()))
+        });
+        self.reads.push(ReadBack { session: id, chunk, read: Box::pin(read) });
+        if let Some(msg) = first {
+            self.bytes = self.bytes.saturating_add(crate::memory::queue::Weigh::weight(&msg));
+            self.held.push_front(msg);
+        }
+    }
+
+    /// Whether `msg` waits: it's about a session whose chunk is being read back or whose message is held, or it may be about
+    /// any (it names none) while anything is, or a message held before it may be about any.
+    fn holds(&self, msg: &Msg) -> bool {
+        if self.reads.is_empty() && self.held.is_empty() {
+            return false;
+        }
+        let Some(s) = session_of(msg) else { return true };
+        self.reads.iter().any(|r| r.session == s) || self.held.iter().any(|h| session_of(h).is_none_or(|t| t == s))
+    }
+
+    fn hold(&mut self, msg: Msg) {
+        self.bytes = self.bytes.saturating_add(crate::memory::queue::Weigh::weight(&msg));
+        self.held.push_back(msg);
+    }
+
+    /// Whether what it holds weighs as much as its owner's inbox holds at the most: the owner takes nothing more from it
+    /// until a read is back.
+    fn full(&self) -> bool {
+        self.bytes >= self.bound && !self.reads.is_empty()
+    }
+
+    /// The first message it holds that waits for nothing now, in the order they came: its session's chunk is back and
+    /// none of its session's before it still waits; one that may be about any, once nothing is read or held before it.
+    fn next_free(&mut self) -> Option<Msg> {
+        if !self.freed {
+            return None;
+        }
+        let mut free = None;
+        for (j, h) in self.held.iter().enumerate() {
+            match session_of(h) {
+                None => {
+                    if j == 0 && self.reads.is_empty() {
+                        free = Some(j);
+                    }
+                    break;
+                }
+                Some(s) => {
+                    if !self.reads.iter().any(|r| r.session == s) && !self.held.iter().take(j).any(|p| session_of(p) == Some(s)) {
+                        free = Some(j);
+                        break;
+                    }
+                }
+            }
+        }
+        match free.and_then(|j| self.held.remove(j)) {
+            Some(msg) => {
+                self.bytes = self.bytes.saturating_sub(crate::memory::queue::Weigh::weight(&msg));
+                Some(msg)
+            }
+            None => {
+                self.freed = false;
+                None
+            }
+        }
+    }
+
+    /// A chunk read back, if one is: polled with `cx`, which a read that isn't back yet wakes once it is.
+    fn poll_back(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Back> {
+        for at in 0..self.reads.len() {
+            let Some(r) = self.reads.get_mut(at) else { break };
+            if let std::task::Poll::Ready(out) = r.read.as_mut().poll(cx) {
+                let r = self.reads.swap_remove(at);
+                self.freed = true;
+                return std::task::Poll::Ready((r.session, r.chunk, out));
+            }
+        }
+        std::task::Poll::Pending
+    }
+
+    /// A chunk read back already, if one is, without waiting for one.
+    async fn back_now(&mut self) -> Option<Back> {
+        if self.reads.is_empty() {
+            return None;
+        }
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match self.poll_back(cx) {
+                std::task::Poll::Ready(back) => Some(back),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    /// The next message its owner takes from `rx`, those it holds held as they come; none while what it holds is full.
+    fn next_from(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Next {
+        while !self.full() {
+            match rx.try_recv() {
+                Ok(msg) if self.holds(&msg) => self.hold(msg),
+                Ok(msg) => return Next::Took(msg),
+                Err(async_channel::TryRecvError::Empty) => return Next::Empty,
+                Err(async_channel::TryRecvError::Closed) => return Next::Closed,
+            }
+        }
+        Next::Empty
+    }
+
+    /// The next message from `rx` or chunk read back, whichever comes first: a read back alone while what it holds is full.
+    async fn wait(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Woke {
+        let full = self.full();
+        let mut recv = std::pin::pin!(rx.recv());
+        std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(back) = self.poll_back(cx) {
+                return std::task::Poll::Ready(Woke::Back(back));
+            }
+            if full {
+                return std::task::Poll::Pending;
+            }
+            recv.as_mut().poll(cx).map(Woke::Msg)
+        })
+        .await
+    }
+}
+
+/// Tests: a gate a session's chunks read back for its updates wait at ([`Thawing::start`]), shut until the test opens it, so a
+/// test holds one read out and looks at what its owner does meanwhile.
+#[cfg(test)]
+mod held_back {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arc_swap::ArcSwapOption;
+
+    pub(super) struct Gate {
+        open: AtomicBool,
+        reached: AtomicBool,
+        waiting: ArcSwapOption<std::thread::Thread>,
+    }
+
+    impl Gate {
+        /// Whether a read waits at it, or did.
+        pub(super) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+
+        /// Its reads let go on, and every read after.
+        pub(super) fn open(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            if let Some(t) = self.waiting.load_full() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// Every gate shut, with its session.
+    static GATES: ArcSwapOption<Vec<(String, Arc<Gate>)>> = ArcSwapOption::const_empty();
+
+    /// A gate session `id`'s reads wait at, shut.
+    pub(super) fn shut(id: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate { open: AtomicBool::new(false), reached: AtomicBool::new(false), waiting: ArcSwapOption::const_empty() });
+        GATES.rcu(|all| {
+            let mut all: Vec<(String, Arc<Gate>)> = all.as_deref().cloned().unwrap_or_default();
+            all.push((id.to_owned(), Arc::clone(&gate)));
+            Some(Arc::new(all))
+        });
+        gate
+    }
+
+    /// Session `id`'s gate, if a test shut one.
+    pub(super) fn gate(id: &str) -> Option<Arc<Gate>> {
+        GATES.load().as_deref()?.iter().find(|(s, _)| s == id).map(|(_, g)| Arc::clone(g))
+    }
+
+    /// Waits at `gate`, if there's one, until it's open.
+    pub(super) fn wait(gate: Option<Arc<Gate>>) {
+        let Some(g) = gate else { return };
+        g.waiting.store(Some(Arc::new(std::thread::current())));
+        g.reached.store(true, Ordering::SeqCst);
+        while !g.open.load(Ordering::SeqCst) {
+            std::thread::park();
+        }
+    }
+}
+
 /// A shard's owner: its messages, in the order they came, as fast as they come, in turns of its shard (the HTTP listener may
 /// share it), each a poll of its own within the shard's step quantum ([`Turn`]; goal 9, plan 01a1a87b2cec step 3). It waits on
 /// nothing but its inbox, and ends with it. A turn takes its first piece whatever that's expected to take (so each takes
@@ -4806,36 +5080,56 @@ async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
 ///
 /// A turn ends where what follows it gives the shard up: an inbox's wait that pended, a pool's await, a yield; each turn
 /// that took something is said ended there ([`Shard::turned`]), as long as it held the shard ([`Turn::held`]).
-async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
+///
+/// A compact chunk an update changes is read back on the blocking pool while the owner goes on with its other sessions'
+/// messages ([`Thawing`]; goal 11 audit A2(b)): that session's, and what may be about it, wait for it in the order they
+/// came. `inbox`: what its inbox holds at the most, in bytes, and so what it holds back so.
+async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>, inbox: usize) {
     let mut costs = Costs::default();
     let mut turn = Turn::new();
     // Nothing taken yet this turn: its first piece goes whatever it's expected to take.
     let mut fresh = true;
     // What's left of the message the last turn ran out in, or the next it had no room for.
     let mut rest: Option<Msg> = None;
+    // The chunks being read back for its sessions' updates, and what waits for them.
+    let mut thawing = Thawing::new(inbox);
     loop {
-        let msg = match rest.take() {
+        let msg = match rest.take().or_else(|| thawing.next_free()) {
             Some(msg) => msg,
-            None => match rx.try_recv() {
-                Ok(msg) => msg,
-                Err(async_channel::TryRecvError::Closed) => return,
-                // None waiting: waiting for one gives the shard to its other work, so a turn starts afresh once one comes
-                // (else an update after a quiet spell would find its turn spent already). One that came as it asked is this
-                // turn's still.
-                Err(async_channel::TryRecvError::Empty) => {
-                    let held = turn.held();
-                    match waited(rx.recv()).await {
-                        (Ok(msg), gave_up) => {
-                            if gave_up {
-                                shard.turned(held, fresh);
-                                (turn, fresh) = (Turn::new(), true);
-                            }
-                            msg
+            None => {
+                // A chunk read back since the last look: taken in at once, so its session's update is the next taken.
+                if let Some(back) = thawing.back_now().await {
+                    shard.thawed_back(back);
+                    continue;
+                }
+                match thawing.next_from(&rx) {
+                    Next::Took(msg) => msg,
+                    Next::Closed => return,
+                    // None waiting: waiting for one gives the shard to its other work, so a turn starts afresh once one comes
+                    // (else an update after a quiet spell would find its turn spent already). One that came as it asked is
+                    // this turn's still. A chunk read back meanwhile is taken in as it comes.
+                    Next::Empty => {
+                        let held = turn.held();
+                        let (woke, gave_up) = waited(thawing.wait(&rx)).await;
+                        if gave_up {
+                            shard.turned(held, fresh);
+                            (turn, fresh) = (Turn::new(), true);
                         }
-                        (Err(_), _) => return,
+                        match woke {
+                            Woke::Back(back) => {
+                                shard.thawed_back(back);
+                                continue;
+                            }
+                            Woke::Msg(Ok(msg)) if thawing.holds(&msg) => {
+                                thawing.hold(msg);
+                                continue;
+                            }
+                            Woke::Msg(Ok(msg)) => msg,
+                            Woke::Msg(Err(_)) => return,
+                        }
                     }
                 }
-            },
+            }
         };
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
         let h = hub.get().and_then(Weak::upgrade);
@@ -4857,9 +5151,20 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 hyper_rt::futures::label(label);
             }
             rest = left;
-            // Nothing after a frame that waits to be written off the shard (below) goes before it.
+            // A change to an event of a compact chunk: that chunk read back on the blocking pool while this owner goes on with
+            // its other sessions, the update that changes it held with what comes for its session meanwhile (goal 11 audit
+            // A2(b); goal 9, plan 01a1a87b2cec step 3). Every session of the shard waited for the read, the owner awaiting it.
+            if let Some((id, chunk)) = shard.thaw.take() {
+                let first = rest.take_if(|m| session_of(m) == Some(id.as_str()));
+                thawing.start(id, chunk, first);
+            }
+            // Nothing after a frame that waits to be written off the shard (below) goes before it. What a read back freed
+            // goes before what's newer.
             if rest.is_none() && shard.frame.is_none() {
-                next = rx.try_recv().ok();
+                next = thawing.next_free().or_else(|| match thawing.next_from(&rx) {
+                    Next::Took(msg) => Some(msg),
+                    Next::Empty | Next::Closed => None,
+                });
             }
         }
         drop(h);
@@ -4870,31 +5175,6 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         if let Some((id, later)) = shard.frame.take() {
             let held = turn.held();
             if frame_off(&mut shard, &id, later).await {
-                shard.turned(held, fresh);
-                (turn, fresh) = (Turn::new(), true);
-            }
-        }
-        // A change to an event of a compact chunk: that chunk read back on the blocking pool, the shard given up meanwhile,
-        // before the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3). This owner's next messages wait for it,
-        // as they waited for it to be read back here.
-        if let Some((id, chunk)) = shard.thaw.take() {
-            let c = Arc::clone(&chunk);
-            let held = turn.held();
-            let (read, gave_up) = waited(crate::rt::blocking(move || c.evs().map(|evs| Chunk::of(evs.into_owned())))).await;
-            match read {
-                Ok(Ok(made)) => {
-                    shard.take_thawed(&id, &chunk, made);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(session = %id, error = %e, "a session copy's packed events couldn't be read back off its shard: changed where they are");
-                    shard.thawed = Arc::downgrade(&chunk);
-                }
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's packed events couldn't be read back off its shard: changed where they are");
-                    shard.thawed = Arc::downgrade(&chunk);
-                }
-            }
-            if gave_up {
                 shard.turned(held, fresh);
                 (turn, fresh) = (Turn::new(), true);
             }
@@ -6405,6 +6685,91 @@ mod tests {
         })
     }
 
+    /// Goal 11 audit A2(b) (goal 9, plan 01a1a87b2cec step 3): while a chunk of one session's copy is read back off its
+    /// owner's shard for an update that changes it, the owner goes on with its other sessions. Do: two sessions of one owner,
+    /// the first's oldest chunk compact; an update that changes an event there, its read held out at a gate; then the first
+    /// session's next event, the other's, and a job on the owner's copies. Expect: the other session's event taken while the
+    /// read is out; the first's change and its next event, and the job (which may be about it), held; once the read is back,
+    /// the first's change, then its next event, then the job, in the order they came. The owner awaited the read, and the
+    /// other session's event waited with it: this fails on the code before.
+    #[test]
+    fn g9_s3_a2b_an_owner_goes_on_with_its_other_sessions_while_one_sessions_chunk_is_read_back() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            copies.bind(&hub);
+            let (x, y) = ("a2b-held".to_owned(), "a2b-other".to_owned());
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            let (i, j) = (x.clone(), y.clone());
+            let first = copies
+                .on(&x, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.publish();
+                    let first = m.events.chunks().first().filter(|c| c.is_compact()).cloned();
+                    let o = s.entry(&j, || Mirror::new(Info { id: j.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    o.rev = 1;
+                    o.upsert(entry("y1", 1));
+                    o.publish();
+                    first
+                })
+                .await
+                .flatten();
+            let Some(first) = first else { anyhow::bail!("its first chunk compact") };
+            let said = |id: &str, q: u64, text: &str| Event { id: id.to_owned(), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
+            let update = |id: &str, e: Event| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u: Update::Events { events: vec![e] }, shipped: true, reported: String::new() }));
+            let gate = held_back::shut(&x);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            // The first session's e5, in its compact chunk, said again: its read held out.
+            anyhow::ensure!(copies.send(&x, update(&x, said("e5", 5, "said again"))).await, "sent");
+            while !gate.reached() {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the chunk was never read back");
+                crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // Its next event, the other session's, and a job on the owner's copies, while the read is out.
+            anyhow::ensure!(copies.send(&x, update(&x, said(&format!("e{}", n + 1), n + 1, "its next"))).await, "sent");
+            anyhow::ensure!(copies.send(&y, update(&y, said("y2", 2, "the other's next"))).await, "sent");
+            let (tx, mut job) = futures::channel::oneshot::channel();
+            let (on, at, i) = (Arc::clone(&copies), x.clone(), x.clone());
+            drop(crate::rt::spawn(async move {
+                let seen = on.on(&at, move |s| s.get(&i).map(|m| (m.events.len(), m.events.last().map(|e| e.entry.text().to_owned())))).await.flatten();
+                let _ = tx.send(seen);
+            }));
+            while copies.with(&y, |v| v.events.len()) != Some(2) {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the other session's event waited for the first's read");
+                crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let held = copies.with(&x, |v| (v.events.len(), v.events.get(4).is_some_and(|e| e.entry.text().contains("said again")))).unwrap_or_default();
+            anyhow::ensure!(held == (CHUNK * 3 + 9, false), "the first session's held while its chunk is out: {held:?}");
+            anyhow::ensure!(matches!(job.try_recv(), Ok(None)), "a job on the copies, which may be about it, held too");
+            gate.open();
+            let seen = job.await.ok().flatten();
+            let total = CHUNK * 3 + 10;
+            anyhow::ensure!(seen.as_ref().is_some_and(|(len, last)| *len == total && last.as_deref().is_some_and(|t| t.contains("its next"))), "the job after both of its events: {seen:?}");
+            copies.settled().await;
+            let (i, was) = (x.clone(), Arc::clone(&first));
+            let now = copies
+                .on(&x, move |s| {
+                    let read_back = s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was));
+                    s.get(&i).map(|m| (read_back, m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.last().map(|e| e.entry.text().to_owned())))
+                })
+                .await
+                .flatten();
+            let Some((read_back, len, Some(changed), Some(last))) = now else { anyhow::bail!("no copy: {now:?}") };
+            anyhow::ensure!(read_back && len == total && changed.contains("said again") && last.contains("its next"), "{read_back} {len} {changed} {last}");
+            Ok(())
+        })
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 5: an event's id is kept in its meta, with no allocation of its own up to
     /// `ID_INLINE` bytes (a UUID written either way, a harness's ids), a longer one boxed, each read back as it was;
     /// a meta takes 96 bytes, against 72 and the 48 to 64 its id's `Arc<str>` took besides.
@@ -7720,8 +8085,9 @@ mod tests {
     #[test]
     fn g9_s3_an_owners_own_work_is_labeled_and_learned_by_its_kind() {
         let us = Duration::from_micros;
-        let compact = || work(&kinds::COMPACT, |_: &mut Shard| {});
-        let spill = || work(&kinds::SPILLED, |_: &mut Shard| {});
+        let session: Arc<str> = Arc::from("s");
+        let compact = || work(&kinds::COMPACT, &session, |_: &mut Shard| {});
+        let spill = || work(&kinds::SPILLED, &session, |_: &mut Shard| {});
         let other = || Msg::Run(Box::new(|_: &mut Shard| {}));
         assert!(std::ptr::eq(label_of(&compact()), &kinds::COMPACT) && std::ptr::eq(label_of(&spill()), &kinds::SPILLED));
         assert!(std::ptr::eq(label_of(&Msg::Each(Box::new(Shard::pack_idle()))), &kinds::IDLE), "the sweep for idle copies");
