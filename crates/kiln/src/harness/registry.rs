@@ -2591,8 +2591,10 @@ impl Registry {
         let tried = s.tried_insert(id);
         let mut insert = None;
         // This update's next event long to write out, to be written so by its owner: where its session works, for the files
-        // it mentions (`super::copies::Shard::want_write`).
+        // it mentions (`super::copies::Shard::want_write`). And whether this turn took one its owner wrote so: its update is
+        // let go of off the shard, as the event's megabytes are freed with it (below).
         let mut write: Option<(String, Location)> = None;
+        let mut took_written = false;
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
@@ -2753,6 +2755,7 @@ impl Registry {
                     // long to write is learned (step 3).
                     let (entry, mentioned) = match tried_write.and_then(|w| w.made) {
                         Some(made) => {
+                            took_written = true;
                             rows.extend(made.row);
                             (made.entry, made.mentions)
                         }
@@ -2812,20 +2815,30 @@ impl Registry {
         // The copy goes out, then its viewers are sent what changed. A state goes out with the name
         // given here in it (the machine's may lack it). An Open that goes on from what the copy has
         // isn't one to its viewers: they go on with what they have, unless the copy's events went
-        // another way than theirs.
-        m.commit(|m| match &u {
-            _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
-            Update::Open { since: Some(_), .. } => None,
-            Update::State { .. } => m.state_frame(),
-            Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
-            Update::Meta { .. } if meta_same => None,
-            _ => Some(m.frame_of(&u, &entries)),
-        });
+        // another way than theirs. Its events' frame, where its owner wrote one of them out off the shard
+        // (a large tool output's megabytes, which the frame copies in), is written off it too, before
+        // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
+        let later = if !resync && matches!(u, Update::Events { .. }) {
+            m.commit_events(&entries, took_written)
+        } else {
+            m.commit(|m| match &u {
+                _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
+                Update::Open { since: Some(_), .. } => None,
+                Update::State { .. } => m.state_frame(),
+                Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
+                Update::Meta { .. } if meta_same => None,
+                _ => Some(m.frame_of(&u, &entries)),
+            });
+            None
+        };
         // What the copy's state or meta was made of, kept with the value as made (a name given here in it): the
         // same one again finds it so (above).
         match u {
             Update::State { state } => m.state_of = Some((state, Arc::clone(&m.state))),
             Update::Meta { meta } => m.meta_of = Some((meta, Arc::clone(&m.meta))),
+            // Events among which one its owner wrote out off the shard (a large tool output): let go of off it too, the
+            // event's megabytes freed there (goal 9, plan 01a1a87b2cec step 3).
+            Update::Events { events } if took_written => super::copies::let_go(events),
             _ => {}
         }
         if gone {
@@ -2895,6 +2908,9 @@ impl Registry {
         }
         if let Some((cwd, location)) = write {
             s.want_write(id, store.is_some(), cwd, location);
+        }
+        if let Some(later) = later {
+            s.want_frame(id, later);
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -4498,8 +4514,10 @@ mod tests {
         let many: Vec<Value> = (0..400).map(|n| file(&format!("src/f{n}.rs"), None, lines)).collect();
         m.take_changes(many, Vec::new(), true);
         let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
-        // The first goes whole, nothing before it to patch: the bus refuses it, its viewers start over.
-        assert_eq!(m.feed.publish_payload(f), super::super::live::Published::Refused);
+        // The first would go whole, nothing before it to patch, past what the bus takes: it isn't written, and its viewers
+        // start over, sent the resync marker where the bus refused it (goal 9, plan 01a1a87b2cec step 3).
+        assert_eq!(m.feed.publish_payload(f), super::super::live::Published::Sent);
+        assert_eq!(m.feed.refusals(), 0);
         m.take_changes(vec![file("src/f3.rs", None, lines + 1)], Vec::new(), false);
         let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         assert_eq!(m.feed.publish_payload(f), super::super::live::Published::Sent);
