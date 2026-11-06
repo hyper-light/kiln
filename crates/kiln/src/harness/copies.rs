@@ -1694,6 +1694,23 @@ impl Mirror {
         self.slot.view.store(Arc::new(self.view()));
     }
 
+    /// Whether it changed since its view last went out ([`Mirror::publish`]): its revision, or anything its view shares of
+    /// it, isn't its view's (a change copies what a view shares before it changes it).
+    fn unpublished(&self) -> bool {
+        let v = self.slot.view.load();
+        let changes = match (&self.changes, &v.changes) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        self.rev != v.rev
+            || !changes
+            || !self.events.same_as(&v.events)
+            || !Arc::ptr_eq(&self.info, &v.info)
+            || !Arc::ptr_eq(&self.location, &v.location)
+            || !Arc::ptr_eq(&self.meta, &v.meta)
+            || !Arc::ptr_eq(&self.state, &v.state)
+    }
+
     /// Its info as it was last published, encoded ([`View::info_json`]): what the events socket's frame
     /// of a change of it is made of, rather than encoded again (`crate::wire::events::harness_frame`;
     /// goal 10, plan 01a1a87b2dae step 5).
@@ -2232,9 +2249,21 @@ impl Shard {
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
             tracing::error!(shard = self.me, panic = %crate::sup::panic_message(p.as_ref()), "a change to an agent session's copy panicked: its shard goes on");
+            self.resync_unpublished();
         }
         self.publish_board();
         rest
+    }
+
+    /// Each copy changed since its view last went out, as a change a panic cut short leaves it ([`Shard::take`]): out as
+    /// it is, its viewers sent back to a snapshot of it (the feed's resync marker), a change half made going to no one as
+    /// a frame. Its readers had it only with its next change, and its viewers never had what the cut change made (goal 4,
+    /// plan 01a1a59c2a9c step 5: `g4_s5_an_owner_goes_on_after_a_change_that_panicked_and_its_viewers_with_it`).
+    fn resync_unpublished(&mut self) {
+        for m in self.mirrors.values_mut().filter(|m| m.unpublished()) {
+            m.started_over();
+            m.commit(|_| Some(payload_of(super::live::RESYNC, 0)));
+        }
     }
 }
 
