@@ -49,6 +49,16 @@ pub struct Profile {
     /// Seconds of load before the window, and of the window.
     pub warmup_s: u64,
     pub window_s: u64,
+    /// Of the active sessions, how many work in subagent turns instead (the first of them, the longest): a Task's call,
+    /// `subagent_events` events of its subagent's, `turn_every_ms` apart, then the Task's result, which updates the Task's
+    /// tool event that many events after it began (copies-lat2's A2(b) shape, on shards with the other sessions; Ada's own
+    /// sessions run subagents everywhere). The other sessions' frames are told apart from theirs
+    /// ([`frames_by_subagents`]). None but in the `subagents` profile.
+    #[serde(default)]
+    pub subagents: usize,
+    /// Each subagent turn's events between its Task's call and its result.
+    #[serde(default)]
+    pub subagent_events: u64,
 }
 
 impl Profile {
@@ -75,7 +85,15 @@ impl Profile {
             page_think_ms: 100,
             warmup_s: 5,
             window_s: 60,
+            subagents: 0,
+            subagent_events: 100,
         }
+    }
+
+    /// The realistic profile with two of its eight active sessions working in subagent turns of 100 events: each Task's
+    /// tool event updated more than 70 events after it began, on shards with the other sessions (copies-lat2's A2(b)).
+    pub fn subagents() -> Self {
+        Self { subagents: 2, subagent_events: 100, ..Self::realistic() }
     }
 
     /// The realistic profile with no think time for its people and readers: each viewer opens the next
@@ -115,7 +133,8 @@ impl Profile {
             "overload" => Self::overload(),
             "many" => Self::many(),
             "flood" => Self::flood(),
-            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
+            "subagents" => Self::subagents(),
+            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many, subagents or small"),
         })
     }
 
@@ -138,6 +157,8 @@ impl Profile {
             page_think_ms: 500,
             warmup_s: 2,
             window_s: 10,
+            subagents: 0,
+            subagent_events: 100,
         }
     }
 }
@@ -611,7 +632,13 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
     let mut out = Vec::new();
     let mut r = Lcg(0x5eed ^ ((i as u64) << 8));
     let mut http = Http::new(s.port, &s.admin);
-    let turn = Duration::from_millis(p.turn_events.saturating_mul(p.turn_every_ms));
+    // The first `subagents` of the active sessions work in subagent turns (their Task's call and result besides).
+    let (text, events) = if i < p.subagents {
+        (format!("lab:subagent:{}:{}", p.subagent_events, p.turn_every_ms), p.subagent_events.saturating_add(2))
+    } else {
+        (format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms), p.turn_events)
+    };
+    let turn = Duration::from_millis(events.saturating_mul(p.turn_every_ms));
     let path = format!("/api/harness/sessions/{id}/command");
     // Not all at once.
     if !nap(s, jitter(&mut r, Duration::from_millis(p.turn_think_ms))) {
@@ -619,7 +646,7 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
     }
     while !s.stop.load(Ordering::Relaxed) {
         let n = s.next.fetch_add(1, Ordering::Relaxed);
-        let body = json!({"type": "send", "id": format!("lab-{n}"), "text": format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms)}).to_string();
+        let body = json!({"type": "send", "id": format!("lab-{n}"), "text": text}).to_string();
         let mut retry_after = None;
         out.push(timed(Class::ApiWrite, "command", || {
             http.send("POST", &path, Some(body.as_bytes())).map(|a| {
@@ -1115,6 +1142,10 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
+    if p.subagents > 0 {
+        let subagent_sessions: HashSet<&str> = active.iter().take(p.subagents).map(String::as_str).collect();
+        seen.extend(frames_by_subagents(&watches, window, &subagent_sessions));
+    }
     let quantum_us = measure::quantum_us(&after);
     Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
 }
@@ -1139,6 +1170,23 @@ pub fn frames_against_attaches(watches: &[Watch], window: (u64, u64)) -> BTreeMa
                 "websocket.live"
             };
             by.entry(group.to_owned()).or_default().push(took);
+        }
+    }
+    by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
+}
+
+/// The window's frames (stamped in it) told apart by whose session they're of, in a profile with subagent turns
+/// (copies-lat2's A2(b)): `websocket.subagents`, those of the sessions working in subagent turns, and
+/// `websocket.others`, the rest: whether the other sessions' frames keep their pace beside sessions whose tool events
+/// are updated long after they began.
+pub fn frames_by_subagents(watches: &[Watch], window: (u64, u64), subagents: &HashSet<&str>) -> BTreeMap<String, measure::Seen> {
+    let mut by: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for w in watches {
+        let group = if subagents.contains(w.session.as_str()) { "websocket.subagents" } else { "websocket.others" };
+        for &(stamp, took) in &w.frames {
+            if stamp >= window.0 && stamp < window.1 {
+                by.entry(group.to_owned()).or_default().push(took);
+            }
         }
     }
     by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
@@ -1759,6 +1807,22 @@ mod tests {
         let mut none = BTreeMap::new();
         server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
         assert!(!none.keys().any(|k| k.starts_with("shards.by_")), "{none:?}");
+    }
+
+    /// copies-lat2's A2(b) (main's ask, 2026-11-06): the subagents profile is the realistic one with two of its active
+    /// sessions in subagent turns of more than 70 events, and the window's frames are told apart by whose session.
+    #[test]
+    fn a2b_the_subagents_profile_tells_the_other_sessions_frames_apart() {
+        let (sub, realistic) = (Profile::subagents(), Profile::realistic());
+        assert_eq!((sub.subagents, sub.active, realistic.subagents), (2, realistic.active, 0));
+        assert!(sub.subagent_events > 70, "{sub:?}");
+        assert_eq!(Profile::named("subagents").map(|p| p.subagents).ok(), Some(2));
+        let watch = |session: &str, frames: Vec<(u64, u64)>| Watch { viewer: 0, session: session.to_owned(), from_us: 0, to_us: 0, frames };
+        let watches = vec![watch("s0", vec![(10, 500), (2_000, 9)]), watch("s5", vec![(20, 100), (30, 300)])];
+        let subagents: HashSet<&str> = std::iter::once("s0").collect();
+        let seen = frames_by_subagents(&watches, (0, 1_000), &subagents);
+        assert_eq!(seen.get("websocket.subagents").map(|s| s.n), Some(1), "outside the window isn't counted");
+        assert_eq!(seen.get("websocket.others").map(|s| s.n), Some(2));
     }
 
     /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
