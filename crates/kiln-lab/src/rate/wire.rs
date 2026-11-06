@@ -505,7 +505,7 @@ impl Scan<'_> {
         if !wants.iter().any(on) {
             return self.skip();
         }
-        let ends: Vec<usize> = wants.iter().enumerate().filter(|(_, w)| w.len() == depth && on(*w)).map(|(i, _)| i).collect();
+        let ends: Vec<usize> = wants.iter().enumerate().filter(|(_, w)| w.len() == depth && on(w)).map(|(i, _)| i).collect();
         let deeper = wants.iter().any(|w| w.len() > depth && on(w));
         match self.peek()? {
             open @ (b'{' | b'[') => {

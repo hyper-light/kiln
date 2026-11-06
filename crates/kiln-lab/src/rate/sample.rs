@@ -1,6 +1,12 @@
 //! The server's CPU and memory through a window, as the OS counts them: its whole process tree's (a server that
 //! runs under a wrapper or starts helpers is all of them), and its root process's alone. Linux reads `/proc`;
 //! macOS asks `ps` (no `/proc` there, and `ps` needs nothing of the lab's own); Windows isn't measured.
+//!
+//! On Linux also what the host did to the tree's threads: how long they waited, runnable, for a CPU (the kernel's
+//! run delay), and the scheduling policy and nice value each ran at. A host can demote a server on its own: on
+//! adacachy (CachyOS) ananicy-cpp's rule for `node` puts every Node process in the idle policy, so T3 Code's server
+//! got a CPU only when nothing else wanted one, and at 100 requests a second it answered 5 (the rate's smoke test,
+//! 2026-11-06). The lab says so rather than charge the server.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -76,6 +82,113 @@ fn proc_stat(line: &str, ticks: f64, page: u64) -> Option<Proc> {
     #[allow(clippy::cast_precision_loss)]
     let cpu_s = ticks_used as f64 / ticks;
     Some(Proc { ppid, cpu_s, rss: rss_pages * page })
+}
+
+/// A thread of the tree as Linux says it: its scheduling policy, real-time priority and nice value
+/// (`/proc/<pid>/task/<tid>/stat`'s 41st, 40th and 19th fields), and its time on a CPU and waiting, runnable, for
+/// one (`schedstat`, the kernel's `proc_pid_schedstat`: `<ran ns> <waited ns> <runs>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Thread {
+    policy: u32,
+    rt_priority: u32,
+    nice: i64,
+    /// None where the kernel keeps no thread's times (no `CONFIG_SCHED_INFO`: it says zeros).
+    ran_ns: Option<u64>,
+    waited_ns: Option<u64>,
+}
+
+/// Linux's `SCHED_IDLE` (sched(7)): a thread that gets a CPU only when nothing else wants it.
+const SCHED_IDLE: u32 = 5;
+
+/// A policy's name (sched(7), `linux/sched.h`).
+fn policy_name(p: u32) -> String {
+    match p {
+        0 => "SCHED_OTHER".into(),
+        1 => "SCHED_FIFO".into(),
+        2 => "SCHED_RR".into(),
+        3 => "SCHED_BATCH".into(),
+        SCHED_IDLE => "SCHED_IDLE".into(),
+        6 => "SCHED_DEADLINE".into(),
+        p => format!("policy {p}"),
+    }
+}
+
+/// A task's `stat` line: its policy, real-time priority and nice value, counted from the last `)` as
+/// [`proc_stat`] counts.
+fn task_stat(line: &str) -> Option<(u32, u32, i64)> {
+    let after = line.get(line.rfind(')')? + 1..)?;
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let field = |n: usize| f.get(n - 3).copied();
+    Some((field(41)?.parse().ok()?, field(40)?.parse().ok()?, field(19)?.parse().ok()?))
+}
+
+/// A `schedstat` line's time on a CPU and waiting for one, ns: none where the kernel keeps none (all zeros), as
+/// kiln's own reader takes it (`crates/kiln/src/nudge.rs`, `run_wait_of`).
+fn sched_times(line: &str) -> Option<(u64, u64)> {
+    let mut w = line.split_ascii_whitespace().map(|x| x.parse::<u64>().ok());
+    let (ran, waited, runs) = (w.next()??, w.next()??, w.next()??);
+    (ran > 0 || runs > 0).then_some((ran, waited))
+}
+
+/// Every thread of `pids` (Linux; nothing elsewhere), by its id.
+fn threads(pids: &BTreeSet<u32>) -> BTreeMap<u32, Thread> {
+    let mut out = BTreeMap::new();
+    if !cfg!(target_os = "linux") {
+        return out;
+    }
+    for pid in pids {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+        for t in tasks.flatten() {
+            let Some(tid) = t.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let Some((policy, rt_priority, nice)) = std::fs::read_to_string(t.path().join("stat")).ok().as_deref().and_then(task_stat) else { continue };
+            let times = std::fs::read_to_string(t.path().join("schedstat")).ok().as_deref().and_then(sched_times);
+            out.insert(tid, Thread { policy, rt_priority, nice, ran_ns: times.map(|t| t.0), waited_ns: times.map(|t| t.1) });
+        }
+    }
+    out
+}
+
+/// What the host did to the tree's threads between two looks `span_s` apart: their wait for a CPU (CPUs' worth,
+/// and seconds of it for each second they ran; a thread born between the looks counts from its start), the share
+/// of its time wanting a CPU that the neediest thread (the most time on one and waiting for one) waited, and their
+/// policies at the second look, most first.
+fn held(first: &BTreeMap<u32, Thread>, last: &BTreeMap<u32, Thread>, span_s: f64, w: &mut Window) {
+    let (mut ran, mut waited, mut known) = (0u64, 0u64, false);
+    let mut neediest: Option<(u64, u64)> = None;
+    for (tid, t) in last {
+        let before = first.get(tid);
+        if let (Some(r), Some(q)) = (t.ran_ns, t.waited_ns) {
+            known = true;
+            let (r, q) = (r.saturating_sub(before.and_then(|b| b.ran_ns).unwrap_or(0)), q.saturating_sub(before.and_then(|b| b.waited_ns).unwrap_or(0)));
+            (ran, waited) = (ran + r, waited + q);
+            if neediest.is_none_or(|(nr, nq)| r + q > nr + nq) {
+                neediest = Some((r, q));
+            }
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (ran_s, waited_s) = (ran as f64 / 1e9, waited as f64 / 1e9);
+    if known && span_s > 0.0 {
+        w.run_wait_share = Some(waited_s / span_s);
+        w.run_wait_per_cpu_s = (ran_s > 0.0).then(|| waited_s / ran_s);
+        #[allow(clippy::cast_precision_loss)]
+        let need = neediest.filter(|(r, q)| r + q > 0).map(|(r, q)| q as f64 / (r + q) as f64);
+        w.neediest_wait_share = need;
+    }
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    for t in last.values() {
+        let how = match t.policy {
+            1 | 2 => format!("{} priority {}", policy_name(t.policy), t.rt_priority),
+            6 => policy_name(t.policy),
+            _ => format!("{} nice {}", policy_name(t.policy), t.nice),
+        };
+        *groups.entry(how).or_default() += 1;
+    }
+    let mut groups: Vec<(String, usize)> = groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    w.sched = (!groups.is_empty()).then(|| groups.iter().map(|(how, n)| format!("{n} {how}")).collect::<Vec<_>>().join(", "));
+    w.idle_threads = last.values().filter(|t| t.policy == SCHED_IDLE).count();
+    w.threads = last.len();
 }
 
 /// `ps`'s CPU time (`[[dd-]hh:]mm:ss[.ss]`) in seconds.
@@ -172,12 +285,35 @@ pub struct Window {
     pub root_rss_mb_max: Option<f64>,
     pub procs: usize,
     pub samples: usize,
+    /// Linux: the tree's threads' wait, runnable, for a CPU through the window, CPUs' worth (1.0: one thread
+    /// waiting throughout), and the seconds they waited for each second they ran: the host's other work holding
+    /// the server back.
+    #[serde(default)]
+    pub run_wait_share: Option<f64>,
+    #[serde(default)]
+    pub run_wait_per_cpu_s: Option<f64>,
+    /// Linux: of the thread that wanted a CPU the most through the window (its time on one and waiting for one,
+    /// together), the share of that it waited: the hold on what is likely the server's bottleneck (a single-threaded
+    /// server's loop), which its other threads' waits can hide (Node's own workers, not demoted with its loop).
+    #[serde(default)]
+    pub neediest_wait_share: Option<f64>,
+    /// Linux: the tree's threads at the window's end by scheduling policy and nice value, most first
+    /// (`16 SCHED_OTHER nice 0, 2 SCHED_IDLE nice 16`), how many there were, and how many of them in the idle
+    /// policy, which gets a CPU only when nothing else wants one.
+    #[serde(default)]
+    pub sched: Option<String>,
+    #[serde(default)]
+    pub threads: usize,
+    #[serde(default)]
+    pub idle_threads: usize,
 }
 
-/// Samples `tree` from `from` to `to`, every [`EVERY`], and sums them up.
+/// Samples `tree` from `from` to `to`, every [`EVERY`], and sums them up, with what the host did to its threads
+/// between the window's ends.
 pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
     std::thread::sleep(from.saturating_duration_since(Instant::now()));
     tree.find();
+    let (first, looked) = (threads(&tree.pids), Instant::now());
     let mut points: Vec<(f64, Usage)> = Vec::new();
     let mut next = Instant::now();
     loop {
@@ -191,7 +327,9 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
         next += EVERY;
         std::thread::sleep(next.min(to).saturating_duration_since(Instant::now()));
     }
-    summarize(&points)
+    let mut w = summarize(&points);
+    held(&first, &threads(&tree.pids), looked.elapsed().as_secs_f64(), &mut w);
+    w
 }
 
 fn summarize(points: &[(f64, Usage)]) -> Window {
@@ -243,5 +381,54 @@ mod tests {
         // This process, as the OS says it now.
         let me = Tree::of(std::process::id());
         assert!(cfg!(not(unix)) || me.now().is_some_and(|u| u.procs >= 1 && u.rss > 0), "{:?}", me.now());
+    }
+
+    /// Goal 10 (Ada's fixed-rate benchmark; the rate mode's smoke test, 2026-11-06): what the host did to a server's
+    /// threads through a window. A task's `stat` line gives its policy, real-time priority and nice value; its
+    /// `schedstat` its time on a CPU and waiting for one (none where the kernel keeps none); between two looks the
+    /// threads' waits are summed (a thread born between them from its start), as CPUs' worth and as seconds for each
+    /// second they ran, and their policies are said most first, the idle policy's counted.
+    #[test]
+    fn rate_the_hosts_hold_on_a_servers_threads_is_seen() {
+        let line = |nice: &str, rt: &str, policy: &str| {
+            let mut f: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
+            for (n, v) in [(3, "S"), (19, nice), (40, rt), (41, policy)] {
+                if let Some(x) = f.get_mut(n - 3) {
+                    *x = v.to_owned();
+                }
+            }
+            format!("1150491 (node (Main) x) {}", f.join(" "))
+        };
+        assert_eq!(task_stat(&line("16", "0", "5")), Some((SCHED_IDLE, 0, 16)));
+        assert_eq!(task_stat(&line("-4", "1", "2")), Some((2, 1, -4)));
+        assert_eq!(task_stat("12 (short) S 1 2 3"), None);
+        assert_eq!(sched_times("1500 3000 7\n"), Some((1500, 3000)));
+        assert_eq!(sched_times("0 0 0\n"), None, "no CONFIG_SCHED_INFO: the kernel says zeros");
+        assert_eq!(sched_times("x"), None);
+        let t = |policy: u32, rt_priority: u32, nice: i64, ran: f64, waited: f64| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ns = |s: f64| Some((s * 1e9) as u64);
+            Thread { policy, rt_priority, nice, ran_ns: ns(ran), waited_ns: ns(waited) }
+        };
+        let first = BTreeMap::from([(1, t(0, 0, 0, 1.0, 0.5)), (2, t(SCHED_IDLE, 0, 16, 2.0, 1.0)), (9, t(0, 0, 0, 5.0, 5.0))]);
+        // 1 ran 0.5 s and waited 1; 2 ran 0.5 and waited 3; 3, born since, ran 0.25 and waited 0.5; 9 ended.
+        let last = BTreeMap::from([(1, t(0, 0, 0, 1.5, 1.5)), (2, t(SCHED_IDLE, 0, 16, 2.5, 4.0)), (3, t(SCHED_IDLE, 0, 16, 0.25, 0.5)), (4, t(2, 1, 0, 0.0, 0.0))]);
+        let mut w = Window::default();
+        held(&first, &last, 2.0, &mut w);
+        let near = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-9);
+        assert!(near(w.run_wait_share, 2.25) && near(w.run_wait_per_cpu_s, 3.6), "4.5 s waited over 2 s, against 1.25 s ran: {w:?}");
+        assert!(near(w.neediest_wait_share, 3.0 / 3.5), "the neediest, 2, wanted a CPU 3.5 s and waited 3 of them: {w:?}");
+        assert_eq!(w.sched.as_deref(), Some("2 SCHED_IDLE nice 16, 1 SCHED_OTHER nice 0, 1 SCHED_RR priority 1"));
+        assert_eq!((w.threads, w.idle_threads), (4, 2));
+        // A kernel that keeps no thread's times: the policies, and no wait.
+        let blind = BTreeMap::from([(1, Thread { ran_ns: None, waited_ns: None, ..t(0, 0, 10, 0.0, 0.0) })]);
+        let mut w = Window::default();
+        held(&BTreeMap::new(), &blind, 2.0, &mut w);
+        assert_eq!((w.run_wait_share, w.run_wait_per_cpu_s, w.neediest_wait_share, w.sched.as_deref()), (None, None, None, Some("1 SCHED_OTHER nice 10")));
+        // This process's own threads, as Linux says them now.
+        if cfg!(target_os = "linux") {
+            let mine = threads(&BTreeSet::from([std::process::id()]));
+            assert!(mine.contains_key(&std::process::id()), "its main thread among {:?}", mine.keys().collect::<Vec<_>>());
+        }
     }
 }

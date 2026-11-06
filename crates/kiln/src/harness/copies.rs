@@ -2474,7 +2474,7 @@ pub struct Shard {
     write: Option<Writing>,
     /// What was made of the event last written out so, or tried, for the update's next take alone ([`Shard::take_written`]).
     written: Option<Written>,
-    /// Events written out so ([`Shard::written_off`]), counted for the tests that read it.
+    /// Events written out so ([`Shard::written_off`]): its tests' count.
     #[cfg(test)]
     written_off: u64,
     /// A frame of a session's events long to write (a large tool output's megabytes), with its session: written off the shard
