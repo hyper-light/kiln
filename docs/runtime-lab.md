@@ -2226,13 +2226,20 @@ frame pointers), and what reads each:
 | `.rodata`, `.data`, `.data.rel.ro` | | measured by section (below) | g11pages: about 6 MB of read-only data and 2 MB of data resident; BOLT moves code, not data. Rust's statics have sections of their own, so the same linker order (below) could lay out the data a profile of loads names: next only if `sections.txt` shows them past a few MB once the code is laid out |
 
 So the binary's pages fall only by layout: **BOLT**, or failing it, **the linker's order**, both from a profile of
-the lab's realistic profile, off unless `ci/release/build.sh`'s `KILN_RELEASE_BOLT` says (x86_64 musl alone):
+the lab's realistic profile, off unless `ci/release/build.sh`'s `KILN_RELEASE_BOLT` says (x86_64 musl alone). BOLT's
+first gain isn't the pages: the code the shards run laid out together takes fewer I-cache lines and iTLB entries, so
+less CPU a request and a shorter busy share, which come first under Ada's rule (latency and throughput before memory);
+the pages follow from the same layout.
 - `relocs`: the release built keeping its relocations and symbols (strip off, linked through `zig-relocs.sh`:
-  `--emit-relocs`, a build id) in `<target>/bolt`; `dist/` gets it stripped, the release as it would ship: what the
-  lab profiles, and the A/B's side without a layout.
-- a BOLT profile (`.fdata`, `.yaml`): that build laid out by `llvm-bolt` (`bolt.sh optimize`: the functions the
-  profile saw together by `cdsort`, their blocks that didn't run split out, identical ones folded; what didn't run
-  left where the linker put it), stripped.
+  `--emit-relocs`, a build id) in `<target>/bolt`, with a cargo-zigbuild cache of its own (`CARGO_ZIGBUILD_CACHE_DIR`:
+  the linker wrapper cargo-zigbuild writes exports the zig it runs and is named by target alone, so in the shared
+  cache any other build of x86_64 musl on the machine rewrites it mid-build and the link skips `zig-relocs.sh`, as
+  happened on adacachy at 07:28Z 2026-11-06, `bolt.sh check` refusing the result); `dist/` gets it stripped, the
+  release as it would ship: what the lab profiles, and the A/B's side without a layout.
+- a BOLT profile (`.fdata`, `.yaml`): that build laid out by `llvm-bolt` (`bolt.sh optimize`, the options below),
+  stripped, and shipped only once `bolt.sh same` says it's the same program (one build: its build id, which llvm-bolt
+  patches, "flipped last bit", so a profile of one is never taken for the other's; one `--version`; its code moved);
+  what the profile covered beside BOLT's log (`kiln.bolt.txt`), never in `dist/`. BOLT failing fails the build.
 - an order (`.order`, `bolt.sh order`'s: every function a profile saw, hottest first, named as the unstripped build
   names them): that build linked with those functions first, in that order (LLD's `--symbol-ordering-file`), and
   stripped. No BOLT and no rewrite: perf and the linker alone, whole functions moved, none split. Checked on a Rust
@@ -2240,124 +2247,212 @@ the lab's realistic profile, off unless `ci/release/build.sh`'s `KILN_RELEASE_BO
   lead `.text` in the profile's order. A binary in `<target>/bolt` linked in another order than the one asked is
   removed first, so cargo relinks it (`kiln.linked-order` beside it says which).
 
-**The tools** (read, 2026-11-06):
+**The tools** (adacachy read 2026-11-06 ~07:10Z; fedora's runner didn't answer then, so its column is g11-bolt's
+reading of ~02:00Z; `scripts/memory_lab/bolt-lab.sh tools` reads a machine's row):
 
 | | adacachy | fedora (the lab) |
 | --- | --- | --- |
-| `llvm-bolt`, `perf2bolt`, `merge-fdata` | not installed; CachyOS's 23.1.4 unpacked at `~/.cache/kiln-g11s5-layout/tools/llvm-bolt-23.1.4/usr/bin` (runs; it takes glibc 2.44, so not on fedora) | not installed; Fedora's `llvm-bolt` 22.1.8 in `updates` (`dnf download`, no root); else `bolt.sh tools` fetches LLVM 23.1.5's release once (1.2 GB) |
-| `ld.lld` | LLD 23.1.1; zig 0.17.0's own LLD 22.1.8 links kiln: both take `--symbol-ordering-file`, `--call-graph-ordering-file`, `--icf` | none; zig on `PATH` is 0.16.0 |
-| perf | `/usr/bin/perf` 7.2.10 | none installed; `~/.cache/kiln-g9-subms-shards/perf-root`'s 7.2.15 (`PERF_LIBS=<it>/usr/lib64`) |
-| branch records | Zen 5's LbrExtV2 (`amd_lbr_v2`) | arch LBR, 32 entries, on every CPU (`cpu_core` 0-15, `cpu_atom` 16-31) |
-| `perf_event_paranoid` | 2: a user's own processes, user space | 2 |
+| CPU, branch records | AMD Ryzen 9 9950X3D2 (Zen 5): LbrExtV2 (`amd_lbr_v2`); `bolt.sh lbr`: yes | i9-14900HX: arch LBR, 32 entries, every CPU (`cpu_core` 0-15, `cpu_atom` 16-31, the lab's server's) |
+| perf | `/usr/bin/perf` 7.2.10 | none installed; `~/.cache/kiln-g9-subms-shards/perf-root`'s 7.2.15 (`PERF=<it>/usr/bin/perf PERF_LIBS=<it>/usr/lib64`) |
+| `perf_event_paranoid` | 2: a user's own processes, user space, enough for `perf record -e cycles:u -j any,u -p <pid>` | 2 |
+| `llvm-bolt`, `perf2bolt`, `merge-fdata` | none installed or on `PATH`; CachyOS's 23.1.4 unpacked, not installed, at `~/.cache/kiln-g11s5-layout/tools/llvm-bolt-23.1.4/usr/bin` (`KILN_BOLT_BIN`; it takes glibc 2.44) | none; Fedora's `llvm-bolt` 22.1.8 in `updates`, untried; `bolt.sh tools` would fetch LLVM 23.1.5's release (1.2 GB) |
+| linkers | `ld.lld` 23.1.1; zig 0.17.0's own LLD 22.1.8 links kiln | zig 0.16.0 on `PATH` |
+| glibc | 2.44 | 2.43 |
 
-fedora has LBR, so the profile is perf's branch records: no frame-pointer build, no instrumented one unless the
-records miss functions (below).
+Nothing has to be installed on fedora: perf records there, the recordings come to adacachy, whose `perf2bolt` (with
+adacachy's perf, matching them to the build by its build id) and `llvm-bolt` lay the build out, and the laid-out build
+goes back for the smoke and the A/B. Installing BOLT on fedora (Fedora's package, or `bolt.sh tools`'s fetch) is the
+coordinator's call.
 
-**The lab to run** (the coordinator's). The build, rt-next with this step merged, where release builds go, no spaces
-in its paths:
+**The pipeline** (`scripts/memory_lab/bolt-lab.sh`, a stage a command; tested with stand-ins in
+`scripts/test_bolt.py`):
+1. **The build**, production's (x86_64 musl, jemalloc, thin LTO), relocations kept:
+   `KILN_RELEASE_BOLT=relocs ci/release/build.sh x86_64-unknown-linux-musl`. Two binaries of one build id:
+   `dist/kiln-x86_64-unknown-linux-musl` (stripped: the release, the A side, what the lab profiles) and
+   `<target>/bolt/x86_64-unknown-linux-musl/release/kiln` (relocations and symbols: BOLT's input).
+2. **The profile**, `bolt-lab.sh record <kiln> <kiln-lab> <dir> <rounds>`: rounds of the realistic profile in
+   production's layout, perf recording the server from its start to its window's end (`bolt-hook.sh`,
+   `BOLT_RECORD=auto`), since what stays resident at the window's end is all the server touched after startup's drop:
+   the runners connecting, the fill, the window. `auto` is perf's branch stacks wherever the CPU records them (`bolt.sh
+   lbr` asks perf, recording `true` with `-j any,u`): BOLT's README's `perf record -e cycles:u -j any,u`, at `-F max`
+   (`BOLT_FREQ`): perf's "currently maximum allowed frequency, i.e. the value in the kernel.perf_event_max_sample_rate
+   sysctl", a rate the kernel learns, lowering it machine-wide while sampling takes more of the CPU than
+   `kernel.perf_cpu_time_max_percent` allows. At perf's own default, 4,000 a second, a round on adacachy gave BOLT 72
+   times too few samples by its own estimate; the kernel allowed 50,000 there. Elsewhere,
+   `-e cycles:u --call-graph dwarf`: samples with their call graphs (DWARF's, as the release keeps no frame pointers),
+   whose addresses alone perf2bolt reads (`-ba`, the README's "If the profile was collected without brstacks"); the
+   call graphs are for reading the profile. Each round's `perf.log` says which perf took, and `bolt.sh profile` says it
+   of each recording. Both of the lab's machines record LBR.
+3. **The layout**, `bolt-lab.sh bolt <kiln.relocs> <dir>`: every recording to one profile (`perf2bolt`, merged by
+   `merge-fdata`), the build laid out by it (`kiln.bolt`), what it covered (`kiln.bolt.txt`: llvm-bolt's version, the
+   functions with a profile, the instructions it ran by `-dyno-stats`, the hot and cold bytes split apart, ICF, lite
+   mode, warnings), and the same profile as YAML (`kiln.yaml`, from the same pass of perf2bolt, as OptimizingClang.md's
+   `perf2bolt ... -o clang-7.fdata -w clang-7.yaml`) for later commits' builds (`-infer-stale-profile`). How long to
+   profile is BOLT's to say, two ways, and the rounds each takes are derived from what the rounds so far gave it
+   (`rounds.txt`, the more of the two): its README's "We recommend the profile to cover 1B instructions as reported by
+   BOLT -dyno-stats option", and perf2bolt's own estimate from each recording's samples against the code they fell in,
+   "BOLT is estimated to optimize better with <N>x more samples". The 1B is the README's round figure, which Ada's rule
+   doesn't count even cited; perf2bolt's estimate is measured, against a threshold inside BOLT: the coordinator says
+   whether either stands. `bolt-lab.sh profile` runs 2 and 3 on one machine, one round and then as many as they ask.
+4. **The same program**, `bolt-lab.sh smoke <kiln> <kiln.bolt> <kiln-lab> <dir>`: `bolt.sh same` (one build, BOLT's
+   build id its input's with the last bit flipped; one `--version`; the code moved), then a round of the small profile
+   against each, A then B, every class
+   the lab times in a minute: B's round done and its errors no more than A's (`bolt-read.py smoke`). kiln's lib tests
+   can't run BOLTed (their binary isn't the server), so the server's own run is the check.
+5. **The A/B**, `bolt-lab.sh ab <kiln> <kiln.bolt> <kiln-lab> <dir>`: below.
+
+**The options**, every one from BOLT's own documents (its README's step 3 command whole, `llvm-project/bolt/README.md`,
+and its command-line reference, `bolt/docs/CommandLineArgumentReference.md`), none a number of ours:
+
+| Option | Where BOLT documents it | What it does here |
+| --- | --- | --- |
+| `-reorder-blocks=ext-tsp` | README step 3; reference: "perform layout optimizing I-cache behavior" | each function's blocks in the order the profile ran them |
+| `-reorder-functions=cdsort` | README step 3; reference: "use cache-directed sort", which "works only with relocations" | functions that run together laid out together: fewer I-cache lines, iTLB entries and pages |
+| `-split-functions` | README step 3; reference: "split functions into fragments", by default `-split-strategy=profile2`, "a hot and cold fragment using profiling information" | the blocks that ran apart from those that didn't |
+| `-split-all-cold` | README step 3; reference: "outline as many cold basic blocks as possible" | every cold block out of the hot code |
+| `-split-eh` | README step 3; reference: "split C++ exception handling code" | the landing pads out: they run only as a contained panic unwinds |
+| `-dyno-stats` | README step 3; reference: "print execution info based on profile" | what the profile covered, which the README's recommendation is read in |
+| `-icf=safe` | reference: "Enable safe identical code folding" (`OptimizingClang.md` folds with `-icf=1`) | identical functions folded where nothing takes their address, as the binary's C may compare them |
+| not `-use-gnu-stack` | `OptimizingClang.md` uses it, the reference's "workaround for issues with strip/objcopy" | it would take over `PT_GNU_STACK`, which musl reads as its threads' default stack (zig links 16 MiB there); BOLT's own headers strip and run |
+| lite mode, as llvm-bolt sets it | reference: "skip processing of cold functions" | what the profile didn't see stays where the linker put it (`.bolt.org.text`), untouched and not resident |
+
+Documented but not taken, each its own A/B once this one holds: `-split-strategy=cdsplit` (the reference's "a hot,
+warm, and cold fragment"), and `-hugify` ("put hot code on 2MB page(s) (hugify) at runtime": fewer iTLB misses still,
+but the server turns transparent huge pages off for itself, part 6 below, and a static binary needs BOLT's runtime
+linked in for it).
+
+**The dry run on adacachy** (2026-11-06: the pipeline whole on kiln's real release, origin/main `e144811a934`,
+beside production, so the rounds in the shared layout in a unit at `CPUWeight=1`, nothing pinned, BOLT capped; its
+latencies aren't the lab's and decide nothing; files in `~/.cache/kiln-g11-bolt2/{build,dry,dry2}`):
+- **The build**, production's with relocations: 15 min 45 s at `-j 4` under `MemoryMax=20G` (kiln's lib peaked at
+  18.2 GB); the release 266 MB stripped, its relocations build 485 MB, one build id. The first attempt kept no
+  relocations: the shared cargo-zigbuild wrapper, rewritten mid-build by another x86_64 musl build, ran the plain zig,
+  and `bolt.sh check` refused the binary; the cache of its own fixed it.
+- **The profile**, LBR (Zen 5's LbrExtV2, about 14.5 branch records a sample). At perf's default 4,000 a second, one
+  round: 133,537 samples, 40.0M instructions by `-dyno-stats`, 6,123 of 200,299 functions with a profile, perf2bolt's
+  "72.0x more samples". At `-F max`, 50,000 a second (the kernel kept it there), one round gave 557.8M instructions and
+  "5.8x more samples", so `bolt-lab.sh profile` took 6 rounds (the README's figure alone, 2): 3.45B instructions,
+  10,560 functions with a profile, about 0.7 GB of `perf.data` a round, 15 minutes all told. While a profile's perf
+  records it holds the user's whole `perf_event_mlock_kb`, so any other perf of the same user fails meanwhile ("Permission
+  error mapping pages"): profile where nothing else of that user profiles.
+- **The cost**: perf2bolt about 50 s and 22.7 GiB a recording (it reads every function of the binary, and runs strict:
+  "-strict and -lite cannot be used at the same time"); llvm-bolt 22 to 29 s and 4.0 GiB, at 4 threads, at all 32 or
+  with none.
+- **Repeatable**: llvm-bolt's layout came out the same bytes at every thread count and on every path; only its
+  `.note.bolt_info`, its command line, told them apart, which `optimize` now strips.
+- **The layout** of the six rounds' profile (`dry2/kiln.bolt`, sha256 `2ae48f68…`): 4.23 MB of hot code split from
+  10.07 MB of cold (29.6% of the split functions' bytes hot), 8,966 functions' blocks reordered, 400 identical ones
+  folded; BOLT's new text a segment of its own (32 MiB at `0x11000000`), the original `.text` left where it was (lite).
+  Its 18 warnings are aws-lc's hand-written assembly (FDE conflicts, internal calls), which BOLT leaves as it is.
+- **The same program**: `bolt.sh same` (build id `b3002122…f13`, its last bit flipped as BOLT patches it; both say
+  `kiln 0.2.0`), then the smoke: each build's round done, 0 errors each.
+- **One calm realistic round of each** (one round on a busy host: a look, no noise interval):
+
+| | the release | BOLTed |
+| --- | --- | --- |
+| the binary resident (sections.txt) | 104.9 MB, 1,726 of 4,063 windows | 19.4 MB, 588 of 4,605 |
+| its code | 94.6 MB, 1,565 of 3,014 windows | 15.0 MB, 442 of 3,250: hot `.text` 4.5 MB on all its 78, `.text.cold` 4.7, `.bolt.org.text` 5.8 (what ran that the profile missed) |
+| its read-only data | 6.8 MB | 3.2 MB |
+| `server.rss_file_mb` | 107.3 | 19.9 |
+| `server.cpu_ms_per_request` | 2.52 | 2.23 |
+| `shards.busy_share` (the worst shard's) | 0.009 (0.015) | 0.008 (0.010) |
+
+  Its latencies moved both ways (attach p99 35 to 92 ms, websocket p99.9 6.6 to 3.1 ms), as one round on a busy
+  machine's do: the lab's 8 and 8 say. Which profile is B's: the lab's own machine's (aws-lc picks its code by the CPU
+  at run time: AVX2 on fedora's cores, AVX-512 on Zen 5), or adacachy's, ready now and from production's CPU; the A/B
+  can take both, one B each.
+
+**The A/B** (the coordinator's lab, fedora): A the release (`dist/`'s build), B it BOLTed (`kiln.bolt`), 8 rounds calm
+and 8 with as many hogs as the server's CPUs, production's layout as goal 9's lab runs it (the lab's clients on CPUs
+0-15, the server and its hogs on 16-31, `KILN_RT_SHARDS=4`, the shards the server sizes itself to on those 16 CPUs),
+each round's pages and sections written as its window ends (`bolt-hook.sh`, `BOLT_RECORD` none):
 
 ```sh
-B=$HOME/.cache/kiln-g11-bolt-build; mkdir -p $B/tmp
-CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=$B/target TMPDIR=$B/tmp KILN_DIST=$B/dist KILN_UI_SERVER=off \
-  KILN_RELEASE_BOLT=relocs nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
-#   $B/dist/kiln-x86_64-unknown-linux-musl                 stripped: the A side, and what the lab profiles
-#   $B/target/bolt/x86_64-unknown-linux-musl/release/kiln  the same build id, its relocations and symbols kept
+L=$HOME/.cache/kiln-g11-bolt-lab; P=$HOME/.cache/kiln-g9-subms-shards/perf-root
+# $L/bin: kiln (dist's), kiln.relocs (adacachy keeps it for `bolt`), kiln-lab (train 27's or newer), and this tree's
+#   ci/release/bolt.sh with scripts/memory_lab/{bolt-lab.sh,bolt-hook.sh,bolt-read.py,sections.py,kinds.py}
+export BOLT_SH=$L/bin/bolt.sh
+# the profile: one round, then as many as rounds.txt says (bolt on adacachy, its recordings carried over)
+PERF=$P/usr/bin/perf PERF_LIBS=$P/usr/lib64 $L/bin/bolt-lab.sh record $L/bin/kiln $L/bin/kiln-lab $L/prof 1
+#   adacachy: KILN_BOLT_BIN=~/.cache/kiln-g11s5-layout/tools/llvm-bolt-23.1.4/usr/bin KILN_BOLT_ARGS=-thread-count=4 \
+#     bolt-lab.sh bolt <kiln.relocs> <the recordings' dir>   -> kiln.bolt, kiln.bolt.txt, kiln.yaml, rounds.txt
+# or adacachy's six-round layout of the same build, ready: ~/.cache/kiln-g11-bolt2/dry2/kiln.bolt (sha256 2ae48f68...),
+#   its release ~/.cache/kiln-g11-bolt2/build/dist/kiln-x86_64-unknown-linux-musl (de444215...)
+$L/bin/bolt-lab.sh smoke $L/bin/kiln $L/bin/kiln.bolt $L/bin/kiln-lab $L/smoke
+$L/bin/bolt-lab.sh ab $L/bin/kiln $L/bin/kiln.bolt $L/bin/kiln-lab $L/ab
+#   = for hogs in 0 1x: taskset -c 0-15 kiln-lab ab --a kiln --b kiln.bolt --label-a release --label-b bolt
+#     --env-a KILN_RT_SHARDS=4 --env-b KILN_RT_SHARDS=4 --profile realistic --rounds 8 --hogs $hogs
+#     --layout production --server-cpus 16-31 --out $L/ab/{calm,hogs}/run, each in a user unit at MemoryMax=16G
 ```
 
-Or the lab's glibc build, by `relbuild.sh` as it is, its environment saying how (a target dir of its own: strip off
-changes every unit's flags):
+What to read: `$L/ab/{calm,hogs}/run/report.md` (every number B against A, with its noise) and `$L/ab/read.md`
+(`bolt-read.py ab`: the medians, and the binary's pages by section):
+- the server's CPU per request (`server.cpu_ms_per_request`) and the shards' busy share (`shards.busy_share`,
+  `shards.worst_busy_share`): where fewer I-cache and iTLB misses show first;
+- every latency number: each class's p50, p99, p99.9 and most (`page`, `api_read`, `api_write`, `websocket`,
+  `attach`), the shards' delay (`shards.delay_*_us`, the worst shard's), each route's server-side took and wait;
+- `server.rss_file_mb` (the binary's pages at the window's end), `server.rss_mb`, `server.rss_anon_mb`;
+- `read.md`'s sections, each build's median: the code (every `.text` section together, so A's `.text` against B's
+  hot `.text`, `.text.cold` and `.bolt.org.text`, and each apart) by resident KiB, 4 KiB pages and 64 KiB windows
+  touched; the read-only data, the unwinding tables (near 0 unless something unwinds), the data, all of it. B's
+  `.bolt.org.text` is code that ran which the profile missed, a window each (about 47 KB): if it's most of B's code,
+  profile every edge instead (`bolt.sh instrument`, below) and A/B again.
+- **B ships** (the release builds with `KILN_RELEASE_BOLT`, below) if no latency or throughput number is worse beyond
+  noise, calm or with hogs (Ada's rule), and the CPU per request, the busy share or the file pages are better beyond
+  it.
+- **If BOLT fails, or its binary misbehaves or is slower**, the linker's order, from the same recordings
+  (`bolt.sh order <kiln.relocs> kiln.order <perf.data>...`, then the build again with `KILN_RELEASE_BOLT=<kiln.order>`:
+  only the executable relinks), A/B'd the same way. Every edge counted rather than sampled:
+  `bolt.sh instrument <kiln.relocs> kiln.instr <dump>`, rounds with `BOLT_RECORD=instrumented BOLT_DUMP=<dump>`,
+  `merge-fdata` of their `instr-window.fdata` (Fedora's BOLT may want
+  `KILN_BOLT_ARGS=-runtime-instrumentation-lib=<its libbolt_rt_instr.a>`).
 
-```sh
-TARGET=$HOME/.cache/kiln-rt-int/target-bolt CARGO_PROFILE_RELEASE_STRIP=false KILN_ZIG_REAL=$HOME/.local/bin/zig \
-  CARGO_ZIGBUILD_ZIG_COMMAND=$HOME/.cache/kiln-rt-int/relsrc/ci/release/zig-relocs.sh \
-  ~/.cache/kiln-rt-int/tools/relbuild.sh g11bolt <sha> lab
-gzip -1 -c $HOME/.cache/kiln-rt-int/target-bolt/x86_64-unknown-linux-gnu/release/kiln \
-  > ~/.cache/kiln-rt-int/xfer/g11bolt-kiln.relocs.gz      # relbuild.sh ships only the stripped copy
-```
+**BOLT in kiln's release build: what it would take** (Ada decides every part; this tree does what lives in its scripts
+and docs):
+- **The profile, and its home.** The release would build with `KILN_RELEASE_BOLT=<kiln.yaml>`: the lab's latest
+  profile as YAML, which llvm-bolt matches to a later commit's functions by their hashes (`-infer-stale-profile`), so
+  one profile serves the commits after it until the code it describes has changed; each BOLT lab writes a new one
+  (`bolt-lab.sh bolt`). It needs a place the release jobs read: checked in (`ci/release/kiln.bolt.yaml`,
+  31 MB for the dry run's six rounds, 2.7 MB zstd'd), or an artifact kiln keeps beside its releases.
+- **The tools at release time**: llvm-bolt alone, no perf (`bolt.sh tools` checks perf2bolt and merge-fdata beside
+  it): `KILN_BOLT_BIN` (a distribution's: Fedora's and Arch's `llvm-bolt`, Debian's `bolt-<n>`), or `bolt.sh tools`'s
+  pinned LLVM 23.1.5 release fetched once per machine into `~/.cache/kiln-bolt` (1.2 GB, zstd and curl, checked
+  against GitHub's digest).
+- **kiln's release and image** (`.kiln/release.yaml`, `.kiln/image.yaml`): their shared "x86_64 musl" step, whose text
+  is its memo key in both (W28-R78), changes in both alike:
+  `KILN_COMMIT=$KILN_SHA KILN_RELEASE_BOLT=ci/release/kiln.bolt.yaml nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl`;
+  their `requires` gain what the tools need (`tools has zstd` for the fetch, or a machine with llvm-bolt);
+  `timeout-minutes: 90` holds BOLT's time easily (llvm-bolt took 22 to 29 s here, below). The image takes `dist/`'s
+  binary (`--target prebuilt`), so it ships BOLTed with no change of its own.
+- **GitHub's release** (`.github/workflows/release.yml`): the x86_64 musl leg's "Build" step with the same
+  `KILN_RELEASE_BOLT`, and llvm-bolt on `ubuntu-latest` (`bolt.sh tools`'s fetch, or apt.llvm.org's `bolt-<n>`); its
+  "Check the binary" step already runs `--version`, which `bolt.sh same` has by then.
+- **The Dockerfile's own build** (`docker build .`'s `build` stage: alpine's toolchain, no zig) stays as it is. It
+  isn't production's image (that's `prebuilt`); BOLTing it would take `-C link-arg=-Wl,--emit-relocs`, llvm-bolt in the
+  stage and the profile in its context.
+- **CI** (`.kiln/ci.yaml`): the scripts' tests as a job beside `locks` (seconds, offline; what needs cc, readelf, zstd
+  or a real BOLT skips), so they don't rot between labs:
 
-On fedora, `$L/bin` takes the stripped `kiln`, the unstripped `kiln.relocs`, a `kiln-lab`, and this tree's
-`ci/release/bolt.sh`, `scripts/memory_lab/bolt-hook.sh` and `scripts/memory_lab/sections.py` (the hook finds it
-beside itself):
-
-```sh
-L=$HOME/.cache/kiln-g11-bolt-lab; mkdir -p $L/bin $L/tools
-P=$HOME/.cache/kiln-g9-subms-shards/perf-root; export PERF=$P/usr/bin/perf PERF_LIBS=$P/usr/lib64
-(cd $L/tools && dnf download llvm-bolt && rpm2cpio llvm-bolt-*.rpm | cpio -idm)
-export KILN_BOLT_BIN=$L/tools/usr/bin; $KILN_BOLT_BIN/llvm-bolt --version   # built against llvm-libs 22.1.8; if
-#   the installed 22.1.1 won't do, `dnf download llvm-libs` too and LD_LIBRARY_PATH=$L/tools/usr/lib64, or unset
-#   KILN_BOLT_BIN and bolt.sh fetches LLVM's release
-LD_LIBRARY_PATH=$PERF_LIBS $PERF record -e cycles:u -j any,u -o $L/smoke.data -- python3 -c 'sum(range(10**7))' &&
-  LD_LIBRARY_PATH=$PERF_LIBS $PERF evlist -v -i $L/smoke.data | grep -c BRANCH_STACK          # LBR records: 1 or 2
-```
-
-1. The profile: 3 rounds of the realistic profile, calm, in production's layout, perf recording the server's branch
-   records from its start to the window's end (what's resident then is all it touched since startup's drop). Est.
-   0.4 GB of `perf.data` a round (perf's 4,000 samples a second of the server's 0.83 CPU, each with its 32
-   records); `-E BOLT_FREQ=1000` takes a quarter:
-
-   ```sh
-   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-prof -p MemoryMax=16G --working-directory=$L \
-     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
-     -E BOLT_SH=$L/bin/bolt.sh -E BOLT_RECORD=lbr -E PERF=$PERF -E PERF_LIBS=$PERF_LIBS \
-     taskset -c 0-15 $L/bin/kiln-lab run --kiln $L/bin/kiln --label relocs --env KILN_RT_SHARDS=4 \
-     --profile realistic --rounds 3 --hogs 0 --layout production --server-cpus 16-31 --out $L/prof
-   ```
-
-2. BOLT (time and memory on the 255 MB binary unmeasured; minutes in its lite mode):
-
-   ```sh
-   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh profile $L/bin/kiln.relocs $L/kiln.fdata $L/prof/rounds/*.hook/perf.data
-   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh optimize $L/bin/kiln.relocs $L/kiln.fdata $L/bin/kiln.bolt
-   ```
-
-   If perf2bolt balks at the hybrid CPU's two events, profile again with `-E BOLT_EVENT=cpu_atom/cycles/u` (the
-   server's CPUs are E-cores). `$L/bin/kiln.relocs.bolt.log` says the profile's coverage ("have non-empty
-   execution profile"), "splitting separates H hot bytes", what ICF folded, and any function it couldn't move.
-
-3. The A/B, BOLT against none, 8 rounds calm, then the same with hogs (`--hogs 16 --out $L/ab-hogs`):
-
-   ```sh
-   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-ab -p MemoryMax=16G --working-directory=$L \
-     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
-     taskset -c 0-15 $L/bin/kiln-lab ab --a $L/bin/kiln --b $L/bin/kiln.bolt --label-a relocs --label-b bolt \
-     --env-a KILN_RT_SHARDS=4 --env-b KILN_RT_SHARDS=4 --profile realistic --rounds 8 --hogs 0 \
-     --layout production --server-cpus 16-31 --out $L/ab-calm
-   ```
-
-4. What to read:
-   - `report.md`: `server.rss_file_mb` (the binary's pages at the window's end; expected from about 105 to 12 to 17),
-     `server.rss_mb`, `server.rss_anon_mb`, and every latency number beyond noise.
-   - each round's `rounds/*.hook/sections.txt` (`sections.py`): on B, the new `.text` is the hot code BOLT laid
-     out, `.bolt.org.text` what the profile missed (each function it missed costs a window, about 47 KB), and
-     `.text.cold` what it split out; on both, `.rodata`, `.data.rel.ro`, `.data`, and `.eh_frame` with
-     `.gcc_except_table` (near 0 unless something unwinds). `pages.txt` says the same by mapping.
-   - **BOLT's layout ships** if the file pages fall beyond noise and no latency number is worse beyond noise: the
-     release then builds with `KILN_RELEASE_BOLT=<profile>`, the profile written as YAML for later commits
-     (`bolt.sh profile ... kiln.yaml`, applied with `-infer-stale-profile`), until a lab profiles again.
-   - **If B's `.bolt.org.text` holds more than about 10 MB**, the records missed what ran: profile every edge instead,
-     and A/B again:
-
-     ```sh
-     mkdir -p $L/instr; $L/bin/bolt.sh instrument $L/bin/kiln.relocs $L/bin/kiln.instr $L/instr/dump
-     #   (Fedora's BOLT may want KILN_BOLT_ARGS=-runtime-instrumentation-lib=$L/tools/usr/lib64/libbolt_rt_instr.a)
-     # step 1 with --kiln $L/bin/kiln.instr --rounds 2 --out $L/prof-instr, -E BOLT_RECORD=instrumented -E BOLT_DUMP=$L/instr/dump
-     $KILN_BOLT_BIN/merge-fdata $L/prof-instr/rounds/*.hook/instr-window.fdata > $L/kiln.instr.fdata
-     # step 2's optimize with $L/kiln.instr.fdata, into $L/bin/kiln.bolt-instr; step 3 with --b $L/bin/kiln.bolt-instr
-     ```
-
-   - **If BOLT fails, or its binary misbehaves or is slower**, the linker's order, from the same recordings:
-
-     ```sh
-     $L/bin/bolt.sh order $L/bin/kiln.relocs $L/kiln.order $L/prof/rounds/*.hook/perf.data
-     # kiln.order back where the build ran; the same tree and target dir, as the build above but with
-     #   KILN_DIST=$B/dist-order KILN_RELEASE_BOLT=<kiln.order>: only the executable relinks
-     # step 3 with --b <$B/dist-order's kiln>
-     ```
-
-     The lab's glibc build takes it from `relbuild.sh`'s environment: the build above with
-     `KILN_LINK_ORDER=<kiln.order>`, its executable removed first (`find <TARGET>/x86_64-unknown-linux-gnu/release/deps
-     -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete`), since cargo doesn't know an
-     order changed.
+  ```yaml
+  bolt-scripts:
+    name: the release's code layout scripts
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 1Gi }
+    timeout-minutes: 10
+    steps:
+      - name: build.sh's KILN_RELEASE_BOLT, bolt.sh, the BOLT lab's stages
+        run: TMPDIR=$(mktemp -d -p "$PWD") python3 scripts/test_bolt.py
+  ```
+- **The cost of each release**: the relocations build in a target dir of its own (`<target>/bolt`: strip off changes
+  every unit's flags, so its first build is a whole release's, 16 to 18 min here at `-j 4`, incremental after), llvm-bolt
+  (22 to 29 s and 4.0 GiB on adacachy, at any thread count), and a strip. No perf and no perf2bolt at release time.
+- **Done in this tree**: `build.sh`'s `KILN_RELEASE_BOLT=<profile>` builds in a cargo-zigbuild cache of its own, lays
+  out, strips (llvm-bolt's `.note.bolt_info` too, so one build and one profile make one layout's bytes on any machine),
+  and ships only what `bolt.sh same` says is the same program, where the build machine runs x86-64 (a
+  layout it refuses fails the build and leaves `dist/`); BOLT failing fails the build (nothing ships laid out
+  otherwise than asked, and nothing falls back without saying); what the profile covered goes to the build's log and
+  beside BOLT's (`kiln.bolt.txt`), never into `dist/`, whose every `kiln-*` file `SHA256SUMS` lists.
 
 ### The vendored projects' memory as kiln sets it (step 5, part 4)
 
