@@ -238,7 +238,7 @@ mod tests {
     fn g9_s4_the_cap_is_a_park_bound_and_the_window_holds_a_share_to_five_points() {
         assert!(PARK_BOUNDS_NS.contains(&CAP_NS));
         assert!(PARK_BOUNDS_NS.iter().filter(|bound| **bound < CAP_NS).all(|bound| *bound < 12_600));
-        assert!(CAP_NS > 12_600);
+        const { assert!(CAP_NS > 12_600) };
         // In millionths: z · ½ = 1.960 · 0.5 = 0.980, and h, half the convergence width (a tenth, ±5 %), 0.050.
         let spread: u64 = 1_960 * 500;
         let half = crate::machine::stats::CONVERGED_WIDTH_PERMILLE / 2 * 1_000;
