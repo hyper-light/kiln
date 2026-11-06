@@ -7880,11 +7880,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;
@@ -7914,11 +7914,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: {}", "the retry loop reads its deadline ".repeat(usize::try_from(n % 7 + 1).unwrap_or(1))), streaming: false } };
             // Past two chunks, a third begun.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
             let unpack = |b: &[u8]| -> anyhow::Result<String> {
                 let mut text = String::new();
                 flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
@@ -7953,13 +7953,13 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             for (id, at) in [("b", 2), ("a", 1)] {
                 let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), created_at: at, ..crate::harness::session::Info::default() };
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its \"deadline\""), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             // The second's copy holds its timeline from its fifth event on.
-            hub.harness.ingest(&hub, &there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
+            hub.harness.ingest(&there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
             assert_eq!(hub.harness.list_json().as_ref(), serde_json::to_vec(&hub.harness.list())?.as_slice(), "the list, oldest first");
             let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
             assert!(a.last_activity > 0, "the state changed its info");
@@ -8006,10 +8006,10 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), tags: vec!["Lab".into()], source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::plans::create(&hub, crate::plans::New { body: "Another's".into(), ..crate::plans::New::default() }, "admin").await?;
@@ -8149,10 +8149,10 @@ mod tests {
             // An agent at work, with a plan and a goal.
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
@@ -8314,14 +8314,14 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // Two chunks' events and nine: the two sealed are packed off the owner's shard and kept compact, and the
             // newest fifty reach into the second. A chunk's events, from the bound of what a copy keeps packed (two
             // chunks' at a packed event's bytes).
             let chunk = crate::harness::copies::PAGE_BYTES / (2 * crate::harness::copies::PACKED_EVENT_BYTES);
             let n = u64::try_from(2 * chunk + 9)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
             // Till its chunks are compact, the page is read from the events themselves.
             let deadline = Instant::now() + Duration::from_secs(30);
             while hub.harness.events_page_kept("a", None, 50) != Err(Unread::Unkept) {
@@ -8476,11 +8476,11 @@ mod tests {
             // A long session: its snapshot is megabytes, far more than the sockets between hold.
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let said = |n: u64, text: String| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
             let long: Vec<Event> = (1..=256).map(|n| said(n, format!("{n}: {}", "the retry loop reads its deadline ".repeat(960)))).collect();
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: long }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: long }).await;
             let wait = Duration::from_secs(60);
             let next = |rx: async_channel::Receiver<Said>, what: &'static str| async move {
                 match crate::rt::timeout(wait, rx.recv()).await {
@@ -8541,7 +8541,7 @@ mod tests {
             let feed = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session s"))?;
             let from = feed.at.ok_or_else(|| anyhow::anyhow!("the session's feed has no topic"))?;
             // The frame, published while B attaches: A has it, while B's snapshot is still being written.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
             let (live, a_has) = next(a_rx, "A's frame (it waited for B's attach)").await?;
             anyhow::ensure!(live, "A had the frame live");
             anyhow::ensure!(writing() == 1, "B's attach was under way as A had the frame: {} snapshots being written", writing());
@@ -8591,10 +8591,10 @@ mod tests {
             anyhow::ensure!(!elsewhere || hub.harness.owner_shard(&id) != here, "{id} is owned where its viewer's connection is served");
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, &id, Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, &id, Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, &id, Update::State { state: Box::new(State::default()) }).await;
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.to_owned(), streaming: false } };
-            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(1, "the retry loop reads its deadline")] }).await;
+            hub.harness.ingest(&there, &id, Update::Events { events: vec![said(1, "the retry loop reads its deadline")] }).await;
             let on0 = VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed));
             // The viewer: its snapshot (its frames, then `synced`), then the live frame.
             let (tx, rx) = async_channel::unbounded::<Result<bool, String>>();
@@ -8627,7 +8627,7 @@ mod tests {
                 }
             };
             anyhow::ensure!(!next("its snapshot").await?, "its snapshot comes first");
-            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(2, MARK)] }).await;
+            hub.harness.ingest(&there, &id, Update::Events { events: vec![said(2, MARK)] }).await;
             anyhow::ensure!(next("its live frame").await?, "the live frame");
             let (off, on) = (VIEWERS_ON_OWNER.first().map_or(0, |n| n.load(Ordering::Relaxed)), VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed)));
             anyhow::ensure!(off == 0, "{off} viewers in this process ran off their session's owner's shard");
@@ -9268,10 +9268,10 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;

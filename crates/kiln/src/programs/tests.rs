@@ -172,7 +172,7 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
     let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
     f(&mut st);
-    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
+    hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
 
@@ -466,7 +466,7 @@ fn g9_s3_programs_find_their_sessions_by_id_none_copied() -> anyhow::Result<()> 
         let hub = crate::hub::tests::scratch_hub().await?;
         let there = Location::Machine("g9s3-box".into());
         let info = Info { id: "g9s3-w".into(), kind: "claude".into(), name: "Worker".into(), pause_at: Some(80), ..Info::default() };
-        hub.harness.ingest(&hub, &there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
+        hub.harness.ingest(&there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
         let shared = hub.harness.info_shared("g9s3-w").map(|i| Info::clone(&i));
         anyhow::ensure!(shared.is_some() && shared == hub.harness.info("g9s3-w"), "the same session: {shared:?}");
         anyhow::ensure!(hub.harness.info_shared("g9s3-gone").is_none(), "none for a session that isn't there");

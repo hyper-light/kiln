@@ -285,7 +285,7 @@ mod tests {
             let (here, there) = (Location::Machine("g9s3-box".into()), Location::Machine("g9s3-other".into()));
             for (id, from) in [("g9s3-a", &here), ("g9s3-b", &there), ("g9s3-c", &here), ("g9s3-d", &Location::Local)] {
                 let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), ..Info::default() };
-                hub.harness.ingest(&hub, from, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(from, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             for target in ["agent:g9s3-box", "agent:g9s3-other", "local", "agent:g9s3-none"] {
                 let mut found = hub.harness.ids_on(target);

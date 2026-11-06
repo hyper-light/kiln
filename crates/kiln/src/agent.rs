@@ -5686,7 +5686,7 @@ mod tests {
             // The copy: the session's first 150 events, as they went over the wire.
             for u in [Update::Open { info: Box::new(info.clone()), since: None }, Update::Events { events: timeline.iter().take(150).cloned().collect() }] {
                 for json in harness_frames("s", &u) {
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?).await;
+                    hub.harness.ingest(&there, "s", serde_json::from_str(&json)?).await;
                 }
             }
             let kept = hub.harness.kept_on("box");
@@ -5954,13 +5954,13 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "codex".into(), ..Default::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info.clone()), since: None }).await;
             let mut sent = SentChanges::default();
             sent.server(true);
             let take = async |frames: &[String]| -> anyhow::Result<()> {
                 for f in frames {
                     anyhow::ensure!(f.len() <= HARNESS_FRAME, "a frame of {} bytes", f.len());
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?).await;
+                    hub.harness.ingest(&there, "s", serde_json::from_str(f)?).await;
                 }
                 Ok(())
             };

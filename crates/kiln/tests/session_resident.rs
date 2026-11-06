@@ -135,7 +135,7 @@ async fn scratch() -> anyhow::Result<Arc<Hub>> {
 /// Each of `updates` to the session's owner, as a runner's link hands them over, then back once it took them.
 async fn ingest(hub: &Arc<Hub>, there: &Location, updates: Vec<Update>) {
     for u in updates {
-        hub.harness.ingest_from(hub, there, ID, u, false).await;
+        hub.harness.ingest_from(there, ID, u, false).await;
     }
     hub.harness.applied(ID).await;
 }
