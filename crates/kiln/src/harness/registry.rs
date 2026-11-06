@@ -2637,9 +2637,25 @@ impl Registry {
         // the store's row of each: milliseconds on the shard for a large one): written out off the shard first, nothing of it
         // taken yet, then taken as written there; one its owner tried is taken either way (goal 9, plan 01a1a87b2cec step 3:
         // `super::copies::Shard::want_off`).
+        //
+        // The same state or meta again as the copy's was made of (a harness says its meta at each turn) has nothing to make, so
+        // nothing long to: told apart first, on the shard (a compare), and only one that changed is judged by what its kind takes
+        // (`super::copies::Mirror::said`), so a session's first long one goes off the shard too (step 3).
+        let same = s.get(id).is_some_and(|m| m.same_again(&u));
+        // What every session's states and metas taught their owners, for one's first.
+        let said = s.said();
         let tried = s.take_off_written(id);
-        if tried.is_none() && s.get(id).is_some_and(|m| super::copies::long_off(m, &u)) {
+        if tried.is_none() && !same && s.get(id).is_some_and(|m| super::copies::long_off(m, &u, &said)) {
             s.want_off(id, store.is_some());
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+        }
+        // An Open going on from an event inside a compact chunk of its copy (a runner's reconnect after it lost events the copy
+        // has): that chunk is read back off the shard first, as one an update changes is, nothing of the Open taken yet (goal 9,
+        // plan 01a1a87b2cec step 3: `super::copies::Mirror::keep_through` inflated it and parsed its events on the shard).
+        if let Update::Open { info, since: Some(n) } = &u
+            && let Some(c) = s.get(id).filter(|m| m.info.epoch == info.epoch).and_then(|m| m.thaw_for_open(*n)).filter(|c| !std::ptr::eq(s.thawed().as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
         }
         let (mut written_off, took_off) = match tried {
@@ -2649,15 +2665,17 @@ impl Registry {
             }
             None => (None, None),
         };
-        // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below).
-        let row_began = std::time::Instant::now();
+        // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below). What's learned
+        // here is timed on the CPU where the shard's thread says, as a turn's hold is (`super::copies::Timer`; goal 9, plan
+        // 01a1a87b2cec step 3).
+        let row_began = super::copies::Timer::start();
         if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
             match written_off.as_mut() {
                 Some(made) => store.put(made.take_rows()),
                 None => store.send(id, &u),
             }
         }
-        let row_took = row_began.elapsed();
+        let row_took = row_began.took();
         // The event of this update its owner wrote out off the shard, or tried, for that event as it's taken (below; goal 9,
         // plan 01a1a87b2cec step 3).
         let mut written = s.take_written(id);
@@ -2839,16 +2857,18 @@ impl Registry {
                             m.long_to_free = true;
                         }
                         if let Some(took) = took_off {
-                            m.said_took(&u, took);
+                            m.said_took(&u, took, &said);
                         }
                     }
-                    _ => {
-                        let began = std::time::Instant::now();
-                        if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
-                            m.state = Arc::new(StateDoc::made(&**state, &m.state));
-                        }
-                        m.said_took(&u, row_took.saturating_add(began.elapsed()));
+                    // Made, and timed, only where it changed: the same one again is a compare, and timed with the rest it taught
+                    // that the session's states are short, so the next one that changed was written on the shard however long
+                    // (step 3).
+                    _ if !same => {
+                        let began = super::copies::Timer::start();
+                        m.state = Arc::new(StateDoc::made(&**state, &m.state));
+                        m.said_took(&u, row_took.saturating_add(began.took()), &said);
                     }
+                    _ => {}
                 }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
@@ -2904,22 +2924,20 @@ impl Registry {
                             None => meta_same = true,
                         }
                         if let Some(took) = took_off {
-                            m.said_took(&u, took);
+                            m.said_took(&u, took, &said);
                         }
                     }
+                    _ if same => meta_same = true,
+                    // Made, and timed, only where it changed, as a state is (above).
                     _ => {
-                        let began = std::time::Instant::now();
-                        if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
+                        let began = super::copies::Timer::start();
+                        let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
+                        if *m.meta == meta {
                             meta_same = true;
                         } else {
-                            let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
-                            if *m.meta == meta {
-                                meta_same = true;
-                            } else {
-                                m.meta = Arc::new(meta);
-                            }
+                            m.meta = Arc::new(meta);
                         }
-                        m.said_took(&u, row_took.saturating_add(began.elapsed()));
+                        m.said_took(&u, row_took.saturating_add(began.took()), &said);
                     }
                 }
             }
@@ -2931,9 +2949,9 @@ impl Registry {
                     m.long_to_free = true;
                 }
                 _ => {
-                    let began = std::time::Instant::now();
+                    let began = super::copies::Timer::start();
                     m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true);
-                    super::copies::wrote_changes(&u, began.elapsed());
+                    super::copies::wrote_changes(&u, began.took());
                 }
             },
             Update::ChangesPatch { set, gone } => {
@@ -2943,9 +2961,9 @@ impl Registry {
                         m.long_to_free = true;
                     }
                     _ => {
-                        let began = std::time::Instant::now();
+                        let began = super::copies::Timer::start();
                         m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
-                        super::copies::wrote_changes(&u, began.elapsed());
+                        super::copies::wrote_changes(&u, began.took());
                     }
                 }
                 if self.convo.is_some() && !shipped {
@@ -2984,14 +3002,20 @@ impl Registry {
                             (made.entry, made.mentions)
                         }
                         None => {
-                            let began = std::time::Instant::now();
+                            let began = super::copies::Timer::start();
                             let entry = Arc::new(if store.is_some() {
                                 Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
                             } else {
                                 Entry::of_event(e, None)
                             });
-                            super::copies::wrote(e, began.elapsed());
-                            (entry, mentions(id, &m.info.cwd, &m.location, e))
+                            // The files it mentions found with it, as one written out off the shard has them (`made_of`, whose time
+                            // counts both), and timed with it: what an event's writing out is expected to take is what an owner's turn
+                            // asks of its next event (step 3), and looking through the lab's replies' words for files took about as
+                            // long on the CPU as writing them out (42 µs to 36 µs, g9-owners3's measure of the lab's mix in a test
+                            // build), so its turns were judged by half of what their events took.
+                            let mentioned = mentions(id, &m.info.cwd, &m.location, e);
+                            super::copies::wrote(e, began.took());
+                            (entry, mentioned)
                         }
                     };
                     if let Some(job) = mentioned {
@@ -3044,7 +3068,7 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) && matches!(u, Update::Meta { .. }) {
+        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) && matches!(u, Update::Meta { .. }) {
             // A meta that changed, its session's metas long to write out: its frame, the whole value written out, off the shard
             // too (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
             m.commit_meta_off()
@@ -6242,7 +6266,7 @@ mod tests {
         let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
         let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
-        anyhow::ensure!(events.spilled(&chunks, spilled) > 0, "some spilled");
+        anyhow::ensure!(events.spilled_where(&chunks, spilled) > 0, "some spilled");
         let snapshot = || Snapshot { parts: Parts { events: events.clone(), ..m.view().parts() }, files: Some(r#"{"t":"files","files":[]}"#.into()), store: None };
         let whole = snapshot().packed("synced")?;
         for size in [1, 1024, 64 << 10, usize::MAX] {
