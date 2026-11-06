@@ -13,7 +13,9 @@
 //! - **What a shard reads**, once a period of its health probe (`crate::shard_health::PERIOD`, 10 ms), on its own
 //!   thread: the kernel's count of how long the thread waited, runnable, for a CPU (the run delay of
 //!   `/proc/thread-self/schedstat`, a file kept open and read again, one system call), and its parks by what ended
-//!   them (`hyper_rt`'s counters): another thread's kick or its I/O, or its own timers.
+//!   them (`hyper_rt`'s counters): another thread's kick or its I/O, or its own timers. A shard that nudges on no
+//!   judgment of its own (off, or on) only shows its wait, and reads it every `crate::shard_health::COUNTS_EVERY`th
+//!   period (goal 9, plan 01a1a87b2cec step 5: a system call on every shard every 10 ms, which their busy share counts).
 //! - **Held** ([`Judge`]): the period's wait, less what a calm CPU makes a wake by the thread's own timer wait
 //!   ([`TIMER_WAKE_NS`]), over the wakes others made: how long its host held each of them. At [`HELD_NS`] or more
 //!   the period was held. While the shard nudges, its own timers wake it every period, and on a busy CPU each of
@@ -299,6 +301,9 @@ struct Here {
     tried: bool,
     /// When its last period ended.
     last: Option<Instant>,
+    /// Periods it ended: while it nudges on no judgment of its own, its wait is read only at every
+    /// `crate::shard_health::COUNTS_EVERY`th ([`Here::period`]).
+    periods: u64,
 }
 
 thread_local! {
@@ -345,6 +350,18 @@ pub fn tick(shard: usize, now: Instant, counters: Option<&hyper_rt::shard_loop::
 }
 
 impl Here {
+    /// Whether the period ending now reads its thread's wait, the period counted (goal 9, plan 01a1a87b2cec step 5). A
+    /// shard that judges nothing by its wait (off, the default; or on, whatever its host does) only shows it: read at its
+    /// first period and every `crate::shard_health::COUNTS_EVERY`th after, as the probe copies the shard's other counts,
+    /// and what held it judged over those periods (its counts' differences span them). Each read is a `pread` of procfs:
+    /// kernel time on every shard every 10 ms, which the shards' busy share counts and their user-time profiles don't
+    /// show. `auto` reads every period: it acts on each.
+    fn reads_wait(&mut self) -> bool {
+        let period = self.periods;
+        self.periods = self.periods.wrapping_add(1);
+        self.may_ns != 0 || period.is_multiple_of(crate::shard_health::COUNTS_EVERY)
+    }
+
     fn period(&mut self, shard: usize, now: Instant, reading: impl FnOnce(u64) -> Reading) {
         let figures = figures_of(shard);
         if let Some(f) = figures {
@@ -359,6 +376,9 @@ impl Here {
         if !self.tried {
             self.tried = true;
             self.run_wait = RunWait::open();
+        }
+        if !self.reads_wait() {
+            return;
         }
         let Some(waited) = self.run_wait.as_ref().and_then(RunWait::read) else { return };
         let verdict = self.judge.period(now, reading(waited));
@@ -581,6 +601,21 @@ mod tests {
         } else {
             assert_eq!(seen, None);
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a shard that judges nothing by its wait (off, the default; or on, whatever its
+    /// host does) reads it at its first probe period and every `COUNTS_EVERY`th after; one that nudges on its own (auto)
+    /// reads it every period, as it judges each.
+    #[test]
+    fn g9_s5_a_shard_that_judges_nothing_reads_its_wait_every_tenth_period() {
+        let every = crate::shard_health::COUNTS_EVERY;
+        let periods = 3 * every + 1;
+        let reads = |mut here: Here| (0..periods).filter(|_| here.reads_wait()).collect::<Vec<u64>>();
+        let tenths: Vec<u64> = (0..periods).filter(|p| p.is_multiple_of(every)).collect();
+        assert_eq!(tenths, [0, every, 2 * every, 3 * every]);
+        assert_eq!(reads(Here::default()), tenths, "off");
+        assert_eq!(reads(Here { armed: true, ..Here::default() }), tenths, "on");
+        assert_eq!(reads(Here { may_ns: 166_700, ..Here::default() }), (0..periods).collect::<Vec<u64>>(), "auto");
     }
 
     /// Goal 8, plan 01a1a59c2b29 step 7: `[server] nudge` takes a mode's word or the flag it was before; the lab's
