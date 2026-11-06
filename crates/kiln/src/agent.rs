@@ -4443,7 +4443,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Harness(session, u, taken) => {
+            Ev::Harness(session, u, taken_at) => {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
@@ -4493,7 +4493,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
                             start_stream(&mut updates, &session, &s, Some(kept), &mut sent_changes);
                             if connected {
-                                flush_updates(&mut updates, &own).await;
+                                let behind = !own_rx.is_empty() || !taken.is_empty();
+                                flush_updates_now(&mut updates, &own, behind, |data| send_term(&net, delay_line.as_ref(), data)).await;
                             }
                             continue 'events;
                         }
@@ -4502,12 +4503,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // A new session's Open is its stream's picture. Its frames say how long this runner held it
                     // (goal 10, plan 01a1a87b2dae step 5).
-                    push_update(&mut updates, &session, &u, opens, &mut sent_changes, Some(taken));
+                    push_update(&mut updates, &session, &u, opens, &mut sent_changes, Some(taken_at));
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
+                    // Straight to the link from this turn, unless what this loop said or took before waits to go
+                    // (`flush_updates_now`; goal 10, plan 01a1a87b2dae step 5).
                     if connected {
-                        flush_updates(&mut updates, &own).await;
+                        let behind = !own_rx.is_empty() || !taken.is_empty();
+                        flush_updates_now(&mut updates, &own, behind, |data| send_term(&net, delay_line.as_ref(), data)).await;
                     }
                 } else if connected && welcomed {
                     // A server from before the channel: not kept across a disconnect, the
@@ -5010,6 +5014,41 @@ async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, (Instan
 async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
     for f in updates.poll(Instant::now()) {
         uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
+    }
+}
+
+/// [`flush_updates`] from the turn of the runner's loop that made them (goal 10, plan 01a1a87b2dae step 5): each frame
+/// straight to the link (`send`, as `Ev::Up` sends a `Up::Term`) where nothing the loop said or took before still waits
+/// to go (`behind` false: its own channel, `own`, empty, and nothing taken ahead of its turn). Through `own` each was
+/// the next frame the loop sent anyway, a turn of the loop later: that turn's select, a dozen of its sources' waits
+/// armed and withdrawn before it came to `own`. Where something waits (a custody record or an identity's ask said this
+/// turn, a channel's answer, a job's word taken ahead), the frames go behind it on `own`, as before, so the link takes
+/// everything in the order the loop said it: custody's records keep their place among the session's updates.
+async fn flush_updates_now<F, Fut>(updates: &mut crate::wire::uplink::Updates, own: &Uplink, behind: bool, mut send: F)
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if behind {
+        flush_updates(updates, own).await;
+        return;
+    }
+    for f in updates.poll(Instant::now()) {
+        // What `Ev::Up` encodes of a `Up::Term`, and as it passes over one that can't be.
+        if let Ok(data) = proto::encode(&AgentMsg::Wire(f)) {
+            send(data).await;
+        }
+    }
+}
+
+/// A frame on the terminal lane, as `Ev::Up` sends a `Up::Term` on a connection: by a test build's delay line where it
+/// has one (`crate::runner::chaos`), else to the server's peer.
+async fn send_term(net: &net::NetHandle, delay: Option<&crate::runner::chaos::DelayLine>, data: Vec<u8>) {
+    match delay {
+        Some(d) => d.send(LANE_TERM, Kind::Term, data, false),
+        None => {
+            net.send(SERVER_PEER, LANE_TERM, Kind::Term, data).await;
+        }
     }
 }
 
@@ -5816,6 +5855,59 @@ mod tests {
         anyhow::ensure!(said_held.first() == Some(&None), "the snapshot says none");
         anyhow::ensure!(said_held.iter().skip(1).all(|h| h.is_some_and(|d| d >= held_for)), "each part at least {held_for:?}: {said_held:?}");
         Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a turn of the runner's loop sends the channel's frames straight to the link where
+    /// nothing it said or took before waits to go, in the channel's order, as `Ev::Up` would have sent them a turn later
+    /// (the same bytes), and puts nothing on its own channel; where something waits there (a custody record said this
+    /// turn), the frames go behind it on that channel, none straight on, so the link takes the record first.
+    #[test]
+    fn g10_s5_a_turn_sends_its_frames_straight_on_where_nothing_waits_before_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let mut updates = crate::wire::uplink::Updates::new("boot");
+            // The link up and the server's word in (it has nothing yet): what's pushed goes at the next poll.
+            updates.on_frame(crate::wire::channel::Frame::Have(Vec::new()));
+            let mut sent = SentChanges::default();
+            updates.start(&crate::wire::uplink::session_key("s"));
+            let one = |n: usize| Update::Events { events: vec![said(n, format!("event {n}"))] };
+            push_update(&mut updates, "s", &one(1), true, &mut sent, None);
+            push_update(&mut updates, "s", &one(2), false, &mut sent, Some(Instant::now()));
+            let (own_tx, own_rx) = crate::memory::queue::unbounded::<Up>(&crate::memory::owners::CHANNELS);
+            let own = Uplink(own_tx);
+            // What `Ev::Up` sends of a `Up::Term`: the channel's items, in order.
+            let item = |data: &[u8]| -> anyhow::Result<u64> {
+                match proto::read_agent(data) {
+                    Ok(AgentMsg::Wire(crate::wire::channel::Frame::Item { seq, .. })) => Ok(seq),
+                    other => anyhow::bail!("not a channel's item: {other:?}"),
+                }
+            };
+            let mut linked: Vec<Vec<u8>> = Vec::new();
+            flush_updates_now(&mut updates, &own, false, |data| {
+                linked.push(data);
+                async {}
+            })
+            .await;
+            let seqs = linked.iter().map(|d| item(d)).collect::<anyhow::Result<Vec<u64>>>()?;
+            anyhow::ensure!(seqs.len() == 2 && seqs.windows(2).all(|w| w.first() < w.get(1)), "both straight on, in the channel's order: {seqs:?}");
+            anyhow::ensure!(own_rx.is_empty(), "nothing on the loop's own channel");
+            // A custody record said this turn waits on the loop's own channel: the next frame goes behind it there.
+            own.0.send(Up::Term(AgentMsg::Custody { json: "{\"t\":\"custody\"}".into() })).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            push_update(&mut updates, "s", &one(3), false, &mut sent, Some(Instant::now()));
+            let before = linked.len();
+            flush_updates_now(&mut updates, &own, !own_rx.is_empty(), |data| {
+                linked.push(data);
+                async {}
+            })
+            .await;
+            anyhow::ensure!(linked.len() == before, "none straight on past the record");
+            anyhow::ensure!(matches!(own_rx.try_recv(), Ok(Up::Term(AgentMsg::Custody { .. }))), "the record first");
+            match own_rx.try_recv() {
+                Ok(Up::Term(m @ AgentMsg::Wire(_))) => anyhow::ensure!(seqs.last().is_some_and(|last| item(&proto::encode(&m).unwrap_or_default()).is_ok_and(|s| s > *last)), "the next item, after the record"),
+                other => anyhow::bail!("not the frame behind the record: {other:?}"),
+            }
+            anyhow::ensure!(own_rx.is_empty(), "nothing else");
+            Ok(())
+        })
     }
 
     /// A file of a changeset with `lines` added lines, each about as long as a line of code.

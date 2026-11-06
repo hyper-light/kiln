@@ -367,8 +367,10 @@ pub fn adopt_duplex(_d: Detached) -> anyhow::Result<Duplex> {
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): created suspended,
-/// put in the agent's job, then let run, so nothing it starts is outside the job.
-pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+/// put in the agent's job, then let run, so nothing it starts is outside the job. Its pipes are
+/// drained by threads of their own here, on no shard, so `_home` (the shard Unix serves them on, the
+/// one that takes what they read) places nothing.
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>, _home: Option<usize>) -> anyhow::Result<Duplex> {
     use std::os::windows::io::AsRawHandle as _;
     use std::os::windows::process::CommandExt as _;
     let Some(group) = group else { return spawn_duplex(cmd) };
