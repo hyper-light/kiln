@@ -1348,6 +1348,25 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
             }
         }
         delay_us(&mut put, "shards.", &delay);
+        // The same samples apart by where each came from, all shards together, where the build says it (goal 9, plan
+        // 01a1a87b2cec step 5's quiet probe, `kiln_shard_delay_by_seconds`): `shards.by_work.*`, the shards' wakes by
+        // their work and the probe's turn on a shard awake; `shards.by_probe.*`, the probe's own timer waking a shard
+        // idle a whole period, an idle shard's delay alone. A build without the family samples the probe's timer every
+        // period (`shards.delay_*` alone): another instrument.
+        for by in ["work", "probe"] {
+            let mut d: Vec<(f64, f64)> = Vec::new();
+            for sh in &shards {
+                let one = histogram("kiln_shard_delay_by_seconds", &[("shard", sh.as_str()), ("by", by)]);
+                if d.is_empty() {
+                    d = one;
+                } else {
+                    for ((_, total), (_, add)) in d.iter_mut().zip(one) {
+                        *total += add;
+                    }
+                }
+            }
+            delay_us(&mut put, &format!("shards.by_{by}."), &d);
+        }
         put("shards.worst_delay_p999_us".into(), worst_p999);
         put("shards.worst_busy_share".into(), worst_busy);
         #[allow(clippy::cast_precision_loss)]
@@ -1696,6 +1715,35 @@ mod tests {
         let mut none = BTreeMap::new();
         server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
         assert!(!none.contains_key("shards.nudged_share") && !none.contains_key("shards.held_wake_us"), "{none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5's quiet probe: the shards' delay samples apart by where each came from, all
+    /// shards together (`shards.by_work.*`, `shards.by_probe.*`) beside both together (`shards.delay_*`); none apart
+    /// where the build has no `kiln_shard_delay_by_seconds` (the probe's timer every period: another instrument).
+    #[test]
+    fn g9_s5_the_shards_delay_is_reported_by_where_its_samples_came_from() {
+        // Over the window: shard 0's work 900 samples under 100 µs and 100 under 1 ms, its probe's timer 10 under 250 µs;
+        // shard 1's work 1,000 under 100 µs, no probe's.
+        let scrape = |at: f64| {
+            let mut t = String::new();
+            for (sh, by, under_100us, under_250us, under_1ms) in [(0, "work", 900.0, 900.0, 1000.0), (0, "probe", 0.0, 10.0, 10.0), (1, "work", 1000.0, 1000.0, 1000.0), (1, "probe", 0.0, 0.0, 0.0)] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", at * 1000.0));
+                for (le, n) in [("0.0001", under_100us), ("0.00025", under_250us), ("0.001", under_1ms), ("+Inf", under_1ms)] {
+                    t.push_str(&format!("kiln_shard_delay_by_seconds_bucket{{shard=\"{sh}\",by=\"{by}\",le=\"{le}\"}} {}\n", at * n));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0.0), &scrape(1.0), 60.0);
+        let got = |name: &str| n.get(name).copied();
+        // 2,000 work samples, 1,900 under 100 µs: p99.9 at the 1,998th, in the bucket to 1 ms; the probe's 10, under 250 µs.
+        assert!(got("shards.by_work.delay_p999_us").is_some_and(|v| v > 250.0 && v <= 1000.0), "{n:?}");
+        assert!(got("shards.by_work.delay_p50_us").is_some_and(|v| v <= 100.0), "{n:?}");
+        assert!(got("shards.by_probe.delay_p999_us").is_some_and(|v| v > 100.0 && v <= 250.0), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
+        assert!(!none.keys().any(|k| k.starts_with("shards.by_")), "{none:?}");
     }
 
     /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.

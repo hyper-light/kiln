@@ -1604,26 +1604,171 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
     }));
 }
 
-/// How long a copy takes nothing in before its newest chunk is packed and kept compact ([`Shard::pack_idle`]; goal 11,
-/// plan 01a1a87b2e56 step 5): as long as the allocator keeps what's freed before it gives it back, after which a pool's
-/// worker gives back its caches too (`crate::os::alloc::COLD_AFTER`, jemalloc's dirty decay): what's idle that long is
-/// let go of. A session at work takes an event far more often (the lab's: a turn's 40 events 25 ms apart, then 1.5 to
-/// 2.5 s before the next turn), so only an idle one's goes.
-pub const IDLE_AFTER: Duration = crate::os::alloc::COLD_AFTER;
+/// A copy's gaps between the changes it takes, and when it last took one (consts-audit R1; goal 11, plan 01a1a87b2e56
+/// step 5): its busy gaps (a turn's events, its stream) and its quiet gaps (those past its busy gaps' bound: between its
+/// turns), each smoothed as RFC 6298 smooths a round trip ([`Smooth`]). It's idle once it has taken nothing in for longer
+/// than its quiet gaps' bound ([`Idle::after`]): longer than it's ever quiet between turns, give or take four of its
+/// variations. Its owner's alone.
+#[derive(Default)]
+pub(super) struct Gaps {
+    last: Option<Instant>,
+    busy: Smooth,
+    quiet: Smooth,
+}
 
-/// Every [`IDLE_AFTER`], each owner told to pack its copies that took nothing in since it was last told
-/// ([`Shard::pack_idle`]), from wherever the runtime runs this; once no owner is left, it ends. It's a sweep the owner takes a
-/// copy at a time across its turns (goal 9, plan 01a1a87b2cec step 3): one job over all of them held its shard for all of
-/// them, a chunk sealed, or kept compact and its copy published, for each (production's 134 copies, about 34 a shard).
-async fn pack_idle_every(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>) {
+impl Gaps {
+    /// A change taken at `now`: its gap since the last learned, as a busy one or, past the busy ones' bound, a quiet one,
+    /// which it returns (every copy's are learned together too: [`Idle::quiet`]). The first gap is a busy one.
+    fn changed(&mut self, now: Instant) -> Option<u64> {
+        let last = self.last.replace(now)?;
+        let gap = u64::try_from(now.saturating_duration_since(last).as_nanos()).unwrap_or(u64::MAX);
+        match self.busy.bound() {
+            Some(bound) if gap > bound => {
+                self.quiet.learn(gap);
+                Some(gap)
+            }
+            _ => {
+                self.busy.learn(gap);
+                None
+            }
+        }
+    }
+
+    /// When it falls idle, having taken nothing in for `after` nanoseconds since its last change ([`Idle::after`]): none
+    /// before a change, or with nothing to judge by.
+    fn idle_at(&self, after: Option<u64>) -> Option<Instant> {
+        self.last?.checked_add(Duration::from_nanos(after?))
+    }
+}
+
+/// A sample smoothed as RFC 6298 (§2.2–2.3) smooths a round trip, nanoseconds, one owner's (`crate::rt::Smoothed` is the
+/// shared one's): the first sets the mean to it and the variation to half of it; after it the variation goes a quarter of
+/// the way to how far a sample falls from the mean, then the mean an eighth of the way to the sample.
+#[derive(Default, Clone, Copy, Debug)]
+struct Smooth {
+    mean: u64,
+    dev: u64,
+    learned: bool,
+}
+
+impl Smooth {
+    fn learn(&mut self, x: u64) {
+        (self.mean, self.dev) = if self.learned {
+            ((self.mean - self.mean / 8).saturating_add(x / 8), (self.dev - self.dev / 4).saturating_add(x.abs_diff(self.mean) / 4))
+        } else {
+            (x, x / 2)
+        };
+        self.learned = true;
+    }
+
+    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none before a sample.
+    fn bound(&self) -> Option<u64> {
+        self.learned.then(|| self.mean.saturating_add(self.dev.saturating_mul(4)))
+    }
+}
+
+/// What the owners of one [`Copies`] know of their copies falling idle (consts-audit R1; goal 11, plan 01a1a87b2e56 step 5):
+/// every copy's quiet gaps smoothed together, what a copy with none of its own yet is judged by; and the earliest a copy of
+/// theirs falls idle, scheduled by its changes and by their sweeps, for the task that has them swept then
+/// ([`sweep_when_idle`]). It was `IDLE_AFTER`, 5 s (`crate::os::alloc::COLD_AFTER`, jemalloc's dirty decay, chosen from the
+/// lab's profile), for every copy, swept every 5 s. No lock: atomics, and a [`crate::rt::Notify`].
+pub(super) struct Idle {
+    /// What [`Idle::due`] counts from.
+    base: Instant,
+    /// Every copy's quiet gaps.
+    quiet: crate::rt::Smoothed,
+    /// Nanoseconds past `base` the earliest scheduled copy falls idle; `u64::MAX`: none scheduled.
+    due: AtomicU64,
+    /// Told when a copy is scheduled earlier than any was, or its owners are gone.
+    wake: crate::rt::Notify,
+    /// Its owners are gone ([`Said`]'s drop): the sweeping task ends.
+    gone: AtomicBool,
+    /// A test's idle wait for every copy, nanoseconds ([`Idle::pin_after`]); 0: each its own, learned.
+    #[cfg(test)]
+    pinned_after: AtomicU64,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self {
+            base: Instant::now(),
+            quiet: crate::rt::Smoothed::nothing_yet(),
+            due: AtomicU64::new(u64::MAX),
+            wake: crate::rt::Notify::new(),
+            gone: AtomicBool::new(false),
+            #[cfg(test)]
+            pinned_after: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Idle {
+    /// How long a copy whose own quiet gaps' bound is `own` may take nothing in before it's idle: that, else every copy's
+    /// quiet gaps' bound; none before any copy was quiet between two changes. A test's where it pinned one.
+    fn after(&self, own: Option<u64>) -> Option<u64> {
+        #[cfg(test)]
+        {
+            let pinned = self.pinned_after.load(Ordering::Relaxed);
+            if pinned > 0 {
+                return Some(pinned);
+            }
+        }
+        own.or_else(|| self.quiet.bound())
+    }
+
+    /// A copy falls idle at `at`: its owners' sweep scheduled for then where that's sooner than the soonest scheduled, and
+    /// the sweeping task told. A change mostly finds one sooner already (one load, nothing written).
+    fn schedule(&self, at: Instant) {
+        let ns = u64::try_from(at.saturating_duration_since(self.base).as_nanos()).unwrap_or(u64::MAX).min(u64::MAX - 1);
+        if ns < self.due.load(Ordering::Relaxed) && ns < self.due.fetch_min(ns, Ordering::Relaxed) {
+            self.wake.notify();
+        }
+    }
+
+    /// When the soonest scheduled copy falls idle: none scheduled.
+    fn due(&self) -> Option<Instant> {
+        let ns = self.due.load(Ordering::Relaxed);
+        (ns != u64::MAX).then(|| self.base.checked_add(Duration::from_nanos(ns))).flatten()
+    }
+
+    /// The sweeps scheduled are under way: none scheduled until they, or changes, schedule the next.
+    fn clear(&self) {
+        self.due.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    /// A test's: every copy idle once it has taken nothing in for `ns` (0: each as its own gaps say).
+    #[cfg(test)]
+    pub(super) fn pin_after(&self, ns: u64) {
+        self.pinned_after.store(ns, Ordering::Relaxed);
+    }
+}
+
+/// The owners of one [`Copies`] told to sweep their copies for idle ones ([`Shard::pack_idle`]) once the soonest of them
+/// falls idle, as their changes and their last sweeps scheduled ([`Idle`]; consts-audit R1): nothing is swept before a copy
+/// is due, and a copy is swept as it falls due. From wherever the runtime runs this; it ends once its owners are gone. Each
+/// sweep is one the owner takes a copy at a time across its turns (goal 9, plan 01a1a87b2cec step 3: one job over all of them
+/// held its shard for all of them, a chunk sealed, or kept compact and its copy published, for each: production's 134
+/// copies, about 34 a shard). It waits for room in a busy owner's inbox, so no owner's sweep is lost.
+async fn sweep_when_idle(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>, idle: Arc<Idle>) {
     loop {
-        crate::rt::sleep(IDLE_AFTER).await;
+        if idle.gone.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(at) = idle.due() else {
+            idle.wake.notified().await;
+            continue;
+        };
+        let now = Instant::now();
+        if at > now {
+            // Until then, or until a copy falls due sooner (or the owners go).
+            let _ = crate::rt::timeout(at.saturating_duration_since(now), idle.wake.notified()).await;
+            continue;
+        }
+        idle.clear();
         let mut any = false;
         for inbox in &inboxes {
             if let Some(tx) = inbox.upgrade() {
-                any = true;
-                // Not waited for: an owner whose inbox is full has work, its copies taking things in.
-                let _ = tx.try_send(Msg::Each(Box::new(Shard::pack_idle())));
+                any |= tx.send(Msg::Each(Box::new(Shard::pack_idle()))).await.is_ok();
             }
         }
         if !any {
@@ -2066,9 +2211,9 @@ pub struct Mirror {
     /// Its view holds what's long to free, replaced since it went out (a long state's, meta's or changeset's last): the next
     /// publish lets go of it off the shard, as one holding chunks taken out ([`Mirror::publish`]; step 3).
     pub(super) long_to_free: bool,
-    /// Its revision at its owner's last sweep for idle copies ([`Shard::pack_idle`]; goal 11, plan 01a1a87b2e56
-    /// step 5): the same at the next, it took nothing in between.
-    idle_rev: u64,
+    /// Its gaps between the changes it takes, and when it last took one: when it falls idle ([`Shard::pack_idle`]; goal 11,
+    /// plan 01a1a87b2e56 step 5; consts-audit R1).
+    gaps: Gaps,
 }
 
 impl Drop for Mirror {
@@ -2236,7 +2381,7 @@ impl Mirror {
             state_ns: 0,
             meta_ns: 0,
             long_to_free: false,
-            idle_rev: u64::MAX,
+            gaps: Gaps::default(),
         }
     }
 
@@ -2281,8 +2426,20 @@ impl Mirror {
         }
     }
 
+    /// A change it took at `now` (`Registry::apply`): its gap since its last learned, a quiet one taught to every copy's too
+    /// (`idle`), and when it falls idle scheduled with its owners' sweeps ([`Idle::schedule`]; consts-audit R1, goal 11, plan
+    /// 01a1a87b2e56 step 5).
+    pub(super) fn changed(&mut self, now: Instant, idle: &Idle) {
+        if let Some(quiet) = self.gaps.changed(now) {
+            idle.quiet.learn(quiet);
+        }
+        if let Some(at) = self.gaps.idle_at(idle.after(self.gaps.quiet.bound())) {
+            idle.schedule(at);
+        }
+    }
+
     /// Its newest chunk packed off the shard and kept compact once it is, as a sealed chunk is ([`Events::compact`]):
-    /// its copy took nothing in since its owner's last sweep for idle copies ([`Shard::pack_idle`]; goal 11, plan
+    /// its copy took nothing in for longer than it's quiet between its turns ([`Shard::pack_idle`]; goal 11, plan
     /// 01a1a87b2e56 step 5). One packed already (a snapshot packs a full newest chunk) is kept compact now.
     fn pack_newest(&mut self) {
         let Some(newest) = self.events.chunks().last().cloned() else { return };
@@ -2962,6 +3119,19 @@ impl Rate {
 pub(super) struct Said {
     states: Took,
     metas: Took,
+    /// What they know of their copies falling idle, shared with the task that has them swept then ([`sweep_when_idle`]).
+    pub(super) idle: Arc<Idle>,
+    /// A test's round trip to the compute pool for these owners alone ([`Said::pin_trip`]), nanoseconds; 0: the process's.
+    #[cfg(test)]
+    pinned_trip: AtomicU64,
+}
+
+impl Drop for Said {
+    /// Its owners are gone: the task that has them swept for idle copies ends.
+    fn drop(&mut self) {
+        self.idle.gone.store(true, Ordering::Relaxed);
+        self.idle.wake.notify();
+    }
 }
 
 impl Said {
@@ -2972,6 +3142,28 @@ impl Said {
             Update::Meta { .. } => Some(&self.metas),
             _ => None,
         }
+    }
+
+    /// What these owners weigh writing out on their shards against (`crate::rt::Sides`; consts-audit B1): their shard's
+    /// quantum, and the pool's round trip as the shards' tasks learned it, or a test's own.
+    pub(super) fn sides(&self) -> crate::rt::Sides {
+        #[allow(unused_mut)]
+        let mut sides = crate::rt::Sides::here();
+        #[cfg(test)]
+        {
+            let pinned = self.pinned_trip.load(Ordering::Relaxed);
+            if pinned > 0 {
+                sides.trip_ns = Some(pinned);
+            }
+        }
+        sides
+    }
+
+    /// A test's: these owners weigh their work against a round trip of `ns` (0: the process's), whatever the pool's is in
+    /// the process the tests share.
+    #[cfg(test)]
+    pub(super) fn pin_trip(&self, ns: u64) {
+        self.pinned_trip.store(ns, Ordering::Relaxed);
     }
 }
 
@@ -3052,11 +3244,13 @@ pub(super) fn write_ns(e: &super::model::Event) -> u64 {
     WRITES.expected(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
 }
 
-/// Whether writing event `e` out is expected to hold its owner's shard past a slow poll (`hyper_rt::slow::SLOW_POLL_NS`), as a
-/// runner's frame expected to is read off the shard (`crate::wire::payload`): it's written on the compute pool instead
-/// ([`Shard::want_write`]).
-pub(super) fn long_to_write(e: &super::model::Event) -> bool {
-    write_ns(e) > hyper_rt::slow::SLOW_POLL_NS
+/// Whether writing event `e` out is expected to take past a turn on its owner's shard (the quantum), or to cost it more than
+/// handing it to the compute pool and back (the pool's round trip, learned: `sides`, [`Said::sides`]), as a runner's frame
+/// that would is read off the shard (`crate::wire::payload`): it's written on the compute pool instead
+/// ([`Shard::want_write`]). Consts-audit B1: it was past a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs).
+pub(super) fn long_to_write(e: &super::model::Event, sides: crate::rt::Sides) -> bool {
+    let ns = write_ns(e);
+    !sides.take_here(ns, ns)
 }
 
 /// Event `e` was written out in `took`, on its owner's shard ([`WRITES`]).
@@ -3074,11 +3268,13 @@ fn changes_bytes(u: &Update) -> u64 {
     u64::try_from(crate::memory::queue::Weigh::weight(u)).unwrap_or(u64::MAX)
 }
 
-/// Whether `u` is a changeset, or a changeset's patch, expected to hold its owner's shard past a slow poll to write out
-/// (`hyper_rt::slow::SLOW_POLL_NS`, as [`long_to_write`] judges an event): it's written on the compute pool instead
-/// ([`Shard::want_off`]). None is until one was written: the first is written where it is, and learned.
-pub(super) fn long_changes(u: &Update) -> bool {
-    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && CHANGES.expected(changes_bytes(u)) > hyper_rt::slow::SLOW_POLL_NS
+/// Whether `u` is a changeset, or a changeset's patch, expected to take past a turn on its owner's shard to write out, or to
+/// cost it more than the compute pool's round trip (`sides`, as [`long_to_write`] judges an event): it's written on the
+/// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
+/// it is, and learned.
+pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
+    let ns = CHANGES.expected(changes_bytes(u));
+    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
 }
 
 /// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
@@ -3086,12 +3282,14 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
     CHANGES.learn(changes_bytes(u), nanos(took));
 }
 
-/// Whether `u`, an update of the session whose copy is `m`, is expected to hold its owner's shard past a slow poll to write
-/// out: a changeset by its bytes ([`long_changes`]), a state or a meta that changed (its caller tells the same one again
-/// apart: `Mirror::same_again`) by what the session's last took, or every session's before it had one ([`Mirror::said`],
-/// `all`). It's written out on the compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+/// Whether `u`, an update of the session whose copy is `m`, is expected to take past a turn on its owner's shard to write out,
+/// or to cost it more than the compute pool's round trip ([`Said::sides`]; consts-audit B1: it was past a slow poll, 100 µs): a changeset by its bytes
+/// ([`long_changes`]), a state or a meta that changed (its caller tells the same one again apart: `Mirror::same_again`) by
+/// what the session's last took, or every session's before it had one ([`Mirror::said`], `all`). It's written out on the
+/// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
 pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
-    long_changes(u) || m.said(u, all).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS)
+    let sides = all.sides();
+    long_changes(u, sides) || m.said(u, all).is_some_and(|ns| !sides.take_here(ns, ns))
 }
 
 /// What its owner needs to write session `session`'s update out off the shard ([`Shard::want_off`]): whether its row for the
@@ -3211,12 +3409,14 @@ impl Shard {
         Arc::clone(&self.said)
     }
 
-    /// Its copies that took nothing in since its last sweep ([`IDLE_AFTER`] ago: [`pack_idle_every`]) have their newest
-    /// chunk packed off the shard and kept compact once it is, as a sealed chunk is ([`Mirror::pack_newest`]; goal 11,
-    /// plan 01a1a87b2e56 step 5). An idle session's newest chunk kept its events as they are, their texts whole, for as
-    /// long as it was idle: up to 70 events, most of a session's whole texts in memory (production's 126 idle copies
-    /// of its 134, est. 17 MB). Its next event, or a stream into one of its events, has it read back off the shard
-    /// before it's taken (`Mirror::thaw_for`, `Mirror::thaw_for_stream`, [`Shard::want_thaw`]).
+    /// Its copies that took nothing in for longer than they're quiet between their turns ([`Idle::after`], learned of each
+    /// copy's own gaps: consts-audit R1) have their newest chunk packed off the shard and kept compact once it is, as a
+    /// sealed chunk is ([`Mirror::pack_newest`]; goal 11, plan 01a1a87b2e56 step 5). An idle session's newest chunk kept its
+    /// events as they are, their texts whole, for as long as it was idle: up to 70 events, most of a session's whole texts in
+    /// memory (production's 126 idle copies of its 134, est. 17 MB). Its next event, or a stream into one of its events, has
+    /// it read back off the shard before it's taken (`Mirror::thaw_for`, `Mirror::thaw_for_stream`, [`Shard::want_thaw`]).
+    /// A copy as busy as its turns keep it is never packed between them, as with the 5 s every copy waited before
+    /// (`IDLE_AFTER`, jemalloc's dirty decay): its quiet gaps' bound is past them.
     ///
     /// Only one no read took since its last change: a copy whose page is read keeps its texts as they are (a read takes them
     /// so), and kept compact it would hold its segment beside them. One kept compact that a read took since (its texts made
@@ -3225,14 +3425,25 @@ impl Shard {
     ///
     /// A sweep of its copies ([`Each`]), a copy at a time across its owner's turns, the first compact newest chunk a read took
     /// read back as it ends (goal 9, plan 01a1a87b2cec step 3): one job over every copy of the shard held it for all of them.
+    /// As it ends, the soonest of its copies still to fall idle is scheduled with its owners' next sweep ([`Idle::schedule`]).
     pub(super) fn pack_idle() -> Each {
+        Self::pack_idle_as_of(None)
+    }
+
+    /// [`Shard::pack_idle`], each copy judged idle or not as of `now` (none: as each is looked at): a test's later time.
+    fn pack_idle_as_of(now: Option<Instant>) -> Each {
         let mut thaw: Option<(String, Arc<Chunk>)> = None;
+        let mut next: Option<Instant> = None;
         let step = move |s: &mut Shard, id: Option<&str>| match id {
             Some(id) => {
-                if let Some(c) = s.pack_idle_one(id)
+                let (read_back, due) = s.pack_idle_one(id, now.unwrap_or_else(Instant::now));
+                if let Some(c) = read_back
                     && thaw.is_none()
                 {
                     thaw = Some((id.to_owned(), c));
+                }
+                if let Some(due) = due {
+                    next = Some(next.map_or(due, |n| n.min(due)));
                 }
             }
             None => {
@@ -3241,26 +3452,36 @@ impl Shard {
                 {
                     s.want_thaw(&id, c);
                 }
+                if let Some(due) = next.take() {
+                    s.said.idle.schedule(due);
+                }
             }
         };
         Each { left: None, label: &kinds::IDLE, pick: Box::new(|_: &str, _: &Mirror| true), step: Box::new(step) }
     }
 
-    /// Session `id`'s copy in its owner's sweep for idle copies ([`Shard::pack_idle`]): its newest chunk packed where it took
-    /// nothing in since the last sweep and no read took it since it changed; and that chunk, where it's kept compact and a
-    /// read took it since, to be read back.
-    fn pack_idle_one(&mut self, id: &str) -> Option<Arc<Chunk>> {
-        let m = self.mirrors.get_mut(id)?;
-        let idle = std::mem::replace(&mut m.idle_rev, m.rev) == m.rev;
+    /// Session `id`'s copy in its owner's sweep for idle copies ([`Shard::pack_idle`]), at `now`: its newest chunk packed
+    /// where it fell idle by now ([`Idle::after`]) and no read took it since it changed; that chunk, where it's kept compact
+    /// and a read took it since, to be read back; and, where its newest is still to be packed, when it falls idle. None for
+    /// one packed now, or one a read took (its next change schedules it), or one nothing has taught when it falls idle.
+    fn pack_idle_one(&mut self, id: &str, now: Instant) -> (Option<Arc<Chunk>>, Option<Instant>) {
+        let idle = Arc::clone(&self.said.idle);
+        let Some(m) = self.mirrors.get_mut(id) else { return (None, None) };
+        let at = m.gaps.idle_at(idle.after(m.gaps.quiet.bound()));
+        let fell = at.is_some_and(|at| at <= now);
         let (read_back, pack) = match m.events.chunks().last() {
             Some(c) if c.is_compact() => (c.page_read.load(Ordering::Relaxed).then(|| Arc::clone(c)), false),
-            Some(c) => (None, idle && !c.page_read.load(Ordering::Relaxed)),
+            Some(c) => (None, fell && !c.page_read.load(Ordering::Relaxed)),
             None => (None, false),
         };
         if pack {
             m.pack_newest();
         }
-        read_back
+        let due = match m.events.chunks().last() {
+            Some(c) if !pack && !c.is_compact() && !c.is_empty() && !c.page_read.load(Ordering::Relaxed) => at.filter(|at| *at > now),
+            _ => None,
+        };
+        (read_back, due)
     }
 
     /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
@@ -3820,7 +4041,7 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        drop(crate::rt::spawn(pack_idle_every(inboxes.iter().map(crate::memory::queue::Sender::downgrade).collect())));
+        drop(crate::rt::spawn(sweep_when_idle(inboxes.iter().map(crate::memory::queue::Sender::downgrade).collect(), Arc::clone(&said.idle))));
         Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
     }
 
@@ -4542,6 +4763,16 @@ mod tests {
     /// About one of these tests' messages, in an inbox's bytes (goal 11, plan 01a1a87b2e56 step 3): its
     /// place, and a job's closure of a few captured words.
     const MSG: usize = size_of::<Msg>() + crate::memory::queue::PLACE + 4 * size_of::<usize>();
+
+    /// The compute pool's round trip, nanoseconds, the tests of where an owner writes out pin its owners to
+    /// ([`Said::pin_trip`]; consts-audit B1): what they write out on their shard and off it then doesn't move with the round
+    /// trip the tests' process learns, which a loaded host makes milliseconds.
+    const TRIP: u64 = 100_000;
+
+    /// What the owners the placement tests pin weigh their work against: their shard's quantum and [`TRIP`].
+    fn pinned() -> crate::rt::Sides {
+        crate::rt::Sides { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: Some(TRIP) }
+    }
 
     /// What a source file's code says outside its tests, its comments left out. Lines may end in
     /// CRLF, as a Windows checkout writes them (git's autocrlf): read as LF, or the tests' own
@@ -6124,7 +6355,8 @@ mod tests {
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap), with goal 9's rule (plan 01a1a87b2cec step 3): an idle copy's owner, swept
-    /// twice with nothing taken in between ([`Shard::pack_idle`]), has its newest chunk packed off its shard and kept compact.
+    /// once it has fallen idle ([`Shard::pack_idle`]: its copies' idle wait pinned to an hour, so no sweep of their own comes
+    /// between, and swept as of an hour on: consts-audit R1), has its newest chunk packed off its shard and kept compact.
     /// Its next event has that chunk read back off the shard (the owner's read-back on the blocking pool: [`Shard::thawed`]
     /// names it) before the event is taken, and so does a stream into an event of it, each taken once it's back: the copy
     /// holds every event, in order, and the streamed text. Kept compact again and then read (its texts made off the shard for
@@ -6136,6 +6368,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
             copies.bind(&hub);
+            const IDLE: Duration = Duration::from_secs(3600);
+            copies.on_each(|s| s.said().idle.pin_after(u64::try_from(IDLE.as_nanos()).unwrap_or(u64::MAX))).await;
             let id = "idle".to_owned();
             let i = id.clone();
             copies
@@ -6164,12 +6398,12 @@ mod tests {
             let n = u64::try_from(CHUNK + 9)?;
             anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
             until("its events", Box::new(move |v: &View| v.events.len() == usize::try_from(n).unwrap_or(0))).await?;
-            // Swept twice with nothing in between: its newest sealed, packed off the shard, kept compact. Each sweep as
-            // `pack_idle_every` sends it, a copy at a time (goal 9, plan 01a1a87b2cec step 3), taken before the job after it.
+            // Swept as of when it's idle: its newest sealed, packed off the shard, kept compact. Each sweep as
+            // `sweep_when_idle` sends it, a copy at a time (goal 9, plan 01a1a87b2cec step 3), taken before the job after it.
             let sweep = || {
                 let (copies, id) = (Arc::clone(&copies), id.clone());
                 async move {
-                    let _ = copies.send(&id, Msg::Each(Box::new(Shard::pack_idle()))).await;
+                    let _ = copies.send(&id, Msg::Each(Box::new(Shard::pack_idle_as_of(Instant::now().checked_add(IDLE))))).await;
                     copies.applied(&id).await;
                 }
             };
@@ -6212,6 +6446,109 @@ mod tests {
             sweep().await;
             let left = copies.on(&id, |s| s.get("idle").and_then(|m| m.events.chunks().last().map(|c| !c.is_compact() && c.packed().is_none()))).await.flatten();
             anyhow::ensure!(left == Some(true), "read since it last changed: not packed again");
+            Ok(())
+        })
+    }
+
+    /// Consts-audit R1 (goal 11, plan 01a1a87b2e56 step 5): a copy falls idle by its own gaps between the changes it takes,
+    /// where every copy waited 5 s (`IDLE_AFTER`, jemalloc's dirty decay). Do: teach one copy turns of 40 changes 25 ms
+    /// apart with 1.5 to 2.5 s between them (the lab's profile), another the same turns 15 to 25 s apart, a third 150 to 250
+    /// ms apart; then a copy with one change and no gap of its own, and owners that learned nothing. Expect: each copy's
+    /// gaps within a turn learned as busy and those between as quiet; each idle past its quiet gaps' bound, never between
+    /// its turns (its longest wait between them comes before it), so the slow copy only past tens of seconds, the quick one
+    /// past a few hundred milliseconds; the copy with no gap of its own judged by every copy's quiet gaps, smoothed
+    /// together; and none idle where nothing was learned.
+    #[test]
+    fn r1_a_copy_falls_idle_by_its_own_gaps_between_changes() -> anyhow::Result<()> {
+        let base = Instant::now();
+        let at = |ms: u64| base.checked_add(Duration::from_millis(ms)).ok_or_else(|| anyhow::anyhow!("no such time"));
+        let idle = Idle::default();
+        anyhow::ensure!(idle.after(None).is_none(), "nothing learned: none idle");
+        // Ten turns of 40 changes 25 ms apart, `quiet` between them in turn, from `from` ms; when its last change was.
+        let turns = |gaps: &mut Gaps, from: u64, quiet: [u64; 5]| -> anyhow::Result<u64> {
+            let mut t = from;
+            for turn in 0..10 {
+                for k in 0..40 {
+                    if let Some(q) = gaps.changed(at(t)?) {
+                        idle.quiet.learn(q);
+                    }
+                    if k < 39 {
+                        t += 25;
+                    }
+                }
+                if turn < 9 {
+                    t += quiet.get(turn % quiet.len()).copied().unwrap_or(0);
+                }
+            }
+            Ok(t)
+        };
+        let mut lab = Gaps::default();
+        let last = turns(&mut lab, 0, [2_000, 1_500, 2_500, 1_800, 2_200])?;
+        let busy = lab.busy.bound().ok_or_else(|| anyhow::anyhow!("no busy gaps"))?;
+        anyhow::ensure!(busy < 1_500_000_000, "the gaps within a turn are busy ones: their bound {busy} ns");
+        let lab_after = idle.after(lab.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
+        anyhow::ensure!(lab_after > 2_500_000_000 && lab_after < 10_000_000_000, "past its longest wait between turns, within seconds: {lab_after} ns");
+        let fell = lab.idle_at(idle.after(lab.quiet.bound())).ok_or_else(|| anyhow::anyhow!("never idle"))?;
+        anyhow::ensure!(fell > at(last + 2_500)? && fell <= at(last + 10_000)?, "idle {:?} after its last change", fell.saturating_duration_since(at(last)?));
+        let mut slow = Gaps::default();
+        turns(&mut slow, 0, [20_000, 15_000, 25_000, 18_000, 22_000])?;
+        let slow_after = idle.after(slow.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
+        anyhow::ensure!(slow_after > 25_000_000_000, "a copy quiet longer between its turns falls idle later: {slow_after} ns");
+        let mut quick = Gaps::default();
+        turns(&mut quick, 0, [200, 150, 250, 180, 220])?;
+        let quick_after = idle.after(quick.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
+        anyhow::ensure!(quick_after > 250_000_000 && quick_after < lab_after, "a copy quiet briefly between its turns falls idle sooner: {quick_after} ns");
+        // A copy with no gap of its own yet: every copy's quiet gaps, smoothed together, judge it.
+        let mut new = Gaps::default();
+        anyhow::ensure!(new.changed(at(0)?).is_none() && new.quiet.bound().is_none(), "one change: no gap");
+        anyhow::ensure!(idle.after(new.quiet.bound()) == idle.quiet.bound() && idle.quiet.bound().is_some(), "judged by every copy's");
+        Ok(())
+    }
+
+    /// Consts-audit R1 (goal 11, plan 01a1a87b2e56 step 5): a copy is swept as it falls idle, as its owners' changes scheduled
+    /// it, with no sweep every 5 s; and the task that has it swept ends with its owners. Do: owners whose copies fall idle
+    /// 300 ms after their last change (pinned, as a copy's gaps would teach it); a copy that takes its events; wait, sending no
+    /// sweep. Expect: its newest still as it was at once, then packed and kept compact; once the owners are gone, the task
+    /// that sweeps them told so.
+    #[test]
+    fn r1_a_copy_is_swept_as_it_falls_idle_and_no_sooner() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let after = Duration::from_millis(300);
+            copies.on_each(move |s| s.said().idle.pin_after(u64::try_from(after.as_nanos()).unwrap_or(u64::MAX))).await;
+            let idle = copies.on_each(|s| Arc::clone(&s.said().idle)).await.pop().ok_or_else(|| anyhow::anyhow!("no owner"))?;
+            let id = "falls-idle".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            let n = u64::try_from(CHUNK + 9)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
+            let sent = Instant::now();
+            let u = Update::Events { events: (1..=n).map(said).collect() };
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            copies.applied(&id).await;
+            let compact = || copies.with(&id, |v| v.events.chunks().last().is_some_and(|c| c.is_compact())).unwrap_or(false);
+            if sent.elapsed() < after {
+                anyhow::ensure!(!compact(), "packed before it fell idle");
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !compact() {
+                anyhow::ensure!(Instant::now() < deadline, "not swept in 30 s, {after:?} after it fell idle");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(sent.elapsed() >= after, "packed {:?} after its change, before it fell idle", sent.elapsed());
+            drop(copies);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !idle.gone.load(Ordering::Relaxed) {
+                anyhow::ensure!(Instant::now() < deadline, "the owners' sweeping task wasn't told they're gone");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
             Ok(())
         })
     }
@@ -6569,6 +6906,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
             copies.bind(&hub);
+            // Its owners weigh writing out on their shard against a round trip of their own (consts-audit B1).
+            copies.on_each(|s| s.said().pin_trip(TRIP)).await;
             let id = "large".to_owned();
             let i = id.clone();
             copies
@@ -6582,7 +6921,7 @@ mod tests {
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.written_off()).await.unwrap_or_default();
             let large = "x".repeat(8 << 20);
-            anyhow::ensure!(long_to_write(&said(10, large.clone())), "8 MB expected to take past a slow poll to write out");
+            anyhow::ensure!(long_to_write(&said(10, large.clone()), pinned()), "8 MB expected to cost more to write out than the compute pool's round trip");
             anyhow::ensure!(copies.send(&id, update(vec![said(9, "before".into()), said(10, large.clone()), said(11, "after".into())])).await, "sent");
             let i = id.clone();
             let now = copies
@@ -6854,6 +7193,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
             copies.bind(&hub);
+            // Its owners weigh writing out on their shard against a round trip of their own (consts-audit B1).
+            copies.on_each(|s| s.said().pin_trip(TRIP)).await;
             let id = "changed".to_owned();
             let i = id.clone();
             copies
@@ -6898,7 +7239,7 @@ mod tests {
             }
             let was = copies.on(&id, |s| s.updates_off()).await.unwrap_or_default();
             let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
-            anyhow::ensure!(long_changes(&large), "a changeset of 40,000 lines expected to take past a slow poll to write out");
+            anyhow::ensure!(long_changes(&large, pinned()), "a changeset of 40,000 lines expected to cost more to write out than the compute pool's round trip");
             for u in updates {
                 anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
             }
@@ -6972,6 +7313,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
             copies.bind(&hub);
+            // Its owners weigh writing out on their shard against a round trip of their own (consts-audit B1).
+            copies.on_each(|s| s.said().pin_trip(TRIP)).await;
             let id = "said".to_owned();
             let i = id.clone();
             copies
@@ -7030,6 +7373,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
             copies.bind(&hub);
+            // Its owners weigh writing out on their shard against a round trip of their own (consts-audit B1).
+            copies.on_each(|s| s.said().pin_trip(TRIP)).await;
             for id in ["first", "next"] {
                 let i = id.to_owned();
                 copies
@@ -7048,7 +7393,7 @@ mod tests {
             let was = off().await;
             let (states, metas) = learned().await;
             anyhow::ensure!(was == 0, "the first session's first state and meta written on the shard: {was} off it");
-            anyhow::ensure!(states > hyper_rt::slow::SLOW_POLL_NS && metas > hyper_rt::slow::SLOW_POLL_NS, "each taught its owners it's long: {states} ns, {metas} ns");
+            anyhow::ensure!(!pinned().take_here(states, states) && !pinned().take_here(metas, metas), "each taught its owners it's long to write out against {:?}: {states} ns, {metas} ns", pinned());
             anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
             let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
@@ -7326,6 +7671,8 @@ mod tests {
             let bus = sim_bus();
             let copies = Copies::start_with(Arc::clone(&bus), 1, 64 * MSG);
             copies.bind(&hub);
+            // Its owners weigh writing out on their shard against a round trip of their own (consts-audit B1).
+            copies.on_each(|s| s.said().pin_trip(TRIP)).await;
             let id = "framed".to_owned();
             let (i, b) = (id.clone(), Arc::clone(&bus));
             copies
@@ -7344,7 +7691,7 @@ mod tests {
             let was = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
             // A large one whose frame the bus takes (half its most), and one past what it takes.
             let (large, past) = ("x".repeat(kiln_seams::bus::PAYLOAD_MAX / 2), "y".repeat(kiln_seams::bus::PAYLOAD_MAX * 2));
-            anyhow::ensure!(long_to_write(&said(9, large.clone())) && long_to_write(&said(11, past.clone())), "both expected to take past a slow poll to write out");
+            anyhow::ensure!(long_to_write(&said(9, large.clone()), pinned()) && long_to_write(&said(11, past.clone()), pinned()), "both expected to cost more to write out than the compute pool's round trip");
             for (q, text) in [(9, large.clone()), (10, "after".to_owned()), (11, past), (12, "after that".to_owned())] {
                 anyhow::ensure!(copies.send(&id, update(vec![said(q, text)])).await, "sent");
             }

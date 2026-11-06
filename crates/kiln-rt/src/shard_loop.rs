@@ -386,6 +386,9 @@ struct Core {
     /// where it does not park. A loop that does neither finds the driver asked once a quantum, as a
     /// busy turn does.
     harvest_owed: bool,
+    /// What ended the driver's last blocking wait, as [`Shard::wait_in_driver`] counted it: read once, as the park
+    /// notes its wake ([`Shard::note_last_wake`]).
+    last_by: Option<crate::quiet::By>,
     /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
@@ -573,6 +576,7 @@ impl Shard {
             },
             last_driver_ns: now_ns,
             harvest_owed: false,
+            last_by: None,
             real_time: !is_sim,
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
@@ -883,7 +887,9 @@ impl Shard {
             } else {
                 self.core.last_driver_ns.saturating_add(self.desk.quantum_ns.get())
             };
-            timer.min(harvest)
+            // A quiet sleep's due time: a step after it, whatever else it finds, ends it ([`Shard::fire_quiet`]).
+            let quiet = self.desk.quiet.get().filter(|q| q.came.is_none()).map_or(u64::MAX, |q| q.due_ns);
+            timer.min(harvest).min(quiet)
         };
         self.desk.due_ns.set(due);
     }
@@ -1005,7 +1011,8 @@ impl Shard {
     /// Runs the loop on the calling thread until shutdown completes. When idle within the window a client's
     /// last activity opened, the shard spins out the window checking its inboxes and driver before it parks;
     /// outside every window it parks at once. A step that follows a park or a busy step at once takes the
-    /// reading that ended it as its clock ([`Shard::step_after`]).
+    /// reading that ended it as its clock ([`Shard::step_after`]). A step that did work and left nothing for the
+    /// next to find goes on as an idle one would, with no idle step between ([`Shard::left_nothing`]).
     pub fn run(&mut self) {
         let mut reading = None;
         loop {
@@ -1013,7 +1020,7 @@ impl Shard {
             if outcome.exit {
                 break;
             }
-            if outcome.did_work {
+            if outcome.did_work && !self.left_nothing(last) {
                 reading = last;
                 continue;
             }
@@ -1022,11 +1029,13 @@ impl Shard {
             if self.desk.movable.look(&self.desk) {
                 continue;
             }
-            if self.spin_after_activity(outcome.next_deadline_ns) {
+            // A spinning shard is awake: a quiet sleep falling due ends its spin as a timer would ([`crate::quiet`]).
+            let awake_deadline_ns = self.awake_deadline(outcome.next_deadline_ns);
+            if self.spin_after_activity(awake_deadline_ns) {
                 continue;
             }
             // The spin before a park its thread asked for, if any (kiln's goal 9, plan 01a1a87b2cec step 4).
-            if self.spin_before_park(outcome.next_deadline_ns) {
+            if self.spin_before_park(awake_deadline_ns) {
                 continue;
             }
             reading = self.park_owned_then(outcome.next_deadline_ns);
@@ -1553,12 +1562,36 @@ impl Shard {
         let mut did_work = self.drain_control();
         did_work |= self.drain_wakes();
         did_work |= self.expire_timers();
+        did_work |= self.fire_quiet();
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
         self.desk.local.release_yielded(self.desk.now_ns.get());
         self.refresh_due();
         did_work
+    }
+
+    /// Whether a step that did work left nothing for the next to find, as the idle step after it would find it
+    /// ([`Shard::run`]): no task ready, those that woke themselves among them, and no input pending as of `last`,
+    /// the step's last reading of the clock (none: the clock now). Then the loop goes on as after an idle step, to
+    /// the park: half of a server shard's steps were that idle one, each reading its inputs, its wheel and its
+    /// judgments to find nothing (kiln's goal 9, plan 01a1a87b2cec step 5: 44.6 steps to 22.9 parks a request in
+    /// kiln's lab, g9p16). What that step left for the park is left here too: its clock, and the driver owed its
+    /// look where readiness waits are registered ([`Shard::read_inputs`]). The park announces itself and looks at its
+    /// inbox again as it always does, so a wake sent after this look is never lost ([`crate::parking`]).
+    fn left_nothing(&mut self, last: Option<Reading>) -> bool {
+        if !self.core.real_time || self.core.driver_lost || self.core.exited || !self.desk.local.is_empty() {
+            return false;
+        }
+        let now = last.map_or_else(|| self.carried_now_ns(), |reading| reading.ns);
+        if self.inputs_pending_at(now) {
+            return false;
+        }
+        self.desk.now_ns.set(now);
+        if !self.core.waiting.is_empty() {
+            self.core.harvest_owed = true;
+        }
+        true
     }
 
     /// Whether the inputs may hold work (docs/runtime.md §3.10), from what tells without touching them: an
@@ -1568,9 +1601,14 @@ impl Shard {
     /// shard's steps are the idle one before each park, and each drained nothing, examined its wheel and asked
     /// its driver twice, only to leave the driver to the park ([`Shard::read_inputs`] keeps that).
     fn inputs_pending(&self) -> bool {
+        self.inputs_pending_at(self.desk.now_ns.get())
+    }
+
+    /// [`Shard::inputs_pending`] as of `now_ns`.
+    fn inputs_pending_at(&self, now_ns: u64) -> bool {
         !self.core.real_time
             || self.desk.asked.get()
-            || self.desk.now_ns.get() >= self.desk.due_ns.get()
+            || now_ns >= self.desk.due_ns.get()
             || self
                 .desk
                 .entry
@@ -1618,11 +1656,17 @@ impl Shard {
             }
             return None;
         }
+        // A quiet sleep waiting on the shard ends the park only after its quiet ([`crate::quiet`]).
+        let (deadline_ns, by_quiet) = self.quiet_deadline(deadline_ns);
         self.core.waited_for_ns = deadline_ns;
         self.core.attribution.wait_began();
         let (retrieved, woke) = match self.desk.entry {
-            Some(entry) => self.park_announced(entry, deadline_ns),
-            None => (true, self.wait_in_driver(deadline_ns)),
+            Some(entry) => self.park_announced(entry, deadline_ns, by_quiet),
+            None => {
+                let woke = self.wait_in_driver(deadline_ns);
+                self.note_last_wake(woke, None, deadline_ns, by_quiet);
+                (true, woke)
+            }
         };
         let lost = self.core.driver_lost;
         self.wait_ended(retrieved, woke);
@@ -1637,11 +1681,13 @@ impl Shard {
     /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
     /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
     /// cost. Whether it waited, and the reading its wait returned with: none where the driver was lost, or where
-    /// the shard learns (its readings of its switches and CPU, system calls, follow the wait).
+    /// the shard learns (its readings of its switches and CPU, system calls, follow the wait). A wait's wake is
+    /// noted for a quiet sleep (`by_quiet`: the deadline is the sleep's; [`Shard::note_last_wake`]).
     fn park_announced(
         &mut self,
         entry: &'static Entry,
         deadline_ns: Option<u64>,
+        by_quiet: bool,
     ) -> (bool, Option<Reading>) {
         let learns = self.core.real_time && self.core.wake.is_some();
         // A spin before each park that sizes itself reads each park's gap, and learns what a park costs from the parks
@@ -1688,6 +1734,7 @@ impl Shard {
             }
             return (false, None);
         };
+        self.note_last_wake(woke, woken.and_then(|woken| woken.latency_ns()), deadline_ns, by_quiet);
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
         }
@@ -1934,14 +1981,15 @@ impl Shard {
         if self.core.driver_lost {
             return None;
         }
-        let by = if self.core.driver.kicks_taken() != kicks {
-            &self.desk.live.woken_by_kick
+        let (by, cause) = if self.core.driver.kicks_taken() != kicks {
+            (&self.desk.live.woken_by_kick, crate::quiet::By::Kick)
         } else if harvested {
-            &self.desk.live.woken_by_io
+            (&self.desk.live.woken_by_io, crate::quiet::By::Io)
         } else {
-            &self.desk.live.woken_by_timer
+            (&self.desk.live.woken_by_timer, crate::quiet::By::Timer)
         };
         count(by, 1);
+        self.core.last_by = Some(cause);
         let woke = self.read_clock();
         self.note_parked(woke.ns.saturating_sub(began));
         Some(woke)
@@ -2163,6 +2211,61 @@ impl Shard {
                 .pulse
                 .record_admission_refused(self.desk.live.admission_refused.get());
         }
+    }
+
+    /// A quiet sleep fallen due by the step's clock: how its turn came, from the shard's last wake
+    /// ([`crate::quiet::came`]), left for its task, which is woken. Whether there was one.
+    fn fire_quiet(&mut self) -> bool {
+        let Some(mut quiet) = self.desk.quiet.get() else {
+            return false;
+        };
+        if quiet.came.is_some() || self.desk.now_ns.get() < quiet.due_ns || self.core.driver_lost {
+            return false;
+        }
+        quiet.came = Some(crate::quiet::came(&quiet, self.desk.last_wake.get()));
+        self.desk.quiet.set(Some(quiet));
+        self.wake_word(Encoded::from_word(quiet.word));
+        true
+    }
+
+    /// The deadline of a spin that would end at `deadline_ns`, for a quiet sleep waiting on the shard: the earlier of the
+    /// two, the sleep's when it falls due (a spinning shard is awake).
+    fn awake_deadline(&self, deadline_ns: Option<u64>) -> Option<u64> {
+        match self.desk.quiet.get().filter(|q| q.came.is_none()) {
+            Some(quiet) => Some(deadline_ns.map_or(quiet.due_ns, |deadline| deadline.min(quiet.due_ns))),
+            None => deadline_ns,
+        }
+    }
+
+    /// The deadline of a park beginning now that would end at `deadline_ns`, for a quiet sleep waiting on the shard: the
+    /// earlier of the two, the sleep's only after its quiet ([`crate::quiet::deadline`]); and whether it's the sleep's.
+    fn quiet_deadline(&self, deadline_ns: Option<u64>) -> (Option<u64>, bool) {
+        let Some(quiet) = self.desk.quiet.get().filter(|q| q.came.is_none()) else {
+            return (deadline_ns, false);
+        };
+        let at = crate::quiet::deadline(&quiet, self.carried_now_ns());
+        match deadline_ns {
+            Some(deadline) if deadline <= at => (Some(deadline), false),
+            _ => (Some(at), true),
+        }
+    }
+
+    /// A park's wait returned at `woke`: its wake noted for a quiet sleep ([`crate::quiet::Wake`]), what ended it as
+    /// [`Shard::wait_in_driver`] counted it (the park's own deadline, `by_quiet`, a quiet sleep's), and how long that took
+    /// to run where the shard knows: a kick's from `kick_ns`, its sender's stamp to the wait's return; a timer's from
+    /// `deadline_ns`.
+    fn note_last_wake(&mut self, woke: Option<Reading>, kick_ns: Option<u64>, deadline_ns: Option<u64>, by_quiet: bool) {
+        use crate::quiet::By;
+        let (Some(woke), Some(by)) = (woke, self.core.last_by.take()) else {
+            return;
+        };
+        let by = if by == By::Timer && by_quiet { By::Quiet } else { by };
+        let waited_ns = match by {
+            By::Kick => kick_ns,
+            By::Timer | By::Quiet => deadline_ns.map(|deadline| woke.ns.saturating_sub(deadline)),
+            By::Io => None,
+        };
+        self.desk.last_wake.set(Some(crate::quiet::Wake { at_ns: woke.ns, by, waited_ns }));
     }
 
     fn expire_timers(&mut self) -> bool {
