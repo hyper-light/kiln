@@ -5,7 +5,7 @@
  * workflows and background calls it left running never keep it working by themselves. The server
  * says the same (`stand` in harness/wait.rs, `SubagentBrief::of`, `Task::live`).
  */
-import type { AgentInfo, Approval, ApprovalBrief, SendMode, Status, SubagentBrief, Task } from "@/api/harness";
+import type { AgentInfo, Approval, ApprovalBrief, SendMode, State, Status, SubagentBrief, Task } from "@/api/harness";
 import { agentLabel, taskLive } from "./derive";
 
 /**
@@ -100,6 +100,18 @@ export const workingThrough = (status: Status, atWork: number): boolean => statu
 
 /** {@link workingThrough}, from the agents list. */
 export const throughSubagents = (a: Pick<AgentInfo, "status" | "subagents">): boolean => workingThrough(a.status, subagentsAtWork(a.subagents).length);
+
+/**
+ * At work now, as its page has it from its live session: its turn runs, or {@link workingThrough} the
+ * subagents it sent off: its harness's own, from its live tasks (`state`; until they're in, the
+ * agents list's), and those kiln started for its goals or plan steps (`kiln`). As Mission control's
+ * row and its page's head have it.
+ */
+export function workingNow(info: Pick<AgentInfo, "status" | "subagents"> | null, state: Pick<State, "tasks"> | null, kiln: readonly AgentInfo[] = []): boolean {
+  if (!info) return false;
+  if (info.status === "running") return true;
+  return workingThrough(info.status, (state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info.subagents).length) + kilnAtWork(kiln).length);
+}
 
 /** A subagent running right now: what the holographic shimmer marks (one waiting to start or paused for an approval holds still). */
 export const subagentRunning = (subagents: readonly Pick<Task, "status">[] | undefined): boolean => (subagents ?? []).some((t) => t.status === "running");

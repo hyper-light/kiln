@@ -178,7 +178,7 @@
     transform: rotate(1turn);
   }
 }
-/* Under way while the agent is between turns: the ring held in the light's blue. */
+/* Under way while the agent is between turns, no subagent of its at work: the ring held in the light's blue. */
 .gs-link[data-status="active"] .gs-node[data-stand="waiting"] {
   border-color: #a6c4ed;
   color: #a6c4ed;
