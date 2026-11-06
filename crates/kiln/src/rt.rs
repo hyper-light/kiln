@@ -347,42 +347,44 @@ fn place_on(cpus: &[u32], apart: bool, shards: u16, quantum_ns: Option<u64>) -> 
 /// step 4), from the CPUs it may run on (`cpus`, [`crate::os::cpu_topology`]): `[kept, shard 1, …, shard n, the
 /// rest]`, what [`pin_apart`] takes, so each shard is fixed to a CPU of its own and the server's other threads keep
 /// every other one; or why there's no such place. From the machine's own topology, nothing set:
-/// - **its fastest CPUs** (the kernel's capacity; a hybrid machine's performance cores), where a shard's ready work
-///   runs soonest;
+/// - **its fastest CPUs first** (its core types where a hybrid machine's kernel lists them, else the kernel's
+///   capacity: [`crate::os::Cpu::rank`]), where a shard's ready work runs soonest, the next class only where the
+///   fastest has too few;
 /// - **one to a physical core**: SMT siblings share one core's pipeline, and two shards there would slow each other;
-/// - **in the last-level cache holding most of those cores, then the next**: the shards and the threads they hand
+/// - **in the last-level cache holding most of a class's cores, then the next**: the shards and the threads they hand
 ///   work to share it; the kernel's order within each;
 /// - **the first kept for the server's other threads**, as [`shard_cores`] keeps one of declared cores and
-///   hyper-rt's placement keeps one: they keep a core whatever the shards take.
+///   hyper-rt's placement keeps the fastest class's first: they keep a core whatever the shards take.
 ///
-/// Fewer such cores than a shard each and one more is no place: a real-time shard shares its CPU with no other shard
-/// and no thread of the server's own ([`Place`]).
+/// Fewer cores than a shard each and one more is no place: a real-time shard shares its CPU with no other shard and no
+/// thread of the server's own ([`Place`]).
 fn class_cpus(cpus: &[crate::os::Cpu], shards: u16) -> Result<Vec<u32>, String> {
-    let Some(fastest) = cpus.iter().map(|c| c.rank).max() else {
+    if cpus.is_empty() {
         return Err("this process's CPUs couldn't be read (its affinity, Linux's sysfs)".to_owned());
-    };
+    }
     let mut by_id = cpus.to_vec();
     by_id.sort_unstable_by_key(|c| c.id);
     by_id.dedup_by_key(|c| c.id);
-    // One CPU to a physical core, of the fastest class: each core's first.
+    // One CPU to a physical core: each core's first.
     let mut cores: Vec<crate::os::Cpu> = Vec::new();
-    for cpu in by_id.iter().filter(|c| c.rank == fastest) {
+    for cpu in &by_id {
         if !cores.iter().any(|c| c.core == cpu.core) {
             cores.push(*cpu);
         }
     }
-    // The last-level cache holding most of them first, then the next, each in the kernel's order.
-    let held = |llc: u32| cores.iter().filter(|c| c.llc == llc).count();
-    let mut ranked: Vec<(usize, u32, u32)> = cores.iter().map(|c| (held(c.llc), c.llc, c.id)).collect();
-    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    // The fastest class first; within it, the last-level cache holding most of its cores first, then the next, each
+    // in the kernel's order.
+    let held = |rank: u32, llc: u32| cores.iter().filter(|c| c.rank == rank && c.llc == llc).count();
+    let mut ranked: Vec<(u32, usize, u32, u32)> = cores.iter().map(|c| (c.rank, held(c.rank, c.llc), c.llc, c.id)).collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
     let need = usize::from(shards).saturating_add(1);
     if ranked.len() < need {
         return Err(format!(
-            "it may run on {} core(s) of this machine's fastest, where {shards} shards and the server's other threads take {need}: a real-time shard shares its CPU with no other shard and no thread of the server's own",
+            "it may run on {} core(s), where {shards} shards and the server's other threads take {need}: a real-time shard shares its CPU with no other shard and no thread of the server's own",
             ranked.len()
         ));
     }
-    let mut ordered: Vec<u32> = ranked.iter().take(need).map(|(_, _, id)| *id).collect();
+    let mut ordered: Vec<u32> = ranked.iter().take(need).map(|(_, _, _, id)| *id).collect();
     let rest: Vec<u32> = by_id.iter().map(|c| c.id).filter(|id| !ordered.contains(id)).collect();
     ordered.extend(rest);
     Ok(ordered)
@@ -2898,12 +2900,13 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 4: with no cores of the server's own declared, shards in the real-time class
-    /// take CPUs of their own from the machine's topology: its fastest, one to a physical core, in the last-level
-    /// cache holding most of those, the first kept for the server's other threads, every other CPU theirs too.
-    /// Production's machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores) gives the shards 1-4 and
+    /// take CPUs of their own from the machine's topology: its fastest first, one to a physical core, in the
+    /// last-level cache holding most of those, the first kept for the server's other threads, every other CPU theirs
+    /// too. Production's machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores) gives the shards 1-4 and
     /// keeps 0; the lab's server held to fedora's efficiency cores, 16-31, gives them 17-20, as the lab's cores do;
-    /// fedora whole gives them its performance cores, one thread of each; a cache holding more cores wins; too few
-    /// cores for a shard each and one more, or none read, is no place.
+    /// fedora whole gives them its performance cores, one thread of each; a cache holding more cores wins; a fastest
+    /// class too small for them takes the next class's after its own; too few cores for a shard each and one more, or
+    /// none read, is no place.
     #[test]
     fn g9_s4_shards_in_the_class_take_cpus_of_their_own() -> anyhow::Result<()> {
         let fixed = |cpus: &[crate::os::Cpu], shards: u16| class_cpus(cpus, shards).map(|cores| (cores.first().copied(), shard_cores(&cores, shards), cores));
@@ -2926,6 +2929,10 @@ mod tests {
         let lopsided: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1)).chain((2..8).map(|id| cpu(id, id, 2, 1))).collect();
         let (kept, shards, _) = fixed(&lopsided, 4).map_err(|e| anyhow::anyhow!(e))?;
         anyhow::ensure!(kept == Some(2) && shards == vec![3, 4, 5, 6], "{kept:?} {shards:?}");
+        // big.LITTLE with two big cores: the next class fills in, the fastest first.
+        let little: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1024)).chain((2..8).map(|id| cpu(id, id, 2, 446))).collect();
+        let (kept, shards, _) = fixed(&little, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![1, 2, 3, 4], "{kept:?} {shards:?}");
         // Two cores of two threads: two shards and a core more don't fit.
         let small: Vec<crate::os::Cpu> = (0..4).map(|id| cpu(id, id % 2, 0, 1)).collect();
         anyhow::ensure!(class_cpus(&small, 2).is_err_and(|why| why.contains("2 core(s)")), "a place on two cores");
@@ -2954,6 +2961,33 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         anyhow::ensure!(granted.is_err(), "granted off Linux");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: on this machine as this thread may run on it, the server's four shards in the
+    /// class take four physical cores, of its fastest class where that has five, none the kept CPU's, and every CPU it
+    /// may run on is listed once; or, where it has fewer than five cores, there's no place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_this_machines_shards_take_cores_of_their_own() -> anyhow::Result<()> {
+        let cpus = crate::os::cpu_topology();
+        let fastest = cpus.iter().map(|c| c.rank).max();
+        let all_cores: std::collections::BTreeSet<u32> = cpus.iter().map(|c| c.core).collect();
+        let cores_of_fastest: std::collections::BTreeSet<u32> = cpus.iter().filter(|c| Some(c.rank) == fastest).map(|c| c.core).collect();
+        let Ok(ordered) = class_cpus(&cpus, 4) else {
+            anyhow::ensure!(all_cores.len() < 5, "{} cores, and no place", all_cores.len());
+            return Ok(());
+        };
+        let of = |id: u32| cpus.iter().find(|c| c.id == id).copied();
+        let shards: Vec<crate::os::Cpu> = shard_cores(&ordered, 4).into_iter().filter_map(of).collect();
+        let kept = ordered.first().copied().and_then(of);
+        let cores: std::collections::BTreeSet<u32> = shards.iter().map(|c| c.core).collect();
+        anyhow::ensure!(shards.len() == 4 && cores.len() == 4, "shards {shards:?}");
+        anyhow::ensure!(cores_of_fastest.len() < 5 || shards.iter().all(|c| Some(c.rank) == fastest), "a shard off the fastest: {shards:?}");
+        anyhow::ensure!(kept.is_some_and(|k| !cores.contains(&k.core)), "the kept CPU {kept:?} on a shard's core");
+        let mut every = ordered.clone();
+        every.sort_unstable();
+        anyhow::ensure!(every == cpus.iter().map(|c| c.id).collect::<Vec<u32>>(), "not every CPU once: {ordered:?}");
         Ok(())
     }
 
@@ -3002,30 +3036,34 @@ mod tests {
                 };
                 let (ready, placed, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
                 let (done, waited) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-                // The normal thread: on the CPU, busy there until the waiter starts waiting, then done.
+                // The normal thread: on the CPU, asleep until the waiter wakes it there as it starts waiting (so it's
+                // ready on that CPU, as a thread preempted mid-push is), then done. Asleep, not spinning, so it takes
+                // nothing from the tests beside it.
                 let normal = {
                     let (ready, placed, go, done) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done));
                     std::thread::spawn(move || {
                         placed.store(on_cpu(), Ordering::Release);
                         ready.store(true, Ordering::Release);
                         while !go.load(Ordering::Acquire) && stamp() < 2_000_000_000 {
-                            std::hint::spin_loop();
+                            std::thread::park_timeout(Duration::from_millis(10));
                         }
                         done.store(stamp().max(1), Ordering::Release);
                     })
                 };
-                // The waiter: on the same CPU once the normal thread is, in the class as asked, yielding until the
-                // normal thread is done or its wait ends.
+                let wake = normal.thread().clone();
+                // The waiter: on the same CPU once the normal thread is, in the class as asked, waking it and yielding
+                // until it's done or the wait ends.
                 let waiter = {
                     let (ready, placed, go, done, waited) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done), Arc::clone(&waited));
                     std::thread::spawn(move || -> bool {
                         let pinned = on_cpu();
                         while !ready.load(Ordering::Acquire) && stamp() < 1_000_000_000 {
-                            std::hint::spin_loop();
+                            std::thread::sleep(Duration::from_micros(100));
                         }
                         let ok = pinned && placed.load(Ordering::Acquire) && (!realtime || hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY).is_ok());
                         let from = stamp();
                         go.store(true, Ordering::Release);
+                        wake.unpark();
                         while ok && done.load(Ordering::Acquire) == 0 && stamp() < from.saturating_add(wait_ns) {
                             std::thread::yield_now();
                         }

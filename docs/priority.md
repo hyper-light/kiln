@@ -315,9 +315,10 @@ shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-ti
   - on its declared cores (`[server] cores`, "Cores of its own"), where they give each shard one and keep a core
     for its other threads;
   - else on CPUs the machine's topology gives (`crate::rt::class_cpus`, from `crate::os::cpu_topology`): its
-    fastest (the kernel's `cpu_capacity`; a hybrid machine's performance cores), one thread of each physical core
-    (SMT siblings share one core's pipeline), in the last-level cache holding most of them, then the next, the
-    kernel's order within each, the first kept for its other threads, which keep every CPU but the shards'
+    fastest first (a hybrid machine's performance cores where its kernel lists the core types, whatever a favoured
+    core's capacity says; else the kernel's `cpu_capacity`), the next class only where the fastest has too few, one
+    thread of each physical core (SMT siblings share one core's pipeline), in the last-level cache holding most of
+    them, then the next, the kernel's order within each, the first kept for its other threads, which keep every CPU but the shards'
     (`keep_threads_off`, `keep_apart`, `keep_child_off_shards`, as for declared cores). On production's machine,
     one thread each of cores 1-4 (CPUs 1-4), CPU 0 kept; for the lab's server held to fedora's efficiency cores,
     17-20, 16 kept.

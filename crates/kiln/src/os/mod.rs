@@ -308,21 +308,27 @@ pub struct Cpu {
     /// The last-level cache it shares, as the lowest id among the CPUs sharing its highest-level cache
     /// (`cache/index<n>/shared_cpu_list` of the largest `level`); its core's where none is said.
     pub llc: u32,
-    /// How fast the kernel ranks it, higher faster: its `cpu_capacity` (the largest core's is 1024) where the
-    /// kernel keeps one; else 0 for an efficiency core of a hybrid machine (`/sys/devices/cpu_atom/cpus`) and 1
-    /// for any other. Only ever compared with the other CPUs of its machine, read the same way.
+    /// How fast its class is, higher faster: on a hybrid machine whose kernel lists its core types
+    /// (`/sys/devices/cpu_core/cpus` and `cpu_atom/cpus`), 1 for a performance core and 0 for an efficiency one, whatever
+    /// the cores' capacities (which may differ by a favoured core's turbo within a type); else its `cpu_capacity` (the
+    /// largest core's is 1024, a big.LITTLE machine's clusters apart); else 1. Only ever compared with the other CPUs of
+    /// its machine, read the same way.
     pub rank: u32,
 }
 
 impl Cpu {
     /// CPU `id` from what Linux's files say of it: its SMT siblings (`thread_siblings_list`), each of its caches'
     /// level and the CPUs sharing it (`cache/index<n>/level` and `shared_cpu_list`), its capacity
-    /// (`cpu_capacity`), and whether it's a hybrid machine's efficiency core.
-    pub fn of(id: u32, siblings: Option<&str>, caches: &[(u32, &str)], capacity: Option<&str>, efficiency: bool) -> Cpu {
+    /// (`cpu_capacity`), and its core type where a hybrid machine's kernel lists it (`Some(true)` for an efficiency
+    /// core).
+    pub fn of(id: u32, siblings: Option<&str>, caches: &[(u32, &str)], capacity: Option<&str>, efficiency: Option<bool>) -> Cpu {
         let lowest = |list: &str| cpu_list(list).ok().and_then(|cpus| cpus.first().copied());
         let core = siblings.and_then(lowest).unwrap_or(id);
         let llc = caches.iter().max_by_key(|(level, _)| *level).and_then(|(_, shared)| lowest(shared)).unwrap_or(core);
-        let rank = capacity.and_then(|c| c.trim().parse().ok()).unwrap_or(u32::from(!efficiency));
+        let rank = match efficiency {
+            Some(efficiency) => u32::from(!efficiency),
+            None => capacity.and_then(|c| c.trim().parse().ok()).unwrap_or(1),
+        };
         Cpu { id, core, llc, rank }
     }
 }
@@ -334,7 +340,13 @@ pub fn cpu_topology() -> Vec<Cpu> {
     {
         let Ok(allowed) = rustix::thread::sched_getaffinity(None) else { return Vec::new() };
         let read = |path: &str| std::fs::read_to_string(path).ok();
-        let efficiency = read("/sys/devices/cpu_atom/cpus").and_then(|list| cpu_list(&list).ok()).unwrap_or_default();
+        // A hybrid machine's core types, where its kernel lists them: none on a machine of one type.
+        let listed = |path: &str| read(path).and_then(|list| cpu_list(&list).ok()).unwrap_or_default();
+        let (performance, efficiency) = (listed("/sys/devices/cpu_core/cpus"), listed("/sys/devices/cpu_atom/cpus"));
+        let core_type = |id: u32| match (performance.contains(&id), efficiency.contains(&id)) {
+            (false, false) => None,
+            (_, efficient) => Some(efficient),
+        };
         (0..rustix::thread::CpuSet::MAX_CPU)
             .filter(|c| allowed.is_set(*c))
             .filter_map(|c| u32::try_from(c).ok())
@@ -351,7 +363,7 @@ pub fn cpu_topology() -> Vec<Cpu> {
                     })
                     .collect();
                 let caches: Vec<(u32, &str)> = caches.iter().map(|(level, shared)| (*level, shared.as_str())).collect();
-                Cpu::of(id, read(&format!("{dir}/topology/thread_siblings_list")).as_deref(), &caches, read(&format!("{dir}/cpu_capacity")).as_deref(), efficiency.contains(&id))
+                Cpu::of(id, read(&format!("{dir}/topology/thread_siblings_list")).as_deref(), &caches, read(&format!("{dir}/cpu_capacity")).as_deref(), core_type(id))
             })
             .collect()
     }
@@ -1000,16 +1012,18 @@ mod tests {
     /// Goal 9, plan 01a1a87b2cec step 4: a CPU's place in its machine reads as Linux writes it. Production's
     /// machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores): CPU 24 is a thread of core 8 and
     /// shares the L3 of 8-15 and 24-31; its L1 and L2, shared with its sibling alone, aren't the last level.
-    /// Without a capacity, a hybrid machine's efficiency cores rank below its others; without siblings or caches
-    /// said, a CPU is its own core and its core's cache.
+    /// A hybrid machine's listed core types rank its cores whatever their capacities say (a favoured core's turbo
+    /// within a type); a big.LITTLE machine's capacities rank its clusters; without siblings or caches said, a CPU is
+    /// its own core and its core's cache.
     #[test]
     fn g9_s4_a_cpus_place_reads_as_linux_writes_it() {
         let caches = [(1, "8,24\n"), (1, "8,24\n"), (2, "8,24\n"), (3, "8-15,24-31\n")];
-        assert_eq!(Cpu::of(24, Some("8,24\n"), &caches, Some("1024\n"), false), Cpu { id: 24, core: 8, llc: 8, rank: 1024 });
-        assert_eq!(Cpu::of(3, Some("2-3\n"), &[(3, "0-31\n")], None, false), Cpu { id: 3, core: 2, llc: 0, rank: 1 });
-        assert_eq!(Cpu::of(20, Some("20\n"), &[(2, "20-23\n"), (3, "0-31\n")], None, true), Cpu { id: 20, core: 20, llc: 0, rank: 0 }, "an efficiency core");
-        assert_eq!(Cpu::of(5, None, &[], None, false), Cpu { id: 5, core: 5, llc: 5, rank: 1 });
-        assert_eq!(Cpu::of(5, Some("x"), &[(3, "?")], Some("big"), false), Cpu { id: 5, core: 5, llc: 5, rank: 1 }, "what isn't a list or a count is unsaid");
+        assert_eq!(Cpu::of(24, Some("8,24\n"), &caches, Some("1024\n"), None), Cpu { id: 24, core: 8, llc: 8, rank: 1024 });
+        assert_eq!(Cpu::of(3, Some("2-3\n"), &[(3, "0-31\n")], Some("987\n"), Some(false)), Cpu { id: 3, core: 2, llc: 0, rank: 1 }, "a performance core, its capacity below a favoured one's");
+        assert_eq!(Cpu::of(20, Some("20\n"), &[(2, "20-23\n"), (3, "0-31\n")], Some("650\n"), Some(true)), Cpu { id: 20, core: 20, llc: 0, rank: 0 }, "an efficiency core");
+        assert_eq!(Cpu::of(6, Some("6\n"), &[(2, "4-7\n")], Some("446\n"), None).rank, 446, "a little cluster's core");
+        assert_eq!(Cpu::of(5, None, &[], None, None), Cpu { id: 5, core: 5, llc: 5, rank: 1 });
+        assert_eq!(Cpu::of(5, Some("x"), &[(3, "?")], Some("big"), None), Cpu { id: 5, core: 5, llc: 5, rank: 1 }, "what isn't a list or a count is unsaid");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 4: the round-robin real-time class's quantum reads from its file's

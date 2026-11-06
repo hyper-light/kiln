@@ -149,7 +149,7 @@ pub struct Server {
     /// plan 01a1a87b2cec step 4), where the system grants it (`kiln install` writes the grant,
     /// `LimitRTPRIO=`): a shard waking takes its CPU at once, whatever runs there, under every kernel
     /// preemption mode. Each takes it on a CPU of its own, the server's other threads kept off them:
-    /// those of `cores`, else the machine's fastest, one thread of each core (`crate::rt::class_cpus`);
+    /// those of `cores`, else the machine's fastest first, one thread of each core (`crate::rt::class_cpus`);
     /// with no such CPU for each shard, none asks (2026-11-06). Refused or held back, the shards run as
     /// without it and `/healthz/server` and the log say why. Off until declared (docs/ci.md §0.3,
     /// "Opt-in automation"): on bare metal, `kiln install` declares it in a new server's config wherever

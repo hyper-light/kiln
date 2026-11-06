@@ -2915,8 +2915,8 @@ grants" and "The bare-metal default"):
   `RLIMIT_RTPRIO` 1 or more. Elsewhere it stays off, and the install says what it would take. Once its shards
   have asked, the server gives up the room, so nothing it starts inherits it.
 - **Each shard in the class on a CPU of its own, the server's other threads kept off them** (2026-11-06, "What
-  production grants the shards", 3 and 4): on its declared cores, else on the machine's fastest CPUs, one thread
-  of each physical core, in the last-level cache holding most of them, the first kept for the server's other
+  production grants the shards", 3 and 4): on its declared cores, else on the machine's fastest CPUs first, one
+  thread of each physical core, in the last-level cache holding most of them, the first kept for the server's other
   threads (`crate::rt::class_cpus`). Where there are too few (cores for a shard each and one more), or declared
   cores would put two shards on one CPU, the shards stay at the normal class, and the server says why
   (`/healthz/server`'s `priority.realtime.held`, its log); placed, it says where (`priority.realtime.place`).
