@@ -3,7 +3,7 @@
 /proc/<pid>/smaps, so a lab says how much of the server's anonymous memory the allocator holds, how much the threads'
 stacks, turso's arenas and the C libraries' malloc, beside jemalloc's own word for its kinds
 (`kiln_memory_allocator_bytes`, whose `resident` counts every page of its extents and metadata, written or not: in
-g9p16, main's tree, 169 MB of it beside 138 MB of the process's anonymous memory in all).
+g9p16's calm medians, main's tree: 173.7 MB of it beside 145.2 MB of the process's anonymous memory in all).
 
     python3 -I kinds.py <pid>
 
