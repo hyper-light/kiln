@@ -1232,19 +1232,31 @@ pub use hyper_rt::compute::{Step, Turn};
 /// compressing, diffing, hashing), off every shard and below them in the OS's priority, so one heavy
 /// request holds up no other (goal 3, plan 01a1a59c2a8e; `hyper_rt::compute`). Its result comes back
 /// here. Waits while the pool is at its bound; with no pool running, `f` gets a thread of its own. A
-/// job that can run long goes in pieces: [`compute_pieces`].
-pub async fn compute<R, F>(f: F) -> anyhow::Result<R>
+/// job that can run long goes in pieces: [`compute_pieces`]. Counted against the caller's place
+/// (`crate::compute_sites`: its time on the pool's thread and the caller's wait for it; goal 9, plan
+/// 01a1a87b2cec step 5).
+#[track_caller]
+pub fn compute<R, F>(f: F) -> impl Future<Output = anyhow::Result<R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    rt()?;
-    let (tx, rx) = futures::channel::oneshot::channel::<R>();
-    let job = move || {
-        let _ = tx.send(f());
-    };
-    to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let site = std::panic::Location::caller();
+    async move {
+        rt()?;
+        let asked = Instant::now();
+        let (tx, rx) = futures::channel::oneshot::channel::<R>();
+        let job = move || {
+            let began = Instant::now();
+            let made = f();
+            crate::compute_sites::sites().ran(site, began.elapsed());
+            let _ = tx.send(made);
+        };
+        to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
+        let made = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+        crate::compute_sites::sites().waited(site, asked.elapsed());
+        made
+    }
 }
 
 /// Run a job in pieces on the compute pool: `step` is called with `state` and its piece's [`Turn`]
@@ -1252,47 +1264,70 @@ where
 /// [`Step::More`] when told yes: its piece has had a shard's step and another job waits for the thread,
 /// which it then gives up, going on after (big JSON written a part at a time, a long diff a file at a
 /// time). Otherwise as [`compute`].
-pub async fn compute_pieces<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+#[track_caller]
+pub fn compute_pieces<S, T, F>(state: S, step: F) -> impl Future<Output = anyhow::Result<T>>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    compute_pieces_from(state, step, std::panic::Location::caller())
+}
+
+/// [`compute_pieces`] asked for at `site`.
+async fn compute_pieces_from<S, T, F>(state: S, mut step: F, site: &'static std::panic::Location<'static>) -> anyhow::Result<T>
 where
     S: Send + 'static,
     T: Send + 'static,
     F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
 {
     rt()?;
+    let asked = Instant::now();
     let (tx, rx) = futures::channel::oneshot::channel::<T>();
-    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| match step(state, turn) {
-        Step::Done(value) => {
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(value);
+    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| {
+        let began = Instant::now();
+        let stepped = step(state, turn);
+        crate::compute_sites::sites().ran(site, began.elapsed());
+        match stepped {
+            Step::Done(value) => {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(value);
+                }
+                Step::Done(())
             }
-            Step::Done(())
+            Step::More => Step::More,
         }
-        Step::More => Step::More,
     };
     to_compute(((state, Some(tx)), piece), |(state, piece)| hyper_rt::compute::run_pieces(state, piece).map(drop), |(state, piece)| hyper_rt::compute::run_here(state, piece)).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let made = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+    crate::compute_sites::sites().waited(site, asked.elapsed());
+    made
 }
 
 /// `f` of each item on the compute pool, in pieces ([`compute_pieces`]): an item a unit, its piece
 /// ended where another job waits, so a long list holds no pool thread long. The outputs in the items'
 /// order.
-pub async fn compute_map<T, R, F>(items: Vec<T>, f: F) -> anyhow::Result<Vec<R>>
+#[track_caller]
+pub fn compute_map<T, R, F>(items: Vec<T>, f: F) -> impl Future<Output = anyhow::Result<Vec<R>>>
 where
     T: Send + 'static,
     R: Send + 'static,
     F: FnMut(T) -> R + Send + 'static,
 {
     let out = Vec::with_capacity(items.len());
-    compute_pieces((items.into_iter(), out, f), |(todo, out, f), turn| {
-        for item in todo.by_ref() {
-            out.push(f(item));
-            if turn.over() {
-                return Step::More;
+    compute_pieces_from(
+        (items.into_iter(), out, f),
+        |(todo, out, f), turn| {
+            for item in todo.by_ref() {
+                out.push(f(item));
+                if turn.over() {
+                    return Step::More;
+                }
             }
-        }
-        Step::Done(std::mem::take(out))
-    })
-    .await
+            Step::Done(std::mem::take(out))
+        },
+        std::panic::Location::caller(),
+    )
 }
 
 /// [`compute_pieces`] for a thread of its own, which may block (never a shard): the job runs on the compute
