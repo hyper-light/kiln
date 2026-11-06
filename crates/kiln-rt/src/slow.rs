@@ -302,4 +302,83 @@ mod tests {
         assert_eq!((p.polls, p.total_ns), (4, 3_200_000));
         assert_eq!((p.cpu_polls, p.cpu_held_ns, p.cpu_ns, p.longest_cpu_ns), (3, 2_700_000, 830_000, 400_000));
     }
+
+    /// One shard on this thread, its quantum `quantum_ns` (its step budget: it tracks no wake).
+    fn one_shard(quantum_ns: u64) -> crate::runtime::LocalRuntime {
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 8,
+            timers_per_shard: 8,
+            interests_per_shard: 8,
+            ring_entries: 16,
+            step_budget_ns: quantum_ns,
+            timer_tick_ns: 100_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        };
+        crate::runtime::LocalRuntime::new(&config).unwrap()
+    }
+
+    /// Spins `spin_ns` on the CPU, by the thread's own clock where it has one (a loaded machine that preempts the spin
+    /// stretches its wall time, not its time on the CPU), else by the wall clock; read between runs of plain arithmetic, so
+    /// the spin's time is the task's own, not the clock's calls (Linux's task clock counts user time alone).
+    fn spin_on_the_cpu(spin_ns: u64) {
+        let began = std::time::Instant::now();
+        let cpu_from = crate::attribution::thread_cpu_now();
+        let mut spins = 0u64;
+        loop {
+            for _ in 0..u16::MAX {
+                spins = std::hint::black_box(spins.wrapping_add(1));
+            }
+            let ran = match cpu_from {
+                Some(from) => crate::attribution::thread_cpu_now().map_or(0, |now| now.saturating_sub(from)),
+                None => u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            };
+            if ran >= spin_ns {
+                break;
+            }
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (lab-main, 2026-11-06): a shard's polls that run past the threshold on the CPU say
+    /// their time there wherever the shard's thread has a CPU clock: Linux's task clock where its perf event opens, and
+    /// macOS's thread CPU clock, which no task clock replaces there. The Mac lab's step 3 table (g9p31-mac) had every listed
+    /// path's on-CPU column empty: the shard took a slow poll's CPU from the task clock alone, which opens on Linux only.
+    /// The root spins twice, each far past the quantum, and at least its second spin is read where a clock is (on macOS a
+    /// reading is a call, so a site's polls are read there from the one after its first past the quantum). With no clock
+    /// (Windows, a Linux whose perf event is refused) the polls count in their holds alone.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s3_a_shards_slow_poll_says_its_time_on_the_cpu_where_its_thread_has_a_cpu_clock() {
+        let clock = crate::task_clock::TaskClock::open().is_some()
+            || (cfg!(target_os = "macos") && crate::attribution::thread_cpu_now().is_some());
+        let mut rt = one_shard(1_000_000);
+        let shard = rt.shard_id();
+        // Each spin 200 times the threshold, 20 times the quantum.
+        let spin_ns = SLOW_POLL_NS.saturating_mul(200);
+        rt.block_on(async move {
+            spin_on_the_cpu(spin_ns);
+            crate::futures::yield_now().await;
+            spin_on_the_cpu(spin_ns);
+        })
+        .unwrap();
+        let polls = crate::registry::holder_of(shard.0).map(slow_polls).unwrap_or_default();
+        let spun = polls.iter().find(|p| p.longest_ns >= spin_ns).copied();
+        assert!(spun.is_some(), "no poll of {spin_ns} ns among the shard's slow polls: {polls:?}");
+        let Some(spun) = spun else { return };
+        assert_eq!(spun.polls, 2, "the root's two spins: {spun:?}");
+        if !clock {
+            assert_eq!(spun.cpu_polls, 0, "no CPU clock on this thread, yet a time on the CPU: {spun:?}");
+            return;
+        }
+        assert!(spun.cpu_polls >= 1, "the spins' polls said no time on the CPU: {spun:?}");
+        // At least half the spin: the shard's clock (Linux's task clock, user time alone) and the spin's (the thread's
+        // CPU clock, the kernel's time in its calls too) are two clocks of one thread.
+        assert!(spun.longest_cpu_ns >= spin_ns / 2 && spun.longest_cpu_ns <= spun.longest_ns, "spun {spin_ns} ns on the CPU: {spun:?}");
+    }
 }
