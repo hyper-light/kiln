@@ -149,8 +149,10 @@ pub fn search(c: &Connection, q: &Query) -> rusqlite::Result<Vec<Hit>> {
     Ok(out)
 }
 
-/// The indexer's wake-up: a leg finished.
-static KICK: LazyLock<(async_channel::Sender<()>, async_channel::Receiver<()>)> = LazyLock::new(|| async_channel::bounded(1));
+/// The indexer's wake-up: a leg finished. A permit, however many legs finish before the indexer looks, taken with no
+/// lock (`crate::rt::Notify`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel of one place, which it was,
+/// took event-listener's `Mutex` on the shard a leg's end came on and on the indexer's.
+static KICK: LazyLock<crate::rt::Notify> = LazyLock::new(crate::rt::Notify::new);
 
 /// Indexes legs as they finish, for as long as the server runs.
 pub fn spawn(hub: Arc<Hub>) {
@@ -163,7 +165,7 @@ pub fn spawn(hub: Arc<Hub>) {
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "logs could not be indexed"),
             }
             futures::select_biased! {
-                _ = KICK.1.recv().fuse() => {}
+                () = KICK.notified().fuse() => {}
                 () = crate::rt::sleep(Duration::from_secs(30)).fuse() => {}
             }
         }
@@ -172,7 +174,7 @@ pub fn spawn(hub: Arc<Hub>) {
 
 /// Wakes the indexer: a leg finished.
 pub fn kick() {
-    let _ = KICK.0.try_send(());
+    KICK.notify();
 }
 
 /// Indexes up to [`PER_PASS`] finished legs not yet in the index, oldest first, so the index's

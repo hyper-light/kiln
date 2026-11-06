@@ -1058,6 +1058,33 @@ mod tests {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a feed's watch takes no lock (a [`crate::rt::Notify`]; goal 9, plan
+    /// 01a1a87b2cec step 5). No word waits before a commit; commits made while its watcher looks elsewhere leave one word,
+    /// which it takes, and none more until the next commit; a watcher gone is let go at the next commit, and the one left
+    /// still hears it.
+    #[test]
+    fn g5_a_watchers_word_waits_once_however_many_commits_came() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        let (_dir, store) = scratch()?;
+        let watch = store.watch();
+        // A word waiting, taken: its wait ends at once.
+        let told = |w: &crate::rt::Notify| w.notified().now_or_never().is_some();
+        anyhow::ensure!(!told(&watch), "a word before any commit");
+        for i in 1..=3u64 {
+            store.send("w1", &said(&format!("m{i}"), i, "x"));
+            store.sync()?;
+        }
+        anyhow::ensure!(told(&watch), "no word after three commits");
+        anyhow::ensure!(!told(&watch), "more than one word for three commits");
+        drop(store.watch());
+        anyhow::ensure!(store.watchers.lock().unwrap_or_else(PoisonError::into_inner).len() == 2, "the two watchers listed");
+        store.send("w1", &said("m4", 4, "x"));
+        store.sync()?;
+        anyhow::ensure!(store.watchers.lock().unwrap_or_else(PoisonError::into_inner).len() == 1, "the watcher gone wasn't let go");
+        anyhow::ensure!(told(&watch), "the watcher left didn't hear the next commit");
+        Ok(())
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: what a store's own feeds have to ship is read without asking its writer
     /// ([`Store::grown`]): it grows by the rows put once they're committed, and by a feed's batch taken in, each by its rows'
     /// bytes; a batch that brings nothing new grows it by nothing.

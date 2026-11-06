@@ -766,8 +766,8 @@ and `rank` gives kiln's, Quiver's, the dependencies' and the allocator's locks t
 
 | crate | what it locks | where kiln reaches it |
 | --- | --- | --- |
-| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | in train 8's tree, every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`). The next train takes the server's live commands, reach's relay, WebRTC, browser streams, blob reads, `rt::Notify` and `rt::Shutdown` off it (`memory::queue` and its lock-free waiter list) |
-| async-tungstenite 0.35.0 | a split WebSocket's stream, which its two halves share (a std Mutex) | every frame the API's WebSockets send, flush or read: each is split into a sender and a reader |
+| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | in train 8's tree, every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`), and the rest of the server's request, websocket and runner paths in goal 5 (below, "What census16 found left") |
+| async-tungstenite 0.35.0 | a split WebSocket's stream, which its two halves share (a std Mutex) | every frame the API's WebSockets send, flush or read: each is split into a sender and a reader, both its socket's one task's |
 | async-broadcast 0.7.2 | each channel's state (a std Mutex) | nowhere now: goal 4 made agent sessions' events, terminals' output, job logs and CD's changes lock-free lanes, and kiln takes only its error types |
 | parking 2.2.1 | a parked thread's `Parker` (a std Mutex beside its Condvar) | event-listener's blocking waits (a cluster copy's file read on the blocking pool, a child's output reader), unparked by the shard that sends or makes room |
 | uuid 1.28.0 | the process's one v7 context (a std Mutex) | `util::new_id`: each terminal session's, agent session's and upload's id |
@@ -1025,9 +1025,89 @@ waiting at any time), identities' `enrolled_by` 37 / 33 at 4.6 / 6.0 ms, the aud
   server's live commands, reach's relay, WebRTC, browser streams, blob reads and kiln's `rt::Notify` and
   `rt::Shutdown` off it; the runner process's own channels (its uplink, harness pumps, PTYs) follow. What stays
   is async-lock's few uses on the shards (the password gate, cluster copies) and the `Event`s kiln holds directly,
-  each listed in `hot.toml`'s terms when it goes there.
+  each listed in `hot.toml`'s terms when it goes there. (Since: none of these on the server's paths, below.)
 - **async-tungstenite's.** One lock a WebSocket, shared by the socket's two halves, each one task's on the socket's
   shard: never found held, calm or with hogs. No other shard takes it, so it stays.
+
+### What census16 found left, and what became of it
+
+Main's census after train 16 (`e4b39c53f0b`, the jemalloc build, production's layout, 3 rounds calm and 3 with
+hogs, fedora 2026-11-06 10:12–10:19Z; `~/.cache/kiln-lab-main/census16`) found none of kiln's locks on the hot path
+waited, and three of the dependencies' taken on the server's shards:
+
+| lock | taken a second | held when asked a second | waited, ms a second | longest wait, ms |
+| --- | --- | --- | --- | --- |
+| event-listener's list (`intrusive.rs`: notify 2,025, a listener added 171, polled 171, gone 171) | 2,537 / 2,670 | 5.75 / 9.67 | 0.116 / 0.839 | 0.59 / 3.99 |
+| async-tungstenite's split socket (sent 166, flushed 149, read 1) | 540.7 / 516.5 | 0 / 0 | 0 / 0 | 0 / 0 |
+| uuid's v7 context (`util::new_id`) | 0.1 / 0.1 | 0 / 0 | 0 / 0 | 0.003 / 0.002 |
+
+(calm / with hogs). **Why event-listener's is taken so often:** in 5.4.2 an `Event`'s notify takes its list's
+Mutex every time, whether or not anyone waits (its earlier versions looked at an atomic first). So each send to an
+async-channel takes it twice (its receivers' event and its streams'), each receive once (its senders'), and each
+wait three times (listed, polled, gone): the 2,025 notifies a second were some 675 messages through async-channels,
+and the 171 waits their receivers parked. The census can't say whose: a channel's send and receive are futures, polled
+by the runtime, so the census's `#[track_caller]` stops in async-channel. From the code, the lab's server (no local
+runner, no terminals, CI's engine and CD off) ran these on its shards, each between a thread of its own and a shard,
+or two shards:
+
+- **The cluster group's messages to the runners' learners** (`store/group.rs`: the group's thread, `Hub::cluster_loop`
+  on a shard): every raft message to each of the four lab runners' replicas. The learners' answers came back at 605
+  a second (the census's `self.joiner`, `store/learner.rs`), so about as many went out, three notifies each: most of
+  the 2,025.
+- **The conversation store's word to its feeds** (`convo/store.rs` `watch`): each commit (55 a second, its
+  `watchers`' lock) woke each feed's watcher on its shard, three notifies and a wait's three takes a feed.
+- **Observe's messages to the runners' replicas** (`observe/owner.rs`, `observe/hub.rs`) and **kept files**
+  (`keep.rs`: an agent's name or epoch, a terminal's name, the mirrors chosen), as they came.
+
+and production's load has more on the same paths, none of which the lab drives: sync's messages to the runners
+(`sync/server.rs`), the browser protocol's (every event the hub emits, on whichever shard, to the topics' owner on
+its own, and each socket's starts and answers: `live/owner.rs`, `live/conn.rs`), CI's dispatcher's answers to the
+API (`ci/dispatch.rs`, and the nine modules asking it), a finished leg's word to the log index (`ci/logsearch.rs`),
+files, archived records, git's and REAPI's bytes on their way to a response or a file (`rt::file_source`,
+`rt::file_sink`, `harness/archive.rs`, `ci/facade.rs`, `ci/work/reapi.rs`), Mantle's requests and answers
+(`blobs/mantle.rs`), and an HTTP tunnel's relay (`tunnel.rs`, whose writer listed and dropped a wait on the Mutex with
+every datagram).
+
+**What each became** (goal 5, its top goal): `crate::memory::queue`, whose waits sit in a lock-free list of their
+own, with the same order, bounds and wakes. A queue bounded by its one sender's count (the group's and observe's,
+past which a message is dropped and raft sends it again) is `memory::queue::unbounded` with `memory::send_within`
+keeping the count, as it was; one bounded by a count is `memory::queue::places` of that count (the browser
+protocol's 4,096 events and asks, a socket's 256 starts, a file's 4 chunks read ahead and 16 to write, a stream's
+4 or 16, Mantle's 64 requests, a tunnel's 16 answers); a watcher's word, one place (a commit's word waits once,
+however many commits come); an owner's one answer, `memory::queue::answer` (one place, its sender cloned as a
+run's start keeps it); and the log index's kick, `rt::Notify` (a permit). Every queue's receiver waits under any
+waker, as an async-channel's did.
+
+**What stays,** each in `scripts/locks/hot.toml`'s `waiting` with why: the runner process's own channels (a chaos
+delay line, its microVMs, its preview browser, its front door, its learner and its repo sync), kiln as a client
+(uploads through its HTTP client) and its command line (`kiln mcp`, the CLI's terminal and uploads), and the
+server's off its request, websocket and runner paths (CD's rollouts, guard, store changes and artifacts' streams,
+observe's archives, rehydrations and notifications, sync's collection, the LAN's discovery). `scripts/locks.py
+check` now fails on an async-channel made or named anywhere else in kiln's code (`async_channel`; its error types,
+which `memory::queue` returns too, are no channel) and on a WebSocket split anywhere else (`split`), as it fails on
+async-lock and event-listener. A module only a test build compiles, in a file of its own, isn't read.
+
+**async-tungstenite's split stays:** every socket the server serves (a job's logs, the events socket, a terminal, a
+stream's viewer, an agent session's viewer, the browser protocol's, a log tail, CD's logs, an HTTP tunnel's) is one
+task, spawned where its upgrade's handler ran, that holds both halves (a select over the reader and the rest, the
+sender used between): its Mutex is that task's alone, on one shard, which is why it was never found held. A half
+moved to another task would make it shared, so a split anywhere new fails the check until its `split` entry says
+the same.
+
+**uuid's v7 context** (`Uuid::now_v7`, a std Mutex the process shares): taken as an agent session, an upload or a
+terminal session is made (`util::new_id`), 0.1 a second, never found held. It keeps the ids made in one millisecond
+in order. `util::new_id` now makes its v7 ids with no lock (`util::new_v7`): the millisecond and a 16-bit counter
+(RFC 9562 §6.2's first method, 12 to 42 bits) in one atomic word moved on by compare-and-swap, a new millisecond
+starting its counter in the lower half of its range and a counter run out going on in the next millisecond, as
+uuid's own context does, so ids still sort as they're made; the rest random. `Uuid::now_v7` stays where kiln calls it
+off the server's paths (a runner's harness sessions and hand-overs, reach's run groups, upgrades, SBOMs, incidents).
+
+**The measurement that shows it:** the census of the tree with this change (`scripts/locks.py census-tree`, then
+`rank`, the jemalloc build, production's layout, 3 rounds calm and 3 with hogs, as census16): event-listener's
+list taken next to never on the server (none of the paths above runs a channel; what's left of it is a rare
+off-path use, `rank`'s row near 0 a second, and none waited), uuid's v7 context not taken (`util::new_id` no longer
+takes it), the split socket's rate as census16's (about 540 a second) and never held when asked, and the latency and
+busy share of the A/B against census16's tree no worse.
 - **The allocator's.** jemalloc's 63 mutexes (production's allocator since goal 11 step 4): its arenas' bins as
   threads' caches fill and flush, 23,000 to 25,500 a second, found held 2 to 4 times a second in all and never
   blocked calm; with hogs 0.07 ms a second, 10 ms once, a holder a hog took off its CPU. Its five arenas

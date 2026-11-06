@@ -4,7 +4,10 @@
 `check` (step 3): it fails on a lock planted on the hot path, and passes what only a test build compiles,
 what comments and strings say, and the locks hot.toml lists with why. Its `waits` (goal 5's top goal): it fails
 on async-lock or event-listener named in kiln's code (their waits are event-listener's list, behind its Mutex),
-and passes the same in comments, strings and tests, and those hot.toml lists under `waiting`.
+on an async-channel made or named there (its sends and receives take that Mutex; its error types alone are no
+channel) and on a WebSocket split by async-tungstenite (its halves share a Mutex), and passes the same in
+comments, strings, tests and a test build's own module files, and those hot.toml lists under `waiting` (a file's
+channels as `async_channel`, its splits as `split`).
 
 The census of the dependencies' and the allocator's locks: `census-tree` copies the dependencies
 scripts/locks/deps.toml names from the cargo registry, their locks the census's with every line where it
@@ -195,6 +198,42 @@ class Check(unittest.TestCase):
             shutil.rmtree(dest, ignore_errors=True)
 
 
+    def test_g5_waits_an_async_channel_or_a_split_planted_on_the_servers_paths_fails(self) -> None:
+        """The real hot.toml and every folder its `waits` names, as they are: then an async-channel planted where
+        goal 5 took them out (the cluster group's messages to the runners, the hub, the browser protocol's topics) and
+        a WebSocket split planted in an agent session's live feed, each failing the check, by its kind's name."""
+        spec = tomllib.loads((ROOT / "scripts" / "locks" / "hot.toml").read_text())
+        dest = Path(tempfile.mkdtemp(prefix="kiln-locks-channels-"))
+        try:
+            (dest / "scripts" / "locks").mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "locks" / "hot.toml", dest / "scripts" / "locks" / "hot.toml")
+            for h in [*spec["hot"], *spec["waits"]]:
+                src = ROOT / h
+                if src.is_dir():
+                    shutil.copytree(src, dest / h, dirs_exist_ok=True)
+                else:
+                    (dest / h).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest / h)
+            before = check(dest)
+            self.assertEqual(before.returncode, 0, before.stdout)
+            for rel, planted, name in [
+                ("crates/kiln/src/store/group.rs", "static PLANTED: std::sync::LazyLock<(async_channel::Sender<u8>, async_channel::Receiver<u8>)> = std::sync::LazyLock::new(async_channel::unbounded);\n", "async_channel"),
+                ("crates/kiln/src/hub.rs", "fn planted() -> async_channel::Receiver<u8> {\n    async_channel::bounded(1).1\n}\n", "async_channel"),
+                ("crates/kiln/src/live/owner.rs", "use async_channel::{Receiver, Sender};\n", "async_channel"),
+                ("crates/kiln/src/harness/live.rs", "async fn planted(socket: crate::http::ws::WebSocket) {\n    let (_tx, _rx) = socket.split();\n}\n", "split"),
+            ]:
+                f = dest / rel
+                was = f.read_text()
+                f.write_text(planted + was)
+                after = check(dest)
+                self.assertEqual(after.returncode, 1, after.stdout)
+                self.assertIn(f"{rel}:", after.stdout)
+                self.assertIn(f": {name}: ", after.stdout)
+                f.write_text(was)
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+
 WAITS = '''//! A module off the hot path: async_lock::Mutex named in a comment is no wait.
 use std::sync::Arc;
 
@@ -268,6 +307,121 @@ class Waits(unittest.TestCase):
             self.assertIn("src/feed.rs room", r.stdout)
         finally:
             t.close()
+
+    def test_g5_waits_an_async_channel_made_or_named_fails(self) -> None:
+        """Goal 5's top goal: an async-channel's sends and receives take event-listener's Mutex, so one made, a field
+        or a parameter of one, its ends imported, or the crate renamed, each fails, by its kind's name."""
+        for planted in [
+            "    queue: async_channel::Sender<Vec<u8>>,\n",
+            "    queue: (async_channel::Sender<u8>, ::async_channel::Receiver<u8>),\n",
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", WAITS.replace("    changed: crate::rt::Changed,\n", "    changed: crate::rt::Changed,\n" + planted))
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("src/feed.rs:7: async_channel:", r.stdout)
+            finally:
+                t.close()
+        for planted, line in [
+            ("use async_channel::{Receiver, Sender};\n", 1),
+            ("use async_channel as chan;\n", 1),
+            ("use async_channel::{\n    TrySendError,\n    Receiver,\n};\n", 1),
+            ("fn made() {\n    let (tx, rx) = async_channel::bounded::<u8>(1);\n    drop((tx, rx));\n}\n", 2),
+            ("async fn taken(rx: &async_channel::Receiver<u8>) {\n    let _ = rx.recv().await;\n}\n", 1),
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", planted + WAITS)
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(f"src/feed.rs:{line}: async_channel:", r.stdout)
+            finally:
+                t.close()
+
+    def test_g5_waits_async_channels_error_types_alone_pass(self) -> None:
+        """What `crate::memory::queue` returns are async-channel's error types: named alone, in a path or an import
+        (on one line or several), they're no channel."""
+        t = Tree([], waits=["src"])
+        try:
+            uses = "use async_channel::{RecvError, SendError, TryRecvError, TrySendError};\nuse async_channel::{\n    TrySendError as Full,\n};\n"
+            body = "\nfn sent(r: Result<(), async_channel::TrySendError<u8>>) -> bool {\n    !matches!(r, Err(async_channel::TrySendError::Closed(_)) | Err(async_channel :: TrySendError::Full(_)))\n}\nfn ended(r: Result<u8, async_channel::RecvError>) -> bool {\n    r.is_err()\n}\n"
+            t.file("src/feed.rs", uses + WAITS + body)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_files_listed_channels_pass_and_gone_ones_fail(self) -> None:
+        """A file's async-channels are one `waiting` entry, `async_channel`: listed, every one passes; once none is left
+        the entry is stale and fails."""
+        listed = "fn made() {\n    let (tx, rx) = async_channel::unbounded::<u8>();\n    drop((tx, rx));\n}\nasync fn taken(rx: &async_channel::Receiver<u8>) {\n    let _ = rx.recv().await;\n}\n"
+        t = Tree([], waits=["src"], waiting=[("src/feed.rs", "async_channel", "a runner's own: its jobs, on the runner")])
+        try:
+            t.file("src/feed.rs", WAITS + listed)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            t.file("src/feed.rs", WAITS)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("src/feed.rs async_channel", r.stdout)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_websocket_split_fails_unless_listed(self) -> None:
+        """async-tungstenite's split: the two halves share a Mutex. A socket split, or a half named, fails until the
+        file's `split` entry says its halves stay in one task; a buffer's split (`BytesMut::split`) or a string's is
+        none."""
+        for planted in [
+            "async fn served(socket: crate::http::ws::WebSocket) {\n    let (mut tx, mut rx) = socket.split();\n    drop((tx, rx));\n}\n",
+            "async fn dialed(ws: crate::http::ws::ClientSocket) {\n    let (tx, rx) = ws . split ( );\n    drop((tx, rx));\n}\n",
+            "async fn sent(tx: &mut async_tungstenite::WebSocketSender<Io>) {\n    drop(tx);\n}\n",
+            "async fn read(rx: &mut WebSocketReceiver<Io>) {\n    drop(rx);\n}\n",
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", WAITS + planted)
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(": split:", r.stdout)
+            finally:
+                t.close()
+        none = "fn cut(mut buf: bytes::BytesMut) -> bytes::Bytes {\n    buf.split().freeze()\n}\nfn words(s: &str) -> usize {\n    s.split(' ').count()\n}\n"
+        t = Tree([], waits=["src"], waiting=[("src/feed.rs", "split", "its socket's one task holds both halves")])
+        try:
+            t.file("src/feed.rs", WAITS + none)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("src/feed.rs split", r.stdout, "a buffer's split is none: the entry is stale")
+            t.file("src/feed.rs", WAITS + none + "async fn served(socket: crate::http::ws::WebSocket) {\n    let (tx, rx) = socket.split();\n    drop((tx, rx));\n}\n")
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_test_builds_own_module_file_isnt_read(self) -> None:
+        """A module file only a test build compiles (declared under `#[cfg(test)]` or `#[cfg(all(test, ..))]`, or inside
+        one that is) isn't read; one declared otherwise (`not(test)`, none) is."""
+        channel = "fn made() {\n    let (tx, rx) = async_channel::unbounded::<u8>();\n    drop((tx, rx));\n}\n"
+        for declared, read in [
+            ("#[cfg(test)]\nmod faults;\n", False),
+            ("#[cfg(all(test, unix))]\n#[allow(dead_code)]\npub(crate) mod faults;\n", False),
+            ("#[cfg(not(test))]\nmod faults;\n", True),
+            ("mod faults;\n", True),
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", WAITS + declared)
+                t.file("src/feed/faults.rs", channel)
+                t.file("src/feed/faults/deeper.rs", channel)
+                t.file("src/feed/faults.rs", "mod deeper;\n" + channel)
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1 if read else 0, declared + r.stdout)
+                if read:
+                    self.assertIn("src/feed/faults.rs:3: async_channel:", r.stdout)
+                    self.assertIn("src/feed/faults/deeper.rs:2: async_channel:", r.stdout)
+            finally:
+                t.close()
 
 
 def rewritten(text: str, track_caller: tuple[str, ...] = ()) -> tuple[str, int]:
