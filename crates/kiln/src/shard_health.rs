@@ -847,6 +847,33 @@ pub fn render(o: &mut String) {
     render_spins(o, &all.iter().map(Shard::spins).collect::<Vec<_>>(), &help);
     render_held(o, &help);
     render_timer_wakes(o, &help);
+    render_kicks_in(o, &help);
+}
+
+/// `kiln_shard_kicks_in_total{shard,from,found}`: the kicks each shard's senders made to it, by who sent them (`shard`,
+/// another shard's thread; `compute` or `blocking`, a pool's; `thread`, any other) and whether each found it `parked`
+/// (claimed: a system call and a wake) or `awake` (saved), read from its parking word's counts without a lock (goal 9,
+/// plan 01a1a87b2cec step 5: who kicks whom, and which kicks find a shard already awake).
+fn render_kicks_in(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    // No probes, no runtime asked for (rendering must not start one).
+    if shards().is_empty() {
+        return;
+    }
+    let all: Vec<[(u64, u64); hyper_rt::parking::SENDERS]> =
+        crate::rt::shard_holders().into_iter().take(shards().len()).map(|holder| hyper_rt::registry::kicks_from(holder).unwrap_or_default()).collect();
+    kicks_in_series(o, &all, help);
+}
+
+/// [`render_kicks_in`]'s family from each shard's counts, in the runtime's order.
+fn kicks_in_series(o: &mut String, all: &[[(u64, u64); hyper_rt::parking::SENDERS]], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_kicks_in_total", "counter", "Kicks sent to each shard, by who sent them (shard, compute, blocking, thread) and whether each found it parked (a system call and a wake) or awake (saved).");
+    for (i, kicks) in all.iter().enumerate() {
+        for (from, (claimed, saved)) in hyper_rt::parking::KickFrom::ALL.iter().zip(kicks) {
+            let from = from.name();
+            let _ = writeln!(o, "kiln_shard_kicks_in_total{{shard=\"{i}\",from=\"{from}\",found=\"parked\"}} {claimed}");
+            let _ = writeln!(o, "kiln_shard_kicks_in_total{{shard=\"{i}\",from=\"{from}\",found=\"awake\"}} {saved}");
+        }
+    }
 }
 
 /// `kiln_shard_timer_wakes_total{shard,site}`: each shard's parks a timer ended, by where the timer was asked for
@@ -1449,6 +1476,26 @@ mod tests {
             anyhow::ensure!(me.runs() == 3 && (s.busy.is_some() || first.is_none()), "three runs noted, with the thread's CPU time: {s:?}");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the kicks sent each shard are on `/metrics` by who sent them and whether each
+    /// found it parked or awake, a series each.
+    #[test]
+    fn g9_s5_each_shards_kicks_are_on_metrics_by_sender() {
+        let mut o = String::new();
+        kicks_in_series(&mut o, &[[(1, 2), (3, 4), (5, 6), (7, 8)]], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_kicks_in_total counter",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"shard\",found=\"parked\"} 1",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"shard\",found=\"awake\"} 2",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"compute\",found=\"parked\"} 3",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"blocking\",found=\"awake\"} 6",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"thread\",found=\"parked\"} 7",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: each shard's timer wakes are on `/metrics` by the place their timer was asked

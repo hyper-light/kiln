@@ -172,7 +172,7 @@ impl Entry {
 
     /// Called inside the existing parking fence protocol, after payload publication.
     fn kick_parked(&self) {
-        self.parking.kick_if_parked(|| self.kick_now());
+        self.parking.kick_if_parked_from(crate::parking::sender(), || self.kick_now());
     }
 
     /// The kick of a park claimed: the driver's, or the owner's thread in driverless cleanup. Counted on the
@@ -788,13 +788,20 @@ fn push_movable_onto(
 pub(crate) fn kick_if_parked(holder: SlotHolder) -> bool {
     with_holder(holder, |entry| {
         let mut kicked = false;
-        entry.parking.kick_if_parked(|| {
+        entry.parking.kick_if_parked_from(crate::parking::sender(), || {
             kicked = true;
             entry.kick_now();
         });
         kicked
     })
     .unwrap_or(false)
+}
+
+/// The kicks sent to the shard `holder` names, by who sent them (`crate::parking::KickFrom::ALL`'s order): each claimed
+/// (a system call) and saved (the shard awake); none for a holder no longer registered (kiln's goal 9, plan
+/// 01a1a87b2cec step 5).
+pub fn kicks_from(holder: SlotHolder) -> Option<[(u64, u64); crate::parking::SENDERS]> {
+    with_holder(holder, |entry| entry.parking.kicks_from())
 }
 
 /// A spawn site as a slot recorded it: the `&'static Location` a pointer names, or `None` for null.

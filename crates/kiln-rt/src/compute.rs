@@ -625,7 +625,10 @@ fn spawn_workers(
         )]
         let spawned = std::thread::Builder::new()
             .name(format!("kiln-compute-{index}"))
-            .spawn(move || work(index, rank, &local, &report));
+            .spawn(move || {
+                crate::parking::mark_thread(crate::parking::KickFrom::Compute);
+                work(index, rank, &local, &report);
+            });
         let Ok(handle) = spawned else {
             break;
         };
