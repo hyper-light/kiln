@@ -1,0 +1,24 @@
+# kiln's reads for `kiln-lab rate` (docs/runtime-lab.md, "Fixed rates"; Ada's fixed-rate benchmark, goal 10).
+# kiln-lab starts each --kiln as `kiln-lab run` does: a fresh data dir, the lab's runners and stand-in agent,
+# filled with --profile's sessions. ${token} is its admin token; ${session} its sessions, largest first.
+name = "kiln"
+
+[server]
+kind = "kiln"
+
+# The agents page's list of sessions.
+[[workload]]
+name = "sessions"
+kind = "http"
+method = "GET"
+path = "/api/harness/sessions"
+headers = { Authorization = "Bearer ${token}" }
+
+# One session's newest page, the largest session's: its newest 100 events (`EVENTS_PAGE`,
+# crates/kiln/src/harness/copies.rs), what a client's first read of a conversation asks for at the most.
+[[workload]]
+name = "newest"
+kind = "http"
+method = "GET"
+path = "/api/harness/sessions/${session}/events"
+headers = { Authorization = "Bearer ${token}" }

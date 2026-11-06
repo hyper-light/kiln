@@ -106,6 +106,18 @@ impl Profile {
         Self { runners: 10, active: sessions.len(), sessions, ..Self::realistic() }
     }
 
+    /// The profile `name` names (`--profile`).
+    pub fn named(name: &str) -> anyhow::Result<Self> {
+        Ok(match name {
+            "small" => Self::small(),
+            "realistic" => Self::realistic(),
+            "overload" => Self::overload(),
+            "many" => Self::many(),
+            "flood" => Self::flood(),
+            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
+        })
+    }
+
     /// A small one, to try the lab out (and for its own test).
     pub fn small() -> Self {
         Self {
@@ -843,26 +855,22 @@ impl Hook {
     }
 }
 
-/// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
-pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
-    std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
-    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
-    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
-    let hook = Hook::from_env(&fleet, dir);
-    hook.run("server-up");
+/// `p`'s runners of `build` for `fleet`'s server, each its own `kiln agent` whose `claude` is the stand-in in `bin`,
+/// connected and with their headroom off: their names. (`kiln-lab rate` starts kiln this way too: goal 10, Ada's
+/// fixed-rate benchmark.)
+pub fn runners(fleet: &mut Fleet, build: &Build, p: &Profile, bin: &Path) -> anyhow::Result<Vec<String>> {
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
     }
     fleet.runners_ready(Duration::from_secs(180))?;
+    Ok(names)
+}
 
-    // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
-    // server's /metrics either side of it too: the conversation feed at its busiest, every session's
-    // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
-    let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
-    let fill_before = scrape(&fleet)?;
-    hook.run("fill-start");
+/// The fill: each of `p`'s sessions opened on its runner (of `names`), its conversation written as fast as it's
+/// taken, until every one is idle with its conversation in the server's store: the sessions (each its id and its
+/// events) and the seconds it took.
+pub fn fill(fleet: &Fleet, p: &Profile, names: &[String]) -> anyhow::Result<(Vec<(String, u64)>, f64)> {
     let filled = Instant::now();
     let mut opened: Vec<(String, u64)> = Vec::new();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -905,9 +913,29 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         anyhow::ensure!(Instant::now() < deadline, "the fill didn't finish: {} of {} sessions in", filled_ids.len(), opened.len());
         std::thread::sleep(Duration::from_millis(250));
     }
-    let fill_s = filled.elapsed().as_secs_f64();
+    Ok((opened, filled.elapsed().as_secs_f64()))
+}
+
+/// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
+pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
+    std::fs::create_dir_all(dir)?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
+    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
+    let hook = Hook::from_env(&fleet, dir);
+    hook.run("server-up");
+    let names = runners(&mut fleet, build, p, bin)?;
+
+    // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
+    // server's /metrics either side of it too: the conversation feed at its busiest, every session's
+    // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
+    let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
+    let fill_before = scrape(&fleet)?;
+    hook.run("fill-start");
+    let (opened, fill_s) = fill(&fleet, p, &names)?;
     hook.run("fill-end");
     let fill_after = scrape(&fleet)?;
+    let mut http = Http::new(fleet.port, &fleet.admin);
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
