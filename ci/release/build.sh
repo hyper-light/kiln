@@ -39,6 +39,11 @@
 # - a profile's path (perf2bolt's or an instrumented window's .fdata, of that very build; or a .yaml, which BOLT
 #   matches to a nearby build's code): dist/kiln-x86_64-unknown-linux-musl is the build laid out by it
 #   (bolt.sh optimize) and stripped.
+# - an order's path (a .order file, `bolt.sh order`'s: the functions a profile saw run, hottest first): the build
+#   linked with those functions first, in that order (LLD's --symbol-ordering-file, through zig-relocs.sh), and
+#   stripped. The layout without BOLT: whole functions, none split.
+# cargo relinks only what it knows changed, and an order is no input it knows of, so a binary in that target dir
+# linked in another order than the one asked (none, for `relocs` and a profile) is removed first, and relinked.
 # Other targets build as ever.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -62,7 +67,7 @@ if [ -n "$bolt" ]; then
   if [ "$bolt" != relocs ]; then
     # A path as the caller gave it, from where they were before the cd above.
     case $bolt in /*) ;; *) bolt=$OLDPWD/$bolt ;; esac
-    [ -s "$bolt" ] || { echo "KILN_RELEASE_BOLT is relocs or a profile's path: $bolt is no profile" >&2; exit 1; }
+    [ -s "$bolt" ] || { echo "KILN_RELEASE_BOLT is relocs, a profile's path or an order's: $bolt is no profile" >&2; exit 1; }
   fi
   case " ${targets[*]} " in
     *" x86_64-unknown-linux-musl "*) ;;
@@ -174,17 +179,30 @@ for t in "${targets[@]}"; do
         export AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE=16
       fi
       if [ -n "$bolt" ] && [ "$t" = x86_64-unknown-linux-musl ]; then
-        # BOLT's input (above): its relocations and symbols kept, linked through zig-relocs.sh.
-        input=$target_dir/bolt/$t/release/kiln
-        KILN_ZIG_REAL="$zig_home/zigbin/zig" CARGO_ZIGBUILD_ZIG_COMMAND="$root/ci/release/zig-relocs.sh" \
+        # BOLT's input (above): its relocations and symbols kept, linked through zig-relocs.sh, in an order's
+        # order if one is asked (above), else the linker's own. Which it was linked in is marked beside it: none, or
+        # the order's digest.
+        built=$target_dir/bolt/$t/release
+        input=$built/kiln
+        order='' mark=none
+        case $bolt in *.order) order=$bolt mark=$(sha256sum < "$bolt" | cut -c1-64) ;; esac
+        if [ "$(cat "$built/kiln.linked-order" 2> /dev/null)" != "$mark" ]; then
+          # Linked in another order, or in one not marked: the executable goes (cargo's deps/kiln-<hash>, which
+          # cargo then builds again, and its copy), and the rest of the build stays.
+          find "$built/deps" -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete 2> /dev/null || true
+          rm -f "$input"
+        fi
+        rm -f "$built/kiln.linked-order"
+        KILN_LINK_ORDER=$order KILN_ZIG_REAL="$zig_home/zigbin/zig" CARGO_ZIGBUILD_ZIG_COMMAND="$root/ci/release/zig-relocs.sh" \
           CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR="$target_dir/bolt" \
           "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
+        # Relinked through zig-relocs.sh (its relocations say so), so in the order asked: marked as such.
         ci/release/bolt.sh check "$input"
-        if [ "$bolt" = relocs ]; then
-          "${KILN_STRIP:-strip}" --strip-all -o "$dist/kiln-$t" "$input"
-        else
-          ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t"
-        fi
+        echo "$mark" > "$built/kiln.linked-order"
+        case $bolt in
+          relocs | *.order) "${KILN_STRIP:-strip}" --strip-all -o "$dist/kiln-$t" "$input" ;;
+          *) ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t" ;;
+        esac
       else
         "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
         cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
