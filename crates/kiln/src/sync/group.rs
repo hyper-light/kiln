@@ -27,8 +27,9 @@ pub const SERVER: u64 = 1;
 /// The largest message a member sends as hyper-raft's wire writes it, but for a snapshot, whose
 /// image goes in parts (`wire::split`): it fits one frame of kiln's control lane with room to spare.
 pub const MESSAGE: usize = 768 << 10;
-/// The entries one append carries, at the most (an entry larger than it goes alone).
-const APPEND: u64 = 256 << 10;
+/// The entries one append carries, at the most (an entry larger than it goes alone); the sync log keeps
+/// one of them a group in memory ([`super::disk`]).
+pub(crate) const APPEND: u64 = 256 << 10;
 /// The most members a group names: the server and its copies.
 const MEMBERS: usize = 64;
 /// How often an owner ticks its groups. A leader beats every [`BEAT`] ticks, which tells the copies
