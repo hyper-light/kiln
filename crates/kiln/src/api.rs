@@ -6735,8 +6735,8 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         return Ok(());
     };
     // The attach's poll ends here, and its snapshot begins in a poll of its own (goal 10, plan 01a1a87b2dae step 5):
-    // the shards' table counts a poll against the last label it set, so an attach's work and its snapshot's first
-    // piece in one poll were the snapshot's, past the quantum, and a poll's hold is the two added.
+    // the shards' table counts a poll against the last label it set, so an attach's work and the start of its
+    // snapshot in one poll were counted as the snapshot's, and held the shard for the two together.
     hyper_rt::futures::yield_now().await;
     {
         // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
