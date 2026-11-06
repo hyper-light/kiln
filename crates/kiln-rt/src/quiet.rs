@@ -77,6 +77,8 @@ pub(crate) struct Quiet {
     /// How its turn came, once it has, timed to the step that saw it ([`came`]), and when, by the shard's clock, the rest
     /// of it is counted from to the poll that takes it ([`to_poll`]).
     pub(crate) came: Option<(Came, u64)>,
+    /// Where it was asked for: what its own wake of the shard is counted against (`crate::timer_sites`).
+    pub(crate) site: Option<&'static std::panic::Location<'static>>,
 }
 
 /// When a park beginning at `now_ns` ends for `quiet`, a sleep that hasn't come yet: no earlier than it falls due, nor
@@ -111,8 +113,9 @@ pub(crate) fn to_poll(came: Came, from_ns: u64, now_ns: u64) -> Came {
 /// Sleeps `span_ns` on the shard, quietly: a parked shard is woken for it only after `quiet_ns` with no wake at all (the
 /// module notes). How its turn came is what it returns. Refused off a shard's thread, and while another quiet sleep waits
 /// on the shard.
+#[track_caller]
 pub fn sleep_quiet(span_ns: u64, quiet_ns: u64) -> SleepQuiet {
-    SleepQuiet { span_ns, quiet_ns, word: None }
+    SleepQuiet { span_ns, quiet_ns, word: None, site: std::panic::Location::caller() }
 }
 
 /// The quiet sleep's future ([`sleep_quiet`]).
@@ -122,6 +125,8 @@ pub struct SleepQuiet {
     quiet_ns: u64,
     /// Its task's word once it waits on the desk.
     word: Option<u64>,
+    /// Where it was asked for.
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Future for SleepQuiet {
@@ -132,7 +137,7 @@ impl Future for SleepQuiet {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
         let word = task.word();
-        let (span_ns, quiet_ns, waiting) = (self.span_ns, self.quiet_ns, self.word);
+        let (span_ns, quiet_ns, waiting, site) = (self.span_ns, self.quiet_ns, self.word, self.site);
         let polled = registry::with_current(|ctx| match (ctx.quiet.get(), waiting) {
             // Its turn came: taken, timed to this poll, and the desk free for the next.
             (Some(q), Some(_)) if q.word == word && q.came.is_some() => {
@@ -146,7 +151,7 @@ impl Future for SleepQuiet {
             }),
             (None, _) => {
                 let due_ns = ctx.now_ns().saturating_add(span_ns);
-                ctx.quiet.set(Some(Quiet { due_ns, quiet_ns, word, came: None }));
+                ctx.quiet.set(Some(Quiet { due_ns, quiet_ns, word, came: None, site: Some(site) }));
                 // The loop takes its due time into its own as it applies what this poll asked.
                 ctx.asked.set(true);
                 if let Some(entry) = ctx.entry {

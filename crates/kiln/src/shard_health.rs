@@ -815,6 +815,78 @@ pub fn render(o: &mut String) {
     render_parks(o, &all.iter().map(|s| (s.parks(), s.wakes().parks)).collect::<Vec<_>>(), &help);
     render_spins(o, &all.iter().map(Shard::spins).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+    render_timer_wakes(o, &help);
+    render_kicks_in(o, &help);
+}
+
+/// `kiln_shard_kicks_in_total{shard,from,found}`: the kicks each shard's senders made to it, by who sent them (`shard`,
+/// another shard's thread; `compute` or `blocking`, a pool's; `thread`, any other) and whether each found it `parked`
+/// (claimed: a system call and a wake) or `awake` (saved), read from its parking word's counts without a lock (goal 9,
+/// plan 01a1a87b2cec step 5: who kicks whom, and which kicks find a shard already awake).
+fn render_kicks_in(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    // No probes, no runtime asked for (rendering must not start one).
+    if shards().is_empty() {
+        return;
+    }
+    let all: Vec<[(u64, u64); hyper_rt::parking::SENDERS]> =
+        crate::rt::shard_holders().into_iter().take(shards().len()).map(|holder| hyper_rt::registry::kicks_from(holder).unwrap_or_default()).collect();
+    kicks_in_series(o, &all, help);
+}
+
+/// [`render_kicks_in`]'s family from each shard's counts, in the runtime's order.
+fn kicks_in_series(o: &mut String, all: &[[(u64, u64); hyper_rt::parking::SENDERS]], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_kicks_in_total", "counter", "Kicks sent to each shard, by who sent them (shard, compute, blocking, thread) and whether each found it parked (a system call and a wake) or awake (saved).");
+    for (i, kicks) in all.iter().enumerate() {
+        for (from, (claimed, saved)) in hyper_rt::parking::KickFrom::ALL.iter().zip(kicks) {
+            let from = from.name();
+            let _ = writeln!(o, "kiln_shard_kicks_in_total{{shard=\"{i}\",from=\"{from}\",found=\"parked\"}} {claimed}");
+            let _ = writeln!(o, "kiln_shard_kicks_in_total{{shard=\"{i}\",from=\"{from}\",found=\"awake\"}} {saved}");
+        }
+    }
+}
+
+/// `kiln_shard_timer_wakes_total{shard,site}`: each shard's parks a timer ended, by where the timer was asked for
+/// (`hyper_rt::timer_sites`: a sleep's, a deadline's or an interval's caller, `file:line:column`; none where no timer
+/// fell due for the wake), read from the shard's table without a lock (goal 9, plan 01a1a87b2cec step 5: what the
+/// shards' timer wakes are, to cut what isn't needed). Their sum is `kiln_shard_wakeups_total{by="timer"}`.
+fn render_timer_wakes(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    // No probes, no runtime asked for (rendering must not start one).
+    if shards().is_empty() {
+        return;
+    }
+    timer_wakes_series(o, &site_rows(hyper_rt::timer_sites::timer_wakes), help);
+    kicked_tasks_series(o, &site_rows(hyper_rt::timer_sites::kicked_tasks), help);
+}
+
+/// Each shard's counts by site from `read` (its table, `hyper_rt::timer_sites`), keyed by shard and `file:line:column`.
+fn site_rows(read: fn(hyper_rt::SlotHolder) -> Vec<hyper_rt::timer_sites::SiteCount>) -> std::collections::BTreeMap<(usize, String), u64> {
+    let mut rows: std::collections::BTreeMap<(usize, String), u64> = std::collections::BTreeMap::new();
+    for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
+        for w in read(holder) {
+            let site = w.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            let n = rows.entry((i, site)).or_default();
+            *n = n.saturating_add(w.count);
+        }
+    }
+    rows
+}
+
+/// `kiln_shard_kicked_tasks_total{shard,site}`: the kicks that found each shard parked, by where the task each woke was
+/// spawned (empty: a control message's), from its rows (goal 9, plan 01a1a87b2cec step 5: who other threads wake on a
+/// parked shard). Their sum is the claimed kicks, `kiln_shard_kicks_in_total{found="parked"}`.
+fn kicked_tasks_series(o: &mut String, rows: &std::collections::BTreeMap<(usize, String), u64>, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_kicked_tasks_total", "counter", "Kicks that found each shard parked, by where the task each woke was spawned (file:line:column; empty for a control message's): their sum is kiln_shard_kicks_in_total found=parked.");
+    for ((i, site), n) in rows {
+        let _ = writeln!(o, "kiln_shard_kicked_tasks_total{{shard=\"{i}\",site=\"{}\"}} {n}", escape(site));
+    }
+}
+
+/// [`render_timer_wakes`]'s family from its rows (each shard and site's wakes).
+fn timer_wakes_series(o: &mut String, rows: &std::collections::BTreeMap<(usize, String), u64>, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_timer_wakes_total", "counter", "Parks a timer ended on each shard, by where the timer was asked for (file:line:column of the sleep, deadline or interval; empty where no timer fell due for the wake): their sum is kiln_shard_wakeups_total by=timer.");
+    for ((i, site), n) in rows {
+        let _ = writeln!(o, "kiln_shard_timer_wakes_total{{shard=\"{i}\",site=\"{}\"}} {n}", escape(site));
+    }
 }
 
 /// The families of what each shard's spin before a park did ([`Spins`]; goal 9, plan 01a1a87b2cec step 4), from `all`,
@@ -1389,6 +1461,51 @@ mod tests {
             anyhow::ensure!(me.runs() == 3 && (s.busy.is_some() || first.is_none()), "three runs noted, with the thread's CPU time: {s:?}");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the kicks sent each shard are on `/metrics` by who sent them and whether each
+    /// found it parked or awake, a series each.
+    #[test]
+    fn g9_s5_each_shards_kicks_are_on_metrics_by_sender() {
+        let mut o = String::new();
+        kicks_in_series(&mut o, &[[(1, 2), (3, 4), (5, 6), (7, 8)]], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_kicks_in_total counter",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"shard\",found=\"parked\"} 1",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"shard\",found=\"awake\"} 2",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"compute\",found=\"parked\"} 3",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"blocking\",found=\"awake\"} 6",
+            "kiln_shard_kicks_in_total{shard=\"0\",from=\"thread\",found=\"parked\"} 7",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: each shard's timer wakes are on `/metrics` by the place their timer was asked
+    /// for, a series a shard and site, the wakes no timer fell due for under an empty site.
+    #[test]
+    fn g9_s5_each_shards_timer_wakes_are_on_metrics_by_site() {
+        let rows: std::collections::BTreeMap<(usize, String), u64> =
+            [((0, "crates/kiln/src/hub.rs:10:5".to_owned()), 7), ((0, String::new()), 1), ((2, "crates/kiln-http/src/h2/server.rs:1090:62".to_owned()), 3)].into_iter().collect();
+        let mut o = String::new();
+        timer_wakes_series(&mut o, &rows, &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        kicked_tasks_series(&mut o, &rows, &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_kicked_tasks_total counter",
+            "kiln_shard_kicked_tasks_total{shard=\"0\",site=\"crates/kiln/src/hub.rs:10:5\"} 7",
+            "# TYPE kiln_shard_timer_wakes_total counter",
+            "kiln_shard_timer_wakes_total{shard=\"0\",site=\"crates/kiln/src/hub.rs:10:5\"} 7",
+            "kiln_shard_timer_wakes_total{shard=\"0\",site=\"\"} 1",
+            "kiln_shard_timer_wakes_total{shard=\"2\",site=\"crates/kiln-http/src/h2/server.rs:1090:62\"} 3",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's arms and socket calls becomes its

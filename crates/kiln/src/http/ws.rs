@@ -77,6 +77,16 @@ const COMMANDS_READ: usize = 16 << 10;
 /// what's large in frames of at most this (`crate::api`'s packed snapshots).
 pub const SOCKET_WRITE: usize = 16 << 10;
 
+/// The most payload a frame carries that, with its head, is what a socket of the UI's writes at a time ([`SOCKET_WRITE`]):
+/// that less a server frame's head for a payload of 126 to 65,535 bytes ([`FRAME_HEAD`]). Such a frame is a TLS record whole
+/// (RFC 8446 §5.1: 2^14 bytes of plaintext), where one of `SOCKET_WRITE` bytes of payload went in a write of that and its head,
+/// two records, the second of its head's 4 bytes (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row C12).
+pub const WRITE_FRAME: usize = SOCKET_WRITE - FRAME_HEAD;
+
+/// A server frame's head for a payload of 126 to 65,535 bytes (RFC 6455 §5.2: a server's frames are unmasked): its 2 bytes,
+/// and 2 of the payload's length.
+const FRAME_HEAD: usize = 2 + 2;
+
 /// [`accept`] for a socket whose peer sends little, reading [`COMMANDS_READ`] bytes at a time: people's commands
 /// (an agent's page), a terminal's keystrokes and resizes, a page's notes of what it couldn't read (the events
 /// socket, a job's and a deployment's logs). Each such socket saves 112 KiB of tungstenite's 128 KiB, made up
@@ -88,7 +98,7 @@ pub fn accept_commands(
 }
 
 /// A socket's of [`accept_commands`]: its message's limit, and its reads and writes a TLS record at a time.
-fn commands_config() -> WebSocketConfig {
+pub(crate) fn commands_config() -> WebSocketConfig {
     limits(16 << 20).read_buffer_size(COMMANDS_READ).write_buffer_size(SOCKET_WRITE)
 }
 

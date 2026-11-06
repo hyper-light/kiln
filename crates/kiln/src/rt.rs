@@ -1424,28 +1424,39 @@ pub use hyper_rt::compute::{Step, Turn};
 /// compressing, diffing, hashing), off every shard and below them in the OS's priority, so one heavy
 /// request holds up no other (goal 3, plan 01a1a59c2a8e; `hyper_rt::compute`). Its result comes back
 /// here. Waits while the pool is at its bound; with no pool running, `f` gets a thread of its own. A
-/// job that can run long goes in pieces: [`compute_pieces`].
-pub async fn compute<R, F>(f: F) -> anyhow::Result<R>
+/// job that can run long goes in pieces: [`compute_pieces`]. Counted against the caller's place
+/// (`crate::compute_sites`: its time on the pool's thread and the caller's wait for it; goal 9, plan
+/// 01a1a87b2cec step 5).
+#[track_caller]
+pub fn compute<R, F>(f: F) -> impl Future<Output = anyhow::Result<R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    rt()?;
-    let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
-    // Handed over from a shard: its round trip, past the job's own run, is what work kept on a shard is weighed against
-    // ([`POOL_TRIP`], [`here`]; consts-audit B1).
-    let handed = on_shard().then(Instant::now);
-    let job = move || {
-        let began = Instant::now();
-        let out = f();
-        let _ = tx.send((out, nanos_since(began)));
-    };
-    to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
-    let (out, ran_ns) = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))?;
-    if let Some(handed) = handed {
-        POOL_TRIP.learn(nanos_since(handed).saturating_sub(ran_ns));
+    let site = std::panic::Location::caller();
+    async move {
+        rt()?;
+        let asked = Instant::now();
+        let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
+        // Handed over from a shard: its round trip, past the job's own run, is what work kept on a shard is weighed
+        // against ([`POOL_TRIP`], [`here`]; consts-audit B1).
+        let handed = on_shard().then_some(asked);
+        let job = move || {
+            let began = Instant::now();
+            let out = f();
+            let ran = began.elapsed();
+            crate::compute_sites::sites().ran(site, ran);
+            let _ = tx.send((out, u64::try_from(ran.as_nanos()).unwrap_or(u64::MAX)));
+        };
+        to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
+        let got = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+        crate::compute_sites::sites().waited(site, asked.elapsed());
+        let (out, ran_ns) = got?;
+        if let Some(handed) = handed {
+            POOL_TRIP.learn(nanos_since(handed).saturating_sub(ran_ns));
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Whole nanoseconds since `t`.
@@ -1456,7 +1467,7 @@ fn nanos_since(t: Instant) -> u64 {
 /// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
 /// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
 /// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
-/// trip ([`POOL_TRIP`]), every session copy's quiet gaps (`crate::harness::copies`).
+/// trip ([`POOL_TRIP`]).
 pub struct Smoothed {
     mean: AtomicU64,
     dev: AtomicU64,
@@ -1477,12 +1488,6 @@ impl Smoothed {
     /// Its variation, nanoseconds: 0 until a sample was learned.
     pub fn dev(&self) -> u64 {
         self.dev.load(Ordering::Relaxed)
-    }
-
-    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none until a sample was
-    /// learned.
-    pub fn bound(&self) -> Option<u64> {
-        self.mean().map(|mean| mean.saturating_add(self.dev().saturating_mul(4)))
     }
 
     /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
@@ -1546,47 +1551,70 @@ pub fn here(expected_ns: u64, bound_ns: u64) -> bool {
 /// [`Step::More`] when told yes: its piece has had a shard's step and another job waits for the thread,
 /// which it then gives up, going on after (big JSON written a part at a time, a long diff a file at a
 /// time). Otherwise as [`compute`].
-pub async fn compute_pieces<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+#[track_caller]
+pub fn compute_pieces<S, T, F>(state: S, step: F) -> impl Future<Output = anyhow::Result<T>>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    compute_pieces_from(state, step, std::panic::Location::caller())
+}
+
+/// [`compute_pieces`] asked for at `site`.
+async fn compute_pieces_from<S, T, F>(state: S, mut step: F, site: &'static std::panic::Location<'static>) -> anyhow::Result<T>
 where
     S: Send + 'static,
     T: Send + 'static,
     F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
 {
     rt()?;
+    let asked = Instant::now();
     let (tx, rx) = futures::channel::oneshot::channel::<T>();
-    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| match step(state, turn) {
-        Step::Done(value) => {
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(value);
+    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| {
+        let began = Instant::now();
+        let stepped = step(state, turn);
+        crate::compute_sites::sites().ran(site, began.elapsed());
+        match stepped {
+            Step::Done(value) => {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(value);
+                }
+                Step::Done(())
             }
-            Step::Done(())
+            Step::More => Step::More,
         }
-        Step::More => Step::More,
     };
     to_compute(((state, Some(tx)), piece), |(state, piece)| hyper_rt::compute::run_pieces(state, piece).map(drop), |(state, piece)| hyper_rt::compute::run_here(state, piece)).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let made = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+    crate::compute_sites::sites().waited(site, asked.elapsed());
+    made
 }
 
 /// `f` of each item on the compute pool, in pieces ([`compute_pieces`]): an item a unit, its piece
 /// ended where another job waits, so a long list holds no pool thread long. The outputs in the items'
 /// order.
-pub async fn compute_map<T, R, F>(items: Vec<T>, f: F) -> anyhow::Result<Vec<R>>
+#[track_caller]
+pub fn compute_map<T, R, F>(items: Vec<T>, f: F) -> impl Future<Output = anyhow::Result<Vec<R>>>
 where
     T: Send + 'static,
     R: Send + 'static,
     F: FnMut(T) -> R + Send + 'static,
 {
     let out = Vec::with_capacity(items.len());
-    compute_pieces((items.into_iter(), out, f), |(todo, out, f), turn| {
-        for item in todo.by_ref() {
-            out.push(f(item));
-            if turn.over() {
-                return Step::More;
+    compute_pieces_from(
+        (items.into_iter(), out, f),
+        |(todo, out, f), turn| {
+            for item in todo.by_ref() {
+                out.push(f(item));
+                if turn.over() {
+                    return Step::More;
+                }
             }
-        }
-        Step::Done(std::mem::take(out))
-    })
-    .await
+            Step::Done(std::mem::take(out))
+        },
+        std::panic::Location::caller(),
+    )
 }
 
 /// [`compute_pieces`] for a thread of its own, which may block (never a shard): the job runs on the compute
@@ -1813,6 +1841,13 @@ impl Default for Turns {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
+    /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
+    pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
@@ -1820,6 +1855,8 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
+    BLOCKING_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
     rt()?;
     let (tx, rx) = futures::channel::oneshot::channel::<R>();
     let job: Arc<Mutex<Option<(F, futures::channel::oneshot::Sender<R>)>>> = Arc::new(Mutex::new(Some((f, tx))));
@@ -1993,16 +2030,24 @@ fn nanos(d: Duration) -> u64 {
 
 /// A sleep until a deadline on the shard's timing wheel; under a foreign waker it runs in a
 /// [`Bridge`]. If the runtime refuses the timer it completes rather than hang. `Send + Sync`, so it
-/// also serves as hyper's `Sleep`.
+/// also serves as hyper's `Sleep`. A park its timer ends is counted against where it was asked for
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`; goal 9, plan 01a1a87b2cec step 5).
 pub struct Sleep {
     deadline: Instant,
     native: Option<hyper_rt::futures::Sleep>,
     bridged: Option<Bridge<Result<(), RtError>>>,
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Sleep {
+    #[track_caller]
     pub fn until(deadline: Instant) -> Self {
-        Self { deadline, native: None, bridged: None }
+        Self::until_from(deadline, std::panic::Location::caller())
+    }
+
+    /// [`Sleep::until`] asked for at `site`: a wrapper's, passing its own caller's place on.
+    pub fn until_from(deadline: Instant, site: &'static std::panic::Location<'static>) -> Self {
+        Self { deadline, native: None, bridged: None, site }
     }
 
     fn remaining_ns(&self) -> u64 {
@@ -2021,10 +2066,11 @@ impl Future for Sleep {
             self.bridged = None;
             return Poll::Ready(());
         }
+        let site = self.site;
         if is_native(cx) {
             self.bridged = None;
             let remaining = self.remaining_ns();
-            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep(remaining));
+            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep_from(remaining, site));
             return match Pin::new(sleep).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(_) => Poll::Ready(()),
@@ -2033,7 +2079,7 @@ impl Future for Sleep {
         self.native = None;
         if self.bridged.is_none() {
             let remaining = self.remaining_ns();
-            match Bridge::spawn(hyper_rt::futures::sleep(remaining), cx.waker()) {
+            match Bridge::spawn(hyper_rt::futures::sleep_from(remaining, site), cx.waker()) {
                 Ok(bridge) => self.bridged = Some(bridge),
                 Err(_) => return Poll::Ready(()),
             }
@@ -2048,8 +2094,9 @@ impl Future for Sleep {
     }
 }
 
+#[track_caller]
 pub fn sleep(d: Duration) -> Sleep {
-    Sleep::until(kiln_seams::clock::later(Instant::now(), d))
+    Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), std::panic::Location::caller())
 }
 
 /// Real time, on the runtime's timers, as kiln-seams' [`kiln_seams::Clock`]: what production code
@@ -2074,8 +2121,9 @@ pub fn clock() -> Arc<dyn kiln_seams::Clock> {
     Arc::new(RtClock)
 }
 
+#[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
-    Sleep::until(deadline)
+    Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
 /// The deadline passed before the future finished.
@@ -2182,13 +2230,18 @@ pub async fn each_in_order<T, R, Fut: Future<Output = R>>(items: impl IntoIterat
 }
 
 /// `fut`'s output, or `Err(Elapsed)` once `d` has passed (the future is then dropped). When both are
-/// ready the output wins.
-pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    let fut = pin!(fut);
-    let deadline = pin!(sleep(d));
-    match futures::future::select(fut, deadline).await {
-        futures::future::Either::Left((v, _)) => Ok(v),
-        futures::future::Either::Right(_) => Err(Elapsed),
+/// ready the output wins. Its deadline is counted against the caller's place where it wakes a shard
+/// ([`Sleep`]).
+#[track_caller]
+pub fn timeout<F: Future>(d: Duration, fut: F) -> impl Future<Output = Result<F::Output, Elapsed>> {
+    let site = std::panic::Location::caller();
+    async move {
+        let fut = pin!(fut);
+        let deadline = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+        match futures::future::select(fut, deadline).await {
+            futures::future::Either::Left((v, _)) => Ok(v),
+            futures::future::Either::Right(_) => Err(Elapsed),
+        }
     }
 }
 
@@ -2197,15 +2250,18 @@ pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapse
 pub struct Interval {
     period: Duration,
     next: Instant,
+    /// Where it was made: what its ticks' wakes of a shard are counted against ([`Sleep`]).
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Interval {
+    #[track_caller]
     pub fn new(period: Duration) -> Self {
-        Self { period: period.max(Duration::from_millis(1)), next: Instant::now() }
+        Self { period: period.max(Duration::from_millis(1)), next: Instant::now(), site: std::panic::Location::caller() }
     }
 
     pub async fn tick(&mut self) {
-        sleep_until(self.next).await;
+        Sleep::until_from(self.next, self.site).await;
         let now = Instant::now();
         self.next += self.period;
         if self.next <= now {
@@ -2312,14 +2368,19 @@ impl Shutdown {
         self.0.waits.until(|| self.is_cancelled()).await;
     }
 
-    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first.
-    pub async fn sleep(&self, d: Duration) -> bool {
-        if self.is_cancelled() {
-            return false;
+    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
+    /// against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
         }
-        let cancelled = pin!(self.cancelled());
-        let slept = pin!(sleep(d));
-        matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
     }
 }
 

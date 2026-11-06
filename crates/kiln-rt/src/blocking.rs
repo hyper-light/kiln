@@ -184,7 +184,10 @@ fn thread(name: String, body: impl FnOnce() + Send + 'static) -> Result<JoinHand
         clippy::disallowed_methods,
         reason = "the blocking pool's threads (docs/runtime.md §9): started once, joined by `stop`"
     )]
-    let spawned = std::thread::Builder::new().name(name).spawn(body);
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        crate::parking::mark_thread(crate::parking::KickFrom::Blocking);
+        body();
+    });
     spawned.map_err(|_| RtError::BadConfig {
         what: "the OS refused a blocking pool thread",
     })

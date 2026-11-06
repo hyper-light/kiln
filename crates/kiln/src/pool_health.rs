@@ -220,6 +220,8 @@ pub fn render(o: &mut String) {
     let help = |o: &mut String, name: &str, kind: &str, h: &str| {
         let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
     };
+    // The awaited jobs by where each was asked for (goal 9, plan 01a1a87b2cec step 5).
+    crate::compute_sites::render(o);
     let p = pools();
     let s = hyper_rt::compute::stats();
     for (name, kind, h, v) in [

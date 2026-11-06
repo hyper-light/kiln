@@ -67,6 +67,11 @@
 //! - `feed_changed`: the first batch of a conversation store's feed this process signs for has a
 //!   byte changed after it signed its hand-on, once (docs/ci.md W27-R08): the taker refuses it,
 //!   kiln records the break, and the batch goes again as it was.
+//! - `receipts_unkept`: the server's: no receipt of a batch it takes from a runner's conversation
+//!   store is ever kept, so it says no Ack of any (an Ack waits for its receipt: consts-audit R4).
+//!   Each runner's feed holds what its store commits after its first batch, as behind a kiln.db
+//!   that never keeps a receipt, so a restarted server's store lacks what came since (docs/wire.md,
+//!   "Restarts").
 //! - `sync_file_changed`: the first piece of a file this runner syncs to another (`kiln run`), `.git`
 //!   aside, has a byte changed after it hashed it, as in transit (docs/ci.md W27-R08): the other
 //!   runner refuses the copy and kiln records the break.
@@ -150,6 +155,9 @@ pub struct Chaos {
     pub mantle_lost: bool,
     /// The first batch of a feed it signs for changes after its hand-on, once (`feed_changed`).
     pub feed_changed: bool,
+    /// The server's: says no Ack of any batch it takes from a runner's feed, its receipt never kept
+    /// (`receipts_unkept`).
+    pub receipts_unkept: bool,
     /// A file it syncs to another runner changes after it hashed it (`sync_file_changed`).
     pub sync_file_changed: bool,
     /// The server's: the first copy of kiln.db it hands on to a learner changes after it hashed it
@@ -262,6 +270,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "no_git" => c.no_git = true,
             "peer_object_changed" => c.peer_object_changed = true,
             "feed_changed" => c.feed_changed = true,
+            "receipts_unkept" => c.receipts_unkept = true,
             "blob_changed" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `blob_changed` takes an object's key");
                 c.blob_changed = Some(v.to_owned());
@@ -528,6 +537,7 @@ mod tests {
                 blob_changed: None,
                 mantle_lost: false,
                 feed_changed: false,
+                receipts_unkept: false,
                 sync_file_changed: false,
                 copy_changed: false,
                 entry_changed: false,
@@ -543,6 +553,7 @@ mod tests {
         assert_eq!(parse("blob_changed=artifacts/7/app")?.blob_changed.as_deref(), Some("artifacts/7/app"));
         assert!(parse("blob_changed").is_err(), "it names an object's key");
         assert!(parse("feed_changed")?.feed_changed);
+        assert!(parse("receipts_unkept")?.receipts_unkept);
         assert!(parse("mantle_lost")?.mantle_lost);
         assert!(parse("sync_file_changed")?.sync_file_changed);
         // W27-R08's cluster group: a copy, and an entry, changed on their way.
