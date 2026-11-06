@@ -99,7 +99,7 @@ lab.calibrate = async function calibrate(url, n = 200, check = 400) {
 
 /** The protocol each resource came over (h2, h3, http/1.1), by path. */
 function protocols() {
-  for (const e of performance.getEntriesByType("resource")) {
+  for (const e of /** @type {PerformanceResourceTiming[]} */ (performance.getEntriesByType("resource"))) {
     const path = new URL(e.name).pathname.replace(/\/[0-9a-f]{32}(?=\/|$)/g, "/:id");
     if (e.nextHopProtocol) lab.protocols[path] = e.nextHopProtocol;
   }

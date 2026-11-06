@@ -482,6 +482,7 @@ Chromium-only pilot, 1.7 h and about 5.3 h, by 8 rows to 5) and the matrix's 109
 
 ```sh
 cd crates/kiln-lab/web && npm ci        # Playwright, pinned; its browsers from ~/.cache/ms-playwright
+npm run check && npm run typecheck && npm run lint && npm test   # the lab's JavaScript: syntax, types (jsconfig.json), ESLint, its tests
 kiln-lab browser probe
 kiln-lab browser check-profiles --out ~/.cache/kiln-bp/g1/checks
 kiln-lab browser record --kiln path/to/kiln --out ~/.cache/kiln-bp/g1/record

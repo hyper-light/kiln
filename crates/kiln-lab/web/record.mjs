@@ -26,7 +26,8 @@ for (const j of spec.journeys) {
   const put = (o) => appendFileSync(file, JSON.stringify(o) + "\n");
   const pending = [];
   for (const ev of ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFailed", "Network.webSocketCreated", "Network.webSocketClosed", "Network.webSocketFrameReceived", "Network.webSocketFrameSent", "Network.eventSourceMessageReceived", "Network.dataReceived"]) {
-    cdp.on(ev, (p) => {
+    // Each of the events by its name (the protocol's types are by event; these are read as data).
+    /** @type {any} */ (cdp).on(ev, (p) => {
       if (ev === "Network.dataReceived") return;
       const o = { ev: ev.slice(8), wall_us: Math.round((performance.timeOrigin + performance.now()) * 1000), ...p };
       if (ev === "Network.requestWillBeSent") o.request = { url: p.request.url, method: p.request.method, postData: p.request.postData, headers: p.request.headers };

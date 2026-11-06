@@ -122,7 +122,7 @@ export async function runJob(path) {
     await page.evaluate(() => window.__lab.close());
     // The requests closing found unanswered, as misses.
     await drain();
-    result.page_protocol = await page.evaluate(() => performance.getEntriesByType("navigation")[0]?.nextHopProtocol || "");
+    result.page_protocol = await page.evaluate(() => /** @type {PerformanceNavigationTiming | undefined} */ (performance.getEntriesByType("navigation")[0])?.nextHopProtocol || "");
   } catch (e) {
     result.errors.push({ where: "driver", error: String(e && e.stack ? e.stack : e) });
     result.failed = true;
