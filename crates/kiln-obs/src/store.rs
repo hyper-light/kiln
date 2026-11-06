@@ -821,12 +821,14 @@ impl Store {
         let mut symbols = Symbols::new(self.hash);
         let mut index = Index::new(self.hash);
         let mut kept: Vec<u32> = Vec::new();
+        // Each key written again from this index's symbols (it keeps none: `crate::index`), one at a time.
+        let mut key = Vec::new();
         for id in 0..self.index.len() as u32 {
             if !keep.get(id as usize).copied().unwrap_or(false) {
                 continue;
             }
-            let (Some(fp), Some(info), Some(key)) = (self.index.fp(id), self.index.info(id), self.index.key(id)) else { continue };
-            index.define(&mut symbols, fp, key, info.kind)?;
+            let (Some(fp), Some(info), true) = (self.index.fp(id), self.index.info(id), self.index.key_into(&self.symbols, id, &mut key)) else { continue };
+            index.define(&mut symbols, fp, &key, info.kind)?;
             kept.push(id);
         }
         let dropped = (self.index.len() - kept.len()) as u64;
@@ -1260,15 +1262,31 @@ impl Store {
             }
             let seq = w.manifest.next_seq;
             let file = manifest::block_file(seq);
+            // The series' keys, written again from the symbols for the block (the index keeps none: `crate::index`):
+            // one buffer for them all, each a range of it, let go once the block is written.
+            let mut keys: Vec<u8> = Vec::new();
+            let mut one = Vec::new();
+            let ranges: Vec<Option<(usize, usize)>> = borrowed
+                .iter()
+                .map(|(id, _)| {
+                    self.index.key_into(&self.symbols, *id, &mut one).then(|| {
+                        let start = keys.len();
+                        keys.extend_from_slice(&one);
+                        (start, keys.len())
+                    })
+                })
+                .collect();
             let series: Vec<SeriesData<'_>> = borrowed
                 .iter()
                 .zip(&made)
-                .filter_map(|((id, closed), (_, new))| {
+                .zip(&ranges)
+                .filter_map(|(((id, closed), (_, new)), range)| {
                     let info = self.index.info(*id)?;
+                    let (start, end) = (*range)?;
                     // A cut writes no rollups (it decodes nothing it need not): the first merge
                     // to take its block makes them.
                     let chunks = closed.iter().chain(new).map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect();
-                    Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: self.index.key(*id)?, chunks, rollups: &[] })
+                    Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: keys.get(start..end)?, chunks, rollups: &[] })
                 })
                 .collect();
             written.push(dir.join(&file));

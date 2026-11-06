@@ -40,8 +40,9 @@ pub trait Custodian: Send + Sync {
     fn received(&self, machine: &str, hand_on: &str, thing: Subject);
 }
 
-/// Where a feed's end keeps its [`Custodian`]: set once its identity can sign, read per batch.
-type Signs = Arc<parking_lot::RwLock<Option<Arc<dyn Custodian>>>>;
+/// Where a feed's end keeps its [`Custodian`]: set once its identity can sign, read per batch, a copy swapped
+/// in whole (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal: an `RwLock` each batch read on its shard).
+type Signs = Arc<crate::rcu::Rcu<Option<Arc<dyn Custodian>>>>;
 
 /// A batch of `store`'s feed, following `from` and reading through `upto`, by the SHA-256 of its
 /// rows as JSON (`sha256`): what a hand-on and its receipt are about.
@@ -280,7 +281,7 @@ impl Shipper {
 
     /// Its batches go signed by `c` from now on ([`Custodian`]).
     pub fn sign_with(&self, c: Arc<dyn Custodian>) {
-        *self.signs.write() = Some(c);
+        self.signs.set(Some(c));
     }
 
     /// Where the feed stands, for telemetry.
@@ -328,7 +329,12 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
     let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
+    // Its turns on its shard: what waits in its queue is taken without waiting (a commit's nudges pile up while its
+    // window is full, 20 a second for as long as its taker is slow), so it's given up between them once its turn would
+    // pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+    let mut turns = crate::rt::Turns::new();
     loop {
+        turns.after().await;
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(ev)) => Some(ev),
             Ok(Err(_)) => return,
@@ -418,20 +424,22 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
             if batch.rows.is_empty() {
                 break;
             }
-            // What the taker has already is left out; the batch still says through where it read.
-            if let Some(skip) = &skip {
-                batch.rows.retain(|c| !skip(c.rev));
-            }
             // Its JSON and the SHA-256 of it made on the compute pool (goal 3, plan 01a1a59c2a8e step 3): a
-            // batch of up to two MiB, written out and hashed on the shard, held it all the while.
-            let (upto, rows) = (batch.upto, batch.rows.len());
-            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String)> {
+            // batch of up to two MiB, written out and hashed on the shard, held it all the while. What the taker
+            // has already is left out there first, the rows let go of there too: a mirror's batch asked of each
+            // of its up to tens of thousands of rows whether it had it, on the shard (goal 9, plan 01a1a87b2cec
+            // step 3). The batch still says through where it read.
+            let (upto, skip) = (batch.upto, skip.clone());
+            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)> {
+                if let Some(skip) = &skip {
+                    batch.rows.retain(|c| !skip(c.rev));
+                }
                 let json = serde_json::to_vec(&batch)?;
                 let digest = crate::util::sha256_hex(&json);
-                Ok((json, digest))
+                Ok((json, digest, batch.rows.len()))
             })
             .await;
-            let (mut json, digest) = match encoded {
+            let (mut json, digest, rows) = match encoded {
                 Ok(Ok(e)) => e,
                 Ok(Err(e)) | Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
@@ -439,7 +447,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
                 }
             };
             // Its hand-on, by the SHA-256 of what goes (docs/ci.md W27-R08).
-            let signer = signs.read().clone();
+            let signer = Option::clone(&signs.load());
             let hand_on = match signer {
                 Some(c) => c.hand_on(batch_thing(&me, from, upto, &digest)).await,
                 None => None,
@@ -525,13 +533,18 @@ pub enum Brings {
 pub struct Intake {
     tx: crate::memory::queue::Sender<Heard>,
     restores: std::sync::Arc<Restores>,
+    /// Where each store that feeds it stands ([`Peers`]).
     peers: std::sync::Arc<Peers>,
     signs: Signs,
 }
 
-/// Where each store that feeds an intake stands, by its name among the store's peers
-/// ([`peer_name`]): for telemetry.
-type Peers = std::sync::Mutex<HashMap<String, PeerView>>;
+/// Where each store that feeds an intake stands, by its name among the store's peers ([`peer_name`]): for
+/// telemetry. Its thread alone writes it, as it takes each message ([`Feed::note`]), and [`Intake::peers`]
+/// reads it, with no lock (goal 5, plan 01a1a59c2aae, its top goal: a `Mutex` the thread took for each message
+/// and a telemetry read took on its shard). Each store's view is a copy of its own, swapped in whole, and the
+/// map of them a copy swapped in whole as a store first feeds it (`crate::rcu`): a message copies its own
+/// store's view, never every store's.
+type Peers = crate::rcu::Rcu<HashMap<String, Arc<crate::rcu::Rcu<PeerView>>>>;
 
 /// A feed's message as its intake's thread takes it: the link it came on, its machine, the message, and
 /// the bytes that came with it (a part of a batch).
@@ -570,33 +583,38 @@ fn answers() -> (crate::memory::queue::Sender<Out>, crate::memory::queue::Receiv
 pub const HEARD_BYTES: usize = crate::net::WINDOW as usize;
 
 /// What each mirror sent back to restore a store, by the numbers it was written under there: the
-/// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
+/// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent. Read for each
+/// row a mirror's feed sends and written as a copy sent back is taken, so a copy swapped in whole
+/// (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal: a `Mutex` the feeds' shards and the intake's
+/// thread took).
 #[derive(Default)]
-pub struct Echoes(std::sync::Mutex<HashMap<String, Vec<(u64, u64)>>>);
+pub struct Echoes(crate::rcu::Rcu<HashMap<String, Vec<(u64, u64)>>>);
 
 impl Echoes {
     /// Numbers `first` through `last` were written from `machine`'s copy.
     pub fn add(&self, machine: &str, first: u64, last: u64) {
-        let mut all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ranges = all.entry(machine.to_owned()).or_default();
-        match ranges.last_mut() {
-            Some(r) if r.1 + 1 == first => r.1 = last,
-            _ => ranges.push((first, last)),
-        }
+        self.0.update(|all| {
+            let ranges = all.entry(machine.to_owned()).or_default();
+            match ranges.last_mut() {
+                Some(r) if r.1 + 1 == first => r.1 = last,
+                _ => ranges.push((first, last)),
+            }
+        });
     }
 
     /// Whether number `rev` was written from `machine`'s copy.
     pub fn has(&self, machine: &str, rev: u64) -> bool {
-        let all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        all.get(machine).is_some_and(|ranges| {
+        self.0.load().get(machine).is_some_and(|ranges| {
             let i = ranges.partition_point(|r| r.1 < rev);
             ranges.get(i).is_some_and(|r| r.0 <= rev)
         })
     }
 }
 
-/// The mirrors' copies an intake takes to restore its store from ([`Intake::accept_restore`]).
-type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
+/// The mirrors' copies an intake takes to restore its store from ([`Intake::accept_restore`]): read for each
+/// batch its thread takes, written as a mirror says it sends one back, so a copy swapped in whole
+/// (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal).
+type Restores = crate::rcu::Rcu<std::collections::HashSet<String>>;
 
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
@@ -610,7 +628,7 @@ impl Intake {
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
             while let Ok((peer, machine, msg, data)) = rx.recv_blocking() {
-                let signer = signing.read().clone();
+                let signer = Option::clone(&signing.load());
                 let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
                 for m in take(&feed, &mut taking, peer, &machine, msg, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
@@ -624,18 +642,20 @@ impl Intake {
 
     /// The batches it takes are signed for by `c` from now on ([`Custodian`]).
     pub fn sign_with(&self, c: Arc<dyn Custodian>) {
-        *self.signs.write() = Some(c);
+        self.signs.set(Some(c));
     }
 
     /// Where each store that feeds this intake stands, since kiln started.
     pub fn peers(&self) -> Vec<PeerView> {
-        self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect()
+        self.peers.load().values().map(|v| PeerView::clone(&v.load())).collect()
     }
 
     /// Take store `store`'s feed as a mirror's copy of this one, sent back to restore it
     /// ([`super::store::Store::take_copy`]): what it brings fills in what this store lacks.
     pub fn accept_restore(&self, store: &str) {
-        self.restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(store.to_owned());
+        self.restores.update(|all| {
+            all.insert(store.to_owned());
+        });
     }
 
     /// What runner process `peer` of `machine` sent on the feed's lane, read where its frame was
@@ -663,11 +683,15 @@ struct Feed<'a> {
 }
 
 impl Feed<'_> {
-    /// Telemetry of store `store` of `machine`.
-    fn note(&self, machine: &str, store: &str, f: impl FnOnce(&mut PeerView)) {
-        let mut all = self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let v = all.entry(peer_name(machine, store)).or_insert_with(|| PeerView { machine: machine.to_owned(), store: store.to_owned(), ..PeerView::default() });
-        f(v);
+    /// Telemetry of store `store` of `machine`: its view, changed by `f` on a copy swapped in ([`Peers`]).
+    fn note(&self, machine: &str, store: &str, mut f: impl FnMut(&mut PeerView)) {
+        let name = peer_name(machine, store);
+        let known = self.peers.load().get(&name).cloned();
+        let view = known.unwrap_or_else(|| {
+            let made = Arc::new(crate::rcu::Rcu::new(PeerView { machine: machine.to_owned(), store: store.to_owned(), ..PeerView::default() }));
+            self.peers.update(|all| Arc::clone(all.entry(name.clone()).or_insert_with(|| Arc::clone(&made))))
+        });
+        view.update(&mut f);
     }
 }
 
@@ -768,7 +792,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
-            let copy = restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&s);
+            let copy = restores.load().contains(&s);
             let began = Instant::now();
             let took = if copy { store.take_copy(&peer_name(machine, &s), from, batch) } else { store.take(&peer_name(machine, &s), theirs, from, batch) };
             let take_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1233,7 +1257,9 @@ mod tests {
             server.send("live", &said("l1", 1, "as it is now"));
             server.sync()?;
             let restores = Restores::default();
-            restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(mirror.id().to_owned());
+            restores.update(|all| {
+                all.insert(mirror.id().to_owned());
+            });
             let (ship, out) = Shipper::start_restore(mirror.clone());
             ship.link(Link::Up);
             let mut partial = HashMap::new();
@@ -1519,6 +1545,40 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal): an intake's telemetry of its feeds is written by its thread
+    /// alone and read with no lock, and is there by the time a message is answered. A copy to restore from is
+    /// taken as said. What a mirror sent back is read, from every shard at once, while it's written, and holds
+    /// every range added.
+    #[test]
+    fn g5_an_intakes_telemetry_and_what_it_reads_per_batch_take_no_lock() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_dir, server) = super::super::store::scratch()?;
+            let (intake, answers) = Intake::start(server, Brings::TheirMachine, None)?;
+            anyhow::ensure!(intake.peers().is_empty(), "telemetry before any feed");
+            intake.heard(7, "box", Msg::Hello { store: "r1".into(), restore: false }, Vec::new());
+            let answer = crate::rt::timeout(Duration::from_secs(5), answers.recv()).await??;
+            anyhow::ensure!(answer.peer == 7 && matches!(decode(&answer.json), Some(Msg::From { .. })), "{answer:?}");
+            let seen = intake.peers();
+            anyhow::ensure!(seen.iter().any(|p| p.machine == "box" && p.store == "r1" && p.hello_at > 0), "its hello isn't in the telemetry: {seen:?}");
+            intake.accept_restore("a-copy");
+            anyhow::ensure!(intake.restores.load().contains("a-copy"), "a copy to restore from, said, isn't taken");
+            let echoes = Arc::new(Echoes::default());
+            let mut reading = Vec::new();
+            for _ in 0..8 {
+                let e = Arc::clone(&echoes);
+                reading.push(crate::rt::spawn_spread_joined(async move { (0..1_000u64).filter(|rev| e.has("m", *rev)).count() }));
+            }
+            for n in 0..100u64 {
+                echoes.add("m", n * 10, n * 10 + 4);
+            }
+            for r in reading {
+                r.await.map_err(|_| anyhow::anyhow!("a reader ended"))?;
+            }
+            anyhow::ensure!((0..100u64).all(|n| echoes.has("m", n * 10) && echoes.has("m", n * 10 + 4) && !echoes.has("m", n * 10 + 5)), "a range added is missing");
+            Ok(())
+        })
+    }
+
     #[test]
     fn what_a_mirror_sent_back_is_known_by_the_numbers_it_was_written_under() {
         let e = Echoes::default();
@@ -1558,6 +1618,19 @@ mod tests {
             assert_eq!(ids, vec!["m1".to_owned(), "m3".to_owned()]);
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a mirror has already is left out of a batch on the compute pool, in the
+    /// job that writes its JSON and digest, its rows let go of there, not asked of row by row on the feed's shard; and
+    /// the feed takes its turns between what waits in its queue. What it leaves out, and that its taker still goes
+    /// through it, is `a_shipper_leaves_out_what_the_taker_has_and_still_goes_through_it`'s.
+    #[test]
+    fn g9_s3_a_batch_is_left_out_of_off_the_shard() {
+        let code: String = include_str!("feed.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let ship = code.split("async fn ship(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+        let (on_shard, in_job) = ship.split_once("crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)>").unwrap_or_default();
+        assert!(!on_shard.is_empty() && !on_shard.contains("skip(c.rev)") && in_job.contains("skip(c.rev)"), "{ship}");
+        assert!(on_shard.contains("turns.after().await"), "its turns: {ship}");
     }
 
     /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.

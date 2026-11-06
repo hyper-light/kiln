@@ -592,7 +592,7 @@ Four edges are left, and the lab steers clear of each:
 | `TermReplay` | answer | Answers `TermAttach`. | As its class says. |
 | `AiSessions` | state | The AI sessions found running on this machine. | Sent when they change, not acknowledged. |
 | `AiTranscript` | answer | Answers `AiTranscript`. | As its class says. |
-| `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. |
+| `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. On the channel, an update the runner took in from its harness ends with `taken_us`: how long before its frame was made the runner took it in, in microseconds on the runner's own clock (`crate::wire::stamp`). The server reads it off before the update and observes it as the `runner` leg of `kiln_runner_wait_leg_seconds`; an older server lets it go as a field it doesn't know. |
 | `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers, and each session's epoch there (`epochs`, new: the server tells such a copy left behind, its session gone on elsewhere at a later epoch, to let go of it; ci.md W27-R08). | Sent on every connect, not acknowledged. |
 | `AiView` | answer | Answers `AiView`. | As its class says. |
 | `Instance` | handshake | Which runner process of its machine this connection is. | As its class says. |
@@ -922,5 +922,9 @@ goes on as it did:
   newest 4,096, the size of the broadcast behind it, under an epoch drawn as the server starts.
   A page that reconnects is sent what it missed, coalesced; when the epoch isn't this server's, or
   the ring no longer has it, its first batch starts with `resync`, and the page loads what it shows
-  again. A socket that falls more than the ring behind is told `resync` too, as before.
+  again. A socket that falls more than the ring behind is told `resync` too, as before. The ring
+  holds at most 64 MiB of frames as well, as many bytes as a listener of the hub's events holds,
+  past which its oldest go as past its 4,096. An agent's `harness` frame lets go of that agent's
+  last one (it says the agent whole): readers pass over what's let go of so, with no gap and no
+  `resync`, and are sent the newest (goal 11, plan 01a1a87b2e56 step 5).
 

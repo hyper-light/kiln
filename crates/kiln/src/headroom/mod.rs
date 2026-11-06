@@ -51,8 +51,9 @@ struct Shared {
     /// Another process of this machine paces; this one only holds work back.
     standby: AtomicBool,
     admit: Mutex<Admit>,
-    /// Held sessions wait on this; the engine notifies it when one may start.
-    room: event_listener::Event,
+    /// Held sessions wait on this; the engine notifies it when one may start (`crate::rt::Changed`, no lock; goal 5,
+    /// plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    room: crate::rt::Changed,
     kick: (Mutex<bool>, Condvar),
     pushed: Mutex<Option<Settings>>,
     latest: Mutex<Option<String>>,
@@ -66,7 +67,7 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     enabled: AtomicBool::new(true),
     standby: AtomicBool::new(false),
     admit: Mutex::new(Admit::default()),
-    room: event_listener::Event::new(),
+    room: crate::rt::Changed::new(),
     kick: (Mutex::new(false), Condvar::new()),
     pushed: Mutex::new(None),
     latest: Mutex::new(None),
@@ -467,7 +468,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             probes = probes::Probes::start(specs(&settings), Arc::clone(&wake));
             let learned = std::mem::take(&mut engine.learned);
             engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
         // The machine and its groups, measured as often as the fastest probe, and never over less
         // than a period: the time scale the engine decides at.
@@ -547,7 +548,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                 tracing::info!(session = %s, why, "headroom: let in");
             }
             drop(a);
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
         if !plan.events.is_empty() {
             for e in &plan.events {
@@ -627,7 +628,7 @@ pub(crate) mod tests {
             a.granted.insert(self.session.clone(), u64::MAX);
             a.fresh.insert(self.session.clone());
             drop(a);
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
     }
 

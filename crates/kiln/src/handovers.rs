@@ -272,7 +272,8 @@ impl Hub {
         // Addressed as the process knows itself: by the name its certificate carries, for one from
         // before its certificate for the machine's id (docs/machines.md).
         let addressee = self.peer_certs.load().get(&peer).cloned().unwrap_or_else(|| agent.to_owned());
-        match crate::custody::word(&self.pki, session, &json, &addressee, &instance, epoch) {
+        // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+        match crate::custody::word_off(&self.pki, session, &json, &addressee, &instance, epoch).await {
             Ok(worded) => {
                 // Kept, so a walk through a relay that passes it on (blue/green's old build) reaches
                 // it (docs/ci.md W27-R08's relays).

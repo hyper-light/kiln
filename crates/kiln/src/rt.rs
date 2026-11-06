@@ -17,15 +17,16 @@
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
 //!   task's own waker. Everything exported here works under any waker: timers fall back to a
 //!   helper task ([`Bridge`]) when polled through a combinator or library that substitutes its own
-//!   waker, and the cross-task primitives are built on `event-listener` / `async-channel` /
-//!   `async-broadcast`, which work with any executor.
+//!   waker, and the cross-task primitives work with any executor: [`Notify`], [`Shutdown`] and [`Changed`]
+//!   wait on `crate::memory::queue`'s lock-free list of waiters (goal 5), [`Broadcast`] on
+//!   `crate::memory::lanes`, and the channels here are `async-channel`'s.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -301,8 +302,9 @@ fn took_realtime() -> bool {
     took.is_ok()
 }
 
-/// Whether the shards nudge their CPUs while they wait ([`nudge`]).
-static NUDGE: AtomicBool = AtomicBool::new(false);
+/// How the shards nudge their CPUs while they wait ([`nudge`]): a [`crate::nudge::Mode`]'s index, off until the
+/// server's config says.
+static NUDGE: AtomicU8 = AtomicU8::new(0);
 
 /// The shards' answers to the nudge ([`nudge`]), three counts in one atomic so exactly one shard, the
 /// last to answer, sees every answer in: those nudged in units of one, those that took the real-time
@@ -325,29 +327,42 @@ static NUDGE_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
 /// The first refusal a shard met, for why.
 static NUDGE_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
 
-/// Each of the server's shards nudges its CPU while it waits (`[server] nudge`; docs/priority.md, "A nudge
-/// for the shards"; goal 8, plan 01a1a59c2b29 step 7): each wait in its driver ends by the period
-/// [`nudge_period_ns`] gives, so a shard woken behind a thread busy in user space on a kernel that
-/// preempts lazily runs at its own timer's interrupt, not at the kernel's next tick (up to 1 ms at
-/// 1000 Hz). In the real-time class's place where that's refused: a shard that took the real-time class
-/// ([`realtime`]) preempts at once and doesn't nudge. It costs a wake of each waiting shard every period,
-/// so it's off until declared. The log and `/healthz/server` say how the shards took it
-/// ([`nudge_status`]). Call it before the runtime starts: later calls change nothing.
-pub fn nudge(on: bool) {
-    NUDGE.store(on, Ordering::Relaxed);
+/// How each of the server's shards nudges its CPU while it waits (`[server] nudge`; docs/priority.md, "A nudge
+/// for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3): a nudged shard's
+/// waits in its driver end by the period [`nudge_period_ns`] gives, so a shard woken behind a thread busy in
+/// user space on a kernel that preempts lazily runs at its own timer's interrupt, not at the kernel's next
+/// tick (up to 1 ms at 1000 Hz). `on` nudges every wait; `auto`, the mode a config declares, only while the
+/// shard's host holds its wakes, judged by its probe each period (`crate::nudge`), so a calm server pays nothing;
+/// `off`, the default until a config declares another (docs/ci.md §0.3, "Opt-in automation"), never. In the
+/// real-time class's place where that's refused: a shard that took the real-time class
+/// ([`realtime`]) preempts at once and doesn't nudge. The log and `/healthz/server` say how the shards took it
+/// ([`nudge_status`]). Call it before the runtime starts: later calls change nothing. A process that never
+/// calls it (a runner, a command) doesn't nudge.
+pub fn nudge(mode: crate::nudge::Mode) {
+    NUDGE.store(mode.index(), Ordering::Relaxed);
+}
+
+/// The nudge asked for ([`nudge`]).
+fn nudge_mode() -> crate::nudge::Mode {
+    crate::nudge::Mode::of_index(NUDGE.load(Ordering::Relaxed))
 }
 
 /// The nudge's period: `KILN_RT_NUDGE_US` microseconds where it's set and above 0 (the lab's A/B of
-/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the timers' tick, `timer_tick_ns`. The shard's
-/// timer slack is that tick too (hyper-rt's `Shard::build`), which the kernel adds to every timed wait,
-/// so at the tick a nudged shard's CPU is interrupted at least every two ticks while it waits: a shard
-/// woken behind a busy thread waits no longer than a timer of its own may be late (hyper-rt's
-/// `Driver::set_timer_slack_ns`: a timed wait ends at most a tick late).
-fn nudge_period_ns(timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
+/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the longest that keeps a shard woken behind a busy
+/// thread within a step quantum of its CPU (goal 9, plan 01a1a87b2cec step 4: a wait's timeout derived from
+/// the tick). The quantum is the host's share of a ready task's delay ([`STEP_BUDGET_NS`]: its CPU, where
+/// another thread holds it, for about a quantum), and each of a nudged shard's waits ends within its period
+/// and the timer slack the kernel adds to every timed wait, the timers' tick (hyper-rt's `Shard::build`), so
+/// the period is the quantum less that tick, 166.7 µs at kiln's: an interrupt of the shard's own at least
+/// every 266.7 µs while it waits, 3,750 a second, where the timers' tick as the period gave one every 200 µs,
+/// 5,000 a second, for no bar it holds. Never shorter than that tick, the finest wait a shard keeps (a lab's
+/// quantum under two ticks). The kernel's own tick bounds the same wait too, at a millisecond on every HZ
+/// Linux offers (1000 at most), longer than any quantum the bar allows, so the nudge never leaves it to that.
+fn nudge_period_ns(step_budget_ns: u64, timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
     env_us
         .and_then(|us| us.trim().parse::<u64>().ok())
         .filter(|us| *us > 0)
-        .map_or(timer_tick_ns, |us| us.saturating_mul(1000))
+        .map_or_else(|| step_budget_ns.saturating_sub(timer_tick_ns).max(timer_tick_ns), |us| us.saturating_mul(1000))
 }
 
 /// What a shard asks the OS for as it starts, past the real-time class (goal 3, plan 01a1a59c2a8e
@@ -374,13 +389,16 @@ fn shard_asks(took_realtime: bool, nudge: bool) -> ShardAsks {
 /// How the shards took the nudge ([`nudge`]), for the log and `/healthz/server`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Nudge {
-    /// Whether it was asked for (`[server] nudge`).
+    /// Whether it was asked for (`[server] nudge` on or auto).
     pub asked: bool,
+    /// How (`[server] nudge`): `on`, `auto` or `off`.
+    pub mode: crate::nudge::Mode,
     /// Its period, microseconds.
     pub period_us: u64,
     /// The shards that answered it.
     pub shards: u32,
-    /// Of them, those that nudge their CPUs.
+    /// Of them, those that nudge their CPUs: every wait where it's on; where it's auto, while their host holds
+    /// their wakes.
     pub nudged: u32,
     /// Those that took the real-time class instead, whose wakes preempt at once.
     pub realtime: u32,
@@ -388,6 +406,11 @@ pub struct Nudge {
     pub refused: u32,
     /// Why those refused were.
     pub why: Option<String>,
+    /// The shards nudging now (`crate::nudge`'s, as their probes left it): where it's auto, those whose host holds
+    /// their wakes.
+    pub armed: u32,
+    /// The times shards began nudging on their own, all of them together (auto).
+    pub starts: u64,
 }
 
 impl Nudge {
@@ -397,7 +420,10 @@ impl Nudge {
         if !self.asked || self.shards == 0 || answered < self.shards {
             return None;
         }
-        let nudged = format!("nudge their CPUs while they wait, each wait ending within {} µs plus its timer slack: on a kernel that preempts lazily a shard woken behind a busy thread runs then, not at the kernel's next tick", self.period_us);
+        let nudged = match self.mode {
+            crate::nudge::Mode::Auto => format!("nudge their CPUs while their host holds their wakes (auto: past {:.1} µs a wake on average, as each shard's probe reads the kernel's count of its wait for a CPU), each wait then ending within {} µs plus its timer slack: on a kernel that preempts lazily a shard woken behind a busy thread runs then, not at the kernel's next tick; a calm shard never nudges", crate::nudge::HELD_NS as f64 / 1e3, self.period_us),
+            _ => format!("nudge their CPUs while they wait, each wait ending within {} µs plus its timer slack: on a kernel that preempts lazily a shard woken behind a busy thread runs then, not at the kernel's next tick", self.period_us),
+        };
         Some(match (self.nudged, self.realtime, &self.why) {
             (n, 0, _) if self.refused == 0 => format!("the server's {n} shards {nudged}"),
             (0, r, _) if self.refused == 0 => format!("the server's {r} shards took the real-time class and need no nudge"),
@@ -414,14 +440,18 @@ pub fn nudge_status() -> Nudge {
 
 /// [`Nudge`] from the shards' `answers` ([`NUDGE_ANSWERS`]).
 fn nudge_of(answers: u32) -> Nudge {
+    let mode = nudge_mode();
     Nudge {
-        asked: NUDGE.load(Ordering::Relaxed),
+        asked: mode != crate::nudge::Mode::Off,
+        mode,
         period_us: NUDGE_PERIOD_NS.load(Ordering::Relaxed) / 1000,
         shards: NUDGE_SHARDS.load(Ordering::Relaxed),
         nudged: answers % NUDGE_REALTIME_ONE,
         realtime: (answers / NUDGE_REALTIME_ONE) % NUDGE_REALTIME_ONE,
         refused: answers / NUDGE_REFUSED_ONE,
         why: NUDGE_REFUSAL.get().map(nudge_why),
+        armed: crate::nudge::armed_now(),
+        starts: crate::nudge::starts(),
     }
 }
 
@@ -434,14 +464,19 @@ fn nudge_why(refusal: &hyper_rt::compute::Refusal) -> String {
     }
 }
 
-/// A shard answers the nudge asked for ([`nudge`]): nudged at `period_ns` where it `nudges`, else counted
-/// with those in the real-time class, the one reason a shard asked to nudge doesn't ([`shard_asks`]); or
-/// refused. The last shard to answer says how they all did, once.
-fn answer_nudge(nudges: bool, period_ns: u64) {
+/// A shard answers the nudge asked for ([`nudge`], `mode`): where it `nudges`, nudged at `period_ns` from here on
+/// (`on`) or allowed to nudge at it while its host holds its wakes (`auto`, `crate::nudge::allow`); else counted
+/// with those in the real-time class, the one reason a shard asked to nudge doesn't ([`shard_asks`]); or refused.
+/// The last shard to answer says how they all did, once.
+fn answer_nudge(mode: crate::nudge::Mode, nudges: bool, period_ns: u64) {
     let one = if !nudges {
         NUDGE_REALTIME_ONE
     } else {
-        match hyper_rt::compute::nudge_current_thread(period_ns) {
+        let asked = match mode {
+            crate::nudge::Mode::Auto => crate::nudge::allow(period_ns),
+            _ => hyper_rt::compute::nudge_current_thread(period_ns).inspect(|_| crate::nudge::always()),
+        };
+        match asked {
             Ok(()) => 1,
             Err(refusal) => {
                 let _ = NUDGE_REFUSAL.set(refusal);
@@ -457,6 +492,89 @@ fn answer_nudge(nudges: bool, period_ns: u64) {
             tracing::info!("{line}");
         } else {
             tracing::warn!("{line}");
+        }
+    }
+}
+
+/// What each of the server's shards asks of its spin before a park (goal 9, plan 01a1a87b2cec step 4;
+/// `hyper_rt::park_spin`; docs/priority.md, "A spin before the park"): `KILN_RT_SPIN_US` microseconds,
+/// `fixed_us`, where it's set and above 0, at every idle moment whatever it costs (the lab's measure of what a
+/// spin buys and costs); else, where `KILN_RT_SPIN` is on, `on`, the spin each shard's own gaps make cheapest
+/// in CPU, up to 16 µs (`hyper_rt::park_spin::CAP_NS`), so it spends less of the shard's CPU than parking at
+/// once wherever it spins; else none, as before. Off until asked: the lab's A/B decides whether it becomes a
+/// default (docs/runtime-lab.md, "The shard's own wake path").
+fn spin_ask(on: Option<&str>, fixed_us: Option<&str>) -> hyper_rt::park_spin::Ask {
+    use hyper_rt::park_spin::{Ask, CAP_NS};
+    if let Some(us) = fixed_us.and_then(|us| us.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
+        return Ask::Fixed { ns: us.saturating_mul(1000) };
+    }
+    match on.map(str::trim) {
+        Some(v) if !v.is_empty() && !matches!(v, "0" | "false" | "off" | "no") => Ask::Sized { cap_ns: CAP_NS },
+        _ => Ask::Off,
+    }
+}
+
+/// The spin before a park the shards were asked for ([`spin_ask`]), once the runtime started.
+static SPIN: OnceLock<hyper_rt::park_spin::Ask> = OnceLock::new();
+
+/// How many shards answer the spin: the runtime's, where one was asked for.
+static SPIN_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The shards that took the spin, and those refused it (a task off its shard's thread: never, here), in one atomic
+/// as the nudge's answers are, refusals in units of [`REFUSED_ONE`].
+static SPIN_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// How the shards took the spin before a park ([`spin_ask`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Spin {
+    /// What was asked: `off`, `sized` (as long as each shard's own gaps make cheapest in CPU) or `fixed`.
+    pub asked: &'static str,
+    /// Its length, microseconds: the sized spin's cap, the fixed spin's time; 0 when off.
+    pub us: u64,
+    /// The shards that answered it.
+    pub shards: u32,
+    /// Of them, those that took it.
+    pub took: u32,
+}
+
+impl Spin {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        if self.asked == "off" || self.shards == 0 || self.took < self.shards {
+            return None;
+        }
+        Some(match self.asked {
+            "sized" => format!("the server's {} shards spin before each park as long as their own gaps make cheapest in CPU, up to {} µs: a gap a spin catches needs no wake (KILN_RT_SPIN)", self.took, self.us),
+            _ => format!("the server's {} shards spin {} µs before each park, whatever it costs (KILN_RT_SPIN_US, the lab's measure)", self.took, self.us),
+        })
+    }
+}
+
+/// How the shards took the spin so far ([`spin_ask`]).
+pub fn spin_status() -> Spin {
+    spin_of(SPIN.get().copied().unwrap_or_default(), SPIN_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Spin`] from what was asked and the shards' `answers` ([`SPIN_ANSWERS`]).
+fn spin_of(ask: hyper_rt::park_spin::Ask, answers: u32) -> Spin {
+    use hyper_rt::park_spin::Ask;
+    let (asked, ns) = match ask {
+        Ask::Off => ("off", 0),
+        Ask::Sized { cap_ns } => ("sized", cap_ns),
+        Ask::Fixed { ns } => ("fixed", ns),
+    };
+    Spin { asked, us: ns / 1000, shards: SPIN_SHARDS.load(Ordering::Relaxed), took: answers % REFUSED_ONE }
+}
+
+/// A shard takes the spin asked for ([`spin_ask`]), on its own thread; the last to answer says how they all did, once.
+fn answer_spin(ask: hyper_rt::park_spin::Ask) {
+    let one = if hyper_rt::park_spin::ask_current_thread(ask).is_ok() { 1 } else { REFUSED_ONE };
+    let answers = SPIN_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
+    let status = spin_of(ask, answers);
+    if status.took.saturating_add(answers / REFUSED_ONE) == status.shards {
+        match status.said() {
+            Some(line) => tracing::info!("{line}"),
+            None => tracing::warn!(refused = answers / REFUSED_ONE, "a shard was refused its spin before a park: it parks at once"),
         }
     }
 }
@@ -633,15 +751,25 @@ fn start() -> Result<Rt, String> {
     if realtime {
         REALTIME_SHARDS.store(shards, Ordering::Relaxed);
     }
-    let nudge = NUDGE.load(Ordering::Relaxed);
-    let period_ns = nudge_period_ns(config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
+    let mode = nudge_mode();
+    let nudge = mode != crate::nudge::Mode::Off;
+    let period_ns = nudge_period_ns(config.step_budget_ns, config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
     if nudge {
         NUDGE_PERIOD_NS.store(period_ns, Ordering::Relaxed);
         NUDGE_SHARDS.store(shards, Ordering::Relaxed);
     }
+    // The spin before each park, where the lab asks for one (goal 9, plan 01a1a87b2cec step 4; [`spin_ask`]).
+    let spin = spin_ask(std::env::var("KILN_RT_SPIN").ok().as_deref(), std::env::var("KILN_RT_SPIN_US").ok().as_deref());
+    let _ = SPIN.set(spin);
+    if spin != hyper_rt::park_spin::Ask::Off {
+        SPIN_SHARDS.store(shards, Ordering::Relaxed);
+    }
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            // Its stack takes no huge pages (goal 11, plan 01a1a87b2e56 step 5; `crate::os::stack`): a shard reaches
+            // 0.40 to 0.75 MB deep (the lab's smaps), which where every anonymous mapping takes them would be 2 MB.
+            let _ = crate::os::stack::no_huge_pages();
             let took = realtime && took_realtime();
             let asks = shard_asks(took, nudge);
             if asks.slice
@@ -650,7 +778,10 @@ fn start() -> Result<Rt, String> {
                 tracing::debug!(%refusal, "a shard kept the OS's slice");
             }
             if nudge {
-                answer_nudge(asks.nudge, period_ns);
+                answer_nudge(mode, asks.nudge, period_ns);
+            }
+            if spin != hyper_rt::park_spin::Ask::Off {
+                answer_spin(spin);
             }
         });
     }
@@ -1266,6 +1397,24 @@ impl Turns {
         }
     }
 
+    /// The loop's next item off `rx`: one waiting already goes on in this turn; one it waited for starts its turn
+    /// afresh, as the wait gave its shard to its other work, as the copies' owners take their inboxes
+    /// (`crate::harness::copies`). `None` once `rx` is closed and empty. Goal 10, plan 01a1a87b2dae step 5: the
+    /// hub's loop counted its idle wait as a piece of its turn, so after any quiet spell its first frame spent
+    /// the turn, the loop gave its shard away, and the frames queued behind that one waited on the shard's other
+    /// tasks (runners' frames, `to_loop`: p50 44 µs, p99 6.1 ms in g11alloc2's calm rounds).
+    pub async fn next<T>(&mut self, rx: &crate::memory::queue::Receiver<T>) -> Option<T> {
+        match rx.try_recv() {
+            Ok(item) => Some(item),
+            Err(async_channel::TryRecvError::Closed) => None,
+            Err(async_channel::TryRecvError::Empty) => {
+                let item = rx.recv().await.ok()?;
+                *self = Self::new();
+                Some(item)
+            }
+        }
+    }
+
     /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
     /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
     pub fn over(&self) -> bool {
@@ -1693,13 +1842,76 @@ impl Interval {
 
 // ---------------------------------------------------------------------------------- shutdown
 
+/// The waits on a [`Shutdown`] or a [`Notify`], with no lock (goal 5, plan 01a1a59c2aae, its top goal): each
+/// wait waits in a place on memory::queue's own lock-free list of waiters (`crate::memory::queue::Waiters`, a
+/// Dekker handshake, so no wake is lost), and a wake wakes every place listed then. Their waits were
+/// event-listener's, whose list sits behind a std `Mutex` that every wait, every wait dropped and every wake
+/// took: a terminal's relay listed and dropped two a frame on its shard while the hub's loop rang one on its
+/// own, and each loop selecting on the server's shutdown listed and dropped one a turn (goal 5's census of
+/// train 8's tree on fedora: event-listener the one lock the shards still shared, waiting 0.24 ms a second with
+/// hogs, 1.87 ms at the longest).
+///
+/// A wait's place goes back to `spares` as the wait ends or is dropped, listed still or not, and the next
+/// wait takes it up: a loop that waits each turn beside other arms (a select another arm wins) keeps one place
+/// listed, not one more a turn, and there are never more places than there were waits at once.
+struct Waits {
+    list: crate::memory::queue::Waiters,
+    spares: concurrent_queue::ConcurrentQueue<Arc<crate::memory::queue::Place>>,
+}
+
+impl Default for Waits {
+    fn default() -> Self {
+        Self { list: crate::memory::queue::Waiters::new(), spares: concurrent_queue::ConcurrentQueue::unbounded() }
+    }
+}
+
+impl Waits {
+    /// Waits until `ready` says so (it may take what it finds: a permit): at once if it does now, else in a
+    /// place on the list, looking again once the place is listed and each time it's woken.
+    async fn until(&self, ready: impl Fn() -> bool) {
+        if ready() {
+            return;
+        }
+        let held = Held { place: self.spares.pop().unwrap_or_else(|_| crate::memory::queue::Place::new()), spares: &self.spares };
+        std::future::poll_fn(|cx| {
+            if ready() {
+                return Poll::Ready(());
+            }
+            self.list.wait(&held.place, cx.waker());
+            if ready() { Poll::Ready(()) } else { Poll::Pending }
+        })
+        .await;
+    }
+
+    /// Wakes every wait listed now, each once.
+    fn wake(&self) {
+        self.list.wake();
+    }
+}
+
+/// A wait's place, back among its spares as the wait ends or is dropped ([`Waits`]), the waker it held let go
+/// first: a wake that finds it listed meanwhile wakes no one.
+struct Held<'a> {
+    place: Arc<crate::memory::queue::Place>,
+    spares: &'a concurrent_queue::ConcurrentQueue<Arc<crate::memory::queue::Place>>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.place.let_go();
+        // Unbounded and never closed: the push always goes.
+        let _ = self.spares.push(Arc::clone(&self.place));
+    }
+}
+
 #[derive(Default)]
 struct ShutdownInner {
     cancelled: AtomicBool,
-    event: event_listener::Event,
+    waits: Waits,
 }
 
-/// A cancellation signal any number of tasks can wait on (process shutdown, a job's cancel).
+/// A cancellation signal any number of tasks can wait on (process shutdown, a job's cancel), with no lock
+/// ([`Waits`]): a cancel wakes every wait once.
 #[derive(Clone, Default)]
 pub struct Shutdown(Arc<ShutdownInner>);
 
@@ -1710,7 +1922,7 @@ impl Shutdown {
 
     pub fn cancel(&self) {
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
-            self.0.event.notify(usize::MAX);
+            self.0.waits.wake();
         }
     }
 
@@ -1723,16 +1935,7 @@ impl Shutdown {
     /// `hyper_rt::coop`).
     pub async fn cancelled(&self) {
         hyper_rt::coop::consume_budget().await;
-        loop {
-            if self.is_cancelled() {
-                return;
-            }
-            let listener = self.0.event.listen();
-            if self.is_cancelled() {
-                return;
-            }
-            listener.await;
-        }
+        self.0.waits.until(|| self.is_cancelled()).await;
     }
 
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first.
@@ -1748,11 +1951,12 @@ impl Shutdown {
 
 // ------------------------------------------------------------------------------------- notify
 
-/// Wake one waiter, or leave a permit for the next one (like a binary semaphore).
+/// Wake one waiter, or leave a permit for the next one (like a binary semaphore). With no lock ([`Waits`]): a
+/// notify wakes every wait listed, the first to look takes the permit, and the rest wait on.
 #[derive(Default)]
 pub struct Notify {
     permit: AtomicBool,
-    event: event_listener::Event,
+    waits: Waits,
 }
 
 impl Notify {
@@ -1762,23 +1966,111 @@ impl Notify {
 
     pub fn notify(&self) {
         self.permit.store(true, Ordering::SeqCst);
-        self.event.notify(1);
+        self.waits.wake();
     }
 
     /// A notification, taken; a charge of the task's turn on its shard (`hyper_rt::coop`), so a loop on a
     /// notifier that is always set yields at its share.
     pub async fn notified(&self) {
         hyper_rt::coop::consume_budget().await;
+        self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+    }
+}
+
+// ------------------------------------------------------------------------------------ changed
+
+/// Something changed (a store's commit, a session let in, a task's news): a notify ends every wait begun before
+/// it, and a wait begun after it waits for the next; nothing is kept for a wait to come. So a waiter listens first
+/// ([`Changed::listen`]), looks at what it waits for, then waits: a change made after its look is a notify after
+/// its listen. With no lock ([`Waits`]; goal 5, plan 01a1a59c2aae, its top goal): it was event-listener's `Event`,
+/// whose list of listeners sits behind a std `Mutex` that every listen, every wait given up and every notify finding
+/// a listener took. The records' change feed, the conversation store's writer's room, a sync task's news, a
+/// runner's harness host and cache uploads, and headroom's held sessions waited so (the census of train 8's tree:
+/// event-listener's the one lock the shards still shared, 1.8 ms a second waited with hogs, docs/runtime-lab.md).
+#[derive(Default)]
+pub struct Changed {
+    /// The notifies so far: a wait is over once they're more than when it began.
+    count: AtomicU64,
+    waits: Waits,
+}
+
+impl Changed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends every wait begun before it.
+    pub fn notify(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.waits.wake();
+    }
+
+    /// A wait for the next notify, begun now: a notify between this and its await still ends it. Awaited, or on
+    /// a thread of its own ([`Listen::wait_deadline`]).
+    pub fn listen(&self) -> Listen<'_> {
+        Listen { changed: self, seen: self.count.load(Ordering::SeqCst), held: None }
+    }
+}
+
+/// A wait on a [`Changed`], begun as it was made: a future (a charge of the task's turn on its shard first,
+/// `hyper_rt::coop`, as [`Notify::notified`]'s), or a thread's wait ([`Listen::wait_deadline`]). Its place on the
+/// list is one of the changed's spares, back among them as it's dropped ([`Waits`]).
+#[must_use = "a wait does nothing unless it's awaited"]
+pub struct Listen<'a> {
+    changed: &'a Changed,
+    seen: u64,
+    held: Option<Held<'a>>,
+}
+
+impl<'a> Listen<'a> {
+    /// Whether a notify came since it began.
+    fn over(&self) -> bool {
+        self.changed.count.load(Ordering::SeqCst) != self.seen
+    }
+
+    /// Its place on the list: a spare's, taken up as it first waits.
+    fn place(&mut self) -> Arc<crate::memory::queue::Place> {
+        let changed: &'a Changed = self.changed;
+        let held = self.held.get_or_insert_with(|| Held { place: changed.waits.spares.pop().unwrap_or_else(|_| crate::memory::queue::Place::new()), spares: &changed.waits.spares });
+        Arc::clone(&held.place)
+    }
+
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
+    /// notify came.
+    pub fn wait_deadline(mut self, until: Instant) -> bool {
+        let waker = crate::memory::queue::thread_waker();
         loop {
-            if self.permit.swap(false, Ordering::SeqCst) {
-                return;
+            if self.over() {
+                return true;
             }
-            let listener = self.event.listen();
-            if self.permit.swap(false, Ordering::SeqCst) {
-                return;
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return true;
             }
-            listener.await;
+            let now = Instant::now();
+            if now >= until {
+                return false;
+            }
+            std::thread::park_timeout(until.saturating_duration_since(now));
         }
+    }
+}
+
+impl Future for Listen<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if this.over() {
+            return Poll::Ready(());
+        }
+        let place = this.place();
+        this.changed.waits.list.wait(&place, cx.waker());
+        if this.over() { Poll::Ready(()) } else { Poll::Pending }
     }
 }
 
@@ -2100,6 +2392,37 @@ mod tests {
         assert!(!Turns::new().over());
     }
 
+    /// Goal 10 (plan 01a1a87b2dae step 5): a loop takes an item waiting already in the turn it has, and starts its
+    /// turn afresh with one it waited for, as the copies' owners do: the hub's loop counted its idle wait as a
+    /// piece of its turn, so the first frame after any quiet spell spent it. Closed and empty, there's none.
+    #[test]
+    fn g10_s5_a_loops_wait_for_its_next_item_is_no_piece_of_its_turn() -> anyhow::Result<()> {
+        block_on(async {
+            // Counted as the hub's loop's own queue is (a few bytes, for a moment).
+            let (tx, rx) = crate::memory::queue::bounded::<Vec<u8>>(&crate::memory::owners::NET_EVENTS, 1 << 20);
+            let mut turns = Turns::new();
+            let began = turns.began;
+            // Waiting already: taken in the turn the loop has.
+            anyhow::ensure!(tx.try_send(vec![1]).is_ok(), "sent");
+            anyhow::ensure!(turns.next(&rx).await == Some(vec![1]), "the item waiting");
+            anyhow::ensure!(turns.began == began, "an item waiting already goes on in the turn");
+            // None waiting: the loop waits (polled once, it's pending), and the item it waited for starts its turn.
+            let asked = Instant::now();
+            {
+                let mut next = std::pin::pin!(turns.next(&rx));
+                anyhow::ensure!(futures::poll!(next.as_mut()).is_pending(), "nothing to take yet");
+                anyhow::ensure!(tx.try_send(vec![2]).is_ok(), "sent");
+                anyhow::ensure!(next.await == Some(vec![2]), "the item it waited for");
+            }
+            anyhow::ensure!(turns.began >= asked && turns.began != began, "its turn starts as the item it waited for comes");
+            anyhow::ensure!(!turns.over_at(turns.began + Duration::from_micros(100), STEP_BUDGET_NS), "a 100 µs piece after the wait is within its turn");
+            // Closed and empty: none.
+            drop(tx);
+            anyhow::ensure!(turns.next(&rx).await.is_none(), "closed and empty");
+            Ok(())
+        })
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 6): with cores of its own the server's shards each get one,
     /// the first core kept for its other threads; more shards than cores go around again, and a
     /// single core takes them all.
@@ -2147,17 +2470,59 @@ mod tests {
         assert_eq!(shard_asks(false, false), ShardAsks { slice: true, nudge: false }, "the nudge only where asked for");
     }
 
-    /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge's period is the timers' tick, which with the shard's slack
-    /// (that tick too) bounds a nudged shard's wake as its own timers' lateness is bounded; the lab may set
-    /// another in microseconds, and a value that isn't a positive count leaves the tick.
+    /// Goal 8 (plan 01a1a59c2b29 step 7), goal 9 (plan 01a1a87b2cec step 4): the nudge's period is the step
+    /// quantum less the timers' tick, the slack the kernel adds to each wait, so a nudged shard's CPU takes an
+    /// interrupt of its own within a quantum of the last while it waits: 166.666 µs at kiln's, where the tick as
+    /// the period woke each waiting shard a third again as often. Never under the tick; the lab may set another
+    /// in microseconds, and a value that isn't a positive count leaves the derived one.
     #[test]
-    fn g8_s7_the_nudge_s_period_is_the_timers_tick_unless_the_lab_sets_it() {
-        let tick = runtime_config(4, 64).timer_tick_ns;
-        assert_eq!(nudge_period_ns(tick, None), tick);
-        assert_eq!(nudge_period_ns(tick, Some("50")), 50_000);
-        assert_eq!(nudge_period_ns(tick, Some(" 250 ")), 250_000);
-        assert_eq!(nudge_period_ns(tick, Some("0")), tick, "0 isn't a period");
-        assert_eq!(nudge_period_ns(tick, Some("soon")), tick);
+    fn g9_s4_the_nudge_s_period_is_the_quantum_less_the_timers_slack() {
+        let c = runtime_config(4, 64);
+        let derived = nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, None);
+        assert_eq!(derived, 166_666);
+        assert!(derived + c.timer_tick_ns <= c.step_budget_ns, "each nudge's interrupt within a quantum of the last");
+        assert_eq!(1_000_000_000 / (derived + c.timer_tick_ns), 3_750, "wakes a second of a waiting shard");
+        assert_eq!(1_000_000_000 / (2 * c.timer_tick_ns), 5_000, "with the tick as the period");
+        assert_eq!(nudge_period_ns(150_000, TIMER_TICK_NS, None), TIMER_TICK_NS, "a quantum under two ticks: the tick");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("50")), 50_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some(" 250 ")), 250_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("0")), derived, "0 isn't a period");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("soon")), derived);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): the spin before a park is off unless the lab asks for it: `KILN_RT_SPIN` on
+    /// asks for the spin each shard's own gaps size, up to 16 µs; `KILN_RT_SPIN_US` for a fixed one, which goes first;
+    /// anything else is none, as before.
+    #[test]
+    fn g9_s4_the_spin_before_a_park_is_the_labs_to_ask_for() {
+        use hyper_rt::park_spin::{Ask, CAP_NS};
+        assert_eq!(spin_ask(None, None), Ask::Off);
+        for off in ["", "0", "false", "off", "no", " off "] {
+            assert_eq!(spin_ask(Some(off), None), Ask::Off, "{off:?}");
+        }
+        for on in ["1", "on", "true", "auto", " yes "] {
+            assert_eq!(spin_ask(Some(on), None), Ask::Sized { cap_ns: CAP_NS }, "{on:?}");
+        }
+        assert_eq!(CAP_NS, 16_000);
+        assert_eq!(spin_ask(None, Some("16")), Ask::Fixed { ns: 16_000 });
+        assert_eq!(spin_ask(Some("off"), Some(" 4 ")), Ask::Fixed { ns: 4_000 }, "a fixed spin asked for goes first");
+        assert_eq!(spin_ask(Some("1"), Some("0")), Ask::Sized { cap_ns: CAP_NS }, "0 isn't a spin's length");
+        assert_eq!(spin_ask(None, Some("soon")), Ask::Off);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): how the shards took the spin is said once every shard has answered, never
+    /// when none was asked for; what was asked reads back from its ask, and the answers count in one atomic.
+    #[test]
+    fn g9_s4_the_spin_is_said_as_the_shards_took_it() {
+        use hyper_rt::park_spin::Ask;
+        let status = |asked, us, took| Spin { asked, us, shards: 4, took };
+        assert_eq!(Spin { asked: "off", us: 0, shards: 0, took: 0 }.said(), None, "not asked for: nothing to say");
+        assert_eq!(status("sized", 16, 3).said(), None, "not every shard has answered");
+        assert!(status("sized", 16, 4).said().is_some_and(|s| s.contains("4 shards spin before each park") && s.contains("up to 16 µs")));
+        assert!(status("fixed", 8, 4).said().is_some_and(|s| s.contains("spin 8 µs before each park") && s.contains("KILN_RT_SPIN_US")));
+        let sized = spin_of(Ask::Sized { cap_ns: 16_000 }, 2 + REFUSED_ONE);
+        assert_eq!((sized.asked, sized.us, sized.took), ("sized", 16, 2));
+        assert_eq!((spin_of(Ask::Fixed { ns: 8_000 }, 0).asked, spin_of(Ask::Off, 0).asked), ("fixed", "off"));
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): how the shards took the nudge is said once all of them answered,
@@ -2165,7 +2530,7 @@ mod tests {
     /// and a refusal says why. Three kinds of answer count in one atomic, each read back apart.
     #[test]
     fn g8_s7_the_nudge_is_said_as_the_shards_took_it() {
-        let status = |nudged, realtime, refused, why: Option<&str>| Nudge { asked: true, period_us: 100, shards: 4, nudged, realtime, refused, why: why.map(str::to_owned) };
+        let status = |nudged, realtime, refused, why: Option<&str>| Nudge { asked: true, mode: crate::nudge::Mode::On, period_us: 100, shards: 4, nudged, realtime, refused, why: why.map(str::to_owned), armed: 0, starts: 0 };
         assert_eq!(Nudge { asked: false, ..status(4, 0, 0, None) }.said(), None, "not asked for: nothing to say");
         assert_eq!(Nudge { shards: 0, ..status(0, 0, 0, None) }.said(), None, "before the runtime started");
         assert_eq!(status(3, 0, 0, None).said(), None, "not every shard has answered");
@@ -2177,6 +2542,20 @@ mod tests {
         assert_eq!(nudge_why(&elsewhere), "no lazy preemption to nudge on macOS");
         let answers = 2 + 3 * NUDGE_REALTIME_ONE + 64 * NUDGE_REFUSED_ONE;
         assert_eq!((answers % NUDGE_REALTIME_ONE, (answers / NUDGE_REALTIME_ONE) % NUDGE_REALTIME_ONE, answers / NUDGE_REFUSED_ONE), (2, 3, 64));
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7) and goal 6 (plan 01a1a59c2abe step 3): `auto`, the mode a config declares, is said as
+    /// nudging only while a shard's host holds its wakes, with the threshold it judges by; `/healthz/server` carries the
+    /// mode as its word and the shards nudging now; a process that never set it (a runner, a command) doesn't nudge.
+    #[test]
+    fn g6_s3_auto_is_said_as_nudging_only_while_held() -> anyhow::Result<()> {
+        let auto = Nudge { asked: true, mode: crate::nudge::Mode::Auto, period_us: 100, shards: 4, nudged: 4, realtime: 0, refused: 0, why: None, armed: 1, starts: 3 };
+        let said = auto.said().unwrap_or_default();
+        anyhow::ensure!(said.starts_with("the server's 4 shards nudge their CPUs while their host holds their wakes") && said.contains("17.2 µs") && said.contains("a calm shard never nudges"), "{said}");
+        let json = serde_json::to_value(&auto)?;
+        anyhow::ensure!(json.get("mode").and_then(serde_json::Value::as_str) == Some("auto") && json.get("armed") == Some(&serde_json::json!(1)), "{json}");
+        anyhow::ensure!(nudge_mode() == crate::nudge::Mode::Off, "off until the server's config says");
+        Ok(())
     }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
@@ -2509,6 +2888,276 @@ mod tests {
             drop(tx);
             assert!(done.await.is_err());
             assert!(file_source(dir.path().join("missing")).is_err());
+            Ok(())
+        })
+    }
+
+    /// The code of [`Shutdown`] and [`Notify`] and of their waits, outside comments: from rt.rs's shutdown
+    /// section's head to its broadcast section's.
+    fn shutdown_and_notify_code() -> String {
+        let src = include_str!("rt.rs").replace("\r\n", "\n");
+        let section = src.split("--- shutdown\n").nth(1).and_then(|rest| rest.split("--- broadcast\n").next()).unwrap_or_default();
+        section.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: a notifier, a shutdown and a
+    /// changed take no lock and wait on nothing that does. Their waits were event-listener's, whose list sits behind
+    /// a `Mutex` every wait and every wake took: goal 5's census of train 8's tree found it the one lock the shards
+    /// still shared.
+    #[test]
+    fn g5_notify_and_shutdown_take_no_lock() {
+        let code = shutdown_and_notify_code();
+        assert!(code.contains("pub struct Notify") && code.contains("pub struct Shutdown") && code.contains("pub struct Changed"), "not Notify's, Shutdown's and Changed's code:\n{code}");
+        for lock in ["Mutex", "RwLock", "Condvar", "parking_lot", "async_lock", "event_listener", "Event::new", "async_channel"] {
+            assert!(!code.contains(lock), "rt::Notify, rt::Shutdown or rt::Changed takes a lock, or waits on something that does: {lock}");
+        }
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a notify before its wait isn't lost, and two before a wait are
+    /// one permit, which that wait takes; the next wait waits for the next notify.
+    #[test]
+    fn g5_a_notify_before_its_wait_is_kept_and_taken_once() -> anyhow::Result<()> {
+        block_on(async {
+            let n = Notify::new();
+            n.notify();
+            n.notify();
+            timeout(Duration::from_secs(1), n.notified()).await?;
+            anyhow::ensure!(!n.permit.load(Ordering::SeqCst), "two notifies before a wait were more than one permit");
+            let mut next = std::pin::pin!(n.notified());
+            anyhow::ensure!(futures::poll!(next.as_mut()).is_pending(), "a wait after the permit was taken ended at once");
+            n.notify();
+            timeout(Duration::from_secs(1), next).await?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): notifies from another shard lose no wake. Two tasks hand a turn
+    /// back and forth through two notifiers, each wait listing its place while the other side's notify may be on
+    /// its way (the list's Dekker handshake has one of them see the other), and every turn is taken. Each side
+    /// waits on one notifier one wait at a time, so each keeps one place, reused.
+    #[test]
+    fn g5_notifies_from_another_shard_lose_no_wake() -> anyhow::Result<()> {
+        block_on(async {
+            let (ping, pong) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            let rounds = 5_000u32;
+            let (p, q) = (Arc::clone(&ping), Arc::clone(&pong));
+            let other = spawn_spread_joined(async move {
+                for _ in 0..rounds {
+                    p.notified().await;
+                    q.notify();
+                }
+            });
+            for round in 0..rounds {
+                ping.notify();
+                timeout(Duration::from_secs(5), pong.notified()).await.map_err(|_| anyhow::anyhow!("round {round}: a wake was lost"))?;
+            }
+            timeout(Duration::from_secs(5), other).await?.map_err(|_| anyhow::anyhow!("the other side ended"))?;
+            for (what, n) in [("ping", &ping), ("pong", &pong)] {
+                anyhow::ensure!(n.waits.list.listed() <= 1 && n.waits.spares.len() <= 1, "{what}: {} places listed, {} spare", n.waits.list.listed(), n.waits.spares.len());
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a loop that waits on a notifier and a shutdown each turn beside an
+    /// arm that wins (a terminal's relay, each loop on the server's shutdown) keeps one place on each, not one more
+    /// a turn; and its next waits on them are woken, from another shard, by the notify and the cancel after.
+    #[test]
+    fn g5_waits_given_up_each_turn_keep_one_place() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        block_on(async {
+            let (n, sd) = (Arc::new(Notify::new()), Shutdown::new());
+            for _ in 0..10_000 {
+                let ev = futures::select_biased! {
+                    () = sd.cancelled().fuse() => "cancelled",
+                    () = n.notified().fuse() => "notified",
+                    () = futures::future::ready(()).fuse() => "turn",
+                };
+                anyhow::ensure!(ev == "turn", "{ev}, with neither rung");
+            }
+            for (what, waits) in [("the notifier", &n.waits), ("the shutdown", &sd.0.waits)] {
+                anyhow::ensure!(waits.list.listed() <= 1 && waits.spares.len() <= 1, "{what}: {} places listed, {} spare after 10,000 turns", waits.list.listed(), waits.spares.len());
+            }
+            let (n2, sd2) = (Arc::clone(&n), sd.clone());
+            let ringing = spawn_spread_joined(async move {
+                sleep(Duration::from_millis(20)).await;
+                n2.notify();
+                sleep(Duration::from_millis(20)).await;
+                sd2.cancel();
+            });
+            timeout(Duration::from_secs(5), n.notified()).await?;
+            timeout(Duration::from_secs(5), sd.cancelled()).await?;
+            timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a cancel wakes every wait once, on every shard. Tasks wait at
+    /// once, half of them after giving up a wait first (as a loop's turn does, its place taken up again); none
+    /// ends before the cancel, each ends once after it, a second cancel changes nothing, and a wait after it ends
+    /// at once.
+    #[test]
+    fn g5_a_cancel_wakes_every_wait_once() -> anyhow::Result<()> {
+        block_on(async {
+            let sd = Shutdown::new();
+            let (waiters, ended) = (64usize, Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for i in 0..waiters {
+                let (sd, ended) = (sd.clone(), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    if i % 2 == 0 {
+                        let _ = timeout(Duration::from_millis(1), sd.cancelled()).await;
+                    }
+                    sd.cancelled().await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before the cancel");
+            sd.cancel();
+            sd.cancel();
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its wake"))?;
+            }
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == waiters, "{} of {waiters} waits ended", ended.load(Ordering::SeqCst));
+            // Every wait over, every place is a spare (some listed still, for a wake that wakes no one), and there
+            // were never more of them than waits at once.
+            let (listed, spares) = (sd.0.waits.list.listed(), sd.0.waits.spares.len());
+            anyhow::ensure!(listed <= spares && spares <= waiters, "{listed} places listed, {spares} spare, for {waiters} waits");
+            timeout(Duration::from_millis(100), sd.cancelled()).await?;
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a notify wakes every wait listed, and one of them takes its
+    /// permit. Of tasks waiting on one notifier on every shard, each notify ends one wait, never two, until all
+    /// have ended.
+    #[test]
+    fn g5_each_notify_ends_one_wait_of_many() -> anyhow::Result<()> {
+        block_on(async {
+            let n = Arc::new(Notify::new());
+            let (waiters, ended) = (16usize, Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for _ in 0..waiters {
+                let (n, ended) = (Arc::clone(&n), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    n.notified().await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before any notify");
+            for k in 1..=waiters {
+                n.notify();
+                let until = Instant::now() + Duration::from_secs(5);
+                while ended.load(Ordering::SeqCst) < k {
+                    anyhow::ensure!(Instant::now() < until, "notify {k} ended no wait");
+                    sleep(Duration::from_millis(1)).await;
+                }
+                sleep(Duration::from_millis(5)).await;
+                anyhow::ensure!(ended.load(Ordering::SeqCst) == k, "notify {k} ended {} waits in all", ended.load(Ordering::SeqCst));
+            }
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its notify"))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a changed's notify ends every wait begun before it, on every shard,
+    /// one begun before it and awaited after it among them; it keeps nothing for a wait begun after it. Every wait
+    /// over, its places are spares, never more than the waits at once.
+    #[test]
+    fn g5_a_changed_ends_every_wait_begun_before_it_and_keeps_nothing() -> anyhow::Result<()> {
+        block_on(async {
+            let c = Arc::new(Changed::new());
+            let early = c.listen();
+            c.notify();
+            timeout(Duration::from_secs(1), early).await?;
+            let mut after = std::pin::pin!(c.listen());
+            anyhow::ensure!(futures::poll!(after.as_mut()).is_pending(), "a wait begun after a notify ended without one");
+            let (waiters, listening, ended) = (32usize, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for _ in 0..waiters {
+                let (c, listening, ended) = (Arc::clone(&c), Arc::clone(&listening), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    let l = c.listen();
+                    listening.fetch_add(1, Ordering::SeqCst);
+                    l.await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while listening.load(Ordering::SeqCst) < waiters {
+                anyhow::ensure!(Instant::now() < until, "{} of {waiters} listening after 5 s", listening.load(Ordering::SeqCst));
+                sleep(Duration::from_millis(1)).await;
+            }
+            sleep(Duration::from_millis(20)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before the notify");
+            c.notify();
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its wake"))?;
+            }
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == waiters, "{} of {waiters} waits ended", ended.load(Ordering::SeqCst));
+            timeout(Duration::from_secs(1), after).await?;
+            let (listed, spares) = (c.waits.list.listed(), c.waits.spares.len());
+            anyhow::ensure!(listed <= spares && spares <= waiters + 1, "{listed} places listed, {spares} spare, for {} waits at most", waiters + 1);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a thread's wait on a changed (the conversation store's senders'
+    /// room) ends at its deadline with no notify, at once for a notify after its listen, and at a notify from a shard.
+    #[test]
+    fn g5_a_threads_wait_on_a_changed_ends_at_a_notify_or_its_deadline() -> anyhow::Result<()> {
+        let c = Arc::new(Changed::new());
+        let began = Instant::now();
+        anyhow::ensure!(!c.listen().wait_deadline(began + Duration::from_millis(30)), "a wait ended with no notify");
+        anyhow::ensure!(began.elapsed() >= Duration::from_millis(30), "a wait ended before its deadline with no notify");
+        let begun = c.listen();
+        c.notify();
+        anyhow::ensure!(begun.wait_deadline(Instant::now() + Duration::from_secs(5)), "a notify after the listen was lost");
+        let c2 = Arc::clone(&c);
+        let ringer = std::thread::spawn(move || {
+            block_on(async move {
+                let until = Instant::now() + Duration::from_secs(5);
+                while c2.waits.list.listed() == 0 {
+                    anyhow::ensure!(Instant::now() < until, "the thread's wait never listed its place");
+                    sleep(Duration::from_millis(1)).await;
+                }
+                c2.notify();
+                Ok(())
+            })
+        });
+        anyhow::ensure!(c.listen().wait_deadline(Instant::now() + Duration::from_secs(10)), "a notify from a shard didn't end a thread's wait");
+        ringer.join().map_err(|_| anyhow::anyhow!("the ringer panicked"))??;
+        Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a loop that listens each turn beside an arm that wins (the records'
+    /// waits beside their callers' timeouts) keeps one place, not one more a turn; its next wait is woken from
+    /// another shard.
+    #[test]
+    fn g5_waits_on_a_changed_given_up_each_turn_keep_one_place() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        block_on(async {
+            let c = Arc::new(Changed::new());
+            for _ in 0..10_000 {
+                let ev = futures::select_biased! {
+                    () = c.listen().fuse() => "changed",
+                    () = futures::future::ready(()).fuse() => "turn",
+                };
+                anyhow::ensure!(ev == "turn", "{ev}, with no notify");
+            }
+            anyhow::ensure!(c.waits.list.listed() <= 1 && c.waits.spares.len() <= 1, "{} places listed, {} spare after 10,000 turns", c.waits.list.listed(), c.waits.spares.len());
+            let next = c.listen();
+            let c2 = Arc::clone(&c);
+            let ringing = spawn_spread_joined(async move {
+                sleep(Duration::from_millis(20)).await;
+                c2.notify();
+            });
+            timeout(Duration::from_secs(5), next).await?;
+            timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
             Ok(())
         })
     }

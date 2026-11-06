@@ -25,14 +25,34 @@
 # memory back), or `musl`, musl's own malloc. The default is jemalloc, the lab's pick: on the static musl
 # build, resident memory 523 to 333 MB, and no latency number worse beyond noise. KILN_LINUX_ALLOCATOR=musl
 # leaves it out of one build.
+# A lab's build may take `jemalloc-prof`: jemalloc with its heap profile built in (kiln's `jemalloc-prof`
+# feature, off until a run's _RJEM_MALLOC_CONF says prof:true; goal 11, plan 01a1a87b2e56 step 5), never a
+# release's.
+#
+# The Linux x86-64 binary's code layout (goal 11, plan 01a1a87b2e56 step 5; ci/release/bolt.sh): off unless
+# KILN_RELEASE_BOLT says, which builds x86_64-unknown-linux-musl keeping its relocations and symbols (strip off,
+# linked by ci/release/zig-relocs.sh: --emit-relocs and a build id) in a target dir of its own (<target dir>/bolt,
+# so the release's own build stays built), and then:
+# - `relocs`: dist/kiln-x86_64-unknown-linux-musl is that build stripped, the release as it would be: what a lab
+#   profiles (its build id matches the unstripped one's, BOLT's input, which stays at
+#   <target dir>/bolt/x86_64-unknown-linux-musl/release/kiln) and the A/B's side without BOLT;
+# - a profile's path (perf2bolt's or an instrumented window's .fdata, of that very build; or a .yaml, which BOLT
+#   matches to a nearby build's code): dist/kiln-x86_64-unknown-linux-musl is the build laid out by it
+#   (bolt.sh optimize) and stripped.
+# - an order's path (a .order file, `bolt.sh order`'s: the functions a profile saw run, hottest first): the build
+#   linked with those functions first, in that order (LLD's --symbol-ordering-file, through zig-relocs.sh), and
+#   stripped. The layout without BOLT: whole functions, none split.
+# cargo relinks only what it knows changed, and an order is no input it knows of, so a binary in that target dir
+# linked in another order than the one asked (none, for `relocs` and a profile) is removed first, and relinked.
+# Other targets build as ever.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
 
 linux_allocator=${KILN_LINUX_ALLOCATOR:-jemalloc}
 case $linux_allocator in
-  musl | jemalloc) ;;
-  *) echo "KILN_LINUX_ALLOCATOR is musl or jemalloc, not $linux_allocator" >&2; exit 1 ;;
+  musl | jemalloc | jemalloc-prof) ;;
+  *) echo "KILN_LINUX_ALLOCATOR is musl, jemalloc or jemalloc-prof (a lab's), not $linux_allocator" >&2; exit 1 ;;
 esac
 
 all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc)
@@ -41,6 +61,19 @@ targets=("$@")
 for t in "${targets[@]}"; do
   case $t in x86_64-apple-darwin) echo "kiln doesn't ship for Intel Macs: only aarch64-apple-darwin" >&2; exit 1 ;; esac
 done
+
+bolt=${KILN_RELEASE_BOLT:-}
+if [ -n "$bolt" ]; then
+  if [ "$bolt" != relocs ]; then
+    # A path as the caller gave it, from where they were before the cd above.
+    case $bolt in /*) ;; *) bolt=$OLDPWD/$bolt ;; esac
+    [ -s "$bolt" ] || { echo "KILN_RELEASE_BOLT is relocs, a profile's path or an order's: $bolt is no profile" >&2; exit 1; }
+  fi
+  case " ${targets[*]} " in
+    *" x86_64-unknown-linux-musl "*) ;;
+    *) echo "KILN_RELEASE_BOLT lays out x86_64-unknown-linux-musl, which this build doesn't make" >&2; exit 1 ;;
+  esac
+fi
 
 native_mac=false
 if [ "$(uname -s)" = Darwin ]; then
@@ -136,8 +169,8 @@ for t in "${targets[@]}"; do
     *-unknown-linux-musl)
       rustup target add "$t" >/dev/null
       alloc=()
-      if [ "$linux_allocator" = jemalloc ]; then
-        alloc=(--features jemalloc)
+      if [ "$linux_allocator" != musl ]; then
+        alloc=(--features "$linux_allocator")
         # jemalloc's page must be at least the system's, or it refuses to start ("Unsupported system page
         # size"), and built here its configure can't ask the machine it will run on, so it takes 4 KiB.
         # x86-64's pages are 4 KiB; arm64 Linux runs 4, 16 or 64 KiB pages (16 on Apple silicon and the
@@ -145,8 +178,35 @@ for t in "${targets[@]}"; do
         # all three. tikv-jemalloc-sys reads it per target.
         export AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE=16
       fi
-      "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
-      cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
+      if [ -n "$bolt" ] && [ "$t" = x86_64-unknown-linux-musl ]; then
+        # BOLT's input (above): its relocations and symbols kept, linked through zig-relocs.sh, in an order's
+        # order if one is asked (above), else the linker's own. Which it was linked in is marked beside it: none, or
+        # the order's digest.
+        built=$target_dir/bolt/$t/release
+        input=$built/kiln
+        order='' mark=none
+        case $bolt in *.order) order=$bolt mark=$(sha256sum < "$bolt" | cut -c1-64) ;; esac
+        if [ "$(cat "$built/kiln.linked-order" 2> /dev/null)" != "$mark" ]; then
+          # Linked in another order, or in one not marked: the executable goes (cargo's deps/kiln-<hash>, which
+          # cargo then builds again, and its copy), and the rest of the build stays.
+          find "$built/deps" -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete 2> /dev/null || true
+          rm -f "$input"
+        fi
+        rm -f "$built/kiln.linked-order"
+        KILN_LINK_ORDER=$order KILN_ZIG_REAL="$zig_home/zigbin/zig" CARGO_ZIGBUILD_ZIG_COMMAND="$root/ci/release/zig-relocs.sh" \
+          CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR="$target_dir/bolt" \
+          "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
+        # Relinked through zig-relocs.sh (its relocations say so), so in the order asked: marked as such.
+        ci/release/bolt.sh check "$input"
+        echo "$mark" > "$built/kiln.linked-order"
+        case $bolt in
+          relocs | *.order) "${KILN_STRIP:-strip}" --strip-all -o "$dist/kiln-$t" "$input" ;;
+          *) ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t" ;;
+        esac
+      else
+        "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
+        cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
+      fi
       ;;
     *-apple-darwin)
       rustup target add "$t" >/dev/null

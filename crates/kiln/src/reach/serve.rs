@@ -370,9 +370,10 @@ fn end_now(pgid: u32, group: Option<crate::os::contain::Group>) {
 
 /// Start `spec`; its events go to `events` in order, ending with Exit. `extra_env` comes last
 /// (who asked, the shell's state folder). Returns at once; a failure to start is an Exit with
-/// an error.
-pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_env: Vec<(String, String)>, events: async_channel::Sender<Event>) -> async_channel::Sender<Vec<u8>> {
-    let (stdin_tx, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
+/// an error. Its stdin, and its events, on lock-free queues (`crate::memory::queue`; goal 5, plan
+/// 01a1a59c2aae): its stdin unbounded, as the channel it was.
+pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_env: Vec<(String, String)>, events: crate::memory::queue::Sender<Event>) -> crate::memory::queue::Sender<Vec<u8>> {
+    let (stdin_tx, stdin_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     crate::rt::spawn(async move {
         let env = login_env().await;
         if let Some(dir) = &shell_state
@@ -550,7 +551,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn run(spec: RunSpec, cwd: &Path, shell: Option<PathBuf>) -> anyhow::Result<(Vec<u8>, Vec<u8>, Option<i32>, Option<String>)> {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let stdin = start(spec, cwd.to_path_buf(), shell, vec![("KILN_REACH_FROM".into(), "mac".into())], tx);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let _keep = stdin;
@@ -695,12 +696,56 @@ mod tests {
         })
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a run's events go out on a lock-free queue
+    /// of 16 places, as the node gives it. Not taken while its command writes far more, it holds 16 and no
+    /// more (the run waits for room, and its command for its pipe); then taken, its output comes once, in
+    /// order, its exit after it, and then its end.
+    #[cfg(unix)]
+    #[test]
+    fn g5_a_runs_events_hold_their_bound_keep_their_order_and_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            // Past 16 of its reads and its harness pipe's 256 behind them.
+            let lines = 3_000_000u32;
+            let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 16);
+            let _stdin = start(RunSpec { id: 1, command: format!("seq 1 {lines}"), ..RunSpec::default() }, dir.path().to_path_buf(), None, vec![], tx);
+            let full = crate::rt::timeout(Duration::from_secs(60), async {
+                while rx.len() < 16 {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(full.is_ok(), "its events never filled: {} held", rx.len());
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            anyhow::ensure!(rx.len() == 16, "{} events held, past the 16 it holds", rx.len());
+            let (mut out, mut code) = (Vec::new(), None);
+            loop {
+                match crate::rt::timeout(Duration::from_secs(30), rx.recv()).await.map_err(|_| anyhow::anyhow!("its events never ended"))? {
+                    Ok(Event::Output { stream: Stream::Out, data }) => {
+                        anyhow::ensure!(code.is_none(), "output after its exit");
+                        out.extend(data);
+                    }
+                    Ok(Event::Exit { code: c, .. }) => {
+                        anyhow::ensure!(code.is_none(), "two exits");
+                        code = Some(c);
+                    }
+                    Ok(Event::Started { .. } | Event::Output { .. }) => {}
+                    Err(_) => break,
+                }
+            }
+            let want: String = (1..=lines).map(|n| format!("{n}\n")).collect();
+            anyhow::ensure!(out == want.as_bytes(), "{} bytes of {}, in order: {}", out.len(), want.len(), out.starts_with(want.as_bytes()));
+            anyhow::ensure!(code == Some(Some(0)), "{code:?}");
+            Ok(())
+        })
+    }
+
     #[cfg(unix)]
     #[test]
     fn stdin_reaches_the_command_and_a_missing_folder_fails_cleanly() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             let stdin = start(RunSpec { id: 1, command: "tr a-z A-Z".into(), stdin: true, ..RunSpec::default() }, dir.path().to_path_buf(), None, vec![], tx);
             stdin.send(b"hello reach".to_vec()).await?;
             stdin.send(Vec::new()).await?;

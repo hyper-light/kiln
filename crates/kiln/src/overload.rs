@@ -194,12 +194,11 @@ impl Connection {
         conn
     }
 
-    /// A request begins: classed, its class put on it (an extension the API reads), and the connection's task
-    /// set to the most urgent class it now serves. The guard ends it, and says whether the request lowered the
-    /// task's class ([`Serving::demoted`]).
-    pub fn begin(self: &Arc<Self>, req: &mut Request) -> Serving {
+    /// A request begins: classed (its connection puts the class on it with where it came from,
+    /// `crate::http::server::Arrival`, which the API reads), and the connection's task set to the most urgent class it
+    /// now serves. The guard ends it, and says whether the request lowered the task's class ([`Serving::demoted`]).
+    pub fn begin(self: &Arc<Self>, req: &Request) -> Serving {
         let class = class_of(req.method(), req.uri().path(), req.headers());
-        req.extensions_mut().insert(class);
         if let Some(n) = self.serving.get(class as usize) {
             n.fetch_add(1, Ordering::Relaxed);
         }
@@ -244,8 +243,8 @@ impl Serving {
 
 /// A response's body that keeps its request's [`Serving`] until it ends: a body streamed after the handler
 /// returned (a download, a log) goes on at its request's class, not at the class of a connection between
-/// requests.
-struct Guarded {
+/// requests. The body a connection sends (`crate::http::server`), as it is: no box of its own around the answer's.
+pub struct Guarded {
     body: srv::Body,
     _serving: Serving,
 }
@@ -267,9 +266,10 @@ impl http_body::Body for Guarded {
     }
 }
 
-/// `resp`, its body keeping `serving` until it ends ([`Guarded`]).
-pub fn while_sent(resp: Response, serving: Serving) -> Response {
-    resp.map(|body| http_body_util::BodyExt::boxed(Guarded { body, _serving: serving }))
+/// `resp`, its body keeping `serving` until it ends ([`Guarded`]). Its connection sends a [`Guarded`] as it is: each
+/// answer's body was boxed again in one (goal 9, plan 01a1a87b2cec step 5: an allocation a request).
+pub fn while_sent(resp: Response, serving: Serving) -> http::Response<Guarded> {
+    resp.map(|body| Guarded { body, _serving: serving })
 }
 
 impl Drop for Serving {
@@ -634,8 +634,11 @@ thread_local! {
 /// The route waits goal 1 counts (`crate::route_latency`) are no signal here: they run from a request's head read
 /// off its socket, which its connection's task reads at Critical (`Connection`) and serves at once, so they do not
 /// carry the waits a class makes.
-pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>) {
-    let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else {
+///
+/// `counters`: the shard's counts as the probe's wake read them, the copy it noted (goal 9, plan 01a1a87b2cec step 5:
+/// the tick read a copy of its own); none off a shard.
+pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>, counters: Option<&hyper_rt::shard_loop::Counters>) {
+    let (Some(state), Some(&now)) = (shards().get(index), counters) else {
         return;
     };
     let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
@@ -869,10 +872,10 @@ fn answer(class: Class, delay_ns: u64, calm_ns: u64, pool: Option<usize>) -> Res
     srv::with_header(resp, header::HeaderName::from_static("x-kiln-shed"), class.as_str())
 }
 
-/// The answer for `req` when its shard sheds its class now (its class as [`Connection::begin`] put it, else read
-/// from it).
+/// The answer for `req` when its shard sheds its class now (its class as its connection put it on it, else read from
+/// it).
 pub fn shed_request(req: &Request) -> Option<Response> {
-    let class = req.extensions().get::<Class>().copied().unwrap_or_else(|| class_of(req.method(), req.uri().path(), req.headers()));
+    let class = req.extensions().get::<srv::Arrival>().map_or_else(|| class_of(req.method(), req.uri().path(), req.headers()), |a| a.class);
     shed(class)
 }
 
@@ -1080,29 +1083,29 @@ mod tests {
         let token = [("authorization", "Bearer kiln_pat_x")];
         let (api, page, catch_up) = (request(Method::GET, "/api/runs", &token)?, request(Method::GET, "/agents/a1", &[])?, request(Method::GET, "/api/harness/sessions/s1/events", &token)?);
         let seen = one_shard()?.block_on(async move {
-            let (mut api, mut page, mut catch_up) = (api, page, catch_up);
             let class = hyper_rt::coop::class;
             let conn = Connection::new();
             let mut seen = vec![class()];
-            let call = conn.begin(&mut api);
+            let call = conn.begin(&api);
             seen.extend([class(), Some(call.class())]);
             let demoted = vec![call.demoted()];
             drop(call);
             seen.push(class());
-            let shown = conn.begin(&mut page);
-            let beside = conn.begin(&mut catch_up);
+            let shown = conn.begin(&page);
+            let beside = conn.begin(&catch_up);
             seen.extend([class(), Some(beside.class())]);
             let demoted = [demoted, vec![shown.demoted(), beside.demoted()]].concat();
             drop(shown);
             seen.push(class());
             drop(beside);
             seen.push(class());
-            (seen, demoted, api.extensions().get::<Class>().copied())
+            (seen, demoted)
         });
-        let (seen, demoted, put) = seen.map_err(|e| anyhow::anyhow!("the shard: {e}"))?;
+        // The class a request carries for the API's shedding is its connection's to put on it, with where it came
+        // from (`crate::http::server::Arrival`; goal 9, plan 01a1a87b2cec step 5).
+        let (seen, demoted) = seen.map_err(|e| anyhow::anyhow!("the shard: {e}"))?;
         assert_eq!(seen, [Some(C), Some(N), Some(N), Some(C), Some(C), Some(B), Some(B), Some(C)], "the task's class through the requests");
         assert_eq!(demoted, [true, false, false], "the API call demoted the task; the page and the catch-up beside it didn't");
-        assert_eq!(put, Some(N), "the request carries its class");
         Ok(())
     }
 

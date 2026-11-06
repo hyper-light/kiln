@@ -32,7 +32,7 @@ struct Lab {
     /// under it), in order.
     ended: Arc<Mutex<Vec<String>>>,
     /// What linux is handed to take over.
-    adoptions: async_channel::Receiver<node::Adoption>,
+    adoptions: crate::memory::queue::Receiver<node::Adoption>,
     ctl: async_channel::Sender<Ctl>,
     _dirs: Vec<tempfile::TempDir>,
     mirrors: std::path::PathBuf,
@@ -74,9 +74,9 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
     let [mac_version, linux_version] = versions;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
-    let (adopt_tx, adoptions) = async_channel::unbounded();
+    let (adopt_tx, adoptions) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let using = Arc::new(super::keeper::Using::default());
-    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config {
+    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<crate::memory::queue::Sender<node::Adoption>>| Config {
         name: name.into(),
         dir: d.path().join("reach"),
         accept: true,
@@ -183,8 +183,8 @@ async fn run_from_mac(lab: &Lab, req: RunReq, mid: impl Fn(&Ev) -> Option<Ctl>) 
 
 /// Run `req` from runner `me` (mac or linux) through the local driver; every event until the end.
 async fn run_from(lab: &Lab, me: &'static str, req: RunReq, mid: impl Fn(&Ev) -> Option<Ctl>) -> anyhow::Result<Vec<Ev>> {
-    let (ev_tx, ev_rx) = async_channel::unbounded();
-    let (_ctl_tx, ctl_rx) = async_channel::unbounded();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+    let (_ctl_tx, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let handle = if me == "mac" { lab.mac.clone() } else { lab.linux.clone() };
     crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
     let mut evs = Vec::new();
@@ -614,8 +614,8 @@ fn a_hand_over_whose_answer_is_lost_may_have_been_taken_over() -> anyhow::Result
 
 /// Run `req` from mac as `kiln run --reuse` does, against `svc`; every event until the end.
 async fn reuse_from_mac(lab: &Lab, svc: &Arc<crate::runner::work::service::Service>, req: RunReq) -> anyhow::Result<Vec<Ev>> {
-    let (ev_tx, ev_rx) = async_channel::unbounded();
-    let (_ctl_tx, ctl_rx) = async_channel::unbounded();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+    let (_ctl_tx, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let (mac, svc) = (lab.mac.clone(), Arc::clone(svc));
     crate::rt::spawn(async move { super::reuse::run_with(Some(&svc), &mac, "mac", req, ev_tx, ctl_rx).await });
     let mut evs = Vec::new();
@@ -951,8 +951,8 @@ fn a_links_ends_are_known_open_and_lately_closed() {
 /// Start `req` from `me` through the local driver and, once it started, go as a client does
 /// (`kiln run --detach` killed, its terminal closed): its controls and its events dropped.
 async fn start_then_leave(lab: &Lab, me: &'static str, req: RunReq) -> anyhow::Result<()> {
-    let (ev_tx, ev_rx) = async_channel::unbounded();
-    let (ctl_tx, ctl_rx) = async_channel::unbounded::<local::Req>();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+    let (ctl_tx, ctl_rx) = crate::memory::queue::unbounded::<local::Req>(&crate::memory::owners::CHANNELS);
     let handle = if me == "mac" { lab.mac.clone() } else { lab.linux.clone() };
     crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
     loop {
@@ -1094,7 +1094,7 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         // handshake. A fixed sleep can end before this test starts measuring the unread output.
         let keep = dir.path().join("keep");
         std::fs::write(&keep, b"")?;
-        let (kept, kept_said) = async_channel::unbounded();
+        let (kept, kept_said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         lab.mac.run("linux", RunSpec { command: format!("while [ -e '{}' ]; do sleep 0.1; done", keep.display()), ..RunSpec::default() }, kept).await?;
         // On a link with custody (W27-R08) the run's custody record comes before it starts.
         let started = async {
@@ -1106,7 +1106,7 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         };
         crate::rt::timeout(Duration::from_secs(60), started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not start"))??;
         // Asked as a runner from before asks a detached run, then let go of.
-        let (says, _said) = async_channel::unbounded();
+        let (says, _said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;
         lab.mac.leave("linux", Some(id), None).await;
         // leave enqueues the request. This status request follows it on the same queue: no

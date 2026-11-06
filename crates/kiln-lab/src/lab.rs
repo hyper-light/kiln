@@ -338,39 +338,87 @@ pub struct LockSeen {
     pub max_wait_s: f64,
     /// The first addresses of the locks taken there, in hex: sites that take one lock share its.
     pub addrs: String,
+    /// The copies of the site's location the build counted it under, summed in each figure above (goal 5, plan
+    /// 01a1a59c2aae step 1; `lock_sums`). 0 from a kiln-lab from before it summed them, whose figures for a site
+    /// of two or more took one copy's count at the start and another's at the end (`scripts/locks.py rank`
+    /// refuses those runs).
+    #[serde(default)]
+    pub copies: usize,
 }
 
-/// The lock census of a build that counts its locks, between the fill's scrapes and the window's.
-fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
-    let mut out: BTreeMap<String, LockSeen> = BTreeMap::new();
+/// One scrape's `kiln_lock_*` figures for a site and kind, over every series with its labels.
+#[derive(Default)]
+struct LockSums {
+    taken: f64,
+    contended: f64,
+    wait_s: f64,
+    max_wait_s: f64,
+    addrs: Vec<String>,
+    copies: usize,
+}
+
+/// Each site's and kind's figures in one scrape, summed over its copies (goal 5, plan 01a1a59c2aae step 1). The
+/// census keys its counters by the address of the site's `Location` (scripts/locks/census.rs), and the compiler
+/// makes one of those for each instance of a generic caller and each codegen unit an inlined caller lands in, so
+/// one site can have several counters, each its own series under the same labels: census-B's build has 53 such
+/// sites of 280, event-listener's 2 or 3 copies each. Taking a site's start from its first series and its end
+/// from its last paired two counters, which put event-listener's window below zero.
+fn lock_sums(s: &Scrape) -> BTreeMap<(String, String), LockSums> {
     let label = |l: &[(String, String)], k: &str| l.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    for (name, labels, value) in &window.1.series {
-        let (site, kind) = (label(labels, "site"), label(labels, "kind"));
-        if !name.starts_with("kiln_lock_") || site.is_empty() {
+    let mut out: BTreeMap<(String, String), LockSums> = BTreeMap::new();
+    for (name, labels, value) in &s.series {
+        let Some(figure) = name.strip_prefix("kiln_lock_") else { continue };
+        let site = label(labels, "site");
+        if site.is_empty() {
             continue;
         }
-        let want = [("site", site.as_str()), ("kind", kind.as_str())];
-        let since = |s: &Scrape| s.get(name, &want).unwrap_or(0.0);
-        let e = out.entry(format!("{site} {kind}")).or_insert_with(|| LockSeen { kind: kind.clone(), ..LockSeen::default() });
-        match name.as_str() {
-            "kiln_lock_taken_total" => {
-                e.taken = value - since(window.0);
-                e.fill_taken = since(fill.1) - since(fill.0);
+        let e = out.entry((site, label(labels, "kind"))).or_default();
+        match figure {
+            "taken_total" => {
+                e.taken += value;
+                e.copies += 1;
             }
-            "kiln_lock_contended_total" => {
-                e.contended = value - since(window.0);
-                e.fill_contended = since(fill.1) - since(fill.0);
+            "contended_total" => e.contended += value,
+            "wait_seconds_total" => e.wait_s += value,
+            "wait_max_seconds" => e.max_wait_s = e.max_wait_s.max(*value),
+            "addresses" => {
+                for a in label(labels, "addrs").split_whitespace() {
+                    if !e.addrs.iter().any(|x| x == a) {
+                        e.addrs.push(a.to_owned());
+                    }
+                }
             }
-            "kiln_lock_wait_seconds_total" => {
-                e.wait_s = value - since(window.0);
-                e.fill_wait_s = since(fill.1) - since(fill.0);
-            }
-            "kiln_lock_wait_max_seconds" => e.max_wait_s = *value,
-            "kiln_lock_addresses" => e.addrs = label(labels, "addrs"),
             _ => {}
         }
     }
     out
+}
+
+/// The lock census of a build that counts its locks, between the fill's scrapes and the window's: each site's
+/// growth over each, its copies summed in every scrape first (`lock_sums`). A copy first taken between two
+/// scrapes is in the second alone, and its counters began at zero, so no figure can come out below zero.
+fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
+    let (fill_start, fill_end, start) = (lock_sums(fill.0), lock_sums(fill.1), lock_sums(window.0));
+    let none = LockSums::default();
+    lock_sums(window.1)
+        .into_iter()
+        .map(|(key, end)| {
+            let (f0, f1, s) = (fill_start.get(&key).unwrap_or(&none), fill_end.get(&key).unwrap_or(&none), start.get(&key).unwrap_or(&none));
+            let seen = LockSeen {
+                kind: key.1.clone(),
+                taken: end.taken - s.taken,
+                contended: end.contended - s.contended,
+                wait_s: end.wait_s - s.wait_s,
+                fill_taken: f1.taken - f0.taken,
+                fill_contended: f1.contended - f0.contended,
+                fill_wait_s: f1.wait_s - f0.wait_s,
+                max_wait_s: end.max_wait_s,
+                addrs: end.addrs.join(" "),
+                copies: end.copies,
+            };
+            (format!("{} {}", key.0, key.1), seen)
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------------------------- the load
@@ -417,7 +465,7 @@ fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u1
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None }
 }
 
 /// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
@@ -480,7 +528,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "" });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -497,7 +545,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "" });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None });
         if !opened {
             continue;
         }
@@ -510,7 +558,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                     let now = now_us();
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "" });
+                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None });
                             watch.frames.push((stamp, now.saturating_sub(stamp)));
                         }
                     }
@@ -558,7 +606,9 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
 fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
     let mut out = Vec::new();
     let mut r = Lcg(0xa11ce ^ ((i as u64) << 16));
-    let mut http = Http::new(s.port, &s.admin);
+    // Each read asks the server for its own time with it, so the slowest are split (goal 10, plan 01a1a87b2dae
+    // step 5: `measure::split`).
+    let mut http = Http::new(s.port, &s.admin).timed();
     while !s.stop.load(Ordering::Relaxed) {
         let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
         // Each read is told apart by its route, so a run says which of them its tail is.
@@ -573,13 +623,15 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             18 => ("plans", format!("/api/plans?session={id}")),
             _ => ("goals", format!("/api/harness/sessions/{id}/goals")),
         };
-        let mut retry_after = None;
-        out.push(timed(Class::ApiRead, what, || {
+        let (mut retry_after, mut server) = (None, None);
+        let sample = timed(Class::ApiRead, what, || {
             http.send("GET", &path, None).map(|a| {
                 retry_after = a.retry_after;
+                server = a.server;
                 a.status
             })
-        }));
+        });
+        out.push(Sample { server, ..sample });
         if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.read_think_ms)), retry_after)) {
             break;
         }
@@ -938,6 +990,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
     let seen = measure::seen(&in_window);
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
+    splits(&mut numbers, &in_window);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
     let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
@@ -974,6 +1027,30 @@ pub fn frames_against_attaches(watches: &[Watch], window: (u64, u64)) -> BTreeMa
     }
     by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
 }
+
+/// The slowest API reads of the window split ([`measure::split`]): those at or past the class's p99 and those at
+/// or past its p99.9, each as `split.api_read.<q>.{wait,took,rest}_ms` (the server's wait before its handler, its
+/// handler's time, the rest: the hops either way, the transfer, the client's reading; each the mean over them, so
+/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5.
+fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
+    for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
+        if let Some(s) = measure::split(window, Class::ApiRead, at) {
+            let name = Class::ApiRead.name();
+            n.insert(format!("split.{name}.{q}.wait_ms"), s.wait_ms);
+            n.insert(format!("split.{name}.{q}.took_ms"), s.took_ms);
+            n.insert(format!("split.{name}.{q}.rest_ms"), s.rest_ms);
+            #[allow(clippy::cast_precision_loss)]
+            n.insert(format!("split.{name}.{q}.n"), s.n as f64);
+        }
+    }
+}
+
+/// The legs of a runner's message at the server that a round reports (`kiln_runner_wait_leg_seconds`), each by
+/// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
+/// each event it took; and step 5's `runner` and `server`, of each agent session's update whose runner said how
+/// long it held it: that hold, on the runner's clock, and the server's time from its frame's arrival to its owner
+/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's.
+const RUNNER_LEGS: [&str; 6] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1039,8 +1116,10 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     // A runner's message's wait by its legs, to the microsecond, where the build has them
     // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
     // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
-    // copy, and that owner taking it.
-    for leg in ["to_loop", "in_loop", "to_owner"] {
+    // copy, and that owner taking it; and how long the loop held each event it took, its waits included (step 5:
+    // set against `to_loop`, it tells the loop held by its events from the loop waiting for its shard); and of the
+    // updates whose runner said how long it held them, that hold and the server's time with them (step 5).
+    for leg in RUNNER_LEGS {
         let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
         for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
             if let Some(v) = measure::histogram_quantile(at, &d) {
@@ -1114,6 +1193,23 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
         }
+        // Their nudge (kiln's goal 8 step 7 and goal 6 step 3, `crate::nudge`), where the build says it: the share of the
+        // window each shard's waits were nudged, and, all shards together, how long their host held each wake another
+        // thread or their I/O made them, as each shard judges it (`held_wake_us`).
+        let mut nudged = None::<f64>;
+        let mut held = HeldWakes::default();
+        for sh in &shards {
+            let want = [("shard", sh.as_str())];
+            let share = diff("kiln_shard_nudged_seconds_total", &want).map(per_s);
+            put(format!("shard{sh}.nudged_share"), share);
+            if let Some(share) = share {
+                nudged = Some(nudged.unwrap_or(0.0) + share / count);
+            }
+            let wakes = |by: &str| diff("kiln_shard_wakeups_total", &[("shard", sh.as_str()), ("by", by)]);
+            held.add(diff("kiln_shard_run_wait_seconds_total", &want), wakes("kick"), wakes("io"), wakes("timer"));
+        }
+        put("shards.nudged_share".into(), nudged);
+        put("shards.held_wake_us".into(), held.per_wake_us());
         // How long their parks lasted, all shards together (goal 9, plan 01a1a87b2cec step 5), where the build says it:
         // the median and p99, and the share of parks under 16 µs, the first of hyper-rt's bounds (`PARK_BOUNDS_NS`) past
         // the cheapest wake measured on fedora (a socket's on the waiting thread's own CPU, 12.6 µs at its median:
@@ -1172,13 +1268,43 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     shards.len()
 }
 
+/// What a wake by a shard's own timer makes it wait for its CPU on a calm machine, at the most, seconds: kiln's
+/// `crate::nudge::TIMER_WAKE_NS` (the wake-2 lab, no hog: 0.4 to 0.7 µs a run).
+const TIMER_WAKE_S: f64 = 0.7e-6;
+
+/// The shards' waits for a CPU over a window and the wakes they took, summed (kiln's goal 8 step 7, `crate::nudge`):
+/// how long their host held each wake another thread or their I/O made them, as each shard judges its own periods,
+/// over the whole window: their run wait past [`TIMER_WAKE_S`] for each wake of their own timers, over their wakes by
+/// a kick or I/O.
+#[derive(Debug, Default)]
+struct HeldWakes {
+    waited_s: f64,
+    others: f64,
+    seen: bool,
+}
+
+impl HeldWakes {
+    /// One shard's growth over the window: its run wait (seconds), and its wakes by a kick, by I/O and by its timers.
+    fn add(&mut self, waited_s: Option<f64>, kick: Option<f64>, io: Option<f64>, timer: Option<f64>) {
+        let (Some(waited_s), Some(kick), Some(io), Some(timer)) = (waited_s, kick, io, timer) else { return };
+        self.seen = true;
+        self.waited_s += (waited_s - timer * TIMER_WAKE_S).max(0.0);
+        self.others += kick + io;
+    }
+
+    /// Microseconds a wake, where any shard said its wait and any took a wake by another thread or I/O.
+    fn per_wake_us(&self) -> Option<f64> {
+        (self.seen && self.others > 0.0).then(|| self.waited_s / self.others * 1e6)
+    }
+}
+
 /// What each of the window's `requests` cost the shards in loop steps, polls, parks, wakes and system calls (goal
 /// 9, plan 01a1a87b2cec step 5, beside `server.cpu_ms_per_request`): each family's growth over the window summed
 /// over the shards, over the requests, as `shards.<what>_per_request`, where the build has the family; and, where
 /// it has every one, the calls' sum (`shards.syscalls_per_request`). A park that waits is a system call and a
 /// sleep, and a kick a system call on its sender; a park withdrawn costs neither.
 fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
-    const FAMILIES: [(&str, &str, &[(&str, &str)]); 20] = [
+    const FAMILIES: [(&str, &str, &[(&str, &str)]); 23] = [
         ("steps", "kiln_shard_steps_total", &[]),
         ("polls", "kiln_shard_polls_total", &[]),
         ("parks", "kiln_shard_parks_total", &[]),
@@ -1199,6 +1325,11 @@ fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
         ("socket_writes", "kiln_shard_socket_calls_total", &[("call", "write")]),
         ("socket_reads_empty", "kiln_shard_socket_calls_idle_total", &[("call", "read")]),
         ("socket_writes_full", "kiln_shard_socket_calls_idle_total", &[("call", "write")]),
+        // The spin before a park, where the server was asked for one (goal 9, plan 01a1a87b2cec step 4): its spins,
+        // those that found work (a park, its wake and a kick saved each), and the seconds they spun, the CPU it cost.
+        ("spins", "kiln_shard_spins_total", &[]),
+        ("spin_hits", "kiln_shard_spin_hits_total", &[]),
+        ("spin_seconds", "kiln_shard_spin_seconds_total", &[]),
     ];
     // Each of these a system call on a shard: their sum is what a request costs the shards in calls into the
     // kernel, as counted (docs/runtime-lab.md says what isn't).
@@ -1288,6 +1419,36 @@ pub fn better(name: &str) -> crate::stats::Better {
 mod tests {
     use super::*;
 
+    /// Goal 8, plan 01a1a59c2b29 step 7 (and goal 6 step 3): each shard's nudged share of the window, their mean, and how
+    /// long their host held each wake another thread or I/O made them over the window, its own timers' calm wait set
+    /// aside; none where the build says none of it.
+    #[test]
+    fn g8_s7_the_shards_nudge_and_held_wakes_are_reported() {
+        // Shard 0 nudged 30 s of the 60 s window, its run wait 15 ms over 100 kicks, 50 I/O wakes and 6,000 timer
+        // wakes; shard 1 never nudged and waited 0.3 ms over 150 wakes by others and 100 by its timers.
+        let scrape = |at: f64| {
+            let mut t = String::new();
+            for (sh, nudged, waited, kick, io, timer) in [(0, 30.0, 0.015, 100.0, 50.0, 6000.0), (1, 0.0, 0.0003, 100.0, 50.0, 100.0)] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", at * 1000.0));
+                t.push_str(&format!("kiln_shard_nudged_seconds_total{{shard=\"{sh}\"}} {}\n", at * nudged));
+                t.push_str(&format!("kiln_shard_run_wait_seconds_total{{shard=\"{sh}\"}} {}\n", at * waited));
+                for (by, n) in [("kick", kick), ("io", io), ("timer", timer)] {
+                    t.push_str(&format!("kiln_shard_wakeups_total{{shard=\"{sh}\",by=\"{by}\"}} {}\n", at * n));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0.0), &scrape(1.0), 60.0);
+        let near = |name: &str, want: f64| n.get(name).is_some_and(|v| (v - want).abs() < 1e-9);
+        assert!(near("shard0.nudged_share", 0.5) && near("shard1.nudged_share", 0.0) && near("shards.nudged_share", 0.25), "{n:?}");
+        // (15 ms − 6,000 × 0.7 µs) + (0.3 ms − 100 × 0.7 µs) over 300 wakes by others: 36.8 µs a wake.
+        assert!(near("shards.held_wake_us", (0.015 - 6000.0 * 0.7e-6 + 0.0003 - 100.0 * 0.7e-6) / 300.0 * 1e6), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
+        assert!(!none.contains_key("shards.nudged_share") && !none.contains_key("shards.held_wake_us"), "{none:?}");
+    }
+
     /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
     #[test]
     fn g6_s4_flood_is_overload_with_many_more_clients() {
@@ -1301,7 +1462,8 @@ mod tests {
     /// the server's histogram of it between the window's two scrapes.
     #[test]
     fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
-        let legs = ["to_loop", "in_loop", "to_owner"];
+        let legs = RUNNER_LEGS;
+        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs");
         let scrape = |n: f64| {
             let mut t = String::new();
             for leg in legs {
@@ -1321,6 +1483,51 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports the runner's hold of its updates beside the server's time
+    /// with them, each its own, to the microsecond (`server.runner.runner_*`, `server.runner.server_*`): here the
+    /// runner's tail at 73.5 ms where the server's is under a millisecond, as g9p7's fifth round's frames would have
+    /// shown if the runner held them. A build, or runners, without the stamp report the legs before them alone.
+    #[test]
+    fn g10_s5_a_round_reports_the_runners_hold_beside_the_servers_time() {
+        let scrape = |n: f64, stamped: bool| {
+            let mut t = String::new();
+            for leg in RUNNER_LEGS.iter().filter(|l| stamped || !matches!(**l, "runner" | "server")) {
+                // The runner's: half at or under 0.1 ms, the rest up to 75 ms. The rest: half at or under 0.5 ms, all at or under 1 ms.
+                let buckets = if *leg == "runner" { [("0.0001", n / 2.0), ("0.075", n), ("+Inf", n)] } else { [("0.0005", n / 2.0), ("0.001", n), ("+Inf", n)] };
+                for (le, c) in buckets {
+                    t.push_str(&format!("kiln_runner_wait_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0, true), &scrape(1000.0, true), 60.0);
+        let at = |k: &str| n.get(k).copied();
+        let near = |k: &str, want: f64| at(k).is_some_and(|v| (v - want).abs() < 1.0);
+        assert!(near("server.runner.runner_p50_us", 100.0) && near("server.runner.runner_p99_us", 73_502.0), "the runner's: {:?} {:?}", at("server.runner.runner_p50_us"), at("server.runner.runner_p99_us"));
+        assert!(near("server.runner.server_p50_us", 500.0) && near("server.runner.server_p99_us", 990.0), "the server's: {:?} {:?}", at("server.runner.server_p50_us"), at("server.runner.server_p99_us"));
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0, false), &scrape(1000.0, false), 60.0);
+        assert!(n.contains_key("server.runner.to_owner_p99_us"), "the legs before them");
+        assert!(!n.keys().any(|k| k.starts_with("server.runner.runner_") || k.starts_with("server.runner.server_")), "no stamp, neither: {:?}", n.keys().collect::<Vec<_>>());
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports its slowest API reads split, at p99 and at p99.9, by name;
+    /// a window whose reads the server didn't time reports none.
+    #[test]
+    fn g10_s5_a_round_reports_its_slowest_reads_split() {
+        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server };
+        let told = |wait_us, took_us| Some(crate::client::ServerTime { wait_us: Some(wait_us), took_us });
+        // 1,000 reads, the slowest two (the 999th and 1,000th by nearest rank) 4 ms, the server's share 1.5 ms of each.
+        let window: Vec<Sample> = (0..998).map(|_| read(200, told(10, 10))).chain([read(4_000, told(1_000, 500)), read(4_000, told(1_000, 500))]).collect();
+        let mut n = BTreeMap::new();
+        splits(&mut n, &window);
+        let get = |k: &str| n.get(k).copied();
+        assert_eq!((get("split.api_read.p999.wait_ms"), get("split.api_read.p999.took_ms"), get("split.api_read.p999.rest_ms"), get("split.api_read.p999.n")), (Some(1.0), Some(0.5), Some(2.5), Some(2.0)));
+        assert!(get("split.api_read.p99.n").is_some_and(|c| c >= 1.0), "{n:?}");
+        let mut none = BTreeMap::new();
+        splits(&mut none, &[read(200, None)]);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: only a frame that brings events (or an event's streamed text) is a
@@ -1398,6 +1605,33 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_wakes(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what a spin before each park did is reported per request where the build counts
+    /// it, its spins, its hits and the seconds it spun, summed over the shards; a build without it reports none (and the
+    /// spin isn't among the system calls: no call is made to spin).
+    #[test]
+    fn g9_s4_the_shards_spins_before_their_parks_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for sh in ["0", "1"] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", 30.0 * k));
+                t.push_str(&format!("kiln_shard_spins_total{{shard=\"{sh}\"}} {}\n", 8.0 * k));
+                t.push_str(&format!("kiln_shard_spin_hits_total{{shard=\"{sh}\"}} {}\n", 3.0 * k));
+                t.push_str(&format!("kiln_shard_spin_seconds_total{{shard=\"{sh}\"}} {}\n", 0.0001 * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_wakes(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("spins", 1.6), ("spin_hits", 0.6), ("spin_seconds", 0.00002)] {
+            let got = n.get(&format!("shards.{key}_per_request")).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-12), "{key}: {got:?}, want {want}");
+        }
+        let mut without = BTreeMap::new();
+        let polls = |k: f64| measure::Scrape::parse(&format!("kiln_shard_polls_total{{shard=\"0\"}} {}\n", 30.0 * k));
+        per_request_wakes(&mut without, &polls(1.0), &polls(2.0), 10);
+        assert!(!without.contains_key("shards.spins_per_request"), "{without:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: where the build counts every kind of system call a shard makes, a request's
@@ -1547,5 +1781,37 @@ mod tests {
         let f = br#"{"t":"events","events":[{"text":"@lab:1730000000123456 the retry"},{"text":"no stamp"},{"output":"@lab:42 x @lab:"}]}"#;
         assert_eq!(stamps(f).collect::<Vec<_>>(), vec![1_730_000_000_123_456, 42]);
         assert_eq!(stamps(b"nothing").count(), 0);
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 1 (census-B's event-listener rates below zero): a site the build counts under
+    /// several copies of its location has a series of each under the same labels, in the census table's order.
+    /// Each scrape's copies are summed before the growth is taken, so a big copy at the window's start isn't
+    /// paired against a small one at its end, and a copy first taken in the window, ahead of the others in the
+    /// table, adds what it took.
+    #[test]
+    fn g5_s1_a_sites_copies_are_summed_before_its_growth() {
+        let site = "event-listener@5.4.2:src/intrusive.rs:220:14";
+        // Each copy as the census renders it: taken, held when asked, seconds waited, longest wait, addresses.
+        let scrape = |copies: &[(u64, u64, f64, f64, &str)]| {
+            let mut t = String::from("# TYPE kiln_lock_taken_total counter\n");
+            for (taken, contended, wait, max, addrs) in copies {
+                let labels = format!("site=\"{site}\",kind=\"std_mutex\"");
+                t.push_str(&format!("kiln_lock_taken_total{{{labels}}} {taken}\nkiln_lock_contended_total{{{labels}}} {contended}\n"));
+                t.push_str(&format!("kiln_lock_wait_seconds_total{{{labels}}} {wait}\nkiln_lock_wait_max_seconds{{{labels}}} {max}\n"));
+                t.push_str(&format!("kiln_lock_addresses{{{labels},addrs=\"{addrs}\"}} 1\n"));
+            }
+            t.push_str("kiln_lock_sites_full_total 0\n");
+            measure::Scrape::parse(&t)
+        };
+        let (big, small) = ((20_000, 1_000, 0.5, 0.25, "7f01 7f02"), (1_000, 50, 0.125, 0.0625, "7f03"));
+        let fill = (scrape(&[]), scrape(&[(18_000, 900, 0.25, 0.25, "7f01 7f02"), (900, 40, 0.125, 0.0625, "7f03")]));
+        let start = scrape(&[big, small]);
+        // In the window the big copy took 6,000 and the small one 500, and a third, first taken in it, 300.
+        let end = scrape(&[(300, 2, 0.0625, 0.03125, "7f04 7f01"), (26_000, 1_400, 0.75, 0.25, "7f01 7f02"), (1_500, 60, 0.125, 0.0625, "7f03")]);
+        let locks = lock_census((&fill.0, &fill.1), (&start, &end));
+        let seen = locks.get(&format!("{site} std_mutex"));
+        let got = seen.map(|s| (s.taken, s.contended, s.wait_s, s.fill_taken, s.fill_contended, s.fill_wait_s, s.max_wait_s, s.addrs.as_str(), s.copies));
+        assert_eq!(got, Some((6_800.0, 412.0, 0.3125, 18_900.0, 940.0, 0.375, 0.25, "7f04 7f01 7f02 7f03", 3)), "{locks:?}");
+        assert_eq!(locks.len(), 1, "one entry a site and kind, whatever its copies: {locks:?}");
     }
 }

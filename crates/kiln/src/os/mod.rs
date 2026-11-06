@@ -31,6 +31,9 @@ mod win32;
 /// 01a1a87b2e56 step 4).
 pub mod alloc;
 pub mod battery;
+/// The unit tests' allocator, counting what each thread allocates (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub mod counted;
 pub mod cgroup;
 /// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
 pub mod macsign;
@@ -93,6 +96,15 @@ pub mod pages;
 #[cfg(not(target_os = "linux"))]
 #[path = "pages_none.rs"]
 pub mod pages;
+
+/// The calling thread's own stack in resident memory: a runtime thread's kept off huge pages, a cold pool worker's
+/// unused pages given back ([`alloc`]'s hooks; Linux, elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
+#[cfg(target_os = "linux")]
+#[path = "stack_linux.rs"]
+pub mod stack;
+#[cfg(not(target_os = "linux"))]
+#[path = "stack_none.rs"]
+pub mod stack;
 
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.

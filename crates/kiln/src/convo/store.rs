@@ -20,13 +20,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use event_listener::Listener as _;
 use serde::{Deserialize, Serialize};
 
 use super::rows::{self, EventRow, Row};
 use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkeeping};
 use crate::harness::core::Update;
-use crate::harness::session::Sink;
+use crate::harness::session::{Sink, Taken};
 
 /// How long a row waits for others to share its commit.
 pub const COMMIT_MS: u64 = 50;
@@ -307,8 +306,12 @@ pub struct Queue {
     /// Bytes committed, and the microseconds their commits took: the writer's measured rate.
     written: AtomicU64,
     took_us: AtomicU64,
-    /// Told each time the writer commits.
-    room: event_listener::Event,
+    /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
+    /// was an event-listener `Event`, its list behind a `Mutex`).
+    room: crate::rt::Changed,
+    /// The most any sender may let wait past [`Queue::bound`] before it waits itself ([`Store::room_within`]),
+    /// for what `/metrics` says the queue may hold.
+    within: AtomicUsize,
 }
 
 impl Queue {
@@ -331,13 +334,30 @@ impl Queue {
 
     /// Whether more may be sent: the queue is empty, or under its bound.
     fn has_room(&self) -> bool {
+        self.has_room_within(0)
+    }
+
+    /// Whether more may be sent by one that may let `most` wait: the queue is empty, or under its bound or `most`.
+    fn has_room_within(&self, most: usize) -> bool {
         let b = self.bytes();
-        b == 0 || b <= self.bound()
+        b == 0 || b <= self.bound().max(most)
     }
 
     fn took(&self, bytes: usize) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         crate::memory::CONVO_QUEUE.add(bytes);
+    }
+
+    /// `bytes` counted as waiting for the writer, for a test of what waits on the queue.
+    #[cfg(test)]
+    pub(crate) fn pretend_waiting(&self, bytes: usize) {
+        self.took(bytes);
+    }
+
+    /// `bytes` the writer let go of, for a test of what waits on the queue.
+    #[cfg(test)]
+    pub(crate) fn pretend_written(&self, bytes: usize) {
+        self.let_go(bytes, None);
     }
 
     /// `bytes` committed in `took` (or let go of, the writer gone): their room is the senders' again.
@@ -351,8 +371,8 @@ impl Queue {
             now = seen;
         }
         crate::memory::CONVO_QUEUE.sub(bytes);
-        crate::memory::CONVO_QUEUE.bound_at(self.bound());
-        self.room.notify(usize::MAX);
+        crate::memory::CONVO_QUEUE.bound_at(self.bound().max(self.within.load(Ordering::Relaxed)));
+        self.room.notify();
     }
 }
 
@@ -468,9 +488,21 @@ impl Store {
     /// after, so a burst waits for the writer rather than growing without bound or being dropped. A
     /// task's wait (the thread goes on with others).
     pub async fn room(&self) {
-        while !self.queue.has_room() {
+        self.room_within(0).await;
+    }
+
+    /// [`Store::room`] for a sender whose updates' rows may wait as long as `most` bytes of them: what would wait
+    /// for room in its own queues otherwise. Goal 10, plan 01a1a87b2dae step 5: a sessions' owner waited for room
+    /// (the bound, what the writer commits in [`COMMIT_MS`]) between its turns, so a disk that stalled the writer
+    /// stalled every frame and attach of every session it owned (g9p7: an update's wait for its owner 839 ms at
+    /// p99.9 in one round). Its rows now wait here instead, as long as the updates would have waited for it in its
+    /// inbox, and what hands it updates waits past that: none of them dropped, each session's in order (they come
+    /// from its one owner), and as much held as before.
+    pub async fn room_within(&self, most: usize) {
+        self.queue.within.fetch_max(most, Ordering::Relaxed);
+        while !self.queue.has_room_within(most) {
             let listener = self.queue.room.listen();
-            if self.queue.has_room() {
+            if self.queue.has_room_within(most) {
                 return;
             }
             listener.await;
@@ -817,16 +849,21 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
 }
 
 /// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
-/// same room (a full `sink` holds the sessions back, as it always did).
+/// same room (a full `sink` holds the sessions back, as it always did): `room` updates, whatever each
+/// carries, on a lock-free queue (goal 5, plan 01a1a59c2aae: an async-channel's wait took
+/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own). Each goes on
+/// with when it was sent in, its wait here the runner's (goal 10, plan 01a1a87b2dae step 5: `Taken`).
 pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
     let sink: Sink = sink.into();
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
-            store.send(&id, &u);
-            // A store over its bound holds what passes back, rather than its rows piling up (goal 11).
-            store.room().await;
-            if sink.send((id, u)).await.is_err() {
+        while let Ok(t) = rx.recv().await {
+            store.send(&t.session, &t.update);
+            // A store over its bound holds what passes back, rather than its rows piling up (goal 11), once they're as
+            // many as this runner's streams keep unanswered for the server (goal 10, plan 01a1a87b2dae step 5: the
+            // disk's stall held the updates, and the frames they make, before the server ever had them).
+            store.room_within(crate::wire::uplink::TOTAL_ROOM).await;
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
@@ -850,7 +887,7 @@ enum Keeping {
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
     /// The tee's way in, held weakly: the tee still ends once its senders have.
-    input: async_channel::WeakSender<(String, Update)>,
+    input: crate::memory::queue::WeakSender<Taken>,
 }
 
 impl Held {
@@ -884,28 +921,31 @@ impl Held {
 /// the store wait for it in memory; never given, they go.
 pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
     let sink: Sink = sink.into();
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s, each with when it was sent in.
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
     let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
+        while let Ok(t) = rx.recv().await {
             // Kept before it goes on, under the lock a taker waits on; then, the lock let go, a store over
             // its bound holds what passes back (goal 11, plan 01a1a87b2e56 step 3).
             let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
                 Keeping::Waiting(rows) => {
-                    rows.extend(rows::of(&id, &u, crate::util::now_ms()));
+                    rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
                     None
                 }
                 Keeping::Store(st) => {
-                    st.send(&id, &u);
+                    st.send(&t.session, &t.update);
                     Some(st.clone())
                 }
                 Keeping::Gone => None,
             };
+            // As [`tee`]'s: held back once its rows are as many as this runner's streams keep unanswered.
             if let Some(st) = kept_in {
-                st.room().await;
+                st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
             }
-            if sink.send((id, u)).await.is_err() {
+            // With when it was sent in, not now: its wait here was the runner's (goal 10, plan 01a1a87b2dae step 5).
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
@@ -1008,6 +1048,25 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a sender that may let `most` bytes of rows wait (a sessions' owners', as many
+    /// as their inboxes hold) goes on while the queue holds no more than that, past the writer's own bound, and past it
+    /// waits until the writer lets them go; `/metrics` is told the queue may hold that much.
+    #[test]
+    fn g10_s5_a_sender_waits_only_past_what_it_may_let_wait() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        let q = store.queue();
+        // Nothing committed yet, so the writer's own bound lets nothing wait.
+        q.pretend_waiting(1_000);
+        anyhow::ensure!(!q.has_room() && q.has_room_within(1_000) && !q.has_room_within(999));
+        anyhow::ensure!(futures::FutureExt::now_or_never(store.room_within(1_000)).is_some(), "within what it may let wait: at once");
+        let mut past = Box::pin(store.room_within(999));
+        anyhow::ensure!(futures::FutureExt::now_or_never(past.as_mut()).is_none(), "past it: it waits");
+        q.pretend_written(1_000);
+        anyhow::ensure!(futures::FutureExt::now_or_never(past.as_mut()).is_some(), "the writer let them go: it goes on");
+        anyhow::ensure!(q.within.load(Ordering::Relaxed) == 1_000, "the most any sender may let wait");
+        Ok(())
+    }
+
     #[test]
     fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -1024,6 +1083,92 @@ mod tests {
             st.sync()?;
             let texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
             assert_eq!(texts, vec!["before the store".to_owned(), "after it".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a tee's way in is a lock-free queue of
+    /// `room` updates. Sessions on every shard sending at once, past its room while what's after it takes
+    /// slowly, each have every update passed on once, in the order sent; its way in never holds more than its
+    /// room; and once its senders are gone and it's drained, what's after it sees the end.
+    #[test]
+    fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, 4);
+            let room = 16;
+            let (sink, held) = tee_held(out, None, room);
+            // Looked at weakly: a sender held here would keep the tee from ever ending.
+            let way_in = match &sink {
+                Sink::Stamped(q) => q.downgrade(),
+                Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
+            };
+            let (senders, per) = (8usize, 200u64);
+            let mut sending = Vec::new();
+            for t in 0..senders {
+                let sink = sink.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        if sink.send((format!("s{t}"), said(&format!("m{n}"), n, "x"))).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }));
+            }
+            drop(sink);
+            let (mut got, mut most) = (vec![Vec::<u64>::new(); senders], 0usize);
+            loop {
+                most = most.max(way_in.upgrade().map_or(0, |q| q.len()));
+                let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the tee never ended"))?;
+                let Ok((id, u)) = next else { break };
+                let t: usize = id.trim_start_matches('s').parse()?;
+                let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
+                got.get_mut(t).ok_or_else(|| anyhow::anyhow!("no session {t}"))?.extend(events.iter().map(|e| e.seq));
+                // Slower than its senders now and then, so they wait for room.
+                if got.iter().map(Vec::len).sum::<usize>() % 100 == 0 {
+                    crate::rt::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            for s in sending {
+                anyhow::ensure!(s.await.unwrap_or(false), "a session's update was refused");
+            }
+            for (t, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "session {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
+            anyhow::ensure!(held.drained(), "drained, its senders gone");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's tee passes each update on with when its session sent it in, not
+    /// when the tee got to pass it on: an update that waited in the tee, behind a sink with no room, still says when
+    /// it was taken in, so its frame counts that wait as the runner's. Into a sink that keeps no such time (the
+    /// server's), it passes on as it always did.
+    #[test]
+    fn g10_s5_a_tee_passes_each_update_on_with_when_it_was_taken_in() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, 1);
+            let (sink, _held) = tee_held(out, None, 16);
+            anyhow::ensure!(matches!(sink, Sink::Stamped(_)), "its way in notes when");
+            sink.send(("a1".to_owned(), said("m1", 1, "fills what's after the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let before = Instant::now();
+            sink.send(("a1".to_owned(), said("m2", 2, "waits in the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let sent = Instant::now();
+            // The tee holds the second while what's after it has no room.
+            let waited = Duration::from_millis(30);
+            crate::rt::sleep(waited).await;
+            let first = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            let second = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            anyhow::ensure!(first.session == "a1" && matches!(&second.update, Update::Events { events } if events.first().is_some_and(|e| e.id == "m2")), "in order: {first:?} {second:?}");
+            anyhow::ensure!(before <= second.at && second.at <= sent, "taken in as it was sent, not as the tee passed it on");
+            anyhow::ensure!(second.at.elapsed() >= waited, "its wait in the tee is counted from then");
+            // Into a sink of plain updates, as before.
+            let (plain, got) = async_channel::unbounded();
+            let (sink, _held) = tee_held(plain, None, 16);
+            sink.send(("a2".to_owned(), said("m3", 3, "plain"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let (id, u) = crate::rt::timeout(Duration::from_secs(5), got.recv()).await??;
+            anyhow::ensure!(id == "a2" && u == said("m3", 3, "plain"), "passed on as it came");
             Ok(())
         })
     }
