@@ -2559,7 +2559,7 @@ mod tests {
             Ok(Event { id, seq, at, parent, by, body })
         };
         // The words of a refusal, where it was said left out (the derive says it once it has read the whole map).
-        let words = |r: Result<Event, serde_json::Error>| r.err().map(|e| e.to_string().split(" at line").next().unwrap_or_default().to_owned());
+        let words = |r: Result<Event, serde_json::Error>| r.err().map(|e| e.to_string().split(" at line").next().unwrap_or_default().replace("struct Derived", "struct Event"));
         // `pairs` as a JSON object, in their order.
         let object = |pairs: &[(&str, &serde_json::Value)]| -> anyhow::Result<String> {
             let fields: Vec<String> = pairs.iter().map(|(k, v)| Ok(format!("{}:{}", serde_json::to_string(k)?, serde_json::to_string(v)?))).collect::<anyhow::Result<_>>()?;
