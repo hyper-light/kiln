@@ -226,8 +226,9 @@ impl Messages {
     }
 }
 
-/// A call's messages, then its status in the trailers.
-fn streamed(rx: async_channel::Receiver<Frame<Bytes>>) -> Response {
+/// A call's messages, then its status in the trailers, from a queue that takes no lock (`crate::memory::queue`; goal 5,
+/// plan 01a1a59c2aae, its top goal: as an async-channel's, each frame took event-listener's `Mutex`).
+fn streamed(rx: crate::memory::queue::Receiver<Frame<Bytes>>) -> Response {
     use futures::StreamExt as _;
     grpc_response(http_body_util::BodyExt::boxed(http_body_util::StreamBody::new(rx.map(Ok::<_, std::io::Error>))))
 }
@@ -620,7 +621,7 @@ async fn read_stream(cache: &Cache, caller: &Caller, body: &[u8]) -> Result<Resp
         return Err(Status::new(Code::NotFound, format!("{} isn't in the store", d.hash)));
     }
     let end = if limit == 0 { d.bytes() } else { offset.saturating_add(limit).min(d.bytes()) };
-    let (tx, rx) = async_channel::bounded::<Frame<Bytes>>(4);
+    let (tx, rx) = crate::memory::queue::places::<Frame<Bytes>>(&crate::memory::owners::CHANNELS, 4);
     let hub = Arc::clone(&cache.hub);
     crate::rt::spawn(async move {
         let mut sent = 0u64;

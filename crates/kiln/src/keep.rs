@@ -33,10 +33,14 @@ struct Place {
     synced: bool,
 }
 
-/// The writer's ends: each kept file's place, and the paths whose bytes wait, in the order they came.
+/// The writer's ends: each kept file's place, and the paths whose bytes wait, in the order they came. The paths'
+/// queue is `crate::memory::queue`'s, lock-free (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's send
+/// on whichever shard kept a file (an agent's name or epoch, a terminal's name, the mirrors chosen) and its receipt
+/// on the writer's took event-listener's `Mutex`. Unbounded as it was: a file's path waits in it once at most (its
+/// place says so).
 struct Keeper {
     places: crate::rcu::Rcu<HashMap<PathBuf, Arc<Place>>>,
-    tx: async_channel::Sender<PathBuf>,
+    tx: crate::memory::queue::Sender<PathBuf>,
 }
 
 static KEEPER: OnceLock<Keeper> = OnceLock::new();
@@ -56,7 +60,7 @@ pub fn synced(path: PathBuf, bytes: Vec<u8>) {
 
 fn keep(path: PathBuf, bytes: Vec<u8>, synced: bool) {
     let keeper = KEEPER.get_or_init(|| {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let places = crate::rcu::Rcu::default();
         crate::rt::spawn(write_each(rx));
         Keeper { places, tx }
@@ -81,7 +85,7 @@ fn keep(path: PathBuf, bytes: Vec<u8>, synced: bool) {
 }
 
 /// Writes each file's newest bytes as its path comes, in the order the paths came.
-async fn write_each(rx: async_channel::Receiver<PathBuf>) {
+async fn write_each(rx: crate::memory::queue::Receiver<PathBuf>) {
     while let Ok(path) = rx.recv().await {
         let Some(keeper) = KEEPER.get() else { return };
         let Some((bytes, synced)) = keeper.places.load().get(&path).and_then(|p| p.newest.swap(None).map(|b| (b, p.synced))) else { continue };

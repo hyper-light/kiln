@@ -198,7 +198,15 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// of their requests and a socket's audit rows (`crate::api`); and the runner process's own (goal 5, plan
 /// 01a1a59c2aae): its uplink and what its loop takes (`crate::agent`, `crate::exec::Uplink`), its sessions'
 /// lanes, control and updates (`crate::harness`, `crate::convo::store::tee`), its harnesses' and steps'
-/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Each item is counted at its place alone
+/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Then the server's that census16 found still
+/// on its request, websocket and runner paths (goal 5, plan 01a1a59c2aae, its top goal): the cluster group's,
+/// observe's and sync's messages to the runners (`crate::store::group`, `crate::observe`, `crate::sync::server`),
+/// the conversation store's word to its feeds (`crate::convo::store::Store::watch`), kept files' paths
+/// (`crate::keep`), the browser protocol's events, asks and starts (`crate::live`), the answers of CI's dispatcher
+/// and of Mantle's client (`crate::memory::queue::answer`), files', archived records', git's and REAPI's bytes on
+/// their way to a response or a file (`crate::rt::file_source`, `crate::rt::file_sink`, `crate::harness::archive`,
+/// `crate::ci::facade`, `crate::ci::work::reapi`), Mantle's requests, an HTTP tunnel's answers and bindings
+/// (`crate::tunnel`), and the process's signals. Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");

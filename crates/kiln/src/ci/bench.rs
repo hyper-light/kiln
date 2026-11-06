@@ -295,7 +295,7 @@ jobs:
     let mut lat = Vec::with_capacity(pushes);
     for i in 0..pushes {
         let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", i + 1), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
         let t = Instant::now();
         crate::ci::events::start_given(hub, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
@@ -333,7 +333,7 @@ async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
             payload: serde_json::json!({}),
             ..Event::default()
         };
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
         crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
         let run = crate::rt::timeout(Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("no run within a minute"))??;

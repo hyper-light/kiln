@@ -74,7 +74,7 @@ pub(crate) async fn specs(hub: &Hub) -> Vec<PoolSpec> {
 
 /// `GET /api/ci/pools[/:name]`.
 pub async fn list(hub: &Hub, name: Option<&str>) -> Result<Response, Fail> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let live: Value = rx.recv().await.unwrap_or_else(|_| json!([]));
     let configured: HashMap<String, bool> = hub.cfg.ci.pools.iter().map(|p| (p.name.clone(), true)).collect();
@@ -105,7 +105,7 @@ pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
         if !hub.ci.enabled() {
             continue;
         }
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
         let Ok(Ok(live)) = crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await else { continue };
         let n = |p: &Value, k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
@@ -206,7 +206,7 @@ async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
     for r in carriers {
         diagnostics.push(json!({ "level": "warning", "message": format!("runner {} carries all of {} itself: a leg asking for them may run there instead of in the pool", hub.shown(&r), pool.labels.join(", ")) }));
     }
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let live: Value = crate::rt::timeout(std::time::Duration::from_secs(5), rx.recv()).await.ok().and_then(Result::ok).unwrap_or_else(|| json!([]));
     let now = live.as_array().into_iter().flatten().find(|p| p.get("name").and_then(Value::as_str) == Some(pool.name.as_str())).cloned().unwrap_or(Value::Null);
@@ -336,7 +336,7 @@ pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
 
 /// The executors the scheduler has now.
 async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let pools = rx.recv().await.ok()?;
     Some(

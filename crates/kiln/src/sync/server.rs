@@ -203,9 +203,9 @@ pub struct Sync {
     tx: Sender<Input>,
     view: Arc<Mutex<View>>,
     activity: Arc<Mutex<Activity>>,
-    out: async_channel::Receiver<Out>,
+    out: crate::memory::queue::Receiver<Out>,
     /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
-    say: async_channel::Sender<Out>,
+    say: crate::memory::queue::Sender<Out>,
     contents: Arc<Contents>,
     key: String,
 }
@@ -227,9 +227,11 @@ impl Sync {
         // sends (`out`) is its groups' raft messages, each group's in flight within the limits hyper-raft
         // derives from the 64 MiB it states (`super::group::settings`), each message at most
         // `super::group::MESSAGE`; what comes in (`tx`) is the copies' answers to those (they're learners:
-        // they answer, never lead), runners' word on their copies, and asks each waited for.
+        // they answer, never lead), runners' word on their copies, and asks each waited for. What it sends goes
+        // through `crate::memory::queue`, lock-free (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's send
+        // on sync's thread and its receipt on the hub's shard (`Hub::sync_loop`) took event-listener's `Mutex`.
         let (tx, rx) = std::sync::mpsc::channel();
-        let (out_tx, out) = async_channel::unbounded();
+        let (out_tx, out) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let view = Arc::new(Mutex::new(View::default()));
         let activity = Arc::new(Mutex::new(Activity::default()));
         let say = out_tx.clone();
@@ -307,7 +309,7 @@ impl Sync {
     }
 
     /// What to send, as the owner makes it.
-    pub fn outgoing(&self) -> async_channel::Receiver<Out> {
+    pub fn outgoing(&self) -> crate::memory::queue::Receiver<Out> {
         self.out.clone()
     }
 
@@ -376,7 +378,7 @@ pub struct Owner {
     statuses: HashMap<(String, u64), CopyStatus>,
     joiner: Joiner,
     part: u64,
-    out: async_channel::Sender<Out>,
+    out: crate::memory::queue::Sender<Out>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
     view: Arc<Mutex<View>>,
@@ -415,7 +417,7 @@ pub struct Owner {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String, labels: crate::hub::Labels) -> anyhow::Result<Self> {
+    fn open(dir: &Path, contents: Arc<Contents>, out: crate::memory::queue::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String, labels: crate::hub::Labels) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
             Ok(b) => serde_json::from_slice(&b)?,

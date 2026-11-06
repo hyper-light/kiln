@@ -137,6 +137,10 @@ const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// dropped: Raft sends what's needed again). Kept where the group's thread, their one sender, sends
 /// them: their queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5: a bounded one
 /// makes every place as it's made, concurrent-queue writing each one's stamp, 160 KiB of them).
+/// The queue is `crate::memory::queue`'s, lock-free (goal 5, plan 01a1a59c2aae, its top goal): as an
+/// async-channel, every message's send on the group's thread and its receipt on the hub's shard (the server's
+/// cluster loop, a runner's learner) took event-listener's `Mutex`, about three times a message (main's census,
+/// census16: that lock taken 2,537 times a second calm, waited up to 4 ms with hogs).
 const OUTGOING: usize = 4096;
 /// How many times a learner tries to fetch a copy of the database before its replica stops.
 const FETCH_TRIES: u32 = 4;
@@ -417,7 +421,7 @@ pub struct Group {
     /// Where the log starts (its compaction's index): a member behind it is sent an image.
     log_start: Arc<AtomicU64>,
     /// The group's messages to the other members: to whom, and the message's bytes.
-    outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
+    outgoing: crate::memory::queue::Receiver<(u64, Vec<u8>)>,
     /// Why its driver stopped, once it has (it applies nothing from then on).
     stopped: Arc<Mutex<Option<String>>>,
     /// The leaves of the entries it applied, which checkpoints of the log run over.
@@ -516,7 +520,7 @@ impl Group {
             disk: hyper_durable::Disk::Flushed,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
-        let (out_tx, outgoing) = async_channel::unbounded();
+        let (out_tx, outgoing) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
@@ -598,7 +602,7 @@ impl Group {
     }
 
     /// The group's messages to the other members, as they come: the member, and the message.
-    pub fn outgoing(&self) -> async_channel::Receiver<(u64, Vec<u8>)> {
+    pub fn outgoing(&self) -> crate::memory::queue::Receiver<(u64, Vec<u8>)> {
         self.outgoing.clone()
     }
 
@@ -814,7 +818,7 @@ struct Driver {
     /// Where the log starts, for [`Group::log_start`].
     log_start: Arc<AtomicU64>,
     /// The group's messages to the other members.
-    outgoing: async_channel::Sender<(u64, Vec<u8>)>,
+    outgoing: crate::memory::queue::Sender<(u64, Vec<u8>)>,
     /// Why it stopped, for [`Group::stopped`].
     stopped: Arc<Mutex<Option<String>>>,
     /// The server's member (the group's leader), or a runner's learner.
