@@ -284,7 +284,7 @@ impl Index {
     /// 01a1a87b2cec step 3: the index was made again for it, every event's id hashed, on the owner's shard).
     pub(super) fn forget(&mut self, id: &str, at: usize) {
         if let std::collections::hash_map::Entry::Occupied(o) = self.by_hash.entry(Self::hash(id))
-            && *o.get() == at
+            && usize::try_from(*o.get()).ok() == Some(at)
         {
             o.remove();
         }

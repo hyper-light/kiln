@@ -174,8 +174,8 @@ async fn checkpoint(hub: &Arc<Hub>, d: Due) {
     // Worked out on the compute pool (goal 9, plan 01a1a87b2cec step 3): a SHA-256 over the leaves of the learner's
     // period so far, up to 65,536 of them (2 MiB), on the shard that ran this loop every 10 s for each learner, up to
     // 0.93 ms on the CPU in rt9's rounds.
-    let (h, from, to) = (Arc::clone(hub), d.from, d.to);
-    let digest = match crate::rt::compute(move || h.store.group().map(|g| g.digest(from, to))).await {
+    let (h, first, last) = (Arc::clone(hub), d.from, d.to);
+    let digest = match crate::rt::compute(move || h.store.group().map(|g| g.digest(first, last))).await {
         Ok(Some(Ok(digest))) => digest,
         // kiln no longer holds the leaves its period starts after (it started since, or the
         // learner's period outlasted what it keeps): one starts where the group stands.
