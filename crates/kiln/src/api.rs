@@ -8047,6 +8047,9 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            // The legs' series are made by the first runner's message the hub times (goal 11, plan 01a1a87b2e56 step 5:
+            // a runner's process renders none), which this hub hasn't had.
+            let _ = crate::route_latency::legs();
             let resp = Arc::clone(&api).handle(lab_get("/metrics")?).await;
             anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
             let body = http_body_util::BodyExt::collect(resp.into_body()).await.map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();

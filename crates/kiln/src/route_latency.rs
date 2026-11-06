@@ -107,10 +107,15 @@ impl Routes {
     }
 }
 
+/// The server's route histograms, made by the first of its work they time (a request, a runner's message).
+/// A process that serves none, a runner's, never makes them, so its registry renders none of them: they
+/// were 220 series of zeros a runner, every 15 s into observe, each kept there as a series of its own
+/// (goal 11, plan 01a1a87b2e56 step 5).
+static ROUTES: OnceLock<Routes> = OnceLock::new();
+
 /// The server's.
 pub fn routes() -> &'static Routes {
-    static R: OnceLock<Routes> = OnceLock::new();
-    R.get_or_init(Routes::new)
+    ROUTES.get_or_init(Routes::new)
 }
 
 /// The legs of a runner's message's wait, apart (goal 10, plan 01a1a87b2dae step 4: the runner class's wait
@@ -193,10 +198,13 @@ impl Legs {
     }
 }
 
+/// The server's runner-wait legs, made by the first runner's message its hub times: as [`ROUTES`], none in a
+/// runner's process (282 series of zeros it rendered; goal 11, plan 01a1a87b2e56 step 5).
+static LEGS: OnceLock<Legs> = OnceLock::new();
+
 /// The server's.
 pub fn legs() -> &'static Legs {
-    static L: OnceLock<Legs> = OnceLock::new();
-    L.get_or_init(Legs::new)
+    LEGS.get_or_init(Legs::new)
 }
 
 /// A runner's message spent `took` on `leg`, on the server's histograms.
@@ -317,21 +325,26 @@ fn runners(segs: &[&str]) -> bool {
     )
 }
 
-/// The `kiln_route_*` families, in the exposition.
+/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`]).
 pub fn render(o: &mut String) {
-    let r = routes();
+    render_of(o, ROUTES.get(), LEGS.get());
+}
+
+/// The families of `routes` and `legs`: each said, with its TYPE, whether or not it's made (as every family of
+/// the registry is, before anything happened), and its series where it's made, so a runner's process renders none.
+fn render_of(o: &mut String, routes: Option<&Routes>, legs: Option<&Legs>) {
     let _ = writeln!(
         o,
         "# HELP kiln_route_wait_seconds How long the server's work waited before its handler started, by class (page, api_read, api_write, websocket, runner).\n# TYPE kiln_route_wait_seconds histogram"
     );
     for c in Class::ALL {
-        if let Some((wait, _)) = r.of(c) {
+        if let Some((wait, _)) = routes.and_then(|r| r.of(c)) {
             wait.render(o, "kiln_route_wait_seconds", &format!("class=\"{}\"", c.name()));
         }
     }
     let _ = writeln!(o, "# HELP kiln_route_seconds How long the server's work took once its handler started, by class.\n# TYPE kiln_route_seconds histogram");
     for c in Class::ALL {
-        if let Some((_, took)) = r.of(c) {
+        if let Some((_, took)) = routes.and_then(|r| r.of(c)) {
             took.render(o, "kiln_route_seconds", &format!("class=\"{}\"", c.name()));
         }
     }
@@ -339,9 +352,8 @@ pub fn render(o: &mut String) {
         o,
         "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it); held, the loop's own time with each event it takes, its waits included (what the frames behind it wait for), every event's; and of each agent session's update whose runner said how long it held it, runner (from the runner taking it in to making its frame, on the runner's clock) and server (from its frame's arrival to its owner done with it, on the server's).\n# TYPE kiln_runner_wait_leg_seconds histogram"
     );
-    let l = legs();
     for leg in RunnerLeg::ALL {
-        if let Some(h) = l.of(leg) {
+        if let Some(h) = legs.and_then(|l| l.of(leg)) {
             h.render(o, "kiln_runner_wait_leg_seconds", &format!("leg=\"{}\"", leg.name()));
         }
     }
@@ -516,5 +528,29 @@ mod tests {
         assert_eq!(made, 0, "{made} allocations");
         assert_eq!(told, [Some(Class::ApiRead), Some(Class::ApiWrite), Some(Class::Runner), Some(Class::Page), Some(Class::ApiRead), None]);
         assert_eq!(class_of(&Method::GET, "/api/harness/sessions/a/files/src/kiln/lib/http/server.rs", false), Some(Class::ApiRead), "deeper than any route");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a process that times none of the server's work (a runner's)
+    /// renders none of its route and leg histograms' series, where it rendered them all as zeros: 502 series a
+    /// runner, each a series of its own in observe. Each family is still said with its TYPE; the server renders
+    /// every series, every class and leg, once they're made.
+    #[test]
+    fn g11_s5_heap_a_process_that_times_none_of_the_servers_work_renders_none_of_it() {
+        let mut none = String::new();
+        render_of(&mut none, None, None);
+        assert!(none.lines().all(|l| l.starts_with('#')), "series of nothing made: {none}");
+        for family in ["kiln_route_wait_seconds", "kiln_route_seconds", "kiln_runner_wait_leg_seconds"] {
+            assert!(none.contains(&format!("# TYPE {family} histogram")), "{family} said with its TYPE");
+        }
+        let mut made = String::new();
+        render_of(&mut made, Some(&Routes::new()), Some(&Legs::new()));
+        // A histogram's series: a bucket each bound, `+Inf`, `_sum` and `_count`.
+        let routes = Class::ALL.len() * 2 * (STALL_BUCKETS.len() + 3);
+        let legs = RunnerLeg::ALL.len() * (crate::shard_health::DELAY_BUCKETS.len() + 3);
+        let series = made.lines().filter(|l| !l.starts_with('#')).count();
+        assert_eq!((series, routes, legs), (routes + legs, 220, 282), "every class's and leg's, zeros and all");
+        for c in Class::ALL {
+            assert!(made.contains(&format!("kiln_route_wait_seconds_count{{class=\"{}\"}} 0", c.name())), "{}", c.name());
+        }
     }
 }
