@@ -726,8 +726,7 @@ impl Level {
 
     /// The longest it was quiet before reads came back to it, in milliseconds: none while none has.
     fn back(&self) -> Option<u64> {
-        let back = self.back_ms.load(Ordering::Acquire);
-        (back > 0).then(|| back.saturating_sub(1))
+        self.back_ms.load(Ordering::Acquire).checked_sub(1)
     }
 }
 
