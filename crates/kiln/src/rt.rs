@@ -747,6 +747,16 @@ fn start() -> Result<Rt, String> {
     if holders.is_empty() {
         return Err("runtime started without shards".to_owned());
     }
+    // The shards' own arenas, where they're to have them (goal 9, plan 01a1a87b2cec step 3; `crate::os::alloc`):
+    // made before any shard's first task, in which each takes its own.
+    crate::os::alloc::make_shard_arenas(holders.len());
+    if let Some(said) = crate::os::alloc::shard_arenas_said() {
+        if p.announce {
+            tracing::info!("{said}");
+        } else {
+            tracing::debug!("{said}");
+        }
+    }
     // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
     // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
     // the real-time class is asked for and granted ([`realtime`]), it takes that instead ([`shard_asks`]).
@@ -770,9 +780,11 @@ fn start() -> Result<Rt, String> {
     if spin != hyper_rt::park_spin::Ask::Off {
         SPIN_SHARDS.store(shards, Ordering::Relaxed);
     }
-    for holder in &holders {
+    for (shard, holder) in holders.iter().enumerate() {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            // Its own arena, where the shards have them (goal 9, plan 01a1a87b2cec step 3; `crate::os::alloc`).
+            let _ = crate::os::alloc::shard_started(shard);
             // Its stack takes no huge pages (goal 11, plan 01a1a87b2e56 step 5; `crate::os::stack`): a shard reaches
             // 0.40 to 0.75 MB deep (the lab's smaps), which where every anonymous mapping takes them would be 2 MB.
             let _ = crate::os::stack::no_huge_pages();
