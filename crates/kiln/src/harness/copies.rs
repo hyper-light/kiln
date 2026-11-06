@@ -2016,6 +2016,23 @@ impl Mirror {
         self.slot.view.store(Arc::new(self.view()));
     }
 
+    /// Whether it changed since its view last went out ([`Mirror::publish`]): its revision, or anything its view shares of
+    /// it, isn't its view's (a change copies what a view shares before it changes it).
+    fn unpublished(&self) -> bool {
+        let v = self.slot.view.load();
+        let changes = match (&self.changes, &v.changes) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        self.rev != v.rev
+            || !changes
+            || !self.events.same_as(&v.events)
+            || !Arc::ptr_eq(&self.info, &v.info)
+            || !Arc::ptr_eq(&self.location, &v.location)
+            || !Arc::ptr_eq(&self.meta, &v.meta)
+            || !Arc::ptr_eq(&self.state, &v.state)
+    }
+
     /// Its info as it was last published, encoded ([`View::info_json`]): what the events socket's frame
     /// of a change of it is made of, rather than encoded again (`crate::wire::events::harness_frame`;
     /// goal 10, plan 01a1a87b2dae step 5).
@@ -2688,9 +2705,21 @@ impl Shard {
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
             tracing::error!(shard = self.me, panic = %crate::sup::panic_message(p.as_ref()), "a change to an agent session's copy panicked: its shard goes on");
+            self.resync_unpublished();
         }
         self.publish_board();
         rest
+    }
+
+    /// Each copy changed since its view last went out, as a change a panic cut short leaves it ([`Shard::take`]): out as
+    /// it is, its viewers sent back to a snapshot of it (the feed's resync marker), a change half made going to no one as
+    /// a frame. Its readers had it only with its next change, and its viewers never had what the cut change made (goal 4,
+    /// plan 01a1a59c2a9c step 5: `g4_s5_an_owner_goes_on_after_a_change_that_panicked_and_its_viewers_with_it`).
+    fn resync_unpublished(&mut self) {
+        for m in self.mirrors.values_mut().filter(|m| m.unpublished()) {
+            m.started_over();
+            m.commit(|_| Some(payload_of(super::live::RESYNC, 0)));
+        }
     }
 }
 
@@ -4276,6 +4305,7 @@ mod tests {
     /// gets the view from before at once; once the owner goes on, its readers take the new one.
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8 * MSG));
             let (bus, id) = (sim_bus(), "s1".to_owned());
@@ -4322,6 +4352,7 @@ mod tests {
     /// the order its sender sent them.
     #[test]
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count().max(1);
             let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2 * MSG));
@@ -5014,6 +5045,8 @@ mod tests {
     #[test]
     fn g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
+        // It times its own tasks' turns: no test that keeps the shards busy beside it (goal 4, plan 01a1a59c2a9c step 5).
+        let _alone = crate::hub::tests::shards_timed();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
@@ -5106,6 +5139,220 @@ mod tests {
             anyhow::ensure!(off == was + 1, "written off its owner's shard once: {was} then {off}");
             anyhow::ensure!(seqs == (1..=11).collect::<Vec<u64>>(), "in order, none lost: {seqs:?}");
             anyhow::ensure!(len.is_some_and(|l| l > large.len()) && at == Some(9) && after == Some(10), "taken as written, in its place: {len:?} {at:?} {after:?}");
+            Ok(())
+        })
+    }
+
+    /// Session `id`'s copy, made by its owner.
+    async fn opened(copies: &Copies, id: &str) {
+        let (i, info) = (id.to_owned(), Info { id: id.to_owned(), kind: "claude".into(), ..Info::default() });
+        copies.on(id, move |s| s.insert(i, Mirror::new(info, Location::Local, sim_bus()))).await;
+    }
+
+    /// Change `n` of session `id`'s copy, as its owner takes one: its revision first, then its event `n` (named for the
+    /// session, so a change taken by another copy shows), then out to its readers.
+    fn change(id: &str, n: u64) -> Msg {
+        let id = id.to_owned();
+        Msg::Run(Box::new(move |s: &mut Shard| {
+            if let Some(m) = s.get_mut(&id) {
+                m.rev += 1;
+                m.upsert(Arc::new(Entry::new(json!({"id": format!("{id}-{n}"), "seq": n}))));
+                m.commit(|_| None);
+            }
+        }))
+    }
+
+    /// Whether session `id`'s copy, as its readers find it, took changes 1 to `to` (and none of another's), once each and
+    /// in order: what it holds when it didn't.
+    fn took_in_order(copies: &Copies, id: &str, to: u64) -> Result<(), String> {
+        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq)).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
+        let want: Vec<(String, Option<u64>)> = (1..=to).map(|n| (format!("{id}-{n}"), Some(n))).collect();
+        if events == want && rev == to {
+            return Ok(());
+        }
+        Err(format!("{id}: revision {rev}, {} events of {to}, the first out of place {:?}", events.len(), events.iter().zip(&want).find(|(a, b)| a != b)))
+    }
+
+    /// A shard's hold ([`hold`]): let go of as it's dropped, however its test ends.
+    struct Held {
+        holding: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        /// Whether the hold is still on.
+        fn on(&self) -> bool {
+            self.holding.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Shard `held` held by one poll that doesn't end until it's let go (its [`Held`] dropped), or half a minute on at the
+    /// latest: spinning on the shard's thread, or asleep in a call (`blocked`). Back once it's begun.
+    async fn hold(held: usize, blocked: bool) -> anyhow::Result<Held> {
+        let (holding, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let poll = {
+            let (holding, release) = (Arc::clone(&holding), Arc::clone(&release));
+            async move {
+                holding.store(true, Ordering::SeqCst);
+                let cap = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
+                    if blocked {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                holding.store(false, Ordering::SeqCst);
+            }
+        };
+        anyhow::ensure!(crate::rt::spawn_on(held, poll), "shard {held} refused the hold");
+        let hold = Held { holding, release };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !hold.on() {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "the hold never began");
+            crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        Ok(hold)
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a shard held by one long poll, or blocked in a call, holds up its own owner's
+    /// sessions and no other's. While it's held, the owner on this test's shard takes every change sent to its sessions,
+    /// each session's in order; the held owner's sessions take none, and their readers still read their views (a read that
+    /// waited on the held owner would have kept the hold on to its end). Sent by a sender a session, every inbox holding
+    /// about four changes, the held owner's senders wait for room, nothing dropped. Handed over by one loop, as the hub's
+    /// loop hands over every runner's update, every inbox with room for them all (as an owner's holds a window of runners'
+    /// messages, `crate::net::EVENTS_BYTES`), the loop goes on past the held owner (past that room it would wait for it,
+    /// and every session's changes behind it: the bound is the room). Let go, the held owner takes every change it was
+    /// sent, each session's in the order sent. With one lock over every copy, as there was, a holder held so held up every
+    /// session (the plan's f4, f5). The one test of the process that holds a shard until it's done with it: two such at
+    /// once could each hold the other's.
+    #[test]
+    fn g4_s5_a_held_shard_holds_up_its_own_sessions_and_no_others() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let shards = crate::rt::shard_count();
+            anyhow::ensure!(shards >= 2, "{shards} shards: none to hold beside this test's");
+            // This test's task goes on on the shard it began on (a task stays where it's taken in); the next is held.
+            let here = hyper_rt::futures::shard_id().and_then(|id| crate::rt::shard_holders().iter().position(|h| h.shard() == id.0)).ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let held = (here + 1) % shards;
+            let of = |k: usize| (0u32..).map(|n| format!("h{n}")).filter(|id| owner_of(id, shards) == k).take(6).collect::<Vec<_>>();
+            let (theirs, ours) = (of(held), of(here));
+            let per = 60u64;
+            for (blocked, one_loop) in [(false, false), (true, false), (false, true)] {
+                // An owner a shard, as the server has them.
+                let room = if one_loop { 2 * usize::try_from(per)? * (theirs.len() + ours.len()) * MSG } else { 4 * MSG };
+                let copies = Arc::new(Copies::start_with(sim_bus(), shards, room));
+                for id in theirs.iter().chain(&ours) {
+                    opened(&copies, id).await;
+                }
+                let holds = hold(held, blocked).await?;
+                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+                if one_loop {
+                    // This test's task the one loop, each session's change in turn.
+                    for n in 1..=per {
+                        for id in theirs.iter().chain(&ours) {
+                            anyhow::ensure!(copies.send(id, change(id, n)).await, "the owners went away");
+                        }
+                        crate::rt::maybe_yield().await;
+                    }
+                } else {
+                    // A sender a session, each on this test's shard (a task spawned from here stays here).
+                    for id in theirs.iter().chain(&ours) {
+                        let (copies, id, done) = (Arc::clone(&copies), id.clone(), done_tx.clone());
+                        drop(crate::rt::spawn(async move {
+                            for n in 1..=per {
+                                if !copies.send(&id, change(&id, n)).await {
+                                    return;
+                                }
+                            }
+                            let _ = done.send(()).await;
+                        }));
+                    }
+                }
+                drop(done_tx);
+                // Ours to the end, while theirs is held.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !ours.iter().all(|id| took_in_order(&copies, id, per).is_ok()) {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "blocked {blocked}, one loop {one_loop}: the other owner's sessions were held up too: {:?}", ours.iter().map(|id| took_in_order(&copies, id, per)).find(Result::is_err));
+                    crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                // Theirs took nothing meanwhile, and their views are read while the hold is still on.
+                for id in &theirs {
+                    let rev = copies.with(id, |v| v.rev);
+                    anyhow::ensure!(rev == Some(0), "blocked {blocked}, one loop {one_loop}: {id} took a change while its shard was held: revision {rev:?}");
+                }
+                anyhow::ensure!(holds.on(), "blocked {blocked}, one loop {one_loop}: the hold ended before the other owner's sessions were done");
+                drop(holds);
+                if !one_loop {
+                    for _ in theirs.iter().chain(&ours) {
+                        crate::rt::timeout(std::time::Duration::from_secs(30), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("a sender never got its changes in"))??;
+                    }
+                }
+                copies.settled().await;
+                for id in theirs.iter().chain(&ours) {
+                    took_in_order(&copies, id, per).map_err(|e| anyhow::anyhow!("blocked {blocked}, one loop {one_loop}: {e}"))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: many sessions on few shards. Five hundred and twelve sessions on one owner, then
+    /// on two, their changes handed over by eight senders each going round its own sessions (as the hub's loop goes
+    /// round its runners'), every owner's inbox holding about four: each session's copy takes every change once, in the
+    /// order sent, and none of another's; and each owner's board (what readers find) holds its own sessions, every one,
+    /// and no other's.
+    #[test]
+    fn g4_s5_many_sessions_on_few_shards_keep_their_order_and_none_is_lost() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let (count, senders, per) = (512usize, 8usize, 16u64);
+            for owners in [1usize, 2] {
+                let copies = Arc::new(Copies::start_with(sim_bus(), owners, 4 * MSG));
+                let sessions: Vec<String> = (0..count).map(|n| format!("m{owners}-{n}")).collect();
+                for id in &sessions {
+                    opened(&copies, id).await;
+                }
+                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+                for k in 0..senders {
+                    let mine: Vec<String> = sessions.iter().skip(k).step_by(senders).cloned().collect();
+                    let (copies, done) = (Arc::clone(&copies), done_tx.clone());
+                    crate::rt::spawn_spread(async move {
+                        for n in 1..=per {
+                            for id in &mine {
+                                if !copies.send(id, change(id, n)).await {
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = done.send(()).await;
+                    });
+                }
+                drop(done_tx);
+                for _ in 0..senders {
+                    crate::rt::timeout(std::time::Duration::from_secs(60), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("{owners} owners: a sender never got its changes in"))??;
+                }
+                copies.settled().await;
+                for id in &sessions {
+                    took_in_order(&copies, id, per).map_err(|e| anyhow::anyhow!("{owners} owners: {e}"))?;
+                }
+                for k in 0..owners {
+                    let mut want: Vec<&str> = sessions.iter().map(String::as_str).filter(|id| owner_of(id, owners) == k).collect();
+                    want.sort_unstable();
+                    let mut held = copies.on_shard(k, |s| s.mirrors().map(|(id, _)| id.clone()).collect::<Vec<_>>()).await.unwrap_or_default();
+                    held.sort_unstable();
+                    let mut board: Vec<String> = copies.boards.get(k).map(|b| b.load().keys().map(|id| id.to_string()).collect()).unwrap_or_default();
+                    board.sort_unstable();
+                    anyhow::ensure!(held == want && board == want, "{owners} owners: owner {k} holds {} and its board {}, of its {}", held.len(), board.len(), want.len());
+                }
+                anyhow::ensure!(copies.ids().len() == count, "{owners} owners: {} sessions found of {count}", copies.ids().len());
+            }
             Ok(())
         })
     }
