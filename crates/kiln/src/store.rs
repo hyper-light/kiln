@@ -453,10 +453,13 @@ impl Writing {
                         g.append(seq, change);
                     }
                 }
+                // Counted before its callers are told: one told its group committed finds it counted (counted
+                // after, a caller that looked as soon as it was answered found the count from before under load:
+                // "the calls waiting were one group, not 0").
+                self.committed.fetch_add(1, Ordering::Relaxed);
                 for d in done {
                     (d.tell)(d.lost.map_or(Told::Committed, Told::Lost));
                 }
-                self.committed.fetch_add(1, Ordering::Relaxed);
                 crate::pool_health::store_commit(calls, began.elapsed());
             }
             Err(e) => {
@@ -3499,6 +3502,48 @@ mod tests {
         let (held, out) = futures::join!(holder, rest);
         held?;
         Ok(out)
+    }
+
+    /// A call that does nothing and, as its caller is told how its group ended, reads how many groups its
+    /// writer has counted (on the writer's thread, in that moment), and says so.
+    struct Counting {
+        counted: Arc<AtomicU64>,
+        found: std::sync::mpsc::Sender<u64>,
+    }
+
+    impl Call for Counting {
+        fn run(self: Box<Self>, _conn: &mut Connection) -> Ran {
+            let Counting { counted, found } = *self;
+            Ran {
+                kept: true,
+                tell: Box::new(move |_: Told| {
+                    let _ = found.send(counted.load(Ordering::SeqCst));
+                }),
+            }
+        }
+
+        fn refuse(self: Box<Self>, _why: &anyhow::Error) {}
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2, and the flaky tests under load (2026-11-06): a group is counted
+    /// before its callers are told it committed, so a caller that looks as soon as it's answered finds
+    /// its group among those counted. Told first and counted after, the writer let a loaded machine's
+    /// caller find the count from before ("the calls waiting were one group, not 0"); here the call reads
+    /// the count as it's told, on the writer's thread, which the old order failed every time: in memory,
+    /// in a file, and through the cluster group.
+    #[test]
+    fn g5_s2_a_group_is_counted_before_its_callers_are_told() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for (kind, s) in three(dir.path(), WIDE)? {
+            let before = s.groups();
+            let (found, told) = std::sync::mpsc::channel();
+            let call = Counting { counted: Arc::clone(&s.inner.writer.seen.0), found };
+            anyhow::ensure!(s.inner.writer.send(Errand::Call { call: Box::new(call), local: false }), "{kind}: the writer has stopped");
+            // The bound only ends a hang.
+            let counted = told.recv_timeout(Duration::from_secs(300)).map_err(|_| anyhow::anyhow!("{kind}: never told"))?;
+            anyhow::ensure!(counted == before + 1, "{kind}: told its group committed with {counted} groups counted, {before} before it: told before it was counted");
+        }
+        Ok(())
     }
 
     /// Goal 5, plan 01a1a59c2aae step 2 (group commit): the calls waiting for the writer are committed
