@@ -411,6 +411,12 @@ impl Chunk {
         Ok(made)
     }
 
+    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), if any: what a read on a shard takes
+    /// without inflating anything (goal 10, plan 01a1a87b2dae step 5).
+    fn page_texts_kept(&self) -> Option<Bytes> {
+        self.texts.load_full().map(|kept| Bytes::clone(&kept))
+    }
+
     /// Lets go of the texts a page's read kept ([`Chunk::page_texts`]).
     fn unpage(&self) {
         if let Some(kept) = self.texts.swap(None) {
@@ -552,6 +558,17 @@ impl Chunk {
         self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
         self.evs.push(ev);
     }
+}
+
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
+    Cannot,
+    /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
+    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
+    Unkept,
 }
 
 /// A copy's events in order, in chunks ([`Chunk`]) of [`CHUNK`]: the first may hold fewer, once its
@@ -757,29 +774,39 @@ impl Events {
     /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
     /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
     /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. None as `texts_into` says none.
-    pub fn pieces_into(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>) -> Option<()> {
+    /// events' texts written out once. [`Unread::Cannot`] where `texts_into` says none.
+    ///
+    /// A compact chunk's segment is inflated only where `inflate` says so (step 5): a read on a shard takes the
+    /// texts its copy's reads kept, and has the others made off the shard ([`Unread::Unkept`]). An inflate is a
+    /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
+    /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
+    /// 3.6 ms on the CPU, past the shards' quantum.
+    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
         let mut i = range.start;
         while i < range.end {
-            let (c, k) = self.place(i)?;
-            let chunk = self.chunk(c)?;
-            let n = chunk.len().checked_sub(k)?.min(range.end - i);
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
+            let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
             if n == 0 || chunk.is_spilled() {
-                return None;
+                return Err(Unread::Cannot);
             }
             if i > range.start {
                 out.push(Bytes::from_static(b","));
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
-                let (from, to) = (first.off, last.off.checked_add(last.len)?);
-                let texts = chunk.page_texts().ok()?;
+                let (first, last) = (chunk.meta.get(k).ok_or(Unread::Cannot)?, chunk.meta.get(k + n - 1).ok_or(Unread::Cannot)?);
+                let (from, to) = (first.off, last.off.checked_add(last.len).ok_or(Unread::Cannot)?);
+                let texts = match chunk.page_texts_kept() {
+                    Some(kept) => kept,
+                    None if inflate => chunk.page_texts().map_err(|_| Unread::Cannot)?,
+                    None => return Err(Unread::Unkept),
+                };
                 if from > to || to > texts.len() {
-                    return None;
+                    return Err(Unread::Cannot);
                 }
                 out.push(texts.slice(from..to));
             } else {
-                let evs = chunk.evs.get(k..k + n)?;
+                let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
                 let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
@@ -791,7 +818,7 @@ impl Events {
             }
             i += n;
         }
-        Some(())
+        Ok(())
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -1423,24 +1450,37 @@ impl View {
     /// 10, plan 01a1a87b2dae step 5: the lab's events reads, at p99 1.1 to 2.0 ms on rt5 calm, inflated a
     /// whole chunk's segment each, on the request's shard).
     pub fn events_page(&self, before: Option<u64>, limit: usize) -> Option<Vec<Bytes>> {
+        self.page(before, limit, true).ok()
+    }
+
+    /// [`View::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
+    /// (goal 10, plan 01a1a87b2dae step 5). [`Unread::Unkept`]: a compact chunk's texts the page needs aren't kept,
+    /// and [`View::events_page`] makes them, off the shard (the reads after take them as kept); [`Unread::Cannot`]
+    /// where `events_page` says none.
+    pub fn events_page_kept(&self, before: Option<u64>, limit: usize) -> Result<Vec<Bytes>, Unread> {
+        self.page(before, limit, false)
+    }
+
+    /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
+    fn page(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
             Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
             None => self.events.len(),
         };
         let start = end.saturating_sub(limit);
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
-            return None;
+            return Err(Unread::Cannot);
         }
         for i in start..end {
-            let m = self.events.meta(i)?;
+            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
             if m.seq.is_none() || m.id().is_empty() {
-                return None;
+                return Err(Unread::Cannot);
             }
         }
         let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_into(start..end, &mut parts)?;
+        self.events.pieces_with(start..end, &mut parts, inflate)?;
         parts.push(Bytes::from_static(b"]}"));
-        Some(parts)
+        Ok(parts)
     }
 }
 
@@ -3082,6 +3122,52 @@ mod tests {
         let now = m.view();
         let newest = now.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page now"))?;
         anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 2).is_some(), "the newest compact chunk's kept now");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a page read on a shard (`View::events_page_kept`) inflates nothing. One
+    /// that needs a compact chunk's texts not kept yet says so (`Unread::Unkept`), and the read that makes them (off
+    /// the shard: `View::events_page`) keeps the newest compact chunk's, so the shard's read after it answers the same
+    /// bytes from them; a page of the open chunk alone needs none; one that reaches an older compact chunk, whose
+    /// texts no read keeps, says so each time; and one the copy can't say is `Unread::Cannot`, as before.
+    #[test]
+    fn g10_s5_a_page_read_on_a_shard_inflates_nothing() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Two sealed chunks, compact, and the newest open with nine: the newest fifty reach into the second.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = |limit: usize| format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(limit)..).unwrap_or_default().join(","));
+        let view = m.view();
+        let was = inflated();
+        anyhow::ensure!(view.events_page_kept(None, 50) == Err(Unread::Unkept), "its compact chunk's texts aren't kept yet");
+        anyhow::ensure!(view.events_page_kept(None, 9).map(|p| p.concat()) == Ok(page(9).into_bytes()), "the open chunk's alone: nothing to inflate");
+        anyhow::ensure!(inflated() == was, "the shard's reads inflated nothing");
+        // Made off the shard: inflated once, the newest compact chunk's texts kept.
+        let made = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page made"))?;
+        anyhow::ensure!(inflated() == was + 1, "made once");
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the kept page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was + 1, "the shard's read after it inflates nothing");
+        anyhow::ensure!(kept.concat() == made.concat() && made.concat() == page(50).into_bytes(), "the same bytes, the events' texts joined");
+        // Past the open chunk and the newest compact one, into the older: kept by no read, so made off the shard each time.
+        let long = CHUNK + 9 + 5;
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 2, "still not kept: an older chunk's never are");
+        // An event with no number: the copy can't say the page (the store answers it), kept or not.
+        m.rev = n + 1;
+        m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
+        m.publish();
+        anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Cannot), "the store's to answer");
         Ok(())
     }
 

@@ -2990,18 +2990,79 @@ fn queue_now() -> (i64, i64) {
 /// The overview of every repository: the last day's figures `stats`, the runners `agents`, the server
 /// as `system` says and the jobs `queue` (queued, running).
 fn overview_json(hub: &Hub, stats: &serde_json::Value, agents: &[crate::hub::AgentLive], system: &crate::reads::SystemNow, queue: (i64, i64)) -> serde_json::Value {
+    overview_of(hub, stats, RunnerCounts::of_list(agents), system, queue)
+}
+
+/// [`overview_json`] of the runners as `agents` counts them.
+fn overview_of(hub: &Hub, stats: &serde_json::Value, agents: RunnerCounts, system: &crate::reads::SystemNow, queue: (i64, i64)) -> serde_json::Value {
     json!({
         "stats": stats,
         "queue": { "queued": queue.0, "running": queue.1 },
         "agents": {
-            "connected": agents.iter().filter(|a| a.connected).count(),
-            "total": agents.len(),
-            "slots": agents.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
-            "busy": agents.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
+            "connected": agents.connected,
+            "total": agents.total,
+            "slots": agents.slots,
+            "busy": agents.busy,
         },
         "system": system_of(hub, system),
         "sample": system.sample,
     })
+}
+
+/// The runners as the overview says them: those connected, all of them, and the connected ones' slots and busy
+/// slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunnerCounts {
+    connected: usize,
+    total: usize,
+    slots: u32,
+    busy: u32,
+}
+
+impl RunnerCounts {
+    /// One more runner, connected or not, with its slots and busy slots.
+    fn add(&mut self, connected: bool, slots: u32, busy: u32) {
+        self.total = self.total.saturating_add(1);
+        if connected {
+            self.connected = self.connected.saturating_add(1);
+            self.slots = self.slots.wrapping_add(slots);
+            self.busy = self.busy.wrapping_add(busy);
+        }
+    }
+
+    /// The runners of a list (`Hub::agent_list`'s).
+    fn of_list(agents: &[crate::hub::AgentLive]) -> Self {
+        let mut n = Self::default();
+        for a in agents {
+            n.add(a.connected, a.slots, a.busy);
+        }
+        n
+    }
+
+    /// What `Hub::agent_list_of` lists of the store's `rows` and the live records `live`, counted with none of
+    /// them copied (goal 10, plan 01a1a87b2dae step 5: the overview copied every runner's whole record, its facts
+    /// with it, to count them, and `read /api/overview` held its shard 0.39 to 0.64 ms on the CPU in rt9's lab).
+    /// As it lists them: each row as its live record says where it has one (by its name), else not connected; then
+    /// each live record no listed runner is named as.
+    fn of_rows(rows: &[crate::store::AgentRow], live: &HashMap<String, Arc<crate::hub::AgentLive>>) -> Self {
+        let mut n = Self::default();
+        for r in rows {
+            match live.get(&r.name) {
+                Some(l) => n.add(l.connected, l.slots, l.busy),
+                None => n.add(false, r.slots, 0),
+            }
+        }
+        // A listed runner is named as its live record names it, where it has one; so is a live record listed here.
+        let named = |r: &crate::store::AgentRow, name: &str| live.get(&r.name).map_or(r.name.as_str(), |l| l.name.as_str()) == name;
+        let mut listed: Vec<&str> = Vec::new();
+        for (name, l) in live {
+            if !rows.iter().any(|r| named(r, name)) && !listed.contains(&name.as_str()) {
+                n.add(l.connected, l.slots, l.busy);
+                listed.push(l.name.as_str());
+            }
+        }
+        n
+    }
 }
 
 /// What `GET /api/overview` is made of now, for whoever reads every repository's runs: none while the
@@ -3013,30 +3074,26 @@ fn overview_key(hub: &Hub) -> Option<crate::reads::OverviewKey> {
     Some(crate::reads::OverviewKey { stats, rows, live: hub.agents.get(), system: system_now(hub), queue: queue_now() })
 }
 
-/// `GET /api/overview` made of what `key` says, encoded.
+/// `GET /api/overview` made of what `key` says, encoded: its runners counted from their rows and live records as
+/// they're kept, none copied ([`RunnerCounts::of_rows`]), so its making is the few kilobytes it encodes.
 fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<Bytes> {
-    let rows = &key.rows.1;
-    let agents = hub.agent_list_of(rows.rows.clone(), &rows.labels, &rows.machines, &key.live);
-    crate::reads::encode(&overview_json(hub, &key.stats.1.json, &agents, &key.system, key.queue))
+    let agents = RunnerCounts::of_rows(&key.rows.1.rows, &key.live);
+    crate::reads::encode(&overview_of(hub, &key.stats.1.json, agents, &key.system, key.queue))
 }
 
 /// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
-/// again where what it's made of changed: the runners' encoded on the compute pool (a long list of
-/// them is hundreds of microseconds of encoding, more than a shard's step), the overview here (a few
-/// kilobytes). Says when the overview next changes by itself: at the next second of the server's
-/// uptime, which it says.
-pub(crate) async fn make_ahead(hub: &Hub) -> Option<Instant> {
+/// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
+/// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
+/// quantum), the overview here (its counts and a few kilobytes encoded). Says when the overview next changes
+/// by itself: at the next second of the server's uptime, which it says.
+pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     let v = &hub.harness.views;
     if v.agents.asked()
         && let Some(key) = agents_key(hub)
         && !v.agents.holds(&key)
+        && let Err(e) = agents_making(hub, key).await
     {
-        let was = v.agents.now();
-        let list = agents_made(hub, &key);
-        match crate::rt::compute(move || crate::reads::encode(&list)).await {
-            Ok(Ok(made)) => v.agents.keep(&was, key, made),
-            Ok(Err(e)) | Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it"),
-        }
+        tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it");
     }
     if !v.overview.asked() {
         return None;
@@ -3055,16 +3112,40 @@ pub(crate) async fn make_ahead(hub: &Hub) -> Option<Instant> {
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
 /// (goal 10, plan 01a1a87b2dae step 2), made of the runners' rows kept in memory and their live
-/// records: nothing is read from the store or encoded while it's answered. The store's, while the
-/// rows kept are behind it.
+/// records: nothing is read from the store or encoded while it's answered. One that finds it behind what
+/// it's made of (a runner's record changed since its maker's turn) has it made on the compute pool, as its
+/// maker does, nothing of it on the request's shard (step 5: made there, `read /api/agents` held its shard
+/// 0.28 to 0.40 ms on the CPU in rt9's lab). The store's, while the rows kept are behind it.
 async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
     if caller.is_owner() {
         hub.harness.views.start(hub);
-        if let Some(made) = agents_key(hub).and_then(|key| hub.harness.views.agents.answer(key, |k| crate::reads::encode(&agents_made(hub, k))).ok()) {
-            return pre_encoded(made);
+        if let Some(key) = agents_key(hub) {
+            if let Some(made) = hub.harness.views.agents.held(&key) {
+                return pre_encoded(made);
+            }
+            match agents_making(hub, key).await {
+                Ok(made) => return pre_encoded(made),
+                Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made off the shard: the store's answers"),
+            }
         }
     }
     srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await)
+}
+
+/// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
+/// encoded) and kept for the reads after it, unless a making begun after this one's was kept meanwhile (goal 10,
+/// plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
+async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<Bytes> {
+    let was = hub.harness.views.agents.now();
+    let h = Arc::clone(hub);
+    let (key, made) = crate::rt::compute(move || {
+        let made = crate::reads::encode(&agents_made(&h, &key));
+        (key, made)
+    })
+    .await?;
+    let made = made?;
+    hub.harness.views.agents.keep(&was, key, made.clone());
+    Ok(made)
 }
 
 /// What the owner's `GET /api/agents` is made of now: none while the runners' rows kept in memory are
@@ -5495,16 +5576,38 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(crate::harness::copies::EVENTS_PAGE).clamp(1, 1000);
     // From the session's copy when it holds them all: the events' texts as each was written once,
     // neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2), sent in the
-    // pieces they're kept in, nothing inflated or joined for this read (step 5).
-    if let Some(events) = hub.harness.events_page(id, before, limit) {
-        return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events)));
+    // pieces they're kept in, nothing inflated or joined for this read (step 5). On the request's shard
+    // only as the copy keeps them: a compact chunk's texts no read kept yet are inflated on the blocking
+    // pool by the read that needs them first, and kept for the reads after (step 5: inflated on the shard,
+    // they were the lab's slowest read, a poll of `read /api/harness/sessions` 0.8 to 3.6 ms on the CPU).
+    match hub.harness.events_page_kept(id, before, limit) {
+        Ok(events) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
+        Err(crate::harness::copies::Unread::Unkept) => {
+            if let Some(view) = hub.harness.view_held(id) {
+                match crate::rt::blocking(move || view.events_page(before, limit)).await {
+                    Ok(Some(events)) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
+                    // The copy can't say it after all (a chunk spilled meanwhile): the store's.
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!(session = id, error = %format!("{e:#}"), "a page's texts weren't made off the shard: the store answers"),
+                }
+            }
+        }
+        Err(crate::harness::copies::Unread::Cannot) => {}
     }
     let id = id.to_owned();
     crate::reads::trace::asked();
-    let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    // The store's rows read, and written out as the answer, on the blocking pool: none of a page's JSON is read or
+    // written on the request's shard (goal 10, plan 01a1a87b2dae step 5).
+    let made = crate::rt::blocking(move || store.events(&id, before, limit).map(|rows| stored_events(&rows))).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let made = made.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    made.map(pre_encoded).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e:#}")))
+}
+
+/// `GET /api/harness/sessions/{id}/events` as the conversation store's `rows` say it: `{events}`, each row's body read
+/// as JSON (one that isn't is left out) and written out as `srv::json` writes an answer, compact.
+fn stored_events(rows: &[crate::convo::rows::EventRow]) -> anyhow::Result<Bytes> {
     let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
+    crate::reads::encode(&json!({ "events": events }))
 }
 
 #[derive(Deserialize)]
@@ -6344,10 +6447,14 @@ fn pieces_of(bytes: Vec<u8>, first: bool, last: bool) -> impl Iterator<Item = ws
 
 /// A snapshot's next piece as it's packed going out ([`crate::harness::registry::Packing`]), made on the
 /// blocking pool: a place held for the piece, not for the viewer's reading (goal 11, plan 01a1a87b2e56 step 5).
-async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<(crate::harness::registry::Packing, Option<Vec<u8>>)> {
+/// Once it's all out (or its making failed), the snapshot is let go of there too, not on the viewer's shard: it
+/// may be the last to hold what its copy has since let go of (the chunks, meta and state it was taken with),
+/// and a long session's are thousands of allocations to free (goal 10, plan 01a1a87b2dae step 5).
+async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<(Option<crate::harness::registry::Packing>, Option<Vec<u8>>)> {
     let (packing, piece) = crate::rt::blocking(move || {
         let piece = packing.next_piece(SNAPSHOT_PIECE);
-        (packing, piece)
+        let rest = matches!(piece, Ok(Some(_))).then_some(packing);
+        (rest, piece)
     })
     .await?;
     Ok((packing, piece?))
@@ -6365,10 +6472,13 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // 01a1a87b2e56 step 3): past it this attach waits its turn, until one in flight is written out. Made, it's
     // counted as it is, until handed to the socket: a packed one until its last piece goes (its pieces share
     // its buffer), frames as each goes.
-    // Between its pieces the shard goes to its other tasks once this one has had its share of it
-    // (`crate::rt::consume_budget`): a socket that takes each piece at once never made it wait, and a long
-    // session's megabytes went out in one poll, holding its shard's other viewers, owners and requests
-    // 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
+    // Between its frames the shard goes to its other tasks: a socket that takes each piece at once never made it
+    // wait, and a long session's megabytes went out in one poll, holding its shard's other viewers, owners and
+    // requests 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
+    // Its turn ends once its next frame would pass the shard's quantum, whether or not anything else wants the shard
+    // then (`crate::rt::Turns`, and a yield that always yields): a turn given up only where the shard is wanted
+    // (`crate::rt::consume_budget`) goes on past the quantum where it isn't, and the snapshot's longest polls were
+    // 2.4 to 3.5 ms on the CPU in rt9's calm rounds (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum).
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
     if packed {
         // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
@@ -6378,13 +6488,18 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         let (mut packing, mut now) = next_piece(snapshot.packing(&synced())).await?;
         let mut first = true;
         while let Some(piece) = now {
-            let (rest, following) = next_piece(packing).await?;
+            let (rest, following) = match packing.take() {
+                Some(p) => next_piece(p).await?,
+                None => (None, None),
+            };
             packing = rest;
             held.made(piece.capacity().saturating_add(following.as_ref().map_or(0, Vec::capacity)));
             let last = following.is_none();
+            // A turn from here: the piece came in a poll of its own, made on the blocking pool.
+            let mut turns = crate::rt::Turns::new();
             for frame in pieces_of(piece, first, last) {
                 tx.send(frame).await?;
-                crate::rt::consume_budget().await;
+                turn_after(&mut turns).await;
             }
             first = false;
             now = following;
@@ -6393,14 +6508,25 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
     held.made(frames.iter().map(String::capacity).fold(0usize, usize::saturating_add));
+    let mut turns = crate::rt::Turns::new();
     for f in frames {
         let n = f.capacity();
         tx.send(ws::text(f)).await?;
         held.written(n);
-        crate::rt::consume_budget().await;
+        turn_after(&mut turns).await;
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
+}
+
+/// After a frame of a viewer's snapshot: its turn given up once its next frame, as long as the longest this turn,
+/// would take it past the shard's quantum, the shard given to its other tasks whether or not they want it now, and
+/// a turn begun afresh (goal 10, plan 01a1a87b2dae step 5).
+async fn turn_after(turns: &mut crate::rt::Turns) {
+    if turns.over() {
+        hyper_rt::futures::yield_now().await;
+        *turns = crate::rt::Turns::new();
+    }
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
@@ -6502,8 +6628,9 @@ enum Fed {
 }
 
 /// Writes a batch of a session's feed to its viewer's socket `tx` (goal 9, plan 01a1a87b2cec step 5): each frame
-/// the viewer takes is fed to the socket and the batch flushed once, one write for the batch where each frame
-/// was a write of its own (a system call on the shard each). Each frame goes as its payload's own bytes, read
+/// the viewer takes is fed to the socket and the batch flushed once (and at the end of each of its turns on the
+/// shard, should it take more than one), one write for the batch where each frame was a write of its own (a
+/// system call on the shard each). Each frame goes as its payload's own bytes, read
 /// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
 /// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
 /// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
@@ -6515,6 +6642,10 @@ where
     use futures::SinkExt as _;
     let mut fed = 0u64;
     let mut came_to = Fed::Written;
+    // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
+    // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
+    // viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds).
+    let mut turns = crate::rt::Turns::new();
     for m in messages {
         let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
             tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
@@ -6551,6 +6682,11 @@ where
         *have = (*have).max(rev);
         tx.feed(ws::text(said)).await?;
         fed = fed.saturating_add(1);
+        if turns.over() {
+            tx.flush().await?;
+            hyper_rt::futures::yield_now().await;
+            turns = crate::rt::Turns::new();
+        }
     }
     if fed > 0 || came_to == Fed::Closed {
         tx.flush().await?;
@@ -6598,6 +6734,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
+    // The attach's poll ends here, and its snapshot begins in a poll of its own (goal 10, plan 01a1a87b2dae step 5):
+    // the shards' table counts a poll against the last label it set, so an attach's work and its snapshot's first
+    // piece in one poll were the snapshot's, past the quantum, and a poll's hold is the two added.
+    hyper_rt::futures::yield_now().await;
     {
         // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
         let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
@@ -6775,6 +6915,8 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 tx.send(closed()).await?;
                 return Ok(());
             };
+            // As for an attach: what was found and the catch-up's first piece in polls of their own.
+            hyper_rt::futures::yield_now().await;
             {
                 let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
                 crate::rt::labeled(&VIEWER_CATCH_UP, send_snapshot(&mut tx, snapshot, takes.packed)).await?;
@@ -7643,6 +7785,151 @@ mod tests {
                 anyhow::ensure!(Instant::now() < deadline, "the runs' list wasn't kept again");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
+            Ok(())
+        })
+    }
+
+    /// `fut`'s output, and the segments its polls inflated on their own thread (`crate::harness::packed::INFLATED`):
+    /// what a read inflated on its shard.
+    async fn inflated_in<F: Future>(fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut inflated = 0u64;
+        let out = std::future::poll_fn(|cx| {
+            let before = crate::harness::packed::INFLATED.with(std::cell::Cell::get);
+            let polled = fut.as_mut().poll(cx);
+            inflated = inflated.wrapping_add(crate::harness::packed::INFLATED.with(std::cell::Cell::get).wrapping_sub(before));
+            polled
+        })
+        .await;
+        (out, inflated)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a read of a session's newest events whose compact chunk's texts no read
+    /// kept yet inflates nothing on its shard: they're inflated on the blocking pool and kept, and the read after
+    /// takes them as they are; both answer what the copy's page says, byte for byte.
+    #[test]
+    fn g10_s5_an_events_read_inflates_nothing_on_its_shard() -> anyhow::Result<()> {
+        use crate::harness::copies::Unread;
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            // Two chunks' events and nine: the two sealed are packed off the owner's shard and kept compact, and the
+            // newest fifty reach into the second. A chunk's events, from the bound of what a copy keeps packed (two
+            // chunks' at a packed event's bytes).
+            let chunk = crate::harness::copies::PAGE_BYTES / (2 * crate::harness::copies::PACKED_EVENT_BYTES);
+            let n = u64::try_from(2 * chunk + 9)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            // Till its chunks are compact, the page is read from the events themselves.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.events_page_kept("a", None, 50) != Err(Unread::Unkept) {
+                anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = || {
+                let api = Arc::clone(&api);
+                async move {
+                    let (r, inflated) = inflated_in(api.handle(lab_get("/api/harness/sessions/a/events?limit=50")?)).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, inflated))
+                }
+            };
+            let (status, first, inflated) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK && inflated == 0, "the first read: {status}, {inflated} inflated on its shard");
+            anyhow::ensure!(hub.harness.events_page_kept("a", None, 50).is_ok(), "its texts kept for the reads after it");
+            let (status, again, inflated) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK && inflated == 0 && again == first, "the read after: {status}, {inflated} inflated");
+            let copy = hub.harness.events_json("a", None, 50).ok_or_else(|| anyhow::anyhow!("the copy's page"))?;
+            anyhow::ensure!(first == copy.as_ref(), "the copy's page, byte for byte");
+            let events: serde_json::Value = serde_json::from_slice(&first)?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            assert_eq!(seqs, (n - 49..=n).collect::<Vec<u64>>(), "its newest fifty, oldest first");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the conversation store's page of a session's events, now written out on the
+    /// blocking pool (`stored_events`), is the bytes the request's shard wrote: each row's body read as JSON, one that
+    /// isn't left out, as `srv::json` writes an answer.
+    #[test]
+    fn g10_s5_the_stores_events_page_is_written_as_it_was() -> anyhow::Result<()> {
+        let row = |seq: u64, body: &str| crate::convo::rows::EventRow {
+            session: "a".into(),
+            id: format!("e{seq}"),
+            seq,
+            at: 1,
+            parent: None,
+            by: None,
+            kind: "assistant".into(),
+            level: None,
+            tool: None,
+            status: None,
+            text: String::new(),
+            body: body.into(),
+        };
+        let rows = vec![
+            row(1, r#"{"id":"e1","seq":1,"kind":"assistant","text":"the retry loop é \"reads\""}"#),
+            row(2, "not json"),
+            row(3, r#"{ "seq": 3, "id": "e3", "kind": "tool", "input": {"b": 2, "a": [1, 2.50, null]} }"#),
+        ];
+        let made = stored_events(&rows)?;
+        let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+        let was = crate::rt::block_on(async move { body_of(srv::json(StatusCode::OK, &json!({ "events": events }))).await })?;
+        assert_eq!(made.as_ref(), was.as_slice());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&made)?.get("events").and_then(serde_json::Value::as_array).map(Vec::len), Some(2), "the row that isn't JSON left out");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the overview counts its runners from their rows and live records as they're
+    /// kept, none copied, as their list counts them (a row with a live record, connected or not; a row without one; a
+    /// live record without a row), and says the bytes it said when it made their list to count them.
+    #[test]
+    fn g10_s5_the_overview_counts_its_runners_as_their_list_does() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let row = |name: &str, slots: u32| crate::store::AgentRow { name: name.into(), labels: vec![], slots, hostname: name.into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: false, last_seen: 0, enrolled_at: 0 };
+            for (name, slots) in [("box", 4), ("attic", 3), ("shed", 5)] {
+                hub.store.upsert_agent(row(name, slots)).await?;
+            }
+            let live = |name: &str, connected: bool, slots: u32, busy: u32| crate::hub::AgentLive { connected, slots, busy, ..crate::hub::tests::live_runner(name, "linux", "x86_64") };
+            // box: live and connected; attic: no live record; shed: live, not connected; ghost: live with no row.
+            hub.put_agent(live("box", true, 4, 3));
+            hub.put_agent(live("shed", false, 5, 2));
+            hub.put_agent(live("ghost", true, 2, 1));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let key = loop {
+                if let Some(key) = overview_key(&hub) {
+                    break key;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            let rows = &key.rows.1;
+            let list = hub.agent_list_of(rows.rows.clone(), &rows.labels, &rows.machines, &key.live);
+            let counted = RunnerCounts::of_rows(&rows.rows, &key.live);
+            assert_eq!(counted, RunnerCounts::of_list(&list), "as the list counts them");
+            assert_eq!(counted, RunnerCounts { connected: 2, total: 4, slots: 6, busy: 4 });
+            let made = overview_made(&hub, &key)?;
+            // As it was written before (`overview_json` of the runners' list).
+            let (stats, system, (queued, running)) = (&key.stats.1.json, &key.system, key.queue);
+            let was = crate::reads::encode(&json!({
+                "stats": stats,
+                "queue": { "queued": queued, "running": running },
+                "agents": {
+                    "connected": list.iter().filter(|a| a.connected).count(),
+                    "total": list.len(),
+                    "slots": list.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
+                    "busy": list.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
+                },
+                "system": system_of(&hub, system),
+                "sample": system.sample,
+            }))?;
+            assert_eq!(made, was, "the bytes it said when it counted the list");
             Ok(())
         })
     }
