@@ -2374,6 +2374,47 @@ copies its readers don't read (`many` with all but 8 idle, no events reads of th
 - **kiln.db's leaves** (`store::group::Leaves`, W27-R08's): 32 bytes an entry applied, up to 65,536 (2 MiB after
   about 15 minutes of custody's writes; 0.5 MB in a lab round), what a checkpoint runs over: W27's to bound.
 
+### Transparent huge pages off for the server (step 5, part 6)
+
+A transparent huge page makes 2 MiB of anonymous memory resident at the first touch of any byte of it. kiln keeps
+its own memory off them already (jemalloc's `thp:never`, the runtime threads' stacks `MADV_NOHUGEPAGE`); what's left
+asks for them or takes what the machine gives:
+- **turso's buffer pools** (vendor/turso `core/storage/buffer_pool.rs`): each database it opens (the conversation
+  store, records.db) maps two arenas of 3 MiB and advises them `MADV_HUGEPAGE`. In alloc2's musl-jemalloc rounds
+  (smaps at the window's end) the two mappings (6,164 kB each, `VmFlags` `hg`) held 2,064 and 5,760 kB resident,
+  2,048 kB of each in a huge page: 4 MiB of `AnonHugePages`, the server's only ones on the lab's machine, which gives
+  them only where asked (fedora: `madvise`).
+- **Everything else, on production's host**, which gives them to every anonymous mapping (adacachy: `always`,
+  `max_ptes_none` 409): the C libraries' malloc, the stacks of threads the runtime didn't start (jemalloc's
+  background threads, the vendored crates' own), and any other anonymous mapping. alloc2's tree, before the runtime's
+  own stacks were marked, had 92 anonymous mappings neither marked nor advised that hold a whole 2 MiB-aligned range,
+  8.7 MB resident in all: each such range a fault there may make a whole huge page.
+
+`kiln::os::thp`: the server turns them off for its whole process as it starts (`PR_SET_THP_DISABLE`, prctl(2)),
+whatever a mapping asks, so each of these holds the pages it touches. It's what focal does for a bus node
+(`focal_platform::memory::disable_transparent_huge_pages`: a fault in an advised range entered direct compaction for
+70 to 685 ms on a busy host, and with huge pages off the bus's throughput and p99 were both better) and Redis for
+itself (`disable-thp`); Quiver's memory is jemalloc's, kept off them already. The switch is kept across `fork` and
+`execve`, so only a server that starts no runner of its own turns it (`[local_agent] enabled = false`: the lab's
+server, and a server whose runners are machines of their own); the server's own runner's legs and agents keep what
+the machine gives. Its own helpers (git, a render) inherit it. The log says which (`transparent huge pages are off
+for the server's process`, or why they stay). macOS and Windows give no transparent huge pages to turn off.
+
+**The A/B** (one build; `KILN_KEEP_THP=1` keeps them as the machine gives them), 8 rounds calm, production's layout,
+then the same with `--hogs 1x`:
+
+```sh
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a thp --label-b no-thp --env-a KILN_KEEP_THP=1 --server-cpus 16-31 --layout production --rounds 8
+```
+
+Expected: `server.rss_anon_mb` (and `server.rss_mb`) 2 to 4 MB lower on B: the 4 MiB of huge pages less the pages
+turso's caches and writes touch in them (records.db's held 16 kB past its huge page, so nearly all of its 2 MiB
+goes; the conversation store's 3,712 kB past its, so its huge page may be mostly in use). No latency number should
+move: turso's reads and writes run on its own threads and the blocking pool, and its arenas' 4 KiB pages cost them
+TLB reach alone. A round's server (`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host
+the saving is larger and the lab can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and
+after the deploy says it (its kernel makes no huge pages of files: no `READ_ONLY_THP_FOR_FS`, `FileHugePages` 0).
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
