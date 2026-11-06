@@ -85,6 +85,9 @@ hot = [
   # protocol connection runs, and kiln's topics fed from the hub and the bus.
   "crates/kiln-bp/src",
   "crates/kiln/src/bp",
+  # The protocol over one WebSocket (goal 3 of the browser protocol program): its endpoint, its
+  # sockets' task and send path, and the topics' owner.
+  "crates/kiln/src/live",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
   # Turns with no lock: gates, batons, reads and writes, keyed and once (goal 5, plan 01a1a59c2aae, its top goal).

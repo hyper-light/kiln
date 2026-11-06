@@ -628,6 +628,163 @@ The tests, each named for the plan's step it holds:
 | kiln's topics against the core | `crates/kiln/src/bp/tests.rs` |
 | the measurements | `crates/kiln/src/bp/measure.rs`, `crates/kiln-bp/tests/bench.rs`, `ui/e2e/bp-decode.spec.ts` |
 
+## The WebSocket carrier
+
+Goal 3 (plan `01a1a832eb2f711f9c6f51d88effe89d`, research `01a1a832eb3277d69530ea8e97fcbe8e`): the
+protocol over one WebSocket per browser, shared by its tabs, beside today's sockets (which stay as they
+are). `crates/kiln/src/live/` is the server's end, `ui/src/api/bp/{carrier,hub,shared,worker}.ts` the
+browser's.
+
+### Served when declared
+
+`[server] live = true` (or `KILN_LIVE=1`) serves it; until then `/api/live` is not found and `/api/me`
+and `/api/system` say `"live": null`. Served, both say where it is and the versions it speaks:
+`"live": {"path": "/api/live", "ticket": "/api/live/ticket", "versions": ["kiln-bp.1"], "congestion": …}`,
+so a page never tries it on a server that lacks it (the field is optional and additive). Moving the UI
+onto it is goal 9's.
+
+### The handshake
+
+- `POST /api/live/ticket` (the session cookie, or a token, as every request): `{"ticket", "life_ms",
+  "versions", "path"}`, a ticket for the caller, good for one open within 30 s ("The ticket"). The
+  tickets live in an `Rcu` (`crate::rcu`): no lock on the request's path.
+- `GET /api/live`, an HTTP/1.1 upgrade (WebSockets are HTTP/1.1's in kiln: no extended CONNECT,
+  RFC 8441, which Safari lacks and which would put the socket behind the page's own bulk loads):
+  - no credentials: 401, as every request; the route table's `runs.read`, as `/api/events`;
+  - an `Origin` that isn't the server's own (the address it was reached at, its `public_url`, a front
+    door's name): 403. No `Origin` is a client that isn't a browser;
+  - `Sec-WebSocket-Protocol` must name a version this build speaks (`kiln-bp.<n>`): else 400, the
+    versions it speaks in the answer's body and in its `Sec-WebSocket-Protocol`;
+  - the 101 names the version taken and never an extension: permessage-deflate is declined however
+    it's offered (RFC 7692 §8 warns of history-based compression over a secure transport; this
+    protocol compresses by trust class itself, "Compression").
+- Inside, the page opens with its ticket; a ticket minted for another caller is `BadTicket`.
+- `GET /api/live/sockets`: the caller's own protocol sockets as the server holds them (every one for
+  the owner): who, which browser session (a digest of its cookie, the same for every tab), and the
+  numbers below.
+
+Every message both ways is binary and holds goal 2's frames. A text message, or a frame that can't be
+read, is answered and noted as goal 2 says (`Unread`, `kiln_wire_refused_total{wire="bp_up"}`); the
+socket stays open. A request (`Call::Http`) runs as the caller through the API's own authenticated
+routes and checks; its answer is the route's status and body (`Outcome::Reply`). Writes and an agent's
+commands over the protocol are goal 9's: answered `Nack` (`unsupported`).
+
+### The topics' owner
+
+One task per server (`crate::live::owner`) holds every topic's log and goal 2's adapters
+(`crate::bp::Feed`). The hub hands it each event it emits, once, as a typed value (`Hub::emit`); it
+makes the topics' changes once, whatever the sockets, and broadcasts each as one shared `Arc`, which
+each socket filters by the topics it holds. A socket asks it by message how a subscription starts
+(resumed from its cursor, or a snapshot). A change broadcast after a start was made is pushed again;
+the server half drops what it has by revision. Today it carries the hub's events (runs, legs, steps,
+runners, samples, the queue, what changed, the carried events); a session's, a log's and a
+terminal's topics need their feeds wired (goal 9).
+
+### The small send path
+
+What waits, waits in the scheduler, where priorities and coalescing apply (`crate::live::send`):
+
+| Layer | Its bound |
+|---|---|
+| a message | at most a chunk, WebSocket header included: `poll_transmit`'s room is the chunk less 10 B, and the fragment bound that less the 16 B a compressing transmit keeps |
+| tungstenite | write buffer 0 (each message written and flushed as given), at most one message and a control frame |
+| TLS | its send buffer limited to a chunk, per connection (`crate::http::tls`, set as the socket's chunk changes); a message written as one, so no record is larger than it |
+| the writer | the next message only once the last one's flush is done: below the scheduler, at most the message being written (`held`) |
+| the kernel | `TCP_NOTSENT_LOWAT` sized from the path (Linux, macOS) |
+
+The chunk is what the path sends in 25 ms (1,200 B to 16 KiB); the mark is 10 ms of the path (a chunk
+at the least, 128 KiB at the most: today's mark for every other socket), so the kernel wakes the
+writer at half of it and the pipe stays full, and an urgent frame waits behind about that much in the
+kernel. The rate is the kernel's delivery-rate sample (Linux `TCP_INFO`) where the path limited it,
+else the window's. Each socket's task runs at its most urgent frame's overload class (keystrokes and
+the connection's own frames Critical, live state and streams Normal, bulk Background;
+`crate::overload`).
+
+### Congestion control, and the end-to-end window
+
+- **The kernel's.** `[server] browser_congestion = "bbr"` (or `KILN_BROWSER_CONGESTION`; unset by
+  default, the host's own) has each protocol socket ask for it (`TCP_CONGESTION`, Linux). What each
+  got, or why it was refused, is on `GET /api/live/sockets` (`congestion`): `not allowed` (not in
+  `net.ipv4.tcp_allowed_congestion_control`) or `not loaded` (no module), naming the host's step, which
+  is its administrator's; nothing falls back silently. The module's version is read from
+  `/sys/module/tcp_<name>/version`; mainline's `tcp_bbr` declares none (v1).
+- **The protocol's.** The server keeps no more than a window of bytes the page hasn't said it has
+  (`kiln_bp::window`), so every buffer between them (the front door, a socat forwarder, a proxy kiln
+  doesn't run, the bottleneck's queue) together holds at most that window; it's the only lever on
+  macOS and Windows servers. The page says what it has by answering a probe the carrier asks for
+  (`Server::ask_ack`, `Event::Acked`: the bytes received, and the round trip), a quarter-window
+  apart, or at once when the window is full. The window is BBR's model over those acknowledgements:
+  startup at 2.89 times the rate measured times the least round trip until the rate stops growing by
+  a quarter for three rounds; then twice the rate times the least round trip (at least two chunks);
+  every 10 s, nothing more sent until the pipe is empty and one probe goes alone, so the least round
+  trip is the path's (at 50 kbit/s even two chunks queued are 400 ms). hyper-quic's own controllers
+  take packet-level samples they build inside their crate (`RateSample` can't be made outside it),
+  hence this one, small and over bytes. A lost segment holds what follows it back at the page (TCP
+  delivers in order), which the page's acknowledgements can't see past as the kernel's selective ones
+  do: on a lossy fast path the window is smaller than the rate times the round trip, and the lab
+  measures window on against off.
+
+### Relays
+
+The front door (in a runner) ends the browser's TLS and pipes the bytes, so the small buffer has to
+hold there too (`crate::frontdoor::proxy`): its browser-facing socket's unsent bytes at 16 KiB
+(`TCP_NOTSENT_LOWAT`) and the congestion control `KILN_BROWSER_CONGESTION` declares in the runner's
+environment; its upstream socket's receive buffer at 128 KiB, so its kernel can't take megabytes the
+browser hasn't been sent; each direction's pipe 16 KiB. A peered cluster's WebSocket pipe bounds its
+upstream socket the same way. Production's LAN path through socat forwarders with 4 MiB buffers
+defeats all of this until the bare-metal cutover (plan `01a18e073f0c`) removes them; the protocol's
+window still bounds what they hold for its sockets.
+
+### One socket per browser
+
+Whoever holds the Web Lock `kiln-bp-owner` owns the browser's socket: a SharedWorker where the
+browser has one (`worker.ts`), else one tab (Samsung Internet, Android WebView, a worker refused), the
+others queued on the lock and reaching it over a `BroadcastChannel` (`kiln-bp`). The owner's `Hub`
+subscribes once per topic: a tab joining a topic another holds gets the owner's copy as a snapshot,
+then each change once. Each tab keeps its own copy and cursor; when the owner goes (its tab closed,
+the worker ended as Android ends one, a page suspended), the lock passes to the next in line, which
+takes over, and every tab subscribes again from its cursor (resumed: no snapshot while the server's
+log holds what it missed; a change at or below the cursor never applied twice). A worker's tabs queue
+on the lock too, so they learn the moment it dies, with no timer, and start it again. Liveness is
+judged from the server's bytes arriving (goal 2's rule), never from a tab's timers. The owner sends
+while `bufferedAmount` is under a chunk, as the WebSocket API has no backpressure of its own. React
+reads a topic through `useTopic` (`useSyncExternalStore`, as `events.ts` does). The lab's page
+(`KILN_LIVE_LAB`, a folder a lab server serves at `/__live/<file>`, the worker needing the server's
+own origin) uses it now.
+
+### What each platform offers
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| the low-water mark | yes | yes | no (a query, not a threshold) |
+| congestion control per socket | yes, where the host allows it | no (CUBIC) | no (system-wide only) |
+| the socket's own reading | every field (`TCP_INFO`, `SIOCOUTQ`) | RTT, window, segment, retransmitted bytes | RTTs, in flight, window, segment, retransmitted bytes |
+| a handle to the socket's options from a handler | yes (a second descriptor) | yes | no |
+| the end-to-end window | yes | yes | yes |
+
+### Metrics
+
+`kiln_proto_sockets_opened_total`, `kiln_proto_handshakes_refused_total`, `kiln_proto_tickets_total`,
+`kiln_proto_events_dropped_total`, `kiln_proto_sockets`, and per socket (`socket` label):
+`kiln_proto_unsent_bytes`, `kiln_proto_in_flight_bytes` (the kernel's), `kiln_proto_mark_bytes`,
+`kiln_proto_chunk_bytes`, `kiln_proto_window_bytes`, `kiln_proto_unacked_bytes`,
+`kiln_proto_held_bytes`, `kiln_proto_rate_bytes_per_second`, `kiln_proto_min_rtt_ms`,
+`kiln_proto_sent_bytes`, `kiln_proto_retransmitted_bytes`, and `kiln_proto_queued_bytes` by priority.
+
+### Its tests
+
+| What | Where |
+|---|---|
+| congestion control, buffers, the socket's reading and its handle, on Linux, macOS and Windows | `crates/kiln-rt/tests/tcp_streams.rs` (`bp_g3_s1_*`) |
+| the handshake, a subscription and a request through it, a malformed frame, fuzzed upgrades | `crates/kiln/tests/live.rs` |
+| the version taken, the owner's starts | `crates/kiln/src/live/tests.rs` |
+| the chunk and the mark | `crates/kiln/src/live/send.rs` |
+| every message at most a chunk and reassembled; the acknowledgements | `crates/kiln-bp/tests/acks.rs` |
+| the window over 50 kbit/s to 10 Mbit/s, 50 to 800 ms, 0 to 5% loss, a deep queue | `crates/kiln-bp/src/window.rs` |
+| a slow browser behind the front door's pipe | `crates/kiln/src/frontdoor/proxy.rs` (`bp_g3_s5_*`) |
+| the lock fallback with two tabs | `ui/tests/bp-shared.test.ts` |
+| three tabs, one socket, takeovers, in Chromium and WebKit, desktop and phone | `ui/e2e/bp-shared.spec.ts` (`playwright.live.config.ts`, a lab server) |
+
 ## Ada's calls, and what's taken meanwhile
 
 - The crate's name: `kiln-bp`.
