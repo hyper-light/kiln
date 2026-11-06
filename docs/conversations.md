@@ -141,7 +141,8 @@ what it took, and says through where it has it.
   made most of kiln.db's writes. So the server's store, and a mirror's copy, trail by up to a tick
   more. What reads them can spare it: a move off a machine that's gone resumes from the harness's
   record, whose lines reach the runner's store only at the recorder's tick already; the board looks
-  every 5 s; a mirror's copy is read only to restore from.
+  every 5 s; a mirror's copy is read only to restore from. A feed hears of its store's commits only
+  at its store's tip, holding nothing: the commits while it holds, or reads on, wake nothing.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.

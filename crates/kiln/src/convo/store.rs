@@ -295,11 +295,19 @@ enum Msg {
     Close(mpsc::Sender<anyhow::Result<()>>),
 }
 
-/// Who wants to know that something was committed (a feed with nothing left to send waits on it).
-type Watchers = Arc<Mutex<Vec<async_channel::Sender<()>>>>;
+/// Who wants to know that something was committed (a feed at its store's tip waits on it): a notifier each
+/// ([`Store::watch`]). One its feed let go of goes at the next commit.
+type Watchers = Arc<Mutex<Vec<Arc<crate::rt::Notify>>>>;
 
 fn notify(watchers: &Watchers) {
-    watchers.lock().unwrap_or_else(PoisonError::into_inner).retain(|w| !matches!(w.try_send(()), Err(async_channel::TrySendError::Closed(_))));
+    watchers.lock().unwrap_or_else(PoisonError::into_inner).retain(|w| {
+        // Its feed holds it as long as it's there.
+        let kept = Arc::strong_count(w) > 1;
+        if kept {
+            w.notify();
+        }
+        kept
+    });
 }
 
 /// What waits for the writer, in bytes, and the most it may hold (goal 11, plan 01a1a87b2e56 step 3).
@@ -693,12 +701,15 @@ impl Store {
         self.run(|_| Ok(()))
     }
 
-    /// Woken (once, however many commits came) after a commit: what a feed with nothing left to
-    /// send waits on.
-    pub fn watch(&self) -> async_channel::Receiver<()> {
-        let (tx, rx) = async_channel::bounded(1);
-        self.watchers.lock().unwrap_or_else(PoisonError::into_inner).push(tx);
-        rx
+    /// Told of each commit: what a feed at its store's tip waits on (`super::feed`). A commit while no one waits
+    /// leaves one notification however many came ([`crate::rt::Notify`]), waking nothing, so a feed holding what
+    /// came, which waits on its link and its hold alone, is woken by none of the commits meanwhile (goal 9, plan
+    /// 01a1a87b2cec step 5: a task of the feed's took each commit's word through a channel of its own and passed it
+    /// on, two tasks woken for every commit, 20 a second while its store takes writes).
+    pub fn watch(&self) -> Arc<crate::rt::Notify> {
+        let commits = Arc::new(crate::rt::Notify::new());
+        self.watchers.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::clone(&commits));
+        commits
     }
 }
 
