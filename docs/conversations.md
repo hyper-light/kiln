@@ -78,8 +78,9 @@ C, no SIMD, no FTS.
   it did without one.
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
   commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  batch reaches `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
-  never by lock.
+  flush brings `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
+  never by lock. While a batch gathers, what's flushed waits for it without waking the writer; a
+  read, a take, a close or a flush of `COMMIT_ROWS` rouses it.
 - **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
   came after a number (see Replication). Each reset of a session's events is a row of its own in
   `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line
@@ -141,7 +142,8 @@ what it took, and says through where it has it.
   made most of kiln.db's writes. So the server's store, and a mirror's copy, trail by up to a tick
   more. What reads them can spare it: a move off a machine that's gone resumes from the harness's
   record, whose lines reach the runner's store only at the recorder's tick already; the board looks
-  every 5 s; a mirror's copy is read only to restore from.
+  every 5 s; a mirror's copy is read only to restore from. A feed hears of its store's commits only
+  at its store's tip, holding nothing: the commits while it holds, or reads on, wake nothing.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.

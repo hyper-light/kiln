@@ -233,9 +233,24 @@ pub struct ShipStats {
     /// Hellos said: when the link came up, and when the taker said nothing for too long.
     hellos: AtomicU64,
     stalls: AtomicU64,
+    /// Its loop's wakes (a test's).
+    #[cfg(test)]
+    wakes: AtomicU64,
 }
 
 impl ShipStats {
+    /// Its loop woke (a test's).
+    #[cfg(test)]
+    pub fn woke(&self) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Its loop's wakes so far (a test's).
+    #[cfg(test)]
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Relaxed)
+    }
+
     pub fn link(&self, up: bool) {
         self.up.store(up, Ordering::Relaxed);
         if !up {
