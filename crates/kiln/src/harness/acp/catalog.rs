@@ -267,22 +267,34 @@ mod tests {
     #[test]
     fn a_deadline_keeps_the_catalog_without_guessing_unanswered_models_efforts() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let dir = tempfile::tempdir()?;
-            let program = agent(dir.path(), &[
-                json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
-                json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "catalog", "configOptions": [
-                    {"id": "model", "category": "model", "type": "select", "currentValue": "default", "options": [{"value": "default", "name": "Default"}, {"value": "unknown", "name": "Unknown"}]},
-                    {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}
-                ]}}),
-            ])?;
-            // The deadline is the whole session's: the handshake within it, then the switch to
-            // "unknown" that this agent never answers takes the rest. 200 ms wasn't room for the
-            // handshake under a loaded gate on fedora (2026-10-29: "did not answer in time").
-            let models = discover(program, Duration::from_secs(2), &dir.path().join("user-config.json")).await?;
-            assert_eq!(models.iter().find(|m| m.default).map(|m| m.efforts.clone()), Some(vec!["high".into()]));
-            assert!(models.iter().find(|m| m.id == "unknown").is_some_and(|m| m.efforts.is_empty()));
-            cleaned(dir.path())?;
-            Ok(())
+            // The deadline is the whole session's: the handshake within it, then the switch to "unknown" that this
+            // agent never answers takes the rest. What's tested is a deadline that passes there, during the switch.
+            // How long the handshake takes is a loaded machine's pace (200 ms, then 2 s, weren't room for it under a
+            // loaded gate on fedora and on adacachy: "did not answer in time"), so a deadline that passed before the
+            // handshake was done (nothing learned) tested nothing: it's given again, twice as long, until one passes
+            // after it, up to a hang's bound. Each deadline waits itself out once, so a calm machine takes 2 s, as before.
+            let mut deadline = Duration::from_secs(2);
+            loop {
+                let dir = tempfile::tempdir()?;
+                let program = agent(dir.path(), &[
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
+                    json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "catalog", "configOptions": [
+                        {"id": "model", "category": "model", "type": "select", "currentValue": "default", "options": [{"value": "default", "name": "Default"}, {"value": "unknown", "name": "Unknown"}]},
+                        {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}
+                    ]}}),
+                ])?;
+                let models = match discover(program, deadline, &dir.path().join("user-config.json")).await {
+                    Err(e) if format!("{e:#}").contains("did not answer in time") && deadline < Duration::from_secs(256) => {
+                        deadline *= 2;
+                        continue;
+                    }
+                    models => models?,
+                };
+                assert_eq!(models.iter().find(|m| m.default).map(|m| m.efforts.clone()), Some(vec!["high".into()]));
+                assert!(models.iter().find(|m| m.id == "unknown").is_some_and(|m| m.efforts.is_empty()));
+                cleaned(dir.path())?;
+                return Ok(());
+            }
         })
     }
 
