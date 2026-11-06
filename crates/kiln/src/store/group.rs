@@ -1466,6 +1466,65 @@ mod tests {
         })
     }
 
+    /// Goal 11's audit, row B21: kiln.db's commits never wait on the cluster log's device. A learner back from away
+    /// (a runner reconnecting) past what the log's cache holds of a group is caught up from the log's file, and the
+    /// read holds the log's device (one job at a time) and the group's thread (its fetch waits on it) while it's out,
+    /// so the log's next frame waits behind it. kiln.db's commit doesn't: the writer commits to kiln.db, hands the
+    /// change to the group's queue, [`QUEUED`] deep, and answers; only a queue that full makes a write wait. Here
+    /// the group's thread is held (the leaves' lock, which it takes to apply each entry, before any SQLite work)
+    /// while writes are made, standing in for a read of any length on its device: each is answered while it's
+    /// held, no slower than with the log free, and the log takes them all once it's let go. The times are printed.
+    #[test]
+    fn g11_b21_kiln_db_commits_are_answered_while_the_cluster_log_is_held() -> anyhow::Result<()> {
+        const WRITES: usize = 64;
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        server.flush_group()?;
+        let g = server.group().context("grouped")?;
+        let timed = |what: &str| -> anyhow::Result<Vec<Duration>> {
+            let (tx, rx) = mpsc::channel();
+            let s = server.clone();
+            let what = what.to_owned();
+            let writes = thread::spawn(move || {
+                for i in 0..WRITES {
+                    let began = Instant::now();
+                    let done = set(&s, &format!("{what}{i}"), "x").map(|()| began.elapsed());
+                    if tx.send(done.map_err(|e| format!("{e:#}"))).is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut took = Vec::new();
+            for _ in 0..WRITES {
+                let done = rx.recv_timeout(Duration::from_secs(30)).map_err(|_| anyhow::anyhow!("a write to kiln.db waited on the cluster log"))?;
+                took.push(done.map_err(|e| anyhow::anyhow!(e))?);
+            }
+            writes.join().map_err(|_| anyhow::anyhow!("the writes' thread panicked"))?;
+            took.sort();
+            Ok(took)
+        };
+        let free = timed("free")?;
+        let held = g.leaves.lock();
+        let applied = g.standing().1;
+        let while_held = timed("held")?;
+        anyhow::ensure!(g.standing().1 <= applied.saturating_add(1), "the group applied past the held lock: {} after {applied}", g.standing().1);
+        drop(held);
+        server.flush_group()?;
+        anyhow::ensure!(g.standing().1 >= applied.saturating_add(WRITES as u64), "the log took every write once let go: {} after {applied}", g.standing().1);
+        let at = |t: &[Duration], q: usize| t.get(t.len().saturating_sub(1) * q / 100).copied().unwrap_or_default();
+        eprintln!(
+            "B21: {WRITES} kiln.db commits each, p50/p99/max: the log free {:?}/{:?}/{:?}; the group's thread held {:?}/{:?}/{:?}",
+            at(&free, 50),
+            at(&free, 99),
+            at(&free, 100),
+            at(&while_held, 50),
+            at(&while_held, 99),
+            at(&while_held, 100)
+        );
+        Ok(())
+    }
+
     #[test]
     fn writes_through_the_group_are_numbered_and_reads_write_nothing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
