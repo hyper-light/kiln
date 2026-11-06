@@ -13,6 +13,10 @@ use super::node::{self, Config, Handle, In};
 use super::relay::{Announce, Frame, Relay};
 use crate::proto::{AgentMsg, ServerMsg};
 
+/// What a test here waits for at the most, a hang's bound and never a pace: a loaded machine's handshakes, runs,
+/// links and the output that goes over them take what time they take (60 s and 20 s ran out under load).
+const HANG: Duration = Duration::from_secs(300);
+
 /// What the test does to the "server".
 enum Ctl {
     /// Drop a runner's connection (its links close; it hears the server went).
@@ -189,7 +193,7 @@ async fn run_from(lab: &Lab, me: &'static str, req: RunReq, mid: impl Fn(&Ev) ->
     crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
     let mut evs = Vec::new();
     loop {
-        match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
+        match crate::rt::timeout(HANG, ev_rx.recv()).await {
             Ok(Ok(e)) => {
                 if let Some(c) = mid(&e) {
                     lab.ctl.send(c).await?;
@@ -252,18 +256,21 @@ fn an_agents_question_for_the_server_goes_through_its_runner_and_back() -> anyho
             assert_eq!(v.pointer("/ok/input/limit"), Some(&serde_json::json!(2)));
             assert_eq!(v.pointer("/ok/session"), Some(&serde_json::json!("s1")));
         }
-        // Away from the server: refused at once, not left to wait.
+        // Away from the server: refused at once, not left to wait. Until mac's node takes the drop its questions
+        // are answered, and one on its way as it takes it is answered as dropped: neither is the refusal, and how
+        // long the drop takes to reach the node is a loaded machine's pace. Each question's bound only ends a
+        // hang, and so does the whole wait's.
         lab.ctl.send(Ctl::Drop("mac")).await?;
-        let mut refused = None;
-        for _ in 0..50 {
-            match lab.mac.query(ask.to_string()).await {
-                Err(e) => {
-                    refused = Some(format!("{e:#}"));
-                    break;
-                }
-                Ok(_) => crate::rt::sleep(Duration::from_millis(20)).await,
+        let until = std::time::Instant::now() + HANG;
+        let refused = loop {
+            let asked = crate::rt::timeout(HANG, lab.mac.query(ask.to_string())).await.map_err(|_| anyhow::anyhow!("a question away from the server was left to wait"))?;
+            match asked.map_err(|e| format!("{e:#}")) {
+                Err(e) if !e.contains("dropped before it answered") => break Some(e),
+                _ if std::time::Instant::now() >= until => break None,
+                _ => {}
             }
-        }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        };
         assert!(refused.as_deref().is_some_and(|e| e.contains("not connected")), "{refused:?}");
         Ok(())
     })
@@ -795,7 +802,7 @@ fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_e
         // Mac sends linux a message of a kind no runner has (variant 99) on its link.
         lab.mac.garble("linux", vec![0, 0, 0, 1, 99]).await;
         let (from, said) = loop {
-            let (from, m) = crate::rt::timeout(Duration::from_secs(20), lab.said.recv()).await??;
+            let (from, m) = crate::rt::timeout(HANG, lab.said.recv()).await??;
             if matches!(m, AgentMsg::LinkUnread { .. }) {
                 break (from, m);
             }
@@ -808,7 +815,7 @@ fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_e
         }
         // Mac was answered Unread, and its link ended on that word, not on a close alone; linux's
         // link to mac goes on.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + HANG;
         while link_to(&lab.mac, "linux").await? == garbled && std::time::Instant::now() < deadline {
             crate::rt::sleep(Duration::from_millis(50)).await;
         }
@@ -956,12 +963,12 @@ async fn start_then_leave(lab: &Lab, me: &'static str, req: RunReq) -> anyhow::R
     let handle = if me == "mac" { lab.mac.clone() } else { lab.linux.clone() };
     crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
     loop {
-        match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
+        match crate::rt::timeout(HANG, ev_rx.recv()).await {
             Ok(Ok(Ev::Started { .. })) => break,
             Ok(Ok(e @ (Ev::Exit { .. } | Ev::Error(_)))) => anyhow::bail!("it ended before its client went: {e:?}"),
             Ok(Ok(_)) => {}
             Ok(Err(_)) => anyhow::bail!("its events ended before it started"),
-            Err(_) => anyhow::bail!("it didn't start in 60 s"),
+            Err(_) => anyhow::bail!("it didn't start in {HANG:?}"),
         }
     }
     drop(ctl_tx);
@@ -969,18 +976,47 @@ async fn start_then_leave(lab: &Lab, me: &'static str, req: RunReq) -> anyhow::R
     Ok(())
 }
 
-/// What `path` holds once it holds something, within `within`.
-async fn appears(path: &std::path::Path, within: Duration) -> Option<String> {
-    let until = std::time::Instant::now() + within;
-    while std::time::Instant::now() < until {
-        if let Ok(s) = std::fs::read_to_string(path)
+/// What `done` holds once [`past_the_buffer`]'s command wrote it: given up on only once the MiB it notes it wrote
+/// (`moved`, beside `done`) stand still for [`HANG`], so a run held up stops the wait and one a loaded machine runs
+/// slowly never does. Its output gives way 8 MiB a node's tick (1 s) once it's held up: 60 s for all of it ran out
+/// under load, ticks and all far behind.
+async fn finishes(done: &std::path::Path) -> Option<String> {
+    let moved = moved_beside(done);
+    let (mut last, mut still_since) = (String::new(), std::time::Instant::now());
+    loop {
+        if let Ok(s) = std::fs::read_to_string(done)
             && !s.is_empty()
         {
             return Some(s);
         }
+        let now = std::fs::read_to_string(&moved).unwrap_or_default();
+        if now != last {
+            (last, still_since) = (now, std::time::Instant::now());
+        } else if still_since.elapsed() >= HANG {
+            return None;
+        }
         crate::rt::sleep(Duration::from_millis(100)).await;
     }
-    None
+}
+
+/// Where [`past_the_buffer`]'s command notes the MiB it wrote: beside `done`.
+fn moved_beside(done: &std::path::Path) -> std::path::PathBuf {
+    done.with_file_name("moved")
+}
+
+/// Until `ok` holds, looking every 50 ms, up to [`HANG`]: a wait on the condition, which a loaded machine takes
+/// what time it takes to meet (counted rounds of 20 ms and 50 ms, 2 s and 10 s all told, were a pace).
+async fn eventually<F: std::future::Future<Output = anyhow::Result<bool>>>(mut ok: impl FnMut() -> F) -> anyhow::Result<bool> {
+    let until = std::time::Instant::now() + HANG;
+    loop {
+        if ok().await? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        crate::rt::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A count a runner's node gives of `peer` now (`runs`, `detached`), as its status says.
@@ -996,12 +1032,18 @@ async fn serving(h: &Handle) -> anyhow::Result<u64> {
     Ok(s.get("serving").and_then(serde_json::Value::as_array).map(|a| a.iter().filter_map(|x| x.get("runs").and_then(serde_json::Value::as_u64)).sum()).unwrap_or(0))
 }
 
-/// Shell text that waits for `go`, fills the node and pipe-reader queues, then writes `done`.
-/// W24 M0 step 4's gate: 20 MB fits in the node's 16 MiB plus the pipe reader's 256 x 64 KiB
-/// queue, so the command could finish before any unread output had to give way.
+/// Shell text that waits for `go`, fills the node and pipe-reader queues a MiB at a time (noting each MiB written
+/// beside `done`, [`moved_beside`]), then writes `done`. W24 M0 step 4's gate: 20 MB fits in the node's 16 MiB plus
+/// the pipe reader's 256 x 64 KiB queue, so the command could finish before any unread output had to give way.
 fn past_the_buffer(go: &std::path::Path, done: &std::path::Path) -> String {
-    let bytes = node::BUFFER.saturating_mul(4);
-    format!("until [ -e '{}' ]; do sleep 0.1; done; head -c {bytes} /dev/zero; echo done > '{}'", go.display(), done.display())
+    let mib = node::BUFFER.saturating_mul(4) >> 20;
+    let moved = moved_beside(done);
+    format!(
+        "until [ -e '{}' ]; do sleep 0.1; done; i=0; while [ $i -lt {mib} ]; do head -c 1048576 /dev/zero; i=$((i+1)); echo $i > '{}'; done; echo done > '{}'",
+        go.display(),
+        moved.display(),
+        done.display()
+    )
 }
 
 /// `kiln run --detach` (docs/reach.md §4.2): once its client went, the run is followed on alone by
@@ -1016,14 +1058,8 @@ fn a_detached_run_goes_on_after_its_client_followed_on_alone() -> anyhow::Result
         let dir = tempfile::tempdir()?;
         let (go, done) = (dir.path().join("go"), dir.path().join("done"));
         start_then_leave(&lab, "mac", RunReq { target: "linux".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
-        let mut alone = false;
-        for _ in 0..100 {
-            if count_of(&lab.mac, "linux", "detached").await? == 1 {
-                alone = true;
-                break;
-            }
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
+        let l = &lab;
+        let alone = eventually(|| async move { anyhow::Ok(count_of(&l.mac, "linux", "detached").await? == 1) }).await?;
         anyhow::ensure!(alone, "mac stopped following the run when its client went");
         anyhow::ensure!(count_of(&lab.mac, "linux", "runs").await? == 1);
         anyhow::ensure!(lab.mac.busy() == 0, "a detached run would hold mac's upgrade");
@@ -1033,26 +1069,16 @@ fn a_detached_run_goes_on_after_its_client_followed_on_alone() -> anyhow::Result
         lab.ctl.send(Ctl::Drop("mac")).await?;
         crate::rt::sleep(Duration::from_millis(500)).await;
         lab.ctl.send(Ctl::Back("mac")).await?;
-        let mut again = false;
-        for _ in 0..200 {
-            let now = link_to(&lab.mac, "linux").await?;
-            if now.is_some() && now != before {
-                again = true;
-                break;
-            }
-            crate::rt::sleep(Duration::from_millis(50)).await;
-        }
+        let was = &before;
+        let again = eventually(|| async move {
+            let now = link_to(&l.mac, "linux").await?;
+            anyhow::Ok(now.is_some() && now != *was)
+        })
+        .await?;
         anyhow::ensure!(again, "mac didn't link to linux again for the detached run");
         std::fs::write(&go, b"")?;
-        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the detached run never got past its output");
-        let mut forgotten = false;
-        for _ in 0..200 {
-            if count_of(&lab.mac, "linux", "runs").await? == 0 && serving(&lab.linux).await? == 0 {
-                forgotten = true;
-                break;
-            }
-            crate::rt::sleep(Duration::from_millis(50)).await;
-        }
+        anyhow::ensure!(finishes(&done).await.as_deref() == Some("done\n"), "the detached run never got past its output");
+        let forgotten = eventually(|| async move { anyhow::Ok(count_of(&l.mac, "linux", "runs").await? == 0 && serving(&l.linux).await? == 0) }).await?;
         anyhow::ensure!(forgotten, "the ended run was kept on one side");
         Ok(())
     })
@@ -1071,7 +1097,7 @@ fn a_detached_run_whose_asker_never_comes_back_goes_on_its_unread_output_giving_
         start_then_leave(&lab, "mac", RunReq { target: "linux".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
         lab.ctl.send(Ctl::Drop("mac")).await?;
         std::fs::write(&go, b"")?;
-        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the run waited on output nobody will read");
+        anyhow::ensure!(finishes(&done).await.as_deref() == Some("done\n"), "the run waited on output nobody will read");
         Ok(())
     })
 }
@@ -1104,7 +1130,7 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
                 }
             }
         };
-        crate::rt::timeout(Duration::from_secs(60), started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not start"))??;
+        crate::rt::timeout(HANG, started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not start"))??;
         // Asked as a runner from before asks a detached run, then let go of.
         let (says, _said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;
@@ -1114,7 +1140,7 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         anyhow::ensure!(count_of(&lab.mac, "linux", "runs").await? == 1, "the asker still followed the detached run");
         let t = std::time::Instant::now();
         std::fs::write(&go, b"")?;
-        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the run waited on output its asker never takes");
+        anyhow::ensure!(finishes(&done).await.as_deref() == Some("done\n"), "the run waited on output its asker never takes");
         anyhow::ensure!(t.elapsed() >= Duration::from_secs(8), "it gave way with a link up before 10 s: {:?}", t.elapsed());
         let ended = lab.ended.lock().clone();
         anyhow::ensure!(ended.is_empty(), "the link did not stay up: {ended:?}");
@@ -1134,7 +1160,7 @@ fn a_detached_run_on_its_own_machine_goes_on_after_its_client() -> anyhow::Resul
         let (go, done) = (dir.path().join("go"), dir.path().join("done"));
         start_then_leave(&lab, "mac", RunReq { target: "mac".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
         std::fs::write(&go, b"")?;
-        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the detached run stopped with its client");
+        anyhow::ensure!(finishes(&done).await.as_deref() == Some("done\n"), "the detached run stopped with its client");
         Ok(())
     })
 }
