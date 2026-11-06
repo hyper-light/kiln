@@ -1,5 +1,5 @@
-//! Runners' custody records, taken off the hub's loop (docs/ci.md W27-R08; goal 9, plan 01a1a87b2cec step 3). Each record
-//! a runner process sends (`crate::proto::AgentMsg::Custody`) is handed by the hub's loop, its JSON not yet read
+//! Runners' custody records, taken off the hub's control loop (docs/ci.md W27-R08; goal 9, plan 01a1a87b2cec step 3). Each record
+//! a runner process sends (`crate::proto::AgentMsg::Custody`) is handed by the hub's control loop, its JSON not yet read
 //! (`crate::wire::payload::Later`), to the one task that reads, checks and keeps runners' records ([`intake_loop`]), which
 //! takes each in turn, in the order they came: every record kept or refused as it was ([`super::on_runner`]), none let go.
 //! The hub's loop read each into a JSON tree on its shard (train 16's lab, g9p16: its polls labeled `runner
@@ -13,11 +13,11 @@ use crate::hub::Hub;
 use crate::instances::PeerId;
 
 /// The bytes of runners' custody records waiting for the intake, at the most: as many as the hub's queue of runner events
-/// they came off holds (`crate::net::EVENTS_BYTES`, one connection's receive window). At the bound the hub's loop waits,
+/// they came off holds (`crate::net::EVENTS_BYTES`, one connection's receive window). At the bound the control loop waits,
 /// and behind it the net thread and QUIC's flow control: no record is let go.
 pub const RECORDS_BYTES: usize = crate::net::EVENTS_BYTES;
 
-/// A custody record runner process `peer` sent, as the hub's loop hands it to the intake: the machine it's of, the
+/// A custody record runner process `peer` sent, as the hub's control loop hands it to the intake: the machine it's of, the
 /// process it came over as that was named when it came (none: one the server doesn't know), and the record, read where
 /// it's taken.
 pub struct Sent {
@@ -34,7 +34,7 @@ impl crate::memory::queue::Weigh for Sent {
     }
 }
 
-/// Runners' custody records on their way to the one task that takes them ([`intake_loop`]): what the hub's loop hands it,
+/// Runners' custody records on their way to the one task that takes them ([`intake_loop`]): what the hub's control loop hands it,
 /// in the order it came, and that task's end of it, for the first to ask ([`Intake::starting`]).
 pub struct Intake {
     tx: crate::memory::queue::Sender<Sent>,
@@ -84,7 +84,7 @@ mod tests {
     use crate::proto::{AgentMsg, CAP_UNREAD, CAP_WIRE, LANE_TERM, ServerMsg};
     use crate::wire::unread::{Code, Wire};
 
-    /// Goal 9, plan 01a1a87b2cec step 3: a runner's custody records are read, checked and kept off the hub's loop by custody's
+    /// Goal 9, plan 01a1a87b2cec step 3: a runner's custody records are read, checked and kept off the hub's control loop by custody's
     /// intake, one at a time in the order the runner sent them, each taken as having come over its process's connection;
     /// one that isn't JSON is refused to its runner and noted, as where its frame was read; and the intake's task is one,
     /// started with the first record.

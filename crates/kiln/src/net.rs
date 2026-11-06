@@ -308,6 +308,9 @@ pub struct QuicSample {
     pub frames_dropped: u64,
     /// Endpoint responses dropped at their bound, since then.
     pub responses_dropped: u64,
+    /// Frames whose buffer no spare held, allocated or grown on the net thread, since then (goal 11's audit,
+    /// row B22: `crate::net_budget::Spares::fresh`).
+    pub frames_allocated: u64,
     /// Each peer with a connection: its name, its path now and what its connection counted.
     pub peers: Vec<PeerSample>,
 }
@@ -349,6 +352,7 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> 
         streams_refused: st.streams_refused,
         frames_dropped: st.frames_dropped,
         responses_dropped: st.responses_dropped,
+        frames_allocated: ep.budget().fresh(),
         peers: Vec::new(),
     };
     ep.directory().each(&mut |peer, name| {
@@ -584,8 +588,9 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
-/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
+/// The bytes of transport events the net thread hands its owner (the server's hub loops, `crate::wire::fan`;
+/// a runner's one loop) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`WINDOW`]), what the
 /// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
 /// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
 /// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
@@ -843,8 +848,8 @@ macro_rules! with_driver {
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
-    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares as many and as large as its frames have had out at once (goal 11's audit, row B22: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 });
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {

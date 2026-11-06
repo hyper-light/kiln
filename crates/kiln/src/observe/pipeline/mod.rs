@@ -172,8 +172,8 @@ fn invalid(s: impl Into<String>) -> PipelineError {
 /// A processor compiled.
 #[derive(Debug)]
 enum Proc {
-    /// Its rules compiled when a record first reaches them (`grok::Lazy`).
-    Grok { source: String, grok: grok::Lazy },
+    /// Its rules compiled as the pipeline is made (`grok::Kept`).
+    Grok { source: String, grok: grok::Kept },
     Date(Vec<String>),
     Status(Vec<String>),
     Service(Vec<String>),
@@ -269,7 +269,7 @@ fn compile(name: &str, filter: &FilterDef, processors: &[ProcessorDef], depth: u
         let at = |e: String| invalid(format!("processor {} ({}): {e}", i + 1, if p.name.is_empty() { "unnamed" } else { &p.name }));
         let nonempty = |v: &[String], what: &str| if v.iter().any(|s| !s.trim().is_empty()) { Ok(v.to_vec()) } else { Err(at(format!("{what}: an attribute at the least"))) };
         procs.push(match &p.kind {
-            KindDef::GrokParser { source, grok, .. } => Proc::Grok { source: source.clone(), grok: grok::Lazy::new(&grok.match_rules, &grok.support_rules).map_err(|e| at(e.to_string()))? },
+            KindDef::GrokParser { source, grok, .. } => Proc::Grok { source: source.clone(), grok: grok::Kept::new(&grok.match_rules, &grok.support_rules).map_err(|e| at(e.to_string()))? },
             KindDef::DateRemapper { sources } => Proc::Date(nonempty(sources, "sources")?),
             KindDef::StatusRemapper { sources } => Proc::Status(nonempty(sources, "sources")?),
             KindDef::ServiceRemapper { sources } => Proc::Service(nonempty(sources, "sources")?),
@@ -658,8 +658,7 @@ fn run<R: Target>(p: &Proc, r: &mut R, now_ns: i64, s: &mut Scratch) {
             // Read where it is: what a rule extracts is its own, every attribute of it read before
             // any is set (one may be the attribute it read).
             let Some(value) = r.get(source) else { return };
-            let Some(grok) = grok.get() else { return };
-            if grok.parse_with(value, now_ns, &mut s.grok, &mut s.out).is_some() {
+            if grok.get().parse_with(value, now_ns, &mut s.grok, &mut s.out).is_some() {
                 r.put(&s.out);
             }
         }
@@ -946,8 +945,7 @@ mod tests {
                     // Read where it is: what a rule extracts is its own, every attribute of it read before
                     // any is set (one may be the attribute it read).
                     let Some(value) = get(r, source) else { return };
-                    let Some(grok) = grok.get() else { return };
-                    if grok::before::parse(grok, value, now_ns, &mut s.grok, &mut s.attrs).is_some() {
+                    if grok::before::parse(grok.get(), value, now_ns, &mut s.grok, &mut s.attrs).is_some() {
                         r.attrs.reserve(s.attrs.len());
                         for (k, v) in s.attrs.drain(..) {
                             put(r, Cow::Owned(k), v);
@@ -1214,24 +1212,28 @@ mod tests {
         assert!(parsed > lines.len(), "{parsed} records a pipeline parsed, of {} lines", lines.len());
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: a pipeline's grok rules are compiled when a record first reaches
-    /// them, not as the pipeline is made: kiln's own (nginx's, Apache's) stay uncompiled while no such log
-    /// comes, and a record of its source compiles them once and is parsed as before.
+    /// Goal 11's audit, row B23: a pipeline's grok rules are compiled as it's made, and no record compiles them:
+    /// a shard taking a record of each of kiln's own pipelines compiles nothing and parses both as before.
+    /// Compiled when a record first reached them (59e6d3318de), the first record of each compiled its rules on
+    /// the shard that took it. Counted on /metrics as they're made: each rule at its lazy DFA's capacity.
     #[test]
-    fn g11_s3_grok_rules_are_compiled_when_a_record_first_reaches_them() {
-        let made = |p: &Pipeline| p.procs.iter().any(|q| matches!(q, Proc::Grok { grok, .. } if grok.made()));
-        let pipelines: Vec<Pipeline> = builtin::all().into_iter().map(|(_, d)| d.compile().unwrap()).collect();
-        assert!(pipelines.iter().all(|p| !made(p)), "compiled as they were made");
-        let record = |source: &str| Record { source: source.into(), message: r#"203.0.113.5 - frank [18/Oct/2026:12:00:00 +0000] "GET /index.html HTTP/1.0" 200 2326"#.into(), ..Record::default() };
-        let mut s = Scratch::default();
-        let mut other = record("kiln");
-        apply_all(&pipelines, &mut other, 0, &mut s);
-        assert!(pipelines.iter().all(|p| !made(p)), "a record no pipeline takes compiled them");
-        let mut r = record("nginx");
-        apply_all(&pipelines, &mut r, 0, &mut s);
-        assert_eq!(pipelines.iter().map(made).collect::<Vec<_>>(), [true, false], "nginx's alone, once a record of its reached it");
-        assert!(r.attrs.iter().any(|(k, v)| k == "http.status_code" && v == "200"), "parsed: {:?}", r.attrs);
-        // Counted on /metrics as they're compiled: each rule at its lazy DFA's capacity (regex says no less).
-        assert!(crate::memory::owners::GROK_DFA.bytes() >= crate::observe::pipeline::grok::LAZY_DFA, "{}", crate::memory::owners::GROK_DFA.bytes());
+    fn g11_b23_no_record_compiles_grok_rules_on_the_shard_that_takes_it() -> anyhow::Result<()> {
+        let pipelines = builtin::all().into_iter().map(|(_, d)| d.compile()).collect::<Result<Vec<Pipeline>, _>>()?;
+        anyhow::ensure!(crate::memory::owners::GROK_DFA.bytes() >= grok::LAZY_DFA, "{}", crate::memory::owners::GROK_DFA.bytes());
+        crate::rt::block_on(async move {
+            anyhow::ensure!(crate::rt::on_shard(), "taken on a shard");
+            let before = grok::COMPILED_HERE.with(std::cell::Cell::get);
+            let mut s = Scratch::default();
+            let mut parsed = Vec::new();
+            for source in ["kiln", "nginx", "apache"] {
+                let mut r = Record { source: source.into(), message: r#"203.0.113.5 - frank [18/Oct/2026:12:00:00 +0000] "GET /index.html HTTP/1.0" 200 2326"#.into(), ..Record::default() };
+                apply_all(&pipelines, &mut r, 0, &mut s);
+                parsed.push(r.attrs.iter().any(|(k, v)| k == "http.status_code" && v == "200"));
+            }
+            let compiled = grok::COMPILED_HERE.with(std::cell::Cell::get).saturating_sub(before);
+            anyhow::ensure!(compiled == 0, "{compiled} rule sets compiled on the shard that took the records");
+            anyhow::ensure!(parsed == [false, true, true], "parsed as before, by the pipeline of each record's source: {parsed:?}");
+            Ok(())
+        })
     }
 }

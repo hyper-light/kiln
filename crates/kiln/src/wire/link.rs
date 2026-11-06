@@ -16,16 +16,18 @@ use super::uplink::key_of;
 use crate::rcu::Rcu;
 
 /// One runner's streams as its receivers have them ([`Receiver::have`]), by name (the order its
-/// receivers keep them in), each stream's swapped in as the hub's loop changes it.
+/// receivers keep them in), each stream's swapped in as its loop changes it.
 type Streams = Rcu<BTreeMap<String, Arc<arc_swap::ArcSwap<Has>>>>;
 
-/// What the server has of each runner's streams, by runner name.
+/// What the server has of each runner's streams, by runner name: one hub loop's (`crate::wire::fan`; goal 10,
+/// plan 01a1a87b2dae step 4), the control loop's for the streams it takes (terminals') and each shard's session
+/// loop's for its sessions' (`Hub::links_of`). "Its loop" below is that one.
 #[derive(Default)]
 pub struct Links {
-    /// Each runner's receivers: the hub's loop alone takes these, for each item a runner sends and then
+    /// Each runner's receivers: its loop alone takes these, for each item a runner sends and then
     /// its answer, in order; no other task does (what's said again of them is read off `has`).
     by_runner: Mutex<HashMap<String, Receiver>>,
-    /// What each runner's receivers have of each of its streams, as [`Receiver::have`] says it: the hub's
+    /// What each runner's receivers have of each of its streams, as [`Receiver::have`] says it: its
     /// loop swaps a stream's in as it changes it, and what's said again every few seconds (by the hub's
     /// commands loop) is read off them without a lock (goal 5, plan 01a1a59c2aae step 2).
     has: Rcu<HashMap<String, Arc<Streams>>>,
@@ -41,7 +43,7 @@ impl Links {
     }
 
     /// What the server has of `runner`'s streams: sent when its link comes up, and again every few
-    /// seconds. Read off the copies the hub's loop keeps of its receivers, as they have them.
+    /// seconds. Read off the copies its loop keeps of its receivers, as they have them.
     pub fn have(&self, runner: &str) -> Frame {
         let streams = self.has.load().get(runner).cloned();
         Frame::Have(streams.map(|s| s.load().values().map(|c| Has::clone(&c.load())).collect()).unwrap_or_default())
@@ -83,7 +85,7 @@ impl Links {
     }
 
     /// Stream `stream` of `runner` as its receivers have it now (`has`; none: they have it no more), and
-    /// the streams they let go of (`gone`): into the copies what's said again is read off. The hub's loop
+    /// the streams they let go of (`gone`): into the copies what's said again is read off. Its loop
     /// publishes, as it changes them, so the copies are what the receivers have between its changes.
     fn publish(&self, runner: &str, stream: &str, has: Option<Has>, gone: &[String]) {
         let streams = self.streams_of(runner);
@@ -149,7 +151,7 @@ mod tests {
     use super::*;
 
     /// Goal 5, plan 01a1a59c2aae step 2: what's said again of a runner's streams (`have`) is read off the
-    /// copies the hub's loop publishes as it takes items and answers them, and is what its receivers have,
+    /// copies its loop publishes as it takes items and answers them, and is what its receivers have,
     /// stream by stream and in their order, after items taken, refused and started over.
     #[test]
     fn g5_what_is_said_again_is_what_the_receivers_have() {

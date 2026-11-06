@@ -19,10 +19,9 @@
 # async-lock's waits are event-listener's, below); tracing-core's callsite registry is lock-free with one global
 # dispatcher; futures-util's locks (`Shared`, `futures::lock::Mutex`) are the preview browser's alone;
 # regex-automata's cache pool is taken only by a regex used from a thread other than its first, and kiln's regexes
-# are off the hot path; sharded-slab's and thread_local's are taken once a thread; crossbeam-utils' `AtomicCell` of a
-# pointer (kiln-rt's tasks) is lock-free; Turso's are the conversation store's writer thread's alone; and the C
-# libraries' (SQLite's, aws-lc's) and the standard library's own (stderr, `std::sync::mpsc`'s waiters) can't be
-# reached from Rust.
+# are off the hot path; sharded-slab's and thread_local's are taken once a thread; Turso's are the conversation
+# store's writer thread's alone; and the C libraries' (SQLite's, aws-lc's) and the standard library's own (stderr,
+# `std::sync::mpsc`'s waiters) can't be reached from Rust.
 
 [[crate]]
 name = "event-listener"

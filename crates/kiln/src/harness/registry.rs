@@ -2309,8 +2309,8 @@ impl Registry {
         let mut turns = crate::rt::Turns::new();
         loop {
             let Ok((id, u)) = rx.recv().await else { return Ok(()) };
-            hub.harness.ingest_from(&hub, &Location::Local, &id, u, false).await;
-            turns.after().await;
+            hub.harness.ingest_from(&Location::Local, &id, u, false).await;
+            turns.end().await;
         }
     }
 
@@ -2491,9 +2491,10 @@ impl Registry {
     }
 
     /// Apply one update from a machine and pass it on to the session's viewers: back once the
-    /// session's owner has (`super::copies`), so what reads the copy next finds it.
-    pub async fn ingest(&self, hub: &Hub, from: &Location, id: &str, u: Update) {
-        self.ingest_from(hub, from, id, u, false).await;
+    /// session's owner has (`super::copies`), so what reads the copy next finds it. The tests' way in.
+    #[cfg(test)]
+    pub(crate) async fn ingest(&self, from: &Location, id: &str, u: Update) {
+        self.ingest_from(from, id, u, false).await;
         self.sessions.applied(id).await;
     }
 
@@ -2544,14 +2545,24 @@ impl Registry {
     }
 
     /// An update of session `id` from `from`, handed to the shard that owns its copy
-    /// (`super::copies`), which applies it after whatever was handed it before ([`Registry::apply`]):
-    /// back once it's handed over, waiting only while that owner's inbox is full. `shipped`: its
-    /// machine keeps it in a store it sends the server's (`crate::convo::feed`), which keeps it from
-    /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
-    pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
-        let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+    /// (`super::copies`), which prepares and applies it after whatever was handed it before
+    /// ([`Registry::take_from`]), as it takes a runner's ([`Registry::from_runner`]): back once it's
+    /// handed over, waiting only while that owner's inbox is full. `shipped`: its machine keeps it in a
+    /// store it sends the server's (`crate::convo::feed`), which keeps it from that, not from here. An
+    /// inbox's answer changes nothing of the copy: whoever waits for it is told here, at once. Goal 4,
+    /// plan 01a1a59c2a9c step 2; the server's own sessions' updates were prepared here, on the caller's
+    /// shard, and handed over prepared, until 2026-11-06 (the legacy audit: one path, the owner's).
+    pub async fn ingest_from(&self, from: &Location, id: &str, u: Update, shipped: bool) {
+        let u = match u {
+            Update::Inbox { said } => {
+                self.answered(id, *said);
+                return;
+            }
+            other => other,
+        };
         self.room_for_rows(shipped).await;
-        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
+        let take = super::copies::Take { from: from.clone(), id: id.to_owned(), u, shipped };
+        if !self.sessions.send(id, Msg::Take(Box::new(take))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
         }
     }
@@ -5040,7 +5051,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
@@ -5048,7 +5059,7 @@ mod tests {
             let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
             let was = encodings().await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state.clone()) }).await;
             let now = encodings().await;
             anyhow::ensure!(now.info == was.info + 1, "the info encoded once: {was:?} then {now:?}");
             let view = hub.harness.sessions.view("s").ok_or_else(|| anyhow::anyhow!("no view"))?;
@@ -5063,19 +5074,19 @@ mod tests {
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "one state frame: {heard:?}");
             // The same state again: its info encoded for its view (its last activity moves), no frame.
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty(), "no frame for a state that changed nothing its viewer has: {heard:?}");
             // A meta: one frame, as it was written before, encoded once; the same again, nothing.
             let meta = Meta { version: "2.1".into(), agents: vec!["explore".into()], ..Meta::default() };
             let was = encodings().await;
-            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
             let heard = sent(&hub, &topic, &mut at);
             let mut want = Vec::new();
             write::value(&mut want, "meta", "meta", &serde_json::to_value(&meta)?, hub.harness.rev("s"))?;
             anyhow::ensure!(heard == vec![String::from_utf8(want)?], "the meta's frame as before: {heard:?}");
             anyhow::ensure!(encodings().await.meta == was.meta + 1, "the meta encoded once");
-            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
             Ok(())
@@ -5093,17 +5104,17 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
             // The copy's state and meta values, by where they are, and its revision.
             let held = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| (Arc::as_ptr(&m.state) as usize, Arc::as_ptr(&m.meta) as usize, m.rev))).await.flatten().unwrap_or_default() };
             let viewed = || hub.harness.sessions.view("s").map(|v| v.state.to_value()).unwrap_or_default();
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state.clone()) }).await;
             let (made, _, rev) = held().await;
             anyhow::ensure!(sent(&hub, &topic, &mut at).iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "the first state's frame");
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state.clone()) }).await;
             let (again, _, rev_again) = held().await;
             anyhow::ensure!(again == made && rev_again == rev + 1, "the same state again: kept ({made:#x} then {again:#x}), its revision {rev} then {rev_again}");
             let heard = sent(&hub, &topic, &mut at);
@@ -5111,18 +5122,18 @@ mod tests {
             // A name given here changes the copy's state: the same state again is made again, the name in it.
             hub.harness.rename(&hub, "s", Some(&json!("parser"))).await;
             let (renamed, _, _) = held().await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state.clone()) }).await;
             let (remade, _, _) = held().await;
             let mut named = serde_json::to_value(&state)?;
             if let Some(o) = named.as_object_mut() {
                 o.insert("name".into(), json!("parser"));
             }
             anyhow::ensure!(remade != renamed && viewed() == named, "made again after the name: {}", viewed());
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(state.clone()) }).await;
             anyhow::ensure!(held().await.0 == remade && viewed() == named, "the same again after that: kept, the name in it");
             // A changed state: made anew.
             let changed = State { doing: Some("Running cargo test".into()), ..state };
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(changed.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(changed.clone()) }).await;
             let mut want = serde_json::to_value(&changed)?;
             if let Some(o) = want.as_object_mut() {
                 o.insert("name".into(), json!("parser"));
@@ -5131,9 +5142,9 @@ mod tests {
             anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f.contains("Running cargo test")), "its frame went");
             // The same meta again: the copy's kept.
             let meta = Meta { version: "2.1".into(), ..Meta::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
             let (_, meta_made, _) = held().await;
-            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta) }).await;
             anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
             Ok(())
         })
@@ -5155,11 +5166,11 @@ mod tests {
             // the shard's path, wherever the tests' process learned the pool's round trip to be (consts-audit B1).
             hub.harness.sessions.on_each(|s| s.said().pin_trip(1_000_000_000)).await;
             let there = Location::Machine("box".into());
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
             // A reply of 1,020 bytes: past what glibc keeps a thread (1,032 bytes, its JSON with it).
             let reply = |n: u64| Event { id: format!("msg_lab_1_{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: "the retry loop reads its deadline ".repeat(30), streaming: false } };
             // A copy with events already, as the lab's are.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=40).map(reply).collect() }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: (1..=40).map(reply).collect() }).await;
             let state = |doing: &str| State { summary: "the retry loop reads its deadline".into(), doing: Some(doing.to_owned()), ..State::default() };
             // What `u` costs its owner, taken as a runner's update is (`Hub::runner_update`'s `take_from`), and whether it
             // was taken whole (none of it left to take later, or written off the shard).
@@ -5171,7 +5182,7 @@ mod tests {
             // owners' for a first: `Mirror::said_took`), and a reply its owners judge long to write (every session's replies
             // teach them: `super::super::copies::long_to_write`) waits, its shard given up, while replies of another session
             // are taken as any are, until it's judged short.
-            hub.harness.ingest(&hub, &there, "fill", Update::Open { info: Box::new(Info { id: "fill".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "fill", Update::Open { info: Box::new(Info { id: "fill".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
             let fills = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let cost = |u: Update| {
                 let (h, from, fills) = (Arc::clone(&hub), there.clone(), Arc::clone(&fills));
@@ -5211,7 +5222,7 @@ mod tests {
                             return (Made::default(), false);
                         }
                         let n = fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
-                        h.harness.ingest(&h, &from, "fill", Update::Events { events: vec![reply(n)] }).await;
+                        h.harness.ingest(&from, "fill", Update::Events { events: vec![reply(n)] }).await;
                     }
                 }
             };
@@ -5267,11 +5278,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             let from = hub.feed.head();
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             let at = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.harness_at)).await.flatten().unwrap_or_default() };
             let mut ats = vec![at().await];
             for summary in ["one", "two", "three"] {
-                hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State { summary: summary.into(), ..State::default() }) }).await;
+                hub.harness.ingest(&there, "s", Update::State { state: Box::new(State { summary: summary.into(), ..State::default() }) }).await;
                 ats.push(at().await);
             }
             anyhow::ensure!(ats.windows(2).all(|w| w.first() < w.get(1)) && ats.first().is_some_and(|a| *a > from), "the copy keeps each frame's number: {ats:?} after {from}");
@@ -5294,7 +5305,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let open = |id: &str, at: i64| Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), created_at: at, ..Info::default() }), since: None };
             for (id, at) in [("b", 2), ("a", 1), ("c", 3)] {
-                hub.harness.ingest(&hub, &there, id, open(id, at)).await;
+                hub.harness.ingest(&there, id, open(id, at)).await;
             }
             let listed = || anyhow::Ok(serde_json::to_vec(&hub.harness.list())?);
             let joins = || hub.harness.sessions.list_joins();
@@ -5308,7 +5319,7 @@ mod tests {
             anyhow::ensure!(joins() == at, "nothing joined for the reads after the first");
             // A session's info changed: joined again once, for itself and the reads after.
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
-            hub.harness.ingest(&hub, &there, "b", Update::State { state: Box::new(state) }).await;
+            hub.harness.ingest(&there, "b", Update::State { state: Box::new(state) }).await;
             let changed = hub.harness.list_json();
             anyhow::ensure!(changed.as_ptr() != first.as_ptr() && changed.as_ref() == listed()?.as_slice(), "the change in it");
             anyhow::ensure!(String::from_utf8_lossy(&changed).contains("the retry loop reads its deadline"), "its summary said");
@@ -5316,16 +5327,16 @@ mod tests {
             // Events whose copy's info stays as it was leave the list as it was.
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
             let before = hub.harness.info_json("a");
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=3).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=3).map(said).collect() }).await;
             if hub.harness.info_json("a") == before {
                 anyhow::ensure!(hub.harness.list_json().as_ptr() == changed.as_ptr() && joins() == at + 1, "events that changed no info: the list as it was");
             }
             // One comes, oldest of all; one goes.
             let joined = joins();
-            hub.harness.ingest(&hub, &there, "d", open("d", 0)).await;
+            hub.harness.ingest(&there, "d", open("d", 0)).await;
             let more = hub.harness.list_json();
             anyhow::ensure!(more.as_ref() == listed()?.as_slice() && more.starts_with(br#"[{"id":"d""#) && joins() == joined + 1, "one came: {}", String::from_utf8_lossy(&more));
-            hub.harness.ingest(&hub, &there, "c", Update::Closed).await;
+            hub.harness.ingest(&there, "c", Update::Closed).await;
             let fewer = hub.harness.list_json();
             anyhow::ensure!(fewer.as_ref() == listed()?.as_slice() && !String::from_utf8_lossy(&fewer).contains(r#""id":"c""#) && joins() == joined + 2, "one went: {}", String::from_utf8_lossy(&fewer));
             anyhow::ensure!(hub.harness.list_json().as_ptr() == fewer.as_ptr() && joins() == joined + 2, "and then as it was");
@@ -5347,7 +5358,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let open = |id: &str, at: i64| Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), created_at: at, ..Info::default() }), since: None };
             for (id, at) in [("b", 2), ("a", 1), ("c", 3)] {
-                hub.harness.ingest(&hub, &there, id, open(id, at)).await;
+                hub.harness.ingest(&there, id, open(id, at)).await;
             }
             // Its name from scratch: each info as the list says it, digested, the digests digested in order.
             let from_scratch = || -> anyhow::Result<String> {
@@ -5359,13 +5370,13 @@ mod tests {
             let first = tag();
             anyhow::ensure!(first.starts_with("W/\"") && first == from_scratch()?, "{first} against {}", from_scratch()?);
             anyhow::ensure!(tag() == first, "the same list, the same name");
-            hub.harness.ingest(&hub, &there, "b", Update::State { state: Box::new(State { summary: "a new summary".into(), ..State::default() }) }).await;
+            hub.harness.ingest(&there, "b", Update::State { state: Box::new(State { summary: "a new summary".into(), ..State::default() }) }).await;
             let changed = tag();
             anyhow::ensure!(changed != first && changed == from_scratch()?, "a changed info: {changed}");
-            hub.harness.ingest(&hub, &there, "d", open("d", 0)).await;
+            hub.harness.ingest(&there, "d", open("d", 0)).await;
             let more = tag();
             anyhow::ensure!(more != changed && more == from_scratch()?, "one came: {more}");
-            hub.harness.ingest(&hub, &there, "c", Update::Closed).await;
+            hub.harness.ingest(&there, "c", Update::Closed).await;
             let fewer = tag();
             anyhow::ensure!(fewer != more && fewer == from_scratch()?, "one went: {fewer}");
             // The read answers with it, and a request that holds it is answered 304.
@@ -5393,7 +5404,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             let open = || Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None };
-            hub.harness.ingest(&hub, &there, "s", open()).await;
+            hub.harness.ingest(&there, "s", open()).await;
             let user = |id: &str, seq: u64, text: &str| Event {
                 id: id.into(),
                 seq,
@@ -5402,12 +5413,12 @@ mod tests {
                 by: None,
                 body: Body::User { text: text.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: Vec::new(), reply_to: None },
             };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass"), user("m-person", 2, "hello"), user("news-1", 3, "one child settled")] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass"), user("m-person", 2, "hello"), user("news-1", 3, "one child settled")] }).await;
             // Upserted again (its delivery's state), with other words: what it was handed stays.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass, edited later")] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![user("goal-1", 1, "/goal tests pass, edited later")] }).await;
             // Its runner's state says another handed.
             let given = |g: &[(&str, &str)]| Update::State { state: Box::new(State { given: g.iter().map(|(m, t)| Given { id: (*m).into(), digest: stable(t) }).collect(), ..State::default() }) };
-            hub.harness.ingest(&hub, &there, "s", given(&[("goal-2", "/goal docs build")])).await;
+            hub.harness.ingest(&there, "s", given(&[("goal-2", "/goal docs build")])).await;
             let want = vec![
                 Given { id: "goal-1".into(), digest: stable("/goal tests pass") },
                 Given { id: "news-1".into(), digest: stable("one child settled") },
@@ -5416,8 +5427,8 @@ mod tests {
             let said = || hub.harness.info("s").map(|i| i.said).unwrap_or_default();
             assert_eq!(said(), want);
             // Its runner comes back, then says less (started again): all of it stays.
-            hub.harness.ingest(&hub, &there, "s", open()).await;
-            hub.harness.ingest(&hub, &there, "s", given(&[])).await;
+            hub.harness.ingest(&there, "s", open()).await;
+            hub.harness.ingest(&there, "s", given(&[])).await;
             assert_eq!(said(), want, "kept across the Open and a state that says less");
             Ok(())
         })
@@ -5437,15 +5448,15 @@ mod tests {
             let open = |since| Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 3, ..Info::default() }), since };
             let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
             let names = |r: std::ops::RangeInclusive<u64>| r.map(|n| format!("m{n}")).collect::<Vec<_>>();
-            hub.harness.ingest(&hub, &there, "s", open(None)).await;
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=10).map(said).collect() }).await;
+            hub.harness.ingest(&there, "s", open(None)).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: (1..=10).map(said).collect() }).await;
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and where on its topic the viewer reads from.
             let (watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
             let resync = |heard: &[String]| heard.iter().any(|f| f == crate::harness::live::RESYNC);
             // Its machine again, with all ten: the copy goes on, and its viewer only hears what follows.
-            hub.harness.ingest(&hub, &there, "s", open(Some(10))).await;
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(11)] }).await;
+            hub.harness.ingest(&there, "s", open(Some(10))).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(11)] }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.len() == 1 && !heard.iter().any(|f| f.contains(r#""t":"open""#)) && !resync(&heard), "the viewer goes on: {heard:?}");
             let had = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default();
@@ -5453,7 +5464,7 @@ mod tests {
             // Again, with only eight of them (its store hadn't kept the rest): the copy lets go of
             // nine and up, and its viewer starts over from the copy: told to by the feed, and what it
             // had can't be resumed, so it's sent the copy whole.
-            hub.harness.ingest(&hub, &there, "s", open(Some(8))).await;
+            hub.harness.ingest(&there, "s", open(Some(8))).await;
             anyhow::ensure!(copy_of(&hub, "s") == names(1..=8));
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(resync(&heard), "the viewer is sent back to a snapshot: {heard:?}");
@@ -5462,7 +5473,7 @@ mod tests {
             let kept = hub.harness.kept_on("box");
             anyhow::ensure!(kept.len() == 1 && kept.iter().all(|k| (k.epoch, k.from, k.seq, k.last.len()) == (3, 1, 8, 8)), "{kept:?}");
             // An event sent again under a number the copy has under another id: in its place.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![Event { id: "other".into(), ..said(5) }] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![Event { id: "other".into(), ..said(5) }] }).await;
             let mut want = names(1..=8);
             if let Some(slot) = want.get_mut(4) {
                 "other".clone_into(slot);
@@ -5470,9 +5481,9 @@ mod tests {
             anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
             anyhow::ensure!(resync(&sent(&hub, &topic, &mut at)), "the viewer starts over");
             // One it lacks under a number before its newest: in among the others, by number.
-            hub.harness.ingest(&hub, &there, "s", open(Some(8))).await;
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(12), said(14)] }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(13)] }).await;
+            hub.harness.ingest(&there, "s", open(Some(8))).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(12), said(14)] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(13)] }).await;
             want.extend(names(12..=14));
             anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
             Ok(())
@@ -5491,7 +5502,7 @@ mod tests {
             let mut opened = Mirror::new(info("opened"), there.clone(), bus);
             opened.opened_at = Some(std::time::Instant::now());
             hub.harness.sessions.on("opened", move |s| s.insert("opened".into(), opened)).await;
-            hub.harness.ingest(&hub, &there, "announced", Update::Open { info: Box::new(info("announced")), since: None }).await;
+            hub.harness.ingest(&there, "announced", Update::Open { info: Box::new(info("announced")), since: None }).await;
             let att = hub.harness.attach("announced").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let at = att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default()).await;
@@ -5502,7 +5513,7 @@ mod tests {
             let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
             anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
             // Its machine announces it: from then on its reports count.
-            hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None }).await;
+            hub.harness.ingest(&there, "opened", Update::Open { info: Box::new(info("opened")), since: None }).await;
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default()).await;
             anyhow::ensure!(hub.harness.ids().is_empty());
             Ok(())
@@ -5519,7 +5530,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
             for id in ["old-1", "old-2", "mine"] {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info(id)), since: None }).await;
             }
             hub.harness.held_by("old-1", "01a14794");
             hub.harness.held_by("old-2", "01a14794");
@@ -5561,10 +5572,10 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
             let there = Location::Machine("box".into());
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             let change = |n: u32| crate::harness::model::FileChange { path: format!("src/f{}.rs", n % 7), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: Vec::new(), truncated: false, at: i64::from(n), by: Vec::new(), place: None };
             for n in 0..200 {
-                hub.harness.ingest(&hub, &there, "s", Update::ChangesPatch { set: vec![change(n)], gone: Vec::new() }).await;
+                hub.harness.ingest(&there, "s", Update::ChangesPatch { set: vec![change(n)], gone: Vec::new() }).await;
             }
             // Each file in the place its first patch gave it, as its last patch has it.
             let want = serde_json::to_value([196, 197, 198, 199, 193, 194, 195].map(change))?;
@@ -5594,9 +5605,9 @@ mod tests {
             // "twin" went on on box-b at epoch 1, its copy left on box-a; "arriving" is on its way
             // from box-b to box-a, at epoch 1 there; "here" runs on box-a.
             let (a, b) = (Location::Machine("box-a".into()), Location::Machine("box-b".into()));
-            hub.harness.ingest(&hub, &b, "twin", Update::Open { info: Box::new(info("twin", 1)), since: None }).await;
-            hub.harness.ingest(&hub, &b, "arriving", Update::Open { info: Box::new(info("arriving", 0)), since: None }).await;
-            hub.harness.ingest(&hub, &a, "here", Update::Open { info: Box::new(info("here", 0)), since: None }).await;
+            hub.harness.ingest(&b, "twin", Update::Open { info: Box::new(info("twin", 1)), since: None }).await;
+            hub.harness.ingest(&b, "arriving", Update::Open { info: Box::new(info("arriving", 0)), since: None }).await;
+            hub.harness.ingest(&a, "here", Update::Open { info: Box::new(info("here", 0)), since: None }).await;
             let report = |held: &[(&str, u64)]| crate::harness::host::Inventory { sessions: held.iter().map(|(s, _)| (*s).to_owned()).collect(), epochs: held.iter().map(|(s, e)| ((*s).to_owned(), *e)).collect(), ..Default::default() };
             assert_eq!(hub.harness.left_behind("box-a", &report(&[("twin", 0), ("arriving", 1), ("here", 0)])), ["twin"]);
             let before = crate::harness::host::Inventory { sessions: vec!["twin".into()], ..Default::default() };
@@ -5615,13 +5626,13 @@ mod tests {
             let there = Location::Machine("box".into());
             let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
             for id in ["quiet", "busy"] {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info(id)), since: None }).await;
             }
-            hub.harness.ingest(&hub, &Location::Machine("elsewhere".into()), "away", Update::Open { info: Box::new(info("away")), since: None }).await;
+            hub.harness.ingest(&Location::Machine("elsewhere".into()), "away", Update::Open { info: Box::new(info("away")), since: None }).await;
             hub.harness.machine_lost(&hub, "box").await;
             hub.harness.machine_lost(&hub, "elsewhere").await;
             // Back: one has something to say at once, the other is quiet.
-            hub.harness.ingest(&hub, &there, "busy", Update::Open { info: Box::new(info("busy")), since: None }).await;
+            hub.harness.ingest(&there, "busy", Update::Open { info: Box::new(info("busy")), since: None }).await;
             let held = ["quiet", "busy", "away", "unknown"].map(str::to_owned);
             let stale = hub.harness.still_disconnected("box", &held);
             anyhow::ensure!(stale == ["quiet"], "only its own quiet session: {stale:?}");
@@ -5718,7 +5729,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let ids: Vec<String> = (0..16).map(|n| format!("s{n}")).collect();
             for id in &ids {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             }
             // Every shard kept busy: tasks that hold it a step at a time, giving it up only to
             // what wants it.
@@ -5743,9 +5754,9 @@ mod tests {
                     for n in 1..=per {
                         let e = format!("{id}-e{n}");
                         let event = Event { id: e.clone(), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: String::new(), streaming: true } };
-                        hub.harness.ingest_from(&hub, &there, &id, Update::Events { events: vec![event] }, false).await;
+                        hub.harness.ingest_from(&there, &id, Update::Events { events: vec![event] }, false).await;
                         for part in ["a", "b"] {
-                            hub.harness.ingest_from(&hub, &there, &id, Update::Stream { id: e.clone(), text: format!("{n}{part}") }, false).await;
+                            hub.harness.ingest_from(&there, &id, Update::Stream { id: e.clone(), text: format!("{n}{part}") }, false).await;
                         }
                         // As a runner's updates come: in bursts, a while apart.
                         if n % 2 == 0 {
@@ -5813,7 +5824,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let ids: Vec<String> = (0..16).map(|n| format!("r{n}")).collect();
             for id in &ids {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             }
             // Every shard kept busy, giving itself up only to what wants it.
             let busy = Arc::new(AtomicBool::new(true));
@@ -6188,21 +6199,21 @@ mod tests {
             let Some(store) = hub.harness.convo.clone() else { anyhow::bail!("the scratch hub keeps no conversations") };
             let there = Location::Machine("box".into());
             let said = |n: u64| Update::Events { events: vec![Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             let q = store.queue();
             // Past the writer's own bound, within the inboxes'.
             let past = q.bound().saturating_add(1);
             q.pretend_waiting(past);
             let within = std::time::Duration::from_secs(10);
             for n in 1..=2 {
-                crate::rt::timeout(within, hub.harness.ingest(&hub, &there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
+                crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
             }
             anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
             // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
             let more = hub.harness.sessions.inboxes_bound();
             q.pretend_waiting(more);
             {
-                let mut handed = std::pin::pin!(hub.harness.ingest_from(&hub, &there, "s", said(3), false));
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&there, "s", said(3), false));
                 anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "past what the inboxes may hold: it waits");
                 q.pretend_written(more);
                 crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
@@ -6233,7 +6244,7 @@ mod tests {
             let there = Location::Machine("box".into());
             let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
             for id in ["s", "fill"] {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             }
             let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() });
             let (mut took, mut fills) = (Vec::new(), 0);
@@ -6256,7 +6267,7 @@ mod tests {
                     took.push(n);
                 } else {
                     fills += 1;
-                    hub.harness.ingest(&hub, &there, "fill", Update::Events { events: vec![said(fills)] }).await;
+                    hub.harness.ingest(&there, "fill", Update::Events { events: vec![said(fills)] }).await;
                 }
                 next = rest;
             }
@@ -6278,10 +6289,10 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             let rev = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default();
             let n = u64::try_from(MAX_EVENTS)?;
-            hub.harness.ingest_from(&hub, &there, "s", Update::Events { events: (1..=n).map(said).collect() }, false).await;
+            hub.harness.ingest_from(&there, "s", Update::Events { events: (1..=n).map(said).collect() }, false).await;
             let found = hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.events.len())).await.flatten();
             anyhow::ensure!(found == Some(MAX_EVENTS), "the job behind it found {found:?} of {MAX_EVENTS}");
             let turns = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default().saturating_sub(rev);
@@ -6432,8 +6443,8 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             let said = |q: u64| said_as("p", q, &format!("line {q}"));
-            hub.harness.ingest(&hub, &there, "p", Update::Open { info: Box::new(Info { id: "p".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
-            hub.harness.ingest(&hub, &there, "p", Update::Events { events: (1..=5).map(said).collect() }).await;
+            hub.harness.ingest(&there, "p", Update::Open { info: Box::new(Info { id: "p".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&there, "p", Update::Events { events: (1..=5).map(said).collect() }).await;
             // A viewer watching throughout: joined before the panic.
             let done = Arc::new(AtomicBool::new(false));
             let viewer = crate::rt::spawn(watch(Arc::clone(&hub), "p".into(), std::time::Duration::ZERO, Arc::clone(&done)));
@@ -6454,7 +6465,7 @@ mod tests {
             anyhow::ensure!(hub.harness.sessions.send("p", panics).await, "its owner took the job");
             // Its runner goes on.
             for q in 7..=12 {
-                hub.harness.ingest_from(&hub, &there, "p", Update::Events { events: vec![said(q)] }, false).await;
+                hub.harness.ingest_from(&there, "p", Update::Events { events: vec![said(q)] }, false).await;
             }
             hub.harness.settled().await;
             done.store(true, Ordering::Release);
@@ -6612,12 +6623,12 @@ mod tests {
             let mut plans = Vec::new();
             for (k, id) in ids.iter().enumerate() {
                 let long = k.is_multiple_of(2);
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
                 let mut model = std::collections::BTreeMap::new();
                 if long {
                     let first = Update::Events { events: (1..=old).filter(|q| !late.contains(q)).map(|q| said_as(id, q, &format!("line {q}"))).collect() };
                     modeled(&mut model, &first);
-                    hub.harness.ingest(&hub, &there, id, first).await;
+                    hub.harness.ingest(&there, id, first).await;
                     // Its older chunks packed and kept compact, as its owner keeps them once the packer is done.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     while hub.harness.sessions.with(id, |v| v.events.chunks().iter().filter(|c| c.is_compact()).count()).unwrap_or(0) < 3 {
@@ -6776,8 +6787,8 @@ mod tests {
             let chunk = u64::try_from((MAX_EVENTS + MAX_EVENTS / 4).isqrt())?;
             let n = chunk * 7 + 9;
             let mut held = Vec::new();
-            hub.harness.ingest(&hub, &there, "old", open(None)).await;
-            hub.harness.ingest(&hub, &there, "old", events(1..=n)).await;
+            hub.harness.ingest(&there, "old", open(None)).await;
+            hub.harness.ingest(&there, "old", events(1..=n)).await;
             hold_view(&hub, &mut held, "events were taken in").await?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while hub.harness.sessions.with("old", |v| v.events.chunks().iter().filter(|c| c.is_spilled()).count()).unwrap_or(0) == 0 {
@@ -6785,28 +6796,28 @@ mod tests {
                 crate::rt::sleep(std::time::Duration::from_millis(5)).await;
             }
             hold_view(&hub, &mut held, "its older chunks were spilled").await?;
-            hub.harness.ingest(&hub, &there, "old", Update::Events { events: vec![said_as("old", 5, "said again")] }).await;
+            hub.harness.ingest(&there, "old", Update::Events { events: vec![said_as("old", 5, "said again")] }).await;
             hold_view(&hub, &mut held, "an old event was said again").await?;
-            hub.harness.ingest(&hub, &there, "old", Update::Events { events: vec![said_as("old", 7, "late")] }).await;
+            hub.harness.ingest(&there, "old", Update::Events { events: vec![said_as("old", 7, "late")] }).await;
             hold_view(&hub, &mut held, "one was put in late").await?;
-            hub.harness.ingest(&hub, &there, "old", Update::Stream { id: format!("old-e{n}"), text: " and more".into() }).await;
+            hub.harness.ingest(&there, "old", Update::Stream { id: format!("old-e{n}"), text: " and more".into() }).await;
             hold_view(&hub, &mut held, "words were streamed into the newest").await?;
             // Past the most a copy keeps, five hundred at a time: its oldest let go of.
             let past = u64::try_from(MAX_EVENTS + MAX_EVENTS / 4)? + 1;
             let mut from = n + 1;
             while from <= past {
                 let to = (from + 499).min(past);
-                hub.harness.ingest(&hub, &there, "old", events(from..=to)).await;
+                hub.harness.ingest(&there, "old", events(from..=to)).await;
                 from = to + 1;
             }
             let first = hub.harness.sessions.with("old", |v| v.events.meta(0).and_then(|m| m.seq())).flatten();
             anyhow::ensure!(first.is_some_and(|q| q > 1), "its oldest weren't let go of: it begins at {first:?}");
             hold_view(&hub, &mut held, "its oldest were let go of").await?;
-            hub.harness.ingest(&hub, &there, "old", open(Some(past - chunk))).await;
+            hub.harness.ingest(&there, "old", open(Some(past - chunk))).await;
             hold_view(&hub, &mut held, "its runner went on from before its newest").await?;
-            hub.harness.ingest(&hub, &there, "old", Update::Reset { from: None }).await;
+            hub.harness.ingest(&there, "old", Update::Reset { from: None }).await;
             hold_view(&hub, &mut held, "it was reset").await?;
-            hub.harness.ingest(&hub, &there, "old", Update::Closed).await;
+            hub.harness.ingest(&there, "old", Update::Closed).await;
             anyhow::ensure!(hub.harness.sessions.view("old").is_none(), "the session never ended");
             still_say(&held, "the session ended").await?;
             // Every view let go of: the copy's spill file goes too.

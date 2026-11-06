@@ -3546,7 +3546,7 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             for (id, at) in [("g9s3-b", 2), ("g9s3-c", 3), ("g9s3-a", 1)] {
                 let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), created_at: at, ..Info::default() };
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             let copied = listed(&hub).await;
             assert_eq!(copied, hub.harness.list());
@@ -5738,7 +5738,7 @@ mod stack_tests {
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };
-        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
+        hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
         let state = |items: &[(&str, &str)], given: &[(&str, &str)]| Update::State {
             state: Box::new(State {
                 status: Status::Running,
@@ -5748,13 +5748,13 @@ mod stack_tests {
                 ..State::default()
             }),
         };
-        hub.harness.ingest(&hub, &there, id, state(&[], &[])).await;
+        hub.harness.ingest(&there, id, state(&[], &[])).await;
         let now = 1_000_000;
         // The stack's word goes, and waits behind the agent's turn; the driver looks and sees it.
         let (went, word) = say(&port, id, Some("g1"), send("/goal tests pass".into()), now).await;
         let word = word.ok_or_else(|| anyhow::anyhow!("no word"))?;
         anyhow::ensure!(went == Sent::Delivered);
-        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
+        hub.harness.ingest(&there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
         resay(&port, now + 1_500).await;
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
@@ -5765,19 +5765,19 @@ mod stack_tests {
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
         match then {
             Then::Says | Then::Reconnects => {
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] }).await;
-                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user.clone()] }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 if then == Then::Reconnects {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
-                    hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                    hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
+                    hub.harness.ingest(&there, id, state(&[], handed)).await;
                 }
                 resay(&port, now + 3_000).await;
             }
             Then::ResumesStateFirst => {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
-                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 resay(&port, now + 3_000).await;
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] }).await;
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user] }).await;
                 resay(&port, now + 4_500).await;
             }
         }

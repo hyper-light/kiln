@@ -691,6 +691,10 @@ impl Pool {
                     self.wake_one();
                 }
                 self.run_piece(job, local);
+            } else if crate::idle::spare() {
+                // No job: a piece of the process's spare work done instead of resting, then a look for jobs again
+                // (`crate::idle::when_spare`; kiln's consts-audit R3). It takes no wake: this worker was running.
+                continue;
             } else if !self.rest(index, local) {
                 return;
             }
@@ -1229,6 +1233,54 @@ mod tests {
         assert_eq!(UNPARKS.load(Ordering::Relaxed) - unparks, 1, "one unpark woke it");
         assert_eq!(PARKS.load(Ordering::Relaxed) - parks, 1, "it parked once");
         assert_eq!(rt.counters().threads_woken, 1, "counted on the shard whose task woke it");
+    }
+
+    static PIECES_LEFT: AtomicUsize = AtomicUsize::new(0);
+    static PIECES_DONE: AtomicUsize = AtomicUsize::new(0);
+
+    /// A piece of spare work, while any is left: one taken off what's left.
+    fn spare_piece() -> bool {
+        let mut left = PIECES_LEFT.load(Ordering::SeqCst);
+        while left > 0 {
+            match PIECES_LEFT.compare_exchange(left, left.saturating_sub(1), Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    PIECES_DONE.fetch_add(1, Ordering::SeqCst);
+                    return true;
+                }
+                Err(now) => left = now,
+            }
+        }
+        false
+    }
+
+    /// Kiln's consts-audit R3: a worker that finds no job takes the process's spare work a piece at a time, looking for jobs
+    /// between, and rests once none is left, with no wake of its own (said once for the process). The pool here is
+    /// stopping, so the worker's rest ends its serving rather than parking it (the parks' test counts exactly).
+    #[test]
+    fn r3_a_worker_with_no_job_takes_spare_work_before_it_rests() {
+        assert!(crate::idle::when_spare(spare_piece));
+        assert!(!crate::idle::when_spare(spare_piece), "said once for the process");
+        let pool: &'static Pool = Box::leak(Box::new(Pool {
+            injector: Injector::new(),
+            stealers: Box::new([]),
+            slots: Box::new([Slot {
+                state: AtomicU8::new(RUNNING),
+                thread: std::thread::current(),
+            }]),
+            idle: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
+            queued: 1,
+            piece_ns: 1,
+            stopping: AtomicBool::new(true),
+            live: AtomicUsize::new(1),
+            stopper: OnceLock::new(),
+        }));
+        PIECES_LEFT.store(3, Ordering::SeqCst);
+        let parks = PARKS.load(Ordering::Relaxed);
+        pool.serve(0, &Worker::new_fifo());
+        assert_eq!((PIECES_LEFT.load(Ordering::SeqCst), PIECES_DONE.load(Ordering::SeqCst)), (0, 3), "every piece taken, each once");
+        assert_eq!(PARKS.load(Ordering::Relaxed), parks, "no park on the way");
     }
 
     static WENT_COLD: AtomicUsize = AtomicUsize::new(0);

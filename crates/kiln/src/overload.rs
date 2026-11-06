@@ -8,7 +8,7 @@
 //! urgent class it serves now ([`Connection`]: an HTTP/2 connection serves many requests in one task), so its
 //! shard gives it its class's share and urgency; between requests at Critical, to read the next head. A request
 //! less urgent than that, its head read in Critical's turn, gives way before its handler runs in that task to a
-//! more urgent task waiting on the shard ([`Serving::demoted`], `crate::placement::request`,
+//! more urgent task waiting on the shard ([`Serving::demoted`], `crate::http::server`'s answer,
 //! `hyper_rt::coop::give_way`): else every API call on a kept-alive connection ran on in Critical's turn, and a
 //! person's page woken behind them queued behind them. The credentials are read, not checked: a forged cookie buys a request a
 //! place ahead and nothing past its own authentication, which it meets as ever.
@@ -227,7 +227,7 @@ pub struct Serving {
 }
 
 impl Serving {
-    /// The request's class: what its handler's task starts in where it is placed apart (goal 7, `crate::placement`).
+    /// The request's class: what its request is marked with for its handler (`crate::http::server`).
     pub fn class(&self) -> Class {
         self.class
     }
@@ -235,7 +235,7 @@ impl Serving {
     /// Whether the request lowered its connection's task to a less urgent class than it had (step 3): its head was
     /// read in the turn of a more urgent class than its own (Critical, the class a connection's task reads heads
     /// in), so its handler, where it stays in that task, should take its own class's turn before it runs rather
-    /// than go on in that one (`crate::placement::request`).
+    /// than go on in that one (`crate::http::server`'s answer).
     pub fn demoted(&self) -> bool {
         self.demoted
     }

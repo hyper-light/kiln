@@ -301,7 +301,9 @@ fn with_recent_hop(mut read: Read, org: &str) -> Read {
 /// no lock; one found in none (older, another process's) is read back from the store, as before.
 pub(crate) mod recent {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
 
     use arc_swap::ArcSwapOption;
@@ -313,7 +315,9 @@ pub(crate) mod recent {
     }
 
     static RING: OnceLock<Ring> = OnceLock::new();
-    /// Hops checked with records found here: what a lab and the tests read.
+    /// Hops checked with records found here: a test build's stamp, which its tests read (nothing reads it in a server,
+    /// so a server doesn't count it: the legacy audit, 2026-11-06).
+    #[cfg(test)]
     static SERVED: AtomicU64 = AtomicU64::new(0);
 
     /// Keeps them for `mirrors` mirrors (`[conversations] mirrors`), once a process: each mirror's feed has at most
@@ -345,7 +349,9 @@ pub(crate) mod recent {
         Some(super::broken(&mine.digest, mine.clone(), map, wanted, org))
     }
 
+    /// A hop was checked with records kept here: counted in a test build ([`served_so_far`]), nothing in a server.
     pub fn served() {
+        #[cfg(test)]
         SERVED.fetch_add(1, Ordering::Relaxed);
     }
 
