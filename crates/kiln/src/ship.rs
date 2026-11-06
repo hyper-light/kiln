@@ -2452,7 +2452,8 @@ fn moves_rows(text: &str) -> bool {
 /// (`APPLY_MS` in `ui/src/lib/resource.ts`).
 pub async fn rows_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    // A listener of the hub's events' lane (`Hub::subscribe_events`; goal 4, plan 01a1a59c2a9c step 5).
+    let mut rx = hub.subscribe_events()?;
     let window = std::time::Duration::from_millis(u64::try_from(FRESH_MS).unwrap_or(250));
     loop {
         let heard = futures::select_biased! {

@@ -136,7 +136,13 @@ impl crate::memory::queue::Weigh for Out {
 /// Follows the hub's events for as long as the server runs, a worker for each subscriber.
 pub fn spawn(hub: Arc<Hub>) {
     crate::rt::spawn(async move {
-        let mut rx = hub.events.subscribe();
+        let mut rx = match hub.subscribe_events() {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!(error = %e, "outgoing webhooks can't follow kiln's events: none are sent");
+                return;
+            }
+        };
         let mut runs: HashMap<String, (String, String)> = HashMap::new();
         let (mut subs, mut read_at): (Vec<Integration>, Option<Instant>) = (Vec::new(), None);
         let mut queues: HashMap<String, crate::memory::queue::Sender<Out>> = HashMap::new();

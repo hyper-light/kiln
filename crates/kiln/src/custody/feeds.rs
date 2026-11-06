@@ -33,10 +33,10 @@ pub fn install(hub: &Arc<Hub>) {
             while let Ok(Receipt { given, receipt, came_from }) = rx.recv().await {
                 let Some(hub) = w.upgrade() else { return };
                 // The runner's hand-on as the batch carried it, then kiln's receipt of what came,
-                // signed off the shards (goal 9, plan 01a1a87b2cec step 3).
-                kept(&hub, &given, &came_from).await;
-                match super::server_signed_off(&hub.pki, receipt).await {
-                    Ok(b) => kept(&hub, &b, "kiln").await,
+                // signed off the shards (goal 9, plan 01a1a87b2cec step 3) in the job that reads it (step 5).
+                kept(&hub, given, &came_from).await;
+                match super::sign_and_take(&hub.store, &hub.pki, receipt, "kiln", crate::util::now_unix()).await {
+                    Ok((_, taken)) => said(taken, "kiln"),
                     Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
                 }
             }
@@ -49,9 +49,15 @@ pub fn install(hub: &Arc<Hub>) {
     }
 }
 
-/// Keeps `bundle`, as it came over `came_from`, saying so where kiln can't.
-async fn kept(hub: &Hub, bundle: &Value, came_from: &str) {
-    match super::take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, crate::util::now_unix()).await {
+/// Keeps `bundle`, as it came over `came_from`, saying so where kiln can't: handed over, not copied (goal 9, plan
+/// 01a1a87b2cec step 5).
+async fn kept(hub: &Hub, bundle: Value, came_from: &str) {
+    said(super::take_owned(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, crate::util::now_unix()).await, came_from);
+}
+
+/// What became of a record of a conversation feed's batch, as it came over `came_from`, said where kiln couldn't take it.
+fn said(taken: anyhow::Result<Result<super::Taken, super::Refused>>, came_from: &str) {
+    match taken {
         Ok(Ok(t)) if t.broke.is_some() => tracing::warn!(target: "kiln.custody", digest = %t.digest, broke = t.broke.as_deref().unwrap_or(""), %came_from, "a conversation feed's batch broke its chain"),
         Ok(Ok(_)) => {}
         Ok(Err(why)) => tracing::info!(target: "kiln.custody", %why, %came_from, "refused a record of a conversation feed's batch"),
@@ -135,15 +141,15 @@ impl Custodian for ToMirror {
             let to = crate::identities::runner_identity(&hub, &self.machine, &instance).await.ok()?.uri().ok()?;
             let server = super::server_uri(&hub.pki.organization());
             let body = Body { to: Some(to), why: "a batch of kiln's conversation store, for the copy this runner keeps".into(), ..Body::new(Kind::HandedOn, &server) };
-            // Signed off the shards (goal 9, plan 01a1a87b2cec step 3).
-            let bundle = match super::server_signed_off(&hub.pki, Statement { subject: vec![thing], ..Statement::new(to_value(&body)) }).await {
-                Ok(b) => b,
+            // Signed off the shards (goal 9, plan 01a1a87b2cec step 3), in the job that reads it to keep it (step 5).
+            let (bundle, taken) = match super::sign_and_take(&hub.store, &hub.pki, Statement { subject: vec![thing], ..Statement::new(to_value(&body)) }, "kiln", crate::util::now_unix()).await {
+                Ok(signed) => signed,
                 Err(e) => {
                     tracing::warn!(target: "kiln.custody", machine = %self.machine, error = %format!("{e:#}"), "kiln's hand-on of a batch to a mirror couldn't be signed");
                     return None;
                 }
             };
-            kept(&hub, &bundle, "kiln").await;
+            said(taken, "kiln");
             Some(bundle.to_string())
         })
     }

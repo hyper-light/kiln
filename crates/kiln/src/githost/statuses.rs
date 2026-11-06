@@ -82,7 +82,7 @@ pub async fn report(hub: &Hub, run_id: &str) -> anyhow::Result<()> {
 /// runs: each run's change as it's broadcast, and every minute the ones a host didn't take.
 pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),

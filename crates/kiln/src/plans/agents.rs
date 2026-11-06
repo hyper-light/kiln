@@ -736,7 +736,7 @@ pub async fn step_left(hub: &Hub, session: &str, input: &serde_json::Value) -> O
     let stack = crate::goals::get(hub, session).await.ok()?;
     let goal = match input.get("id").and_then(serde_json::Value::as_str) {
         Some(id) => stack.items.iter().find(|g| g.id == id),
-        None => stack.items.iter().find(|g| g.status == "active"),
+        None => crate::goals::under_way(&stack.items),
     }?;
     let step = goal.step.as_ref()?;
     let run = step.run.as_deref()?;

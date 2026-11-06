@@ -3,18 +3,21 @@
 //! where it was (`?after=<epoch>.<seq>`) instead of loading everything again; and what each socket
 //! is sent of it ([`Outbox`]): the types it asked for (`topics`), gathered for a short window, only
 //! the newest of each thing a frame carries whole, and none that says again what that socket was
-//! last told. Pure: no clock (the socket's loop keeps time), no disk, no network.
+//! last told. Pure: no clock (the socket's loop keeps time), no disk, no network. No lock on any path
+//! ([`Feed`]: goal 5's rule, plan 01a1a59c2aae): every emit pushes, from whichever shard emits, and
+//! every socket reads, on its own.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use arc_swap::ArcSwapOption;
 use serde_json::Value;
 
-/// The frames the feed keeps: as many as the hub's events ring keeps of its events
+/// The frames the feed keeps: as many as a listener of the hub's events holds of them
 /// ([`crate::hub::EVENTS`]), sharing their text, so a socket that falls behind is told `resync` when
-/// a listener of the ring would be, and a page that was away for no more than that many frames
+/// such a listener would start over, and a page that was away for no more than that many frames
 /// resumes instead.
 pub const RING: usize = crate::hub::EVENTS;
 
@@ -181,18 +184,57 @@ pub enum Since {
     Gap,
 }
 
-struct Ring {
-    /// The number the next frame gets (the first is 1).
-    next: u64,
-    frames: VecDeque<Arc<Frame>>,
-}
-
-/// The ring of the newest [`RING`] frames, and a wake for the sockets that read it.
+/// The newest [`RING`] frames, numbered in the order they're pushed, and a wake for each socket that reads
+/// them, with no lock on any path (goal 5's rule, plan 01a1a59c2aae: no lock two shards share; as goal 4,
+/// plan 01a1a59c2a9c step 5, made the hub's events' lanes). Every emit pushes, from whichever shard emits
+/// it (an agent session's change from its owner's: about 1,700 a second in the lab's many-sessions
+/// profile), and every events socket reads, on its own shard: a ring behind one lock, as this was, had
+/// them all take it.
+///
+/// - **Numbers.** A push claims the next number (a fetch-add on `next`), so frames are numbered in the
+///   order their pushes came, then puts its frame in its place (`seq % cap`), then wakes the listeners.
+/// - **Places.** Each holds the newest frame put in it, swapped in whole (`arc_swap`): a push's frame goes
+///   in unless a newer one already has (a push held up while a whole window of others went by: its frame
+///   is gone before anyone read it, as the oldest of a full ring goes).
+/// - **Reading.** A reader walks the places from its number on, taking each that holds the number it
+///   expects, and stops at the first that doesn't hold it yet (its push still putting it there): it never
+///   skips a frame, and that push wakes it once the frame's in. A place that holds a newer number than it
+///   expects, or a number further than [`RING`] behind the head, says what it wants is gone:
+///   [`Since::Gap`], and the socket is told `resync`.
+/// - **Head** is the newest number claimed: a frame at or below it is in its place, being put there, or
+///   gone.
+/// - **Waking.** Each listener ([`Feed::listen`]) has a wake of its own, `crate::rt::Notify` (a permit, so
+///   a push while it looks isn't lost), in a list swapped in whole as listeners come and go (`crate::rcu`).
+///   A push wakes each. A wake is Notify's to make: where Notify still waits on event-listener, its list
+///   of waiters is behind a lock of that one socket's, not one every push and every socket take, as the
+///   one wake this had was; where Notify waits on a lock-free list, the wake takes no lock at all.
 pub struct Feed {
     epoch: u64,
-    cap: usize,
-    ring: Mutex<Ring>,
-    grew: event_listener::Event,
+    /// The number the next push claims (the first is 1).
+    next: AtomicU64,
+    /// Frame `seq`'s place is `seq % places.len()`: each holds the newest frame put in it, or none yet.
+    places: Box<[ArcSwapOption<Frame>]>,
+    /// The sockets listening, each its own wake.
+    listeners: crate::rcu::Rcu<Vec<Arc<crate::rt::Notify>>>,
+}
+
+/// What a place holds of the frame a reader expects there.
+enum Look {
+    /// That frame.
+    Frame(Arc<Frame>),
+    /// Not that frame yet: its push is still putting it there (or nothing's been put there yet).
+    NotYet,
+    /// A newer one: that frame's gone.
+    Gone,
+}
+
+/// Whether two of a place's values are the same frame (or both none).
+fn same(a: &Option<Arc<Frame>>, b: &Option<Arc<Frame>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl Feed {
@@ -203,32 +245,76 @@ impl Feed {
     }
 
     pub fn with_capacity(epoch: u64, cap: usize) -> Feed {
-        Feed { epoch, cap: cap.max(1), ring: Mutex::new(Ring { next: 1, frames: VecDeque::new() }), grew: event_listener::Event::new() }
+        let places = (0..cap.max(1)).map(|_| ArcSwapOption::empty()).collect();
+        Feed { epoch, next: AtomicU64::new(1), places, listeners: crate::rcu::Rcu::default() }
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
+    /// How many frames it keeps.
+    fn cap(&self) -> u64 {
+        u64::try_from(self.places.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Frame `seq`'s place.
+    fn place(&self, seq: u64) -> Option<&ArcSwapOption<Frame>> {
+        let i = usize::try_from(seq % self.cap().max(1)).ok()?;
+        self.places.get(i)
+    }
+
+    /// The oldest number a feed whose head is `head` keeps: the window of [`RING`] behind it.
+    fn oldest(&self, head: u64) -> u64 {
+        head.saturating_add(1).saturating_sub(self.cap()).max(1)
+    }
+
     /// Numbers `text` and keeps it (the oldest goes past [`RING`]), and wakes the sockets.
     pub fn push(&self, text: Arc<str>) -> u64 {
-        let seq = {
-            let mut r = self.ring.lock();
-            let seq = r.next;
-            r.next += 1;
-            r.frames.push_back(Arc::new(Frame::new(seq, text)));
-            while r.frames.len() > self.cap {
-                r.frames.pop_front();
-            }
-            seq
-        };
-        self.grew.notify(usize::MAX);
+        let seq = self.next.fetch_add(1, Ordering::AcqRel);
+        self.put(Arc::new(Frame::new(seq, text)));
+        self.wake();
         seq
     }
 
-    /// The newest frame's number (0 before the first).
+    /// Puts `frame` in its place, unless a newer frame is there already.
+    fn put(&self, frame: Arc<Frame>) {
+        let Some(place) = self.place(frame.seq) else { return };
+        let mut there = place.load();
+        loop {
+            // A push held up past a window of others: its frame's gone, as a full ring's oldest goes.
+            if there.as_ref().is_some_and(|f| f.seq > frame.seq) {
+                return;
+            }
+            let was = place.compare_and_swap(&there, Some(Arc::clone(&frame)));
+            if same(&was, &there) {
+                return;
+            }
+            // Another push's put went in first (a frame a window before or after this one): looked at again.
+            there = was;
+        }
+    }
+
+    /// Wakes every listener: each takes what's new when it next looks.
+    fn wake(&self) {
+        for l in self.listeners.load().iter() {
+            l.notify();
+        }
+    }
+
+    /// What frame `want`'s place holds of it.
+    fn look(&self, want: u64) -> Look {
+        let Some(place) = self.place(want) else { return Look::Gone };
+        match &*place.load() {
+            Some(f) if f.seq == want => Look::Frame(Arc::clone(f)),
+            Some(f) if f.seq > want => Look::Gone,
+            _ => Look::NotYet,
+        }
+    }
+
+    /// The newest frame's number (0 before the first): the newest a push claimed.
     pub fn head(&self) -> u64 {
-        self.ring.lock().next.saturating_sub(1)
+        self.next.load(Ordering::Acquire).saturating_sub(1)
     }
 
     /// Where the feed is now.
@@ -236,24 +322,38 @@ impl Feed {
         At { epoch: self.epoch, seq: self.head() }
     }
 
-    /// Every frame after `after`, or [`Since::Gap`] when some of them are gone.
+    /// Every frame after `after`, up to the first a push is still putting in its place (that push wakes the
+    /// listeners once it's in), or [`Since::Gap`] when some of them are gone.
     pub fn since(&self, after: u64) -> Since {
-        let r = self.ring.lock();
-        let head = r.next.saturating_sub(1);
-        if after > head {
+        let head = self.head();
+        if after > head || after.saturating_add(1) < self.oldest(head) {
             return Since::Gap;
         }
-        let oldest = r.frames.front().map_or(r.next, |f| f.seq);
-        if after.saturating_add(1) < oldest {
-            return Since::Gap;
+        let mut frames = Vec::new();
+        for want in after.saturating_add(1)..=head {
+            match self.look(want) {
+                Look::Frame(f) => frames.push(f),
+                Look::NotYet => break,
+                Look::Gone => return Since::Gap,
+            }
         }
-        let skip = usize::try_from(after.saturating_add(1) - oldest).unwrap_or(usize::MAX);
-        Since::Frames(r.frames.iter().skip(skip).cloned().collect())
+        Since::Frames(frames)
     }
 
-    /// Every frame it has, oldest first.
+    /// Every frame it has, oldest first: those of the window behind the head in their places, up to the
+    /// first a push is still putting in its place.
     pub fn kept(&self) -> Vec<Arc<Frame>> {
-        self.ring.lock().frames.iter().cloned().collect()
+        let head = self.head();
+        let mut frames = Vec::new();
+        for want in self.oldest(head)..=head {
+            match self.look(want) {
+                Look::Frame(f) => frames.push(f),
+                Look::NotYet => break,
+                // Gone as pushes went on while it looked: the newer ones are still kept.
+                Look::Gone => {}
+            }
+        }
+        frames
     }
 
     /// Where a page that asked to resume from `after` starts: its number when the feed has
@@ -267,9 +367,33 @@ impl Feed {
         }
     }
 
-    /// Wakes when a frame is pushed: listen before looking, then wait.
-    pub fn listen(&self) -> event_listener::EventListener {
-        self.grew.listen()
+    /// A listener from now: [`Listener::woken`] completes once a frame was pushed since it last completed,
+    /// or since it listened. Listen before looking, then wait: a frame pushed while it looks isn't missed.
+    pub fn listen(&self) -> Listener<'_> {
+        let wake = Arc::new(crate::rt::Notify::new());
+        self.listeners.update(|l| l.push(Arc::clone(&wake)));
+        Listener { feed: self, wake }
+    }
+}
+
+/// A socket listening to a [`Feed`] ([`Feed::listen`]): taken off its listeners as it goes.
+pub struct Listener<'a> {
+    feed: &'a Feed,
+    wake: Arc<crate::rt::Notify>,
+}
+
+impl Listener<'_> {
+    /// Completes once a frame was pushed since this last completed, or since it listened (a permit: pushes
+    /// meanwhile are one wake); a charge of the task's turn on its shard (`crate::rt::Notify::notified`).
+    pub async fn woken(&self) {
+        self.wake.notified().await;
+    }
+}
+
+impl Drop for Listener<'_> {
+    fn drop(&mut self) {
+        let wake = &self.wake;
+        self.feed.listeners.update(|l| l.retain(|w| !Arc::ptr_eq(w, wake)));
     }
 }
 

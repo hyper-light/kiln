@@ -79,7 +79,7 @@ impl<T> UnsafeCell<T> {
 /// silicon's 128 bytes): producers write the tail, the consumer the head.
 #[repr(align(128))]
 #[derive(Debug)]
-pub(super) struct Padded<T>(pub(super) T);
+pub(crate) struct Padded<T>(pub(crate) T);
 
 /// One slot: the position it is free for or full at, and its value while full.
 #[derive(Debug)]
@@ -88,17 +88,75 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+/// A ring's head or tail: on a cache line of its own ([`Padded`], the default) where producers and a consumer
+/// contend for them, or as it is ([`Plain`]) where one value passes once (a one-shot's), so the ring's block is a
+/// plain allocation, not one aligned to a line (kiln's goal 9, plan 01a1a87b2cec step 5).
+pub(crate) trait Counter: std::fmt::Debug {
+    /// A counter at `value`.
+    fn at(value: usize) -> Self;
+    /// The counter.
+    fn word(&self) -> &AtomicUsize;
+}
+
+impl Counter for Padded<AtomicUsize> {
+    fn at(value: usize) -> Self {
+        Padded(AtomicUsize::new(value))
+    }
+
+    fn word(&self) -> &AtomicUsize {
+        &self.0
+    }
+}
+
+/// A counter on no line of its own ([`Counter`]).
+#[derive(Debug)]
+pub(crate) struct Plain(AtomicUsize);
+
+impl Counter for Plain {
+    fn at(value: usize) -> Self {
+        Plain(AtomicUsize::new(value))
+    }
+
+    fn word(&self) -> &AtomicUsize {
+        &self.0
+    }
+}
+
+/// A ring's slots: in place where it holds one value, so the ring needs no allocation of its own for them
+/// (kiln's goal 9, plan 01a1a87b2cec step 5: a one-shot's two allocations become one); else on the heap.
+#[derive(Debug)]
+enum Slots<T> {
+    One(Slot<T>),
+    Many(Box<[Slot<T>]>),
+}
+
+impl<T> Slots<T> {
+    fn len(&self) -> usize {
+        match self {
+            Slots::One(_) => 1,
+            Slots::Many(slots) => slots.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&Slot<T>> {
+        match self {
+            Slots::One(slot) => (index == 0).then_some(slot),
+            Slots::Many(slots) => slots.get(index),
+        }
+    }
+}
+
 /// A bounded ring of `T` for any number of producers and consumers (the primitives here have one consumer).
 #[derive(Debug)]
-pub(crate) struct Ring<T> {
-    head: Padded<AtomicUsize>,
-    tail: Padded<AtomicUsize>,
+pub(crate) struct Ring<T, C: Counter = Padded<AtomicUsize>> {
+    head: C,
+    tail: C,
     /// The bit of the tail that marks the ring closed: the capacity rounded up to a power of two, above
     /// every index.
     mark: usize,
     /// One lap of positions: twice the mark, so no position carries it.
     one_lap: usize,
-    slots: Box<[Slot<T>]>,
+    slots: Slots<T>,
 }
 
 /// A push refused, its value handed back.
@@ -113,15 +171,29 @@ pub(crate) enum Refused<T> {
 // SAFETY: a value moves into a slot on one thread and out of it on another, exactly once each, ordered by the
 // slot's stamp (Release by the writer, Acquire by the reader); a `T` that may move between threads makes the
 // ring safe to move and to share. No `&T` is ever handed out, so `T: Sync` is not required.
-unsafe impl<T: Send> Send for Ring<T> {}
+unsafe impl<T: Send, C: Counter + Send> Send for Ring<T, C> {}
 // SAFETY: as for `Send`: every access to a value is the one claim of its position, so shared references to
 // the ring never alias a value.
-unsafe impl<T: Send> Sync for Ring<T> {}
+unsafe impl<T: Send, C: Counter + Sync> Sync for Ring<T, C> {}
 
 impl<T> Ring<T> {
-    /// A ring holding at most `capacity` values. Refused `BadConfig` for no capacity or one whose positions
-    /// do not fit a word beside a lap.
+    /// A ring holding at most `capacity` values, its head and tail each on a line of its own. Refused
+    /// `BadConfig` for no capacity or one whose positions do not fit a word beside a lap.
     pub(crate) fn new(capacity: usize) -> Result<Self, RtError> {
+        Self::made(capacity)
+    }
+}
+
+impl<T> Ring<T, Plain> {
+    /// [`Ring::new`] with its head and tail as they are ([`Plain`]): a ring one value passes through once.
+    pub(crate) fn new_unpadded(capacity: usize) -> Result<Self, RtError> {
+        Self::made(capacity)
+    }
+}
+
+impl<T, C: Counter> Ring<T, C> {
+    /// [`Ring::new`] and [`Ring::new_unpadded`]'s ring.
+    fn made(capacity: usize) -> Result<Self, RtError> {
         let refused = RtError::BadConfig {
             what: "a ring of no capacity, or one too large for its positions",
         };
@@ -138,15 +210,18 @@ impl<T> Ring<T> {
             .ok_or(refused.clone())?;
         // The slots' allocation must be a valid layout, or collecting them would abort on the overflow.
         std::alloc::Layout::array::<Slot<T>>(capacity).map_err(|_| refused)?;
-        let slots = (0..capacity)
-            .map(|position| Slot {
-                stamp: AtomicUsize::new(position),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            })
-            .collect();
+        let slot = |position| Slot {
+            stamp: AtomicUsize::new(position),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        };
+        let slots = if capacity == 1 {
+            Slots::One(slot(0))
+        } else {
+            Slots::Many((0..capacity).map(slot).collect())
+        };
         Ok(Self {
-            head: Padded(AtomicUsize::new(0)),
-            tail: Padded(AtomicUsize::new(0)),
+            head: C::at(0),
+            tail: C::at(0),
             mark,
             one_lap,
             slots,
@@ -176,7 +251,7 @@ impl<T> Ring<T> {
     /// Adds `value` at the tail; hands it back when the ring is full, including while the slot the tail
     /// reaches is still being taken from a lap ago, and when the ring is closed.
     pub(crate) fn push(&self, value: T) -> Result<(), Refused<T>> {
-        let mut tail = self.tail.0.load(Ordering::Relaxed);
+        let mut tail = self.tail.word().load(Ordering::Relaxed);
         let mut reread = false;
         loop {
             // A closed tail carries the mark, so no claim below can succeed past a close.
@@ -188,7 +263,7 @@ impl<T> Ring<T> {
             };
             let stamp = slot.stamp.load(Ordering::Acquire);
             if stamp == tail {
-                match self.tail.0.compare_exchange(
+                match self.tail.word().compare_exchange(
                     tail,
                     self.next(tail),
                     Ordering::Relaxed,
@@ -220,7 +295,7 @@ impl<T> Ring<T> {
                 // read-modify-write reads the last value in the tail's order, where a plain load may keep
                 // returning an old one).
                 reread = true;
-                tail = self.tail.0.fetch_add(0, Ordering::Relaxed);
+                tail = self.tail.word().fetch_add(0, Ordering::Relaxed);
             } else {
                 // Still a lap apart with the latest tail: the slot's stamp read is the old one. Reported full
                 // rather than read again until it changes, which nothing bounds; a sender that must wait fences
@@ -232,13 +307,13 @@ impl<T> Ring<T> {
 
     /// Takes the value at the head, if one is published there.
     pub(crate) fn pop(&self) -> Option<T> {
-        let mut head = self.head.0.load(Ordering::Relaxed);
+        let mut head = self.head.word().load(Ordering::Relaxed);
         let mut reread = false;
         loop {
             let slot = self.slot(head)?;
             let stamp = slot.stamp.load(Ordering::Acquire);
             if stamp == head.wrapping_add(1) {
-                match self.head.0.compare_exchange(
+                match self.head.word().compare_exchange(
                     head,
                     self.next(head),
                     Ordering::Relaxed,
@@ -264,7 +339,7 @@ impl<T> Ring<T> {
                 // This view of the head, or of the slot, is a lap or more behind: read the latest head once
                 // (as for the tail).
                 reread = true;
-                head = self.head.0.fetch_add(0, Ordering::Relaxed);
+                head = self.head.word().fetch_add(0, Ordering::Relaxed);
             } else {
                 // The slot's stamp read is the old one: reported empty (as for a push); a receiver that must
                 // wait fences before it looks again (`crate::handoff`).
@@ -274,14 +349,14 @@ impl<T> Ring<T> {
     }
 }
 
-impl<T> Ring<T> {
+impl<T, C: Counter> Ring<T, C> {
     /// Takes the value at the head as the ring's one taker: the primitives here take only through their one
     /// receiver until it closes the ring (`close`, in the receiver's drop), and a drain, the only other taker,
     /// begins only after that close, so while this end may take, the head is its alone and moves by a plain
     /// store where [`Ring::pop`] claims it by a compare-and-swap. A drain that follows reads the head this end
     /// left, or an older one it walks past as it walks past another taker's ([`Ring::pop`]).
     pub(crate) fn pop_owned(&self) -> Option<T> {
-        let head = self.head.0.load(Ordering::Relaxed);
+        let head = self.head.word().load(Ordering::Relaxed);
         let slot = self.slot(head)?;
         // Anything but the publication of `head` reads as empty: a position claimed and not yet published, or a
         // stamp this thread reads old, which a waiting receiver's fence before its second look rules out
@@ -295,24 +370,24 @@ impl<T> Ring<T> {
         let value = slot.value.with(|cell| unsafe { cell.read().assume_init() });
         slot.stamp
             .store(head.wrapping_add(self.one_lap), Ordering::Release);
-        self.head.0.store(self.next(head), Ordering::Relaxed);
+        self.head.word().store(self.next(head), Ordering::Relaxed);
         Some(value)
     }
 }
 
-impl<T> Ring<T> {
+impl<T, C: Counter> Ring<T, C> {
     /// Refuses every push that has not claimed its place yet; one that has still lands. The mark, then a
     /// fence, so this thread's next look at the slots and a producer's look at the mark after its own fence
     /// cannot both miss the other's write (the store-buffering outcome both fences forbid).
     pub(crate) fn close(&self) {
-        self.tail.0.fetch_or(self.mark, Ordering::SeqCst);
+        self.tail.word().fetch_or(self.mark, Ordering::SeqCst);
         fence(Ordering::SeqCst);
     }
 
     /// Whether the ring is closed, as this thread sees the tail: a producer asks after a fence that
     /// follows its push.
     pub(crate) fn is_closed(&self) -> bool {
-        self.tail.0.load(Ordering::Relaxed) & self.mark != 0
+        self.tail.word().load(Ordering::Relaxed) & self.mark != 0
     }
 
     /// Drops the values in the ring, at most its capacity of them: what a closed ring holds that no one
@@ -327,7 +402,7 @@ impl<T> Ring<T> {
     }
 }
 
-impl<T> Drop for Ring<T> {
+impl<T, C: Counter> Drop for Ring<T, C> {
     /// Drops the values still in the ring: with `&mut self` no end can reach it.
     fn drop(&mut self) {
         while self.pop().is_some() {}
@@ -407,6 +482,30 @@ impl<S> Drop for Shared<S> {
 #[cfg(not(loom))]
 mod tests {
     use super::*;
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a ring of one holds its slot in place, and an unpadded one is aligned
+    /// as its words are, so a one-shot's block is one plain allocation (a padded ring is aligned to a cache line,
+    /// which takes the allocator's aligned path, and kept its slots in an allocation of their own); the padded ring
+    /// keeps its counters' lines; and both carry values as before.
+    #[test]
+    fn g9_s5_a_ring_of_one_holds_its_slot_in_place_and_an_unpadded_one_needs_no_aligned_block() {
+        let plain = Ring::<u32, Plain>::new_unpadded(1).unwrap();
+        assert!(matches!(plain.slots, Slots::One(_)), "one slot, in place");
+        assert!(
+            std::mem::align_of::<Ring<u32, Plain>>() <= 2 * std::mem::align_of::<usize>(),
+            "an unpadded ring is aligned as its words: {}",
+            std::mem::align_of::<Ring<u32, Plain>>()
+        );
+        assert_eq!(std::mem::align_of::<Ring<u32>>(), 128, "a padded ring's counters keep their lines");
+        assert!(matches!(Ring::<u32>::new(2).unwrap().slots, Slots::Many(_)), "two or more on the heap");
+        plain.push(7).unwrap();
+        assert_eq!(plain.push(8), Err(Refused::Full(8)), "one value at a time");
+        assert_eq!(plain.pop_owned(), Some(7));
+        plain.push(9).unwrap();
+        assert_eq!(plain.pop(), Some(9), "the next lap's");
+        plain.close();
+        assert_eq!(plain.push(10), Err(Refused::Closed(10)), "closed, refused");
+    }
 
     #[test]
     fn a_ring_is_fifo_bounded_exactly_and_reuses_its_slots_across_laps() {

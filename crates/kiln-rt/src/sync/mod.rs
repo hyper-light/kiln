@@ -32,7 +32,7 @@ use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
-use ring::{Padded, Refused, Ring, Shared};
+use ring::{Padded, Plain, Refused, Ring, Shared};
 use room::Room;
 
 /// Why a primitive's call ended without a value.
@@ -143,10 +143,13 @@ impl Future for Notified<'_> {
 
 // ------------------------------------------------------------------------------------------ oneshot
 
-/// What a one-shot's ends share: the one value's slot.
+/// What a one-shot's ends share: the one value's slot, in the ring's block itself, its counters on no lines of their
+/// own: one plain allocation a one-shot (kiln's goal 9, plan 01a1a87b2cec step 5: a ring's padded counters made its
+/// block an allocation aligned to a cache line, and its slots another; one of each for every compute job's result,
+/// 0.45% of the shards' CPU in g9p6's calm profile).
 #[derive(Debug)]
 struct OneshotState<T> {
-    value: Ring<T>,
+    value: Ring<T, Plain>,
 }
 
 /// The sending half of a one-shot.
@@ -165,7 +168,7 @@ pub struct OneshotReceiver<T> {
 
 /// A one-shot: one value, from one sender to one receiver. Refused `Capacity` at the cell bound.
 pub fn oneshot<T>() -> Result<(OneshotSender<T>, OneshotReceiver<T>), RtError> {
-    let value = Ring::new(1)?;
+    let value = Ring::new_unpadded(1)?;
     let cell = claim(1)?;
     let sender = Shared::new(OneshotState { value }, cell);
     let receiver = sender.share();

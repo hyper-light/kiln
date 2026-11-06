@@ -1231,7 +1231,7 @@ pub struct Registry {
     pub convo: Option<crate::convo::store::Store>,
     /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
     pub feed: Option<crate::convo::feed::Intake>,
-    feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
+    feed_out: Option<crate::memory::queue::Receiver<crate::convo::feed::Out>>,
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
     copies_out: Option<crate::memory::queue::Receiver<crate::convo::mirror::Out>>,
@@ -2294,8 +2294,8 @@ impl Registry {
             match keep {
                 Some(n) => {
                     let had = m.events.len();
-                    m.events.retain(|e| e.seq.is_some_and(|q| q <= n));
-                    m.reindex();
+                    // Its chunks through `n` kept as they are, none read again (goal 9, plan 01a1a87b2cec step 3).
+                    m.keep_through(n);
                     // Past its machine's newest it had what the machine no longer has: its
                     // viewers let go of that too.
                     resync = m.events.len() != had;
@@ -2517,7 +2517,7 @@ impl Registry {
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get(id) {
-            hub.emit_harness(m.info_encoded());
+            hub.emit_harness(id, m.info_encoded());
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -4391,7 +4391,7 @@ mod tests {
             let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
-            let mut events = hub.harness_events.subscribe();
+            let mut events = hub.harness_events.subscribe(16)?;
             let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
             let was = encodings().await;

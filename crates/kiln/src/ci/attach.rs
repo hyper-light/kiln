@@ -1621,7 +1621,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     // Upgrades that failed or went through before now aren't news.
     let _ = upgrades_failed(&hub).await;
     upgrades_through(&hub).await;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),

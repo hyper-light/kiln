@@ -255,8 +255,9 @@ pub fn empty() -> Body {
     http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
 }
 
-/// A body fed by a channel of chunks; the response ends when the sender is dropped.
-pub fn channel_body(rx: async_channel::Receiver<Bytes>) -> Body {
+/// A body fed by a channel of chunks (an async-channel's, or a lock-free `crate::memory::queue`'s: goal 4,
+/// plan 01a1a59c2a9c step 5); the response ends when the sender is dropped.
+pub fn channel_body(rx: impl futures::Stream<Item = Bytes> + Send + Sync + 'static) -> Body {
     use futures::StreamExt as _;
     let frames = rx.map(|chunk| Ok::<_, std::io::Error>(Frame::data(chunk)));
     BodyExt::boxed(http_body_util::StreamBody::new(frames))

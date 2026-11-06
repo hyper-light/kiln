@@ -1322,7 +1322,7 @@ const RUNS_LOOP_READS: [&str; 4] = ["comment", "review", "cd_apps", "run"];
 /// of a diff's conversation (its comments and reviews). For as long as the server runs.
 pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),

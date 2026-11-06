@@ -66,7 +66,8 @@ impl Key {
     }
 }
 
-/// One entry: a key set once, then the polls it held and for how long, and those of them the host held.
+/// One entry: a key set once, then the polls it held and for how long, those of them the host held, and the time on
+/// the CPU of those whose thread could say it.
 #[derive(Debug, Default)]
 struct Entry {
     key: OnceLock<Key>,
@@ -75,16 +76,27 @@ struct Entry {
     longest_ns: AtomicU64,
     host_polls: AtomicU64,
     host_ns: AtomicU64,
+    cpu_polls: AtomicU64,
+    cpu_held_ns: AtomicU64,
+    cpu_ns: AtomicU64,
+    longest_cpu_ns: AtomicU64,
 }
 
 impl Entry {
-    /// Counts one poll of `ns`, the host's when `host` (the writer's alone).
-    fn count(&self, ns: u64, host: bool) {
+    /// Counts one poll of `ns`, `cpu` of it on the CPU where its thread said, the host's when `host` (the writer's
+    /// alone).
+    fn count(&self, ns: u64, cpu: Option<u64>, host: bool) {
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
         self.longest_ns.fetch_max(ns, Ordering::Relaxed);
         if host {
             self.host_ns.fetch_add(ns, Ordering::Relaxed);
             self.host_polls.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(cpu) = cpu.map(|c| c.min(ns)) {
+            self.cpu_polls.fetch_add(1, Ordering::Relaxed);
+            self.cpu_held_ns.fetch_add(ns, Ordering::Relaxed);
+            self.cpu_ns.fetch_add(cpu, Ordering::Relaxed);
+            self.longest_cpu_ns.fetch_max(cpu, Ordering::Relaxed);
         }
         self.polls.fetch_add(1, Ordering::Relaxed);
     }
@@ -101,6 +113,10 @@ impl Entry {
             longest_ns: self.longest_ns.load(Ordering::Relaxed),
             host_polls: self.host_polls.load(Ordering::Relaxed),
             host_ns: self.host_ns.load(Ordering::Relaxed),
+            cpu_polls: self.cpu_polls.load(Ordering::Relaxed),
+            cpu_held_ns: self.cpu_held_ns.load(Ordering::Relaxed),
+            cpu_ns: self.cpu_ns.load(Ordering::Relaxed),
+            longest_cpu_ns: self.longest_cpu_ns.load(Ordering::Relaxed),
         })
     }
 }
@@ -125,11 +141,25 @@ impl Default for SlowTable {
 impl SlowTable {
     /// One poll that held the shard `ns`, by the task spawned at `site` with `label` set, the host's when `host`
     /// (see [`SlowPoll::host_polls`]): the shard's own call.
+    #[cfg(test)]
     pub(crate) fn note(
         &self,
         site: Option<&'static Location<'static>>,
         label: Option<&'static Label>,
         ns: u64,
+        host: bool,
+    ) {
+        self.note_with_cpu(site, label, ns, None, host);
+    }
+
+    /// [`SlowTable::note`], with `cpu` of the poll's hold on the CPU where the shard's thread said (`crate::task_clock`;
+    /// kiln's goal 9, plan 01a1a87b2cec step 3).
+    pub(crate) fn note_with_cpu(
+        &self,
+        site: Option<&'static Location<'static>>,
+        label: Option<&'static Label>,
+        ns: u64,
+        cpu: Option<u64>,
         host: bool,
     ) {
         let key = Key { site, label };
@@ -142,9 +172,9 @@ impl SlowTable {
             // The shard is the table's only writer: a free entry it finds is still free as it sets the key.
             Some(entry) => {
                 let _ = entry.key.set(key);
-                entry.count(ns, host);
+                entry.count(ns, cpu, host);
             }
-            None => self.rest.count(ns, host),
+            None => self.rest.count(ns, cpu, host),
         }
     }
 
@@ -180,6 +210,16 @@ pub struct SlowPoll {
     pub host_polls: u64,
     /// Their holds added up, nanoseconds.
     pub host_ns: u64,
+    /// Of them, the polls whose shard's thread said its run time (`crate::task_clock`: Linux, where a self-monitoring
+    /// perf event could be opened; kiln's goal 9, plan 01a1a87b2cec step 3).
+    pub cpu_polls: u64,
+    /// Their holds added up, nanoseconds.
+    pub cpu_held_ns: u64,
+    /// Their time on the CPU added up, nanoseconds: the rest of their holds their thread was off the CPU, the host's
+    /// (preempted) or a call's that blocked.
+    pub cpu_ns: u64,
+    /// The longest any of them ran on the CPU, nanoseconds.
+    pub longest_cpu_ns: u64,
 }
 
 /// The slow polls of the shard `holder` names, as they stand (any thread; nothing of the shard's own is
@@ -244,5 +284,22 @@ mod tests {
         let p = read[0];
         assert_eq!((p.polls, p.total_ns, p.longest_ns), (3, 1_650_000, 900_000));
         assert_eq!((p.host_polls, p.host_ns), (2, 1_500_000));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: of an entry's polls, those whose thread said its time on the CPU are counted
+    /// with their holds and that time, and the longest on the CPU; a poll's time on the CPU is never more than its
+    /// hold; one without a reading counts in the hold alone.
+    #[test]
+    fn g9_s3_a_polls_time_on_the_cpu_is_counted_beside_its_hold() {
+        let table = SlowTable::default();
+        let here = Location::caller();
+        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(900_000), false);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false);
+        let read = table.read();
+        let p = read[0];
+        assert_eq!((p.polls, p.total_ns), (4, 3_200_000));
+        assert_eq!((p.cpu_polls, p.cpu_held_ns, p.cpu_ns, p.longest_cpu_ns), (3, 2_700_000, 830_000, 400_000));
     }
 }

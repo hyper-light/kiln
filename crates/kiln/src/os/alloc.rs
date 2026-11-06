@@ -1,15 +1,16 @@
 //! The allocator and how it gives memory back (goal 11 of the API runtime program, plan 01a1a87b2e56 step 4;
 //! docs/runtime-lab.md, "Goal 11 / The allocator (step 4)"). [`init`] is the first thing `main` does.
 //!
-//! * **Linux with kiln's `jemalloc` feature** (production's static musl build once `ci/release/build.sh`'s
-//!   `KILN_LINUX_ALLOCATOR` is `jemalloc`): jemalloc 5.3 is the binary's allocator (`main.rs`'s
-//!   `#[global_allocator]`), with the settings below in its `malloc_conf` ([`JEMALLOC_CONF`]). jemalloc reads
-//!   them at its first allocation, before `main`; `_RJEM_MALLOC_CONF` in the environment overrides them (a
-//!   lab's A/B of one build).
+//! * **Linux with kiln's `jemalloc` feature**: production's static musl build, as `ci/release/build.sh` builds
+//!   it by default (`KILN_LINUX_ALLOCATOR` is `jemalloc` unless a build says `musl`), the lab's pick
+//!   ([`JEMALLOC_CONF`]). jemalloc 5.3 is the binary's allocator (`main.rs`'s `#[global_allocator]`), with the
+//!   settings below in its `malloc_conf`. jemalloc reads them at its first allocation, before `main`;
+//!   `_RJEM_MALLOC_CONF` in the environment overrides them, a setting at a time (a lab's A/B of one build).
 //! * **Linux on glibc** (a build from source for `*-linux-gnu`): glibc's malloc, its arenas capped at
 //!   [`GLIBC_ARENAS`] unless the environment says how many. With the `jemalloc` feature too, that's the C
 //!   libraries' malloc (SQLite's, aws-lc's).
-//! * **Linux on musl without the feature, macOS and Windows**: the platform's allocator, as it is.
+//! * **Linux on musl without the feature** (a release build with `KILN_LINUX_ALLOCATOR=musl`), **macOS and
+//!   Windows**: the platform's allocator, as it is.
 
 use std::sync::OnceLock;
 
@@ -56,8 +57,13 @@ pub const MUZZY_DECAY_MS: u32 = 0;
 /// measured; where they're given only when asked, it changes nothing.
 pub const THP: &str = "never";
 
-/// What jemalloc reads as its `malloc_conf`: the settings above, NUL-terminated. A unit test holds it to
-/// them, and one with the `jemalloc` feature has jemalloc read each back.
+/// What jemalloc reads as its `malloc_conf`: the settings above, NUL-terminated, which the lab's A/B picked
+/// (fedora, 2026-11-05 17:40 to 18:01 UTC, the realistic profile, calm, 8 rounds each; docs/runtime-lab.md,
+/// "The allocator (step 4)"). On the static musl build, against musl's malloc: resident memory 523 to 333 MB
+/// and anonymous 398 to 207 MB, both beyond noise, and none of the latency numbers worse beyond noise. The
+/// lab gave them to a build that predates this string, by `_RJEM_MALLOC_CONF`. Unit tests hold the string to
+/// what the lab ran and to the settings above. With the `jemalloc` feature, they also have jemalloc read
+/// each back, and take a variant from the environment over them.
 pub const JEMALLOC_CONF: &str = "background_thread:true,narenas:5,dirty_decay_ms:5000,muzzy_decay_ms:0,thp:never\0";
 
 /// The settings as jemalloc's `malloc_conf` (tikv-jemalloc-sys's prefixed name for it), read at its first
@@ -220,6 +226,16 @@ mod tests {
         assert!(std::ffi::CStr::from_bytes_with_nul(JEMALLOC_CONF.as_bytes()).is_ok(), "one NUL, at the end");
     }
 
+    /// The settings are the ones the lab's A/B picked, as it ran them (goal 11, plan 01a1a87b2e56 step 4):
+    /// fedora, 2026-11-05, g11alloc2's `_RJEM_MALLOC_CONF` on the static musl build and `MALLOC_CONF` on
+    /// jemalloc preloaded (its alloc.env). Any other setting needs an A/B of its own (docs/runtime-lab.md,
+    /// "The allocator (step 4)").
+    #[test]
+    fn g11_s4_the_settings_are_what_the_lab_picked() {
+        const LAB_RAN: &str = "background_thread:true,narenas:5,dirty_decay_ms:5000,muzzy_decay_ms:0,thp:never";
+        assert_eq!(JEMALLOC_CONF.strip_suffix('\0'), Some(LAB_RAN), "the lab's A/B measured {LAB_RAN}: another setting needs an A/B of its own");
+    }
+
     /// The arenas follow the server's shards: if the server makes more, these say why they're no longer
     /// one for each and one more.
     #[test]
@@ -277,5 +293,34 @@ mod tests {
         assert_eq!(jemalloc_took().as_deref(), Some(JEMALLOC_CONF.trim_end_matches('\0')));
         // Its background threads run: purging is theirs.
         assert_eq!(jemalloc_opt(c"background_thread", false), Some(true));
+    }
+
+    /// The environment still overrides what kiln compiles in, a setting at a time: jemalloc reads
+    /// `_RJEM_MALLOC_CONF` after `malloc_conf`, so a lab's variant needs no rebuild (goal 11, plan
+    /// 01a1a87b2e56 step 4). jemalloc reads both once, as it starts. So this runs again in a process of its
+    /// own (this test's binary, this test alone), started with a variant. There it reads back the variant's
+    /// settings and kiln's for the rest, and checks what the log says of both.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g11_s4_the_environment_overrides_kilns_settings() -> anyhow::Result<()> {
+        // The variants docs/runtime-lab.md names for an A/B on one build.
+        const VARIANT: &str = "narenas:8,dirty_decay_ms:1000";
+        let Some(env) = std::env::var_os("_RJEM_MALLOC_CONF") else {
+            let me = format!("{}::g11_s4_the_environment_overrides_kilns_settings", module_path!().split_once("::").map_or("", |(_, path)| path));
+            let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"]).env("_RJEM_MALLOC_CONF", VARIANT).output()?;
+            let said = String::from_utf8_lossy(&out.stdout);
+            anyhow::ensure!(out.status.success(), "with _RJEM_MALLOC_CONF={VARIANT} ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+            anyhow::ensure!(said.contains("1 passed"), "with _RJEM_MALLOC_CONF={VARIANT}, {me} didn't run: {said}");
+            return Ok(());
+        };
+        // Run with settings of a person's own, jemalloc took theirs: nothing of kiln's to check.
+        if env != VARIANT {
+            return Ok(());
+        }
+        let variant = format!("background_thread:{BACKGROUND_THREAD},narenas:8,dirty_decay_ms:1000,muzzy_decay_ms:{MUZZY_DECAY_MS},thp:{THP}");
+        assert_eq!(jemalloc_took(), Some(variant));
+        let said = said();
+        assert!(said.contains(&format!("kiln's {}, then _RJEM_MALLOC_CONF's {VARIANT})", JEMALLOC_CONF.trim_end_matches('\0'))), "{said}");
+        Ok(())
     }
 }
