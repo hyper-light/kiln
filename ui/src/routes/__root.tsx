@@ -7,6 +7,7 @@ import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-r
 import appCss from "@/index.css?url";
 import geist from "@fontsource-variable/geist?url";
 import geistMono from "@fontsource-variable/geist-mono?url";
+import { Splash } from "@/components/shell/splash";
 
 /**
  * Phone browsers zoom the page into a focused field whose text is under 16px (kiln focuses the
@@ -65,9 +66,13 @@ function Document({ children }: { children: React.ReactNode }) {
       <head>
         <HeadContent />
         <script dangerouslySetInnerHTML={{ __html: NO_AUTO_ZOOM }} />
-        <style>{"html,body{background:#08090a;color:#ededee;margin:0}"}</style>
+        {/* The splash in the HTML stands until the page puts anything of its own after it (goal 8 step 7). */}
+        <style>{"html,body{background:#08090a;color:#ededee;margin:0}#kiln-splash:has(~ :not(script,template)){display:none}"}</style>
       </head>
       <body>
+        <div id="kiln-splash">
+          <Splash />
+        </div>
         {children}
         <Scripts />
       </body>

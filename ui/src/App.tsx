@@ -4,9 +4,8 @@
  */
 import * as React from "react";
 import { AppShell } from "@/components/shell/app-shell";
-import { BrandMark } from "@/components/shell/brand";
+import { Splash } from "@/components/shell/splash";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
-import { Loading } from "@/components/ui/loading";
 import { Toaster } from "@/components/ui/toast";
 import { checkAuth, useAuth } from "@/lib/auth";
 
@@ -44,14 +43,5 @@ export function Providers({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** The first moment, while the app asks who this is: kiln's mark and the loader. */
-export function Splash() {
-  return (
-    <div className="grid min-h-dvh place-items-center" aria-busy="true">
-      <div className="flex flex-col items-center gap-5 text-[#ededee]">
-        <BrandMark className="h-9 w-8 opacity-90" />
-        <Loading label="Loading kiln" />
-      </div>
-    </div>
-  );
-}
+/** The first moment, while the app asks who this is (components/shell/splash.tsx). */
+export { Splash };

@@ -8,28 +8,38 @@ import { events } from "@/api/events";
 
 const RELOADED_AT = "kiln.reloaded-at";
 
-/** The build this page runs: its entry script. */
-function loaded(): string | null {
-  return document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/"]')?.getAttribute("src") ?? null;
+/**
+ * A build as a page's HTML names it: its import map, which names every chunk's file (a deploy that
+ * changes any chunk changes it, while the entry keeps its name unless it changed itself:
+ * ui/scripts/stable-names.mjs, goal 8 step 4), else its entry script.
+ */
+export function buildIn(html: string): string | null {
+  return /<script type="importmap">([\s\S]*?)<\/script>/.exec(html)?.[1] ?? /<script[^>]+type="module"[^>]+src="([^"]+)"/.exec(html)?.[1] ?? null;
+}
+
+/** The build this page runs (production builds only; null under the dev server). */
+export function thisBuild(): string | null {
+  return document.querySelector('script[type="importmap"]')?.textContent ?? document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/"]')?.getAttribute("src") ?? null;
 }
 
 /**
- * The build the server serves now. Asked for as a page: until the UI server is up (just after a
- * restart, say), kiln answers a page with the app's shell, which names the same build.
+ * The build the server serves now. Asked for as a page: kiln answers it with the app's shell, which
+ * names the build. Revalidated by its ETag, so while it's the same build it costs a 304, not the
+ * shell again (goal 8: nothing downloaded twice).
  */
-async function served(): Promise<string | null> {
-  const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin", headers: { accept: "text/html" } })).text();
-  return /<script[^>]+type="module"[^>]+src="([^"]+)"/.exec(html)?.[1] ?? null;
+export async function servedBuild(): Promise<string | null> {
+  const html = await (await fetch("/", { cache: "no-cache", credentials: "same-origin", headers: { accept: "text/html" } })).text();
+  return buildIn(html);
 }
 
 let pending = false;
 
 async function check() {
   if (pending) return;
-  const mine = loaded();
+  const mine = thisBuild();
   if (!mine) return;
   try {
-    const now = await served();
+    const now = await servedBuild();
     if (!now || now === mine) return;
   } catch {
     return; // The next reconnection checks again.

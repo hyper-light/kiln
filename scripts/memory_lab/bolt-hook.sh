@@ -15,7 +15,9 @@
 # sections.txt, the same by section (sections.py: each section's resident KiB, the file's own pages and the process's
 # copies, and its 64 KiB windows touched), which says which code and data the server touched at all: a BOLTed
 # build's hot .text against the .bolt.org.text its profile missed, .rodata, .eh_frame and .gcc_except_table (read
-# only as a panic unwinds), .data.
+# only as a panic unwinds), .data; and kinds.txt, the whole process's resident memory by kind (kinds.py: the
+# binary's, threads' stacks, turso's huge-page-advised arenas, the allocator's mappings, the C heap's), which
+# splits the anonymous memory jemalloc's own figures overstate (goal 11 step 5, part 6).
 # BOLT_RECORD says what else, from the event BOLT_FROM says to the window's end (the lab waits for the hook, so
 # what lasts runs in the background):
 #   none          nothing more (the default: an A/B's rounds)
@@ -51,6 +53,7 @@ pages() {
     awk '/^RssFile:/ { print "process rss_file_kb=" $2 }' "/proc/$pid/status"
   } > "$dir/pages.txt" 2> /dev/null
   python3 -I "$here/sections.py" "$pid" > "$dir/sections.txt" 2>> "$dir/hook.log" || true
+  python3 -I "$here/kinds.py" "$pid" > "$dir/kinds.txt" 2>> "$dir/hook.log" || true
 }
 
 # The instrumented server's dump: its writer's file, the writer a child of the server's.

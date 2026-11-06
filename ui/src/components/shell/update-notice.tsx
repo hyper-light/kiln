@@ -8,26 +8,19 @@
 import { useSyncExternalStore } from "react";
 import { RefreshCw } from "lucide-react";
 import { events } from "@/api/events";
+import { servedBuild, thisBuild } from "@/lib/update";
 
 const EVERY_MS = 5 * 60_000;
-
-/** The entry script this page loaded (production builds only; null under the dev server). */
-function loadedApp(): string | null {
-  const s = document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/index-"]');
-  const m = s?.getAttribute("src")?.match(/\/assets\/index-[^"'?#]+\.js/);
-  return m ? m[0] : null;
-}
 
 let stale = false;
 let started = false;
 const listeners = new Set<() => void>();
 
 async function check() {
-  const mine = loadedApp();
+  const mine = thisBuild();
   if (!mine || stale) return;
   try {
-    const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin" })).text();
-    const served = html.match(/\/assets\/index-[^"'?#]+\.js/)?.[0];
+    const served = await servedBuild();
     if (served && served !== mine) {
       stale = true;
       listeners.forEach((l) => l());
@@ -45,7 +38,8 @@ function start() {
     if (document.visibilityState === "visible") void check();
   });
   window.setInterval(() => void check(), EVERY_MS);
-  void check();
+  // Not as the page starts: it has just loaded the build the server serves, and on a slow link the
+  // shell asked again then is bytes the page's own code waits behind (goal 8 step 6).
 }
 
 function subscribe(listener: () => void) {
