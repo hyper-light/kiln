@@ -1232,12 +1232,96 @@ where
     R: Send + 'static,
 {
     rt()?;
-    let (tx, rx) = futures::channel::oneshot::channel::<R>();
+    let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
+    // Handed over from a shard: its round trip, past the job's own run, is what work kept on a shard is weighed against
+    // ([`POOL_TRIP`], [`here`]; consts-audit B1).
+    let handed = on_shard().then(Instant::now);
     let job = move || {
-        let _ = tx.send(f());
+        let began = Instant::now();
+        let out = f();
+        let _ = tx.send((out, nanos_since(began)));
     };
     to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let (out, ran_ns) = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))?;
+    if let Some(handed) = handed {
+        POOL_TRIP.learn(nanos_since(handed).saturating_sub(ran_ns));
+    }
+    Ok(out)
+}
+
+/// Whole nanoseconds since `t`.
+fn nanos_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
+/// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
+/// nanoseconds. Smoothed as RFC 6298 (§2) smooths a round trip: its mean (a new sample's weight 1/8) and its variation
+/// (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). What [`here`] weighs work kept
+/// on a shard against (consts-audit B1: that was a slow poll, `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the
+/// pool's round trip was). Every shard's tasks teach it: each a load and a store, so a race between two loses one sample
+/// at the most, and no lock is taken.
+pub struct PoolTrip {
+    mean: AtomicU64,
+    dev: AtomicU64,
+    learned: AtomicBool,
+}
+
+impl PoolTrip {
+    /// A [`PoolTrip`] with nothing learned.
+    pub const fn nothing_yet() -> Self {
+        Self { mean: AtomicU64::new(0), dev: AtomicU64::new(0), learned: AtomicBool::new(false) }
+    }
+
+    /// Its mean, nanoseconds: none until a round trip was learned.
+    pub fn mean(&self) -> Option<u64> {
+        self.learned.load(Ordering::Relaxed).then(|| self.mean.load(Ordering::Relaxed))
+    }
+
+    /// Its variation, nanoseconds: 0 until a round trip was learned.
+    pub fn dev(&self) -> u64 {
+        self.dev.load(Ordering::Relaxed)
+    }
+
+    /// A round trip took `took` nanoseconds past its job's run. As RFC 6298 (§2.3) takes a round trip: its variation
+    /// first, against the mean before it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8.
+    pub fn learn(&self, took: u64) {
+        let (mean, dev) = if self.learned.load(Ordering::Relaxed) {
+            let (mean, dev) = (self.mean.load(Ordering::Relaxed), self.dev.load(Ordering::Relaxed));
+            ((mean - mean / 8).saturating_add(took / 8), (dev - dev / 4).saturating_add(took.abs_diff(mean) / 4))
+        } else {
+            (took, took / 2)
+        };
+        self.mean.store(mean, Ordering::Relaxed);
+        self.dev.store(dev, Ordering::Relaxed);
+        self.learned.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The compute pool's round trip as shards' tasks see it ([`PoolTrip`]): learned from every job a task on a shard hands it
+/// ([`compute`]).
+pub static POOL_TRIP: PoolTrip = PoolTrip::nothing_yet();
+
+/// The round trip work done where it's asked is weighed against ([`here`]): on a shard, the compute pool's
+/// ([`POOL_TRIP`], none until learned); off one, none to save (`u64::MAX`): work there is done where it is.
+pub fn trip_from_here() -> Option<u64> {
+    if on_shard() { POOL_TRIP.mean() } else { Some(u64::MAX) }
+}
+
+/// Whether work expected to take `expected_ns` where it's asked is done there rather than handed to the compute pool
+/// (consts-audit B1; goal 9, plan 01a1a87b2cec step 3): the cheaper side does it ([`here_against`] the round trip
+/// [`trip_from_here`]). Whether it fits what's left of the turn is the caller's [`Turns`], which gives the shard up first
+/// where it doesn't.
+pub fn here(expected_ns: u64) -> bool {
+    here_against(expected_ns, trip_from_here())
+}
+
+/// [`here`]'s rule against a round trip of `trip_ns` (none: not learned): work no dearer than the round trip is done
+/// where it is, the hand-off costing at least as much as the work; dearer work goes to the pool. Work expected to cost
+/// nothing (nothing learned of it yet, where its caller learns it as it does it) is no dearer than any round trip. With
+/// nothing learned of the round trip, other work goes to the pool, whose first job teaches it.
+pub fn here_against(expected_ns: u64, trip_ns: Option<u64>) -> bool {
+    expected_ns == 0 || trip_ns.is_some_and(|trip| expected_ns <= trip)
 }
 
 /// Run a job in pieces on the compute pool: `step` is called with `state` and its piece's [`Turn`]
@@ -3366,6 +3450,47 @@ mod tests {
             });
             timeout(Duration::from_secs(5), next).await?;
             timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
+            Ok(())
+        })
+    }
+
+    /// Consts-audit B1 (goal 9, plan 01a1a87b2cec step 3): work is done where it's cheaper, weighed against the compute
+    /// pool's round trip as learned, with no fixed bound (it was a slow poll, 100 µs). Do: weigh 50 µs of work against a
+    /// round trip learned from a fast pool (20 µs samples), then from a slow one (a millisecond's, a loaded host's); weigh
+    /// work no dearer than the round trip, work nothing's been learned of, and work against a pool nothing's been learned
+    /// of; check RFC 6298's arithmetic; hand a job to the pool from a shard. Expect: the fast pool takes the 50 µs, the slow
+    /// one leaves it where it is; work no dearer stays, work expected to cost nothing stays whatever the round trip, and other
+    /// work goes to a pool nothing's been learned of, whose first job teaches it; off a shard work stays where it is.
+    #[test]
+    fn b1_work_is_done_where_its_cheaper_against_the_pools_learned_round_trip() -> anyhow::Result<()> {
+        let trip = PoolTrip::nothing_yet();
+        anyhow::ensure!(trip.mean().is_none() && !here_against(1, trip.mean()), "nothing learned of the pool: there, which teaches it");
+        anyhow::ensure!(here_against(0, trip.mean()), "nothing expected of the work: where it is, which learns it");
+        // RFC 6298's arithmetic: 40 µs, then 8 µs. The first sets the mean and half of it the variation; then the variation
+        // 20 − 20/4 + |8 − 40|/4 = 23 µs, and the mean 40 − 40/8 + 8/8 = 36 µs.
+        trip.learn(40_000);
+        anyhow::ensure!(trip.mean() == Some(40_000) && trip.dev() == 20_000, "the first: {:?}, {}", trip.mean(), trip.dev());
+        trip.learn(8_000);
+        anyhow::ensure!(trip.mean() == Some(36_000) && trip.dev() == 23_000, "the second: {:?}, {}", trip.mean(), trip.dev());
+        // A fast pool takes 50 µs of work; a slow one leaves it where it is, and moving back, takes it again.
+        for _ in 0..32 {
+            trip.learn(20_000);
+        }
+        let fast = trip.mean();
+        anyhow::ensure!(!here_against(50_000, fast) && here_against(20_000, fast), "against a fast pool ({fast:?} ns): 50 µs goes there, 20 µs stays");
+        for _ in 0..32 {
+            trip.learn(1_000_000);
+        }
+        let slow = trip.mean();
+        anyhow::ensure!(here_against(50_000, slow) && !here_against(2_000_000, slow), "against a slow pool ({slow:?} ns): 50 µs stays, 2 ms goes");
+        for _ in 0..32 {
+            trip.learn(20_000);
+        }
+        anyhow::ensure!(!here_against(50_000, trip.mean()), "fast again ({:?} ns): 50 µs goes there", trip.mean());
+        anyhow::ensure!(here(u64::MAX), "off a shard: where it is, whatever it costs");
+        block_on(async {
+            compute(|| ()).await?;
+            anyhow::ensure!(POOL_TRIP.mean().is_some(), "a job handed to the pool from a shard taught its round trip");
             Ok(())
         })
     }
