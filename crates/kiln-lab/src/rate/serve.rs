@@ -25,13 +25,9 @@ pub struct Up {
     pub pid: u32,
     pub vars: Vars,
     pub fill_s: Option<f64>,
-    /// Its processes, stopped when this goes.
-    _running: Running,
-}
-
-enum Running {
-    Fleet(Box<Fleet>),
-    Proc(Proc),
+    /// Its processes, stopped when this goes: kiln's fleet, or a target's command.
+    _fleet: Option<Fleet>,
+    _server: Option<Proc>,
 }
 
 /// A free port on 127.0.0.1, never production's.
@@ -79,7 +75,7 @@ pub fn kiln(build: &Build, profile: &Profile, place: &Place, dir: &Path, bin: &P
     vars.set("dir", Value::One(dir.display().to_string()));
     vars.set("token", Value::One(fleet.admin.clone()));
     vars.set("session", Value::List(opened.into_iter().map(|(id, _)| id).collect()));
-    Ok(Up { port: fleet.port, pid: fleet.server.child.id(), vars, fill_s: Some(fill_s), _running: Running::Fleet(Box::new(fleet)) })
+    Ok(Up { port: fleet.port, pid: fleet.server.child.id(), vars, fill_s: Some(fill_s), _fleet: Some(fleet), _server: None })
 }
 
 fn render(t: &Template, vars: &Vars) -> anyhow::Result<String> {
@@ -156,7 +152,7 @@ pub fn command(c: &target::Command, place: &Place, dir: &Path, unit: &str) -> an
             vars.set(&k, v);
         }
     }
-    Ok(Up { port, pid: server.child.id(), vars, fill_s: None, _running: Running::Proc(server) })
+    Ok(Up { port, pid: server.child.id(), vars, fill_s: None, _fleet: None, _server: Some(server) })
 }
 
 /// Runs a target's seed to its end (within its time): the values its last line gave.
