@@ -522,6 +522,21 @@ impl Chunk {
             .map(Cow::Owned)
     }
 
+    /// Its event `k`'s text alone: as it keeps it, or sliced from its texts joined (as its copy's newest page's reads keep
+    /// them, else a compact one's segment inflated, read back first when it's spilled), no other event of it parsed.
+    fn text_at(&self, k: usize) -> std::io::Result<Cow<'_, str>> {
+        let missing = || std::io::Error::new(std::io::ErrorKind::InvalidData, "a packed event's text isn't where its meta says");
+        if !self.is_compact() {
+            return self.evs.get(k).map(|e| Cow::Borrowed(e.entry.text())).ok_or_else(missing);
+        }
+        let span = self.span(k, 1).ok_or_else(missing)?;
+        let text = |texts: &[u8], at: usize| texts.get(span.start.checked_sub(at)?..span.end.checked_sub(at)?).and_then(|t| std::str::from_utf8(t).ok()).map(str::to_owned);
+        if let Some((at, kept)) = self.page_texts_kept(span.start) {
+            return text(&kept, at).map(Cow::Owned).ok_or_else(missing);
+        }
+        text(&self.joined()?, 0).map(Cow::Owned).ok_or_else(missing)
+    }
+
     /// Its texts joined as an `events` frame joins them: a compact one's segment inflated (read back first
     /// when it's spilled), another's written out now.
     pub fn joined(&self) -> std::io::Result<Cow<'_, [u8]>> {
@@ -830,6 +845,37 @@ pub struct Events {
     /// back, the events made again or let go of): the view let go of then is the last to hold them, so its owner lets go
     /// of that view off its shard ([`Mirror::publish`]; goal 9, plan 01a1a87b2cec step 3).
     took_out: bool,
+    /// Where its last reply on its session's main thread is ([`Replied`]).
+    reply: Replied,
+}
+
+/// Where a copy's last reply on its session's main thread is (an `assistant` event of no subagent's: [`is_reply`]), by its
+/// number: what `agents.result` reads of the copy (`super::registry::Registry::reply`), kept as its events come, change
+/// and go, so no read scans back through it for one (goal 11 audit A2(c)). `Registry::conclusion` scanned back on the
+/// request's shard, every compact chunk on the way inflated and every spilled one read from its file, for each
+/// `agents.get` (which threw the reply away) and `agents.result`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Replied {
+    /// None among its events.
+    #[default]
+    None,
+    /// The one numbered so.
+    At(u64),
+    /// Not known here (it changed into another kind, or went with the events after it, or has no number): found by a
+    /// scan back, off the shard ([`View::reply_read`]).
+    Unknown,
+}
+
+impl Replied {
+    /// `ev`, a reply, as the copy's last.
+    fn of(ev: &Ev) -> Self {
+        ev.entry.seq().map_or(Replied::Unknown, Replied::At)
+    }
+}
+
+/// Whether `e` is a reply on its session's main thread: what `agents.result` says an agent concluded with.
+pub(super) fn is_reply(e: &Entry) -> bool {
+    e.kind() == Some("assistant") && e.on_main_thread()
 }
 
 /// A copy's chunks in order, the newest last ([`Events::chunks`]): what a slice of them was, made of the older
@@ -889,13 +935,48 @@ impl Events {
     /// Made from `all`, in order.
     fn of(all: Vec<Ev>) -> Self {
         let len = all.len();
+        // Its last reply found among them, each in memory: nothing read again.
+        let reply = all.iter().rev().find(|e| is_reply(&e.entry)).map_or(Replied::None, Replied::of);
         let mut chunks = Vec::with_capacity(len.div_ceil(CHUNK));
         let mut rest = all.into_iter().peekable();
         while rest.peek().is_some() {
             chunks.push(Arc::new(Chunk::of(rest.by_ref().take(CHUNK).collect())));
         }
         let newest = chunks.pop();
-        Self { older: Arc::new(chunks), newest, len, first: len.min(CHUNK), took_out: false }
+        Self { older: Arc::new(chunks), newest, len, first: len.min(CHUNK), took_out: false, reply }
+    }
+
+    /// Where its last reply on its session's main thread is ([`Replied`]).
+    pub(super) fn replied(&self) -> Replied {
+        self.reply
+    }
+
+    /// Its last reply's place once event `i`, numbered `was` before, changed: the event changed is in memory (its chunk was
+    /// read back to change it). The last reply itself changed into another, or another number, isn't known here; another
+    /// event that's now a reply past it is the last.
+    fn replied_at(&mut self, i: usize, was: Option<u64>) {
+        let now = self.place(i).and_then(|(c, k)| self.chunk(c)?.evs.get(k)).map(|e| (is_reply(&e.entry), e.entry.seq()));
+        self.reply = match (self.reply, now) {
+            (Replied::At(s), Some((true, Some(q)))) if was == Some(s) && q == s => Replied::At(s),
+            (Replied::At(s), _) if was == Some(s) => Replied::Unknown,
+            (Replied::At(s), Some((true, Some(q)))) => Replied::At(s.max(q)),
+            (Replied::None, Some((true, Some(q)))) => Replied::At(q),
+            (Replied::None, Some((false, _))) | (Replied::At(_), Some((false, _))) => self.reply,
+            _ => Replied::Unknown,
+        };
+    }
+
+    /// Its last reply's place once its first events went (a cut): where it went with them, none is left, as no event after
+    /// it is a reply.
+    fn replied_after_front_cut(&mut self) {
+        if let Replied::At(s) = self.reply {
+            self.reply = match self.meta(0).map(Meta::seq) {
+                None => Replied::None,
+                Some(Some(first)) if first > s => Replied::None,
+                Some(Some(_)) => Replied::At(s),
+                Some(None) => Replied::Unknown,
+            };
+        }
     }
 
     /// Chunk `c` of [`Events::chunks`].
@@ -1109,21 +1190,30 @@ impl Events {
     /// list too. Whether there was one.
     pub(super) fn change(&mut self, i: usize, f: impl FnOnce(&mut Ev)) -> bool {
         let Some((c, k)) = self.place(i) else { return false };
-        if c == self.older.len() {
-            return match self.newest.as_mut() {
+        let was = self.meta(i).and_then(Meta::seq);
+        let changed = if c == self.older.len() {
+            match self.newest.as_mut() {
                 Some(chunk) => Arc::make_mut(chunk).change(k, f),
                 None => false,
-            };
+            }
+        } else {
+            match Arc::make_mut(&mut self.older).get_mut(c) {
+                Some(chunk) => Arc::make_mut(chunk).change(k, f),
+                None => false,
+            }
+        };
+        if changed {
+            self.replied_at(i, was);
         }
-        match Arc::make_mut(&mut self.older).get_mut(c) {
-            Some(chunk) => Arc::make_mut(chunk).change(k, f),
-            None => false,
-        }
+        changed
     }
 
     /// `ev` last: the chunk that sealed as it came (full, and no longer the newest), if one did. Where the newest has room,
     /// that chunk alone is copied (when a view shares it); the older chunks' list only as one seals, once a chunk.
     pub(super) fn push(&mut self, ev: Ev) -> Option<Arc<Chunk>> {
+        if is_reply(&ev.entry) {
+            self.reply = Replied::of(&ev);
+        }
         let room = self.newest.as_ref().is_some_and(|c| c.len() < CHUNK);
         let sealed = if room {
             if let Some(newest) = self.newest.as_mut() {
@@ -1196,6 +1286,7 @@ impl Events {
         self.len -= n;
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.took_out = true;
+        self.replied_after_front_cut();
         (n, remade)
     }
 
@@ -1223,6 +1314,7 @@ impl Events {
         self.len -= now;
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.took_out = true;
+        self.replied_after_front_cut();
         Some((now, cut, left))
     }
 
@@ -1245,6 +1337,7 @@ impl Events {
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
         self.took_out = true;
+        self.replied_after_front_cut();
         Some(left)
     }
 
@@ -1317,6 +1410,14 @@ impl Events {
         self.first = self.chunks().first().map_or(0, |c| c.len());
         self.page_newest();
         self.took_out = true;
+        // Its last reply kept with those it kept, or gone with those after them: then the last of those kept isn't known here.
+        if let Replied::At(s) = self.reply {
+            self.reply = match len.checked_sub(1).and_then(|i| self.meta(i)).map(Meta::seq) {
+                None => Replied::None,
+                Some(Some(last)) if last >= s => Replied::At(s),
+                Some(_) => Replied::Unknown,
+            };
+        }
         Some(len)
     }
 
@@ -1995,6 +2096,42 @@ impl View {
         let mut reading = self.events.reading();
         let events = (begin..end).filter_map(|i| reading.get(i).map(|e| e.entry.sent(lean).to_owned())).collect();
         Paged::Page { events, window: self.window_at(begin, older) }
+    }
+
+    /// Its last reply on its session's main thread where reading it reads nothing back (goal 11 audit A2(c)): its entry,
+    /// where its chunk keeps its events as they are; `Ok(None)` where it has none. [`Unread::Unkept`] where its chunk is
+    /// compact or spilled, or where it is isn't known ([`Replied::Unknown`]): read off the shard ([`View::reply_read`]). Its
+    /// place is found by its number among the metas, in memory whatever's spilled: nothing is inflated, read or parsed.
+    pub fn reply_kept(&self) -> Result<Option<Arc<Entry>>, Unread> {
+        self.reply_at(false)
+    }
+
+    /// Its last reply on its session's main thread ([`View::reply_kept`]), its text read from its chunk where that's compact
+    /// (inflated, or read from its spill file first) and that alone parsed, or found by a scan back through its events where
+    /// its place isn't known: off the runtime's threads (the blocking pool), which may wait on disk (goal 11 audit A2(c), A3).
+    pub fn reply_read(&self) -> Option<Arc<Entry>> {
+        match self.reply_at(true) {
+            Ok(found) => found,
+            Err(_) => self.events.iter().rev().find(|e| is_reply(&e.entry)).map(|e| Arc::clone(&e.entry)),
+        }
+    }
+
+    /// [`View::reply_kept`], a compact chunk's text read back where `read` says so.
+    fn reply_at(&self, read: bool) -> Result<Option<Arc<Entry>>, Unread> {
+        let s = match self.events.replied() {
+            Replied::None => return Ok(None),
+            Replied::Unknown => return Err(Unread::Unkept),
+            Replied::At(s) => s,
+        };
+        let i = self.events.partition_point(|m| m.seq().is_some_and(|q| q < s));
+        let (c, k) = self.events.place(i).filter(|_| self.events.meta(i).and_then(Meta::seq) == Some(s)).ok_or(Unread::Unkept)?;
+        let chunk = self.events.chunk(c).ok_or(Unread::Unkept)?;
+        let entry = match chunk.evs.get(k) {
+            Some(e) if !chunk.is_compact() => Arc::clone(&e.entry),
+            _ if read && chunk.is_compact() => Arc::new(Entry::from_text(&chunk.text_at(k).map_err(|_| Unread::Cannot)?)),
+            _ => return Err(Unread::Unkept),
+        };
+        if is_reply(&entry) { Ok(Some(entry)) } else { Err(Unread::Unkept) }
     }
 
     /// Event `event`, whole, as the copy has it: what a lean one held back (`super::window::lean`).
@@ -3296,6 +3433,38 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
 pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
     let sides = all.sides();
     long_changes(u, sides) || m.said(u, all).is_some_and(|ns| !sides.take_here(ns, ns))
+}
+
+/// What reading a reply's JSON into its tree takes by its bytes ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
+static REPLIES: Rate = Rate::new();
+
+/// Reply `e`'s JSON as its tree, as `agents.result` and an experiment read it (goal 11 audit A2(c)): read where it's asked
+/// where that's expected to fit a turn and cost no more than the compute pool's round trip (`crate::rt::here`, by what
+/// replies' bytes took to read: [`REPLIES`]), else on the pool. Nothing learned yet, it's read where it's asked, and learned.
+pub(super) async fn reply_value(e: Arc<Entry>) -> Value {
+    let bytes = u64::try_from(e.text().len()).unwrap_or(u64::MAX);
+    let ns = REPLIES.expected(bytes);
+    if crate::rt::here(ns, ns) {
+        let began = Timer::start();
+        let value = e.value();
+        REPLIES.learn(bytes, nanos(began.took()));
+        return value;
+    }
+    let held = Arc::clone(&e);
+    match crate::rt::compute(move || {
+        let began = Timer::start();
+        let value = e.value();
+        (value, began.took())
+    })
+    .await
+    {
+        Ok((value, took)) => {
+            REPLIES.learn(bytes, nanos(took));
+            value
+        }
+        // The pool dropped the job (the process is going): read here.
+        Err(_) => held.value(),
+    }
 }
 
 /// What its owner needs to write session `session`'s update out off the shard ([`Shard::want_off`]): whether its row for the

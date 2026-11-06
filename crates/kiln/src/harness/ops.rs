@@ -114,7 +114,8 @@ const HEAVY: &[&str] = &["skills", "plugins", "mcp", "harness_status", "delivery
 async fn get(cx: Cx, v: Value) -> Out {
     let info = seen(&cx, &agent_of(&v)?).await?;
     let id = info.id.clone();
-    let (mut state, _, _) = cx.hub.harness.conclusion(&id).unwrap_or_default();
+    // Its state alone: nothing of its events is read for it (goal 11 audit A2(c)).
+    let mut state = cx.hub.harness.state_value(&id).unwrap_or_default();
     if let Some(o) = state.as_object_mut() {
         for k in HEAVY {
             o.remove(*k);
@@ -483,7 +484,8 @@ async fn result(cx: Cx, v: Value) -> Out {
     if info.parent.is_some() && info.parent == cx.caller.agent {
         super::told::saw(&cx.hub, &info).await;
     }
-    let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
+    // Its last reply found by its place, read off the shard where its chunk is compact or spilled (goal 11 audit A2(c)).
+    let (reply, changes) = (cx.hub.harness.reply(&id).await, cx.hub.harness.changes_value(&id));
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
     let record = match crate::workspace::change::of(&cx.hub, &id).await {
@@ -1894,6 +1896,68 @@ mod end_to_end {
             let mine = call(cx, "agents.list", json!({"parent": p})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let ids: Vec<&str> = mine.get("agents").and_then(Value::as_array).map(|a| a.iter().filter_map(|b| b.get("id").and_then(Value::as_str)).collect()).unwrap_or_default();
             anyhow::ensure!(ids.len() == 2 && kids.iter().all(|k| ids.contains(&k.as_str())), "{mine}");
+            Ok(())
+        })
+    }
+
+    /// `fut`, and what its polls inflated and read back from spill files on the thread that polled them (a request's
+    /// shard), counted a poll at a time so nothing else that thread runs between them counts.
+    async fn read_back_in<F: std::future::Future>(fut: F) -> (F::Output, u64, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let (mut inflated, mut read) = (0u64, 0u64);
+        let out = std::future::poll_fn(|cx| {
+            let was = (crate::harness::packed::INFLATED.with(std::cell::Cell::get), crate::harness::spill::READ_BACK.with(std::cell::Cell::get));
+            let polled = fut.as_mut().poll(cx);
+            inflated = inflated.wrapping_add(crate::harness::packed::INFLATED.with(std::cell::Cell::get).wrapping_sub(was.0));
+            read = read.wrapping_add(crate::harness::spill::READ_BACK.with(std::cell::Cell::get).wrapping_sub(was.1));
+            polled
+        })
+        .await;
+        (out, inflated, read)
+    }
+
+    /// Goal 11 audit A2(c), A3 (goal 10, plan 01a1a87b2dae step 5: the API's reads under a millisecond): `agents.get` reads
+    /// none of an agent's events, and `agents.result` reads its last reply by the place its copy keeps, its chunk read back
+    /// off the request's shard. Do: an agent's reply, then six chunks' events of its subagent's, so the reply's chunk is
+    /// compact and spilled; `agents.get` and `agents.result` called. Expect: nothing inflated or read from a spill file on
+    /// the request's shard by either, the agent's state from `agents.get`, its reply's words from `agents.result`; and a
+    /// reply after them read from memory. `Registry::conclusion` scanned back through every chunk on the shard for both,
+    /// each compact one inflated, each spilled one read from its file: this fails on that code.
+    #[test]
+    fn g10_a2c_agents_get_and_result_read_nothing_back_on_the_requests_shard() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::harness::registry::Location;
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let there = Location::Machine("box".into());
+            let id = crate::util::new_id();
+            let info = crate::harness::session::Info { id: id.clone(), kind: "claude".into(), name: "Helper".into(), status: crate::harness::model::Status::Running, ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            let said = |q: u64, parent: Option<&str>, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: parent.map(str::to_owned), by: None, body: Body::Assistant { text, streaming: false } };
+            let n = u64::try_from(crate::harness::copies::CHUNK * 6 + 9)?;
+            let events: Vec<Event> = std::iter::once(said(1, None, "Done: D42 holds the fix.".into())).chain((2..=n).map(|q| said(q, Some("t1"), format!("{q}: a subagent at work")))).collect();
+            hub.harness.ingest(&there, &id, Update::Events { events }).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !hub.harness.view_held(&id).is_some_and(|v| v.events.chunks().first().is_some_and(|c| c.is_spilled())) {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the reply's chunk never spilled");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let (got, inflated, read) = read_back_in(call(person.clone(), "agents.get", json!({"agent": id}))).await;
+            let got = got.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(inflated == 0 && read == 0, "agents.get: {inflated} inflated, {read} read from a spill file on its shard");
+            anyhow::ensure!(got.pointer("/info/id") == Some(&json!(id)) && got.get("state").is_some(), "{got}");
+            let (got, inflated, read) = read_back_in(call(person.clone(), "agents.result", json!({"agent": id}))).await;
+            let got = got.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(inflated == 0 && read == 0, "agents.result: {inflated} inflated, {read} read from a spill file on its shard");
+            anyhow::ensure!(got.pointer("/reply/text") == Some(&json!("Done: D42 holds the fix.")), "its last reply: {got}");
+            // A reply after them, in the open chunk: read where it is.
+            hub.harness.ingest(&there, &id, Update::Events { events: vec![said(n + 1, None, "And D43.".into())] }).await;
+            hub.harness.applied(&id).await;
+            let (got, inflated, read) = read_back_in(call(person, "agents.result", json!({"agent": id}))).await;
+            let got = got.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(inflated == 0 && read == 0 && got.pointer("/reply/text") == Some(&json!("And D43.")), "the newer reply: {got}");
             Ok(())
         })
     }

@@ -4443,16 +4443,39 @@ impl Registry {
         state.get::<Vec<super::model::QueueItem>>("queue").unwrap_or_default()
     }
 
-    /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
-    /// last reported, its last reply on its main thread (an `assistant` event) and its changeset.
-    pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
-        // References from its view; the copies made after.
-        let (state, reply, changes) = self.sessions.with(id, |v| {
-            let reply = v.events.iter().rev().find(|e| e.entry.kind() == Some("assistant") && e.entry.on_main_thread()).map(|e| Arc::clone(&e.entry));
-            (Arc::clone(&v.state), reply, v.changes.clone())
-        })?;
-        let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
-        Some((state.to_value(), reply.map(|e| e.value()), changes))
+    /// What `agents.get` reads of a session (`harness::ops`): its state as last reported. None of its events is read (goal
+    /// 11 audit A2(c): `conclusion` scanned back through them for a reply `agents.get` threw away, on the request's shard,
+    /// inflating every compact chunk and reading every spilled one on the way).
+    pub fn state_value(&self, id: &str) -> Option<Value> {
+        let state = self.sessions.with(id, |v| Arc::clone(&v.state))?;
+        Some(state.to_value())
+    }
+
+    /// Session `id`'s changeset as JSON: `Null` when it has none, or there's no such session.
+    pub fn changes_value(&self, id: &str) -> Value {
+        let changes = self.sessions.with(id, |v| v.changes.clone()).flatten();
+        changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()))
+    }
+
+    /// Session `id`'s last reply on its main thread (an `assistant` event of no subagent's), as `agents.result` and an
+    /// experiment read it: found by its place, which its copy keeps (`super::copies::Replied`), on the request's shard where
+    /// its chunk keeps its events as they are; else read from its chunk, or the copy scanned back for it, on the blocking
+    /// pool, where a compact chunk is inflated and a spilled one read from its file (goal 11 audit A2(c), A3: no shard
+    /// reads a spill file). Its JSON read where that costs least (`super::copies::reply_value`). None when it has none, or
+    /// there's no such session.
+    pub async fn reply(&self, id: &str) -> Option<Value> {
+        let view = self.sessions.view(id)?;
+        let entry = match view.reply_kept() {
+            Ok(kept) => kept,
+            Err(_) => match crate::rt::blocking(move || view.reply_read()).await {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::debug!(session = id, error = %format!("{e:#}"), "a session's last reply wasn't read off the shard");
+                    None
+                }
+            },
+        }?;
+        Some(super::copies::reply_value(entry).await)
     }
 
     /// Tests: session `id`'s changeset, as its machine would report it.

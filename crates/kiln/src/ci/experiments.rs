@@ -771,7 +771,7 @@ fn named_diff(said: &str) -> Option<&str> {
 /// The diff agent `id` says it made (`D12` on its last line), and that diff's latest change
 /// (`parent..commit`), if it's in `repo`.
 async fn diff_of(hub: &Hub, repo: &Repo, id: &str) -> Result<(String, String, String), String> {
-    let said = hub.harness.conclusion(id).and_then(|(_, reply, _)| reply).and_then(|r| r.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    let said = hub.harness.reply(id).await.and_then(|r| r.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
     let Some(d) = named_diff(&said) else { return Err(format!("its agent ended without a diff: {}", crate::util::truncate(said.trim(), 200))) };
     let diff = super::diffs::find(hub, d).await.ok().flatten().filter(|x| x.repo == repo.name).ok_or_else(|| format!("its agent named {d}, which isn't a diff of {}", repo.name))?;
     let v = super::diffs::versions(hub, &diff).await.ok().and_then(|v| v.into_iter().max_by_key(|x| x.n)).ok_or_else(|| format!("{d} has no version"))?;
