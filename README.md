@@ -81,7 +81,8 @@ default, so `runs-on: [baremetal]` jobs work immediately.
 On Linux with systemd the server comes first on its machine ([docs/priority.md](docs/priority.md), "What
 kiln install grants"): its `kiln.slice` at CPU and I/O weight 1000, and its shards in Linux's real-time
 class wherever its unit can grant it, written into a new server's config (`[server] realtime`): every
-system install, and a user's whose service manager allows `RLIMIT_RTPRIO` 1. `[server] cores` gives it
+system install, and a user's whose service manager allows `RLIMIT_RTPRIO` 1. The shards take it each on a
+CPU of its own, the server's other threads kept off them, or not at all, and the server says which. `[server] cores` gives it
 cores of its own, which a system install also makes a cpuset partition nothing else runs on. A user's
 install can't get, without root: a slice ahead of the system's, the real-time class past their service
 manager's limit, `AllowedCPUs=` without the cpuset controller delegated to it, or a partition; `kiln

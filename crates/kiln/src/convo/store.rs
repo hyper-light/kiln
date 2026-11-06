@@ -665,8 +665,8 @@ impl Store {
     }
 
     /// Bytes of rows this store has committed since it opened (`Row::bytes`): those put ([`Store::put`]) and those of
-    /// feeds' batches taken in. Read without asking its writer: what its own feeds have to ship grows by it (a feed
-    /// ships at once past `super::feed::SHIP_AT_BYTES` of them; goal 9, plan 01a1a87b2cec step 5).
+    /// feeds' batches taken in. Read without asking its writer: past where it stood at a feed's last read that found
+    /// nothing more, that feed has something to ship (goal 9, plan 01a1a87b2cec step 5; consts-audit R4).
     pub fn grown(&self) -> u64 {
         self.queue.written.load(Ordering::Relaxed).saturating_add(self.queue.taken.load(Ordering::Relaxed))
     }

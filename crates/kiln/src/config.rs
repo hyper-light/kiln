@@ -148,10 +148,13 @@ pub struct Server {
     /// (docs/priority.md, "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9,
     /// plan 01a1a87b2cec step 4), where the system grants it (`kiln install` writes the grant,
     /// `LimitRTPRIO=`): a shard waking takes its CPU at once, whatever runs there, under every kernel
-    /// preemption mode. Refused, the shards run as without it and `/healthz/server` and the log say
-    /// why. Off until declared (docs/ci.md §0.3, "Opt-in automation"): on bare metal, `kiln install`
-    /// declares it in a new server's config wherever the systemd unit it writes grants it, saying why
-    /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
+    /// preemption mode. Each takes it on a CPU of its own, the server's other threads kept off them:
+    /// those of `cores`, else the machine's fastest first, one thread of each core (`crate::rt::class_cpus`);
+    /// with no such CPU for each shard, none asks (2026-11-06). Refused or held back, the shards run as
+    /// without it and `/healthz/server` and the log say why. Off until declared (docs/ci.md §0.3,
+    /// "Opt-in automation"): on bare metal, `kiln install` declares it in a new server's config wherever
+    /// the systemd unit it writes grants it, saying why (docs/priority.md, "The bare-metal default").
+    /// `KILN_RT_REALTIME` overrides it.
     pub realtime: bool,
     /// How the server's shards nudge their CPUs while they wait (docs/priority.md, "A nudge for the
     /// shards"; goal 8, plan 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3): a nudged shard's waits

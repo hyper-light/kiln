@@ -72,10 +72,13 @@ pub struct Parking {
     /// park at most.
     kick_cpu_ns: AtomicU64,
     kick_cpu_samples: AtomicU64,
-    /// Whether this shard times its wakes ([`Parking::time_wakes`]): only then does a kick stamp the host
-    /// clock and a park read it. A simulated shard, or one with no estimate to feed, reads no clock on
-    /// either side (D-20: the simulation makes no OS call; its instruction counts are gated on that).
+    /// Whether this shard times its wakes ([`Parking::time_wakes`], [`Parking::stamp_wakes`]): only then does a
+    /// kick stamp the host clock and a park read it. A simulated shard, or one with no estimate to feed, reads
+    /// no clock on either side (D-20: the simulation makes no OS call; its instruction counts are gated on that).
     timed: AtomicBool,
+    /// Whether a timed kick's sender also counts the CPU it cost ([`Parking::time_wakes`]): two readings of its
+    /// thread's CPU clock, each a system call on Linux, which only a shard learning what blocking costs reads.
+    costed: AtomicBool,
 }
 
 /// A shard's control-pending flag: the sender's publication marker for its control queue, so the shard
@@ -199,12 +202,22 @@ impl Parking {
             kick_cpu_ns: AtomicU64::new(0),
             kick_cpu_samples: AtomicU64::new(0),
             timed: AtomicBool::new(false),
+            costed: AtomicBool::new(false),
         }
     }
 
-    /// The shard times its wakes from now on: a tracking shard on a real clock says so once, as it is
-    /// built, before any sender can see it parked.
+    /// The shard times its wakes from now on, and its kicks' senders count what each cost them: a tracking shard
+    /// on a real clock says so once, as it is built, before any sender can see it parked.
     pub fn time_wakes(&self) {
+        self.timed.store(true, Ordering::Relaxed);
+        self.costed.store(true, Ordering::Relaxed);
+    }
+
+    /// The shard times its wakes from now on, its kicks' senders stamping each and counting nothing else: what a
+    /// quiet sleep reads its wakes by (`crate::quiet`; kiln's goal 9, plan 01a1a87b2cec step 5), a reading of the
+    /// clock a kick (no system call where the OS's clock is a page's, as on Linux), not the two system calls of
+    /// [`Parking::time_wakes`]'s count of the kick's CPU.
+    pub(crate) fn stamp_wakes(&self) {
         self.timed.store(true, Ordering::Relaxed);
     }
 
@@ -225,13 +238,17 @@ impl Parking {
             if self.timed.load(Ordering::Relaxed) {
                 self.kicked_at
                     .store(crate::machine::clock::shard_clock_ns(), Ordering::Relaxed);
-                let before = crate::attribution::thread_cpu_now();
-                kick();
-                if let (Some(before), Some(after)) = (before, crate::attribution::thread_cpu_now())
-                {
-                    self.kick_cpu_ns
-                        .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
-                    self.kick_cpu_samples.fetch_add(1, Ordering::Relaxed);
+                if self.costed.load(Ordering::Relaxed) {
+                    let before = crate::attribution::thread_cpu_now();
+                    kick();
+                    if let (Some(before), Some(after)) = (before, crate::attribution::thread_cpu_now())
+                    {
+                        self.kick_cpu_ns
+                            .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+                        self.kick_cpu_samples.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    kick();
                 }
             } else {
                 kick();
