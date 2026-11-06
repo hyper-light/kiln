@@ -76,7 +76,7 @@ struct Common {
     #[arg(long)]
     keep: bool,
     /// The server's `[bus] memory` in bytes, written into the kiln.toml each round's server starts
-    /// with (kiln's default otherwise, 171 MiB): so the lab measures the bus past it (goal 11, plan
+    /// with (kiln's default otherwise, 256 MiB): so the lab measures the bus past it (goal 11, plan
     /// 01a1a87b2e56 step 3).
     #[arg(long)]
     bus_memory: Option<u64>,

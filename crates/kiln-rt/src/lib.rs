@@ -26,8 +26,7 @@
 //! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
 //! sockets ([`udp`] and [`tcp`] on every OS, over one shared readiness future), and the OS drivers.
-//! kiln's own: [`compute`], the pool for CPU-heavy work, off the shards and below them, and [`movable`], tasks an
-//! idle shard may take from a busy one (ORIGIN.md).
+//! kiln's own: [`compute`], the pool for CPU-heavy work, off the shards and below them (ORIGIN.md).
 
 // Test code opts out of the no-panic wall at the crate root (CLAUDE.md §1); shipped code does not.
 #![cfg_attr(
@@ -70,7 +69,6 @@ pub mod local;
 mod localsys;
 pub mod machine;
 pub mod mem;
-pub mod movable;
 mod netsys;
 mod park_cost;
 pub mod park_spin;

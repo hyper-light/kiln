@@ -23,8 +23,11 @@
 # BOLT_RECORD says what else, from the event BOLT_FROM says to the window's end (the lab waits for the hook, so
 # what lasts runs in the background):
 #   none          nothing more (the default: an A/B's rounds)
+#   auto          perf records the server with its branch stacks where this machine's perf records them, else its
+#                 cycles:u samples with their call graphs (perf.data; bolt.sh record auto, which says which it took in
+#                 perf.log): a profile for BOLT on any machine
 #   lbr           perf records the server with its branch stacks (perf.data; bolt.sh record lbr)
-#   samples       the same without them (a machine with no LBR)
+#   samples       its samples with their call graphs, without branch stacks (bolt.sh record samples)
 #   instrumented  the server is a `bolt.sh instrument` build, whose writer (a child of the server) puts its counts
 #                 since it started in <BOLT_DUMP>.<writer's pid>.fdata every few seconds: the latest at the start and
 #                 at the window's end (instr-first.fdata, instr-last.fdata), and their difference, what ran between
@@ -98,7 +101,7 @@ esac
 case "$event" in
   "$from")
     case ${BOLT_RECORD:-none} in
-      lbr | samples)
+      auto | lbr | samples)
         nohup "$bolt" record "$pid" "$dir/perf.data" "$BOLT_RECORD" > "$dir/perf.log" 2>&1 &
         echo $! > "$dir/perf.pid"
         ;;

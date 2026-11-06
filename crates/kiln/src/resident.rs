@@ -1,5 +1,6 @@
 //! What of this binary stays in the server's resident memory once it's done with it (goal 11, plan
-//! 01a1a87b2e56 step 5).
+//! 01a1a87b2e56 step 5): all of it, unless `KILN_KEEP_PAGES=0` says to drop what startup alone needed (goal 11's
+//! audit, row B14).
 //!
 //! A fault on the binary maps the 64 KiB of the file around it that the page cache holds, and the server reads
 //! its whole binary into the page cache as it starts (its build hash). So every 64 KiB window of code and
@@ -22,7 +23,15 @@
 //! Either drop takes a page only where it's still the file's own (`/proc/self/pagemap`): the page cache keeps
 //! it, so its next touch is a minor fault of a few microseconds, which maps its 64 KiB window back. If the
 //! page cache let it go meanwhile (it lets unmapped pages go sooner under memory pressure), that touch reads
-//! it from the file. `KILN_KEEP_PAGES=1` keeps every page as before, for the lab's A/B.
+//! it from the file: a major fault, on whichever thread runs that code next, a shard's among them.
+//!
+//! So neither drop is made unless `KILN_KEEP_PAGES=0` asks (goal 11's audit, row B14): what the drops save is
+//! file pages the page cache holds anyway, and the price is every thread's code faulting back, minor faults at
+//! best and a disk read on a shard where the host reclaimed them (production's host is short of memory, and
+//! its file system stalls). `g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not`
+//! measures it: a shard re-reading data whose pages were dropped is charged faults for them
+//! (`getrusage(RUSAGE_THREAD)`), and one re-reading the same data kept is charged none. `KILN_KEEP_PAGES=0`
+//! drops them, for the lab's memory A/B.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -36,12 +45,13 @@ const BOTH: u8 = WARMED | STARTED;
 /// The marks made so far, of [`WARMED`] and [`STARTED`].
 static MARKS: AtomicU8 = AtomicU8::new(0);
 
-/// Whether `KILN_KEEP_PAGES` (its value `keep`) asks to keep the binary's pages resident as before.
+/// Whether `KILN_KEEP_PAGES` (its value `keep`) keeps the binary's pages resident: unless it's `0`, which asks
+/// for the drops (goal 11's audit, row B14).
 fn keeps(keep: Option<&str>) -> bool {
-    keep.is_some_and(|v| v.trim() == "1")
+    keep.is_none_or(|v| v.trim() != "0")
 }
 
-/// Whether this process keeps the binary's pages resident as before (`KILN_KEEP_PAGES=1`).
+/// Whether this process keeps the binary's pages resident: unless `KILN_KEEP_PAGES=0`.
 fn keep() -> bool {
     keeps(std::env::var("KILN_KEEP_PAGES").ok().as_deref())
 }
@@ -104,7 +114,11 @@ async fn drop_startup() {
         return;
     }
     if keep() {
-        tracing::info!(file_mb = file_mb(), "the binary's pages stay resident (KILN_KEEP_PAGES=1)");
+        tracing::info!(
+            file_mb = file_mb(),
+            "the binary's pages stay resident: a page dropped would fault back on whichever thread next ran it, a shard's \
+             among them (KILN_KEEP_PAGES=0 drops them; goal 11's audit, row B14)"
+        );
         return;
     }
     let before = file_mb();
@@ -148,11 +162,58 @@ mod tests {
         assert_eq!(went, [false, false, true, false, false]);
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 5: only `KILN_KEEP_PAGES=1` keeps the pages.
+    /// Goal 11's audit, row B14: the pages are kept unless `KILN_KEEP_PAGES=0` asks for the drops.
     #[test]
-    fn g11_s5_only_keep_pages_1_keeps_them() {
-        assert!(keeps(Some("1")) && keeps(Some(" 1\n")));
-        assert!(!keeps(None) && !keeps(Some("0")) && !keeps(Some("")) && !keeps(Some("yes")));
+    fn g11_b14_the_pages_are_kept_unless_keep_pages_0() {
+        assert!(keeps(None), "kept by default");
+        assert!(keeps(Some("1")) && keeps(Some(" 1\n")) && keeps(Some("")) && keeps(Some("yes")));
+        assert!(!keeps(Some("0")) && !keeps(Some(" 0\n")), "0 drops them");
+    }
+
+    /// Read-only data of this test binary's own, larger than four of the largest windows Linux maps around a fault
+    /// (64 KiB), for a shard to read.
+    #[cfg(target_os = "linux")]
+    static SHARDS_OWN: [u8; 320 << 10] = [0xA5; 320 << 10];
+
+    /// The faults the calling thread has been charged so far, minor and major (`getrusage(RUSAGE_THREAD)`).
+    #[cfg(target_os = "linux")]
+    fn faults_here() -> anyhow::Result<u64> {
+        let usage = nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_THREAD)?;
+        Ok(u64::try_from(usage.minor_page_faults())?.saturating_add(u64::try_from(usage.major_page_faults())?))
+    }
+
+    /// Goal 11's audit, row B14: a page of the binary that was dropped faults on the thread that next reads it, a
+    /// shard of kiln's runtime here, and a page that was kept doesn't. On one shard, in one poll: the binary's own
+    /// read-only data read whole (so resident), then read again after the drop as the default decides it (kept: no
+    /// fault), then dropped as `KILN_KEEP_PAGES=0` drops it and read again (faults, a window at a time, and the
+    /// same bytes). The faults counted are the shard's own (`getrusage(RUSAGE_THREAD)`), and nothing else runs on
+    /// it in between.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            anyhow::ensure!(crate::rt::on_shard(), "read on a shard");
+            let data: &[u8] = std::hint::black_box(&SHARDS_OWN);
+            let spans = [(data.as_ptr().addr(), data.len())];
+            let sum = |d: &[u8]| d.iter().map(|b| u64::from(*b)).sum::<u64>();
+            let want = sum(data);
+            // As startup's drop decides by default.
+            if !keeps(None) {
+                crate::os::pages::drop_spans(&spans)?;
+            }
+            let before = faults_here()?;
+            let kept = sum(std::hint::black_box(data));
+            let kept_faults = faults_here()?.saturating_sub(before);
+            // As `KILN_KEEP_PAGES=0` drops it.
+            let dropped = crate::os::pages::drop_spans(&spans)?;
+            let before = faults_here()?;
+            let again = sum(std::hint::black_box(data));
+            let dropped_faults = faults_here()?.saturating_sub(before);
+            anyhow::ensure!(kept == want && again == want, "the same bytes either way");
+            anyhow::ensure!(kept_faults == 0, "kept by default: {kept_faults} faults on the shard re-reading it");
+            anyhow::ensure!(dropped.bytes > 0 && dropped_faults > 0, "dropped ({dropped:?}): {dropped_faults} faults on the shard re-reading it");
+            Ok(())
+        })
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: the log's MB are to the tenth.

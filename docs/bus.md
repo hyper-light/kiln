@@ -76,8 +76,8 @@ on any device (`crate::harness::live`):
 
 | Setting | Default | What it is |
 |---|---|---|
-| `memory` | `memory = 179306496` (171 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. The default is the bus lab's most for each topic held (1,327,754 bytes) for as many topics as production's 134 sessions, every one watched, with room for one more of Quiver's largest messages, rounded up to a MiB (docs/runtime-lab.md, goal 11). |
-| `topic_bytes` | `topic_bytes = 5242880` (5 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. The default is the bus lab's largest topic (3,672,418 bytes: a feed's newest 2048 frames) with room for one more of the largest message, rounded up to a MiB. A feed whose frames are larger keeps fewer than 2048, and its viewers fall behind sooner. |
+| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. The default is Quiver's own as CP-T2.1 set it: a ceiling, which costs nothing at rest (Quiver's budget is a counter). Goal 11 lowered it to 171 MiB from the bus lab's figures, and its audit (row C10) put it back: a lower ceiling could only cost Quiver room it would use (docs/runtime-lab.md, goal 11). |
+| `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. The default is Quiver's own as CP-T2.1 set it, as `memory`'s is. The bus lab's largest topic asked for 3,672,418 bytes (a feed's newest 2048 frames). A feed whose frames are larger keeps fewer than 2048, and its viewers fall behind sooner. |
 
 The bus holds 65,536 topics and 65,536 subscriptions at once; a session's feed keeps 2048 frames.
 
@@ -88,7 +88,7 @@ What the bus can hold follows the topics it holds, whatever `memory` allows, bec
 - a message being taken.
 
 For each subscription, it can hold the segment the subscription reads and a message. That bound, capped at
-`memory`, is `kiln_memory_bound_bytes{owner="bus"}` on `/metrics`: about 6.6 MB a feed at the defaults. A
+`memory`, is `kiln_memory_bound_bytes{owner="bus"}` on `/metrics`: about 18.1 MB a feed at the defaults. A
 server watching few sessions is bound by those, not by `memory`. Quiver fixes a node's memory when the node is
 made, so `memory` itself doesn't follow the topics.
 

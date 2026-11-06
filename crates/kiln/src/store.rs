@@ -668,15 +668,13 @@ struct Counted {
     conn: Connection,
     held: usize,
     bound: usize,
-    /// When it was last given back for the next read ([`Reads::give`]): made, for one never used.
-    given: Instant,
 }
 
 impl Counted {
     fn new(conn: Connection) -> Self {
         let bound = cache_bound(&conn);
         crate::memory::owners::SQLITE.bound_add(bound);
-        let mut c = Self { conn, held: 0, bound, given: Instant::now() };
+        let mut c = Self { conn, held: 0, bound };
         c.look();
         c
     }
@@ -707,17 +705,29 @@ impl Drop for Counted {
     }
 }
 
-/// How long a read connection is kept open with no read taking it (goal 11, plan 01a1a87b2e56 step 5): the wait
-/// after which a pool's worker gives its caches back ([`crate::os::alloc::COLD_AFTER`]). A read takes a few
-/// milliseconds, so a connection none took in that long is one past the reads' recent peak.
-const READ_IDLE: std::time::Duration = crate::os::alloc::COLD_AFTER;
+/// A level's time before it first ended (`Level::ended_ms`).
+const NEVER: u64 = u64::MAX;
 
-/// One of [`Reads`]' places: a connection not in use, if any (a lock-free queue of one), and when the one it
-/// holds was given back, in milliseconds since the places were made (a hint for the sweep, which reads the
-/// connection's own time before it closes one).
-struct Place {
-    conn: concurrent_queue::ConcurrentQueue<Counted>,
-    given_ms: std::sync::atomic::AtomicU64,
+/// One level of [`Reads`]' reads at once: the `n`-th read running beside `n - 1` others reaches level `n`, which
+/// place `n - 1`'s connection serves (goal 11's audit, row B17). What's learned of it from the reads' own times, in
+/// milliseconds since the places were made.
+struct Level {
+    /// When the reads at once last fell below it, so that its quiet began: [`NEVER`] before it first ended.
+    ended_ms: AtomicU64,
+    /// One past the longest it was quiet before reads came back to it: 0 while none has come back. What its
+    /// connection is kept open across.
+    back_ms: AtomicU64,
+}
+
+impl Level {
+    fn new() -> Self {
+        Self { ended_ms: AtomicU64::new(NEVER), back_ms: AtomicU64::new(0) }
+    }
+
+    /// The longest it was quiet before reads came back to it, in milliseconds: none while none has.
+    fn back(&self) -> Option<u64> {
+        self.back_ms.load(Ordering::Acquire).checked_sub(1)
+    }
 }
 
 /// Read-only connections to the database's file ([`Store::read`]), each taken by one read at a time
@@ -725,112 +735,158 @@ struct Place {
 /// `store` share runs reads at once. One taken when none is free (a read past them) is opened then.
 ///
 /// A read takes the connection of the lowest place that has one, and one given back takes the lowest
-/// place free, so the reads at once use the low places and the high ones wait idle. Each connection
-/// holds kiln.db's whole schema parsed besides its page cache (604 KB for its 202 tables and 283
-/// indexes, and 62 KB more opened: SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), so
-/// keeping every connection a burst once opened kept as many schemas. As reads give connections back,
-/// at most once each [`READ_IDLE`], the highest place whose connection no read took in that long has it
-/// closed (goal 11, plan 01a1a87b2e56 step 5); the lowest place's, a lone read's, is kept. A read past the reads'
-/// recent peak opens one and parses the schema again: 2.0 ms at the median of 30 on fedora.
+/// place free, so the `n`-th read at once is served by place `n - 1` ([`Level`]). Each connection holds
+/// kiln.db's whole schema parsed besides its page cache (604 KB for its 202 tables and 283 indexes, and 62
+/// KB more opened: SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), and a read past the open
+/// connections opens one and parses the schema again: 2.0 ms at the median of 30 on fedora, on the read's
+/// own job (goal 11, plan 01a1a87b2e56 step 5). So the connections a level of reads comes back to stay open
+/// (goal 11's audit, row B17: a reopen's 2.0 ms is latency, which no memory is saved at): each level learns,
+/// from the reads' own times, the longest it was quiet before reads came back to it, and its connection is
+/// kept for as long as its quiet is within that. What's kept is the floor: every level up to the highest
+/// still expected back. Above it a read giving its connection back closes the highest place's (one a read,
+/// never place 0's, a lone read's), off the read's path ([`close`]). A level that has never come back is kept
+/// as long as the reads at any level have ever stayed away and come back, and while none has, it's kept: nothing
+/// says yet that it won't be needed. A level that comes back after a quiet longer than it ever had costs that
+/// read an open, once, and is kept across such quiets from then on.
 struct Reads {
     path: std::path::PathBuf,
-    places: Box<[Place]>,
-    /// How long a connection is kept with no read taking it: [`READ_IDLE`].
-    idle: std::time::Duration,
-    /// When the places were made: what their times count from.
+    /// A connection not in use, if any, each a lock-free queue of one.
+    places: Box<[concurrent_queue::ConcurrentQueue<Counted>]>,
+    /// One a place.
+    levels: Box<[Level]>,
+    /// The reads running now.
+    busy: std::sync::atomic::AtomicUsize,
+    /// When the places were made: what the levels' times count from.
     made: Instant,
-    /// When the next sweep is due, in milliseconds since `made`.
-    sweep_ms: std::sync::atomic::AtomicU64,
+    /// Connections opened, all told.
+    opened: AtomicU64,
 }
 
 impl Reads {
     fn new(path: &Path) -> Self {
-        Self::with_places(path, crate::rt::profile().pool.1.max(1), READ_IDLE)
+        Self::with_places(path, crate::rt::profile().pool.1.max(1))
     }
 
-    fn with_places(path: &Path, places: usize, idle: std::time::Duration) -> Self {
-        let places = (0..places.max(1)).map(|_| Place { conn: concurrent_queue::ConcurrentQueue::bounded(1), given_ms: std::sync::atomic::AtomicU64::new(0) }).collect();
-        let reads = Self { path: path.to_path_buf(), places, idle, made: Instant::now(), sweep_ms: std::sync::atomic::AtomicU64::new(0) };
-        reads.sweep_ms.store(reads.idle_ms(), std::sync::atomic::Ordering::Relaxed);
-        reads
+    fn with_places(path: &Path, places: usize) -> Self {
+        let places = places.max(1);
+        Self {
+            path: path.to_path_buf(),
+            places: (0..places).map(|_| concurrent_queue::ConcurrentQueue::bounded(1)).collect(),
+            levels: (0..places).map(|_| Level::new()).collect(),
+            busy: std::sync::atomic::AtomicUsize::new(0),
+            made: Instant::now(),
+            opened: AtomicU64::new(0),
+        }
     }
 
-    /// How long a connection is kept with no read taking it, in milliseconds.
-    fn idle_ms(&self) -> u64 {
-        u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Milliseconds from the places' making to `at`.
-    fn ms(&self, at: Instant) -> u64 {
-        u64::try_from(at.saturating_duration_since(self.made).as_millis()).unwrap_or(u64::MAX)
+    /// Milliseconds since the places were made, short of [`NEVER`].
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.made.elapsed().as_millis()).unwrap_or(NEVER).min(NEVER - 1)
     }
 
     fn take(&self) -> anyhow::Result<Counted> {
-        if let Some(c) = self.places.iter().find_map(|place| place.conn.pop().ok()) {
+        self.take_at(self.now_ms())
+    }
+
+    /// A connection for a read beginning at `now`: the lowest place's, else one opened. The read reaches the
+    /// level of the reads running with it, which, back after a quiet, learns how long it can be away.
+    fn take_at(&self, now: u64) -> anyhow::Result<Counted> {
+        let reached = self.busy.fetch_add(1, Ordering::AcqRel);
+        if let Some(level) = self.levels.get(reached) {
+            let ended = level.ended_ms.load(Ordering::Acquire);
+            if ended != NEVER {
+                level.back_ms.fetch_max(now.saturating_sub(ended).saturating_add(1), Ordering::AcqRel);
+            }
+        }
+        if let Some(c) = self.places.iter().find_map(|place| place.pop().ok()) {
             return Ok(c);
         }
+        self.open().inspect_err(|_| self.end(now))
+    }
+
+    fn open(&self) -> anyhow::Result<Counted> {
         let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
         c.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+        self.opened.fetch_add(1, Ordering::Relaxed);
         Ok(Counted::new(c))
     }
 
-    /// Back for the next read, its cache counted as the read left it, in the lowest place free (closed, past as
-    /// many as are kept); then the sweep, where it's due.
-    fn give(&self, mut c: Counted) {
-        c.look();
-        c.given = Instant::now();
-        let at = self.ms(c.given);
-        self.put(c, Some(at));
-        self.sweep(at);
+    /// A read ending at `now`: the level of the reads that ran with it ends.
+    fn end(&self, now: u64) {
+        let running = self.busy.fetch_sub(1, Ordering::AcqRel);
+        if let Some(level) = running.checked_sub(1).and_then(|at| self.levels.get(at)) {
+            level.ended_ms.store(now, Ordering::Release);
+        }
     }
 
-    /// `c` into the lowest place free, saying when it was given back where `at` says (a connection the sweep
-    /// puts back keeps its place's time); closed where every place is taken.
-    fn put(&self, mut c: Counted, at: Option<u64>) {
+    fn give(&self, c: Counted, reuse: bool) {
+        self.give_at(c, reuse, self.now_ms());
+    }
+
+    /// `c` back from a read ending at `now`, its cache counted as the read left it, in the lowest place free;
+    /// closed where none is free, or where the read left it inside a transaction (not `reuse`d). Then the
+    /// connection of a level past the floor, if one is ([`Reads::sweep`]), closed. Every close is off the read's
+    /// path ([`close`]).
+    fn give_at(&self, mut c: Counted, reuse: bool, now: u64) {
+        self.end(now);
+        if reuse {
+            c.look();
+            if let Some(past) = self.put(c) {
+                close(past);
+            }
+        } else {
+            close(c);
+        }
+        if let Some(stale) = self.sweep(now) {
+            close(stale);
+        }
+    }
+
+    /// `c` into the lowest place free; given back where every place holds one.
+    fn put(&self, mut c: Counted) -> Option<Counted> {
         for place in self.places.iter() {
-            match place.conn.push(c) {
-                Ok(()) => {
-                    if let Some(at) = at {
-                        place.given_ms.store(at, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    return;
-                }
+            match place.push(c) {
+                Ok(()) => return None,
                 Err(full) => c = full.into_inner(),
             }
         }
+        Some(c)
     }
 
-    /// Where a sweep is due at `now_ms` (and this read is the one to make it), closes the connection of the
-    /// highest place (not the lowest) that no read took for [`READ_IDLE`]: one a sweep, a close's cost (SQLite
-    /// freeing a schema and a cache) on one read in each `READ_IDLE`. Whether it closed one.
-    fn sweep(&self, now_ms: u64) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let idle = self.idle_ms();
-        let due = self.sweep_ms.load(Relaxed);
-        if now_ms < due || self.sweep_ms.compare_exchange(due, now_ms.saturating_add(idle), Relaxed, Relaxed).is_err() {
-            return false;
+    /// The connection of the highest place that holds one, taken out to be closed, where its level is past the
+    /// floor at `now`: no read reaches it now, and it has been quiet longer than its bound ([`Reads::bound`]).
+    /// Place 0's, a lone read's, is never taken, and none where the level has no bound yet.
+    fn sweep(&self, now: u64) -> Option<Counted> {
+        let (at, place) = self.places.iter().enumerate().skip(1).rev().find(|(_, place)| !place.is_empty())?;
+        if self.busy.load(Ordering::Acquire) > at {
+            return None;
         }
-        for place in self.places.iter().skip(1).rev() {
-            if place.conn.is_empty() || now_ms.saturating_sub(place.given_ms.load(Relaxed)) < idle {
-                continue;
-            }
-            let Ok(c) = place.conn.pop() else { continue };
-            if c.given.elapsed() >= self.idle {
-                drop(c);
-                return true;
-            }
-            // Given back since the hint was read: kept, in the lowest place free.
-            self.put(c, None);
-            return false;
+        let ended = self.levels.get(at)?.ended_ms.load(Ordering::Acquire);
+        let bound = self.bound(at)?;
+        if ended == NEVER || now.saturating_sub(ended) <= bound {
+            return None;
         }
-        false
+        place.pop().ok()
+    }
+
+    /// How long the level at `at` may be quiet with its connection kept, in milliseconds: the longest it was
+    /// quiet before reads came back to it; for a level none came back to yet, the longest any level was. None
+    /// while no level has come back.
+    fn bound(&self, at: usize) -> Option<u64> {
+        self.levels.get(at)?.back().or_else(|| self.levels.iter().filter_map(Level::back).max())
     }
 
     /// The connections open and not in use.
     #[cfg(test)]
     fn kept(&self) -> usize {
-        self.places.iter().filter(|place| !place.conn.is_empty()).count()
+        self.places.iter().filter(|place| !place.is_empty()).count()
     }
+}
+
+/// `c` closed off the read that let it go: SQLite frees its schema and cache on a job of the blocking pool's
+/// own, so no read's answer waits for it (goal 11's audit, row B17); where the pool takes no job, here.
+fn close(c: Counted) {
+    let _ = hyper_rt::blocking::run(crate::rt::SHARE_FS, move || drop(c));
 }
 
 /// An inline store's call yields once first (the wait a crash can come at, [`Store::in_memory_inline`]).
@@ -1584,9 +1640,8 @@ impl Store {
             let conn = reads.take()?;
             let out = in_snapshot(&conn, f);
             // One left inside a transaction (its end refused) is closed, not reused.
-            if conn.is_autocommit() {
-                reads.give(conn);
-            }
+            let reuse = conn.is_autocommit();
+            reads.give(conn, reuse);
             out
         })
         .await?
@@ -3252,55 +3307,116 @@ mod tests {
     use super::*;
     use crate::pipeline;
 
-    /// Goal 11, plan 01a1a87b2e56 step 5: reads take the lowest place's connection and give it back to the lowest
-    /// place free, so the places past the reads at once wait idle; a read giving one back once a sweep is due closes
-    /// the highest place's connection idle that long, one a sweep, never the lowest place's; one given back since
-    /// is kept, and none is closed before a sweep is due. A connection holds kiln.db's whole schema (the measured
-    /// basis, [`Reads`]), so this is what's kept. The sweeps' due times are set here, not waited for.
+    /// A read of its own on `reads` from `at`, given back a millisecond later.
+    fn b17_lone(reads: &Reads, at: u64) -> anyhow::Result<()> {
+        let c = reads.take_at(at)?;
+        let n: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+        anyhow::ensure!(n > 0, "kiln.db's schema read");
+        reads.give_at(c, true, at.saturating_add(1));
+        Ok(())
+    }
+
+    /// `n` reads at once on `reads` from `at`, given back two milliseconds later: the connections they opened.
+    fn b17_burst(reads: &Reads, n: usize, at: u64) -> anyhow::Result<u64> {
+        let before = reads.opened.load(Ordering::Relaxed);
+        let taken = (0..n).map(|_| reads.take_at(at)).collect::<anyhow::Result<Vec<Counted>>>()?;
+        for c in taken {
+            reads.give_at(c, true, at.saturating_add(2));
+        }
+        Ok(reads.opened.load(Ordering::Relaxed).saturating_sub(before))
+    }
+
+    /// Goal 11's audit, row B17: the levels of reads that come back find their connections open, however long
+    /// they were away. Production's shape: a lone read each second, and a burst of three each minute. The first
+    /// burst opens three. Nothing is learned of its levels yet, so they're kept as long as the reads have stayed
+    /// away and come back (the lone reads' second), and close between the first two bursts, one a read, highest
+    /// first. The second burst opens them again and learns the minute. Every burst after finds its three open, a
+    /// minute after the last: where the 5 s idle close (bb60a0d0013) reopened two at every burst, 2.0 ms each.
+    /// Place 0's, the lone read's, is never closed. Times are given, not waited for.
     #[test]
-    fn g11_s5_reads_reuse_the_lowest_places_and_close_the_idle_ones() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering::Relaxed;
-        const IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+    fn g11_b17_a_burst_that_comes_back_finds_its_connections_open() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("kiln.db");
         drop(Store::open(&path)?);
-        let reads = Reads::with_places(&path, 4, IDLE);
-        reads.sweep_ms.store(u64::MAX, Relaxed);
-        // A burst of three reads at once opens three, given back to places 0, 1 and 2.
-        let burst: Vec<Counted> = (0..3).map(|_| reads.take()).collect::<anyhow::Result<_>>()?;
-        for c in burst {
-            reads.give(c);
+        let reads = Reads::with_places(&path, 4);
+        let (mut opens, mut kept) = (Vec::new(), Vec::new());
+        for minute in 0..5u64 {
+            let start = minute * 60_000;
+            opens.push(b17_burst(&reads, 3, start)?);
+            kept.push(reads.kept());
+            for second in 1..60u64 {
+                b17_lone(&reads, start + second * 1000)?;
+            }
+            kept.push(reads.kept());
         }
-        anyhow::ensure!(reads.kept() == 3, "{} kept", reads.kept());
-        // A read at a time takes and gives back place 0's.
-        let lone = |reads: &Reads| -> anyhow::Result<()> {
-            let c = reads.take()?;
-            let n: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            anyhow::ensure!(n > 0, "kiln.db's schema read");
-            reads.give(c);
-            Ok(())
-        };
-        std::thread::sleep(IDLE * 2);
-        // Each sweep due closes one, the highest idle: place 2's, then place 1's; place 0's, the lone read's, stays.
-        reads.sweep_ms.store(0, Relaxed);
-        lone(&reads)?;
-        anyhow::ensure!(reads.kept() == 2 && reads.places.get(2).is_some_and(|p| p.conn.is_empty()), "the highest idle one closed: {} kept", reads.kept());
-        anyhow::ensure!(reads.sweep_ms.load(Relaxed) >= reads.idle_ms(), "the next sweep due a wait later");
-        reads.sweep_ms.store(0, Relaxed);
-        lone(&reads)?;
-        anyhow::ensure!(reads.kept() == 1 && reads.places.first().is_some_and(|p| !p.conn.is_empty()), "{} kept", reads.kept());
-        reads.sweep_ms.store(0, Relaxed);
-        lone(&reads)?;
-        anyhow::ensure!(reads.kept() == 1, "the lowest place's is kept: {} kept", reads.kept());
-        // Two at once again: the second given back just now is kept by a sweep due, and none closes before one is.
-        let (a, b) = (reads.take()?, reads.take()?);
-        reads.give(a);
-        reads.give(b);
-        reads.sweep_ms.store(0, Relaxed);
-        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "given back just now: kept");
-        reads.sweep_ms.store(u64::MAX, Relaxed);
-        std::thread::sleep(IDLE * 2);
-        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "no sweep before it's due");
+        anyhow::ensure!(opens == [3, 2, 0, 0, 0], "connections each burst opened: {opens:?}");
+        anyhow::ensure!(kept == [3, 1, 3, 3, 3, 3, 3, 3, 3, 3], "connections kept after each burst and each minute: {kept:?}");
+        // Away longer than ever: the burst's levels close, and the lone read's place is kept.
+        let late = 5 * 60_000 + 10 * 60_000;
+        for second in 0..3u64 {
+            b17_lone(&reads, late + second * 1000)?;
+        }
+        anyhow::ensure!(reads.kept() == 1 && reads.places.first().is_some_and(|p| !p.is_empty()), "{} kept", reads.kept());
+        // Back after ten minutes: an open each, once, and kept across ten minutes from then on.
+        anyhow::ensure!(b17_burst(&reads, 3, late + 5000)? == 2);
+        for second in 1..600u64 {
+            b17_lone(&reads, late + 5000 + second * 1000)?;
+        }
+        anyhow::ensure!(b17_burst(&reads, 3, late + 5000 + 600_000)? == 0, "ten minutes away: kept");
+        Ok(())
+    }
+
+    /// Goal 11's audit, row B17: a burst that doesn't come back gives its connections back. A burst of four at
+    /// the start, then a lone read each second: the burst's levels, none of which came back, are kept as long as
+    /// the lone reads stayed away and came back, then each read giving its connection back closes the highest
+    /// place's, one a read, until the lone read's is left. While no level has come back, nothing closes.
+    #[test]
+    fn g11_b17_a_burst_that_never_comes_back_gives_its_connections_back() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        drop(Store::open(&path)?);
+        let reads = Reads::with_places(&path, 4);
+        anyhow::ensure!(b17_burst(&reads, 4, 0)? == 4);
+        // No level has come back yet: a close can't be told from a reopen to come.
+        anyhow::ensure!(reads.sweep(1_000_000).is_none() && reads.kept() == 4, "{} kept", reads.kept());
+        let mut kept = Vec::new();
+        for second in 1..6u64 {
+            b17_lone(&reads, second * 1000)?;
+            kept.push(reads.kept());
+        }
+        anyhow::ensure!(kept == [3, 2, 1, 1, 1], "connections kept after each lone read: {kept:?}");
+        anyhow::ensure!(reads.places.first().is_some_and(|p| !p.is_empty()), "the lone read's is kept");
+        Ok(())
+    }
+
+    /// Goal 11's audit, row B17: a level's connection is kept while its quiet is within its bound and closed past
+    /// it, the lone read's place never; and none whose level reads reach now, as reads racing for the lowest place
+    /// may leave one in a place above them.
+    #[test]
+    fn g11_b17_a_level_is_kept_within_its_bound_and_while_reached() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        drop(Store::open(&path)?);
+        let reads = Reads::with_places(&path, 4);
+        anyhow::ensure!(b17_burst(&reads, 2, 0)? == 2);
+        anyhow::ensure!(b17_burst(&reads, 2, 1000)? == 0, "back after a second: both kept");
+        // Level 2 came back after 998 ms, its bound, and has been quiet since 1002, while one read runs.
+        let a = reads.take_at(1500)?;
+        anyhow::ensure!(reads.sweep(1900).is_none() && reads.kept() == 1, "within its bound: kept");
+        let stale = reads.sweep(2100);
+        anyhow::ensure!(stale.is_some() && reads.kept() == 0, "past it: closed");
+        drop(stale);
+        reads.give_at(a, true, 2101);
+        anyhow::ensure!(reads.kept() == 1 && reads.sweep(1 << 40).is_none(), "the lone read's place is never closed");
+        // Three reads at once, and a connection in place 2 as a race can leave one: level 3 is reached, so it's kept.
+        let three = (0..3).map(|_| reads.take_at(3000)).collect::<anyhow::Result<Vec<Counted>>>()?;
+        let raced = reads.open()?;
+        anyhow::ensure!(reads.places.get(2).is_some_and(|p| p.push(raced).is_ok()), "place 2 was free");
+        anyhow::ensure!(reads.sweep(1 << 40).is_none(), "level 3 is reached now: kept");
+        for c in three {
+            reads.give_at(c, true, 3001);
+        }
+        anyhow::ensure!(reads.kept() == 4 && reads.busy.load(Ordering::Relaxed) == 0, "{} kept", reads.kept());
         Ok(())
     }
 
