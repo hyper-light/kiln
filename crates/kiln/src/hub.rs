@@ -539,8 +539,8 @@ pub struct Hub {
     pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
-    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text, but agent
-    /// sessions' own ([`Hub::harness_events`]): runs, jobs, runners, samples, the queue and the rest, sent from
+    /// What kiln's own listeners hear (`GET /api/events` sockets read [`Hub::feed`]), each event as its JSON
+    /// text, but agent sessions' own ([`Hub::harness_events`]): runs, jobs, runners, samples, the queue and the rest, sent from
     /// the hub's loop, CI and the API's handlers, on every shard. One lane, to each listener's own channel
     /// (`crate::memory::lanes`; goal 4, plan 01a1a59c2a9c step 5, and goal 5's rule): no send or receive takes
     /// a lock two shards share, as a ring's did (async-broadcast's `Mutex`), and every listener has the events
@@ -550,14 +550,19 @@ pub struct Hub {
     pub events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Agent sessions' own events (`harness`: an info changed, `harness_closed`: a session gone), apart from
     /// [`Hub::events`] (goal 4, plan 01a1a59c2a9c step 5). Every change of a session's info is one, sent from
-    /// the session's owner shard: about 1,700 a second in the lab's many-sessions profile. Only `GET
-    /// /api/events` sockets, the notifications' listener (`crate::push`) and `agents.wait` read them, so the
-    /// rest of kiln's listeners aren't woken for each. A session's go on its owner shard's own lane (the lane
+    /// the session's owner shard: about 1,700 a second in the lab's many-sessions profile. Only the
+    /// notifications' listener (`crate::push`) and `agents.wait` read them (`GET /api/events` sockets, the
+    /// feed), so the rest of kiln's listeners aren't woken for each. A session's go on its owner shard's own lane (the lane
     /// its id hashes to, `crate::harness::copies::owner_of`), to each reader's own channel for that lane, so
     /// no send or receive of them takes a lock two shards share (`crate::memory::lanes`; goal 5's rule): a
     /// session's reach every reader in the order they're sent. Each reader holds one receive window of their
     /// texts at the most, counted as the hub's events' are (`UI_EVENTS`).
     pub harness_events: crate::memory::lanes::Lanes<Arc<str>>,
+    /// Every frame of both, numbered and kept for the events socket's pages, which resume from them
+    /// (`crate::wire::events::feed`, W21-R15): the sockets read this, kiln's own listeners the lanes. Pushed
+    /// from every shard that emits (a session's change from its owner's, about 1,700 a second in the
+    /// many-sessions profile) and read by every socket's, with no lock on either path (goal 5's rule).
+    pub feed: crate::wire::events::feed::Feed,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`). Each relay's queue is lock-free (goal 4, plan
     /// 01a1a59c2a9c step 5: `crate::termsess`'s `relay`).
@@ -758,6 +763,9 @@ impl Hub {
             tunnels: Arc::default(),
             events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             harness_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES),
+            // This server process's: a page's place in another's feed isn't taken (53 bits, as JSON
+            // carries a number exactly).
+            feed: crate::wire::events::feed::Feed::new(rand::random::<u64>() >> 11),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,
@@ -1020,15 +1028,18 @@ impl Hub {
         self.emit(&ServerEvent::Terminals);
     }
 
-    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners: an agent
-    /// session's own (its info, its end) on its lane of [`Hub::harness_events`], the rest on [`Hub::events`].
+    /// Sends `e` down every events socket (`GET /api/events`), numbered in the feed they resume from
+    /// (W21-R15), and to kiln's own listeners: an agent session's own (its info, its end) on its lane of
+    /// [`Hub::harness_events`], the rest on [`Hub::events`]. One text, shared by the feed and the lanes.
     pub fn emit(&self, e: &ServerEvent) {
+        let text: Arc<str> = Arc::from(e.text());
+        self.feed.push(Arc::clone(&text));
         match e {
-            ServerEvent::Harness { info } => self.emit_session(&info.id, || Arc::from(e.text())),
-            ServerEvent::HarnessClosed { id } => self.emit_session(id, || Arc::from(e.text())),
+            ServerEvent::Harness { info } => self.emit_session(&info.id, text),
+            ServerEvent::HarnessClosed { id } => self.emit_session(id, text),
             _ => {
                 if self.events.receiver_count() > 0 {
-                    self.events.send(0, Arc::from(e.text()));
+                    self.events.send(0, text);
                 }
             }
         }
@@ -1036,8 +1047,10 @@ impl Hub {
 
     /// [`Hub::emit`] of an event its caller wrote out already ([`ServerEvent::text`]), off the shards: a CI verdict's,
     /// the whole verdict in it, written on the compute pool (goal 9, plan 01a1a87b2cec step 3). Never an agent
-    /// session's own ([`ServerEvent::Harness`], [`ServerEvent::HarnessClosed`]), which go on their lanes.
+    /// session's own ([`ServerEvent::Harness`], [`ServerEvent::HarnessClosed`]), which go on their lanes. Numbered in
+    /// the feed the events sockets read (W21-R15), as [`Hub::emit`]'s are: the sockets read no lane.
     pub fn emit_written(&self, text: Arc<str>) {
+        self.feed.push(Arc::clone(&text));
         if self.events.receiver_count() > 0 {
             self.events.send(0, text);
         }
@@ -1052,16 +1065,19 @@ impl Hub {
 
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
     /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5), on the session's
-    /// lane of [`Hub::harness_events`] (goal 4, plan 01a1a59c2a9c step 5).
+    /// lane of [`Hub::harness_events`] (goal 4, plan 01a1a59c2a9c step 5). Made always: the feed keeps it for
+    /// the pages that resume (W21-R15).
     pub fn emit_harness(&self, id: &str, info_json: &[u8]) {
-        self.emit_session(id, || crate::wire::events::harness_frame(info_json));
+        let frame = crate::wire::events::harness_frame(info_json);
+        self.feed.push(Arc::clone(&frame));
+        self.emit_session(id, frame);
     }
 
-    /// Session `id`'s event, made by `text` only if anyone reads them, on the session's lane: its owner
-    /// shard's (goal 4, plan 01a1a59c2a9c step 5).
-    fn emit_session(&self, id: &str, text: impl FnOnce() -> Arc<str>) {
+    /// Session `id`'s event `text`, if anyone reads them, on the session's lane: its owner shard's (goal 4,
+    /// plan 01a1a59c2a9c step 5).
+    fn emit_session(&self, id: &str, text: Arc<str>) {
         if self.harness_events.receiver_count() > 0 {
-            self.harness_events.send(crate::harness::copies::owner_of(id, self.harness_events.lanes()), text());
+            self.harness_events.send(crate::harness::copies::owner_of(id, self.harness_events.lanes()), text);
         }
     }
 

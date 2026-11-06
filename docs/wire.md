@@ -334,6 +334,8 @@ next valid message on its wire applied.
 | `tunnel_down` | A runner's tunnel: what the runner couldn't read of what came down. | Not relayed; the runner sends `unread` up the tunnel, as a page does, and the server notes it from the tunnel's address. Past the runner's bound, it says so and closes the tunnel with 1009. |
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | The error JSON-RPC 2.0 gives it (`crate::mcp::rpc`): -32700 for what isn't JSON, -32600 for what isn't a request (under a null id when its id can't be read; MCP has no null id), -32601 for a method the server doesn't have, -32602 for params that don't fit it and, as MCP 2025-11-25 has it, for a tool it doesn't have. A body it can't read whole is answered under a null id: -32600 with 413 past 16 MiB, -32700 with 400 cut short. A line of `kiln mcp`'s stdio that isn't UTF-8 is refused -32700 like any that isn't JSON. In a batch each message is answered as its own. No notification is answered, but one no client sends is noted `unknown` (a client's are `notifications/initialized`, `cancelled`, `progress`, `roots/list_changed` and `tasks/status`). An input that doesn't fit an operation's type is a tool error saying where and why (docs/agents.md, "Operations"), and so are arguments that don't fit code mode's tools' (`code_search`, `code_run`). Each is noted against the agent session its token names, or the person. |
 | `mcp_reach` | What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's operations through reach. | The error, as for `mcp_http`, from the runner's MCP server (a line that isn't UTF-8 among them). The server hears of it (`ReachAsk`'s `unread`) and notes it against the session, on the runner's page too; an input that doesn't fit an operation is answered (`ReachAsk`'s `call`) and noted the same way. The runner's server reads the arguments of its own tools (`code_run`, `code_search`, `runners`, `run`, `output`, `stop` and the page tools) and of a program's `kiln.machines.*` calls as their types: one that doesn't fit is refused saying where and why, and the server hears of it as `unread`. |
+| `bp_up` | The browser protocol (docs/browser-protocol.md): what a page sends up its connection. | An `Unread` frame (`kind`, `code`, `why`: kiln-bp's reasons, `cut_short` to `out_of_order`), and the next frame is read: an unknown kind is skipped by its length, and a body's bytes past the fields this build knows are a newer build's, counted. A refused open is answered `Refused` (`BadTicket`, `Expired`, `Reused`, `TooOld`, `TooNew`, `Schema`, `Busy`, `Malformed`) and noted here too. Noted from the person the connection's ticket names (`kiln::bp::unread`); no carrier serves it yet (goals 3 and 5). |
+| `bp_down` | The browser protocol: what a page couldn't read of what came down. | Not applied; the page sends `Unread` up, noted from the person. |
 
 A message too large is refused where its wire bounds it:
 - a frame (and what it carries: an item, its JSON, a relay's frame) past its lane's bound (1 MiB
@@ -390,6 +392,47 @@ agreed with T2's Quiver agent on 2026-10-24:
   group's committed offset (CP-T2.7). Quiver leans to the committed offset, as the index is a
   second structure to keep.
 - **(born, rev) stays the server's**: a viewer's resume token, never a Quiver offset.
+
+## Windows
+
+A long session's whole is megabytes: up to 4,000 events (`MAX_EVENTS`), a command's up to 24 KB of
+output (`OUTPUT_MAX`), an edit's input and hunks. A viewer that asks for a window (`?window=1`) is
+sent its newest events alone, and one that asks for lean events (`?lean=1`) is sent settled tool
+calls without their bodies (`crate::harness::window`). The UI asks for both; a viewer that asks for
+neither (an older tab) is sent every event, whole, as before.
+
+- **The window.** From the newest back, at most 10 of a person's turns (a message to the main
+  thread begins one), 500 events and about 1 MiB of them as sent. A bound reached inside a turn
+  cuts the window back to where the oldest whole turn it holds begins; only a turn longer than the
+  bounds is cut at them, and a window holds one event at least, however large. The bounds are T3
+  Code's (its `docs/internals/performance-regressions.md`): its timeline is the same thing,
+  parsed whole by a browser the same way, and kiln's sessions hold about ten calls a turn
+  (38,570 over 3,910 turns of twelve long Claude Code transcripts), so ten turns stay well inside
+  500 events. `open` says where it begins: `window: {before, more}`, `before` the number of its
+  first event and `more` whether there are events before it (in the server's copy, or in its
+  conversation store past what the copy holds, back to where the timeline begins, `State::cleared`).
+- **Older pages.** `GET /api/harness/sessions/:id/timeline?before=<seq>[&lean=1]` is the page just
+  before `before`: oldest first, at most 20 turns (T3 Code's older pages), 500 events and about 1
+  MiB, whole turns where they fit, `{events, before, more}`. From the server's copy, and before what
+  it holds, the conversation store. Each page is the events numbered from where it begins up to
+  where the last began, and new events are numbered after them all, so pages asked for one after
+  another meet with no gap and nothing twice while the session goes on. A viewer holding a window
+  takes no live event from before it that it doesn't hold: that one comes with its page.
+- **Lean events.** A settled tool call of kind shell, read, search, web or edit goes without its
+  output and input (`null`) and with its diffs' hunks empty, each diff saying its lines added and
+  taken out (`add`, `del`), and `held: {output, input, lines}` saying what was held back. What the
+  timeline shows of a folded call (its title, status, exit code, files and counts) is all there.
+  What it shows open as it comes goes whole: a call running or waiting, one that failed (an error,
+  a non-zero exit), and the kinds whose answers kiln reads (a question's, a page shown, research, a
+  subagent's result, a plan). Opening one asks for it whole:
+  `GET /api/harness/sessions/:id/events/:event?seq=<seq>`, from the copy, else the store.
+- **Live frames go whole.** The feed's frames are written once and shared by every viewer
+  (`live::Payload`); a lean copy of each would write every event twice for every watched session.
+  What's live is what's being watched, and a running call goes whole anyway; the window bounds the
+  first load, which is where the bytes were.
+- **Resumes stay bounded.** A viewer of a window that resumes (`after=`) gets what changed since,
+  lean as it takes them; one that missed more than a window holds (500 events or about 1 MiB) is
+  sent a window again instead, never every event.
 
 ## Restarts
 
@@ -808,7 +851,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | up | `unread` | ack | A frame that came down that the page couldn't read: its tag (`of`) and why. | Noted on the agent's page (`session_down`); nothing goes back. |
 | `/api/harness/sessions/:id/ws` | down | `ack` | ack | A command under its id was taken. | Sent once to each socket that sent it, once its runner (or the server) answered. |
 | `/api/harness/sessions/:id/ws` | down | `nack` | ack | A command under its id was refused, saying how and why. | As `ack`. |
-| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
+| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`); to a viewer that asks for a window (`?window=1`), its newest events alone and where they begin (`window`, "Windows"). | Sent on an attach without `after=`, or when the copy can't resume it. |
 | `/api/harness/sessions/:id/ws` | down | `resumed` | stream | Starts a resume (`?after=<born>.<rev>`): the newest meta, state, changes and files, then only the events changed since. | Sent when the copy can resume the viewer. |
 | `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
@@ -816,12 +859,14 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `changes_patch` | state | What changed since the last changeset (`?patch=changes`): the files set and those gone, taken in place. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
-| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
+| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events; settled tool calls lean to a viewer that asks (`?lean=1`, "Windows"). | Every attach gets them all again, or a window of them (`?window=1`); a viewer that falls behind, what it missed. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
 | `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
-| `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
+| `/api/events` | up | `topics` | state | The event types the page wants from now on, and where it was when it asked for more. | The newest wins; of the types new to it, what came since is sent too. |
+| `/api/events` | down | `event` | stream | Kiln's events for the UI, each its own frame. | To a page that didn't ask for batches: not resumed after a reconnect. |
+| `/api/events` | down | `batch` | stream | A window's events, coalesced, and where the feed is (`at`). | A reconnect with `?after=<at>` is sent what it missed, or `resync` when the feed no longer has it. |
 | `/api/events` | down | `refused` | ack | What the page sent up that couldn't be read. | To that socket alone. |
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
@@ -848,3 +893,34 @@ CIs typecheck the UI against them.
 | `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
 | `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
 | `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |
+
+### The events socket
+
+`/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
+tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
+for nothing more is sent each frame as it comes, as before. The UI asks for three things
+(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
+goes on as it did:
+
+- **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
+  `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.
+  It gathers what came for 50 ms after its last send (T3 Code's `groupedWithin(512, 50 ms)`;
+  a frame after a quiet window goes at once, 512 at most go together). Of the frames that carry a
+  thing whole (`run`, `job`, `agent`, `harness` and `harness_closed` of one agent, `update_job`, a
+  land queue's entry), only each thing's newest goes, where the newest was, and none identical to
+  what that socket was last sent of it. "Fetch it again" frames (`updates`, `places`, `front_door`
+  ...) and the queue's counts go once a batch. Notices (`run.failed`, `mention` ...), samples,
+  `cd_apps`, `ship` (each says only what one refresh of Ship's rows changed) and every other frame
+  all go, in their order.
+- **Topics** (`?topics=run,job`, then a `topics` frame up, `EventsUp`): only frames of those
+  types, and `resync`. A `topics` frame with a `since` (a batch's `at`) is also sent, of the types
+  new to it, what came after `since`: the page asks as it starts to load what needs them, so what
+  changes as it loads isn't missed. The page asks for the types its listeners name
+  (`events.on(types, fn)`, `useServerEvents(types, fn)`, the `on:` of the resources it shows or is
+  loading); a listener that names none has it ask for all.
+- **Resume** (`?after=<epoch>.<seq>`, a batch's `at`): every frame is numbered in a ring of the
+  newest 4,096, the size of the broadcast behind it, under an epoch drawn as the server starts.
+  A page that reconnects is sent what it missed, coalesced; when the epoch isn't this server's, or
+  the ring no longer has it, its first batch starts with `resync`, and the page loads what it shows
+  again. A socket that falls more than the ring behind is told `resync` too, as before.
+

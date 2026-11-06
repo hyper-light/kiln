@@ -75,6 +75,9 @@ pub struct Entry {
     head: Head,
     /// Its digest as a runner that starts again compares it (`crate::wire::sums`), once asked for.
     sum: std::sync::OnceLock<u64>,
+    /// Its lean form's JSON, for viewers that take events lean (`super::window::lean`), once made:
+    /// None when it goes as it is.
+    lean: std::sync::OnceLock<Option<Box<str>>>,
 }
 
 /// An entry's JSON: as written out, or its tree while text is streamed into it.
@@ -309,13 +312,13 @@ impl Entry {
     pub(super) fn from_text(text: &str) -> Self {
         let head = Head::of_text(text);
         crate::memory::SESSION_ENTRIES.add(text.len());
-        Self { head, body: Body::Text(text.into()), sum: std::sync::OnceLock::new() }
+        Self { head, body: Body::Text(text.into()), sum: std::sync::OnceLock::new(), lean: std::sync::OnceLock::new() }
     }
 
     /// `value` as `text` writes it (made already, for a live frame): the text kept, the tree let go of.
     pub(super) fn written(value: Value, text: String) -> Self {
         crate::memory::SESSION_ENTRIES.add(text.len());
-        Self { head: Head::of(&value), body: Body::Text(text.into_boxed_str()), sum: std::sync::OnceLock::new() }
+        Self { head: Head::of(&value), body: Body::Text(text.into_boxed_str()), sum: std::sync::OnceLock::new(), lean: std::sync::OnceLock::new() }
     }
 
     /// Event `e` as a copy keeps it, written out once, straight from the event (goal 9, plan 01a1a87b2cec
@@ -336,14 +339,16 @@ impl Entry {
             }
             None => text.into_boxed_str(),
         };
-        Self { head: Head::of_event(e), body: Body::Text(body), sum: std::sync::OnceLock::new() }
+        Self { head: Head::of_event(e), body: Body::Text(body), sum: std::sync::OnceLock::new(), lean: std::sync::OnceLock::new() }
     }
 
-    /// The bytes it holds as text, as `crate::memory::SESSION_ENTRIES` counts them.
+    /// The bytes it holds as text, as `crate::memory::SESSION_ENTRIES` counts them: its JSON, and its lean
+    /// form once made (W21-R15).
     fn counted(&self) -> usize {
+        let lean = self.lean.get().and_then(Option::as_ref).map_or(0, |t| t.len());
         match &self.body {
-            Body::Text(t) => t.len(),
-            Body::Changing(_) => 0,
+            Body::Text(t) => t.len() + lean,
+            Body::Changing(_) => lean,
         }
     }
 
@@ -358,6 +363,26 @@ impl Entry {
     /// Its digest, of its text (`crate::wire::sums::event_text`): made once, however many ask.
     pub fn sum(&self) -> u64 {
         *self.sum.get_or_init(|| crate::wire::sums::event_text(self.text()))
+    }
+
+    /// Its JSON as a viewer that takes events lean (`lean`) is sent it: its lean form, written out
+    /// once when first asked for (and counted as the entry's), or its whole text when it goes as it is
+    /// (docs/wire.md, "Windows").
+    pub fn sent(&self, lean: bool) -> &str {
+        if !lean {
+            return self.text();
+        }
+        let made = self.lean.get_or_init(|| {
+            let made = super::window::lean(&self.value()).and_then(|v| serde_json::to_string(&v).ok()).map(String::into_boxed_str);
+            if let Some(t) = &made {
+                crate::memory::SESSION_ENTRIES.add(t.len());
+            }
+            made
+        });
+        match made {
+            Some(t) => t,
+            None => self.text(),
+        }
     }
 
     /// Its id: what the copy finds an event by.
@@ -403,6 +428,10 @@ impl Entry {
     /// `more` added to its `text`, as a runner streams it: its tree held while that goes on, its JSON and
     /// digest written again when next asked for. False when it has no text to add to.
     pub(super) fn append_text(&mut self, more: &str) -> bool {
+        // Its lean form, if made, says what it was.
+        if let Some(Some(l)) = self.lean.take() {
+            crate::memory::SESSION_ENTRIES.sub(l.len());
+        }
         if let Body::Text(t) = &self.body {
             let Ok(value) = serde_json::from_str::<Value>(t) else { return false };
             if !value.get("text").is_some_and(Value::is_string) {
@@ -423,7 +452,7 @@ impl Entry {
 impl Clone for Entry {
     fn clone(&self) -> Self {
         crate::memory::SESSION_ENTRIES.add(self.counted());
-        Self { body: self.body.clone(), head: self.head.clone(), sum: self.sum.clone() }
+        Self { body: self.body.clone(), head: self.head.clone(), sum: self.sum.clone(), lean: self.lean.clone() }
     }
 }
 
@@ -479,7 +508,12 @@ pub(super) mod write {
 
     /// The bytes [`texts`] writes of `all`: `[`, their texts with a `,` between each, `]`.
     pub fn texts_len<'a>(all: impl IntoIterator<Item = &'a Entry>) -> usize {
-        let (n, bytes) = all.into_iter().fold((0usize, 0usize), |(n, bytes), e| (n + 1, bytes + e.text().len()));
+        strs_len(all.into_iter().map(Entry::text))
+    }
+
+    /// The bytes [`strs`] writes of `all`.
+    pub fn strs_len<'a>(all: impl IntoIterator<Item = &'a str>) -> usize {
+        let (n, bytes) = all.into_iter().fold((0usize, 0usize), |(n, bytes), t| (n + 1, bytes + t.len()));
         "[".len() + bytes + n.saturating_sub(1) * ",".len() + "]".len()
     }
 
@@ -500,20 +534,30 @@ pub(super) mod write {
 
     /// `[<a>,<b>,…]` of entries' texts.
     fn texts<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a Entry>) -> io::Result<()> {
+        strs(w, all.into_iter().map(Entry::text))
+    }
+
+    /// `[<a>,<b>,…]` of JSON texts.
+    fn strs<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a str>) -> io::Result<()> {
         w.write_all(b"[")?;
-        for (i, e) in all.into_iter().enumerate() {
+        for (i, t) in all.into_iter().enumerate() {
             if i > 0 {
                 w.write_all(b",")?;
             }
-            w.write_all(e.text().as_bytes())?;
+            w.write_all(t.as_bytes())?;
         }
         w.write_all(b"]")
     }
 
     /// `{"t":"events","events":[…]}`.
     pub fn events<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a Entry>, rev: Option<u64>) -> io::Result<()> {
+        sent_events(w, all.into_iter().map(Entry::text), rev)
+    }
+
+    /// `{"t":"events","events":[…]}` of events as a viewer is sent them ([`Entry::sent`]).
+    pub fn sent_events<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a str>, rev: Option<u64>) -> io::Result<()> {
         head(w, "events", Some("events"))?;
-        texts(w, all)?;
+        strs(w, all)?;
         tail(w, rev)
     }
 
@@ -628,6 +672,31 @@ pub struct Parts {
     pub(super) state_bytes: usize,
     /// The copy's revision as of the parts.
     pub(super) rev: u64,
+    /// Its events go lean ([`Entry::sent`]).
+    pub(super) lean: bool,
+    /// Its events are a window of the session's (its `open` says where it begins), not all of them.
+    pub(super) window: Option<crate::wire::ui::EventsWindow>,
+    /// Where among its events a window begins (0: the first).
+    pub(super) from: usize,
+}
+
+/// How a viewer takes a session's events, as its socket's query says (docs/wire.md, "Windows"):
+/// `window` (`?window=1`), its first load the newest alone, as many as a window holds, older pages
+/// asked for as it scrolls back; `lean` (`?lean=1`), settled tool calls without their bodies, each
+/// asked for when it's opened. One from before either takes every event, whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct View {
+    pub window: bool,
+    pub lean: bool,
+}
+
+/// An older page of a session's events, from its copy ([`Registry::page`]).
+pub enum Paged {
+    /// The events' JSON as the viewer takes them, oldest first, and where the page begins.
+    Page { events: Vec<String>, window: crate::wire::ui::EventsWindow },
+    /// The copy has none before `before`: what's kept of them is in the conversation store, from
+    /// number `floor` (where the timeline begins) on.
+    Store { before: u64, floor: u64 },
 }
 
 /// A snapshot's events go in frames of about this many bytes.
@@ -768,14 +837,16 @@ impl Snapshot {
         if self.files.is_some() {
             parts.push(Part::Files);
         }
-        if p.since.is_none() {
+        // The session whole, every event as it is: the copy's chunks, each packed once.
+        if p.since.is_none() && p.window.is_none() && !p.lean {
             parts.extend(p.events.chunks().iter().enumerate().filter(|(_, c)| !c.is_empty()).map(|(i, _)| Part::Chunk(i)));
             return Plan { brought: Vec::new(), parts };
         }
-        let brought: Vec<usize> = p.events.metas().enumerate().filter(|(_, m)| p.since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
+        // A window (W21-R15: from `from`), what changed since a revision, or events that go lean.
+        let brought: Vec<usize> = p.events.metas().enumerate().skip(p.from).filter(|(_, m)| p.since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
         let (mut from, mut size) = (0usize, 0usize);
         for (i, at) in brought.iter().enumerate() {
-            let n = p.events.meta(*at).map_or(0, |m| m.len);
+            let n = if p.lean { p.events.get(*at).map_or(0, |e| e.entry.sent(true).len()) } else { p.events.meta(*at).map_or(0, |m| m.len) };
             if size + n > EVENTS_FRAME && i > from {
                 parts.push(Part::Events(from..i));
                 from = i;
@@ -804,7 +875,7 @@ impl Snapshot {
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
-            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch).iter().map(|e| &**e)),
+            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::strs_len(self.batch(plan, batch).iter().map(|e| e.sent(p.lean))),
             // Its texts joined, and the `[` and `]` around them.
             Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).and_then(|c| c.metas().last()).map_or(0, |m| m.off + m.len) + "[]".len(),
         }
@@ -817,7 +888,7 @@ impl Snapshot {
         match part {
             Part::Head => {
                 let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
-                let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } }, rev: Some(p.rev) }.text();
+                let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: p.window } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
             }
             Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
@@ -827,7 +898,7 @@ impl Snapshot {
                 None => Ok(()),
             },
             Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
-            Part::Events(batch) => write::events(w, self.batch(plan, batch).iter().map(|e| &**e), None),
+            Part::Events(batch) => write::sent_events(w, self.batch(plan, batch).iter().map(|e| e.sent(p.lean)), None),
             Part::Chunk(i) => match p.events.chunks().get(*i) {
                 // A compact chunk's texts are its segment's, as they were joined.
                 Some(c) if c.is_compact() => write::joined_events(w, &self.joined(c)?, None),
@@ -3066,13 +3137,14 @@ impl Registry {
     /// Join a session's stream, as a viewer that takes every frame whole. None when there is no
     /// such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
-        self.attach_from(id, None, Patches::default())
+        self.attach_from(id, None, Patches::default(), View::default())
     }
 
     /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`),
-    /// and takes the patches `takes` says: what it lacks if the copy can resume it (the same
-    /// process, nothing started over since), else all of it. None when there is no such session.
-    pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>, takes: Patches) -> Option<Attachment> {
+    /// and takes the patches `takes` says and its events as `view` says: what it lacks if the copy
+    /// can resume it (the same process, nothing started over since), else all of it (or, to a
+    /// viewer that takes a window, its window). None when there is no such session.
+    pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>, takes: Patches, view: View) -> Option<Attachment> {
         // What's kept is read first: the first time, off disk.
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
@@ -3087,11 +3159,11 @@ impl Registry {
         }
         // Where the feed ends, then the view: every frame of a change after that view is past it.
         let at = viewer.position();
-        let view = slot.view();
-        if view.closed {
+        let copy = slot.view();
+        if copy.closed {
             return None;
         }
-        let parts = after.filter(|(b, _)| *b == born()).and_then(|(_, rev)| view.parts_since(rev)).unwrap_or_else(|| view.parts());
+        let parts = copy.parts_after(after.filter(|(b, _)| *b == born()).map(|(_, rev)| rev), view, self.convo.is_some());
         let rev = parts.rev;
         // Written out by the caller off the runtime's threads: no other session's publish waits on
         // this one, nor any socket on its thread, nor its owner.
@@ -3104,19 +3176,34 @@ impl Registry {
     /// reads on from, taken before the view, so it misses nothing (and skips what the catch-up
     /// held); the feed's refusals then; and the copy's revision they bring it to. None when the
     /// session is gone.
-    pub fn frames_since(&self, id: &str, viewer: &Viewer, rev: u64) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
+    /// Its events go as `view` says (W21-R15).
+    pub fn frames_since(&self, id: &str, viewer: &Viewer, rev: u64, view: View) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
         let refusals = viewer.refusals();
         let at = viewer.position();
-        let view = slot.view();
-        if view.closed {
+        let copy = slot.view();
+        if copy.closed {
             return None;
         }
-        let parts = view.parts_since(rev).unwrap_or_else(|| view.parts());
+        let parts = copy.parts_after(Some(rev), view, self.convo.is_some());
         let now = parts.rev;
         let store = self.convo.clone().map(|s| (s, Arc::from(id)));
         Some((Snapshot { parts, files, store }, at, refusals, now))
+    }
+
+    /// An older page of session `id`'s events, for a viewer that has them from number `before` on
+    /// (docs/wire.md, "Windows"): from its copy, or where the conversation store has them
+    /// ([`Paged::Store`]). None when there is no such session.
+    pub fn page(&self, id: &str, before: u64, lean: bool) -> Option<Paged> {
+        let older = self.convo.is_some();
+        self.sessions.with(id, |v| v.page(before, lean, older))
+    }
+
+    /// Event `event` of session `id`, whole, as its copy has it: what a lean one held back
+    /// (`super::window::lean`). None when the copy doesn't have it (or there's no such session).
+    pub fn event_text(&self, id: &str, event: &str) -> Option<String> {
+        self.sessions.with(id, |v| v.event_text(event)).flatten()
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
@@ -4774,7 +4861,7 @@ mod tests {
             anyhow::ensure!(copy_of(&hub, "s") == names(1..=8));
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(resync(&heard), "the viewer is sent back to a snapshot: {heard:?}");
-            let again = hub.harness.frames_since("s", &watching, had).ok_or_else(|| anyhow::anyhow!("no copy"))?.0.frames();
+            let again = hub.harness.frames_since("s", &watching, had, View::default()).ok_or_else(|| anyhow::anyhow!("no copy"))?.0.frames();
             anyhow::ensure!(again.first().is_some_and(|f| f.contains(r#""t":"open""#)) && ids(&again) == names(1..=8), "the viewer starts over: {again:?}");
             let kept = hub.harness.kept_on("box");
             anyhow::ensure!(kept.len() == 1 && kept.iter().all(|k| (k.epoch, k.from, k.seq, k.last.len()) == (3, 1, 8, 8)), "{kept:?}");
@@ -4986,7 +5073,7 @@ mod tests {
     async fn watch(hub: Arc<Hub>, id: String, after: std::time::Duration, done: Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<(String, Vec<(String, String)>, usize)> {
         use kiln_seams::Bus as _;
         crate::rt::sleep(after).await;
-        let att = hub.harness.attach_from(&id, None, CHANGES).ok_or_else(|| anyhow::anyhow!("no copy of {id}"))?;
+        let att = hub.harness.attach_from(&id, None, CHANGES, View::default()).ok_or_else(|| anyhow::anyhow!("no copy of {id}"))?;
         let mut events = std::collections::BTreeMap::new();
         take_frames(&mut events, att.frames().iter().map(String::as_str))?;
         let (mut at, mut have, mut live) = (att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?, att.rev, 0);
@@ -5004,7 +5091,7 @@ mod tests {
                 let f = super::super::live::decode(&m.payload).ok_or_else(|| anyhow::anyhow!("a frame the feed didn't make"))?;
                 if &*f.text == super::super::live::RESYNC {
                     // Back to the copy, from what it has, as a viewer that fell behind.
-                    let (snapshot, from, _, rev) = hub.harness.frames_since(&id, &att.viewer, have).ok_or_else(|| anyhow::anyhow!("{id} gone"))?;
+                    let (snapshot, from, _, rev) = hub.harness.frames_since(&id, &att.viewer, have, View::default()).ok_or_else(|| anyhow::anyhow!("{id} gone"))?;
                     take_frames(&mut events, snapshot.frames().iter().map(String::as_str))?;
                     (at, have) = (from.ok_or_else(|| anyhow::anyhow!("no feed"))?, rev);
                     break;
@@ -5085,7 +5172,7 @@ mod tests {
                 let (hub, id, done) = (Arc::clone(&hub), id.clone(), Arc::clone(&done));
                 crate::rt::spawn_spread(async move {
                     while !done.load(Ordering::Acquire) {
-                        drop(hub.harness.attach_from(&id, None, CHANGES));
+                        drop(hub.harness.attach_from(&id, None, CHANGES, View::default()));
                         crate::rt::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 });
@@ -5648,6 +5735,274 @@ mod tests {
             anyhow::ensure!(pieces.concat() == whole, "pieces of {size}: the message made at once");
             anyhow::ensure!(packing.next_piece(size)?.is_none(), "none once it's all out");
         }
+        Ok(())
+    }
+
+    /* ------------------------------------------------- windows (docs/wire.md, "Windows") */
+
+    /// Words that read as a coding agent's, from a fixed list: text that packs as such text does
+    /// (one character repeated packs a thousandfold, which no conversation does).
+    fn words(n: usize, salt: u64) -> String {
+        const W: [&str; 48] = [
+            "fn", "let", "mut", "self", "impl", "pub", "use", "crate", "match", "Some", "None", "Ok", "Err", "return", "struct", "enum", "error:", "warning:", "src/harness/core.rs", "-->", "|",
+            "cargo", "test", "running", "passed", "failed", "the", "a", "of", "to", "in", "is", "that", "it", "for", "on", "with", "as", "when", "what", "4,000", "1024", "0x7f", "=>", "{", "}", "();", "\n",
+        ];
+        let mut x = salt.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut out = String::with_capacity(n + 16);
+        while out.len() < n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            out.push_str(W.get(((x >> 33) % W.len() as u64) as usize).copied().unwrap_or("x"));
+            out.push(' ');
+        }
+        out.truncate(n);
+        out
+    }
+
+    fn tool_event(seq: u64, tool: &str, name: &str, status: &str, input: Value, output: usize, diffs: Value) -> Value {
+        let mut v = json!({"id": format!("e{seq}"), "seq": seq, "at": seq, "kind": "tool", "tool_id": format!("t{seq}"), "name": name, "tool": tool,
+            "title": words(60, seq), "input": input, "status": status, "started": seq, "ended": seq + 1});
+        if let Some(o) = v.as_object_mut() {
+            if output > 0 {
+                o.insert("output".into(), json!(words(output, seq + 7)));
+            }
+            if tool == "shell" {
+                o.insert("exit_code".into(), json!(0));
+            }
+            if diffs.as_array().is_some_and(|d| !d.is_empty()) {
+                o.insert("diffs".into(), diffs);
+            }
+        }
+        v
+    }
+
+    /// A long session as kiln's sessions go: each of a person's turns its prompt, ten tool calls
+    /// (seven commands, a read, one of kiln's own tools, an edit), four notes and nine thoughts,
+    /// sized as twelve of this repository's longest Claude Code transcripts have them on average
+    /// (38,570 calls over 3,910 turns: a command's input 721 bytes and output 1,429; a read's
+    /// output 6,869; kiln's tools' 600 and 900; an edit's input 1,345; a note 358, a thought 62).
+    fn long_session(events: usize) -> Vec<Value> {
+        let mut out = Vec::with_capacity(events);
+        let mut seq = 0u64;
+        let push = |out: &mut Vec<Value>, v: Value| {
+            if out.len() < events {
+                out.push(v);
+            }
+        };
+        while out.len() < events {
+            let mut next = || {
+                seq += 1;
+                seq
+            };
+            let n = next();
+            push(&mut out, json!({"id": format!("e{n}"), "seq": n, "at": n, "kind": "user", "text": words(200, n)}));
+            for k in 0..10u64 {
+                let n = next();
+                let e = match k {
+                    0..=6 => tool_event(n, "shell", "Bash", "done", json!({"command": words(680, n), "description": "Run it"}), 1429, json!([])),
+                    7 => tool_event(n, "read", "Read", "done", json!({"file_path": "/src/harness/core.rs"}), 6869, json!([])),
+                    8 => tool_event(n, "mcp", "mcp__kiln__run", "done", json!({"command": words(580, n)}), 900, json!([])),
+                    _ => {
+                        let lines: Vec<String> = (0..24u64).map(|l| format!("{}{}", [" ", "-", "+"].get((l % 3) as usize).copied().unwrap_or(" "), words(40, n + l))).collect();
+                        let diffs = json!([{"path": "src/harness/core.rs", "hunks": [{"old_start": 1, "old_lines": 16, "new_start": 1, "new_lines": 16, "lines": lines}]}]);
+                        tool_event(n, "edit", "Edit", "done", json!({"file_path": "src/harness/core.rs", "old_string": words(640, n), "new_string": words(660, n + 1)}), 120, diffs)
+                    }
+                };
+                push(&mut out, e);
+                if k % 3 == 0 {
+                    let n = next();
+                    push(&mut out, json!({"id": format!("e{n}"), "seq": n, "at": n, "kind": "assistant", "text": words(358, n)}));
+                }
+                let n = next();
+                push(&mut out, json!({"id": format!("e{n}"), "seq": n, "at": n, "kind": "thinking", "text": words(62, n)}));
+            }
+        }
+        out
+    }
+
+    fn mirror_of(events: &[Value]) -> Mirror {
+        // Its id is where a shard keeps it (`super::super::copies::Shard::insert`).
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        set_state(&mut m, json!({"status": "idle", "dropped": 0}));
+        for e in events {
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(e.clone()))));
+        }
+        m
+    }
+
+    /// The events a viewer's frames carry, and its `open` frame's window.
+    fn sent_events(frames: &[String]) -> (Vec<Value>, Option<Value>) {
+        let parsed: Vec<Value> = frames.iter().filter_map(|f| serde_json::from_str(f).ok()).collect();
+        let window = parsed.iter().find(|f| f.get("t").and_then(Value::as_str) == Some("open")).and_then(|f| f.get("window").cloned());
+        let events = parsed.iter().filter(|f| f.get("t").and_then(Value::as_str) == Some("events")).flat_map(|f| f.get("events").and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+        (events, window)
+    }
+
+    fn seqs(events: &[Value]) -> Vec<u64> {
+        events.iter().filter_map(|e| e.get("seq").and_then(Value::as_u64)).collect()
+    }
+
+    const WINDOWED: View = View { window: true, lean: false };
+    const LEAN: View = View { window: true, lean: true };
+
+    /// W21-R15 (an agent's page opens at once): a viewer that asks for a window is sent the newest
+    /// ten turns whole, and told where they begin and that there's more before; one from before
+    /// windows is sent every event, its `open` as it was.
+    #[test]
+    fn w21_r15_a_window_is_the_newest_turns_and_says_where_it_begins() {
+        let all = long_session(1_000);
+        let m = mirror_of(&all);
+        let (events, window) = sent_events(&Snapshot { parts: m.view().parts_for(WINDOWED, false), files: None, store: None }.frames());
+        let first = events.first().cloned().unwrap_or_default();
+        assert!(super::super::window::begins_turn(&first), "it begins with a turn's prompt: {first}");
+        assert_eq!(events.iter().filter(|e| super::super::window::begins_turn(e)).count(), super::super::window::TURNS);
+        assert_eq!(seqs(&events), seqs(all.get(all.len() - events.len()..).unwrap_or_default()), "the newest, in order");
+        assert_eq!(window, Some(json!({"before": first.get("seq"), "more": true})));
+        // An older viewer: all of them, and no window.
+        let (whole, none) = sent_events(&Snapshot { parts: m.view().parts_for(View::default(), false), files: None, store: None }.frames());
+        assert_eq!(whole.len(), all.len());
+        assert_eq!(none, None);
+        // A short session goes whole, with nothing before it.
+        let short = mirror_of(all.get(..30).unwrap_or_default());
+        let (few, w) = sent_events(&Snapshot { parts: short.view().parts_for(WINDOWED, false), files: None, store: None }.frames());
+        assert_eq!(few.len(), 30);
+        assert_eq!(w, Some(json!({"before": 1, "more": false})));
+        // With a conversation store that may keep older ones, a window from the copy's first event
+        // still has more before it unless that's where the timeline begins.
+        assert!(!short.view().window_at(0, true).more, "the copy holds the timeline from its first");
+    }
+
+    /// W21-R15: older pages, asked for one after another from where the window begins, bring every
+    /// event before it once, with no gap, oldest first in each, while new events come and old ones
+    /// change between them; the last says there's no more.
+    #[test]
+    fn w21_r15_older_pages_meet_with_no_gap_and_nothing_twice() -> anyhow::Result<()> {
+        let all = long_session(3_000);
+        let mut m = mirror_of(&all);
+        let (window, w) = sent_events(&Snapshot { parts: m.view().parts_for(WINDOWED, false), files: None, store: None }.frames());
+        let mut have: Vec<u64> = seqs(&window);
+        let mut before = w.as_ref().and_then(|w| w.get("before")).and_then(Value::as_u64).unwrap_or(0);
+        let mut more = w.as_ref().and_then(|w| w.get("more")).and_then(Value::as_bool).unwrap_or(false);
+        let mut next = all.len() as u64;
+        let mut pages = 0;
+        while more {
+            // Between pages: new events, and an old one changed in place.
+            next += 1;
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": format!("e{next}"), "seq": next, "at": next, "kind": "assistant", "text": "new"})))));
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": "e2", "seq": 2, "at": 2, "kind": "assistant", "text": "changed"})))));
+            let Paged::Page { events, window } = m.view().page(before, false, false) else { anyhow::bail!("not a page from the copy") };
+            let page: Vec<Value> = events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect();
+            let got = seqs(&page);
+            assert!(got.windows(2).all(|p| p.first() < p.get(1)), "oldest first: {got:?}");
+            assert_eq!(got.last().copied(), Some(before - 1), "it ends just before the last began");
+            assert_eq!(window.before, got.first().copied());
+            assert!(page.iter().map(|e| e.to_string().len()).sum::<usize>() <= super::super::window::BYTES || page.len() == 1);
+            have.splice(0..0, got);
+            before = window.before.unwrap_or(0);
+            more = window.more;
+            pages += 1;
+            assert!(pages < 100, "pages end");
+        }
+        assert_eq!(have, (1..=all.len() as u64).collect::<Vec<_>>(), "every event once, none missing");
+        // Before the first: an empty page, nothing more.
+        assert!(matches!(m.view().page(1, false, false), Paged::Page { events, window } if events.is_empty() && !window.more));
+        // With a store, before where the timeline begins is nowhere; before what the copy has but
+        // after that, the store.
+        assert!(matches!(m.view().page(1, false, true), Paged::Page { .. }));
+        let mut later = mirror_of(all.get(100..200).unwrap_or_default());
+        assert!(matches!(later.view().page(101, false, true), Paged::Store { before: 101, floor: 1 }));
+        // Cleared there: the timeline begins at 101, and nothing's before it.
+        set_state(&mut later, json!({"cleared": 101}));
+        assert!(matches!(later.view().page(101, false, true), Paged::Page { events, window } if events.is_empty() && !window.more));
+        Ok(())
+    }
+
+    /// W21-R15: lean, a settled command, read and edit go without their bodies (each says what it
+    /// held back), what shows open as it comes goes whole, and the whole of one comes on demand.
+    #[test]
+    fn w21_r15_lean_events_hold_their_bodies_back_and_each_comes_whole_on_demand() -> anyhow::Result<()> {
+        let mut all = long_session(48);
+        all.push(tool_event(49, "shell", "Bash", "running", json!({"command": "sleep 9"}), 400, json!([])));
+        let m = mirror_of(&all);
+        let (events, _) = sent_events(&Snapshot { parts: m.view().parts_for(LEAN, false), files: None, store: None }.frames());
+        let by = |id: &str| events.iter().find(|e| e.get("id").and_then(Value::as_str) == Some(id)).cloned().unwrap_or_default();
+        // e2: a command; e9 (or so): the read; the edit with its counts.
+        let cmd = by("e2");
+        assert!(cmd.get("output").is_none() && cmd.get("input") == Some(&Value::Null), "{cmd}");
+        assert_eq!(cmd.pointer("/held/output"), Some(&json!(1429)));
+        let edit = events.iter().find(|e| e.get("tool").and_then(Value::as_str) == Some("edit")).cloned().unwrap_or_default();
+        assert_eq!(edit.pointer("/diffs/0/hunks"), Some(&json!([])));
+        assert_eq!((edit.pointer("/diffs/0/add"), edit.pointer("/diffs/0/del")), (Some(&json!(8)), Some(&json!(8))));
+        let mcp = events.iter().find(|e| e.get("tool").and_then(Value::as_str) == Some("mcp")).cloned().unwrap_or_default();
+        assert!(mcp.get("output").is_some() && mcp.get("held").is_none(), "kiln's own tools' answers go whole: {mcp}");
+        let running = by("e49");
+        assert!(running.get("output").is_some() && running.get("held").is_none(), "a running command goes whole");
+        // On demand: the whole one, as the copy has it.
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.harness.sessions.on("s", move |s| s.insert("s".into(), m)).await;
+            let r = &hub.harness;
+            let whole: Value = serde_json::from_str(&r.event_text("s", "e2").unwrap_or_default())?;
+            assert_eq!(whole.get("output").and_then(Value::as_str).map(str::len), Some(1429));
+            assert_eq!(Some(&whole), all.get(1));
+            assert_eq!(r.event_text("s", "nope"), None);
+            // A page, lean, holds its bodies back too.
+            let Some(Paged::Page { events, .. }) = r.page("s", 40, true) else { anyhow::bail!("not a page") };
+            assert!(events.iter().any(|t| t.contains("\"held\"")));
+            Ok(())
+        })
+    }
+
+    /// W21-R15: a viewer of a window that resumes gets what changed since, lean as it takes them;
+    /// one that missed more than a window holds gets a window again, never every event.
+    #[test]
+    fn w21_r15_a_window_resumes_with_what_it_lacks_and_never_more_than_a_window() {
+        let all = long_session(2_000);
+        let mut m = mirror_of(&all);
+        let had = m.rev;
+        took(&mut m, |m| m.upsert(Arc::new(Entry::new(tool_event(2001, "shell", "Bash", "done", json!({"command": "ls"}), 300, json!([]))))));
+        let p = m.view().parts_after(Some(had), LEAN, false);
+        assert!(p.since.is_some() && p.window.is_none());
+        let (events, _) = sent_events(&Snapshot { parts: p, files: None, store: None }.frames());
+        assert_eq!(seqs(&events), vec![2001]);
+        assert!(events.first().is_some_and(|e| e.get("held").is_some()), "lean, as it takes them");
+        // Away while more than a window's worth came: a window, not all of it.
+        let had = m.rev;
+        for k in 0..(super::super::window::ROWS as u64 + 10) {
+            let n = 3000 + k;
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": format!("e{n}"), "seq": n, "at": n, "kind": "assistant", "text": "x"})))));
+        }
+        let p = m.view().parts_after(Some(had), LEAN, false);
+        assert!(p.since.is_none() && p.window.is_some());
+        assert!(sent_events(&Snapshot { parts: p, files: None, store: None }.frames()).0.len() <= super::super::window::ROWS);
+        // One from before windows resumes with all of what it lacks, as before.
+        let p = m.view().parts_after(Some(had), View::default(), false);
+        assert!(p.since.is_some());
+        assert_eq!(sent_events(&Snapshot { parts: p, files: None, store: None }.frames()).0.len(), super::super::window::ROWS + 10);
+    }
+
+    /// W21-R15: what a long session's first load costs, before windows and after (4,000 events as
+    /// `long_session` makes them): its bytes as written and as packed (`?z=gzip`), and its frames.
+    /// Run with `--nocapture` to read them.
+    #[test]
+    fn w21_r15_window_bounds_measured() -> anyhow::Result<()> {
+        let all = long_session(super::super::core::MAX_EVENTS);
+        let m = mirror_of(&all);
+        let measure = |view: View| -> anyhow::Result<(usize, usize, usize, usize)> {
+            let snap = Snapshot { parts: m.view().parts_for(view, true), files: None, store: None };
+            let frames = snap.frames();
+            let raw: usize = frames.iter().map(String::len).sum();
+            let packed = snap.packed(r#"{"t":"synced"}"#)?.len();
+            Ok((sent_events(&frames).0.len(), frames.len() + 1, raw, packed))
+        };
+        let before = measure(View::default())?;
+        let window = measure(WINDOWED)?;
+        let lean = measure(LEAN)?;
+        for (what, (events, frames, raw, packed)) in [("whole (today)", before), ("window", window), ("window + lean", lean)] {
+            println!("cold open, {what}: {events} events, {frames} frames, {raw} bytes raw, {packed} bytes gzip");
+        }
+        assert_eq!(before.0, super::super::core::MAX_EVENTS);
+        assert!(lean.2 < before.2 / 10, "a window costs a tenth of today's at most: {lean:?} against {before:?}");
+        assert!(lean.2 <= super::super::window::BYTES + 64 * 1024, "about a window's bytes: {lean:?}");
         Ok(())
     }
 }
