@@ -125,26 +125,35 @@ pub fn expand(path: &str) -> Option<PathBuf> {
 
 /// `path` as the session sees it: a relative one is in its folder, `cwd`. Dots are resolved here
 /// (`a/../b`); links are left for the machine, which follows them when it reads.
+///
+/// A session's paths are the ones its agent writes, `/` between their parts, so they're taken apart
+/// at `/` here whatever this host's own separator is: with the host's `Path`, a server on Windows
+/// made `\work\shot.png` of `/work/shot.png` and found no file a message mentions (goal 4, plan
+/// 01a1a59c2a9c step 5's runs on Windows, 2026-11-06: `copies::tests::
+/// g9_s3_an_event_written_off_the_shard_is_as_one_written_on_it`). What it gives is what Linux's
+/// `Path` gave: empty parts and `.` dropped, `..` going up (never past `/`).
 pub fn resolve(path: &str, cwd: &str) -> Option<String> {
+    let joined;
     let p = if path.starts_with('/') || path.starts_with("~/") {
-        PathBuf::from(path)
+        path
     } else {
         if cwd.is_empty() {
             return None;
         }
-        Path::new(cwd).join(path)
+        joined = format!("{cwd}/{path}");
+        joined.as_str()
     };
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                out.pop();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in p.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
             }
-            Component::CurDir => {}
-            other => out.push(other),
+            other => parts.push(other),
         }
     }
-    let s = out.to_string_lossy().into_owned();
+    let s = if p.starts_with('/') { format!("/{}", parts.join("/")) } else { parts.join("/") };
     (s.starts_with('/') || s.starts_with("~/") || s == "~").then_some(s)
 }
 

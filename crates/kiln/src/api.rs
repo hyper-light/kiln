@@ -5733,24 +5733,93 @@ fn pre_named(made: crate::reads::Made) -> Response {
     r
 }
 
+/// How long a join of the sessions' list takes, as the joins so far took ([`harness_sessions`]; goal 10, plan
+/// 01a1a87b2dae step 5): RFC 6298's estimator of a round trip (§2), learned the same way from each join's time, a smoothed
+/// mean and a mean deviation in nanoseconds (gains 1/8 and 1/4), and the bound it puts on the next, the mean and four
+/// deviations (its retransmission timeout's K). No lock: two joins learned at once may lose one's sample, as an
+/// estimate of a mean can.
+#[derive(Debug, Default)]
+struct Joins {
+    /// The smoothed mean, ns: 0 before the first join (none takes nothing).
+    mean_ns: std::sync::atomic::AtomicU64,
+    /// The mean deviation, ns.
+    dev_ns: std::sync::atomic::AtomicU64,
+}
+
+impl Joins {
+    /// A join took `took`: the first sets the mean to it and the deviation to half of it (RFC 6298 §2.2), each after
+    /// moves them by their gains (§2.3).
+    fn took(&self, took: Duration) {
+        let ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if mean == 0 {
+            self.dev_ns.store(ns / 2, std::sync::atomic::Ordering::Relaxed);
+            self.mean_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let dev = self.dev_ns.load(std::sync::atomic::Ordering::Relaxed);
+        self.dev_ns.store((dev - dev / 4).saturating_add(mean.abs_diff(ns) / 4), std::sync::atomic::Ordering::Relaxed);
+        self.mean_ns.store((mean - mean / 8).saturating_add(ns / 8).max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What the next join is bounded by: the mean and four deviations (RFC 6298 §2.3's K); none before the first join.
+    fn bound_ns(&self) -> Option<u64> {
+        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
+        (mean > 0).then(|| mean.saturating_add(self.dev_ns.load(std::sync::atomic::Ordering::Relaxed).saturating_mul(4)))
+    }
+
+    /// Whether the next join is to be made on the request's shard: the joins so far bound it within the shard's step
+    /// quantum (`quantum_ns`, goal 9's: no poll past it). Not before a join was learned, nor off a shard.
+    fn here(&self, quantum_ns: Option<u64>) -> bool {
+        self.bound_ns().zip(quantum_ns).is_some_and(|(bound, quantum)| bound <= quantum)
+    }
+}
+
+/// The sessions' list's joins so far, wherever they were made.
+static JOINS: Joins = Joins { mean_ns: std::sync::atomic::AtomicU64::new(0), dev_ns: std::sync::atomic::AtomicU64::new(0) };
+
+/// The sessions' list as [`crate::harness::registry::Registry::list_tagged`] finds it or joins it, and how long its join
+/// held its thread on the CPU where it joined it (`None` where it found it as it was): what it would hold a shard for.
+/// The thread's own time (`crate::shard_health::CpuClock`), which the host's holds of it don't count in: a compute
+/// worker beside CPU hogs waits for its CPU a tick at a time, and joins timed so would read as longer than any quantum and
+/// keep every read on the pool. Its wall time where the OS keeps no time for a thread (Windows).
+fn list_timed(hub: &Hub) -> ((bytes::Bytes, Option<http::HeaderValue>), Option<Duration>) {
+    let mut cpu = crate::shard_health::CpuClock::Unchosen;
+    let (began, on_cpu, joins) = (Instant::now(), cpu.read(), hub.harness.list_joins());
+    let listed = hub.harness.list_tagged();
+    let held = on_cpu.zip(cpu.read()).map_or_else(|| began.elapsed(), |(from, to)| Duration::from_nanos(to.saturating_sub(from)));
+    (listed, (hub.harness.list_joins() != joins).then_some(held))
+}
+
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
 /// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
 /// sees by lineage, found as it reads.
 async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
     if crate::harness::lineage::sees_all(caller) {
         // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
-        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). Found, or joined again, on the
-        // compute pool, not on the request's shard (step 3): a join reads every session's view, copies each one's info
-        // into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work change it between nearly
-        // any two reads) and digests the infos that changed. Where its job is lost (it panicked), here.
-        let h = Arc::clone(hub);
-        let (json, etag) = match crate::rt::compute(move || h.harness.list_tagged()).await {
-            Ok(listed) => listed,
-            Err(e) => {
-                tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
-                hub.harness.list_tagged()
+        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). A join reads every session's
+        // view, copies each one's info into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work
+        // change it between nearly any two reads) and digests the infos that changed. It's made here, on the request's
+        // shard, where the joins so far bound it within the shard's quantum (`Joins`; goal 9 step 3's bound on a poll),
+        // else on the compute pool (goal 10, plan 01a1a87b2dae step 5): there each read waited on two wakes across
+        // threads, a worker's and its own shard's, and on the pool's queue behind snapshots' and pages' compression
+        // (g9p16: its jobs' wait for a thread 6.9 ms at p99 calm, 25 ms with hogs, where the API's reads were to be
+        // under a millisecond at p99.9). Where the pool's job is lost (it panicked), here.
+        let ((json, etag), joined) = if JOINS.here(hyper_rt::futures::step_budget_ns()) {
+            list_timed(hub)
+        } else {
+            let h = Arc::clone(hub);
+            match crate::rt::compute(move || list_timed(&h)).await {
+                Ok(listed) => listed,
+                Err(e) => {
+                    tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
+                    list_timed(hub)
+                }
             }
         };
+        if let Some(took) = joined {
+            JOINS.took(took);
+        }
         let mut r = pre_encoded(json);
         if let Some(etag) = etag {
             r.headers_mut().insert(header::ETAG, etag);
@@ -6658,7 +6727,14 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     // Whose its commands' ids are: a caller's, as an Idempotency-Key's are.
     let scope = caller.as_ref().map_or_else(String::new, crate::harness::ops::key_scope);
     let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
-    crate::rt::spawn(async move {
+    // Served on its session's owner's shard, where the session's frames are published (goal 10, plan 01a1a87b2dae step
+    // 5): a frame then reaches this viewer in its owner's own thread once the owner's turn ends, where a viewer on
+    // another shard (its connection's, dealt round-robin: three in four with four shards) was woken across threads for
+    // each, its shard kicked where it was parked, and behind a busy CPU up to a tick on a kernel that preempts lazily
+    // (`crate::route_latency::FrameLeg::WokenOther`). Its connection moves there with its upgrade: a socket's waits are
+    // one-shot, armed on whichever shard awaits it, and one left armed where it was is withdrawn there
+    // (`hyper_rt::readiness`), as an accepted connection moves to the shard it's dealt.
+    crate::rt::spawn_owner(hub.harness.owner_shard(&id), async move {
         let Ok(socket) = upgrade.await else { return };
         // Watching is seeing (checked before the upgrade); commands on the socket need acting, and
         // each is audited as its caller.
@@ -6905,6 +6981,27 @@ async fn waited<F: Future>(fut: F) -> (F::Output, bool) {
     (out, pending)
 }
 
+/// A viewer's take of a batch of its session's feed ([`write_live_batch`]; goal 10, plan 01a1a87b2dae step 5): when its
+/// task's poll found the batch there (`woke_us`) and read it off the bus (`now_us`), on the clock each frame's publish is
+/// stamped by ([`crate::harness::live::now_us`]), the read on the monotonic clock its write is timed from (`at`), and
+/// the leg its frames' wait for that poll was: `woken` with the viewer on its session's owner's shard, `woken_other`
+/// across shards (`crate::route_latency::FrameLeg`).
+#[derive(Clone, Copy, Debug)]
+struct Read {
+    woke_us: u64,
+    now_us: u64,
+    at: Instant,
+    woken: crate::route_latency::FrameLeg,
+}
+
+impl Read {
+    /// A batch read now, its viewer's task woken at `woke_us`, on its session's owner's shard (`own`) or another.
+    fn now(woke_us: u64, own: bool) -> Self {
+        let woken = if own { crate::route_latency::FrameLeg::Woken } else { crate::route_latency::FrameLeg::WokenOther };
+        Self { woke_us, now_us: crate::harness::live::now_us(), at: Instant::now(), woken }
+    }
+}
+
 /// What a batch of a session's feed came to for its viewer ([`write_live_batch`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Fed {
@@ -6922,12 +7019,13 @@ enum Fed {
 /// shard, should it take more than one), one write for the batch where each frame was a write of its own (a
 /// system call on the shard each). Each frame goes as its payload's own bytes, read
 /// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
-/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
-/// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
-/// written (goal 1, plan 01a1a59c2a68 step 2). Written in its viewer's turn on its shard, `turns`, which the batches
-/// before it in the same poll took of (goal 9, plan 01a1a87b2cec step 3).
-#[allow(clippy::too_many_arguments)]
-async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
+/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read
+/// (`read.now_us`), are observed as it's fed; its time from the read (`read.at`) to its write once the batch is
+/// written (goal 1, plan 01a1a59c2a68 step 2); and, to the microsecond, its wait from its publish for its viewer's task
+/// to take it up (`read.woke_us`) and that write (goal 10, plan 01a1a87b2dae step 5: `crate::route_latency::FrameLeg`).
+/// Written in its viewer's turn on its shard, `turns`, which the batches before it in the same poll took of (goal 9, plan
+/// 01a1a87b2cec step 3).
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
@@ -6966,9 +7064,11 @@ where
             came_to = Fed::StartOver;
             break;
         }
-        if let Some(waited) = published.map(|at| Duration::from_micros(now_us.saturating_sub(at))) {
+        if let Some(at) = published {
+            let waited = Duration::from_micros(read.now_us.saturating_sub(at));
             crate::metrics::bus().delivery_seconds.observe(waited.as_secs_f64());
             crate::route_latency::observe_wait(crate::route_latency::Class::Websocket, waited);
+            crate::route_latency::observe_frame(read.woken, Duration::from_micros(read.woke_us.saturating_sub(at)));
         }
         *have = (*have).max(rev);
         tx.feed(ws::text(said)).await?;
@@ -6982,9 +7082,16 @@ where
     if fed > 0 || came_to == Fed::Closed {
         tx.flush().await?;
     }
-    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, read_at.elapsed(), fed);
+    let wrote = read.at.elapsed();
+    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, wrote, fed);
+    crate::route_latency::observe_frames(crate::route_latency::FrameLeg::Write, wrote, fed);
     Ok(came_to)
 }
+
+/// The session sockets' viewers that ran on another shard than their session's owner, and on it, in this test process
+/// (goal 10, plan 01a1a87b2dae step 5): each viewer is served on its owner's shard (`harness_ws`).
+#[cfg(test)]
+static VIEWERS_ON_OWNER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
 
 /// What a viewer's socket is doing, for the shards' table of what held them (`hyper_rt::slow`; goal 10, plan
 /// 01a1a87b2dae step 5: g9p7's calm lab named the socket's task by its spawn site alone, held 6.3 ms, and not which
@@ -7063,6 +7170,13 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // only where something else wanted it (`crate::rt::consume_budget`), so a poll of several went on past the quantum.
     // A batch the loop waited for begins a turn afresh: the wait gave its shard to its other work.
     let mut turns = crate::rt::Turns::new();
+    // Whether it runs on its session's owner's shard, where its frames are published: then their wake is no other
+    // thread's (goal 10, plan 01a1a87b2dae step 5).
+    let own = crate::rt::shard_index() == Some(hub.harness.owner_shard(&id));
+    #[cfg(test)]
+    if let Some(n) = VIEWERS_ON_OWNER.get(usize::from(own)) {
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
@@ -7096,15 +7210,17 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 }
             }
             (w, fresh) = live.fuse() => match w {
-                Live::Ready => match crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await {
-                    Ok(batch) => {
+                // This task's poll took its feed's word now: each frame's wait for it is the viewer's wake (goal 10, plan
+                // 01a1a87b2dae step 5).
+                Live::Ready => match (crate::harness::live::now_us(), crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await) {
+                    (woke, Ok(batch)) => {
                         if fresh {
                             turns = crate::rt::Turns::new();
                         }
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
-                        let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at, &mut turns)).await? {
+                        let (read, next) = (Read::now(woke, own), batch.next);
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, read, &mut turns)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
@@ -7114,15 +7230,15 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // next would pass the quantum, whether or not anything else wants the shard then.
                         turns.end().await;
                     }
-                    Err(Refusal::Behind { .. }) => {
+                    (_, Err(Refusal::Behind { .. })) => {
                         crate::metrics::bus().lag_notices.inc();
                         start_over = true;
                     }
-                    Err(Refusal::NoTopic(_)) => {
+                    (_, Err(Refusal::NoTopic(_))) => {
                         tx.send(closed()).await?;
                         return Ok(());
                     }
-                    Err(e) => {
+                    (_, Err(e)) => {
                         tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
                         start_over = true;
                     }
@@ -8443,6 +8559,80 @@ mod tests {
         })
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's viewer is served on its session's owner's shard, wherever its
+    /// connection came in: its socket moves there with its upgrade, and its snapshot and live frames come over it; no
+    /// viewer in this test process runs off its session's owner's shard. Here the session's owner is another shard than
+    /// the one its connection was served on (where the runtime has another), so its socket moved.
+    #[test]
+    fn g10_s5_a_viewer_is_served_on_its_sessions_owner_shard() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::sync::atomic::Ordering;
+        const MARK: &str = "g10-s5: a frame to a viewer on its session's owner's shard";
+        crate::rt::block_on(async {
+            // kiln's API on a port of its own, its connections served on this task's shard.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let port = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let here = crate::rt::shard_index().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (api, remote) = (Arc::clone(&api), stream.peer_addr().ok());
+                    crate::rt::spawn(async move { crate::http::server::serve_accepted(stream, api, remote, None).await });
+                }
+            });
+            // A session another shard owns.
+            let elsewhere = crate::rt::shard_count() > 1;
+            let id = (0u64..1024).map(|n| format!("viewed-{n}")).find(|id| !elsewhere || hub.harness.owner_shard(id) != here).ok_or_else(|| anyhow::anyhow!("no session another shard owns"))?;
+            anyhow::ensure!(!elsewhere || hub.harness.owner_shard(&id) != here, "{id} is owned where its viewer's connection is served");
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, &id, Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.to_owned(), streaming: false } };
+            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(1, "the retry loop reads its deadline")] }).await;
+            let on0 = VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed));
+            // The viewer: its snapshot (its frames, then `synced`), then the live frame.
+            let (tx, rx) = async_channel::unbounded::<Result<bool, String>>();
+            let path = format!("/api/harness/sessions/{id}/ws");
+            std::thread::spawn(move || {
+                let watch = || -> anyhow::Result<()> {
+                    let mut ws = ws_client(port, &path, None)?;
+                    loop {
+                        if let tungstenite::Message::Text(t) = ws.read()? {
+                            if t.as_str() == synced() {
+                                let _ = tx.send_blocking(Ok(false));
+                            } else if t.as_str().contains(MARK) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+                let _ = tx.send_blocking(watch().map(|()| true).map_err(|e| format!("{e:#}")));
+            });
+            let wait = Duration::from_secs(60);
+            let next = |what: &'static str| {
+                let rx = rx.clone();
+                async move {
+                    match crate::rt::timeout(wait, rx.recv()).await {
+                        Ok(Ok(Ok(live))) => Ok(live),
+                        Ok(Ok(Err(why))) => Err(anyhow::anyhow!("{what}: {why}")),
+                        Ok(Err(_)) => Err(anyhow::anyhow!("{what}: its viewer went")),
+                        Err(_) => Err(anyhow::anyhow!("{what}: not within {wait:?}")),
+                    }
+                }
+            };
+            anyhow::ensure!(!next("its snapshot").await?, "its snapshot comes first");
+            hub.harness.ingest(&hub, &there, &id, Update::Events { events: vec![said(2, MARK)] }).await;
+            anyhow::ensure!(next("its live frame").await?, "the live frame");
+            let (off, on) = (VIEWERS_ON_OWNER.first().map_or(0, |n| n.load(Ordering::Relaxed)), VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed)));
+            anyhow::ensure!(off == 0, "{off} viewers in this process ran off their session's owner's shard");
+            anyhow::ensure!(on > on0, "this one ran on its owner's shard: {on0} then {on}");
+            Ok(())
+        })
+    }
+
     /// A command on a session's socket doesn't wait for the store: with the store's one connection
     /// held (a checkpoint on a busy disk, another caller's long write), each one's audit row is
     /// taken at once and the command goes on, where it once waited for the row to be written first
@@ -8628,7 +8818,7 @@ mod tests {
             // The viewer's catch-up held revision 1: that frame isn't sent again.
             let mut have = 1;
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
             anyhow::ensure!(have == FRAMES, "the viewer has the newest sent: {have}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
@@ -8642,7 +8832,7 @@ mod tests {
             // A batch the session's last frame ends: one write, and the viewer ends with it.
             let closed = crate::harness::registry::Frame::of(SessionDown::from(SessionFrame::Closed));
             let last = vec![fed_frame(9, r#"{"t":"events","rev":9}"#, 9), kiln_seams::bus::Message { offset: 10, key: None, payload: crate::harness::live::encode(&closed), at_ms: 0 }];
-            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
+            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Closed, "{came_to:?}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
@@ -8664,7 +8854,7 @@ mod tests {
             let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
             let (mut tx, mut have) = (Written { slow: true, ..Written::default() }, 0);
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
             let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
             anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
@@ -8689,7 +8879,7 @@ mod tests {
             let mut turns = crate::rt::Turns::new();
             std::thread::sleep(Duration::from_nanos(quantum));
             let (mut tx, mut have) = (Written::default(), 0);
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut turns).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut turns).await?;
             anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
             let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
             anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
@@ -8697,6 +8887,76 @@ mod tests {
             anyhow::ensure!(tx.flushed_at.first() == Some(&1) && tx.flushed_at.last() == Some(&texts.len()), "flushed with {:?} sent: the spent turn's after the first frame, the batch's after its last", tx.flushed_at);
             Ok(())
         })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: each live frame a viewer writes is timed by its legs past its owner, to the
+    /// microsecond: its wait from its publish for the viewer's task to take it up, as `woken` where the viewer runs on its
+    /// session's owner's shard and `woken_other` across shards, and the batch's write, each frame's. A frame the viewer's
+    /// catch-up held, not fed, is neither. The histograms are the process's: other tests' frames only add to them.
+    #[test]
+    fn g10_s5_a_viewers_frames_are_timed_by_their_wake_and_their_write() -> anyhow::Result<()> {
+        use crate::route_latency::{FrameLeg, frame_legs};
+        /// Shape: the frames a batch feeds, more than one, so each frame's own observation is seen.
+        const FED: u64 = 3;
+        /// Shape: how long before its viewer's poll each frame was published, past every bucket under it.
+        const BEFORE_US: u64 = 700;
+        let leg = |l: FrameLeg| frame_legs().of(l).map_or((0, 0), |h| (h.count(), h.sum_us()));
+        // A frame published `BEFORE_US` before `woke`: its payload's stamp set so.
+        let published = |offset: u64, rev: u64, woke: u64| {
+            let mut m = fed_frame(offset, &format!(r#"{{"t":"events","rev":{rev}}}"#), rev);
+            if let Some(at) = m.payload.get_mut(..8) {
+                at.copy_from_slice(&woke.saturating_sub(BEFORE_US).to_le_bytes());
+            }
+            m
+        };
+        crate::rt::block_on(async move {
+            for own in [false, true] {
+                let taken = if own { FrameLeg::Woken } else { FrameLeg::WokenOther };
+                let (woken0, write0) = (leg(taken), leg(FrameLeg::Write));
+                // Its viewer woke `BEFORE_US` past now: the process's microsecond clock starts at its first reading, which
+                // may be this one.
+                let woke = crate::harness::live::now_us().saturating_add(BEFORE_US);
+                // Revision 1 the catch-up held: skipped, so neither timed.
+                let batch = (1..=FED + 1).map(|rev| published(rev, rev, woke)).collect();
+                let (mut tx, mut have) = (Written::default(), 1);
+                let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(woke, own), &mut crate::rt::Turns::new()).await?;
+                anyhow::ensure!(came_to == Fed::Written && tx.sent.len() == usize::try_from(FED)?, "{came_to:?}, {} sent", tx.sent.len());
+                let (woken, write) = (leg(taken), leg(FrameLeg::Write));
+                anyhow::ensure!(woken.0 >= woken0.0 + FED && woken.1 >= woken0.1 + FED * BEFORE_US, "{}: {FED} frames each {BEFORE_US} µs: {woken0:?} to {woken:?}", taken.name());
+                anyhow::ensure!(write.0 >= write0.0 + FED, "the batch's write, each frame's: {write0:?} to {write:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the sessions' list's joins are learned as RFC 6298 learns a round trip: the
+    /// first sets the mean to its time and the deviation to half of it, each after moves the mean by an eighth of its
+    /// difference and the deviation by a quarter of its distance; the next join is bounded by the mean and four
+    /// deviations, and made on the request's shard only once one was learned, and only while that bound fits the shard's
+    /// quantum (never off a shard).
+    #[test]
+    fn g10_s5_the_sessions_lists_joins_are_learned_and_made_where_they_fit() {
+        let us = Duration::from_micros;
+        let j = Joins::default();
+        assert_eq!(j.bound_ns(), None);
+        assert!(!j.here(Some(266_667)), "none learned: to the compute pool, which learns it");
+        j.took(us(40));
+        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (40_000, 20_000), "R, and R/2");
+        assert_eq!(j.bound_ns(), Some(120_000), "R + 4 R/2");
+        assert!(j.here(Some(266_667)) && !j.here(Some(100_000)) && !j.here(None), "within the quantum: here; past it, or off a shard: not");
+        j.took(us(120));
+        // RTTVAR = 3/4 · 20 + 1/4 · |40 − 120| = 35 µs; SRTT = 7/8 · 40 + 1/8 · 120 = 50 µs.
+        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (50_000, 35_000));
+        assert_eq!(j.bound_ns(), Some(190_000));
+        // A list grown past the quantum's join goes off the shard, and comes back once its joins are short again.
+        for _ in 0..8 {
+            j.took(us(900));
+        }
+        assert!(!j.here(Some(266_667)), "{:?}", j.bound_ns());
+        for _ in 0..64 {
+            j.took(us(30));
+        }
+        assert!(j.here(Some(266_667)), "{:?}", j.bound_ns());
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: [`waited`] says whether what it awaited made its task wait (a poll of it was

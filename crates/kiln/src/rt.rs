@@ -912,6 +912,13 @@ pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
 }
 
+/// The place among the runtime's shards ([`shard_count`], as [`spawn_on`] and [`spawn_owner`] take it) of the shard the
+/// caller runs on; `None` off them (goal 10, plan 01a1a87b2dae step 5).
+pub fn shard_index() -> Option<usize> {
+    let here = hyper_rt::futures::shard_id()?.0;
+    shard_holders_ref().iter().position(|h| h.shard() == here)
+}
+
 // ------------------------------------------------------------------------------------ spawning
 
 pub(crate) type Boxed = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;

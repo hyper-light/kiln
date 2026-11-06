@@ -38,7 +38,10 @@ impl Class {
 /// One timed thing: its class, when it began (µs since the epoch), how long it took (µs), whether it
 /// went as it should (an answer under 400; a socket that opened), and what it was, finer than its
 /// class (an API read's route: `sessions`, `events`…; empty where its class says it all); and what the
-/// server said of its own time with it, where it was asked (an API read: [`split`]).
+/// server said of its own time with it, where it was asked (an API read: [`split`]); and when what ended it (an
+/// answer's last bytes, a frame) arrived at the lab's socket, µs since the epoch, where the socket stamps arrivals
+/// (`crate::rx`, Linux): what's before it the server's and its way's (an agent's too, for a frame), what's after it the
+/// lab's own, its thread's wake and its read ([`arrivals`]; goal 10, plan 01a1a87b2dae step 5).
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub class: Class,
@@ -47,6 +50,7 @@ pub struct Sample {
     pub ok: bool,
     pub what: &'static str,
     pub server: Option<crate::client::ServerTime>,
+    pub arrived_us: Option<u64>,
 }
 
 /// Where the slowest of a class's samples went ([`split`]), in milliseconds, each the mean over them, so the three
@@ -82,6 +86,24 @@ pub fn split(samples: &[Sample], class: Class, q: f64) -> Option<Split> {
     #[allow(clippy::cast_precision_loss)]
     let mean = |part: fn(&(u64, u64, u64)) -> u64| slow.iter().map(part).fold(0u64, u64::saturating_add) as f64 / n.max(1) as f64 / 1000.0;
     Some(Split { n, wait_ms: mean(|s| s.0), took_ms: mean(|s| s.1), rest_ms: mean(|s| s.2) })
+}
+
+/// A class's samples split at their arrival on the lab's socket (`Sample::arrived_us`; goal 10, plan 01a1a87b2dae
+/// step 5): of each `ok` sample whose arrival was stamped, the time to it (the server's and the way's, and an agent's
+/// and its runner's for a frame) and the time from it to the sample's end (the lab's own: its thread's wake onto its
+/// CPU, the read, the reading), each as a class's figures; `None` where none was stamped (off Linux, or a build of the
+/// lab before the stamps). An arrival stamped before the sample began (a frame's arrival with an earlier one's, read
+/// together) counts as at its start, and one after its end as at its end.
+pub fn arrivals(samples: &[Sample], class: Class) -> Option<(Seen, Seen)> {
+    let (mut to, mut from) = (Vec::new(), Vec::new());
+    for s in samples.iter().filter(|s| s.class == class && s.ok) {
+        let Some(at) = s.arrived_us else { continue };
+        let end = s.at_us.saturating_add(s.took_us);
+        let at = at.max(s.at_us).min(end);
+        to.push(at.saturating_sub(s.at_us));
+        from.push(end.saturating_sub(at));
+    }
+    (!to.is_empty()).then(|| (seen_of(to, 0), seen_of(from, 0)))
 }
 
 /// `q` of sorted `v` by the nearest rank (the smallest value with at least `q` of them at or under
@@ -347,7 +369,7 @@ mod tests {
     /// class's.
     #[test]
     fn g10_s1_each_route_is_seen_to_the_microsecond() {
-        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what, server: None };
+        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what, server: None, arrived_us: None };
         let by = seen_by_what(&[s("sessions", 1_234, true), s("sessions", 17, true), s("events", 999, true), s("events", 5, false), s("", 3, true)]);
         assert_eq!(by.keys().cloned().collect::<Vec<_>>(), vec!["api_read.events".to_owned(), "api_read.sessions".to_owned()]);
         let sessions = by.get("api_read.sessions").cloned().unwrap_or_default();
@@ -361,7 +383,7 @@ mod tests {
     #[test]
     fn g10_s5_the_slowest_reads_are_split_into_the_servers_wait_took_and_the_rest() {
         use crate::client::ServerTime;
-        let read = |took_us: u64, server: Option<(Option<u64>, u64)>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server: server.map(|(wait_us, took_us)| ServerTime { wait_us, took_us }) };
+        let read = |took_us: u64, server: Option<(Option<u64>, u64)>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server: server.map(|(wait_us, took_us)| ServerTime { wait_us, took_us }), arrived_us: None };
         // 1,000 reads of 200 µs, the server's share 50 µs of each; the slowest two, 3 ms and 5 ms, its share 2 ms and 1 ms.
         let mut v: Vec<Sample> = (0..998).map(|_| read(200, Some((Some(30), 20)))).collect();
         v.push(read(3_000, Some((Some(1_500), 500))));
