@@ -1106,19 +1106,33 @@ pub async fn ask_open(hub: &crate::hub::Hub, session: &str) {
 /// The work kiln handed agent session `session` (to it at any epoch) that no receipt answers yet:
 /// the hand-ons' envelopes, oldest first.
 async fn unreceived(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
-    let pattern = format!("%/agent/{session}/epoch/%");
-    store
-        .call(move |c| {
-            let mut q = c.prepare(
-                "SELECT c.envelope FROM custody c WHERE c.kind IN ('handed-on', 'taken', 'passed-on') AND c.counterpart LIKE ?1
-                 AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?2)
-                 AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
-                 ORDER BY c.taken_at, c.rowid",
-            )?;
-            let rows = q.query_map(params![pattern, WORK], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-            Ok(rows)
-        })
-        .await
+    let session = session.to_owned();
+    store.call(move |c| unreceived_in(c, &session)).await
+}
+
+/// The agent session a custody record's counterpart names (the text between its first `/agent/`
+/// and `/epoch/`), as the index `custody_counterpart_session` keys it: the same expression, so
+/// [`unreceived_in`] searches that index instead of reading every record (2026-11-05: a restart's
+/// reconnects queued hundreds of whole-table reads on the store's one connection).
+const COUNTERPART_SESSION: &str = "(CASE WHEN instr(c.counterpart, '/agent/') > 0 AND instr(c.counterpart, '/epoch/') > instr(c.counterpart, '/agent/') + 7 THEN substr(c.counterpart, instr(c.counterpart, '/agent/') + 7, instr(c.counterpart, '/epoch/') - instr(c.counterpart, '/agent/') - 7) END)";
+
+/// [`unreceived`] on connection `c`. A receipt that answers a hand-on is found from the hand-on
+/// (`custody_followed`, then the receipt by its digest: the CROSS JOIN keeps that order), not by
+/// reading every receipt for each hand-on.
+fn unreceived_in(c: &rusqlite::Connection, session: &str) -> anyhow::Result<Vec<String>> {
+    let mut q = c.prepare(&unreceived_sql())?;
+    let rows = q.query_map(params![session, WORK], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(rows)
+}
+
+/// [`unreceived_in`]'s query: `?1` the session, `?2` [`WORK`].
+fn unreceived_sql() -> String {
+    format!(
+        "SELECT c.envelope FROM custody c WHERE {COUNTERPART_SESSION} = ?1 AND c.kind IN ('handed-on', 'taken', 'passed-on')
+         AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?2)
+         AND NOT EXISTS (SELECT 1 FROM custody_follows f CROSS JOIN custody r WHERE f.follows = c.digest AND r.digest = f.record AND r.kind = 'received')
+         ORDER BY c.taken_at, c.rowid"
+    )
 }
 
 /// The newest receipt custodian `custodian` signed: how it came to hold what it holds.
@@ -2647,5 +2661,56 @@ mod tests {
             assert!(v.pointer("/break/detail").and_then(Value::as_str).is_some_and(|d| d.contains(&h.digest)), "{v}");
             Ok(())
         })
+    }
+
+    /// W27-R08, 2026-11-05: the work handed a session that no receipt answers is found by the
+    /// session through `custody_counterpart_session`, never by reading every custody record (a
+    /// restart's reconnects ran one such read per session on the store's one connection): the
+    /// records the old `LIKE '%/agent/<id>/epoch/%'` found, oldest first, and no SCAN in its plan.
+    #[test]
+    fn w27_r08_unreceived_searches_by_session_not_every_record() -> anyhow::Result<()> {
+        let mut c = rusqlite::Connection::open_in_memory()?;
+        crate::store::migrations::apply(&mut c)?;
+        let agent = |s: &str, epoch: u32| format!("kiln://hyper-light/person/ada/agent/{s}/epoch/{epoch}/machine/fedora/instance/01a14c4f");
+        let record = |c: &rusqlite::Connection, digest: &str, kind: &str, counterpart: &str, at: i64, work: bool| -> anyhow::Result<()> {
+            c.execute(
+                "INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES (?1, 'p', ?2, 'kiln://hyper-light/server', ?3, ?1, ?4)",
+                params![digest, kind, counterpart, at],
+            )?;
+            if work {
+                c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, 'step', ?2, 'ab')", params![digest, WORK])?;
+            }
+            Ok(())
+        };
+        // Session s1's: two unanswered (one at another epoch), one answered by a receipt, one
+        // about no work; s10's and a machine's are not s1's.
+        record(&c, "h2", "handed-on", &agent("s1", 1), 20, true)?;
+        record(&c, "h1", "handed-on", &agent("s1", 0), 10, true)?;
+        record(&c, "h3", "passed-on", &agent("s1", 0), 30, true)?;
+        record(&c, "h4", "handed-on", &agent("s1", 0), 40, false)?;
+        record(&c, "x1", "handed-on", &agent("s10", 0), 15, true)?;
+        record(&c, "x2", "taken", FEDORA, 16, true)?;
+        record(&c, "r3", "received", &agent("s1", 0), 31, false)?;
+        c.execute("INSERT INTO custody_follows (record, follows) VALUES ('r3', 'h3')", [])?;
+        assert_eq!(unreceived_in(&c, "s1")?, vec!["h1".to_owned(), "h2".to_owned()]);
+        assert_eq!(unreceived_in(&c, "s10")?, vec!["x1".to_owned()]);
+        assert!(unreceived_in(&c, "s")?.is_empty(), "a prefix of a session is not the session");
+        let like: Vec<String> = c
+            .prepare(
+                "SELECT c.envelope FROM custody c WHERE c.kind IN ('handed-on', 'taken', 'passed-on') AND c.counterpart LIKE '%/agent/s1/epoch/%'
+                 AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?1)
+                 AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
+                 ORDER BY c.taken_at, c.rowid",
+            )?
+            .query_map([WORK], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(unreceived_in(&c, "s1")?, like, "what the LIKE found");
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", unreceived_sql()))?
+            .query_map(params!["s1", WORK], |r| r.get::<_, String>(3))?
+            .collect::<Result<_, _>>()?;
+        assert!(plan.iter().any(|p| p.contains("custody_counterpart_session")), "{plan:?}");
+        assert!(plan.iter().all(|p| !p.starts_with("SCAN")), "{plan:?}");
+        Ok(())
     }
 }
