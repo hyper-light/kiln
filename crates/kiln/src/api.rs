@@ -8387,7 +8387,7 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
             let opened = Instant::now();
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // A chunk's events, and the open chunk's once the turn is in: past the page's reach into a compact chunk, short
             // of sealing it.
             let chunk = CHUNK;
@@ -8395,7 +8395,7 @@ mod tests {
             anyhow::ensure!(open > EVENTS_PAGE.saturating_sub(chunk) && open < chunk, "the page spans one compact chunk: {open} of {chunk}");
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n - 2).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n - 2).map(said).collect() }).await;
             let busy = opened.elapsed();
             // Till its chunks are compact, the page is read from the events themselves.
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -8417,8 +8417,8 @@ mod tests {
             // turns), then a turn of two events: the open chunk changed after the read, as an agent's next turn changes it.
             let quiet = busy.saturating_mul(4).saturating_sub(opened.elapsed());
             crate::rt::sleep(quiet).await;
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: vec![said(n - 1)] }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: vec![said(n)] }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: vec![said(n - 1)] }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: vec![said(n)] }).await;
             // Nothing read or taken in, well past any sweep for idle copies there was.
             let idle = crate::os::alloc::COLD_AFTER.saturating_mul(2).saturating_add(crate::os::alloc::COLD_AFTER / 2);
             crate::rt::sleep(idle).await;
@@ -8457,7 +8457,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // A chunk's events, and the open chunk's: half of what the page takes past a compact chunk, so it reaches into
             // the one before that too.
             let chunk = CHUNK;
@@ -8465,7 +8465,7 @@ mod tests {
             anyhow::ensure!(open > 0 && open + chunk < EVENTS_PAGE && EVENTS_PAGE < open + 2 * chunk, "the page spans two compact chunks: {open} open of {chunk}");
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
             // Till its chunks are compact, the page is read from the events themselves.
             let deadline = Instant::now() + Duration::from_secs(30);
             while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
