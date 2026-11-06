@@ -327,6 +327,9 @@ pub struct Duplex {
     written: Option<oneshot::Receiver<()>>,
     /// Closed once both readers have ended: everything they read is in `stdout` and `stderr`.
     read: Option<crate::memory::queue::Receiver<()>>,
+    /// The shard its stdout's reader read its first chunk on (`usize::MAX` before it read one, or off every shard).
+    #[cfg(test)]
+    read_on: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A harness process let go of by one image of this process for the next (an in-place upgrade):
@@ -407,7 +410,23 @@ impl Duplex {
 }
 
 /// Spawn `cmd` with piped stdin/stdout/stderr in a new process group.
-pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+pub fn spawn_duplex(cmd: Command) -> anyhow::Result<Duplex> {
+    spawn_duplex_at(cmd, None)
+}
+
+/// `fut` as a task of its own on shard `home` of the runtime's (`crate::rt::spawn_owner`) where one's named, else
+/// where `crate::rt::spawn` puts it: on the caller's shard, or, off every shard, the next round-robin.
+#[track_caller]
+fn spawn_at<F: Future<Output = ()> + Send + 'static>(home: Option<usize>, fut: F) {
+    match home {
+        Some(shard) => crate::rt::spawn_owner(shard, fut),
+        None => drop(crate::rt::spawn(fut)),
+    }
+}
+
+/// [`spawn_duplex`], its exit awaited and its pipes served on shard `home` where one's named (the shard of the task
+/// that takes what they read: goal 10, plan 01a1a87b2dae step 5), else where `crate::rt::spawn` puts them.
+fn spawn_duplex_at(mut cmd: Command, home: Option<usize>) -> anyhow::Result<Duplex> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
@@ -418,20 +437,21 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     let err = OwnedFd::from(child.stderr.take().context("no stderr pipe")?);
     let (exit_tx, exit_rx) = oneshot::channel();
-    crate::rt::spawn(async move {
+    spawn_at(home, async move {
         let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    pump(pid, input, out, err, exit_rx, false)
+    pump(pid, input, out, err, exit_rx, false, home)
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): the process joins
-/// it before it runs anything, so everything it starts is in it too.
-pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+/// it before it runs anything, so everything it starts is in it too. Its pipes are served on shard
+/// `home` where one's named ([`spawn_duplex_at`]).
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>, home: Option<usize>) -> anyhow::Result<Duplex> {
     if let Some(g) = group {
         g.enter(&mut cmd);
     }
-    let d = spawn_duplex(cmd)?;
+    let d = spawn_duplex_at(cmd, home)?;
     if let Some(g) = group {
         g.started(d.pid);
     }
@@ -454,7 +474,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
             wait_foreign_exit(pid).await;
             let _ = exit_tx.send(None);
         });
-        return pump(pid, input, out, err, exit_rx, d.foreign);
+        return pump(pid, input, out, err, exit_rx, d.foreign, None);
     }
     crate::rt::spawn(async move {
         let p = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw);
@@ -470,7 +490,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
         .await;
         let _ = exit_tx.send(status.ok().flatten());
     });
-    pump(pid, input, out, err, exit_rx, d.foreign)
+    pump(pid, input, out, err, exit_rx, d.foreign, None)
 }
 
 /// Wait for `pid` to end when it isn't this process's child (another runner of this machine
@@ -509,8 +529,8 @@ fn started_at(pid: u32) -> Option<u64> {
 /// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin. Each on a
 /// lock-free queue with the bound its channel had (goal 5, plan 01a1a59c2aae, its top goal): an
 /// async-channel's wait took event-listener's `Mutex`, a reader's shard sending each chunk and the
-/// session's taking it on its own.
-fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
+/// session's taking it on its own. Each on shard `home` where one's named ([`spawn_at`]).
+fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool, home: Option<usize>) -> anyhow::Result<Duplex> {
     for fd in [&input, &out, &err] {
         nonblocking(fd)?;
     }
@@ -519,10 +539,14 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Each reader holds a sender while it runs: the channel closes once both have ended.
     let (reading_tx, read_rx) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
+    #[cfg(test)]
+    let read_on = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
     let reader = |fd: OwnedFd, cap: usize| {
         let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, cap);
         let (stop, stopped, reading) = (stop_rx.clone(), std::sync::Arc::clone(&stopped), reading_tx.clone());
-        crate::rt::spawn(async move {
+        #[cfg(test)]
+        let read_on = std::sync::Arc::clone(&read_on);
+        spawn_at(home, async move {
             let _reading = reading;
             use futures::FutureExt as _;
             let mut buf = vec![0u8; CHUNK * 2];
@@ -546,6 +570,8 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
                     read_chunk(&fd, &mut buf).await
                 };
                 let Ok(Some(n)) = read else { return };
+                #[cfg(test)]
+                let _ = read_on.compare_exchange(usize::MAX, crate::rt::shard_index().unwrap_or(usize::MAX), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
                 if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
                     return;
                 }
@@ -558,7 +584,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     drop(reading_tx);
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     let (written_tx, written_rx) = oneshot::channel();
-    crate::rt::spawn(async move {
+    spawn_at(home, async move {
         while let Ok(data) = in_rx.recv().await {
             if write_all(&input, &data).await.is_err() {
                 break;
@@ -567,12 +593,53 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         let _ = written_tx.send(());
         // Dropping the fd here closes the child's stdin (unless it was handed over: a copy holds it).
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, foreign, stop: Some(stop_tx), stopped, written: Some(written_rx), read: Some(read_rx) })
+    Ok(Duplex {
+        pid,
+        stdin: in_tx,
+        stdout,
+        stderr,
+        exit,
+        fds,
+        foreign,
+        stop: Some(stop_tx),
+        stopped,
+        written: Some(written_rx),
+        read: Some(read_rx),
+        #[cfg(test)]
+        read_on,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a harness process asked for from a task on a shard (an agent session's) has its
+    /// pipes read on that shard, every shard in turn, where the blocking pool's spawn dealt them round-robin; its output
+    /// comes whole all the same.
+    #[test]
+    fn g10_s5_a_harness_pipes_are_read_on_the_shard_that_asked_for_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for shard in 0..crate::rt::shard_count() {
+                let (tx, rx) = oneshot::channel();
+                let asked = crate::rt::spawn_on(shard, async move {
+                    let asked = async {
+                        let mut cmd = Command::new("sh");
+                        cmd.args(["-c", "echo read"]);
+                        let p = crate::proc::spawn_duplex_in_pool(cmd, None).await?;
+                        let first = p.stdout.recv().await?;
+                        anyhow::Ok((first, p.read_on.load(std::sync::atomic::Ordering::Acquire), crate::rt::shard_index()))
+                    };
+                    let _ = tx.send(asked.await);
+                });
+                anyhow::ensure!(asked, "shard {shard} took no task");
+                let (first, read_on, asked_on) = crate::rt::timeout(Duration::from_secs(30), rx).await.map_err(|_| anyhow::anyhow!("shard {shard}: no answer within 30 s"))???;
+                anyhow::ensure!(first == b"read\n", "{:?}", String::from_utf8_lossy(&first));
+                anyhow::ensure!(asked_on == Some(shard) && read_on == shard, "asked on {asked_on:?}, read on {read_on}, where shard {shard} asked");
+            }
+            Ok(())
+        })
+    }
 
     /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a harness's pipes are lock-free queues
     /// with the bounds their channels had. Its stdout, not taken while it writes far more than 256 chunks,

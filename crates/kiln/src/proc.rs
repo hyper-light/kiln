@@ -10,8 +10,15 @@ pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_gro
 /// headroom paces is frozen for part of each period, and so is a process that joins it between
 /// fork and exec, while `spawn` waits for that exec. On a shard the wait stops everything else the
 /// shard serves, its listeners too (the front door stopped answering while one waited).
+///
+/// Its pipes are served on the caller's shard (goal 10, plan 01a1a87b2dae step 5), where what's read
+/// of them is taken (an agent session's task reading its harness's output): spawned from the blocking
+/// pool, off every shard, they went to the next shard round-robin, which on a runner of two shards was
+/// another thread than the session's for every other harness, a wake across threads for each chunk
+/// of its output on its way to the server's viewers.
 pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crate::os::contain::Group>) -> anyhow::Result<Duplex> {
-    crate::rt::blocking(move || spawn_duplex_in(cmd, group.as_ref())).await?
+    let home = crate::rt::shard_index();
+    crate::rt::blocking(move || spawn_duplex_in(cmd, group.as_ref(), home)).await?
 }
 
 #[cfg(all(test, unix))]
