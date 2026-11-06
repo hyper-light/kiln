@@ -1553,16 +1553,17 @@ What an arena of the shards' own costs at the least, beside what the A/B measure
   `g9_s3_a_slab_of_every_small_size_is_what_jemalloc_cuts` and
   `g9_s3_a_fresh_arena_holds_its_metadata_and_a_slab_of_each_size`), less what's allocated in them.
 
-So an arena of the shards' own adds at most 681,968 bytes of `metadata` and `slack` before fragmentation: `each` with
-4 shards at most 2.7 MB, `one` a quarter of that. `dirty` and `thread_caches` keep the same frees and caches, apart by
-arena. Against g9p16's 12.8 MB of `metadata` and 24.8 MB of `slack`. With either, goal 11's arena arms (`one-arena`, `bisect-arenas`) set how many arenas every other
-thread shares, not the shards: run with `KILN_ALLOC_SHARD_ARENAS` on both sides, an arm's latency risk is those
-threads' alone. As queued, those A/Bs run without it. `one` beside `_RJEM_MALLOC_CONF=narenas:4` keeps 5 arenas in all,
-and so their fixed cost: goal 11's to weigh with its arena arms.
+So an arena of the shards' own adds at most 681,968 bytes of `metadata` and `slab_room` (the slack's part in slabs)
+before fragmentation: `each` with 4 shards at most 2.7 MB, `one` a quarter of that. `dirty` and `thread_caches` keep
+the same frees and caches, apart by arena. Against g9p16's 12.8 MB of `metadata` and 24.8 MB of `slack`. With either,
+goal 11's arena arms (`one-arena`, `bisect-arenas`) set how many arenas every other thread shares, not the shards: run
+with `KILN_ALLOC_SHARD_ARENAS` on both sides, an arm's latency risk is those threads' alone. As queued, those A/Bs run
+without it. `one` beside `_RJEM_MALLOC_CONF=narenas:4` keeps 5 arenas in all, and so their fixed cost: goal 11's to
+weigh with its arena arms.
 
 **The A/B** (the build: production's static musl build with jemalloc, of a tree with this change; kiln-lab of the same
 tree). The arms are `os::alloc::SHARD_ARENA_ARMS`: `shard-arenas-each` first, `shard-arenas-one` only where
-`shard-arenas-each`'s `metadata` and `slack` rose past their noise:
+`shard-arenas-each`'s `metadata` and `slab_room` rose past their noise:
 
 ```sh
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a shared --label-b shard-arenas-each --env-b KILN_ALLOC_SHARD_ARENAS=each --server-cpus 16-31 --layout production --rounds 8
@@ -1573,12 +1574,15 @@ taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a shard-arenas-each --labe
 - Each B round's server log says `each shard allocates in an arena of its own, which no other thread does: <its
   arenas>, shard by shard (KILN_ALLOC_SHARD_ARENAS=each)` (`one`: `the shards allocate in an arena no other thread
   does`); a round whose log doesn't say it measured nothing.
-- Read: shard delay p99.9 for all shards and each; slow polls past the quantum, and the share of their time off the
-  CPU (step 3's check, `kiln-lab report <run>/run.json`); API reads' and websocket frames' p99.9; the runner wait p99;
-  CPU a request and the server's minor faults (a shard reuses only its own dirty extents now); and
-  `server.rss_anon_mb` and `server.allocator.{metadata,slack,dirty,thread_caches}_mb`.
+- Read: `shards.delay_p999_us` and each shard's (`shard<i>.delay_p999_us`), `shards.worst_delay_p999_us`,
+  `shards.busy_share`, `shards.slow_polls_per_s`, and step 3's check (`kiln-lab report <run>/run.json`: the listed
+  paths' longest polls, on the CPU and off it); API reads' and websocket frames' p99.9; the runner wait p99;
+  `server.cpu_ms_per_request`; `server.rss_anon_mb` and `server.allocator.{metadata,slab_room,slack,dirty,thread_caches}_mb`.
+  A shard reuses only its own dirty extents now, so the pages it faults in anew are a cost to see, which kiln-lab
+  doesn't record: the round's hook reads the server's `minflt` (the tenth field of `/proc/<pid>/stat`) at
+  `window-start` and `window-end`.
 - Kept where shard delay p99.9 with hogs is better beyond noise, or no worse with every other number held, and
-  `metadata` and `slack` rose by no more than above.
+  `metadata` and `slab_room` rose by no more than above.
 
 **The census with it** (goal 5's census build of the same tree, its server's environment with
 `KILN_ALLOC_SHARD_ARENAS=each`, 3 rounds calm and 3 with hogs as census16's): locks.md's allocator table, the shards'

@@ -709,7 +709,7 @@ const fn slab_pages(page: usize, size: usize) -> Option<usize> {
 /// `2^(lg_page + 2)` are cut from slabs (src/sc.c, `size_class`), each slab [`slab_pages`] long. With 4 KiB pages, 36
 /// classes, 135 pages: 552,960 bytes. An arena holds a slab of each class it allocates from while any region of it is
 /// live, so a fresh arena's room past its allocations is up to this, beside its metadata: what an arena of the shards'
-/// own adds to `slack` at the least, [`ShardArenas`]. None past `usize`.
+/// own adds to [`Stats::slab_room`] at the least, [`ShardArenas`]. None past `usize`.
 pub const fn slab_bytes_of_every_small_size(lg_page: u32) -> Option<usize> {
     let Some(page) = 1_usize.checked_shl(lg_page) else {
         return None;
