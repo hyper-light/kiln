@@ -48,7 +48,7 @@ reached = "event-listener's blocking waits: a thread blocked in an async-channel
 [[crate]]
 name = "uuid"
 locks = "the process's one v7 context (a std Mutex, `Uuid::now_v7`'s counter)"
-reached = "crate::util::new_id: each terminal session's id (termsess), each agent session's and each upload's (harness/registry, api)"
+reached = "uuid::Uuid::now_v7 where kiln still calls it: a runner's harness sessions' and hand-overs' ids, reach's run groups, upgrades, SBOMs, observe's incidents. crate::util::new_id (each terminal session's id, each agent session's and each upload's: the census16 rate, 0.1 a second) makes its v7 ids with no lock since goal 5's top goal (an atomic word of millisecond and counter); counted to show what's left"
 
 [[crate]]
 name = "futures-channel"

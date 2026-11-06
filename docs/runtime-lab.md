@@ -1096,13 +1096,18 @@ the same.
 
 **uuid's v7 context** (`Uuid::now_v7`, a std Mutex the process shares): taken as an agent session, an upload or a
 terminal session is made (`util::new_id`), 0.1 a second, never found held. It keeps the ids made in one millisecond
-in order: moved in the next commit.
+in order. `util::new_id` now makes its v7 ids with no lock (`util::new_v7`): the millisecond and a 16-bit counter
+(RFC 9562 §6.2's first method, 12 to 42 bits) in one atomic word moved on by compare-and-swap, a new millisecond
+starting its counter in the lower half of its range and a counter run out going on in the next millisecond, as
+uuid's own context does, so ids still sort as they're made; the rest random. `Uuid::now_v7` stays where kiln calls it
+off the server's paths (a runner's harness sessions and hand-overs, reach's run groups, upgrades, SBOMs, incidents).
 
 **The measurement that shows it:** the census of the tree with this change (`scripts/locks.py census-tree`, then
 `rank`, the jemalloc build, production's layout, 3 rounds calm and 3 with hogs, as census16): event-listener's
 list taken next to never on the server (none of the paths above runs a channel; what's left of it is a rare
-off-path use, `rank`'s row near 0 a second, and none waited), the split socket's rate as census16's (about 540 a
-second) and never held when asked, and the latency and busy share of the A/B against census16's tree no worse.
+off-path use, `rank`'s row near 0 a second, and none waited), uuid's v7 context not taken (`util::new_id` no longer
+takes it), the split socket's rate as census16's (about 540 a second) and never held when asked, and the latency and
+busy share of the A/B against census16's tree no worse.
 - **The allocator's.** jemalloc's 63 mutexes (production's allocator since goal 11 step 4): its arenas' bins as
   threads' caches fill and flush, 23,000 to 25,500 a second, found held 2 to 4 times a second in all and never
   blocked calm; with hogs 0.07 ms a second, 10 ms once, a holder a hog took off its CPU. Its five arenas
