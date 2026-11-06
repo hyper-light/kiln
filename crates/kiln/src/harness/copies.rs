@@ -536,8 +536,8 @@ impl Chunk {
 
     /// A compact one's texts joined ([`Chunk::joined`]) from byte `from` of them on, as bytes a page's answer
     /// takes slices of, none copied, and the byte of them they begin at (`from` or before): as a read of its
-    /// copy's newest page kept them, else inflated now, and kept for the reads after while its copy's newest
-    /// page reaches it (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
+    /// copy's newest page kept them, else inflated now, and kept for the reads after while it's its copy's
+    /// newest compact chunk (`paged`; goal 10, plan 01a1a87b2dae step 5). What's kept begins where the reads
     /// reached back to, no further (goal 11, plan 01a1a87b2e56 step 5): the newest page ends at the copy's
     /// newest event, so its reads take a compact chunk's last events alone, the fewer the more of the page its
     /// open chunk holds, and the same page read again takes no more of it. A read that reaches further back
@@ -797,8 +797,8 @@ pub enum Unread {
     /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
     Cannot,
     /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
-    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while its
-    /// copy's newest page reaches it (goal 10, plan 01a1a87b2dae step 5).
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
+    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
     Unkept,
 }
 
@@ -1382,7 +1382,7 @@ impl Events {
     pub(super) fn spillable(&self, page: usize, bytes: usize) -> Vec<Arc<Chunk>> {
         let (mut after, mut kept) = (0usize, 0usize);
         let mut out = Vec::new();
-        for c in self.chunks().iter().rev() {
+        for (n, c) in self.chunks().iter().rev().enumerate() {
             if c.is_compact()
                 && !c.is_spilled()
                 && let Some(s) = c.packed()
@@ -1390,7 +1390,9 @@ impl Events {
                 let with = kept.saturating_add(s.deflated.len());
                 if after < page && with <= bytes {
                     kept = with;
-                } else {
+                } else if n > 0 {
+                    // The newest, kept compact while its copy took nothing in, stays: its next event reads it back
+                    // (goal 11, plan 01a1a87b2e56 step 5).
                     out.push(Arc::clone(c));
                 }
             }
