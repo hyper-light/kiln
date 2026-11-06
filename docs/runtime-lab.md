@@ -1464,6 +1464,7 @@ past the count).
 | `session_entries` | session copies' events as their JSON's text | each copy's `MAX_EVENTS`, its newest chunk alone as text, for each session | the copy's own bound | older chunks are kept packed |
 | `snapshots` | viewers' snapshots in flight: made, and not yet written to their sockets (each taken by its estimate before it's made, then counted as it was made, given back as it's written) | the blocking pool's `fs` places of whole snapshots: 26 x 3.2 MB, 84 MB on the server | the places from the lab's measure of the share's jobs at once (`rt::SERVER_FS`, 25.5); a whole snapshot's events, as many as a copy keeps before it lets its oldest go (`MAX_EVENTS` and a quarter, 5,000) at 647 B packed each (research f20) | an attach waits its turn (a task's wait) until one in flight is written out; one larger than the room goes alone |
 | `ui_events` | the hub's events (`GET /api/events`, kiln's listeners) on one lane, and agent sessions' own on each owner shard's lane, to each listener's own channels (goal 4, `memory::lanes`) | each listener's places (4,096 events in all its lanes; push's sessions' 4,096 a lane) and 64 MiB of the texts (each counted once, as held) | the hub's queue of runners' messages most of them are made from | the oldest go: a page resyncs, a listener is told how many it missed |
+| `events_feed` | the events socket's feed (W21-R15): every frame the hub emits, numbered, so a page that reconnects resumes (`?after=`) and a socket that falls behind reads on | 4,096 frames and 64 MiB of them, each frame's text and its own room (`feed::BYTES`) | as many frames and bytes as a listener of the hub's events holds (`ui_events`), where such a listener starts over; an agent's `harness` frame lets go of its last (goal 11 step 5: most of what's pushed, each a whole info) | the oldest go: a page after them resyncs; the newest stays, alone if it's past the bytes |
 | `log_feeds` | each live job's log on its way to its viewers | 1,024 pieces and 32 MiB a job | one batch of its writer (`FEED` pieces) of the largest chunks a runner sends (`proto::LOG_CHUNK`, 32 KiB) | the oldest go: the viewer is told what it skipped; the log file has it |
 | `terminal_feeds` | each terminal's output on its way to its viewers | 1,024 frames and 256 KiB a terminal | `BACKLOG_BYTES`, the backlog a viewer that falls behind is repainted from | the oldest go: the viewer is repainted from the backlog and screen |
 | `stream_viewers` | each viewer's queue of a browser stream | 12.5 MB a viewer | 240 pictures at 60 a second (4 s) at the encoder's top rate (25 Mb/s, `bitrateFor`) | the chunk isn't sent to that viewer: its next key frame mends it |
@@ -1830,6 +1831,174 @@ hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' p
 - look for: `wire::events::feed` (est. under 1 MB after the cut), `harness::copies::Meta::of` and
   `Mirror::upsert` (the copies' metas and index), `tungstenite::protocol::WebSocketContext::buffer_frame`,
   and with `prof_accum` the sites whose frees make `dirty`.
+
+### The binary's pages: what's touched, and the code's layout (step 5)
+
+Of rt9's 478 MB resident (calm), 103 MB was the binary's own pages (g11pages, before it: 125 MB, 105 once the
+UI's files and startup's pages are dropped, `crate::resident`). A fault on the binary maps the 64 KiB around it
+that the page cache holds (fault-around), the server reads its whole binary into the page cache as it starts, and
+the code it runs lies spread over about half of its `.text`'s 64 KiB windows. So these pages fall only as far as
+what runs is laid out together: est. 12 to 17 MB with BOLT's layout (g11s5-layout's estimate from g9p7's profile:
+its hot functions, 2.4 MB of code, lie on 558 windows of rt7fp's layout and would fit in 38).
+
+**The binary's sections**, rt9 (the lab's glibc build, `dfb491ef3dc`; its symbols from rt9fp, the same tree with
+frame pointers), and what reads each:
+
+| Section | MiB | What reads it |
+| --- | --- | --- |
+| `.text` | 175.5 | the code: 184,011 functions; by crate, kiln's own 70.4, `core` 29.6 (generic code compiled into its users), `alloc` 9.9, `serde_json` 13.7, `turso_core` 6.4, `std` 4.7, `kiln_ci` 3.4, `hyper_rt` 3.0 |
+| `.rodata` | 31.6 | the UI's files (11 MB, dropped once packed), tree-sitter's grammars' tables (10.2 MiB, kiln-search's parsing alone), brotli's tables (the UI's compression at start), strings and constants |
+| `.eh_frame`, `.eh_frame_hdr` | 12.5, 1.4 | a panic unwinding (kiln contains them: `kiln-rt`'s `unwind`, `main`'s hook) |
+| `.gcc_except_table` | 9.9 | the same |
+| `.rela.dyn` | 4.0 | the glibc build's loader, at start (a PIE); production's static musl build has none |
+| `.data` | 4.4 | 4 MiB of it one array, `hyper_rt::sync::cell::TABLE` (262,144 `OnceLock`s, whose first state isn't zero: std's `Once` starts at 3, so it's `.data`, not `.bss`); a read of a slot maps its window from the file |
+| `.data.rel.ro` | 2.7 | vtables and constants with addresses: every `dyn` call; file pages in the static build (train 4: 2.8 of its 2.9 MB resident), the process's own in a PIE (relocated at load) |
+
+**The cheaper levers, and what each is worth to resident memory:**
+
+| Lever | Now | Worth | Why |
+| --- | --- | --- | --- |
+| strip | on (`[profile.release] strip = true`; `relbuild.sh` strips again) | 0 | symbols and debug info lie outside every loaded segment, never mapped: only the file's size (rt9fp 1,182 MB, rt9 254 MB) |
+| `--gc-sections` | on | taken | rustc gives it to every executable's link |
+| identical code folding | off (neither rustc nor zig asks LLD for `--icf`) | under 1 MB | rt9fp's functions identical once their calls and RIP-relative references are read as their targets: 12,480 copies in 5,263 groups, 1.34 MiB of 171.6 (0.8%; byte for byte 0.16 MiB): rustc's MergeFunctions already folds them within a codegen unit. Resident, at most that share of the code touched. BOLT's `-icf=safe` takes it in BOLT's layout |
+| `panic = "abort"` | `unwind`, on purpose | a change of behaviour, not a lever | a contained panic would end the server, not its task (`main`'s hook: "the task will be restarted"). What it would drop, `.gcc_except_table` (9.9 MiB) and the landing pads, isn't resident unless something unwinds: the tables are read only then, and the landing pads in hot functions BOLT moves out (`-split-eh`) |
+| opt-level for cold crates | 3 for all | about 0 | cold code isn't resident (residency is per window touched), and the crates that are cold are small: `kiln_ci` 3.4 MiB, `kiln_cd` 1.8, `toml` 1.0, `k8s_openapi` 0.9, tree-sitter's code 0.7, WebRTC's 1.3; kiln's own crate (70 MiB) holds hot and cold modules together (`kiln::ci`, `deploy`, `cd`), and generic code is compiled into its users. Only the file shrinks |
+| split debuginfo | no debuginfo in a release | 0 | debug sections aren't mapped either |
+| `.rodata`, `.data`, `.data.rel.ro` | | measured by section (below) | g11pages: about 6 MB of read-only data and 2 MB of data resident; BOLT moves code, not data. Rust's statics have sections of their own, so the same linker order (below) could lay out the data a profile of loads names: next only if `sections.txt` shows them past a few MB once the code is laid out |
+
+So the binary's pages fall only by layout: **BOLT**, or failing it, **the linker's order**, both from a profile of
+the lab's realistic profile, off unless `ci/release/build.sh`'s `KILN_RELEASE_BOLT` says (x86_64 musl alone):
+- `relocs`: the release built keeping its relocations and symbols (strip off, linked through `zig-relocs.sh`:
+  `--emit-relocs`, a build id) in `<target>/bolt`; `dist/` gets it stripped, the release as it would ship: what the
+  lab profiles, and the A/B's side without a layout.
+- a BOLT profile (`.fdata`, `.yaml`): that build laid out by `llvm-bolt` (`bolt.sh optimize`: the functions the
+  profile saw together by `cdsort`, their blocks that didn't run split out, identical ones folded; what didn't run
+  left where the linker put it), stripped.
+- an order (`.order`, `bolt.sh order`'s: every function a profile saw, hottest first, named as the unstripped build
+  names them): that build linked with those functions first, in that order (LLD's `--symbol-ordering-file`), and
+  stripped. No BOLT and no rewrite: perf and the linker alone, whole functions moved, none split. Checked on a Rust
+  probe built as the release is (thin LTO, static musl, zig's LLD): its profiled functions, Rust's and zig's libc's,
+  lead `.text` in the profile's order. A binary in `<target>/bolt` linked in another order than the one asked is
+  removed first, so cargo relinks it (`kiln.linked-order` beside it says which).
+
+**The tools** (read, 2026-11-06):
+
+| | adacachy | fedora (the lab) |
+| --- | --- | --- |
+| `llvm-bolt`, `perf2bolt`, `merge-fdata` | not installed; CachyOS's 23.1.4 unpacked at `~/.cache/kiln-g11s5-layout/tools/llvm-bolt-23.1.4/usr/bin` (runs; it takes glibc 2.44, so not on fedora) | not installed; Fedora's `llvm-bolt` 22.1.8 in `updates` (`dnf download`, no root); else `bolt.sh tools` fetches LLVM 23.1.5's release once (1.2 GB) |
+| `ld.lld` | LLD 23.1.1; zig 0.17.0's own LLD 22.1.8 links kiln: both take `--symbol-ordering-file`, `--call-graph-ordering-file`, `--icf` | none; zig on `PATH` is 0.16.0 |
+| perf | `/usr/bin/perf` 7.2.10 | none installed; `~/.cache/kiln-g9-subms-shards/perf-root`'s 7.2.15 (`PERF_LIBS=<it>/usr/lib64`) |
+| branch records | Zen 5's LbrExtV2 (`amd_lbr_v2`) | arch LBR, 32 entries, on every CPU (`cpu_core` 0-15, `cpu_atom` 16-31) |
+| `perf_event_paranoid` | 2: a user's own processes, user space | 2 |
+
+fedora has LBR, so the profile is perf's branch records: no frame-pointer build, no instrumented one unless the
+records miss functions (below).
+
+**The lab to run** (the coordinator's). The build, rt-next with this step merged, where release builds go, no spaces
+in its paths:
+
+```sh
+B=$HOME/.cache/kiln-g11-bolt-build; mkdir -p $B/tmp
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=$B/target TMPDIR=$B/tmp KILN_DIST=$B/dist KILN_UI_SERVER=off \
+  KILN_RELEASE_BOLT=relocs nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+#   $B/dist/kiln-x86_64-unknown-linux-musl                 stripped: the A side, and what the lab profiles
+#   $B/target/bolt/x86_64-unknown-linux-musl/release/kiln  the same build id, its relocations and symbols kept
+```
+
+Or the lab's glibc build, by `relbuild.sh` as it is, its environment saying how (a target dir of its own: strip off
+changes every unit's flags):
+
+```sh
+TARGET=$HOME/.cache/kiln-rt-int/target-bolt CARGO_PROFILE_RELEASE_STRIP=false KILN_ZIG_REAL=$HOME/.local/bin/zig \
+  CARGO_ZIGBUILD_ZIG_COMMAND=$HOME/.cache/kiln-rt-int/relsrc/ci/release/zig-relocs.sh \
+  ~/.cache/kiln-rt-int/tools/relbuild.sh g11bolt <sha> lab
+gzip -1 -c $HOME/.cache/kiln-rt-int/target-bolt/x86_64-unknown-linux-gnu/release/kiln \
+  > ~/.cache/kiln-rt-int/xfer/g11bolt-kiln.relocs.gz      # relbuild.sh ships only the stripped copy
+```
+
+On fedora, `$L/bin` takes the stripped `kiln`, the unstripped `kiln.relocs`, a `kiln-lab`, and this tree's
+`ci/release/bolt.sh`, `scripts/memory_lab/bolt-hook.sh` and `scripts/memory_lab/sections.py` (the hook finds it
+beside itself):
+
+```sh
+L=$HOME/.cache/kiln-g11-bolt-lab; mkdir -p $L/bin $L/tools
+P=$HOME/.cache/kiln-g9-subms-shards/perf-root; export PERF=$P/usr/bin/perf PERF_LIBS=$P/usr/lib64
+(cd $L/tools && dnf download llvm-bolt && rpm2cpio llvm-bolt-*.rpm | cpio -idm)
+export KILN_BOLT_BIN=$L/tools/usr/bin; $KILN_BOLT_BIN/llvm-bolt --version   # built against llvm-libs 22.1.8; if
+#   the installed 22.1.1 won't do, `dnf download llvm-libs` too and LD_LIBRARY_PATH=$L/tools/usr/lib64, or unset
+#   KILN_BOLT_BIN and bolt.sh fetches LLVM's release
+LD_LIBRARY_PATH=$PERF_LIBS $PERF record -e cycles:u -j any,u -o $L/smoke.data -- python3 -c 'sum(range(10**7))' &&
+  LD_LIBRARY_PATH=$PERF_LIBS $PERF evlist -v -i $L/smoke.data | grep -c BRANCH_STACK          # LBR records: 1 or 2
+```
+
+1. The profile: 3 rounds of the realistic profile, calm, in production's layout, perf recording the server's branch
+   records from its start to the window's end (what's resident then is all it touched since startup's drop). Est.
+   0.4 GB of `perf.data` a round (perf's 4,000 samples a second of the server's 0.83 CPU, each with its 32
+   records); `-E BOLT_FREQ=1000` takes a quarter:
+
+   ```sh
+   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-prof -p MemoryMax=16G --working-directory=$L \
+     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
+     -E BOLT_SH=$L/bin/bolt.sh -E BOLT_RECORD=lbr -E PERF=$PERF -E PERF_LIBS=$PERF_LIBS \
+     taskset -c 0-15 $L/bin/kiln-lab run --kiln $L/bin/kiln --label relocs --env KILN_RT_SHARDS=4 \
+     --profile realistic --rounds 3 --hogs 0 --layout production --server-cpus 16-31 --out $L/prof
+   ```
+
+2. BOLT (time and memory on the 255 MB binary unmeasured; minutes in its lite mode):
+
+   ```sh
+   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh profile $L/bin/kiln.relocs $L/kiln.fdata $L/prof/rounds/*.hook/perf.data
+   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh optimize $L/bin/kiln.relocs $L/kiln.fdata $L/bin/kiln.bolt
+   ```
+
+   If perf2bolt balks at the hybrid CPU's two events, profile again with `-E BOLT_EVENT=cpu_atom/cycles/u` (the
+   server's CPUs are E-cores). `$L/bin/kiln.relocs.bolt.log` says the profile's coverage ("have non-empty
+   execution profile"), "splitting separates H hot bytes", what ICF folded, and any function it couldn't move.
+
+3. The A/B, BOLT against none, 8 rounds calm, then the same with hogs (`--hogs 16 --out $L/ab-hogs`):
+
+   ```sh
+   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-ab -p MemoryMax=16G --working-directory=$L \
+     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
+     taskset -c 0-15 $L/bin/kiln-lab ab --a $L/bin/kiln --b $L/bin/kiln.bolt --label-a relocs --label-b bolt \
+     --env-a KILN_RT_SHARDS=4 --env-b KILN_RT_SHARDS=4 --profile realistic --rounds 8 --hogs 0 \
+     --layout production --server-cpus 16-31 --out $L/ab-calm
+   ```
+
+4. What to read:
+   - `report.md`: `server.rss_file_mb` (the binary's pages at the window's end; expected from about 105 to 12 to 17),
+     `server.rss_mb`, `server.rss_anon_mb`, and every latency number beyond noise.
+   - each round's `rounds/*.hook/sections.txt` (`sections.py`): on B, the new `.text` is the hot code BOLT laid
+     out, `.bolt.org.text` what the profile missed (each function it missed costs a window, about 47 KB), and
+     `.text.cold` what it split out; on both, `.rodata`, `.data.rel.ro`, `.data`, and `.eh_frame` with
+     `.gcc_except_table` (near 0 unless something unwinds). `pages.txt` says the same by mapping.
+   - **BOLT's layout ships** if the file pages fall beyond noise and no latency number is worse beyond noise: the
+     release then builds with `KILN_RELEASE_BOLT=<profile>`, the profile written as YAML for later commits
+     (`bolt.sh profile ... kiln.yaml`, applied with `-infer-stale-profile`), until a lab profiles again.
+   - **If B's `.bolt.org.text` holds more than about 10 MB**, the records missed what ran: profile every edge instead,
+     and A/B again:
+
+     ```sh
+     mkdir -p $L/instr; $L/bin/bolt.sh instrument $L/bin/kiln.relocs $L/bin/kiln.instr $L/instr/dump
+     #   (Fedora's BOLT may want KILN_BOLT_ARGS=-runtime-instrumentation-lib=$L/tools/usr/lib64/libbolt_rt_instr.a)
+     # step 1 with --kiln $L/bin/kiln.instr --rounds 2 --out $L/prof-instr, -E BOLT_RECORD=instrumented -E BOLT_DUMP=$L/instr/dump
+     $KILN_BOLT_BIN/merge-fdata $L/prof-instr/rounds/*.hook/instr-window.fdata > $L/kiln.instr.fdata
+     # step 2's optimize with $L/kiln.instr.fdata, into $L/bin/kiln.bolt-instr; step 3 with --b $L/bin/kiln.bolt-instr
+     ```
+
+   - **If BOLT fails, or its binary misbehaves or is slower**, the linker's order, from the same recordings:
+
+     ```sh
+     $L/bin/bolt.sh order $L/bin/kiln.relocs $L/kiln.order $L/prof/rounds/*.hook/perf.data
+     # kiln.order back where the build ran; the same tree and target dir, as the build above but with
+     #   KILN_DIST=$B/dist-order KILN_RELEASE_BOLT=<kiln.order>: only the executable relinks
+     # step 3 with --b <$B/dist-order's kiln>
+     ```
+
+     The lab's glibc build takes it from `relbuild.sh`'s environment: the build above with
+     `KILN_LINK_ORDER=<kiln.order>`, its executable removed first (`find <TARGET>/x86_64-unknown-linux-gnu/release/deps
+     -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete`), since cargo doesn't know an
+     order changed.
 
 ## Goal 10: API reads and frames in under a millisecond
 

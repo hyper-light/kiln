@@ -95,7 +95,7 @@ function UpdatesBody() {
   const releaseJobs = useReleaseJobs(releaseId);
   const pending = usePending((s) => s.pending);
   const picked = usePicked((s) => s.picked);
-  useServerEvents((ev) => {
+  useServerEvents(["agent", "job"], (ev) => {
     if (ev.type === "agent") readAgainSoon();
     // A release job that ends keeps its binaries: the builds, and the runners waiting on them, change.
     if (ev.type === "job" && releaseId !== null && ev.job.run_id === releaseId && FINISHED.has(ev.job.status)) readAgainSoon();

@@ -177,7 +177,7 @@ function settingsOf(d: Draft, base: FrontDoorSettings): FrontDoorSettings | stri
 function FrontDoorPanel({ runner }: { runner: string }) {
   useLabels();
   const view = useSuspenseResource(`front-door/${runner}`, (s) => frontDoorApi.get(runner, s));
-  useServerEvents((ev) => {
+  useServerEvents(["front_door", "agent"], (ev) => {
     if ((ev.type === "front_door" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner && ev.agent.connected !== view.data.connected)) view.reload();
   });
   const v = view.data;
