@@ -477,7 +477,7 @@ impl Entry {
             return self.text();
         }
         let made = self.lean.get_or_init(|| {
-            let made = super::window::lean(&self.value()).and_then(|v| serde_json::to_string(&v).ok()).map(String::into_boxed_str);
+            let made = lean_text(self.text(), self.kind());
             if let Some(t) = &made {
                 crate::memory::SESSION_ENTRIES.add(t.len());
             }
@@ -580,6 +580,41 @@ impl Entry {
         let end = text_end(&written)?;
         Some((std::borrow::Cow::Owned(written), end))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Events whose JSON was read whole on this thread for its lean form ([`lean_text`]): goal 11, plan 01a1a87b2e56 step 5's
+    /// tests of what an attach reads (the memory audit's row A2a: each of a lean window's events read once an attach).
+    pub(crate) static LEAN_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The lean form of an event whose JSON is `text` and whose kind is `kind` (`super::window::lean`), written out; none where
+/// it goes as it is. Only a tool event has one, so another's JSON isn't read at all: a lean viewer's window read every one of
+/// its events' JSON whole for this, a person's prompts and the agent's replies among them, to find nothing to hold back (goal
+/// 11, plan 01a1a87b2e56 step 5; the memory audit's row A2a). The kind is the head's, read from the same JSON's top-level
+/// `kind` as `lean` reads it (`Head`).
+fn lean_text(text: &str, kind: Option<&str>) -> Option<Box<str>> {
+    if kind != Some("tool") {
+        return None;
+    }
+    #[cfg(test)]
+    LEAN_READS.with(|n| n.set(n.get() + 1));
+    let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    super::window::lean(&value).and_then(|v| serde_json::to_string(&v).ok()).map(String::into_boxed_str)
+}
+
+/// Event JSON `text`, one of a compact chunk's read again (`super::copies::Sending`), as a viewer that takes events `lean` is
+/// sent it, and whether it begins a person's turn (a message to its session's main thread, `super::window::begins_turn`):
+/// what's looked up of it read from the text ([`Head::of_text`]), its lean form made where it has one ([`lean_text`]), and
+/// no entry made of it, its text copied once, into what's sent (goal 11, plan 01a1a87b2e56 step 5; the memory audit's row
+/// A2a: each was made an entry, its text copied, for each of the four times an attach read it).
+pub(super) fn sent_of_text(text: &str, lean: bool) -> (Box<str>, bool) {
+    let head = Head::of_text(text);
+    let kind = head.kind.as_deref();
+    let begins = kind == Some("user") && head.main;
+    let made = if lean { lean_text(text, kind) } else { None };
+    (made.unwrap_or_else(|| Box::from(text)), begins)
 }
 
 /// `json` with `add` (escaped already) put in at byte `end` (its text's closing quote), copied once into room for both.
@@ -840,17 +875,18 @@ pub struct Find {
 impl Parts {
     /// What it brings, its window found where one is still to be ([`Parts::find`]): since its revision while what
     /// changed since fits a window's bounds (a resume never costs more than a first load), else the window of the
-    /// newest events; and where among its events that begins. Its events read as its viewer takes them, each compact
-    /// chunk among them read again once (`super::copies::Reading`). What a snapshot's plan does first, where the
-    /// snapshot is written: off the shards.
-    pub(super) fn resolved(&self) -> (Option<u64>, Option<crate::wire::ui::EventsWindow>, usize) {
+    /// newest events; and where among its events that begins. Its events read as its viewer takes them by `sending`,
+    /// which keeps each read for what takes it next, its frames' plan and their writing (`super::copies::Sending`: goal
+    /// 11, plan 01a1a87b2e56 step 5, the memory audit's row A2a). What a snapshot's plan does first, where the snapshot is
+    /// written: off the shards.
+    pub(super) fn resolved(&self, sending: &mut super::copies::Sending<'_>) -> (Option<u64>, Option<crate::wire::ui::EventsWindow>, usize) {
         let Some(find) = self.find else { return (self.since, self.window, self.from) };
         if let Some(after) = self.since
-            && self.events.fit_since(after, self.lean)
+            && self.events.fit_since(after, sending)
         {
             return (Some(after), None, 0);
         }
-        let from = self.events.window_start(self.events.len(), find.turns, self.lean);
+        let from = self.events.window_start(self.events.len(), find.turns, sending);
         (None, Some(super::copies::window_at(&self.events, &self.state, from, find.older)), from)
     }
 }
@@ -961,17 +997,26 @@ enum Part {
     State,
     Changes,
     Files,
-    Events(std::ops::Range<usize>),
+    /// A batch of the events it brings (where they are among them), and the bytes its frame takes, reckoned as it was
+    /// planned (its room: nothing read again for it).
+    Events(std::ops::Range<usize>, usize),
     /// The copy's chunk of events at this place among its chunks, whole.
     Chunk(usize),
 }
 
-/// What a snapshot written out holds of its frames: where the events it brings are in its parts',
-/// and its frames in order; and since what revision it brings them, or the window they are
-/// ([`Parts::resolved`]), which its head says.
+/// What a snapshot written out holds of its frames: its frames in order, and what they're written of.
 struct Plan {
-    brought: Vec<usize>,
     parts: Vec<Part>,
+    of: Planned,
+}
+
+/// What a snapshot's frames are written of ([`Plan`]): where the events it brings are in its parts', each as its viewer is
+/// sent it where it was read planning them (none for one read again where it's written: past a window's bytes, kept by
+/// none), taken as its frame is written; and since what revision it brings them, or the window they are
+/// ([`Parts::resolved`]), which its head says.
+struct Planned {
+    brought: Vec<usize>,
+    sent: Vec<Option<super::copies::Sent>>,
     since: Option<u64>,
     window: Option<crate::wire::ui::EventsWindow>,
 }
@@ -999,7 +1044,10 @@ impl Snapshot {
     /// Its frames, in order. The events it brings are all of them, a frame for each of the copy's
     /// chunks (goal 10, plan 01a1a87b2dae step 3: each chunk's frame is packed once, then taken as it
     /// is), or those changed since its revision, in batches of about [`EVENTS_FRAME`] bytes each (one
-    /// alone when it's larger). Planned from the events' metas alone.
+    /// alone when it's larger). The whole session planned from the events' metas alone; the rest from its
+    /// events as their viewer is sent them, each read once for finding its window, planning its frames and
+    /// writing them (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A2a: the UI's lean window read
+    /// each of its compact chunks again, inflated and each of their events read whole, four times an attach).
     fn plan(&self) -> Plan {
         let p = &self.parts;
         let mut parts = vec![Part::Head];
@@ -1015,40 +1063,65 @@ impl Snapshot {
         if self.files.is_some() {
             parts.push(Part::Files);
         }
-        // Its window found here, where it's written (goal 9, plan 01a1a87b2cec step 3).
-        let (since, window, begins) = p.resolved();
+        // Its window found here, where it's written (goal 9, plan 01a1a87b2cec step 3), each event read for it kept for
+        // what follows.
+        let mut sending = p.events.sending(p.lean);
+        let (since, window, begins) = p.resolved(&mut sending);
         // The session whole, every event as it is: the copy's chunks, each packed once.
         if since.is_none() && window.is_none() && !p.lean {
             parts.extend(p.events.chunks().iter().enumerate().filter(|(_, c)| !c.is_empty()).map(|(i, _)| Part::Chunk(i)));
-            return Plan { brought: Vec::new(), parts, since, window };
+            return Plan { parts, of: Planned { brought: Vec::new(), sent: Vec::new(), since, window } };
         }
         // A window (W21-R15: from where it begins), what changed since a revision, or events that go lean.
         let brought: Vec<usize> = p.events.metas().enumerate().skip(begins).filter(|(_, m)| since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
-        let (mut from, mut size) = (0usize, 0usize);
-        // Each compact chunk read again once for the lean sizes of its events brought (goal 11, plan 01a1a87b2e56 step 5).
-        let mut reading = p.events.reading();
+        // Each as sent: as finding the window read it, or read now, and kept for its frame's writing. What isn't a window's
+        // (all of what changed since a revision, or of a session that goes lean whole) is kept while what's kept is within a
+        // window's bytes (`super::window::BYTES`), and the rest read again where it's written, so what a plan holds is
+        // about a window's at the most; a window's own and what's read already are all kept.
+        let mut sent = Vec::with_capacity(brought.len());
+        let (mut kept, mut from, mut size) = (0usize, 0usize, 0usize);
         for (i, at) in brought.iter().enumerate() {
-            let n = if p.lean { reading.get(*at).map_or(0, |e| e.entry.sent(true).len()) } else { p.events.meta(*at).map_or(0, |m| m.text_len()) };
+            let (s, n) = if kept <= super::window::BYTES || sending.has(*at) {
+                let s = sending.take(*at);
+                let n = s.as_ref().map_or(0, |s| s.text(p.lean).len());
+                kept = kept.saturating_add(n);
+                (s, n)
+            } else if p.lean {
+                (None, sending.take(*at).map_or(0, |s| s.text(true).len()))
+            } else {
+                (None, p.events.meta(*at).map_or(0, |m| m.text_len()))
+            };
             if size + n > EVENTS_FRAME && i > from {
-                parts.push(Part::Events(from..i));
+                parts.push(Part::Events(from..i, events_room(size, i - from)));
                 from = i;
                 size = 0;
             }
             size += n;
+            sent.push(s);
         }
         if from < brought.len() {
-            parts.push(Part::Events(from..brought.len()));
+            parts.push(Part::Events(from..brought.len(), events_room(size, brought.len() - from)));
         }
-        Plan { brought, parts, since, window }
+        Plan { parts, of: Planned { brought, sent, since, window } }
     }
 
-    /// The events of `batch` (where they are among those `plan` brings).
-    fn batch(&self, plan: &Plan, batch: &std::ops::Range<usize>) -> Vec<Arc<Entry>> {
-        self.parts.events.entries_at(plan.brought.get(batch.clone()).unwrap_or_default())
+    /// The events of `batch` (where they are among those `of` brings), as sent: each as its plan read it, taken (a batch is
+    /// written once), and those it didn't keep read now, each compact chunk among them once.
+    fn batch(&self, of: &mut Planned, batch: &std::ops::Range<usize>) -> Vec<super::copies::Sent> {
+        let mut sending: Option<super::copies::Sending<'_>> = None;
+        let mut out = Vec::with_capacity(batch.len());
+        for j in batch.clone() {
+            let s = match of.sent.get_mut(j).and_then(Option::take) {
+                Some(s) => Some(s),
+                None => of.brought.get(j).and_then(|at| sending.get_or_insert_with(|| self.parts.events.sending(self.parts.lean)).take(*at)),
+            };
+            out.extend(s);
+        }
+        out
     }
 
     /// About the bytes `part` takes: the room it's written into.
-    fn room(&self, plan: &Plan, part: &Part) -> usize {
+    fn room(&self, part: &Part) -> usize {
         let p = &self.parts;
         match part {
             // Its info, written as it's made (a few hundred bytes).
@@ -1057,20 +1130,20 @@ impl Snapshot {
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
-            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::strs_len(self.batch(plan, batch).iter().map(|e| e.sent(p.lean))),
+            Part::Events(_, bytes) => *bytes,
             // Its texts joined, and the `[` and `]` around them.
             Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).map_or(0, |c| c.texts_len()) + "[]".len(),
         }
     }
 
-    /// Writes `part` to `w`.
-    fn write(&self, plan: &Plan, part: &Part, w: &mut impl std::io::Write) -> std::io::Result<()> {
+    /// Writes `part` to `w`, of what `of` holds.
+    fn write(&self, of: &mut Planned, part: &Part, w: &mut impl std::io::Write) -> std::io::Result<()> {
         use crate::wire::ui::{SessionDown, SessionFrame};
         let p = &self.parts;
         match part {
             Part::Head => {
                 let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
-                let head = SessionDown { frame: if plan.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: plan.window } }, rev: Some(p.rev) }.text();
+                let head = SessionDown { frame: if of.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: of.window } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
             }
             Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
@@ -1080,7 +1153,7 @@ impl Snapshot {
                 None => Ok(()),
             },
             Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
-            Part::Events(batch) => write::sent_events(w, self.batch(plan, batch).iter().map(|e| e.sent(p.lean)), None),
+            Part::Events(batch, _) => write::sent_events(w, self.batch(of, batch).iter().map(|s| s.text(p.lean)), None),
             Part::Chunk(i) => match p.events.chunks().get(*i) {
                 // A compact chunk's texts are its segment's, as they were joined.
                 Some(c) if c.is_compact() => write::joined_events(w, &self.joined(c)?, None),
@@ -1125,8 +1198,8 @@ impl Snapshot {
     /// The frames that bring a viewer to the copy as it was when this was taken, a message each,
     /// written here and now (tests, and what isn't on a shard).
     pub fn frames(&self) -> Vec<String> {
-        let plan = self.plan();
-        plan.parts.iter().map(|part| write::string(self.room(&plan, part), |b| self.write(&plan, part, b))).collect()
+        let Plan { parts, mut of } = self.plan();
+        parts.iter().map(|part| write::string(self.room(part), |b| self.write(&mut of, part, b))).collect()
     }
 
     /// Its frames and then `last` (the socket's `synced`), a frame a line, gzip'd as one message, put
@@ -1135,24 +1208,24 @@ impl Snapshot {
     /// deflated now and kept only once it's full), between them the few bytes of its frame stored as
     /// they are, and the other frames deflated as they come. One gzip member: every decoder reads it.
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
-        let plan = self.plan();
+        let Plan { parts, mut of } = self.plan();
         let chunks = self.parts.events.chunks();
         let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.texts_len() / 4, |s| s.deflated.len())).sum::<usize>();
         let mut gz = super::packed::Gzip::new(room);
         // The frames between the chunks, deflated together.
         let mut loose: Vec<u8> = Vec::new();
-        for part in &plan.parts {
-            self.part_into(&plan, part, &mut gz, &mut loose)?;
+        for part in &parts {
+            self.part_into(&mut of, part, &mut gz, &mut loose)?;
         }
         loose.extend_from_slice(last.as_bytes());
         gz.deflate(flate2::Compression::fast(), &loose)?;
         Ok(gz.finish())
     }
 
-    /// `part` of `plan` as [`Snapshot::packed`] puts it in: a chunk of events after the frames before it (in
-    /// `loose`, deflated together), as it was packed (the newest, which the next event changes, deflated now),
-    /// between the few bytes of its frame stored as they are; another frame onto `loose`.
-    fn part_into(&self, plan: &Plan, part: &Part, gz: &mut super::packed::Gzip, loose: &mut Vec<u8>) -> std::io::Result<()> {
+    /// `part` of a plan, of what `of` holds, as [`Snapshot::packed`] puts it in: a chunk of events after the frames
+    /// before it (in `loose`, deflated together), as it was packed (the newest, which the next event changes, deflated
+    /// now), between the few bytes of its frame stored as they are; another frame onto `loose`.
+    fn part_into(&self, of: &mut Planned, part: &Part, gz: &mut super::packed::Gzip, loose: &mut Vec<u8>) -> std::io::Result<()> {
         use flate2::Compression;
         match part {
             Part::Chunk(i) => {
@@ -1180,8 +1253,8 @@ impl Snapshot {
                 gz.stored(b"]}\n");
             }
             other => {
-                loose.reserve(self.room(plan, other).saturating_add(1));
-                self.write(plan, other, loose)?;
+                loose.reserve(self.room(other).saturating_add(1));
+                self.write(of, other, loose)?;
                 loose.push(b'\n');
             }
         }
@@ -1228,10 +1301,16 @@ impl Packing {
                 return Ok(making.take().map(super::packed::Gzip::finish));
             };
             *next += 1;
-            snapshot.part_into(plan, part, gz, loose)?;
+            snapshot.part_into(&mut plan.of, part, gz, loose)?;
         }
         Ok(Some(gz.take()))
     }
+}
+
+/// The bytes an `events` frame of `n` events takes whose texts as sent are `texts` bytes in all: its envelope, the `[` and
+/// `]`, and a `,` between each two (`write::sent_events`).
+fn events_room(texts: usize, n: usize) -> usize {
+    write::envelope("events", Some("events"), None) + "[]".len() + texts + n.saturating_sub(1) * ",".len()
 }
 
 /// The epoch to send a message once more for, when its session's inbox refused it as sent for an
@@ -7019,7 +7098,7 @@ mod tests {
         let had = m.rev;
         took(&mut m, |m| m.upsert(Arc::new(Entry::new(tool_event(2001, "shell", "Bash", "done", json!({"command": "ls"}), 300, json!([]))))));
         let p = m.view().parts_after(Some(had), LEAN, false);
-        let (since, window, _) = p.resolved();
+        let (since, window, _) = p.resolved(&mut p.events.sending(p.lean));
         assert!(since.is_some() && window.is_none());
         let (events, _) = sent_events(&Snapshot { parts: p, files: None, store: None }.frames());
         assert_eq!(seqs(&events), vec![2001]);
@@ -7031,12 +7110,12 @@ mod tests {
             took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": format!("e{n}"), "seq": n, "at": n, "kind": "assistant", "text": "x"})))));
         }
         let p = m.view().parts_after(Some(had), LEAN, false);
-        let (since, window, _) = p.resolved();
+        let (since, window, _) = p.resolved(&mut p.events.sending(p.lean));
         assert!(since.is_none() && window.is_some());
         assert!(sent_events(&Snapshot { parts: p, files: None, store: None }.frames()).0.len() <= super::super::window::ROWS);
         // One from before windows resumes with all of what it lacks, as before.
         let p = m.view().parts_after(Some(had), View::default(), false);
-        assert!(p.resolved().0.is_some());
+        assert!(p.resolved(&mut p.events.sending(p.lean)).0.is_some());
         assert_eq!(sent_events(&Snapshot { parts: p, files: None, store: None }.frames()).0.len(), super::super::window::ROWS + 10);
     }
 
@@ -7073,6 +7152,91 @@ mod tests {
         anyhow::ensure!(events.iter().filter(|e| super::super::window::begins_turn(e)).count() == super::super::window::TURNS, "ten turns");
         anyhow::ensure!(events.iter().any(|e| e.get("held").is_some()), "lean");
         anyhow::ensure!(window == Some(json!({"before": first.get("seq"), "more": true})), "{window:?}");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A2a: the UI's lean window (`?window=1&lean=1`) over a long
+    /// session's compact chunks reads each compact chunk it reaches once an attach (inflated once) and each of its events once,
+    /// a tool's JSON read whole once for its lean form and another's not at all: packed as it goes out (as `api::send_snapshot`
+    /// sends it), made as frames, and as a resume past what a window holds alike; an older page too, and a resume that fits
+    /// reads what changed once. An attach read them four times (finding the window, sizing its frames, each frame's room, its
+    /// writing), each time every event of those chunks read whole. The events sent are the window's as before.
+    #[test]
+    fn g11_s5_a2a_a_lean_window_reads_each_compact_chunk_and_event_once() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let parsed = || LEAN_READS.with(std::cell::Cell::get);
+        let all = long_session(1_000);
+        let mut m = mirror_of(&all);
+        // A revision past which more changed than a window holds (`super::window::ROWS`).
+        let early = m.rev / 4;
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        // Each chunk's events (where they begin, how many) and whether it's compact.
+        let mut chunks = Vec::new();
+        let mut at = 0usize;
+        for c in view.events.chunks() {
+            chunks.push((at, c.len(), c.is_compact()));
+            at += c.len();
+        }
+        anyhow::ensure!(chunks.iter().filter(|c| c.2).count() > 3, "compact chunks: {chunks:?}");
+        // What events `from..to` hold: the compact chunks they reach, and their tool events in compact chunks.
+        let of = |from: usize, to: usize| -> (u64, u64) {
+            let reached = chunks.iter().filter(|(start, n, compact)| *compact && *start < to && start + n > from).count();
+            let compact = |i: usize| chunks.iter().any(|(start, n, compact)| *compact && (*start..start + n).contains(&i));
+            let tools = (from..to).filter(|i| compact(*i) && all.get(*i).and_then(|e| e.get("kind")).and_then(Value::as_str) == Some("tool")).count();
+            (reached as u64, tools as u64)
+        };
+        let snapshot = |parts: Parts| Snapshot { parts, files: None, store: None };
+        // The window as before, each event lean where it goes so (and the events kept in memory made lean once, here).
+        let (want, window) = sent_events(&snapshot(view.parts_for(LEAN, false)).frames());
+        let begin = window.as_ref().and_then(|w| w.get("before")).and_then(Value::as_u64).and_then(|s| usize::try_from(s).ok()).map_or(0, |s| s - 1);
+        anyhow::ensure!(want.len() == all.len() - begin && want.iter().any(|e| e.get("held").is_some()), "the newest events from {begin}, lean");
+        let (reached, tools) = of(begin, all.len());
+        anyhow::ensure!(reached >= 2 && tools > 10, "the window reaches {reached} compact chunks, {tools} tools in them");
+        // As it's read: `reads` the chunks inflated and the events read whole, `sent` what it sends.
+        let counted = |make: &dyn Fn() -> anyhow::Result<Vec<Value>>| -> anyhow::Result<((u64, u64), Vec<Value>)> {
+            let (i, p) = (inflated(), parsed());
+            let sent = make()?;
+            Ok(((inflated() - i, parsed() - p), sent))
+        };
+        let packed = || -> anyhow::Result<Vec<Value>> {
+            let mut packing = snapshot(view.parts_for(LEAN, false)).packing(r#"{"t":"synced"}"#);
+            let mut gz = Vec::new();
+            while let Some(piece) = packing.next_piece(16 << 10)? {
+                gz.extend(piece);
+            }
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz.as_slice()), &mut text)?;
+            Ok(sent_events(&text.lines().map(str::to_owned).collect::<Vec<_>>()).0)
+        };
+        let frames = || -> anyhow::Result<Vec<Value>> { Ok(sent_events(&snapshot(view.parts_for(LEAN, false)).frames()).0) };
+        let resumed = || -> anyhow::Result<Vec<Value>> { Ok(sent_events(&snapshot(view.parts_after(Some(early), LEAN, false)).frames()).0) };
+        for (what, make) in [("packed as it goes", &packed as &dyn Fn() -> anyhow::Result<Vec<Value>>), ("as frames", &frames), ("a resume past a window", &resumed)] {
+            let ((chunks_read, events_read), sent) = counted(make)?;
+            anyhow::ensure!(sent == want, "{what}: the same window");
+            // A window ends at a bound inside a turn at its oldest whole turn's start, having read one event before it.
+            anyhow::ensure!(chunks_read >= reached && chunks_read <= reached + 1, "{what}: each compact chunk read once: {chunks_read} reads of {reached}");
+            anyhow::ensure!(events_read == tools, "{what}: each tool's JSON read once for its lean form, no other's: {events_read} of {tools}");
+        }
+        // An older page, lean: its chunks and events read once.
+        let ((chunks_read, events_read), page) = counted(&|| -> anyhow::Result<Vec<Value>> { match view.page(u64::try_from(begin + 1)?, true, false) {
+            Paged::Page { events, .. } => Ok(events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect()),
+            Paged::Store { .. } => anyhow::bail!("a page from the store"),
+        } })?;
+        let page_begin = begin - page.len();
+        let (page_reached, page_tools) = of(page_begin, begin);
+        anyhow::ensure!(seqs(&page) == (page_begin as u64 + 1..=begin as u64).collect::<Vec<_>>(), "the page just before the window");
+        anyhow::ensure!(chunks_read >= page_reached && chunks_read <= page_reached + 1 && events_read == page_tools, "the page: {chunks_read} chunk reads of {page_reached}, {events_read} of {page_tools} tools");
+        // A resume that fits a window: what changed alone, read once.
+        let had = m.rev;
+        took(&mut m, |m| m.upsert(Arc::new(Entry::new(tool_event(1_001, "shell", "Bash", "done", json!({"command": "ls"}), 300, json!([]))))));
+        let view = m.view();
+        let ((_, events_read), sent) = counted(&|| Ok(sent_events(&snapshot(view.parts_after(Some(had), LEAN, false)).frames()).0))?;
+        anyhow::ensure!(seqs(&sent) == vec![1_001] && events_read == 1, "what changed, read once: {events_read}");
         Ok(())
     }
 
