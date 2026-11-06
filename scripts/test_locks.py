@@ -2,12 +2,16 @@
 """Tests of scripts/locks.py (goal 5 of the API runtime program, plan 01a1a59c2aae).
 
 `check` (step 3): it fails on a lock planted on the hot path, and passes what only a test build compiles,
-what comments and strings say, and the locks hot.toml lists with why.
+what comments and strings say, and the locks hot.toml lists with why. Its `waits` (goal 5's top goal): it fails
+on async-lock or event-listener named in kiln's code (their waits are event-listener's list, behind its Mutex),
+and passes the same in comments, strings and tests, and those hot.toml lists under `waiting`.
 
 The census of the dependencies' and the allocator's locks: `census-tree` copies the dependencies
 scripts/locks/deps.toml names from the cargo registry, their locks the census's with every line where it
 was, points the tree's [patch.crates-io] at them, writes Cargo.lock as cargo would and turns jemalloc's
-statistics on; `rank` says kiln's, Quiver's, the dependencies' and the allocator's locks apart.
+statistics on; `rank` says kiln's, Quiver's, the dependencies' and the allocator's locks apart, each
+site's rate once whatever lock its churning addresses join it to, and refuses figures that can't be
+counters' growth (a kiln-lab that didn't sum a site's copies, census-B's event-listener rates below zero).
 
   python3 scripts/test_locks.py
 """
@@ -40,11 +44,15 @@ def check(root: Path) -> subprocess.CompletedProcess[str]:
 class Tree:
     """A tree of its own: hot.toml and the files it names."""
 
-    def __init__(self, hot: list[str], allowed: list[tuple[str, str, str]] | None = None):
+    def __init__(self, hot: list[str], allowed: list[tuple[str, str, str]] | None = None, waits: list[str] | None = None, waiting: list[tuple[str, str, str]] | None = None):
         self.dir = Path(tempfile.mkdtemp(prefix="kiln-locks-"))
         lines = ["hot = [" + ", ".join(f'"{h}"' for h in hot) + "]"]
+        if waits is not None:
+            lines += ["waits = [" + ", ".join(f'"{w}"' for w in waits) + "]"]
         for at, name, why in allowed or []:
             lines += ["[[allowed]]", f'at = "{at}"', f'name = "{name}"', f'why = "{why}"']
+        for at, name, why in waiting or []:
+            lines += ["[[waiting]]", f'at = "{at}"', f'name = "{name}"', f'why = "{why}"']
         (self.dir / "scripts" / "locks").mkdir(parents=True)
         (self.dir / "scripts" / "locks" / "hot.toml").write_text("\n".join(lines) + "\n")
 
@@ -137,10 +145,10 @@ class Check(unittest.TestCase):
         try:
             (dest / "scripts" / "locks").mkdir(parents=True)
             shutil.copy2(ROOT / "scripts" / "locks" / "hot.toml", dest / "scripts" / "locks" / "hot.toml")
-            for h in spec["hot"]:
+            for h in [*spec["hot"], *spec.get("waits", [])]:
                 src = ROOT / h
                 if src.is_dir():
-                    shutil.copytree(src, dest / h)
+                    shutil.copytree(src, dest / h, dirs_exist_ok=True)
                 else:
                     (dest / h).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dest / h)
@@ -153,6 +161,113 @@ class Check(unittest.TestCase):
             self.assertIn(": planted:", after.stdout)
         finally:
             shutil.rmtree(dest, ignore_errors=True)
+
+    def test_g5_waits_on_event_listener_planted_in_kilns_code_fail(self) -> None:
+        """The real hot.toml and every folder its `waits` names: as they are, then an async-lock mutex and an Event
+        planted in modules off the hot path's list (a request's and a runner's), each failing the check."""
+        spec = tomllib.loads((ROOT / "scripts" / "locks" / "hot.toml").read_text())
+        self.assertIn("crates/kiln/src", spec.get("waits", []))
+        dest = Path(tempfile.mkdtemp(prefix="kiln-locks-waits-"))
+        try:
+            (dest / "scripts" / "locks").mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "locks" / "hot.toml", dest / "scripts" / "locks" / "hot.toml")
+            for h in [*spec["hot"], *spec["waits"]]:
+                src = ROOT / h
+                if src.is_dir():
+                    shutil.copytree(src, dest / h, dirs_exist_ok=True)
+                else:
+                    (dest / h).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest / h)
+            before = check(dest)
+            self.assertEqual(before.returncode, 0, before.stdout)
+            for rel, planted, name in [
+                ("crates/kiln/src/plans/review.rs", "static PLANTED: async_lock::Mutex<()> = async_lock::Mutex::new(());\n", "PLANTED"),
+                ("crates/kiln/src/sync/tasks.rs", "static RUNG: std::sync::LazyLock<event_listener::Event> = std::sync::LazyLock::new(event_listener::Event::new);\n", "RUNG"),
+            ]:
+                f = dest / rel
+                was = f.read_text()
+                f.write_text(planted + was)
+                after = check(dest)
+                self.assertEqual(after.returncode, 1, after.stdout)
+                self.assertIn(f"{rel}:1: {name}:", after.stdout)
+                f.write_text(was)
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+
+WAITS = '''//! A module off the hot path: async_lock::Mutex named in a comment is no wait.
+use std::sync::Arc;
+
+/// Waits as event_listener::Event did, in its docs.
+pub struct Feed {
+    changed: crate::rt::Changed,
+}
+
+impl Feed {
+    pub fn say(&self) -> &'static str {
+        "an async_lock::Semaphore in a string is no wait either"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    static ONE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+    fn f() { let e = event_listener::Event::new(); drop(e); }
+}
+'''
+
+
+class Waits(unittest.TestCase):
+    def test_g5_waits_a_clean_module_passes(self) -> None:
+        t = Tree([], waits=["src"])
+        try:
+            t.file("src/feed.rs", WAITS)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_planted_wait_on_event_listener_fails(self) -> None:
+        for planted, name in [
+            ("    gate: async_lock::Mutex<()>,\n", "gate"),
+            ("    copies: async_lock::Semaphore,\n", "copies"),
+            ("    mirror: std::sync::Arc<async_lock::RwLock<()>>,\n", "mirror"),
+            ("    ready: async_lock::OnceCell<()>,\n", "ready"),
+            ("    room: event_listener::Event,\n", "room"),
+        ]:
+            t = Tree([], waits=["src"])
+            try:
+                t.file("src/feed.rs", WAITS.replace("    changed: crate::rt::Changed,\n", "    changed: crate::rt::Changed,\n" + planted))
+                r = check(t.dir)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(f"src/feed.rs:7: {name}:", r.stdout)
+            finally:
+                t.close()
+
+    def test_g5_waits_an_import_a_static_or_a_local_fails_too(self) -> None:
+        t = Tree([], waits=["src"])
+        try:
+            t.file("src/feed.rs", "use event_listener::Listener as _;\n" + WAITS + "\nstatic GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());\nfn g() {\n    let rung = event_listener::Event::new();\n    drop(rung);\n}\n")
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            for name in ("use", "GATE", "rung"):
+                self.assertIn(f": {name}:", r.stdout)
+        finally:
+            t.close()
+
+    def test_g5_waits_a_listed_one_passes_and_a_gone_one_fails(self) -> None:
+        listed = WAITS.replace("    changed: crate::rt::Changed,\n", "    changed: crate::rt::Changed,\n    room: event_listener::Event,\n")
+        t = Tree([], waits=["src"], waiting=[("src/feed.rs", "room", "one task's: its forwarder alone waits on it")])
+        try:
+            t.file("src/feed.rs", listed)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            t.file("src/feed.rs", WAITS)
+            r = check(t.dir)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("src/feed.rs room", r.stdout)
+        finally:
+            t.close()
 
 
 def rewritten(text: str, track_caller: tuple[str, ...] = ()) -> tuple[str, int]:
@@ -466,8 +581,8 @@ class CensusTreeDeps(unittest.TestCase):
             f.close()
 
 
-def lock_seen(taken: float, contended: float = 0.0, wait_s: float = 0.0, kind: str = "std_mutex", addrs: str = "") -> dict:
-    return {"kind": kind, "taken": taken, "contended": contended, "wait_s": wait_s, "fill_taken": taken / 2, "fill_contended": 0.0, "fill_wait_s": 0.0, "max_wait_s": wait_s, "addrs": addrs}
+def lock_seen(taken: float, contended: float = 0.0, wait_s: float = 0.0, kind: str = "std_mutex", addrs: str = "", copies: int = 1) -> dict:
+    return {"kind": kind, "taken": taken, "contended": contended, "wait_s": wait_s, "fill_taken": taken / 2, "fill_contended": 0.0, "fill_wait_s": 0.0, "max_wait_s": wait_s, "addrs": addrs, "copies": copies}
 
 
 class RankGroups(unittest.TestCase):
@@ -548,6 +663,90 @@ class RankGroups(unittest.TestCase):
         md = locks.markdown([], [], 1)
         self.assertIn(locks.NONE_TAKEN["allocator"], md)
         self.assertIn(locks.NONE_TAKEN["dependencies"], md)
+
+
+class RankGrowth(unittest.TestCase):
+    """Goal 5, plan 01a1a59c2aae step 1 (census-B's event-listener rates below zero): `rank` ranks each site's
+    growth as kiln-lab took it, the site's copies summed in every scrape first (`copies`), and only then joins
+    sites into locks by the addresses they took; figures that can't be counters' growth it refuses."""
+
+    EL = "event-listener@5.4.2:src/intrusive.rs"
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="kiln-locks-growth-"))
+        self.tree = self.dir / "tree"
+        self.tree.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def rank(self, rounds: list[dict]) -> list[dict]:
+        run = self.dir / "run.json"
+        run.write_text(json.dumps({"profile": {"window_s": 10}, "rounds": [{"index": i + 1, "fill_s": 5, "locks": seen} for i, seen in enumerate(rounds)]}))
+        with mock.patch.dict(os.environ, {"CARGO_HOME": str(self.dir / "no-cargo")}):
+            rows, _ = locks.rank([run], self.tree)
+        return rows
+
+    def test_g5_s1_a_sites_rate_counts_once_while_its_locks_addresses_churn(self) -> None:
+        """event-listener's locks are each channel's, made and dropped all the time: each round's server has its
+        own, at addresses of their own, its sites share a channel's address in one round and not the next, and
+        a freed lock's address is kiln's in another. Each site counts once, in one lock, whatever it joins; no
+        rate is below zero."""
+        insert, remove, notify, register = (f"{self.EL}:{line}:14 std_mutex" for line in (181, 220, 226, 238))
+        hub = "crates/kiln/src/hub.rs:40:20 mutex"
+        rounds = [
+            {
+                insert: lock_seen(4000, 10, 0.004, addrs="a1 a2", copies=2),
+                remove: lock_seen(3000, 5, 0.002, addrs="a2", copies=2),
+                notify: lock_seen(500, addrs="a3", copies=3),
+                register: lock_seen(800, 1, 0.001, addrs="a4", copies=2),
+                hub: lock_seen(100, kind="mutex", addrs="a3"),
+            },
+            {
+                insert: lock_seen(4200, 8, 0.003, addrs="b1", copies=2),
+                remove: lock_seen(2900, 4, 0.002, addrs="b2", copies=2),
+                notify: lock_seen(600, addrs="b1 b2", copies=3),
+                register: lock_seen(700, addrs="b3", copies=2),
+                hub: lock_seen(110, kind="mutex", addrs="b3"),
+            },
+            {
+                insert: lock_seen(3800, 12, 0.005, addrs="c1", copies=2),
+                register: lock_seen(900, 2, 0.002, addrs="c1 a1", copies=2),
+                hub: lock_seen(90, kind="mutex", addrs="c1"),
+            },
+        ]
+        rows = self.rank(rounds)
+        # Each site's median over the rounds, a round it didn't take counting 0, per second of the 10 s window.
+        taken = {insert: 400.0, remove: 290.0, notify: 50.0, register: 80.0, hub: 10.0}
+        by = {r["owner"]: r for r in rows}
+        self.assertEqual(sorted(by), ["event-listener@5.4.2", "kiln"], "one lock an owner: the channels' sites joined by shared addresses, never kiln's")
+        listener = by["event-listener@5.4.2"]
+        self.assertEqual({f"{d['site']} {d['kind']}": d["taken_per_s"] for d in listener["sites"]}, {k: v for k, v in taken.items() if k != hub})
+        self.assertAlmostEqual(listener["taken_per_s"], 820.0)
+        self.assertAlmostEqual(listener["contended_per_s"], 1.0 + 0.4 + 0.0 + 0.1)
+        self.assertAlmostEqual(listener["wait_ms_per_s"], 0.4 + 0.2 + 0.0 + 0.1)
+        self.assertAlmostEqual(by["kiln"]["taken_per_s"], 10.0)
+        self.assertAlmostEqual(sum(r["taken_per_s"] for r in rows), sum(taken.values()), msg="every site counted once")
+        figures = ("taken_per_s", "contended_per_s", "wait_ms_per_s", "max_wait_ms", "fill_per_s", "fill_wait_ms_per_s")
+        self.assertTrue(all(r[f] >= 0 for r in rows for f in figures), rows)
+
+    def test_g5_s1_figures_that_cant_be_counters_growth_are_refused(self) -> None:
+        """census-B's first round, as the kiln-lab of the time kept it: no `copies`, and the window of
+        intrusive.rs:220 a later copy's count less an earlier one's. Neither that, nor a growth below zero from
+        any kiln-lab, is ranked, and the refusal says why."""
+        site = f"{self.EL}:220:14 std_mutex"
+        census_b = {"kind": "std_mutex", "taken": -4873.0, "contended": -542.0, "wait_s": 0.004519069, "fill_taken": 6404.0, "fill_contended": 479.0, "fill_wait_s": 0.000176259, "max_wait_s": 0.001471389, "addrs": "7f5b79042000 7f5bd5e281b0"}
+        for figures, says in [
+            (census_b, ["didn't sum a site's copies (1 site without `copies`)", f"{site} taken -4873 (round 1)", f"{site} contended -542 (round 1)", "a kiln-lab that sums them"]),
+            ({**lock_seen(300), "copies": 0}, ["didn't sum a site's copies"]),
+            ({**census_b, "copies": 2}, ["2 growths below zero", f"{site} taken -4873 (round 1)"]),
+        ]:
+            with self.subTest(figures=figures):
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                    self.rank([{site: figures}])
+                for s in says:
+                    self.assertIn(s, err.getvalue())
+        self.assertEqual(len(self.rank([{site: lock_seen(300, copies=2)}])), 1, "a sound site is ranked")
 
 
 if __name__ == "__main__":

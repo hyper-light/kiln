@@ -394,7 +394,9 @@ enum Ev {
     Redial,
     Term(String, PtyOut),
     Up(Up),
-    Harness(String, crate::harness::core::Update),
+    /// A session's update, and when its session handed it on: when this runner took it in (goal 10, plan
+    /// 01a1a87b2dae step 5).
+    Harness(String, crate::harness::core::Update, Instant),
     /// The front door's status changed.
     FrontDoor,
     /// What headroom decides changed (docs/headroom.md).
@@ -605,7 +607,7 @@ fn keep_pipes(p: &crate::proc::Detached) -> Option<[std::os::fd::OwnedFd; 3]> {
 /// or this one's still reaped where it was spawned): its output flows again, and it's kept with
 /// `state`. Whether it could.
 #[cfg(unix)]
-fn take_terminal_back(terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>, term_tx: &async_channel::Sender<(String, PtyOut)>, session: String, state: Arc<crate::termsess::Session>, fd: std::os::fd::OwnedFd, pid: u32) -> bool {
+fn take_terminal_back(terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>, term_tx: &crate::memory::queue::Sender<(String, PtyOut)>, session: String, state: Arc<crate::termsess::Session>, fd: std::os::fd::OwnedFd, pid: u32) -> bool {
     use std::os::fd::IntoRawFd as _;
     let Some((pty, rx)) = terminal::adopt(terminal::Handover { fd: fd.into_raw_fd(), pid, foreign: true }) else { return false };
     let (tx, s) = (term_tx.clone(), session.clone());
@@ -698,7 +700,7 @@ struct ReplicaStart {
     starting: Arc<std::sync::atomic::AtomicBool>,
     /// The server's last word to join the group as a learner (`None` once it said Leave).
     join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
-    up: async_channel::Sender<Up>,
+    up: crate::memory::queue::Sender<Up>,
     dir: PathBuf,
     me: String,
     server: String,
@@ -725,7 +727,8 @@ impl ReplicaStart {
                     async move {
                         // A thread of its own: fetching a copy takes minutes on a large store, and the
                         // blocking pool is the runtime's.
-                        let (tx, rx) = async_channel::bounded(1);
+                        // Its one answer, from its thread (goal 5, plan 01a1a59c2aae: no channel whose wait locks).
+                        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
                         std::thread::Builder::new()
                             .name("kiln-learner".into())
                             .spawn(move || {
@@ -881,7 +884,7 @@ async fn roll_back(
     why: &str,
     harness: Option<&Arc<crate::harness::host::Host>>,
     terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
-    term_tx: &async_channel::Sender<(String, PtyOut)>,
+    term_tx: &crate::memory::queue::Sender<(String, PtyOut)>,
     state_dir: &std::path::Path,
 ) -> (Vec<String>, Option<crate::convo::store::Store>) {
     use std::os::fd::IntoRawFd as _;
@@ -1022,7 +1025,7 @@ fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::conv
 /// The store's feed to the server (`crate::convo::feed`), and the harnesses' own records followed
 /// into the store (`crate::convo::record`): as the runner starts, or once a new build taking over
 /// has the store it goes on with.
-fn start_feed(st: &crate::convo::store::Store, harness: Option<&Arc<crate::harness::host::Host>>, up: &async_channel::Sender<Up>) -> crate::convo::feed::Shipper {
+fn start_feed(st: &crate::convo::store::Store, harness: Option<&Arc<crate::harness::host::Host>>, up: &crate::memory::queue::Sender<Up>) -> crate::convo::feed::Shipper {
     if let Some(h) = harness {
         let follow = Arc::clone(h);
         if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || follow.record_sources()) {
@@ -1045,7 +1048,7 @@ fn start_feed(st: &crate::convo::store::Store, harness: Option<&Arc<crate::harne
 
 /// (The new build's runner.) The stores it goes on with ([`Bg::Stores`]): how it went.
 #[cfg(unix)]
-async fn set_stores(tx: &async_channel::Sender<Bg>, own: Option<PathBuf>, mirror: Option<PathBuf>) -> Taken {
+async fn set_stores(tx: &crate::memory::queue::Sender<Bg>, own: Option<PathBuf>, mirror: Option<PathBuf>) -> Taken {
     let stopping = || Taken { note: Some("this runner is stopping".to_owned()), ..Taken::default() };
     let (done, said) = futures::channel::oneshot::channel();
     if tx.send(Bg::Stores { own, mirror, done }).await.is_err() {
@@ -1092,7 +1095,7 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
 /// taken on this runner's loop (`tx`), which also hears once everything is in. `takes_stores`: it
 /// waits for that runner's conversation stores (it keeps conversations).
 #[cfg(unix)]
-async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: Me, takes_stores: bool) -> anyhow::Result<()> {
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: crate::memory::queue::Sender<Bg>, me: Me, takes_stores: bool) -> anyhow::Result<()> {
     use crate::bluegreen::Frame;
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
@@ -1102,7 +1105,7 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
-    let (ftx, frx) = async_channel::unbounded::<anyhow::Result<(Frame, Vec<std::os::fd::OwnedFd>)>>();
+    let (ftx, frx) = crate::memory::queue::unbounded::<anyhow::Result<(Frame, Vec<std::os::fd::OwnedFd>)>>(&crate::memory::owners::CHANNELS);
     let c = Arc::clone(&conn);
     std::thread::Builder::new().name("kiln-take-over".into()).spawn(move || {
         loop {
@@ -1457,7 +1460,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::tunnel::Paths::remembering(&o.server_url, &quic_addr, crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("transport"))
     };
 
-    let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
+    // The uplink, and every queue this loop takes from, lock-free (`crate::memory::queue`; goal 5, plan
+    // 01a1a59c2aae, its top goal), each with the bound its channel had: an async-channel's wait took
+    // event-listener's `Mutex`, its senders' shards and this loop's taking it, this loop on every turn for
+    // each it waited on. The uplink holds `UPLINK_PLACES` messages at most, its senders waiting past them.
+    let (Uplink(up_tx), up_rx) = Uplink::new();
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
     let sync = (!o.ephemeral && !o.outpost).then(|| {
         let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
@@ -1530,7 +1537,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
-    let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
+    let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
         let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
@@ -1572,7 +1579,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // catch-up after a reconnect), the loop stopped, its heartbeats with it, and the server
     // dropped a runner that never heard so: offline for hours while it read connected.
     // What it says is as much as the loop does, so this one needs no bound.
-    let (own_tx, own_rx) = async_channel::unbounded::<Up>();
+    let (own_tx, own_rx) = crate::memory::queue::unbounded::<Up>(&crate::memory::owners::CHANNELS);
     let own = Uplink(own_tx);
     let replica = ReplicaStart {
         slot: cluster.clone(),
@@ -1599,7 +1606,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
-    let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
+    let (done_tx, done_rx) = crate::memory::queue::unbounded::<JobResult>(&crate::memory::owners::CHANNELS);
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
     // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
@@ -1649,7 +1656,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Terminals into legs asked for before the leg had its shell, by session: taken again once it
     // has, with what was typed meanwhile.
     let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-    let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
+    let (term_tx, term_rx) = crate::memory::queue::places::<(String, PtyOut)>(&crate::memory::owners::CHANNELS, 1024);
     // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
     // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
     // process that re-executed itself loses the local network, it hands the terminals to its
@@ -1674,7 +1681,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
-    let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Each with when its session handed it on (`crate::harness::session::Taken`): its frame says how long this
+    // runner held it (`crate::wire::stamp`; goal 10, plan 01a1a87b2dae step 5).
+    let (harness_tx, harness_rx) = crate::memory::queue::places::<crate::harness::session::Taken>(&crate::memory::owners::CHANNELS, 8192);
     // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
     // the server has them, and sent again after a reconnect from where it has them, never whole.
     let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
@@ -1729,7 +1738,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
     // the new one) the runner it takes over from.
     #[cfg_attr(not(unix), allow(unused_variables))]
-    let (bg_tx, bg_rx) = async_channel::unbounded::<Bg>();
+    let (bg_tx, bg_rx) = crate::memory::queue::unbounded::<Bg>(&crate::memory::owners::CHANNELS);
     #[cfg(unix)]
     let mut moving: Option<Moving> = None;
     #[cfg(unix)]
@@ -1748,7 +1757,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut moved: std::collections::HashSet<crate::instances::Owned> = std::collections::HashSet::new();
     #[cfg(unix)]
-    let mut forward: Option<async_channel::Sender<Vec<u8>>> = None;
+    let mut forward: Option<crate::memory::queue::Sender<Vec<u8>>> = None;
     // The local sockets (`kiln spawn`, `kiln run`) are the machine's: a new build taking over
     // serves them once it holds the sessions.
     #[cfg(unix)]
@@ -1960,7 +1969,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = own_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
-            h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
+            h = harness_rx.recv().fuse() => match h { Ok(t) => Ev::Harness(t.session, t.update, t.at), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
             () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
             b = bg_rx.recv().fuse() => match b {
@@ -2279,7 +2288,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     }
                                 }
                                 // What reached this runner meanwhile, then whatever still does, goes to the new build.
-                                let (ftx, frx) = async_channel::unbounded::<Vec<u8>>();
+                                let (ftx, frx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
                                 for d in std::mem::take(&mut mv.held) {
                                     let _ = ftx.try_send(d);
                                 }
@@ -3161,7 +3170,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::Identity(given)) => {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
                         let taken_over = (given.kind == "agent" && given.cert_pem.is_some()).then(|| (given.of.clone(), given.epoch));
-                        if let Err(e) = crate::runner::identity::given(given, &o.state_dir, &label) {
+                        // Its certificate's file written on the blocking pool, waited for here so what follows finds it
+                        // kept (goal 9, plan 01a1a87b2cec step 3: written and synced on this loop's shard).
+                        if let Err(e) = crate::runner::identity::given_off(given, o.state_dir.clone(), label).await {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                         // The runner role handed to this process, signed for once its own
@@ -3684,10 +3695,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 updates_on = true;
                                 // Updates queued meanwhile go on their streams; those of sessions
                                 // whose stream starts now are in its snapshot.
-                                while let Ok((session, u)) = harness_rx.try_recv() {
+                                while let Ok(crate::harness::session::Taken { session, update: u, at }) = harness_rx.try_recv() {
                                     note_announced(&mut announced, &session, &u);
                                     if updates.started(&crate::wire::uplink::session_key(&session)) {
-                                        push_update(&mut updates, &session, &u, false, &mut sent_changes);
+                                        push_update(&mut updates, &session, &u, false, &mut sent_changes, Some(at));
                                     }
                                 }
                             } else {
@@ -4432,7 +4443,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Harness(session, u) => {
+            Ev::Harness(session, u, taken) => {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
@@ -4489,8 +4500,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         updates.start(&key);
                         opens = true;
                     }
-                    // A new session's Open is its stream's picture.
-                    push_update(&mut updates, &session, &u, opens, &mut sent_changes);
+                    // A new session's Open is its stream's picture. Its frames say how long this runner held it
+                    // (goal 10, plan 01a1a87b2dae step 5).
+                    push_update(&mut updates, &session, &u, opens, &mut sent_changes, Some(taken));
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
@@ -4832,8 +4844,10 @@ fn fit_changes(files: &[crate::harness::model::FileChange]) -> Option<String> {
 /// One agent-session update onto its session's channel stream, as the frames it needs: part of the
 /// picture its stream starts with (`picture`: its snapshot, a new session's Open), which goes
 /// whatever its size, or after it. A changeset goes as what changed in it where the server takes
-/// that (`sent`).
-fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges) -> usize {
+/// that (`sent`). `taken`: when this runner took it in (its session handed it on), for an update that
+/// came so: each of its frames says how long before it was made (`crate::wire::stamp`; goal 10, plan
+/// 01a1a87b2dae step 5). A stream's snapshot is the session as it stands, taken in before: it says none.
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges, taken: Option<Instant>) -> usize {
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
@@ -4845,7 +4859,17 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
         }
         _ => harness_frames(session, u),
     };
-    let bodies: Vec<Vec<u8>> = frames.into_iter().filter_map(|json| proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }).ok()).collect();
+    // Read once its frames are made: their making is this runner's time with it too.
+    let held = taken.map(|at| at.elapsed());
+    let bodies: Vec<Vec<u8>> = frames
+        .into_iter()
+        .filter_map(|mut json| {
+            if let Some(held) = held {
+                crate::wire::stamp::put(&mut json, held);
+            }
+            proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }).ok()
+        })
+        .collect();
     let bytes = bodies.iter().map(Vec::len).sum();
     if picture {
         for b in bodies {
@@ -4878,7 +4902,7 @@ fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &c
     // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
     let (mut bytes, mut newest, mut after) = (0, 0, 0);
     for u in &snapshot {
-        let n = push_update(updates, session, u, true, sent);
+        let n = push_update(updates, session, u, true, sent, None);
         bytes += n;
         match u {
             Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
@@ -5355,7 +5379,7 @@ enum Start {
 fn adopt_handover(
     o: &Opts,
     terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
-    term_tx: &async_channel::Sender<(String, PtyOut)>,
+    term_tx: &crate::memory::queue::Sender<(String, PtyOut)>,
 ) -> Start {
     use base64::Engine as _;
     let path = handover_path(o);
@@ -5418,7 +5442,7 @@ fn adopt_handover(
 
 /// The copy of the server's conversation store this runner keeps (a mirror), beside its own, and
 /// the intake that takes the server's feed into it, its answers going up the link.
-fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
+fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
     let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().upkeep())?;
     match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
         Ok((intake, out)) => {
@@ -5752,16 +5776,46 @@ mod tests {
         let key = crate::wire::uplink::session_key("s");
         let mut sent = SentChanges::default();
         updates.start(&key);
-        let bytes = push_update(&mut updates, "s", &history, true, &mut sent);
+        let bytes = push_update(&mut updates, "s", &history, true, &mut sent, None);
         assert!(bytes > crate::wire::uplink::ROOM, "{bytes} bytes");
-        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent);
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent, None);
         assert!(updates.take_stale().is_empty(), "its picture went whole");
         assert_eq!(updates.unanswered(), frames + 1, "the snapshot and what came after it");
         // As it was pushed before: held to the room, it goes stale part-way.
         let other = crate::wire::uplink::session_key("t");
         updates.start(&other);
-        push_update(&mut updates, "t", &history, false, &mut sent);
+        push_update(&mut updates, "t", &history, false, &mut sent, None);
         assert_eq!(updates.take_stale(), vec![other]);
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: an update this runner took in goes out saying how long it held it, in every
+    /// frame of it (a long one goes in parts), at least the time since its session handed it on, and each frame reads
+    /// as its part of the update once that's read off. A stream's snapshot, the session as it stands, says none.
+    #[test]
+    fn g10_s5_an_update_taken_in_says_how_long_the_runner_held_it() -> anyhow::Result<()> {
+        let mut updates = crate::wire::uplink::Updates::new("boot");
+        // The link up and the server's word in (it has nothing yet): what's pushed goes at the next poll.
+        updates.on_frame(crate::wire::channel::Frame::Have(Vec::new()));
+        let mut sent = SentChanges::default();
+        updates.start(&crate::wire::uplink::session_key("s"));
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(1, "as it stands".into())] }, true, &mut sent, None);
+        let long = Update::Events { events: (2..2000).map(|i| said(i, "x".repeat(2000))).collect() };
+        let parts = harness_frames("s", &long).len();
+        anyhow::ensure!(parts > 1, "{parts} part");
+        let held_for = Duration::from_millis(3);
+        let taken = Instant::now().checked_sub(held_for).ok_or_else(|| anyhow::anyhow!("no time 3 ms ago"))?;
+        push_update(&mut updates, "s", &long, false, &mut sent, Some(taken));
+        let mut said_held = Vec::new();
+        for f in updates.poll(Instant::now()) {
+            let crate::wire::channel::Frame::Item { body, .. } = f else { continue };
+            let Ok(AgentMsg::Harness { mut json, .. }) = proto::read_agent(&body) else { anyhow::bail!("not a session's update") };
+            said_held.push(crate::wire::stamp::take(&mut json));
+            anyhow::ensure!(matches!(serde_json::from_str::<Update>(&json), Ok(Update::Events { .. })), "its part of the update, once read off");
+        }
+        anyhow::ensure!(said_held.len() == 1 + parts, "{} frames", said_held.len());
+        anyhow::ensure!(said_held.first() == Some(&None), "the snapshot says none");
+        anyhow::ensure!(said_held.iter().skip(1).all(|h| h.is_some_and(|d| d >= held_for)), "each part at least {held_for:?}: {said_held:?}");
+        Ok(())
     }
 
     /// A file of a changeset with `lines` added lines, each about as long as a line of code.
@@ -5843,7 +5897,7 @@ mod tests {
             // The copy starts over (an Open on the stream): every file again.
             let mut updates = crate::wire::uplink::Updates::new("boot");
             updates.start(&crate::wire::uplink::session_key("s"));
-            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent);
+            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent, None);
             let again: Vec<crate::harness::model::FileChange> = sent.frames("s", &files, false).iter().filter_map(|f| match serde_json::from_str::<Update>(f) { Ok(Update::ChangesPatch { set, .. }) => Some(set), _ => None }).flatten().collect();
             anyhow::ensure!(again == files);
             Ok(())

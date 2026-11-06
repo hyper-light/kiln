@@ -23,6 +23,7 @@ use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
 use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
+use super::state_doc::StateDoc;
 use super::live::Viewer;
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
@@ -95,6 +96,7 @@ struct Changing {
 
 /// What's read of an entry without its JSON.
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 struct Head {
     id: Option<Box<str>>,
     seq: Option<u64>,
@@ -114,6 +116,173 @@ impl Head {
         let kind = s("kind").map(|k| KINDS.iter().find(|known| **known == k).map_or_else(|| std::borrow::Cow::Owned(k.to_owned()), |known| std::borrow::Cow::Borrowed(*known)));
         let file = (v.get("path").is_some() || v.get("tree").is_some()).then(|| Box::new((s("path").map(Box::from), s("tree").map(Box::from))));
         Self { id: s("id").map(Box::from), seq: v.get("seq").and_then(Value::as_u64), kind, main: v.get("parent").is_none_or(Value::is_null), file }
+    }
+
+    /// [`Head::of`] the JSON `text` holds, read from the text without making its tree (goal 9, plan 01a1a87b2cec
+    /// step 3). Each event of a compact chunk read again becomes an entry this way ([`Entry::from_text`]), often on a
+    /// runtime shard, where a poll may hold the shard for 266.7 µs at most; the tree allocated every string, map and
+    /// array of an event's JSON, a tool event's tens of KB of it, for a head of five fields. Only the top-level
+    /// object's `id`, `seq`, `kind`, `parent`, `path` and `tree` are taken; every other value is read through and
+    /// nothing of it kept. Each value is read as `Value` reads one (serde_json's `deserialize_any`), so what the tree
+    /// refuses this refuses, for [`Head::default`]: more than whitespace after the value, a number past f64's range,
+    /// a lone surrogate, nesting past serde_json's 128 levels. `serde::de::IgnoredAny` would take the last three:
+    /// serde_json's `ignore_value`, which it reads through with, checks none of them.
+    fn of_text(text: &str) -> Self {
+        use std::borrow::Cow;
+        use std::fmt;
+
+        use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+        /// How a value is read: the top-level one (an object's head fields taken), a head field's (a string kept),
+        /// or any other (read through, nothing kept).
+        #[derive(Clone, Copy)]
+        enum Look {
+            Top,
+            Field,
+            Through,
+        }
+
+        /// What's taken of a value: the top-level object's head, a head field's string, a number as `Value::as_u64`
+        /// takes one (an integer from 0 to u64::MAX), a null, or nothing.
+        enum Seen<'de> {
+            Object(Head),
+            Str(Cow<'de, str>),
+            U64(u64),
+            Null,
+            Other,
+        }
+
+        impl<'de> Seen<'de> {
+            fn text(self) -> Option<Cow<'de, str>> {
+                if let Seen::Str(s) = self { Some(s) } else { None }
+            }
+            fn number(self) -> Option<u64> {
+                if let Seen::U64(n) = self { Some(n) } else { None }
+            }
+        }
+
+        /// A top-level key: one of the head's, or another.
+        #[derive(Clone, Copy)]
+        enum Key {
+            Id,
+            Seq,
+            Kind,
+            Parent,
+            Path,
+            Tree,
+            Other,
+        }
+
+        /// Reads a top-level key, its escapes undone first, as the tree's map has its keys.
+        struct Keys;
+
+        impl<'de> DeserializeSeed<'de> for Keys {
+            type Value = Key;
+            fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Key, D::Error> {
+                d.deserialize_str(self)
+            }
+        }
+
+        impl<'de> Visitor<'de> for Keys {
+            type Value = Key;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_str<E: de::Error>(self, k: &str) -> Result<Key, E> {
+                Ok(match k {
+                    "id" => Key::Id,
+                    "seq" => Key::Seq,
+                    "kind" => Key::Kind,
+                    "parent" => Key::Parent,
+                    "path" => Key::Path,
+                    "tree" => Key::Tree,
+                    _ => Key::Other,
+                })
+            }
+        }
+
+        /// A kind as [`Head::of`] keeps it: one of `KINDS` without a copy.
+        fn kind(k: Cow<'_, str>) -> Cow<'static, str> {
+            KINDS.into_iter().find(|known| *known == k).map_or_else(|| Cow::Owned(k.into_owned()), Cow::Borrowed)
+        }
+
+        impl<'de> DeserializeSeed<'de> for Look {
+            type Value = Seen<'de>;
+            fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Seen<'de>, D::Error> {
+                d.deserialize_any(self)
+            }
+        }
+
+        impl<'de> Visitor<'de> for Look {
+            type Value = Seen<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Seen<'de>, E> {
+                Ok(Seen::Other)
+            }
+            // serde_json gives a negative integer only here.
+            fn visit_i64<E: de::Error>(self, n: i64) -> Result<Seen<'de>, E> {
+                Ok(u64::try_from(n).map_or(Seen::Other, Seen::U64))
+            }
+            fn visit_u64<E: de::Error>(self, n: u64) -> Result<Seen<'de>, E> {
+                Ok(Seen::U64(n))
+            }
+            // A number with a fraction or an exponent, -0, and an integer past u64::MAX or below i64::MIN: without its
+            // `arbitrary_precision`, which kiln's build hasn't, serde_json reads those as f64.
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Seen<'de>, E> {
+                Ok(Seen::Other)
+            }
+            fn visit_borrowed_str<E: de::Error>(self, s: &'de str) -> Result<Seen<'de>, E> {
+                Ok(if matches!(self, Look::Field) { Seen::Str(Cow::Borrowed(s)) } else { Seen::Other })
+            }
+            // A string with escapes, undone into serde_json's scratch buffer.
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Seen<'de>, E> {
+                Ok(if matches!(self, Look::Field) { Seen::Str(Cow::Owned(s.to_owned())) } else { Seen::Other })
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Seen<'de>, E> {
+                Ok(Seen::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Seen<'de>, A::Error> {
+                while seq.next_element_seed(Look::Through)?.is_some() {}
+                Ok(Seen::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Seen<'de>, A::Error> {
+                if !matches!(self, Look::Top) {
+                    while map.next_key_seed(Look::Through)?.is_some() {
+                        map.next_value_seed(Look::Through)?;
+                    }
+                    return Ok(Seen::Other);
+                }
+                // A key given more than once counts with its last value, as the tree's map keeps it.
+                let mut head = Head { main: true, ..Head::default() };
+                let (mut path, mut tree) = (None, None);
+                while let Some(key) = map.next_key_seed(Keys)? {
+                    let seen = map.next_value_seed(if matches!(key, Key::Id | Key::Kind | Key::Path | Key::Tree) { Look::Field } else { Look::Through })?;
+                    match key {
+                        Key::Id => head.id = seen.text().map(Box::from),
+                        Key::Seq => head.seq = seen.number(),
+                        Key::Kind => head.kind = seen.text().map(kind),
+                        Key::Parent => head.main = matches!(seen, Seen::Null),
+                        Key::Path => path = Some(seen.text()),
+                        Key::Tree => tree = Some(seen.text()),
+                        Key::Other => {}
+                    }
+                }
+                head.file = (path.is_some() || tree.is_some()).then(|| Box::new((path.flatten().map(Box::from), tree.flatten().map(Box::from))));
+                Ok(Seen::Object(head))
+            }
+        }
+
+        let mut json = serde_json::Deserializer::from_str(text);
+        let seen = Look::Top.deserialize(&mut json);
+        // Nothing but whitespace after the value, as `serde_json::from_str` has it.
+        match seen.and_then(|seen| json.end().map(|()| seen)) {
+            Ok(Seen::Object(head)) => head,
+            // A value that isn't an object: nothing found in it, `parent` among it.
+            Ok(_) => Head { main: true, ..Head::default() },
+            Err(_) => Head::default(),
+        }
     }
 
     /// [`Head::of`] an event's JSON, read from the event itself: its kind is its body's tag (`super::model::Body`
@@ -139,9 +308,9 @@ impl Entry {
     }
 
     /// An entry as `text`, its JSON, says (an event of a compact chunk read again): what's looked up of it
-    /// read from it.
+    /// read from the text, no tree made of it ([`Head::of_text`]).
     pub(super) fn from_text(text: &str) -> Self {
-        let head = serde_json::from_str::<Value>(text).map(|v| Head::of(&v)).unwrap_or_default();
+        let head = Head::of_text(text);
         crate::memory::SESSION_ENTRIES.add(text.len());
         Self { head, body: Body::Text(text.into()), sum: std::sync::OnceLock::new(), lean: std::sync::OnceLock::new() }
     }
@@ -348,10 +517,18 @@ pub(super) mod write {
         "[".len() + bytes + n.saturating_sub(1) * ",".len() + "]".len()
     }
 
-    /// `{"t":"<tag>","<key>":<value>}`: a meta, a state, a changeset.
+    /// `{"t":"<tag>","<key>":<value>}`: a meta, a changeset.
     pub fn value(w: &mut impl Write, tag: &str, key: &str, v: &Value, rev: Option<u64>) -> io::Result<()> {
         head(w, tag, Some(key))?;
         serde_json::to_writer(&mut *w, v)?;
+        tail(w, rev)
+    }
+
+    /// `{"t":"state","state":<state>}`, the state written out as its fields are kept (goal 9, plan 01a1a87b2cec
+    /// step 5): the bytes [`value`] wrote of its tree.
+    pub fn state(w: &mut impl Write, s: &super::StateDoc, rev: Option<u64>) -> io::Result<()> {
+        head(w, "state", Some("state"))?;
+        s.write(w)?;
         tail(w, rev)
     }
 
@@ -414,8 +591,9 @@ pub(super) mod write {
         tail(w, rev)
     }
 
-    /// `{"t":"state_patch","set":{…},"gone":[…]}`: `set` always, `gone` left out when empty.
-    pub fn state_patch(w: &mut impl Write, set: &[(&String, &Value)], gone: &[&String], rev: Option<u64>) -> io::Result<()> {
+    /// `{"t":"state_patch","set":{…},"gone":[…]}`: `set` always (each field's key and its value's JSON as the state
+    /// keeps it: `super::StateDoc::patch`), `gone` left out when empty.
+    pub fn state_patch(w: &mut impl Write, set: &[(&str, &[u8])], gone: &[&str], rev: Option<u64>) -> io::Result<()> {
         head(w, "state_patch", Some("set"))?;
         w.write_all(b"{")?;
         for (i, (k, v)) in set.iter().enumerate() {
@@ -424,7 +602,7 @@ pub(super) mod write {
             }
             serde_json::to_writer(&mut *w, k)?;
             w.write_all(b":")?;
-            serde_json::to_writer(&mut *w, v)?;
+            w.write_all(v)?;
         }
         w.write_all(b"}")?;
         if !gone.is_empty() {
@@ -483,7 +661,7 @@ pub struct Parts {
     /// it: goal 10, plan 01a1a87b2dae step 3).
     pub(super) info: Arc<Info>,
     pub(super) meta: Arc<Value>,
-    pub(super) state: Arc<Value>,
+    pub(super) state: Arc<StateDoc>,
     pub(super) changes: Option<Files>,
     pub(super) events: super::copies::Events,
     /// Since a revision: only the events changed after it (it begins with `resumed`). None: the
@@ -714,7 +892,7 @@ impl Snapshot {
                 w.write_all(head.as_bytes())
             }
             Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
-            Part::State => write::value(w, "state", "state", &p.state, None),
+            Part::State => write::state(w, &p.state, None),
             Part::Changes => match &p.changes {
                 Some(files) => write::changes(w, files.iter().map(|f| &**f), None),
                 None => Ok(()),
@@ -1089,17 +1267,6 @@ impl Frame {
     }
 }
 
-/// What changed in a state, for `{"t":"state_patch","set":{..},"gone":[..]}`: the top-level fields
-/// of `now` that differ from `was` (by reference: nothing copied), and those it no longer has. None
-/// when there is nothing to patch (no state before).
-#[allow(clippy::type_complexity)]
-pub(super) fn state_patch_of<'a>(was: &'a Value, now: &'a Value) -> Option<(Vec<(&'a String, &'a Value)>, Vec<&'a String>)> {
-    let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
-    let set = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).collect();
-    let gone = was.keys().filter(|k| !now.contains_key(*k)).collect();
-    Some((set, gone))
-}
-
 /// A changeset's file as its JSON names it ([`crate::harness::model::FileKey`]): its path, and
 /// the top of its working tree when it's in one. Borrowed from the file: naming a file makes nothing.
 pub(super) type FileRef<'a> = (Option<&'a str>, Option<&'a str>);
@@ -1296,8 +1463,9 @@ pub struct Registry {
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
-    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
-    waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
+    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id: one owner
+    /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal).
+    answers: super::answers::Answers,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
@@ -1483,7 +1651,7 @@ impl Registry {
             webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
-            waiting: Mutex::new(HashMap::new()),
+            answers: super::answers::Answers::new(WAITING_MAX),
             opening: Rcu::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
@@ -1748,8 +1916,8 @@ impl Registry {
                     let info = Arc::make_mut(&mut m.info);
                     info.name = if name.is_empty() { info.kind_name.clone() } else { name };
                     let named = json!(info.name);
-                    if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-                        o.insert("name".into(), named);
+                    if m.state.is_object() {
+                        Arc::make_mut(&mut m.state).set("name", &named);
                         m.commit(|m| m.state_frame());
                     } else {
                         m.commit(|_| None);
@@ -1814,12 +1982,11 @@ impl Registry {
             }
             let mut m = Mirror::new(info.clone(), Location::Machine(machine), Arc::clone(&self.bus));
             m.meta = Arc::new(u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null));
+            let mut state = StateDoc::of_value(&state);
+            state.set("status", &json!("disconnected"));
             m.state = Arc::new(state);
-            if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-                o.insert("status".into(), json!("disconnected"));
-            }
             // A conversation cleared since: what came before it is history, not its timeline.
-            let cleared = m.state.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+            let cleared = m.state.get::<u64>("cleared").unwrap_or(0);
             for e in events.into_iter().filter(|e| e.seq >= cleared) {
                 if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
                     let text = serde_json::to_string(&v).unwrap_or_default();
@@ -1972,6 +2139,29 @@ impl Registry {
         let mut v: Vec<Info> = Vec::new();
         self.sessions.each(|_, view| v.push(Info::clone(&view.info)));
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
+    /// [`Registry::list`], each info as its owner shares it with its view, none copied (goal 9, plan 01a1a87b2cec
+    /// step 5: `agents.list` copied every session's whole info to read a few fields of each).
+    pub fn list_shared(&self) -> Vec<Arc<Info>> {
+        let mut v: Vec<Arc<Info>> = Vec::new();
+        self.sessions.each(|_, view| v.push(Arc::clone(&view.info)));
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
+    /// The ids of the sessions whose target is `target` (`agent:<machine>`), in no order, none of their infos copied:
+    /// what a machine's runner processes may hold (goal 9, plan 01a1a87b2cec step 3: `crate::hub::Hub::runner_processes`
+    /// and `check_retire` copied every session's whole info, [`Registry::list`], to find them, the latter for each
+    /// machine with an older process).
+    pub fn ids_on(&self, target: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        self.sessions.each(|id, view| {
+            if view.info.target == target {
+                v.push(id.to_owned());
+            }
+        });
         v
     }
 
@@ -2134,6 +2324,7 @@ impl Registry {
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        self.room_for_rows(shipped).await;
         if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
         }
@@ -2144,8 +2335,19 @@ impl Registry {
     /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
         let id = r.session.clone();
+        self.room_for_rows(r.shipped).await;
         if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
             tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// Waits, before an update that makes rows (one whose machine doesn't keep it in a store it ships, `shipped`) is
+    /// handed to its owner, while the conversation store holds more of them than the owners' inboxes may hold
+    /// together (`super::copies::Copies::inboxes_bound`): the owner never waits for the store itself (goal 10, plan
+    /// 01a1a87b2dae step 5; `crate::convo::store::Store::room_within`), so what hands it updates does, past that.
+    async fn room_for_rows(&self, shipped: bool) {
+        if !shipped && let Some(store) = &self.convo {
+            store.room_within(self.sessions.inboxes_bound()).await;
         }
     }
 
@@ -2234,11 +2436,6 @@ impl Registry {
         let mut rows: Vec<crate::convo::rows::Row> = Vec::new();
         // How many of an update's events its turn took.
         let mut taken = 0;
-        let mut made: Option<Value> = match &u {
-            Update::State { state } => Some(serde_json::to_value(state).unwrap_or(Value::Null)),
-            Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
-            _ => None,
-        };
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
@@ -2309,6 +2506,16 @@ impl Registry {
             m.changes_sent = None;
             changed = true;
         }
+        // The chunk its owner last read back for a change, or tried: changed where it is, should it still be compact.
+        let thawed = s.thawed();
+        // The compact chunk this update's next event changes, to be read back off the shard first (goal 9, plan
+        // 01a1a87b2cec step 3: `super::copies::Shard::want_thaw`).
+        let mut thaw = None;
+        // The event of this session its owner last put in among its copy's events off the shard, or tried: one still to be
+        // put in is put in where it is. And this update's next event to be put in so: where it goes, and the copy's number
+        // (`super::copies::Shard::want_insert`).
+        let tried = s.tried_insert(id);
+        let mut insert = None;
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
@@ -2322,6 +2529,23 @@ impl Registry {
             }
             return None;
         };
+        // Its first event changes one in a compact chunk: nothing of it is taken yet, all of it the rest, once that chunk is
+        // read back off the shard (goal 9, plan 01a1a87b2cec step 3).
+        if let Update::Events { events } = &u
+            && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
+        // Its first event goes in under an older number than the copy's newest: the same, once the copy's events are made
+        // again with it in off the shard (goal 9, plan 01a1a87b2cec step 3).
+        if let Update::Events { events } = &u
+            && let Some((at, e)) = events.first().and_then(|e| m.insert_at(&e.id, e.seq).filter(|_| tried.as_deref() != Some(e.id.as_str())).map(|at| (at, e.clone())))
+        {
+            let rev = m.rev;
+            s.want_insert(id, at, e, rev);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
         m.rev = m.rev.saturating_add(1);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
@@ -2348,7 +2572,13 @@ impl Registry {
                 m.started_over();
             }
             Update::State { state } => {
-                m.state = Arc::new(made.take().unwrap_or(Value::Null));
+                // The same state as the copy's was made of, the copy's still that one: not made again; another is
+                // written once and kept by its fields, its keys the last one's (goal 9, plan 01a1a87b2cec step 5: a
+                // whole state made into a value tree was 0.45% of the process in rt7's calm profile, its patch's field
+                // compares 0.19%, the last tree let go 0.25%).
+                if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
+                    m.state = Arc::new(StateDoc::made(&**state, &m.state));
+                }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
                 let info = Arc::make_mut(&mut m.info);
@@ -2366,9 +2596,10 @@ impl Registry {
                     Naming::Keep => {
                         if let Some(n) = names.get(id) {
                             info.name.clone_from(n);
-                            // The state is the copy's own here (just made): nothing is copied.
-                            if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-                                o.insert("name".into(), json!(n));
+                            // Only where the state doesn't say it already: the copy's own when just made (nothing
+                            // copied), else the last one's, shared with its views, copied only to change.
+                            if m.state.is_object() && m.state.get::<String>("name").as_deref() != Some(n.as_str()) {
+                                Arc::make_mut(&mut m.state).set("name", &json!(n));
                             }
                         }
                     }
@@ -2388,12 +2619,18 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { .. } => {
-                let meta = made.take().unwrap_or(Value::Null);
-                if *m.meta == meta {
+            Update::Meta { meta } => {
+                // The same meta as the copy's was made of, the copy's still that value: the same again, not made
+                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5).
+                if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
                     meta_same = true;
                 } else {
-                    m.meta = Arc::new(meta);
+                    let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
+                    if *m.meta == meta {
+                        meta_same = true;
+                    } else {
+                        m.meta = Arc::new(meta);
+                    }
                 }
             }
             Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
@@ -2405,6 +2642,19 @@ impl Registry {
             }
             Update::Events { events } => {
                 for e in events {
+                    // One the copy has in a compact chunk: that chunk is read back off the shard before it's changed, and this
+                    // event and those after it are the rest, its owner's next (as when its turn is spent, below).
+                    if let Some(c) = m.thaw_for(&e.id, e.seq).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c))) {
+                        thaw = Some(c);
+                        break;
+                    }
+                    // One that goes in under an older number than the copy's newest: the copy's events are made again with
+                    // it in off the shard, and this event and those after it are the rest, so (goal 9, plan 01a1a87b2cec
+                    // step 3: every chunk was read again here).
+                    if let Some(at) = m.insert_at(&e.id, e.seq).filter(|_| tried.as_deref() != Some(e.id.as_str())) {
+                        insert = Some((at, e.clone(), m.rev));
+                        break;
+                    }
                     // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
                     let entry = Arc::new(if store.is_some() {
                         Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
@@ -2464,6 +2714,13 @@ impl Registry {
             Update::Meta { .. } if meta_same => None,
             _ => Some(m.frame_of(&u, &entries)),
         });
+        // What the copy's state or meta was made of, kept with the value as made (a name given here in it): the
+        // same one again finds it so (above).
+        match u {
+            Update::State { state } => m.state_of = Some((state, Arc::clone(&m.state))),
+            Update::Meta { meta } => m.meta_of = Some((meta, Arc::clone(&m.meta))),
+            _ => {}
+        }
         if gone {
             s.remove(id);
         }
@@ -2518,6 +2775,12 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get(id) {
             hub.emit_harness(id, m.info_encoded());
+        }
+        if let Some(c) = thaw {
+            s.want_thaw(id, c);
+        }
+        if let Some((at, e, rev)) = insert {
+            s.want_insert(id, at, e, rev);
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -3322,35 +3585,15 @@ impl Registry {
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
-    /// already (it isn't waited for).
-    fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
-        let mut w = self.waiting.lock();
-        if w.len() >= WAITING_MAX {
-            // Those whose senders went away (and no answer came for) go first.
-            w.retain(|_, v| {
-                v.retain(|tx| !tx.is_canceled());
-                !v.is_empty()
-            });
-            if w.len() >= WAITING_MAX {
-                return None;
-            }
-        }
-        let (tx, rx) = futures::channel::oneshot::channel();
-        w.entry((id.to_owned(), message.to_owned())).or_default().push(tx);
-        Some(rx)
+    /// already (it isn't waited for). Its wait reaches the waits' owner before the message goes.
+    async fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
+        self.answers.wait_for(id, message).await
     }
 
     /// No longer waiting for message `message` sent to session `id`: the waits whose ends were
     /// dropped go (an answer for those still waiting still reaches them).
     fn unwait(&self, id: &str, message: &str) {
-        let mut w = self.waiting.lock();
-        let key = (id.to_owned(), message.to_owned());
-        if let Some(v) = w.get_mut(&key) {
-            v.retain(|tx| !tx.is_canceled());
-            if v.is_empty() {
-                w.remove(&key);
-            }
-        }
+        self.answers.unwait(id, message);
     }
 
     /// Session `id`'s inbox said what became of a message: whoever waits for it longest is told (each
@@ -3358,20 +3601,7 @@ impl Registry {
     /// taken and one refused, are each told their own).
     fn answered(&self, id: &str, said: Said) {
         crate::metrics::sends().said(&said);
-        let key = (id.to_owned(), said.message.clone());
-        let first = {
-            let mut w = self.waiting.lock();
-            let Some(v) = w.get_mut(&key) else { return };
-            v.retain(|tx| !tx.is_canceled());
-            let first = (!v.is_empty()).then(|| v.remove(0));
-            if v.is_empty() {
-                w.remove(&key);
-            }
-            first
-        };
-        if let Some(tx) = first {
-            let _ = tx.send(said);
-        }
+        self.answers.answered(id, said);
     }
 
     /// The answer to message `message` sent to session `id`, once it comes (by [`ANSWER_WAIT`]
@@ -3554,7 +3784,10 @@ impl Registry {
         let epoch = self.epoch_of(id);
         match loc {
             Location::Local => {
-                let wait = message.as_deref().and_then(|m| self.wait_for(id, m));
+                let wait = match message.as_deref() {
+                    Some(m) => self.wait_for(id, m).await,
+                    None => None,
+                };
                 if !self.local.command_at(id, c, Some(epoch)) {
                     // Not waited for after all: its end of the wait goes first, then the wait.
                     drop(wait);
@@ -3602,7 +3835,7 @@ impl Registry {
                     return Pending::Now(Sent::Unreachable);
                 }
                 if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
-                    let wait = self.wait_for(id, &m);
+                    let wait = self.wait_for(id, &m).await;
                     if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {
                         drop(wait);
                         self.unwait(id, &m);
@@ -3636,7 +3869,7 @@ impl Registry {
     /// count: that machine lets go of it if it comes back. Ok once the package is on its way.
     pub async fn resume_on(&self, hub: &Hub, id: &str, to: &str, cwd: Option<String>) -> Result<(), String> {
         let store = self.convo.clone().ok_or_else(|| "this server keeps no conversations (KILN_CONVERSATIONS is off)".to_owned())?;
-        let (from, epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.state.get("epoch").and_then(Value::as_u64).unwrap_or(0))).ok_or_else(|| "no such agent session".to_owned())?;
+        let (from, epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.state.get::<u64>("epoch").unwrap_or(0))).ok_or_else(|| "no such agent session".to_owned())?;
         let from_name = match &from {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
@@ -3652,16 +3885,21 @@ impl Registry {
         }
         let (st, i, f) = (store.clone(), id.to_owned(), from_name.clone());
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
-        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .map_err(|e| format!("{e:#}"))?;
+        // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
+        // plan 01a1a87b2cec step 3).
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)).map(|p| {
+            let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
+            (p, t)
+        }))
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .map_err(|e| format!("{e:#}"))?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
         let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
-        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, timeline, &why).await {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
@@ -3719,7 +3957,7 @@ impl Registry {
             let core = s.core.lock();
             (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
         };
-        let had = self.sessions.with(id, |v| v.state.get("epoch").and_then(Value::as_u64)).flatten().unwrap_or(0);
+        let had = self.sessions.with(id, |v| v.state.get::<u64>("epoch")).flatten().unwrap_or(0);
         let next = had.max(state.epoch) + 1;
         state.epoch = next - 1;
         let from_cwd = state.cwd.clone();
@@ -3793,7 +4031,7 @@ impl Registry {
     pub fn state(&self, id: &str) -> Option<State> {
         // Read from its view (no copy of it made).
         let state = self.sessions.with(id, |v| Arc::clone(&v.state))?;
-        State::deserialize(&*state).ok()
+        state.read::<State>()
     }
 
     /// A session as lists show it.
@@ -3801,10 +4039,16 @@ impl Registry {
         self.sessions.with(id, |v| Info::clone(&v.info))
     }
 
+    /// [`Registry::info`] as its owner shares it with its view, not copied (goal 9, plan 01a1a87b2cec step 3: what
+    /// reads a few fields of a session found by id, the programs' thresholds and the goal stacks' words said again).
+    pub fn info_shared(&self, id: &str) -> Option<Arc<Info>> {
+        self.sessions.with(id, |v| Arc::clone(&v.info))
+    }
+
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
     pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
         let Some(state) = self.sessions.with(id, |v| Arc::clone(&v.state)) else { return Vec::new() };
-        state.get("queue").and_then(|q| Vec::<super::model::QueueItem>::deserialize(q).ok()).unwrap_or_default()
+        state.get::<Vec<super::model::QueueItem>>("queue").unwrap_or_default()
     }
 
     /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
@@ -3816,7 +4060,7 @@ impl Registry {
             (Arc::clone(&v.state), reply, v.changes.clone())
         })?;
         let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
-        Some((Value::clone(&state), reply.map(|e| e.value()), changes))
+        Some((state.to_value(), reply.map(|e| e.value()), changes))
     }
 
     /// Tests: session `id`'s changeset, as its machine would report it.
@@ -3844,8 +4088,8 @@ impl Registry {
 /// A copy whose machine (or runner process) went away: said disconnected, to its viewers too.
 fn disconnected(m: &mut Mirror) -> Info {
     Arc::make_mut(&mut m.info).status = Status::Disconnected;
-    if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-        o.insert("status".into(), json!("disconnected"));
+    if m.state.is_object() {
+        Arc::make_mut(&mut m.state).set("status", &json!("disconnected"));
     }
     m.commit(|m| m.state_frame());
     Info::clone(&m.info)
@@ -3943,20 +4187,20 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let gone = r.wait_for("s1", "m1");
-            let kept = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let gone = r.wait_for("s1", "m1").await;
+            let kept = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             drop(gone);
             r.unwait("s1", "m1");
-            assert_eq!(r.waiting.lock().get(&("s1".to_owned(), "m1".to_owned())).map(Vec::len), Some(1), "the one still waiting stays");
+            assert_eq!(r.answers.held().await, Some(1), "the one still waiting stays");
             let said = Said { message: "m1".into(), answer: Err(inbox::Refusal::NoSession { session: "s1".into() }) };
             r.answered("s1", said.clone());
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             assert_eq!(kept.await.ok(), Some(said));
             // Given up before any answer: nothing is left.
-            let w = r.wait_for("s2", "m2");
+            let w = r.wait_for("s2", "m2").await;
             drop(w);
             r.unwait("s2", "m2");
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
@@ -3970,15 +4214,15 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let first = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
-            let second = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let first = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let second = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             let taken = Said { message: "m1".into(), answer: Ok(inbox::Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 7, repeat: false }) };
             let reused = Said { message: "m1".into(), answer: Err(inbox::Refusal::Reused { session: "s1".into(), message: "m1".into() }) };
             r.answered("s1", taken.clone());
             r.answered("s1", reused.clone());
             assert_eq!(first.await.ok(), Some(taken));
             assert_eq!(second.await.ok(), Some(reused));
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
@@ -3995,7 +4239,7 @@ mod tests {
 
     /// A copy's state, set as its runner's would be.
     fn set_state(m: &mut Mirror, v: Value) {
-        m.state = Arc::new(v);
+        m.state = Arc::new(StateDoc::of_value(&v));
     }
 
     /// A copy's changeset as JSON (null before it has one).
@@ -4067,7 +4311,8 @@ mod tests {
             let written = |f: &dyn Fn(&mut Vec<u8>) -> std::io::Result<()>| write::string(64, |b| f(b));
             assert_eq!(written(&|b| write::events(b, [&e, &e], rev)), say(SessionFrame::Events { events: vec![odd.clone(), odd.clone()] }));
             assert_eq!(written(&|b| write::events(b, std::iter::empty::<&Entry>(), rev)), say(SessionFrame::Events { events: Vec::new() }));
-            assert_eq!(written(&|b| write::value(b, "state", "state", &odd, rev)), say(SessionFrame::State { state: odd.clone() }));
+            assert_eq!(written(&|b| write::state(b, &StateDoc::of_value(&odd), rev)), say(SessionFrame::State { state: odd.clone() }));
+            assert_eq!(written(&|b| write::state(b, &StateDoc::default(), rev)), say(SessionFrame::State { state: Value::Null }));
             assert_eq!(written(&|b| write::value(b, "meta", "meta", &odd, rev)), say(SessionFrame::Meta { meta: odd.clone() }));
             assert_eq!(written(&|b| write::changes(b, fs.iter(), rev)), say(SessionFrame::Changes { files: Value::Array(files.to_vec()) }));
             let set: Vec<&Entry> = fs.iter().collect();
@@ -4076,10 +4321,12 @@ mod tests {
             assert_eq!(written(&|b| write::changes_patch(b, set.get(..1).unwrap_or_default(), &[], rev)), say(SessionFrame::ChangesPatch { set: files.get(..1).unwrap_or_default().to_vec(), gone: Vec::new() }));
             assert_eq!(written(&|b| write::stream(b, "e\"1", "}\n☃", rev)), say(SessionFrame::Stream { id: "e\"1".into(), text: "}\n☃".into() }));
             let (was, now) = (json!({"a": 1, "b": {"c": 2}, "gone": 3}), json!({"a": 1, "b": {"c": 4}, "new\"": [5]}));
-            let (set, gone) = state_patch_of(&was, &now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
-            let want = SessionFrame::StatePatch { set: set.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect(), gone: gone.iter().map(|k| (*k).clone()).collect() };
+            let (was, now) = (StateDoc::of_value(&was), StateDoc::of_value(&now));
+            let (set, gone) = now.patch(&was).ok_or_else(|| anyhow::anyhow!("no patch"))?;
+            let set_values = set.iter().map(|(k, v)| Ok(((*k).to_owned(), serde_json::from_slice(v)?))).collect::<anyhow::Result<serde_json::Map<String, Value>>>()?;
+            let want = SessionFrame::StatePatch { set: set_values, gone: gone.iter().map(|k| (*k).to_owned()).collect() };
             assert_eq!(written(&|b| write::state_patch(b, &set, &gone, rev)), say(want));
-            let (set, gone) = state_patch_of(&now, &now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
+            let (set, gone) = now.patch(&now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
             assert_eq!(written(&|b| write::state_patch(b, &set, &gone, rev)), say(SessionFrame::StatePatch { set: serde_json::Map::new(), gone: Vec::new() }));
             // An entry's text is serde_json's, and its digest the one the runner makes of it.
             assert_eq!(e.text(), serde_json::to_string(&odd)?);
@@ -4104,7 +4351,7 @@ mod tests {
         // A reply's words still go to its event, at the revision they came.
         let last = format!("e{n}");
         took(&mut m, |m| m.append(&last, "more"));
-        let at = m.index.get(last.as_str()).copied().unwrap_or(usize::MAX);
+        let at = m.index.get(&m.events, &last).unwrap_or(usize::MAX);
         assert_eq!(m.events.get(at).and_then(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned)).as_deref(), Some("xmore"));
         assert_eq!(m.events.get(at).map(|e| e.entry.text().contains("xmore")), Some(true), "its text written again");
         assert_eq!(m.events.get(at).map(|e| e.at), Some(m.rev), "changed at the revision it came");
@@ -4234,7 +4481,7 @@ mod tests {
         assert!(first.patch.is_none());
         assert_eq!(first.for_viewer(STATE), first.for_viewer(WHOLE));
         let whole: Value = serde_json::from_str(second.for_viewer(WHOLE))?;
-        assert_eq!(whole, json!({"t": "state", "state": *m.state, "rev": second.rev}));
+        assert_eq!(whole, json!({"t": "state", "state": m.state.to_value(), "rev": second.rev}));
         // As what changed: the activity set, the pause gone, the skills (most of it) left out.
         let patch: Value = serde_json::from_str(second.for_viewer(STATE))?;
         assert_eq!(patch, json!({"t": "state_patch", "set": {"activity": "editing"}, "gone": ["pause"], "rev": second.rev}));
@@ -4248,7 +4495,7 @@ mod tests {
         for k in patch.get("gone").and_then(Value::as_array).into_iter().flatten() {
             had.remove(k.as_str().unwrap_or_default());
         }
-        assert_eq!(Value::Object(had.clone()), *m.state);
+        assert_eq!(Value::Object(had.clone()), m.state.to_value());
         Ok(())
     }
 
@@ -4276,14 +4523,14 @@ mod tests {
         let (_viewer, at) = m.feed.attach(Patches::default());
         let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
         let snapshot = Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
-        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": *m.state}))));
+        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state.to_value()}))));
         set_state(&mut m, json!({"status": "idle"}));
         m.commit(|m| m.state_frame());
         let frames = on_feed(&bus, &m, at)?;
         let [frame] = frames.as_slice() else { anyhow::bail!("{} frames on the feed", frames.len()) };
         // A field that appeared while nobody watched is absent from the whole state too.
         assert!(frame.patch.is_none());
-        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(STATE))?, json!({"t": "state", "state": *m.state, "rev": frame.rev}));
+        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(STATE))?, json!({"t": "state", "state": m.state.to_value(), "rev": frame.rev}));
         Ok(())
     }
 
@@ -4425,6 +4672,63 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the same state again from its machine isn't made into a value while the
+    /// copy's is still the one made of it: the copy keeps that one (its revision moves, no frame goes), and its
+    /// view holds what making it again would. Changed here since (a name given here), it's made again, the name in
+    /// it, and the same again after that keeps that one; a changed state is made anew. The same meta again
+    /// keeps the copy's.
+    #[test]
+    fn g9_s5_the_same_state_again_isnt_made_into_a_value() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            // The copy's state and meta values, by where they are, and its revision.
+            let held = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| (Arc::as_ptr(&m.state) as usize, Arc::as_ptr(&m.meta) as usize, m.rev))).await.flatten().unwrap_or_default() };
+            let viewed = || hub.harness.sessions.view("s").map(|v| v.state.to_value()).unwrap_or_default();
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (made, _, rev) = held().await;
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "the first state's frame");
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (again, _, rev_again) = held().await;
+            anyhow::ensure!(again == made && rev_again == rev + 1, "the same state again: kept ({made:#x} then {again:#x}), its revision {rev} then {rev_again}");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty() && viewed() == serde_json::to_value(&state)?, "no frame, and the view as made again: {heard:?}");
+            // A name given here changes the copy's state: the same state again is made again, the name in it.
+            hub.harness.rename(&hub, "s", Some(&json!("parser"))).await;
+            let (renamed, _, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (remade, _, _) = held().await;
+            let mut named = serde_json::to_value(&state)?;
+            if let Some(o) = named.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(remade != renamed && viewed() == named, "made again after the name: {}", viewed());
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            anyhow::ensure!(held().await.0 == remade && viewed() == named, "the same again after that: kept, the name in it");
+            // A changed state: made anew.
+            let changed = State { doing: Some("Running cargo test".into()), ..state };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(changed.clone()) }).await;
+            let mut want = serde_json::to_value(&changed)?;
+            if let Some(o) = want.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(held().await.0 != remade && viewed() == want, "a changed state made anew: {}", viewed());
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f.contains("Running cargo test")), "its frame went");
+            // The same meta again: the copy's kept.
+            let meta = Meta { version: "2.1".into(), ..Meta::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            let (_, meta_made, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
             Ok(())
         })
     }
@@ -4932,7 +5236,7 @@ mod tests {
             for id in ids.clone() {
                 let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
                 crate::rt::spawn_spread(async move {
-                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None };
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None };
                     let mut n = 0u64;
                     while n < per {
                         let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
@@ -5109,6 +5413,180 @@ mod tests {
             // Its row is the one the event written out again makes.
             assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an entry's head read from its text alone ([`Head::of_text`], no tree made) is
+    /// what its JSON's tree says of it ([`Head::of`]), for any text: every kind of event as it's written out, with a
+    /// parent and without, and tool events whose input and output hold an id, a number and a parent of their own; a
+    /// changeset's files; and texts where a reading of the text alone could part from the tree's: values that aren't
+    /// objects, text that isn't JSON or has more after it, fields of other types or given twice, numbers past u64, i64
+    /// and f64, escapes and lone surrogates, nesting to serde_json's limit and past it.
+    #[test]
+    fn g9_s3_an_entrys_head_read_from_its_text_is_what_its_tree_said() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, FileChange, FilePlace, Hunk, ToolCall};
+        let mut events = every_kind_of_event();
+        // Each tool event again, its input and its output (some 60 KB of JSON written in JSON) holding an id, a number,
+        // a parent, a kind, a path and a tree of their own.
+        let inner = json!({"id": "inner", "seq": 99, "parent": "p", "kind": "user", "path": "a", "tree": "t", "deeper": [{"id": "deeper", "seq": 7, "parent": null, "path": null}]});
+        let held: Vec<Event> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::Tool(call) => Some(Event { id: format!("{}-held", e.id), body: Body::Tool(Box::new(ToolCall { input: inner.clone(), output: Some(inner.to_string().repeat(400)), ..(**call).clone() })), ..e.clone() }),
+                _ => None,
+            })
+            .collect();
+        assert!(held.iter().any(|e| e.parent.is_some()) && held.iter().any(|e| e.parent.is_none()), "tool events with a parent and without");
+        events.extend(held);
+        let mut texts = Vec::new();
+        for e in &events {
+            let text = serde_json::to_string(e)?;
+            assert_eq!(Head::of_text(&text), Head::of_event(e), "event {}", e.id);
+            texts.push(text);
+        }
+        let file = FileChange {
+            path: "src/a.rs".into(),
+            tree: Some("/w/kiln".into()),
+            created: true,
+            deleted: false,
+            added: 2,
+            removed: 1,
+            hunks: vec![Hunk { old_start: 1, old_lines: 1, new_start: 1, new_lines: 2, lines: vec!["-a".into(), "+b".into(), "+\"c\"".into()] }],
+            truncated: false,
+            at: 1_793_800_000_000,
+            by: vec!["main".into(), "t1".into()],
+            place: Some(FilePlace::Project),
+        };
+        texts.push(serde_json::to_string(&file)?);
+        texts.push(serde_json::to_string(&FileChange { tree: None, by: Vec::new(), place: None, ..file })?);
+        let edges = [
+            // Values that aren't objects: nothing found in them, on the main thread.
+            "null", "5", "-1", "1.5", "true", "\"s\"", r#""{\"id\":\"x\"}""#, "[]", r#"[1,{"id":"x"}]"#, r#"[{"id":"x","seq":1,"parent":"p"}]"#, "{}", " {} ",
+            // Text that isn't JSON, or has more than whitespace after its value.
+            "", " ", "{", "}", "[", "nul", "tru", "-", "01", "1.", ".5", "+1", "1e", r#"{"id":}"#, r#"{"id":"a",}"#, "[1,]", "[,1]", r#"{"id" "a"}"#, r#"{"id":"a" "seq":1}"#,
+            "{'id':'a'}", "{id:\"a\"}", "{1:2}", r#"{"id":"a"} x"#, r#"{"id":"a"}}"#, r#"{"id":"a"} {}"#, r#"{"id":"a"},"#, "{\"id\":\"a\"}\u{0}", "\u{feff}{\"id\":\"a\"}",
+            r#"{"id":"a","x":01}"#, r#"{"id":"a","x":1.}"#, r#"{"id":"a","x":-}"#, r#"{"id":"a","x":NaN}"#, r#"{"id":"a"/*c*/}"#, r#"{"id":"a}"#, "{\"id\":\"a\tb\"}",
+            // Whitespace around and between, and after the value.
+            " { \"id\" : \"a\" ,\n\t\"seq\" : 1 ,\r\n \"parent\" : null } ", "{\"id\":\"a\"}\n",
+            // Each field of another type than it's read as.
+            r#"{"id":5,"seq":"5","kind":7,"parent":false,"path":3,"tree":[]}"#,
+            r#"{"id":null,"seq":null,"kind":null,"parent":0,"path":{},"tree":true}"#,
+            r#"{"id":["a"],"seq":true,"kind":{"kind":"user"},"parent":"","path":[null]}"#,
+            r#"{"id":{"id":"x"},"seq":[1],"parent":[],"tree":"t"}"#,
+            r#"{"parent":{}}"#,
+            // A field given twice: its last value counts.
+            r#"{"id":"a","id":"b"}"#, r#"{"id":"a","id":5}"#, r#"{"id":5,"id":"a"}"#, r#"{"seq":1,"seq":"x"}"#, r#"{"seq":"x","seq":2}"#, r#"{"seq":1,"seq":-1}"#,
+            r#"{"kind":"user","kind":"x"}"#, r#"{"kind":"x","kind":"tool"}"#, r#"{"parent":"p","parent":null}"#, r#"{"parent":null,"parent":"p"}"#,
+            r#"{"path":"a","path":5}"#, r#"{"tree":null,"tree":"t"}"#,
+            // Nulls: a null path or tree is there, a null parent is none.
+            r#"{"path":null}"#, r#"{"tree":null}"#, r#"{"path":"a","tree":null}"#, r#"{"parent":null}"#, r#"{"id":"a","parent":null,"path":null,"tree":null}"#,
+            // Numbers: only an integer from 0 to u64::MAX is a seq.
+            r#"{"seq":0}"#, r#"{"seq":-1}"#, r#"{"seq":-0}"#, r#"{"seq":1.0}"#, r#"{"seq":1e3}"#, r#"{"seq":1E3}"#, r#"{"seq":5e-1}"#, r#"{"seq":0.0}"#,
+            r#"{"seq":18446744073709551615}"#, r#"{"seq":18446744073709551616}"#, r#"{"seq":-9223372036854775808}"#, r#"{"seq":-9223372036854775809}"#,
+            r#"{"seq":99999999999999999999999}"#, r#"{"seq":1e400}"#,
+            // Numbers past f64's range, which the tree refuses wherever they are, and numbers near it.
+            r#"{"id":"a","x":1e400}"#, r#"{"id":"a","x":-1e400}"#, r#"{"id":"a","x":1.8e308}"#, r#"{"id":"a","x":1.7976931348623157e308}"#, r#"{"id":"a","x":1e-400}"#,
+            r#"{"id":"a","x":0e999999999999}"#, r#"{"id":"a","x":1e999999999999}"#, r#"{"id":"a","x":[1e400]}"#,
+            // Escapes, characters past ASCII as they are, and lone surrogates, which the tree refuses wherever they are.
+            r#"{"id":"a\"bé"}"#, r#"{"id":"\n\t\\\/\b\f\r"}"#, r#"{"id":"😀","path":"é"}"#, "{\"id\":\"é\u{1F600}\u{7f}\"}",
+            r#"{"id":"\ud800"}"#, r#"{"id":"a","x":"\ud800"}"#, r#"{"id":"a","x":"\udc00"}"#, r#"{"id":"a","x":"\ud800A"}"#, r#"{"id":"a","x":"\ud800x"}"#,
+            r#"{"id":"a","x":"\ud800\n"}"#, r#"{"id":"a","\ud800":1}"#, r#"{"id":"a","x":"\u12"}"#, r#"{"id":"a","x":"\q"}"#,
+            // Head fields inside other values: only the top-level object's count.
+            r#"{"x":{"id":"inner","seq":1,"parent":"p","kind":"user","path":"a","tree":"b"}}"#,
+            r#"{"a":[{"id":"x","parent":"y"}],"id":"outer","b":{"seq":3,"kind":"tool"}}"#,
+        ];
+        texts.extend(edges.map(str::to_owned));
+        // `\u` escapes, each written here as `~` and its four digits, in values and in keys: undone before a key is
+        // compared or a string kept, a pair of surrogates read as one character, two leading surrogates refused.
+        let unicode = |t: &str| t.replace('~', concat!("\\", "u"));
+        let escaped = [
+            r#"{"id":"~00e9~0022","kind":"us~0065r","seq":2}"#,
+            r#"{"kind":"t~006fol","id":"t~0031","parent":"~0070"}"#,
+            r#"{"i~0064":"x","~0073eq":3,"p~0061rent":"q","p~0061th":"f","tre~0065":"g","kin~0064":"n~006ftice"}"#,
+            r#"{"id":"~d83d~de00","path":"~D83D~DE00","p~0061rent":null}"#,
+            r#"{"id":"a","x":"~d800~0041"}"#,
+            r#"{"id":"a","x":"~d800~d800"}"#,
+            r#"{"id":"a","x":"~zzzz"}"#,
+        ];
+        texts.extend(escaped.map(unicode));
+        // Nesting to serde_json's limit (128 levels, the top's among them) and past it: at the top, in a value read
+        // through, in a head field.
+        for n in [1, 64, 126, 127, 128, 200] {
+            let (open, close, objects, ends) = ("[".repeat(n), "]".repeat(n), r#"{"a":"#.repeat(n), "}".repeat(n));
+            texts.extend([
+                format!("{open}{close}"),
+                format!(r#"{{"id":"a","x":{open}{close}}}"#),
+                format!(r#"{{"id":"a","parent":{open}{close},"seq":1}}"#),
+                format!(r#"{{"id":"a","x":{objects}1{ends}}}"#),
+                format!(r#"{objects}{{"id":"a"}}{ends}"#),
+            ]);
+        }
+        texts.push("[".repeat(300));
+        // An integer of 400 digits, past f64's range, and a fraction of as many, not.
+        let digits = "9".repeat(400);
+        texts.extend([format!(r#"{{"id":"a","x":{digits}}}"#), format!(r#"{{"id":"a","x":-{digits}}}"#), format!(r#"{{"seq":{digits}}}"#), format!(r#"{{"id":"a","x":0.{digits}}}"#)]);
+        for t in &texts {
+            let tree = serde_json::from_str::<Value>(t).map(|v| Head::of(&v)).unwrap_or_default();
+            assert_eq!(Head::of_text(t), tree, "{t}");
+        }
+        // A few said outright, so the comparison isn't only of heads with nothing in them.
+        assert_eq!(
+            Head::of_text(r#"{"x":{"id":"inner","parent":"p"},"id":"a\"bé","seq":18446744073709551615,"kind":"tool","parent":null,"path":null}"#),
+            Head { id: Some("a\"bé".into()), seq: Some(u64::MAX), kind: Some("tool".into()), main: true, file: Some(Box::new((None, None))) }
+        );
+        assert_eq!(
+            Head::of_text(r#"{"id":"b","seq":18446744073709551616,"kind":"other","parent":"","tree":"t"}"#),
+            Head { id: Some("b".into()), seq: None, kind: Some("other".into()), main: false, file: Some(Box::new((None, Some("t".into())))) }
+        );
+        assert_eq!(Head::of_text("[1,2]"), Head { main: true, ..Head::default() });
+        assert_eq!(
+            Head::of_text(&unicode(r#"{"i~0064":"x~0022","~0073eq":3,"kin~0064":"t~006fol","p~0061rent":"q","p~0061th":"f"}"#)),
+            Head { id: Some("x\"".into()), seq: Some(3), kind: Some("tool".into()), main: false, file: Some(Box::new((Some("f".into()), None))) }
+        );
+        // What `IgnoredAny` reads through, refused as the tree refuses it.
+        let deep = |n: usize| format!(r#"{{"id":"a","x":{}{}}}"#, "[".repeat(n), "]".repeat(n));
+        assert_eq!(Head::of_text(&deep(1)).id.as_deref(), Some("a"));
+        for refused in [r#"{"id":"a","x":1e400}"#.to_owned(), r#"{"id":"a","x":"\ud800"}"#.to_owned(), deep(200)] {
+            assert_eq!(Head::of_text(&refused), Head::default(), "{refused}");
+        }
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's owner never waits for the conversation store. With the store past
+    /// its writer's bound, one update after another is taken by the owner and its copy has them (the owner waited
+    /// between turns, so the second waited for the writer); only once the store holds as much as the owners' inboxes
+    /// may does what hands it updates wait, and goes on as the writer lets rows go.
+    #[test]
+    fn g10_s5_an_owner_never_waits_for_the_conversation_store() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let Some(store) = hub.harness.convo.clone() else { anyhow::bail!("the scratch hub keeps no conversations") };
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Update::Events { events: vec![Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let q = store.queue();
+            // Past the writer's own bound, within the inboxes'.
+            let past = q.bound().saturating_add(1);
+            q.pretend_waiting(past);
+            let within = std::time::Duration::from_secs(10);
+            for n in 1..=2 {
+                crate::rt::timeout(within, hub.harness.ingest(&hub, &there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
+            }
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
+            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
+            let more = hub.harness.sessions.inboxes_bound();
+            q.pretend_waiting(more);
+            {
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&hub, &there, "s", said(3), false));
+                anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "past what the inboxes may hold: it waits");
+                q.pretend_written(more);
+                crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
+            }
+            q.pretend_written(past);
+            hub.harness.sessions.applied("s").await;
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2", "m3"], "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at

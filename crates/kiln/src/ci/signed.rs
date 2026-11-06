@@ -137,7 +137,8 @@ async fn hand_to_runner(hub: &Hub, job: &str, leg: &str, things: Vec<statement::
     for t in things {
         let body = Body { to: Some(runner.clone()), why: format!("leg {job}'s {}, {why}", t.name), ..Body::new(Kind::HandedOn, &server) };
         let s = statement::Statement { subject: vec![t], ..statement::Statement::new(to_value(&body)) };
-        let bundle = crate::custody::server_signed(&hub.pki, &s)?;
+        // Signed on the compute pool, off the shards, each in its turn (goal 9, plan 01a1a87b2cec step 3).
+        let bundle = crate::custody::server_signed_off(&hub.pki, s).await?;
         match crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", at).await? {
             Ok(_) => out.push(bundle),
             Err(why) => tracing::warn!(target: "kiln.custody", job, %why, "kiln refused its own hand-on of a leg's input"),
@@ -279,15 +280,23 @@ async fn take(hub: &Hub, machine: &str, job: &str, all: Vec<Value>) -> anyhow::R
     let id = job.to_owned();
     let current: i64 = hub.store.call(move |c| Ok(c.query_row("SELECT attempt FROM jobs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.unwrap_or(0))).await?;
     let server = server_uri(hub)?;
-    let against = Against::of(hub, job).await?;
+    let against = std::sync::Arc::new(Against::of(hub, job).await?);
+    // Every record checked on the compute pool, in one job, off the shards (goal 9, plan 01a1a87b2cec step 3): each
+    // check a signature and its chain, a third of a millisecond, for each record a leg sends.
+    let (pki, a) = (std::sync::Arc::clone(&hub.pki), std::sync::Arc::clone(&against));
+    let (all, checks) = crate::rt::compute(move || {
+        let checks: Vec<_> = all.iter().map(|b| a.check(&pki.ca_der, b, at)).collect();
+        (all, checks)
+    })
+    .await?;
     let mut rows = Vec::new();
     let mut hand_on = None;
     // Its custody records, kept in kiln's custody too when its receipts follow its runner's
     // hand-ons (docs/ci.md W27-R08), so a walk from what it made goes back through it to what kiln
     // handed its runner; a runner from before them signs receipts following only the delegation.
     let (mut custody, mut follows_runner) = (Vec::new(), true);
-    for b in all {
-        let (row, checked) = match against.check(hub, &b, at) {
+    for (b, checked) in all.into_iter().zip(checks) {
+        let (row, checked) = match checked {
             Ok(u) => {
                 let c = &u.statement;
                 let why = match whose(hub, machine, job, c).await? {
@@ -365,7 +374,10 @@ async fn receipt(hub: &Hub, job: &str, attempt: i64, h: &statement::Checked, ser
     if had {
         return Ok(None);
     }
-    let signed = crate::identities::sign_as(&hub.pki, "server", statement::PAYLOAD_CUSTODY, &payload)?;
+    // Signed on the blocking pool, the server's key and certificate read from their files there (goal 9, plan
+    // 01a1a87b2cec step 3).
+    let pki = std::sync::Arc::clone(&hub.pki);
+    let signed = crate::rt::blocking(move || crate::identities::sign_as(&pki, "server", statement::PAYLOAD_CUSTODY, &payload)).await??;
     let bundle = signed.to_string();
     let words = Identity::parse(server).map(|i| i.to_string()).unwrap_or_else(|_| server.to_owned());
     let (j, s, at) = (job.to_owned(), server.to_owned(), crate::util::now_unix());
@@ -398,10 +410,11 @@ impl Against {
         Ok(Self { revocations: crate::identities::revocations(&hub.store).await?, delegations: crate::identities::delegations_of(&hub.store, job).await? })
     }
 
-    /// A leg's statement `bundle` checked as kiln took it at `at`, against kiln's root, through
-    /// the leg's delegations: who signed it, under which, or why it isn't taken.
-    fn check(&self, hub: &Hub, bundle: &Value, at: i64) -> Result<statement::Under, statement::Refusal> {
-        statement::verify_under(bundle, &hub.pki.ca_der, &self.revocations, at, |d| self.delegations.get(d).cloned())
+    /// A leg's statement `bundle` checked as kiln took it at `at`, against kiln's root `root`, through
+    /// the leg's delegations: who signed it, under which, or why it isn't taken. On the thread it's
+    /// called on: a compute job's (goal 9, plan 01a1a87b2cec step 3).
+    fn check(&self, root: &[u8], bundle: &Value, at: i64) -> Result<statement::Under, statement::Refusal> {
+        statement::verify_under(bundle, root, &self.revocations, at, |d| self.delegations.get(d).cloned())
     }
 }
 
@@ -510,18 +523,28 @@ pub async fn judged(hub: &Hub, job: &str) -> anyhow::Result<Option<Value>> {
     let server = server_uri(hub)?;
     // Each checked again as kiln took it: at the time it did, against the revocations as they
     // stand, the leg's under the delegation kiln's server gave it.
-    let against = Against::of(hub, job).await?;
+    let against = std::sync::Arc::new(Against::of(hub, job).await?);
+    // Each row read and checked on the compute pool, in one job, off the shards (goal 9, plan 01a1a87b2cec step 3): a
+    // signature and its chain for each of the leg's records, as each page asks for its judgement.
+    let (pki, a, s) = (std::sync::Arc::clone(&hub.pki), std::sync::Arc::clone(&against), server.clone());
+    let (rows, checked) = crate::rt::compute(move || {
+        let checked: Vec<Result<Result<statement::Under, String>, serde_json::Error>> = rows
+            .iter()
+            .map(|r| match &r.refused {
+                Some(why) => Ok(Err(why.clone())),
+                None => serde_json::from_str::<Value>(&r.bundle).map(|b| match a.check(&pki.ca_der, &b, r.taken_at) {
+                    Ok(u) if u.statement.custodian == s => Ok(u),
+                    Ok(u) => leg::under_kilns_delegation(&u, &s).map(|()| u),
+                    Err(e) => Err(e.to_string()),
+                }),
+            })
+            .collect();
+        (rows, checked)
+    })
+    .await?;
     let mut took: Vec<(&Row, Result<statement::Under, String>)> = Vec::new();
-    for r in &rows {
-        let u = match &r.refused {
-            Some(why) => Err(why.clone()),
-            None => match against.check(hub, &serde_json::from_str(&r.bundle)?, r.taken_at) {
-                Ok(u) if u.statement.custodian == server => Ok(u),
-                Ok(u) => leg::under_kilns_delegation(&u, &server).map(|()| u),
-                Err(e) => Err(e.to_string()),
-            },
-        };
-        took.push((r, u));
+    for (r, u) in rows.iter().zip(checked) {
+        took.push((r, u?));
     }
     let records: Vec<Value> = took
         .iter()

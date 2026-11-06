@@ -22,7 +22,7 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | --- | --- |
 | `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) and the thread's timer slack (the tick again) is by design. Its buckets are 25 µs apart to 250 µs and 50 µs apart to 1 ms (`shard_health::DELAY_BUCKETS`, goal 9), so its quantiles read to tens of microseconds below a millisecond. |
 | `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. |
-| `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. |
+| `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. Read at each probe from hyper-rt's task clock with no system call where the shard has one (Linux, where the OS opens the event; it counts from the shard's start, its system calls' time included), else from the OS's clock for the thread, the one chosen at the probe's first wake kept (`shard_health::CpuClock`; goal 9, plan 01a1a87b2cec step 5). |
 | `kiln_shard_polls_total{shard}` | Task polls. |
 | `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (266.7 µs, `rt::STEP_BUDGET_NS`, derived in goal 9's step 3: so past 533 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
 | `kiln_shard_longest_poll_seconds{shard}` | The longest single poll the shard has run. |
@@ -38,6 +38,11 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_threads_woken_total{shard}` | The threads its thread unparked: compute pool workers woken for the jobs it queued, a thread waiting on what its task published; each a system call on it. |
 | `kiln_shard_park_seconds{shard}` (histogram) | How long its parks lasted, each from its driver wait's call to its return, in hyper-rt's bounds (`PARK_BOUNDS_NS`: doubling from 1 µs to 8,192 µs; 16 µs the first past the cheapest wake the lab measured on fedora, a socket's on the waiting thread's own CPU at 12.6 µs, wake-2): the parks a short spin before parking would have served sooner than their wakes, against the rest. |
 | `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
+
+The families from `kiln_shard_steps_total` to `kiln_shard_socket_calls_idle_total` (`crate::shard_health::Wakes`,
+`Calls` and `ParkTimes`) are copied at a probe's first wake and every 10th after (`shard_health::COUNTS_EVERY`):
+they move every 100 ms, the rest every wake (goal 9, plan 01a1a87b2cec step 5). Read as differences across the
+lab's window, 60 s, a copy 100 ms old moves a count by 0.3% at the most.
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -586,7 +591,12 @@ kiln-lab table calm=~/.cache/kiln-lab/g6-priorities/runs/calm/run.json hogs=~/.c
 kiln-lab compare ~/.cache/kiln-lab/g6-priorities/runs/calm/run.json ~/.cache/kiln-lab/g6-priorities/runs/hogs/run.json
 ```
 
-The step holds when `page.p99_ms` with hogs is within noise of calm in production's layout.
+The step holds when `page.p99_ms` with hogs is within noise of calm in production's layout. g9p7 (train 7's tree,
+fedora, 8 rounds each, 2026-11-05) didn't hold it honestly: pages 0.46 to 1.65 ms at p99 and every p50 worse beyond
+noise, the p99s "the same" only because calm's stalls widened the noise. On fedora's lazy kernel a shard woken behind
+a hog waits up to a tick; what holds Critical's p99 there is the nudge, on its own where a config declares it
+(`auto`, from branch `g6-critical-hogs`; off until declared: "The A/B to run: the nudge on its own", below), and what
+else Critical waits for besides its shard is in docs/priority.md, "Critical's own path".
 
 ### Shedding by priority, overloaded on purpose (step 4)
 
@@ -688,7 +698,7 @@ and `rank` gives kiln's, Quiver's, the dependencies' and the allocator's locks t
 
 | crate | what it locks | where kiln reaches it |
 | --- | --- | --- |
-| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`) |
+| event-listener 5.4.2 | each `Event`'s list of listeners (a std Mutex): to add a listener, take one out, notify, poll | in train 8's tree, every wait and wake of an async-channel (the hub's terminals' outputs and its relay loop, termsess, logs, reach's relay, the store's learner, CI's dispatcher, the API), of async-lock (the password gate, cluster copies) and of kiln's own `rt::Notify` (reads made ahead) and `rt::Shutdown`; sessions' inboxes and the net thread's queues left it in goal 4 (`memory::queue`). The next train takes the server's live commands, reach's relay, WebRTC, browser streams, blob reads, `rt::Notify` and `rt::Shutdown` off it (`memory::queue` and its lock-free waiter list) |
 | async-tungstenite 0.35.0 | a split WebSocket's stream, which its two halves share (a std Mutex) | every frame the API's WebSockets send, flush or read: each is split into a sender and a reader |
 | async-broadcast 0.7.2 | each channel's state (a std Mutex) | nowhere now: goal 4 made agent sessions' events, terminals' output, job logs and CD's changes lock-free lanes, and kiln takes only its error types |
 | parking 2.2.1 | a parked thread's `Parker` (a std Mutex beside its Condvar) | event-listener's blocking waits (a cluster copy's file read on the blocking pool, a child's output reader), unparked by the shard that sends or makes room |
@@ -737,7 +747,11 @@ count of its arenas' locks either.
   (WAL), and see every write committed before them. The API's reads on the lab's paths (the runners,
   the overview, runs, plans, goals, sign-in and access checks) and the store's own read methods read so.
   The share's places are goal 3's Little's-law measure of the store's calls (24); the writer's waits and
-  runs are `kiln_blocking_*{share="store_write"}`.
+  runs are `kiln_blocking_*{share="store_write"}`. The writer commits the calls waiting for it together
+  (`Writing::group`: one transaction, each call in a savepoint of its own, at most 1,024 calls or a
+  millisecond of their runs), each caller answered once its group commits (`kiln_store_commit_seconds`,
+  `kiln_store_committed_calls_total`); its WAL is checkpointed on a thread of its own at SQLite's mark,
+  not inside its commits (`kiln_store_checkpoint_seconds`).
 - **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
   readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
   compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and
@@ -864,7 +878,10 @@ First the locks (`scripts/locks.py census-tree`, then `rank`, train 3's tree, 3 
 hogs): 180 call sites, ranked by how often the window took each. The most taken, the store's capture (2,746
 a second), its tables (902), its learner's joiner (603), its groups' point (556), Quiver's node (487) and
 the live channel's receivers (459, one taker), each waited 0.000 ms a second; only Quiver's own locks
-(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on.
+(vendored) waited, 0.047 ms a second at the most. No lock on the hot path is waited on. (A site the census counts
+in more than one copy, one for each copy of its call site in the binary, as a generic or inlined caller makes, had
+one copy's counter taken from another's in these runs, 19 of them below zero in census-A: the census of train 8's
+tree, below, sums them and is exact.)
 
 Then the A/B, the medians of the rounds (ms, but the busy share):
 
@@ -886,17 +903,67 @@ to 475 a second calm) and whose jobs wait longer for it at p99 (0.25 to 7.4 ms c
 hogs): the work goals 3, 9 and 10 moved off the shards (shard 0, which ran 18.5% of the time calm, runs
 2.2%). Goal 9's step 5 (a tenth of the CPU) and goal 10's step 4 (runner messages) take those up.
 
+### The census again, the dependencies' and the allocator's locks counted (train 8's tree)
+
+fedora, 2026-11-05 20:43–20:51Z, the census build of train 8's tree (`08c38ea081f`: goal 4 step 5's lock-free
+`memory::queue` for every queue on the runner path and its lanes for harness frames, `Hub::events`, terminals'
+output, job logs and CD's changes; the async-channels it took off the sealed packer, a terminal's input, the feed,
+a job's writes and the API's replies), with kiln's `jemalloc` feature, so with the dependencies `deps.toml` lists
+and jemalloc's mutexes counted beside kiln's and Quiver's (built in release without LTO, zig, glibc 2.43); driven
+by a kiln-lab that sums each site's copies before it takes their growth (`copies` in `run.json`; `rank` refuses a
+run without them); production's layout (the server alone in its scope at `CPUWeight=1000` on CPUs 16-31), the
+`realistic` profile, 3 rounds calm and 3 with 16 hogs on the server's CPUs at weight 1, while other sessions held
+fedora's load at 23 to 40. Each owner's locks as the lab's window took them, a second, the median of the rounds,
+calm / with hogs:
+
+| owner | locks | taken/s | held when asked/s | waited ms/s | longest wait, ms |
+| --- | --- | --- | --- | --- | --- |
+| kiln's | 115 | 5,743 / 4,861 | 0.00 / 0.07 | 0.000 / 0.010 | 0.25 / 0.98 |
+| Quiver's (`node.rs`; `ephemeral.rs`, its topics' map and tails) | 3 | 1,000 / 854 | 6.27 / 9.62 | 0.006 / 0.695 | 0.31 / 1.93 |
+| event-listener | 1 | 5,084 / 4,348 | 80.0 / 56.8 | 0.052 / 1.783 | 1.01 / 2.41 |
+| async-tungstenite (a socket's two halves) | 1 | 499 / 468 | 0.00 / 0.00 | 0.000 / 0.000 | 0.00 / 0.00 |
+| uuid (`util::new_id`) | 1 | 0.1 / 0.1 | 0.00 / 0.00 | 0.000 / 0.000 | 0.02 / 0.00 |
+| async-broadcast, parking, futures-channel, tracing-subscriber | 0 | none taken | | | |
+| jemalloc (global, each arena's, each arena's bins summed) | 63 | 23,150 / 25,515 | 3.97 / 2.17 | 0.000 / 0.067 | 2 / 10 |
+
+None of kiln's locks on the hot path waited, calm or with hogs; the two that waited with hogs, a harness wait's
+`SENT` (0.03 held when asked a second, no time) and the store's groups' `leaves` (0.010 ms a second, 0.98 ms at
+the longest), are off it. The most taken: the store's capture (1,633 / 1,522 a second), its groups' point (850 /
+299), its learner's joiner (845 / 680), the live channel's receivers (473 / 469, the hub's loop's alone) and the
+feed's (352 / 382). Of the shared locks, event-listener's is the one that waits: calm 80 times a second found held
+and 0.05 ms waited, with hogs 1.8 ms a second, 2.4 ms at the longest, a holder a hog took off its CPU. Quiver's
+waited 0.7 ms a second with hogs; jemalloc's arenas, taken as threads' caches fill and flush, almost never blocked
+(0.07 ms a second with hogs, 10 ms once on arena 0's bins); a socket's two halves never met.
+
+Beside the locks, the store's calls by caller (each its wait for its connection and its run), calm / with hogs:
+custody's `take_read` 180 / 168 a second at 80 / 81 ms each on average (2.6 / 1.2 s at the longest, about 14 calls
+waiting at any time), identities' `enrolled_by` 37 / 33 at 4.6 / 6.0 ms, the audit log's writes 2.6 a second at 38
+/ 58 ms. These are the store's one writer and its read connections, not locks; its writer's group commit (branch
+`store-group`) and custody's reads from memory (goal 9 step 5) are on them.
+
 ### What's left, and why
 
-- **kiln's own.** None of kiln's or kiln-http's locks on the hot path waited in train 3's census, calm or with
-  hogs. `scripts/locks/hot.toml` lists those its modules still declare, each with why it's off the hot path, and
-  `scripts/locks.py check` keeps the rest out.
-- **Quiver's.** The only locks that waited: its topics' map and each topic's tail, 0.047 ms a second at the most.
-  Quiver is vendored (`vendor/quiver`, docs/vendoring.md), so its locks are Quiver's own change, made in Quiver
-  and vendored back, not kiln's to rewrite in its copy.
-- **The dependencies' and the allocator's.** The census counts them (above), each owner in a table of its own:
-  the dependencies kiln's hot path reaches that lock inside, and jemalloc's mutexes where the build has kiln's
-  `jemalloc` feature.
+- **kiln's own.** None of kiln's or kiln-http's locks on the hot path waited, in train 3's census or in train 8's,
+  calm or with hogs (above). `scripts/locks/hot.toml` lists those its modules still declare, each with why it's
+  off the hot path, and `scripts/locks.py check` keeps the rest out. The next train makes more lock-free: CP-T3.2's
+  messages waiting for their inbox's answer (an owner task of their own, `harness/answers.rs`), the conversation
+  feed's and mirrors' maps (copies); a terminal's screen (`termsess.rs` `state`) keeps its lock, listed with why
+  (`attach` answers at once from 14 places, and its replay and the live output must meet with no byte twice or lost).
+- **Quiver's.** Its topics' map and tails (`ephemeral.rs`) waited 0.006 ms a second calm and 0.7 ms with hogs, 1.9
+  ms at the longest. Quiver is vendored (`vendor/quiver`, docs/vendoring.md), so its locks are Quiver's own change,
+  made in Quiver and vendored back, not kiln's to rewrite in its copy.
+- **event-listener's.** The one dependency's lock the shards still share, under every async-channel and async-lock
+  wait and wake left on them: 1.8 ms a second waited with hogs, 2.4 ms at the longest. The next train takes the
+  server's live commands, reach's relay, WebRTC, browser streams, blob reads and kiln's `rt::Notify` and
+  `rt::Shutdown` off it; the runner process's own channels (its uplink, harness pumps, PTYs) follow. What stays
+  is async-lock's few uses on the shards (the password gate, cluster copies) and the `Event`s kiln holds directly,
+  each listed in `hot.toml`'s terms when it goes there.
+- **async-tungstenite's.** One lock a WebSocket, shared by the socket's two halves, each one task's on the socket's
+  shard: never found held, calm or with hogs. No other shard takes it, so it stays.
+- **The allocator's.** jemalloc's 63 mutexes (production's allocator since goal 11 step 4): its arenas' bins as
+  threads' caches fill and flush, 23,000 to 25,500 a second, found held 2 to 4 times a second in all and never
+  blocked calm; with hogs 0.07 ms a second, 10 ms once, a holder a hog took off its CPU. Its five arenas
+  (`narenas:5`) split the threads, so a preempted holder stalls only its own arena's.
 - **What no census inside the process can count.** musl's and glibc's malloc (no count kept: musl's waits only
   from outside, as `futex` waits on its lock), and the C libraries' and the standard library's own locks
   (above).
@@ -1249,6 +1316,53 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   compact), and the index lets go of the rest alone. g9p6's fill doesn't have it (its server is fresh);
   its Opens held up to 10.6 ms with hogs and 0.22 ms calm, a line written to stdout under its lock among
   their work, now the log's writer's.
+- **g9p7's paths (train 7's tree), each moved or cut** (`write /api/mcp`'s is goal 10's: `agents.list` and its
+  answer in turns of their own):
+  - The net loop's `Identity` (about 50 a fill, 0.2 ms each calm, to 3 ms with hogs): its certificate is made
+    on the compute pool (the CSR's check, the CA's signature, its fingerprints: `identities::certify`), and
+    a leg's delegation signed on the blocking pool (the server's key is read from its files for each).
+  - The owners' `Update::Events` (6 to 20 ms the round's longest calm, where `Update::State` on the same
+    shards held 1.3 to 4.8): a long copy letting go of its oldest (every thousand events) read the chunk
+    its cut fell in back from its spill file, inflated and parsed it on the owner's shard. The chunks
+    before the cut go at once now, and that one is made again on the blocking pool and taken in by its
+    owner after (`Events::drain_whole`, `trim_first`).
+  - The mirrors' feed (2.3 ms median calm): what the mirror has is left out of a batch in the compute job
+    that writes it, not row by row on the shard; the feed takes its turns between what waits in its queue.
+  - Custody: a waiting record's two loads share kiln's root and the revocations with their compute jobs,
+    not copies made on the shard (a list growing by one with each certificate kiln supersedes).
+  - The server's own tasks: push parses a `harness` frame's info on the compute pool (1 to 6 ms calm);
+    the fleet's `builds.json` is written by the kept files' writer and read first on the blocking pool;
+    observe's sender takes turns (a replica catching up was sent in one poll).
+- **What was left of those:**
+  - An owner changing an event of a compact chunk (a reconnect's events sent again) read the chunk back on its
+    shard. `Registry::apply` now stops before such an event, the owner reads the chunk back on the blocking pool
+    (the shard free meanwhile), and the rest of the update goes on from it (`Shard::want_thaw`).
+  - Custody: an agent's signed act is checked on the compute pool, the revocations read for it let go of there;
+    a refused act's and a refused word's signer, and a hand-over's reads, too (`verify_off`). kiln's take of a
+    session it resumes is signed there (`server_signed_off`), its timeline worked out where its package is made.
+    The revocations kept before are let go of on the blocking pool.
+  - The scheduler takes its turns between the jobs it walks, and reads `file:` secrets on the blocking pool.
+  - Conversation stores: the board's sample and `/metrics` on the compute pool. Host statuses: the runs a host
+    hasn't taken picked out on the store's side, and their catch-up every minute however many events come.
+  - ci-verdicts: a lane's book is made on the compute pool in pieces, and its runs' results and marks and the
+    workspace's units there too; `refresh` works out its verdicts there, its reads, writes and messages where
+    they were.
+  - goal-stacks: the sessions are copied on the compute pool, its loops take turns, and keep-going's lookups are
+    sets.
+- **And what was left of those:**
+  - An event under an older number than its copy's newest: the owner makes the copy's events again with it in on
+    the blocking pool (`Shard::want_insert`), as it reads a compact chunk back for a change.
+  - `Entry::from_text` reads an event's head from its text without making its JSON tree (`Head::of_text`).
+  - The fleet finds a machine's sessions by id (`Registry::ids_on`), not in a copy of every session's info.
+  - The told and elsewhere ticks look agents up by id and in sets, not by scans.
+  - A CI verdict's event is written on the compute pool (`Hub::emit_written`).
+  - The runner writes a certificate's file with no lock held, on the blocking pool (`given_off`).
+  - The rarer signatures and checks run on the compute or blocking pool: kiln's own hand-ons, receipts, passes and
+    carries; a person's receipt or hand-on; review verdicts; a leg's records and kiln's receipt of them; KilnCD's
+    records and promotions; the store of bytes; a commit kiln signs. Then a land's signature and a revision's
+    VSA (`identities::sign_as_off`) and a hand-over's word (`custody::word_off`).
+  - The programs' `list` and `enforce`, and the goal stacks' words said again, find their sessions by id as the
+    registry shares them (`Registry::info_shared`), none copied.
 
 ### Step 3's check
 
@@ -1530,6 +1644,361 @@ So the switch's default is `jemalloc`. The one number worse beyond noise is the 
 126 to 128 MB (+1.6%). That's jemalloc's code: the binary is 3.1 MB larger. Variants are an environment
 away on the same build, for example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
 
+### The allocator's overhead, threads' stacks and observe's index (step 5)
+
+Of the musl-jemalloc build's 207 MB anonymous (alloc2, the window's end), jemalloc's mappings held 145 to
+165 MB for a live heap of about 88 MB touched (train 4's heap profile, less what's gone since). The rest is
+jemalloc's own: what threads' caches keep, freed pages not yet purged, the room left in slabs and size
+classes, and its metadata. `kiln_memory_allocator_bytes{kind}` splits it, and each kind caps what a setting
+can save: `thread_caches` the cache settings, `dirty` the decays, `active` less `allocated` the fit and arena
+count, `metadata` nothing here.
+
+**Settings past the pick**, each a variant of one build through `_RJEM_MALLOC_CONF` (`os::alloc::CANDIDATES`;
+the allocator's log line names each one a run gives, beside jemalloc's default):
+
+| Setting | jemalloc 5.3's | Variant | Saves at most | Latency risk |
+| --- | --- | --- | --- | --- |
+| `tcache_max` | 32768 | 4096 (TUNING.md's memory-first pick) | what `thread_caches` holds of 4 to 32 KiB, most of it: a busy thread's cache keeps up to 20 of each such size, 2.4 MB of 16 to 32 KiB alone | every allocation of 4 to 32 KiB takes its arena's lock, a growing buffer's every step among them: watch API reads' p99.9, websocket frames' p99, CPU a request |
+| `tcache_nslots_small_max`, `tcache_nslots_large` | 200, 20 | 64, 4 | the same caches, fewer of each size: about half of `tcache_max`'s | lower: refills come sooner, each smaller |
+| `dirty_decay_ms` | (kiln's 5000) | 1000 | about four fifths of `dirty` (what's kept is what was freed in the last half of the decay) | the recurring work (an attach every 2.7 s) faults pages in anew, and purges' TLB shootdowns reach the shards' CPUs five times as often: watch attach p50, API writes' p50, minor faults |
+| `narenas` | (kiln's 5) | 3 | slabs' room and dirty pages spread over fewer arenas: a few MB | shards share arenas (glibc's 2 arenas doubled the bus delivery's p99): watch bus delivery p99, runners' messages p99 |
+| `lg_extent_max_active_fit` | 6 | 2 | large allocations no longer cut from extents up to 64 times their size: part of `active` less `allocated` | low: more fresh extents, more first-touch faults |
+| `oversize_threshold` | 8388608 | 1048576 | dirty pages of frees of 1 to 8 MiB, purged at once instead | the purge runs inline on the thread that frees, a shard among them, and the next such allocation faults its pages in: watch slow polls and frames' p99.9 |
+| `retain` | true | false | none of resident memory: retained address space is never resident (only page tables, `VmPTE`) | every extent given back is unmapped under the process's mmap lock, which every thread's page fault takes: not worth a round |
+
+**The blocking pool's arena** (`KILN_ALLOC_POOL_DECAY_MS`, `os::alloc::POOL_DECAY_VAR`): jemalloc keeps no
+decay of its own for an idle arena, so this gives one. Set, the blocking pool's workers allocate in an arena
+of their own (jemalloc's `arenas.create` and `thread.arena`, TUNING.md's "Explicit arenas"), whose dirty
+pages are kept that long, while the shards' arenas keep theirs 5 s. Most of the pool's 54 workers wait; what
+a job frees is idle until the next job of its kind. It saves about four fifths of the pool's share of
+`dirty`, without the shards' re-faulting that a decay of 1 s for every arena risks. The pool's workers then
+share one arena's locks among the jobs running at once (up to 54): watch the store's and the snapshots' jobs
+(API writes, attach, `blocking.<share>.little_p99`). Unset, as by default, nothing changes.
+
+**The A/B to run**, one build (this branch's musl-jemalloc release build), A without a variant and B with
+one, 8 rounds calm, the winners again with hogs:
+1. Any A/B of this build reads `kiln_memory_allocator_bytes` at the window's end: the split above, which says
+   which of these can matter.
+2. Memory first: `--env-b _RJEM_MALLOC_CONF=tcache_max:4096,dirty_decay_ms:1000,narenas:3`. If anonymous
+   memory falls beyond noise and no latency number is worse beyond noise, kiln compiles them in.
+3. If a number is worse, one at a time, in the order of what the split says they can save: `dirty_decay_ms:1000`;
+   then `KILN_ALLOC_POOL_DECAY_MS=1000` in its place; `tcache_max:4096`, or `tcache_nslots_small_max:64,
+   tcache_nslots_large:4` in its place; `narenas:3`.
+4. Then `lg_extent_max_active_fit:2` and `oversize_threshold:1048576` against the pick so far, if
+   `active` less `allocated` or `dirty` is still more than a few MB.
+
+**Threads' stacks** (`os::stack`): the server's 91 threads' stacks held 5.8 MB (alloc2's smaps): the four
+shards 0.40 to 0.75 MB each, 16 threads 88 KB, the rest 12 to 20 KB. A stack's size is no lever on what's
+resident (a thread holds the pages it reached, whatever its 16 MiB reservation); two things are, and kiln
+does both:
+- A pool's worker gone cold (idle past 5 s, step 5's `hyper_rt::idle`) gives back its stack's pages below its
+  frame (`MADV_DONTNEED`), as it gives back its cache: about 1 to 1.5 MB in the lab at the window's end.
+- A runtime thread (a shard, a pool's worker) marks its stack `MADV_NOHUGEPAGE` as it starts. Production's
+  host gives huge pages to every anonymous mapping, musl maps a stack without `MAP_STACK` (which Linux keeps
+  off huge pages), and khugepaged collapses a range with 103 of its 512 pages in use: a shard's 0.4 to 0.75 MB
+  would be 2 MB. The lab (fedora: `madvise`) can't show it; on adacachy, the server's stack mappings'
+  `AnonHugePages` in smaps say it.
+
+**observe's index** (`kiln_obs::index`): 4 MB in train 4's heap profile. The server's index held 13,779
+series (train 4's realistic profile, a round's block), whose keys took 1,898,546 bytes in a 2 MiB column for
+17,266 bytes of distinct strings: its 233 metrics and 489 tag pairs' 722 posting lists held 60,000 ids. The
+index keeps no key now (it's the series' metric and tags written canonically, which the symbols hold, and is
+written again as it's asked for: a cut, a series' re-definition), save one whose bytes aren't that writing,
+kept as sent; and its columns grow by a quarter, not doubling. An index of the lab's shape holds 1.07 MB:
+about 2.2 MB less.
+
+**kiln.db's read connections** (`store::Reads`): each holds the database's whole schema parsed, which no
+owner counted (`sqlite` counts page caches): 604 KB for its 202 tables and 283 indexes, and 62 KB more
+opened (SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), and its statements. The store kept
+every connection a burst of reads ever opened, up to the `store` share's 24 places, and took them in turn
+(a queue), so none went idle. Now a read takes the lowest place's connection and gives it back to the lowest
+place free, and once each 5 s (`os::alloc::COLD_AFTER`) a read giving one back closes the highest place's
+connection that no read took in that long: what stays open is the reads' recent peak. It saves about 0.75 MB
+for each connection past that peak; how many there were is `kiln_memory_bound_bytes{owner="sqlite"}` over a
+connection's bound (4.6 MB, `store::cache_bound`). A read past the peak opens a connection and parses the
+schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the blocking pool): watch store-backed
+numbers' p99 (pages, MCP, fill).
+
+### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
+
+What's live, biggest first, from train 4's heap profile (the newest there is, 164.6 MB by its estimate) less
+what's been cut since. A figure marked "est." is that arithmetic, not a measurement: the lab's owners and
+a heap profile of the merged tree (below) say what's there now.
+
+| What holds it | train 4 | now | Whose | Where it stands |
+| --- | --- | --- | --- | --- |
+| the events socket's feed: 4,096 frames, most an agent's whole info | (not in that tree) | est. 8 to 10 | kiln (`wire::events::feed`, main's W21-R15) | cut, on train 8's tree with main's (branch `g11s5-anon-feed`): below |
+| session copies: each event's meta, its id and its index entry, the newest page or not | 8.7: `Events::compact` 3.16 (compact chunks' metas), the ids among `Registry::apply`'s 5.25, `Mirror::upsert` 2.65 (the index) | est. 8 (about 45,000 events at 180 bytes) | kiln (`harness::copies`) | cut: ids in their metas, the index by hash (below): est. 2.4 off |
+| session copies: open chunks' texts and the newest page's | 4.7 (`Entry::of_event`) | 6.8 (`session_entries`, g11pages) | kiln | at its basis: each copy's newest chunk as text |
+| hyper-log's read pool and zero-fill buffer; hyper-durable's log entries | 16.4; 5.8 | the same | vendored hyper-raft | not kiln's: READY 1's vendor patches |
+| the bus's frames | 9.5 | 6.9 to 7.7 (`bus`) | vendored quiver, kiln's bounds | at what its topics retain |
+| observe: its owner's batcher and log, its store's head, its ingest | 6.0 | 6.0, and the index's 1.07 | kiln-obs | not on `/metrics`: an owner for it is next |
+| QUIC's transmits | 5.2 | 5.2 | vendored hyper-quic | not kiln's |
+| websockets' send buffers | 2.4 | 2.4 | tungstenite (crates.io) | below |
+| snapshots in flight | 6.3 | 0 at the window's end (`snapshots`) | kiln | in flight only |
+
+**The events feed** (`crate::wire::events::feed`, on main since W21-R15, lock-free in train 8). Every frame
+the hub emits is numbered and kept in a ring of `RING` (4,096) places, so a page that reconnects resumes. Most
+of what's pushed is an agent's `harness` frame: its whole info (about 60 fields, 1.5 to 3 KB) at each change,
+about 1,700 a second in the many-sessions profile (`wire::events::kind_of`'s count), so in the realistic
+profile (8 of 32 agents at work) the ring holds most of a minute of them. Each frame took its text and
+about 224 bytes of room (its `Meta`, 176 bytes, inline), and a socket's read added its kind, key and agent:
+4,096 x about 2.3 KB, est. 9.4 MB, with no owner and no bound in bytes. Every frame but each agent's newest
+is one no socket is sent: a batch sends a thing's newest alone, and a page that resumes from before the
+newest is sent the newest. The cut:
+- `Feed::push_over`: an agent's info frame says the number of that agent's last one (its copy keeps it,
+  `Mirror::harness_at`), and once the new one is in its place, the old one's place takes a frame of its
+  number alone (80 bytes), which readers pass over. Numbers, gaps and resumes are as they were.
+- A frame's `Meta` is boxed, made by the first socket that reads it: a frame's room is 48 bytes.
+- Bounded: 4,096 frames and `feed::BYTES`, 64 MiB of them (`net::EVENTS_BYTES`, what a listener of the
+  hub's events holds before it starts over, where a socket is told `resync`), the oldest going past either,
+  never the newest. `kiln_memory_bytes{owner="events_feed"}` says what its places hold.
+- Expected, the lab's realistic profile: est. 0.8 MB (32 agents' newest, about 75 KB; 4,096 places at 80
+  bytes, 0.33 MB; the other frames), so anonymous memory about 8 MB less than main's feed holds.
+
+**Session copies past the newest page.** A copy keeps its spilled chunks' segments on disk but each event's
+`Meta` in memory: 72 bytes (its id's `Arc<str>` 16, number 16, revision 8, offset 8, length 8, digest 16),
+its id's own allocation (two counts and 30 to 36 bytes: jemalloc's 48 or 64-byte class) and its entry in
+the copy's index (`HashMap<Arc<str>, usize>`, 24 bytes a bucket, 8,192 buckets for a copy of 4,000 to 5,000
+events: 224 KiB): about 180 bytes an event. The realistic profile keeps about 45,000 (2 copies at 4,000 to
+5,000, 6 at 4,000 to 5,000, 24 at 400): est. 8 MB, train 4's 8.7. The cut, all in `harness/copies.rs`
+(`registry.rs` reads a meta's offset, length, number and revision alone):
+- An id is kept in its meta (`copies::Id`), up to 38 bytes (a UUID either way, kiln's 32 hex digits, a
+  harness's `msg_` and `toolu_` ids), a longer one boxed: a meta is 96 bytes and the id no allocation of its
+  own, against 72 and 48 to 64. About 40 bytes an event.
+- The index (`copies::Index`) is keyed by a hash of the id (the process's own key), 16 bytes a bucket against
+  24, each place it finds checked against the id its event's meta keeps (in memory, its chunk spilled or not),
+  and an id whose hash another's place already has kept apart by itself. As events go from the copy's front or
+  past a number, its places move by position (`Index::drop_front`, `Index::retain`), as the ids' lists the
+  drains made did, with none of those lists made.
+- Expected: est. 2.4 MB less in the realistic profile (1.8 the metas, 0.6 the index), more for longer sessions'
+  copies; `harness::copies::Meta::of` and `Mirror::upsert` in a heap profile say it.
+
+**Per-connection and per-shard buffers.** kiln-http keeps per thread a 64 KiB scratch buffer and at most 64
+write buffers of at most 64 KiB, and the API's encode buffer at most 64 KiB (`ENCODE_KEPT`); the sockets read
+16 KiB at a time; a shard's desk is written only as far as it's used. What's left is tungstenite's: each
+socket's send buffer keeps its capacity at the most it ever buffered (`FrameCodec::out_buffer` is drained,
+never shrunk), a batch of the events socket or a snapshot's piece: 2.4 MB in train 4. Kiln can't shrink it
+through tungstenite 0.30's API; either sends go as frames of at most 64 KiB, with `write_buffer_size` at 64
+KiB, or a vendored tungstenite lets an emptied buffer past 64 KiB go. And hyper-quic's transmits (5.2 MB) are
+the vendored transport's.
+
+**Bounds against the lab's peaks.** None of the lab's resident memory sits at a bound: the queues' (64 MiB
+each, most) held 0 to 0.1 MB at the window's end (g11pages, calm and hogs) and make their places as they
+fill, so a tighter bound wouldn't move what's resident. Those that fill as they're used are under theirs:
+`session_segments` 1.5 MB of 2.9 (32 copies x `PAGE_BYTES`), `sqlite` 1.4 to 1.6 MB of about 4.3 MB a
+connection, the bus 12.2 MB at its busiest second of a 171 MiB bound reckoned for production's 134 agents (a
+topic 3.7 MB at the most of 5 MiB). `custody_receipts` reached 4.6 MB (a hogs round) of 64 MiB. What's resident and
+unbounded in bytes was the feed (cut above) and the copies' metas, bounded by `MAX_EVENTS` a copy.
+
+**The A/B for jemalloc's share, in order** (the build: rt-next with this step's branches merged, its static
+musl build with jemalloc; A without a variant, B with it; 8 rounds calm, a winner again with hogs):
+1. Any A/B first reads `kiln_memory_allocator_bytes{kind}` at the window's end, A's rounds: live =
+   `allocated` - `thread_caches`; `thread_caches`; slack = `active` - `allocated`; `dirty`; `metadata`; not
+   jemalloc's = anonymous - `resident`. Each caps what a setting can take: decide from these which of 2 to 4
+   can matter, and skip a setting whose kind is under 2 MB.
+2. `dirty` first (the decay's): `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:1000`. Expect about four fifths of
+   `dirty` off. Watch attach p50, API writes' p50 and p99, the server's minor faults a second. If one is
+   worse beyond noise: `--env-b KILN_ALLOC_POOL_DECAY_MS=1000` instead (the blocking pool's own arena),
+   watching `blocking.<share>.little_p99`.
+3. `thread_caches`: `--env-b _RJEM_MALLOC_CONF=tcache_max:4096` against the pick so far; if API reads' p99.9
+   or websocket frames' p99 is worse, `tcache_nslots_small_max:64,tcache_nslots_large:4` instead.
+4. Slack: `narenas:3,lg_extent_max_active_fit:2` against the pick so far; watch bus delivery p99 and runners'
+   messages p99 (glibc's 2 arenas doubled the first).
+5. One round of `dirty_decay_ms:0` (every free purged at once) says the floor of what decay can give, and
+   its latency cost: a reading, not a candidate.
+6. The pick goes into `os::alloc`'s compiled string once its A/B holds with hogs (`JEMALLOC_CONF`'s test holds
+   the string to what the lab ran).
+
+**What 113 MB takes** (the realistic profile, calm, at the window's end). The binary's pages: 105 MB after
+startup's drop, est. 12 to 17 with BOLT's layout (the coordinator's lab). So anonymous memory has to be at
+most about 96 to 101 MB, from alloc2's 207. What's cut since alloc2, est.: SQLite on jemalloc 10 to 15, the
+transport's spares 7, cold workers' caches and stacks 2 to 4, observe's index 2.2, 16 KiB reads 1.6, the feed
+8 (against main's), so about 175 to 180 MB with main's feed in. jemalloc's settings can take at most what
+`dirty`, `thread_caches` and slack hold (step 1 of the A/B says it; est. 30 to 50 MB). The rest has to come
+from the live heap, est. 85 MB: what's named above that kiln holds (copies' metas 2.4, cut above; observe's 7
+to put an owner on, websockets' buffers 2.4) and what the vendored projects hold (hyper-log's and
+hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' patches would cut.
+
+**A heap profile of the merged tree** (what's live now, ranked; READY 1's method):
+- build: `CARGO_PROFILE_RELEASE_STRIP=none KILN_LINUX_ALLOCATOR=jemalloc-prof ci/release/build.sh x86_64-unknown-linux-musl`
+- run: one round, the realistic profile, calm, with `--env _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_accum:true,prof_prefix:$OUT/jeprof`
+  (no `prof_active`: kiln turns sampling on once its unwinder is in, and says so in its log)
+- dump at the window's end: `gdb -p $PID -batch -nx -q -ex 'call (int)_rjem_mallctl("prof.dump", (void*)0, (void*)0, (void*)0, 0)'`
+- read: `nm -n -C --defined-only kiln | awk '$2 ~ /^[tTwW]$/' > syms.txt; readelf -lW kiln > segments.txt;
+  python3 ~/.cache/kiln-g11-lab/scripts2/heapprof.py $OUT/jeprof.$PID.*.m*.heap syms.txt segments.txt --owners`
+- look for: `wire::events::feed` (est. under 1 MB after the cut), `harness::copies::Meta::of` and
+  `Mirror::upsert` (the copies' metas and index), `tungstenite::protocol::WebSocketContext::buffer_frame`,
+  and with `prof_accum` the sites whose frees make `dirty`.
+
+### The binary's pages: what's touched, and the code's layout (step 5)
+
+Of rt9's 478 MB resident (calm), 103 MB was the binary's own pages (g11pages, before it: 125 MB, 105 once the
+UI's files and startup's pages are dropped, `crate::resident`). A fault on the binary maps the 64 KiB around it
+that the page cache holds (fault-around), the server reads its whole binary into the page cache as it starts, and
+the code it runs lies spread over about half of its `.text`'s 64 KiB windows. So these pages fall only as far as
+what runs is laid out together: est. 12 to 17 MB with BOLT's layout (g11s5-layout's estimate from g9p7's profile:
+its hot functions, 2.4 MB of code, lie on 558 windows of rt7fp's layout and would fit in 38).
+
+**The binary's sections**, rt9 (the lab's glibc build, `dfb491ef3dc`; its symbols from rt9fp, the same tree with
+frame pointers), and what reads each:
+
+| Section | MiB | What reads it |
+| --- | --- | --- |
+| `.text` | 175.5 | the code: 184,011 functions; by crate, kiln's own 70.4, `core` 29.6 (generic code compiled into its users), `alloc` 9.9, `serde_json` 13.7, `turso_core` 6.4, `std` 4.7, `kiln_ci` 3.4, `hyper_rt` 3.0 |
+| `.rodata` | 31.6 | the UI's files (11 MB, dropped once packed), tree-sitter's grammars' tables (10.2 MiB, kiln-search's parsing alone), brotli's tables (the UI's compression at start), strings and constants |
+| `.eh_frame`, `.eh_frame_hdr` | 12.5, 1.4 | a panic unwinding (kiln contains them: `kiln-rt`'s `unwind`, `main`'s hook) |
+| `.gcc_except_table` | 9.9 | the same |
+| `.rela.dyn` | 4.0 | the glibc build's loader, at start (a PIE); production's static musl build has none |
+| `.data` | 4.4 | 4 MiB of it one array, `hyper_rt::sync::cell::TABLE` (262,144 `OnceLock`s, whose first state isn't zero: std's `Once` starts at 3, so it's `.data`, not `.bss`); a read of a slot maps its window from the file |
+| `.data.rel.ro` | 2.7 | vtables and constants with addresses: every `dyn` call; file pages in the static build (train 4: 2.8 of its 2.9 MB resident), the process's own in a PIE (relocated at load) |
+
+**The cheaper levers, and what each is worth to resident memory:**
+
+| Lever | Now | Worth | Why |
+| --- | --- | --- | --- |
+| strip | on (`[profile.release] strip = true`; `relbuild.sh` strips again) | 0 | symbols and debug info lie outside every loaded segment, never mapped: only the file's size (rt9fp 1,182 MB, rt9 254 MB) |
+| `--gc-sections` | on | taken | rustc gives it to every executable's link |
+| identical code folding | off (neither rustc nor zig asks LLD for `--icf`) | under 1 MB | rt9fp's functions identical once their calls and RIP-relative references are read as their targets: 12,480 copies in 5,263 groups, 1.34 MiB of 171.6 (0.8%; byte for byte 0.16 MiB): rustc's MergeFunctions already folds them within a codegen unit. Resident, at most that share of the code touched. BOLT's `-icf=safe` takes it in BOLT's layout |
+| `panic = "abort"` | `unwind`, on purpose | a change of behaviour, not a lever | a contained panic would end the server, not its task (`main`'s hook: "the task will be restarted"). What it would drop, `.gcc_except_table` (9.9 MiB) and the landing pads, isn't resident unless something unwinds: the tables are read only then, and the landing pads in hot functions BOLT moves out (`-split-eh`) |
+| opt-level for cold crates | 3 for all | about 0 | cold code isn't resident (residency is per window touched), and the crates that are cold are small: `kiln_ci` 3.4 MiB, `kiln_cd` 1.8, `toml` 1.0, `k8s_openapi` 0.9, tree-sitter's code 0.7, WebRTC's 1.3; kiln's own crate (70 MiB) holds hot and cold modules together (`kiln::ci`, `deploy`, `cd`), and generic code is compiled into its users. Only the file shrinks |
+| split debuginfo | no debuginfo in a release | 0 | debug sections aren't mapped either |
+| `.rodata`, `.data`, `.data.rel.ro` | | measured by section (below) | g11pages: about 6 MB of read-only data and 2 MB of data resident; BOLT moves code, not data. Rust's statics have sections of their own, so the same linker order (below) could lay out the data a profile of loads names: next only if `sections.txt` shows them past a few MB once the code is laid out |
+
+So the binary's pages fall only by layout: **BOLT**, or failing it, **the linker's order**, both from a profile of
+the lab's realistic profile, off unless `ci/release/build.sh`'s `KILN_RELEASE_BOLT` says (x86_64 musl alone):
+- `relocs`: the release built keeping its relocations and symbols (strip off, linked through `zig-relocs.sh`:
+  `--emit-relocs`, a build id) in `<target>/bolt`; `dist/` gets it stripped, the release as it would ship: what the
+  lab profiles, and the A/B's side without a layout.
+- a BOLT profile (`.fdata`, `.yaml`): that build laid out by `llvm-bolt` (`bolt.sh optimize`: the functions the
+  profile saw together by `cdsort`, their blocks that didn't run split out, identical ones folded; what didn't run
+  left where the linker put it), stripped.
+- an order (`.order`, `bolt.sh order`'s: every function a profile saw, hottest first, named as the unstripped build
+  names them): that build linked with those functions first, in that order (LLD's `--symbol-ordering-file`), and
+  stripped. No BOLT and no rewrite: perf and the linker alone, whole functions moved, none split. Checked on a Rust
+  probe built as the release is (thin LTO, static musl, zig's LLD): its profiled functions, Rust's and zig's libc's,
+  lead `.text` in the profile's order. A binary in `<target>/bolt` linked in another order than the one asked is
+  removed first, so cargo relinks it (`kiln.linked-order` beside it says which).
+
+**The tools** (read, 2026-11-06):
+
+| | adacachy | fedora (the lab) |
+| --- | --- | --- |
+| `llvm-bolt`, `perf2bolt`, `merge-fdata` | not installed; CachyOS's 23.1.4 unpacked at `~/.cache/kiln-g11s5-layout/tools/llvm-bolt-23.1.4/usr/bin` (runs; it takes glibc 2.44, so not on fedora) | not installed; Fedora's `llvm-bolt` 22.1.8 in `updates` (`dnf download`, no root); else `bolt.sh tools` fetches LLVM 23.1.5's release once (1.2 GB) |
+| `ld.lld` | LLD 23.1.1; zig 0.17.0's own LLD 22.1.8 links kiln: both take `--symbol-ordering-file`, `--call-graph-ordering-file`, `--icf` | none; zig on `PATH` is 0.16.0 |
+| perf | `/usr/bin/perf` 7.2.10 | none installed; `~/.cache/kiln-g9-subms-shards/perf-root`'s 7.2.15 (`PERF_LIBS=<it>/usr/lib64`) |
+| branch records | Zen 5's LbrExtV2 (`amd_lbr_v2`) | arch LBR, 32 entries, on every CPU (`cpu_core` 0-15, `cpu_atom` 16-31) |
+| `perf_event_paranoid` | 2: a user's own processes, user space | 2 |
+
+fedora has LBR, so the profile is perf's branch records: no frame-pointer build, no instrumented one unless the
+records miss functions (below).
+
+**The lab to run** (the coordinator's). The build, rt-next with this step merged, where release builds go, no spaces
+in its paths:
+
+```sh
+B=$HOME/.cache/kiln-g11-bolt-build; mkdir -p $B/tmp
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=$B/target TMPDIR=$B/tmp KILN_DIST=$B/dist KILN_UI_SERVER=off \
+  KILN_RELEASE_BOLT=relocs nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+#   $B/dist/kiln-x86_64-unknown-linux-musl                 stripped: the A side, and what the lab profiles
+#   $B/target/bolt/x86_64-unknown-linux-musl/release/kiln  the same build id, its relocations and symbols kept
+```
+
+Or the lab's glibc build, by `relbuild.sh` as it is, its environment saying how (a target dir of its own: strip off
+changes every unit's flags):
+
+```sh
+TARGET=$HOME/.cache/kiln-rt-int/target-bolt CARGO_PROFILE_RELEASE_STRIP=false KILN_ZIG_REAL=$HOME/.local/bin/zig \
+  CARGO_ZIGBUILD_ZIG_COMMAND=$HOME/.cache/kiln-rt-int/relsrc/ci/release/zig-relocs.sh \
+  ~/.cache/kiln-rt-int/tools/relbuild.sh g11bolt <sha> lab
+gzip -1 -c $HOME/.cache/kiln-rt-int/target-bolt/x86_64-unknown-linux-gnu/release/kiln \
+  > ~/.cache/kiln-rt-int/xfer/g11bolt-kiln.relocs.gz      # relbuild.sh ships only the stripped copy
+```
+
+On fedora, `$L/bin` takes the stripped `kiln`, the unstripped `kiln.relocs`, a `kiln-lab`, and this tree's
+`ci/release/bolt.sh`, `scripts/memory_lab/bolt-hook.sh` and `scripts/memory_lab/sections.py` (the hook finds it
+beside itself):
+
+```sh
+L=$HOME/.cache/kiln-g11-bolt-lab; mkdir -p $L/bin $L/tools
+P=$HOME/.cache/kiln-g9-subms-shards/perf-root; export PERF=$P/usr/bin/perf PERF_LIBS=$P/usr/lib64
+(cd $L/tools && dnf download llvm-bolt && rpm2cpio llvm-bolt-*.rpm | cpio -idm)
+export KILN_BOLT_BIN=$L/tools/usr/bin; $KILN_BOLT_BIN/llvm-bolt --version   # built against llvm-libs 22.1.8; if
+#   the installed 22.1.1 won't do, `dnf download llvm-libs` too and LD_LIBRARY_PATH=$L/tools/usr/lib64, or unset
+#   KILN_BOLT_BIN and bolt.sh fetches LLVM's release
+LD_LIBRARY_PATH=$PERF_LIBS $PERF record -e cycles:u -j any,u -o $L/smoke.data -- python3 -c 'sum(range(10**7))' &&
+  LD_LIBRARY_PATH=$PERF_LIBS $PERF evlist -v -i $L/smoke.data | grep -c BRANCH_STACK          # LBR records: 1 or 2
+```
+
+1. The profile: 3 rounds of the realistic profile, calm, in production's layout, perf recording the server's branch
+   records from its start to the window's end (what's resident then is all it touched since startup's drop). Est.
+   0.4 GB of `perf.data` a round (perf's 4,000 samples a second of the server's 0.83 CPU, each with its 32
+   records); `-E BOLT_FREQ=1000` takes a quarter:
+
+   ```sh
+   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-prof -p MemoryMax=16G --working-directory=$L \
+     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
+     -E BOLT_SH=$L/bin/bolt.sh -E BOLT_RECORD=lbr -E PERF=$PERF -E PERF_LIBS=$PERF_LIBS \
+     taskset -c 0-15 $L/bin/kiln-lab run --kiln $L/bin/kiln --label relocs --env KILN_RT_SHARDS=4 \
+     --profile realistic --rounds 3 --hogs 0 --layout production --server-cpus 16-31 --out $L/prof
+   ```
+
+2. BOLT (time and memory on the 255 MB binary unmeasured; minutes in its lite mode):
+
+   ```sh
+   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh profile $L/bin/kiln.relocs $L/kiln.fdata $L/prof/rounds/*.hook/perf.data
+   systemd-run --user --scope -q -p MemoryMax=24G nice -n 10 $L/bin/bolt.sh optimize $L/bin/kiln.relocs $L/kiln.fdata $L/bin/kiln.bolt
+   ```
+
+   If perf2bolt balks at the hybrid CPU's two events, profile again with `-E BOLT_EVENT=cpu_atom/cycles/u` (the
+   server's CPUs are E-cores). `$L/bin/kiln.relocs.bolt.log` says the profile's coverage ("have non-empty
+   execution profile"), "splitting separates H hot bytes", what ICF folded, and any function it couldn't move.
+
+3. The A/B, BOLT against none, 8 rounds calm, then the same with hogs (`--hogs 16 --out $L/ab-hogs`):
+
+   ```sh
+   systemd-run --user --quiet --collect --wait --unit=kiln-lab-g11bolt-ab -p MemoryMax=16G --working-directory=$L \
+     -E HOME=$HOME -E PATH=$PATH -E TMPDIR=$HOME/.cache/kiln-lab/tmp -E KILN_LAB_HOOK=$L/bin/bolt-hook.sh \
+     taskset -c 0-15 $L/bin/kiln-lab ab --a $L/bin/kiln --b $L/bin/kiln.bolt --label-a relocs --label-b bolt \
+     --env-a KILN_RT_SHARDS=4 --env-b KILN_RT_SHARDS=4 --profile realistic --rounds 8 --hogs 0 \
+     --layout production --server-cpus 16-31 --out $L/ab-calm
+   ```
+
+4. What to read:
+   - `report.md`: `server.rss_file_mb` (the binary's pages at the window's end; expected from about 105 to 12 to 17),
+     `server.rss_mb`, `server.rss_anon_mb`, and every latency number beyond noise.
+   - each round's `rounds/*.hook/sections.txt` (`sections.py`): on B, the new `.text` is the hot code BOLT laid
+     out, `.bolt.org.text` what the profile missed (each function it missed costs a window, about 47 KB), and
+     `.text.cold` what it split out; on both, `.rodata`, `.data.rel.ro`, `.data`, and `.eh_frame` with
+     `.gcc_except_table` (near 0 unless something unwinds). `pages.txt` says the same by mapping.
+   - **BOLT's layout ships** if the file pages fall beyond noise and no latency number is worse beyond noise: the
+     release then builds with `KILN_RELEASE_BOLT=<profile>`, the profile written as YAML for later commits
+     (`bolt.sh profile ... kiln.yaml`, applied with `-infer-stale-profile`), until a lab profiles again.
+   - **If B's `.bolt.org.text` holds more than about 10 MB**, the records missed what ran: profile every edge instead,
+     and A/B again:
+
+     ```sh
+     mkdir -p $L/instr; $L/bin/bolt.sh instrument $L/bin/kiln.relocs $L/bin/kiln.instr $L/instr/dump
+     #   (Fedora's BOLT may want KILN_BOLT_ARGS=-runtime-instrumentation-lib=$L/tools/usr/lib64/libbolt_rt_instr.a)
+     # step 1 with --kiln $L/bin/kiln.instr --rounds 2 --out $L/prof-instr, -E BOLT_RECORD=instrumented -E BOLT_DUMP=$L/instr/dump
+     $KILN_BOLT_BIN/merge-fdata $L/prof-instr/rounds/*.hook/instr-window.fdata > $L/kiln.instr.fdata
+     # step 2's optimize with $L/kiln.instr.fdata, into $L/bin/kiln.bolt-instr; step 3 with --b $L/bin/kiln.bolt-instr
+     ```
+
+   - **If BOLT fails, or its binary misbehaves or is slower**, the linker's order, from the same recordings:
+
+     ```sh
+     $L/bin/bolt.sh order $L/bin/kiln.relocs $L/kiln.order $L/prof/rounds/*.hook/perf.data
+     # kiln.order back where the build ran; the same tree and target dir, as the build above but with
+     #   KILN_DIST=$B/dist-order KILN_RELEASE_BOLT=<kiln.order>: only the executable relinks
+     # step 3 with --b <$B/dist-order's kiln>
+     ```
+
+     The lab's glibc build takes it from `relbuild.sh`'s environment: the build above with
+     `KILN_LINK_ORDER=<kiln.order>`, its executable removed first (`find <TARGET>/x86_64-unknown-linux-gnu/release/deps
+     -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete`), since cargo doesn't know an
+     order changed.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
@@ -1722,14 +2191,17 @@ So for each means a thread has without root:
 
 ### What kiln does: a nudge for the shards (goal 8 step 7)
 
-`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its
-period for a lab's A/B) holds each of a shard's waits in its driver to the timers' tick, 100 µs
-(`hyper_rt::compute::nudge_current_thread`: a thread-local the epoll driver's `wait` reads). With the
-shard's timer slack, which is that tick too (hyper-rt's `Shard::build`), its CPU takes an interrupt of the
-shard's own at least every 200 µs while it waits. The wait's timer is armed on the CPU the shard parks on,
-busy with the shard as it arms (`get_nohz_timer_target`, core.c:1202), and its interrupt's return to the
-hog's user space takes the lazy mark, so a shard woken behind a hog waits at most two ticks, no longer than
-a timer of its own may be late, instead of the kernel's tick.
+`[server] nudge` (off until declared: `"on"` nudges every wait, `"auto"` only while the host holds the shard's wakes;
+`KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its period for a lab's A/B) holds each of a nudged shard's waits
+in its driver to its period
+(`hyper_rt::compute::nudge_current_thread`: a thread-local the epoll driver's `wait` reads): the step quantum
+less the timers' tick, 166.7 µs (`crate::rt::nudge_period_ns`, goal 9 step 4; until then the timers' tick,
+100 µs, which the A/B below ran at). With the shard's timer slack, which is that tick (hyper-rt's
+`Shard::build`), its CPU takes an interrupt of the shard's own at least every quantum, 266.7 µs, while it
+waits: the host's share of a ready task's delay in the quantum's derivation ("What moved (step 3)"). The
+wait's timer is armed on the CPU the shard parks on, busy with the shard as it arms
+(`get_nohz_timer_target`, core.c:1202), and its interrupt's return to the hog's user space takes the lazy
+mark, so a shard woken behind a hog waits at most a quantum instead of the kernel's tick.
 
 - **In the real-time class's place.** A shard that took the real-time class (`[server] realtime`, granted)
   asks for nothing more: its wake preempts at once. Refused, or not asked for, it asks for its slice and,
@@ -1737,11 +2209,196 @@ a timer of its own may be late, instead of the kernel's tick.
   lazy preemption to bound.
 - **It says so**, in the log once every shard has answered and in `/healthz/server` (`priority.nudge`:
   asked, period, shards, nudged, those in the real-time class, refused, why).
-- **What it costs.** A waiting shard wakes once a period, up to 10,000 times a second at the tick: a park and
-  a turn of its loop each, CPU the shard spends (its busy share rises with it) and the threads beside it
-  lose; and a calm machine's CPUs can't reach their deeper idle states while a shard waits (fedora's C3
-  takes up to 1,048 µs to leave, which a calm wake pays too). That cost is measurable, so the nudge is a
-  setting, not the default. The microbench below measures it.
+- **What it costs.** A waiting shard wakes once a period, the slack added: 3,750 times a second (5,000 at the
+  timers' tick): a park and a turn of its loop each, CPU the shard spends (its busy share rises with it) and
+  the threads beside it lose; and a calm machine's CPUs can't reach their deeper idle states while a shard
+  waits (fedora's C3 takes up to 1,048 µs to leave, which a calm wake pays too). That cost is measurable, so
+  `on` nudges only where declared. The A/Bs and the microbench below measure it.
+- **On its own, where declared** (goal 6, plan `01a1a59c2abe` step 3; `crate::nudge`; docs/priority.md, "A nudge for
+  the shards"): `[server] nudge = "auto"`, the mode a config declares (off until then: docs/ci.md §0.3, "Opt-in
+  automation"), nudges a shard only while its host holds its wakes, as the shard reads each probe period from the
+  kernel's count of its thread's wait for a CPU (`/proc/thread-self/schedstat`): held past 17.2 µs a wake on average, the geometric
+  mean of what wake-2 measured of runs whose wakes nothing held (at most 4.4 µs) and of held ones (at least
+  67.4 µs), it nudges, and goes on for a tolerance (1 s) past its last held period. A calm shard's wakes wait
+  1.2 µs (wake-2), so it pays a file's read a period. "The A/B to run: the nudge on its own" (below) says what it
+  costs a calm server and buys beside hogs.
+
+### The nudge's A/B (goal 8 step 7)
+
+`scripts/priority_lab/s7c.sh` on fedora, 2026-11-05, 20:51 to 21:34 UTC (at loads of 14 to 50 from other
+sessions): 8 rounds each of `calm`, `hogs` (16 spinning hogs at `cpu.weight` 1 on the server's CPUs,
+16-31), `nudge` (`hogs` with `KILN_RT_NUDGE=1`, its period then the timers' tick, 100 µs) and `calm-nudge`,
+interleaved, every round's server saying `nudge: 4 of 4 every 100 us`. The runs:
+`~/.cache/kiln-lab-pending/g8s7-nudge` there. Each cell the median of the rounds; the verdicts are `kiln-lab
+compare` of `hogs` against `nudge`:
+
+| number | calm | hogs | nudge | calm-nudge | nudge against hogs |
+| --- | --- | --- | --- | --- | --- |
+| shards' delay p50 µs | 191 | 196 | 183 | 171 | better, −6.7% |
+| shards' delay p99 µs | 326 | 1105 | 744 | 230 | better, −32.7% |
+| shards' delay p99.9 µs | 912 | 2980 | 2189 | 858 | same, −26.5% (noise ±55%) |
+| page p99 ms | 0.372 | 1.485 | 0.752 | 0.316 | better, −49.3% |
+| API read p50 ms | 0.156 | 0.630 | 0.235 | 0.149 | better, −62.6% |
+| API read p99 ms | 0.777 | 2.005 | 1.268 | 0.778 | better, −36.8% |
+| API reads' wait p99.9 ms | 0.125 | 1.532 | 0.596 | 0.099 | better, −61.1% |
+| websocket p99 ms | 2.510 | 10.961 | 11.163 | 2.292 | same |
+| shards' busy share | 0.029 | 0.027 | 0.034 | 0.038 | worse, +27.1% |
+| shards' parks a request | 33.6 | 25.5 | 191 | 210 | worse, ×7.5 |
+| their system calls a request | 54.5 | 44.2 | 211 | 231 | worse, ×4.8 |
+
+What it says:
+
+- **The nudge gives back most of what a lazy wake costs a request** with hogs: API reads' wait for their shard
+  at p99.9 from 1.53 to 0.60 ms, their median from 0.63 to 0.24 ms (calm's is 0.16), pages' p99 halved.
+- **It doesn't make goal 9 step 4's bar**: the shards' delay p99.9 with hogs went from 2.98 to 2.19 ms, the same
+  within the rounds' noise. The probe that measures it is woken by a timer of its own shard, on that shard's
+  CPU, so its own wake took the lazy mark at once with or without the nudge (its timer's interrupt is the
+  return to user space that takes it); a lazy wake shows in the probe's delay only through the work it held
+  back, which runs in the probe's step ahead of it, and what holds a shard that is runnable or busy (a long
+  poll, a thread of the server's own beside it) shows in full.
+- **It costs what step 5 is cutting**: the shards' busy share up 27% with hogs (0.027 to 0.034, against step 5's
+  bar of 0.0056 with hogs), seven times the parks. Calm, it bought the shards' median delay (191 to 171 µs) and
+  nothing else beyond noise, at a busy share 31% higher (0.029 to 0.038).
+- So it stays a setting, off until declared, and isn't the bare-metal default: it needs no grant, but it
+  doesn't make the bar and it costs the busy share beyond noise; production's kernel preempts fully, where
+  a wake takes its CPU at once and the nudge would only cost. A nudge on only while a shard waits on work it
+  sent out (g6-critical-hogs's) keeps what it buys at less of the cost.
+
+### The shard's own wake path (goal 9 step 4)
+
+Beyond the nudge, what a shard can do about its own wakes without privilege, read in Linux 6.19's scheduler and the
+files behind a shard's kick (`kernel/sched/fair.c`, `fs/eventfd.c`, `fs/eventpoll.c`, `fs/timerfd.c` at v6.19):
+
+- **Not be woken at all: a spin before the park** (`hyper_rt::park_spin`; docs/priority.md, "A spin before the
+  park"). A shard still spinning when its work comes is never woken: its senders find it running and skip their
+  kicks, and the work runs at once. Asked for with `KILN_RT_SPIN=1`, each shard spins before each park as long as its
+  own idle gaps make cheapest in CPU, up to 16 µs, the first of the park bounds past the cheapest wake the lab
+  measured (12.6 µs, wake-2): each window of 385 idle moments, the spin becomes the one of 0, 1, 2, 4, 8 and 16 µs
+  that would have spent the least of the shard's CPU on them, a gap it catches costing the spin to it, one it misses
+  the spin and the park after it, whose CPU the shard learns from its own parks (its task clock, no system call) and
+  its senders' kicks. A park's gap runs to its kick's stamp where a kick ended it, not to the park's return, which
+  adds the wake's own latency (a lazy wake's up to a tick): the park histogram's share under 16 µs
+  (`kiln_shard_park_seconds`) counts only the gaps whose wakes were short too, and with hogs few are.
+  - **Its cost against step 5's bar.** At the lab's rate with hogs (25.5 parks a request at about 190 requests a
+    second over 4 shards: some 1,200 parks a second a shard, g8s7-nudge), a 16 µs spin that missed every gap would
+    spend 1,200 × 16 µs a second, 1.9% of a CPU, on spinning alone: three times step 5's bar with hogs (a busy share
+    of 0.0056) on its own. A park/wake cycle costs about 4.8 µs of CPU (4.69 to 4.86 µs, `crate::park_cost`'s notes),
+    so a spin longer than that pays for itself only where nearly every gap is under it (`park_spin`'s tests work
+    the cases). Hence the sized spin, which spins only where spinning cost less CPU than parking on the last window's
+    gaps, so the busy share can only fall by it; and a fixed spin (`KILN_RT_SPIN_US`) for the lab alone, to see what
+    spinning buys at a price.
+  - **What it can catch.** A request from a client on another CPU (the lab's are on 0-15) is a remote wake unless it
+    comes within the spin of the shard going idle; a shard's round trip to the pools mostly takes longer (the compute
+    pool's pieces' p99 2.6 ms calm, g9p7). Its catches are short gaps: a reply from a shard that was running, a job
+    that finished at once, work that came as the shard went idle (a park withdrawn).
+- **Be woken on the waker's CPU.** Not kiln's shards:
+  - A shard on cores of its own is fixed to its core, and a wake goes only to a CPU its task may run on
+    (`select_task_rq_fair`'s `want_affine` needs the waker's CPU in the wakee's mask).
+  - An unfixed shard (weights alone) goes where `select_task_rq_fair` puts it: to the waker's CPU only by
+    `wake_affine`, which takes it for a sync wake where the waker runs alone there (`wake_affine_idle`), or where that
+    CPU's load, less a sync waker's, is below the shard's last CPU's (`wake_affine_weight`). A shard's kick is an
+    eventfd's write, never a sync wake (`eventfd_write` and `eventfd_signal_mask` call `wake_up_locked_poll`), though
+    epoll passes a sync wake on (`ep_poll_callback`'s `wake_up_sync`) and a pipe's or a socket's write is one. With
+    hogs on every CPU no waker runs alone, so a sync kick would move a shard between CPUs that are all busy, losing
+    its cache and its placement (goal 7) and none of the lazy wait.
+  - What does make a wake prompt is a waker on the wakee's own CPU: its return to user space from the kick takes the
+    lazy mark, so the shard runs as soon as the waker's system call returns. A shard's job could run there while the
+    shard waits on it: the opposite of what cores of its own do (`rt::keep_apart` keeps the server's other threads
+    off its shards' cores), and goal 3's pool's to weigh. Not built.
+  - No unprivileged call interrupts a CPU another process's thread runs on: `membarrier`'s expedited commands
+    interrupt only CPUs running the caller's own threads (or a process's that registered for them, which a hog
+    hasn't), a signal only the CPU its target runs on, and a wake's own interrupt (the wakelist's) reaches a busy
+    CPU only across last-level caches (fedora's 32 CPUs share one).
+- **A wait's timeout derived from the tick.** Yes: the nudge's period is now the step quantum less the timers' tick,
+  166.7 µs (`crate::rt::nudge_period_ns`), so with the timer slack each nudged wait's interrupt comes within a
+  quantum, the host's share of the delay bar in the quantum's derivation; the timers' tick as the period woke each
+  waiting shard a third again as often for no bar it held. The kernel's own tick bounds the lazy wait at a
+  millisecond on every HZ Linux offers (1000 at most), past any quantum the bar allows, so the nudge never leaves
+  the wait to it. Not built:
+  - Interrupts in phase with the kernel's tick: with the tick's own as one, three of the shard's own a tick (at 250,
+    500 and 750 µs of each millisecond) hold the same bound as 3.75 a millisecond, a fifth fewer; but the timer slack
+    is the thread's, set once for its wheel, so a nudge can't land on a phase within less than it.
+  - An interrupt with no wake: a nudge's cost is the shard's own wake each period, and a timer no one waits on
+    interrupts its CPU waking no one, but no unprivileged timer repeats without one: a timerfd re-arms its period only
+    as it's read (`timerfd_read`), a POSIX timer only as its signal is delivered (an ignored or blocked one stays
+    disarmed), the kernel's guard against short periods. A timerfd armed at each park covers one instant, a system
+    call a park.
+
+### The A/B of the wake path (goal 9 step 4)
+
+Weights alone against the sized spin, a fixed 16 µs spin, the nudge (`on`) at its derived period and at the timers'
+tick, and the sized spin with the nudge, beside the same hogs in production's layout; and calm against the sized spin calm, for
+its cost there. Eight rounds each, interleaved, with `scripts/shard_lab/driver.sh` on fedora (the coordinator's), its
+`kiln` and `kiln-lab` built from a tree with this change (`g9s4-wake`) as for step 7's lab:
+
+```sh
+systemd-run --user --unit=g9s4-wake --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+  env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 SHARDS=4 \
+  CONFIGS="calm hogs spin-calm spin-hogs spin16-hogs nudge-on-hogs nudge100-hogs spin-nudge-on-hogs" \
+  COMPARE="calm:hogs hogs:spin-hogs hogs:spin16-hogs hogs:nudge-on-hogs hogs:nudge100-hogs nudge100-hogs:nudge-on-hogs nudge-on-hogs:spin-nudge-on-hogs calm:spin-calm" \
+  bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g9s4-wake
+```
+
+About 2.5 minutes a round, 64 rounds: two hours and three quarters. What to read in `report.md`:
+
+- **The sized spin** (`spin-hogs`, `spin-calm`): `shards.spins_per_request`, `shards.spin_hits_per_request` and
+  `shards.spin_seconds_per_request` say how often it spun, how often it caught work and the CPU it spent;
+  `shards.busy_share` no worse than `hogs`'s (calm: `calm`'s) beyond noise, as its rule promises; and the delays
+  (`shards.delay_*`, `server.api_read.wait_*`, pages, API reads) what it bought. A default candidate only where it
+  buys a number beyond noise for no busy share.
+- **The fixed spin** (`spin16-hogs`): the most a 16 µs spin buys, and its price: `shards.spin_seconds_per_request` and
+  `shards.busy_share` against step 5's bar (0.0056 with hogs), `shards.parks_per_request` and
+  `shards.kicks_saved_per_request` against `hogs`'s.
+- **The nudge's period** (`nudge-on-hogs`, 166.7 µs, against `nudge100-hogs`, `on` at 100 µs): fewer parks and timer wakeups
+  (`shards.wakeups_timer_per_request`) and a lower busy share, with no API read or shards' delay number worse beyond
+  noise, keeps the derived period; a number worse beyond noise sends it back to the timers' tick.
+- **The spin with the nudge** (`spin-nudge-on-hogs` against `nudge-on-hogs`): whether the spin's catches take parks off the
+  nudge's.
+- **Step 4's bar** (`shards.delay_p999_us` under 1,000 with hogs): none of these is expected to make it ("The nudge's
+  A/B": the probe's own wake is prompt already); the real-time class's A/B ("The A/B to run", above) is the one that
+  can, where Ada has given the room.
+
+### The A/B to run: the nudge on its own (goal 6 step 3 and goal 8 step 7)
+
+`scripts/shard_lab/driver.sh` (goal 9's lab) runs a configuration with `[server] nudge` set by a prefix,
+`nudge-<off|on|auto>-<cfg>` (`KILN_RT_NUDGE`); a configuration without one runs the build's default, `off`. In
+production's layout (the server alone at `CPUWeight=1000` on 16-31, 16 spinning hogs at `cpu.weight` 1 there),
+eight rounds each, interleaved, this branch's `kiln` and `kiln-lab` built as for goal 9's lab:
+
+```sh
+systemd-run --user --unit=g6-auto --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+  env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 SHARDS=4 \
+  CONFIGS="calm nudge-auto-calm hogs nudge-auto-hogs nudge-on-hogs nudge-on-calm" \
+  COMPARE="calm:nudge-auto-calm hogs:nudge-auto-hogs nudge-auto-calm:nudge-auto-hogs calm:hogs nudge-on-hogs:nudge-auto-hogs nudge-on-calm:calm" \
+  bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g6auto
+```
+
+About 2.5 to 3 minutes a round, 48 rounds: two to two and a half hours. What to read (`report.md`, each pair by
+`kiln-lab compare`; kiln-lab reports each shard's `nudged_share` of the window and the shards' `held_wake_us`, how
+long their host held each wake another thread or their I/O made them, as `auto` judges it):
+
+- **What `auto` costs a calm server: `calm` (off, the default) against `nudge-auto-calm`.** `shards.nudged_share` says how much of the
+  window the shards nudged: about 0 where nothing else of fedora's runs on 16-31, more where other sessions'
+  work does (then `shards.held_wake_us` shows it held them, as wake-2's "none, another CPU" did). It passes with no
+  number of `nudge-auto-calm` worse beyond noise: every class's p50, p99 and p99.9 (`page`, `api_read`, `api_write`,
+  `websocket`, `attach`), `shards.delay_p99_us` and `p999_us`, and `server.cpu_share` and `shards.busy_share`, the
+  CPU it would cost.
+- **What it buys with hogs: `hogs` against `nudge-auto-hogs`.** `shards.nudged_share` near 1 in `nudge-auto-hogs`, and
+  `shards.held_wake_us` down from hundreds of µs to about 130 or less (half the nudge's bound at its period). The gain: `page`, `api_read` and
+  `websocket` p50 and p99, `api_write` p50, and `shards.delay_p99_us` and `p999_us` better beyond noise.
+- **The steps' bars: `nudge-auto-calm` against `nudge-auto-hogs`.** Goal 6 step 3 holds where `page.p99_ms` with hogs is
+  within noise of calm; goal 8 step 7 where pages', API reads' and writes' and the live feed's (`websocket`) p99
+  are. Read the noise as the report gives it; g9p7's calm rounds had stalls that widened it (`page.p99_ms` 0.296
+  to 1.916 ms calm), so the medians matter too (`*.p50_ms`, which g9p7 had worse beyond noise in every class).
+- **Whether `auto` nudges whenever `on` helps: `nudge-on-hogs` against `nudge-auto-hogs`**, every number the same within
+  noise; and **what `on` costs calm: `nudge-on-calm` against `calm`**, for the record.
+- **What's left with hogs** shows in `shards.held_wake_us` under `nudge-auto-hogs`: the shards aren't fixed to cores in this
+  layout, so a wake the scheduler moves to another busy CPU isn't bounded by the shard's timer on the one it
+  parked on. If that's most of what's left, `cores` (goal 9 step 4) is the A/B to add, as `cores nudge-auto-cores`.
+
+`auto` stays off until declared either way (docs/ci.md §0.3, "Opt-in automation"; `crate::config`'s
+`Server::default`, `nudge`): where `calm` against `nudge-auto-calm` shows no cost beyond noise and `hogs` against
+`nudge-auto-hogs` a gain, a config may declare it with the lab behind it, and `KILN_RT_NUDGE=auto` serves labs.
 
 ### The wake microbench (goal 8 step 7)
 

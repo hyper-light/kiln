@@ -67,8 +67,8 @@ pub struct Config {
     /// Where copies of other runners' trees live (`~/.kiln/reach`).
     pub mirrors: PathBuf,
     /// Who takes over what another runner hands this one (an agent session moving here); None:
-    /// hand-overs are refused.
-    pub adopt: Option<async_channel::Sender<Adoption>>,
+    /// hand-overs are refused. A lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae).
+    pub adopt: Option<crate::memory::queue::Sender<Adoption>>,
     /// The copies' uses, for their keeper (`super::keeper`, docs/reach.md §5.1): each sync and run
     /// holds its copy in use while it's at it.
     pub using: Arc<super::keeper::Using>,
@@ -147,8 +147,10 @@ impl Config {
     }
 }
 
-/// What follows a run on another runner receives.
-pub type Says = async_channel::Sender<Say>;
+/// What follows a run on another runner receives: a lock-free queue (`crate::memory::queue`; goal 5, plan
+/// 01a1a59c2aae), unbounded as the channel it was, so the node never waits on it (the run's window bounds
+/// what's in flight).
+pub type Says = crate::memory::queue::Sender<Say>;
 
 /// Messages into the node.
 pub enum In {
@@ -189,7 +191,7 @@ pub enum Local {
     /// Something more for a run (input, a signal, Forget).
     Ask { peer: String, ask: Ask },
     /// Follow a sync of `key` on `peer` (what it says goes to `says`), then send it `asks`.
-    Sync { peer: String, key: String, says: async_channel::Sender<SyncSay> },
+    Sync { peer: String, key: String, says: crate::memory::queue::Sender<SyncSay> },
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
@@ -209,11 +211,13 @@ pub enum Local {
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
 /// goes in unbounded (the agent never waits on the node: windows bound what is in flight); local
-/// tools wait their turn.
+/// tools wait their turn. Both lock-free queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its
+/// top goal): an async-channel's wait took event-listener's `Mutex`, the runner's loop sending every
+/// frame on its shard and the node waiting on its own.
 #[derive(Clone)]
 pub struct Handle {
-    net: async_channel::Sender<In>,
-    tx: async_channel::Sender<In>,
+    net: crate::memory::queue::Sender<In>,
+    tx: crate::memory::queue::Sender<In>,
     announce: Announce,
     busy: Arc<AtomicU64>,
     name: String,
@@ -309,7 +313,7 @@ impl Handle {
         self.tx.send(In::Local(Local::Ask { peer: peer.to_owned(), ask })).await.is_ok()
     }
 
-    pub async fn sync(&self, peer: &str, key: &str, says: async_channel::Sender<SyncSay>) -> bool {
+    pub async fn sync(&self, peer: &str, key: &str, says: crate::memory::queue::Sender<SyncSay>) -> bool {
         self.tx.send(In::Local(Local::Sync { peer: peer.to_owned(), key: key.to_owned(), says })).await.is_ok()
     }
 
@@ -402,7 +406,7 @@ impl Handle {
     pub async fn object(&self, peer: &str, repo: &str, digest: &str, into: &std::path::Path) -> anyhow::Result<bool> {
         use std::io::Write as _;
         self.connect(peer).await?;
-        let (tx, rx) = async_channel::unbounded::<Say>();
+        let (tx, rx) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
         let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await?;
         let mut file = std::fs::File::create(into)?;
         let mut offset = 0u64;
@@ -431,7 +435,7 @@ impl Handle {
 
     async fn adopt_once(&self, peer: &str, data: &[u8]) -> Result<(), Missed> {
         self.connect(peer).await.map_err(|e| Missed::Failed(format!("{e:#}")))?;
-        let (tx, rx) = async_channel::unbounded::<Say>();
+        let (tx, rx) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
         let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await.map_err(|e| Missed::Failed(format!("{e:#}")))?;
         let wait = |d: Duration| {
             let rx = rx.clone();
@@ -476,15 +480,17 @@ impl Handle {
 
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
-pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
+pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
     let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version };
     let (dir, root) = (cfg.dir.clone(), Arc::new(cfg.root.clone()));
-    let (net_tx, net_rx) = async_channel::unbounded::<In>();
-    let (tx, rx) = async_channel::bounded::<In>(1024);
+    // Each with the bound its channel had: the network's and the node's own unbounded, local tools'
+    // 1,024 at most, whatever each carries.
+    let (net_tx, net_rx) = crate::memory::queue::unbounded::<In>(&crate::memory::owners::CHANNELS);
+    let (tx, rx) = crate::memory::queue::places::<In>(&crate::memory::owners::CHANNELS, 1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
-    let (out_tx, out_rx) = async_channel::unbounded::<AgentMsg>();
+    let (out_tx, out_rx) = crate::memory::queue::unbounded::<AgentMsg>(&crate::memory::owners::CHANNELS);
     let ticker = net_tx.clone();
     crate::rt::spawn(async move {
         loop {
@@ -625,7 +631,7 @@ struct Peer {
     link: Option<String>,
     state: PeerState,
     follows: HashMap<u64, Follow>,
-    syncs: HashMap<String, async_channel::Sender<SyncSay>>,
+    syncs: HashMap<String, crate::memory::queue::Sender<SyncSay>>,
     /// Hand-overs to this runner being followed, by id.
     adopts: HashMap<u64, Says>,
     /// Asks waiting for the link.
@@ -672,7 +678,7 @@ impl Peer {
 /// A run this side does for another runner.
 struct Served {
     pid: Option<u32>,
-    stdin: Option<async_channel::Sender<Vec<u8>>>,
+    stdin: Option<crate::memory::queue::Sender<Vec<u8>>>,
     /// Output not yet acknowledged: (offset, stream, bytes).
     buf: VecDeque<(u64, Stream, Vec<u8>)>,
     /// Bytes of output so far (the next offset).
@@ -687,9 +693,11 @@ struct Served {
     /// When it was told to stop for its timeout (then killed if it won't).
     stopping: Option<Instant>,
     timed_out: bool,
-    /// Shared with the run's forwarder: bytes held, and its wake-up when that drops.
+    /// Shared with the run's forwarder: bytes held, and its wake-up when that drops (`crate::rt::Changed`, no
+    /// lock; goal 5, plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`
+    /// the node's loop and the forwarder took on the runner's shards).
     held: Arc<AtomicU64>,
-    room: Arc<event_listener::Event>,
+    room: Arc<crate::rt::Changed>,
     /// Its output's SHA-256 so far, each byte as the run said it (docs/ci.md W27-R08).
     out: sha2::Sha256,
     /// What it was taken as (its receipt, whom its output goes to), on a link that carries
@@ -719,7 +727,7 @@ impl Served {
             self.acked = self.acked.max(end);
             self.sent = self.sent.max(end);
         }
-        self.room.notify(usize::MAX);
+        self.room.notify();
     }
 }
 
@@ -728,7 +736,7 @@ struct Session {
     link: Option<String>,
     runs: HashMap<u64, Served>,
     /// Syncs, each its own worker (file system work stays off this task).
-    syncs: HashMap<String, async_channel::Sender<(SyncAsk, Option<Commit>)>>,
+    syncs: HashMap<String, crate::memory::queue::Sender<(SyncAsk, Option<Commit>)>>,
     /// Hand-overs arriving, by id: the bytes so far.
     adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
@@ -760,8 +768,8 @@ struct Node {
     identity: Identity,
     pins: Pins,
     host: Host,
-    out: async_channel::Sender<AgentMsg>,
-    tx: async_channel::Sender<In>,
+    out: crate::memory::queue::Sender<AgentMsg>,
+    tx: crate::memory::queue::Sender<In>,
     /// Links with ciphertext waiting, flushed after each batch.
     dirty: Vec<String>,
     server: bool,
@@ -1467,7 +1475,7 @@ impl Node {
                                 run.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
                             }
                         }
-                        run.room.notify(usize::MAX);
+                        run.room.notify();
                         run.acked = r.from.max(run.acked);
                         run.sent = run.acked;
                         run.exit_sent = false;
@@ -1519,7 +1527,7 @@ impl Node {
                             r.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
                         }
                     }
-                    r.room.notify(usize::MAX);
+                    r.room.notify();
                 }
                 self.pump(&key, id).await;
             }
@@ -1655,8 +1663,8 @@ impl Node {
             self.cfg.dir.join("shells").join(&key.0).join(&key.1).join(safe)
         });
         let held = Arc::new(AtomicU64::new(0));
-        let room = Arc::new(event_listener::Event::new());
-        let (ev_tx, ev_rx) = async_channel::bounded::<serve::Event>(16);
+        let room = Arc::new(crate::rt::Changed::new());
+        let (ev_tx, ev_rx) = crate::memory::queue::places::<serve::Event>(&crate::memory::owners::CHANNELS, 16);
         let extra = vec![("KILN_REACH_FROM".to_owned(), key.0.clone())];
         // A run in a copy holds it in use until the run's last event, noted as the agent's that
         // asked for it (docs/reach.md §5.1).
@@ -2197,9 +2205,9 @@ fn spoken(reason: &str) -> Option<u32> {
 
 /// A sync done for another runner: its own task, the file system work on blocking threads. What it
 /// says goes back through the node.
-fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>, busy: super::keeper::Busy) -> async_channel::Sender<(SyncAsk, Option<Commit>)> {
+fn sync_worker(root: PathBuf, key: String, session: (String, String), node: crate::memory::queue::Sender<In>, busy: super::keeper::Busy) -> crate::memory::queue::Sender<(SyncAsk, Option<Commit>)> {
     // Unbounded: the node never waits on a sync; the asker's window bounds what is in flight.
-    let (tx, rx) = async_channel::unbounded::<(SyncAsk, Option<Commit>)>();
+    let (tx, rx) = crate::memory::queue::unbounded::<(SyncAsk, Option<Commit>)>(&crate::memory::owners::CHANNELS);
     crate::rt::spawn(async move {
         let _busy = busy;
         let said = |s: SyncSay, custody: Option<String>, tree: Option<String>| {

@@ -993,6 +993,9 @@ impl LocalRuntime {
             self.shard.context().end_root();
             return Err(refused);
         }
+        // The reading that ended the last turn, the next step's clock (`Shard::step_after`; kiln's goal 9, plan
+        // 01a1a87b2cec step 5).
+        let mut reading = None;
         loop {
             if self.shard.context().root_unwound() {
                 // The root's poll unwound inside the shard's boundary and its task ended `Unwound`: no output
@@ -1012,7 +1015,7 @@ impl LocalRuntime {
                     }
                 });
             }
-            let outcome = self.shard.step();
+            let (outcome, last) = self.shard.step_after(reading.take());
             if outcome.exit {
                 self.shard.context().end_root();
                 self.shard.discard_root_output();
@@ -1020,9 +1023,11 @@ impl LocalRuntime {
                     shard: self.slot.0.shard(),
                 });
             }
-            if !outcome.did_work {
-                self.shard.park_owned(outcome.next_deadline_ns);
-            }
+            reading = if outcome.did_work {
+                last
+            } else {
+                self.shard.park_owned_then(outcome.next_deadline_ns)
+            };
         }
     }
 

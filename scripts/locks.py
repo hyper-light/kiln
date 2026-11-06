@@ -20,13 +20,20 @@
       The locks a lab run's rounds took, one row a lock (the sites that took one lock, by its
       address, together), ranked by how often the window took it, with the fill's beside it:
       kiln's, Quiver's, the dependencies' and the allocator's apart (`group` and `owner` in JSON); then
-      the store's calls by caller. A dependency's lines are read from the cargo registry.
+      the store's calls by caller. A dependency's lines are read from the cargo registry. Each site's
+      figures are its counters' growth as kiln-lab took it, its copies summed (`copies`: one a generic
+      caller's instance or an inlined one's codegen unit); a run without `copies`, or with a growth
+      below zero, is refused.
   scripts/locks.py list
       Every Mutex and RwLock the instrumented crates declare, with where it's taken.
   scripts/locks.py check [--root DIR]
       The API's hot path stays lockless (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in
       the modules scripts/locks/hot.toml names, outside a test build's code, but those it lists with
-      why each is off the hot path. Fails on any other, and on a listed one that's gone.
+      why each is off the hot path. Nor does kiln's code wait on event-listener (goal 5's census: its
+      list's Mutex, the one lock the shards still shared): no async-lock and no event-listener named in
+      the folders hot.toml's `waits` names, outside a test build's code, but those it lists under
+      `waiting` with why; `crate::turn` and `crate::rt::Changed` wait with no lock. Fails on any other,
+      and on a listed one that's gone.
 
 Exit status: 0 done, 1 failed (the message says why), 2 usage.
 """
@@ -702,12 +709,41 @@ def declarations(tree: Path) -> list[dict]:
     return out
 
 
+# The figures kiln-lab keeps of a site (`LockSeen`) that are its counters' growth, over the window and the fill.
+GROWTH = ("taken", "contended", "wait_s", "fill_taken", "fill_contended", "fill_wait_s")
+
+
+def unsound(run: Path, rounds: list[dict]) -> str | None:
+    """Why a run's lock census can't be ranked, or None (goal 5, plan 01a1a59c2aae step 1). The census counts a
+    site under each copy of its location the compiler made (a generic caller's instances, an inlined caller's
+    codegen units), a series each under the same labels, and kiln-lab sums a site's copies in every scrape before
+    it takes the growth, and says how many (`copies`). A kiln-lab from before took a site's start from one copy
+    and its end from another wherever there were two or more (53 sites of 280 in census-B's build,
+    event-listener's among them), and nothing in its run says which sites those were. Either way, counters'
+    growth can't be below zero."""
+    old = len({key for rd in rounds for key, seen in rd["locks"].items() if not seen.get("copies")})
+    below = [f"{key} {f} {seen[f]:g} (round {rd.get('index', i + 1)})" for i, rd in enumerate(rounds) for key, seen in sorted(rd["locks"].items()) for f in GROWTH if seen.get(f, 0) < 0]
+    if not old and not below:
+        return None
+    why = []
+    if old:
+        why.append(
+            f"its kiln-lab didn't sum a site's copies ({old} site{'s' if old != 1 else ''} without `copies`), so a site the build counted under two or more copies of its location has one copy's count at the start and another's at the end"
+        )
+    if below:
+        why.append(f"{len(below)} growths below zero: " + "; ".join(below[:8]) + ("; ..." if len(below) > 8 else ""))
+    return f"{run}: its lock census can't be ranked: " + "; and ".join(why) + ". Run it again with a kiln-lab that sums them (the census build can stay)."
+
+
 def rank(runs: list[Path], tree: Path) -> tuple[list[dict], list[dict]]:
     rounds = []
     for r in runs:
         data = json.loads(r.read_text())
         window = float(data.get("profile", {}).get("window_s") or 60)
-        rounds.extend((x, window) for x in data.get("rounds", []) if x.get("locks"))
+        mine = [x for x in data.get("rounds", []) if x.get("locks")]
+        if why := unsound(r, mine):
+            fail(why)
+        rounds.extend((x, window) for x in mine)
     if not rounds:
         fail("no round with a lock census: run kiln-lab on a census build (`locks.py census-tree`)")
     # Each site's figures per round, then its median over the rounds; and the addresses it took.
@@ -865,6 +901,9 @@ def markdown(rows: list[dict], store: list[dict], rounds: int) -> str:
 
 HOT = "scripts/locks/hot.toml"
 LOCK_WORD = re.compile(r"\b(Mutex|RwLock|Condvar|ReentrantMutex|FairMutex)\b")
+# What waits on event-listener's list, behind its std Mutex (goal 5, plan 01a1a59c2aae, its top goal): async-lock's
+# locks, semaphores and cells, and event-listener's Events, named by their crates' paths.
+WAIT_WORD = re.compile(r"\b(async_lock|event_listener)::")
 
 
 def blank(text: str) -> str:
@@ -986,9 +1025,9 @@ def name_of(line: str) -> str:
     return s
 
 
-def hot_files(root: Path, spec: dict) -> list[Path]:
+def hot_files(root: Path, spec: dict, key: str = "hot") -> list[Path]:
     files: list[Path] = []
-    for p in spec.get("hot", []):
+    for p in spec.get(key, []):
         at = root / p
         if at.is_dir():
             files.extend(sorted(at.rglob("*.rs")))
@@ -999,44 +1038,66 @@ def hot_files(root: Path, spec: dict) -> list[Path]:
     return files
 
 
-def check(root: Path) -> int:
-    import tomllib
-
-    spec = tomllib.loads((root / HOT).read_text())
-    allowed = {(a["at"], a["name"]): a.get("why", "") for a in spec.get("allowed", [])}
-    for (at, name), why in allowed.items():
+def listed(spec: dict, key: str) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """hot.toml's entries under `key` (`allowed`, `waiting`): each (file, name) with its why, and those still to be
+    replaced, each with what replaces it (`todo`)."""
+    entries = {(a["at"], a["name"]): a.get("why", "") for a in spec.get(key, [])}
+    for (at, name), why in entries.items():
         if not why.strip():
             fail(f"{HOT}: {at} {name} says no why")
-    # Those on the hot path still, each with what replaces it: listed so the check holds the rest, and
-    # said each time it runs.
-    todo = sorted(f"{a['at']} {a['name']}: {a['todo']}" for a in spec.get("allowed", []) if a.get("todo"))
+    return entries, sorted(f"{a['at']} {a['name']}: {a['todo']}" for a in spec.get(key, []) if a.get("todo"))
+
+
+def scan(root: Path, files: list[Path], word: re.Pattern[str], entries: dict[tuple[str, str], str]) -> tuple[list[str], list[str]]:
+    """The lines of `files`' code outside a test build's that `word` finds and `entries` doesn't list, and the
+    entries no such line names any more (stale)."""
     seen: set[tuple[str, str]] = set()
     found = []
-    for f in hot_files(root, spec):
+    for f in files:
         rel = f.relative_to(root).as_posix()
         code = outside_tests(blank(f.read_text()))
         lines = code.split("\n")
         source = f.read_text().split("\n")
         for i, line in enumerate(lines, 1):
-            if not LOCK_WORD.search(line):
+            if not word.search(line):
                 continue
             name = name_of(line)
-            if (rel, name) in allowed:
+            if (rel, name) in entries:
                 seen.add((rel, name))
                 continue
             found.append(f"{rel}:{i}: {name}: {source[i - 1].strip()}")
-    stale = sorted(f"{at} {name}" for (at, name) in allowed if (at, name) not in seen)
+    return found, sorted(f"{at} {name}" for (at, name) in entries if (at, name) not in seen)
+
+
+def check(root: Path) -> int:
+    import tomllib
+
+    spec = tomllib.loads((root / HOT).read_text())
+    # Those on the hot path still, each with what replaces it: listed so the check holds the rest, and
+    # said each time it runs.
+    allowed, todo = listed(spec, "allowed")
+    found, stale = scan(root, hot_files(root, spec), LOCK_WORD, allowed)
+    waiting, waits_todo = listed(spec, "waiting")
+    waits_found, waits_stale = scan(root, hot_files(root, spec, "waits"), WAIT_WORD, waiting)
     if found:
         print("A lock on the API's hot path (goal 5, plan 01a1a59c2aae): make it an owner with messages, an immutable copy swapped in whole (crate::rcu), or a copy per shard; or, if it's off the hot path, list it in " + HOT + " with why.\n")
         print("\n".join(found))
     if stale:
         print(f"\n{HOT} lists locks that aren't there any more: take them out.\n")
         print("\n".join(stale))
-    if found or stale:
+    if waits_found:
+        print("\nA wait on event-listener's list, behind its Mutex (goal 5, plan 01a1a59c2aae, its top goal: the one lock the shards still shared): wait with crate::turn (a gate, a baton, a read-write, keyed, once) or crate::rt::Changed instead; or, if no shard takes it, or one task alone, list it in " + HOT + "'s `waiting` with why.\n")
+        print("\n".join(waits_found))
+    if waits_stale:
+        print(f"\n{HOT}'s `waiting` lists waits that aren't there any more: take them out.\n")
+        print("\n".join(waits_stale))
+    if found or stale or waits_found or waits_stale:
         return 1
-    print(f"locks: no lock on the hot path but the {len(allowed)} {HOT} lists, each with why")
+    print(f"locks: no lock on the hot path but the {len(allowed)} {HOT} lists, each with why; no wait on event-listener but the {len(waiting)} it lists under `waiting`")
     if todo:
         print(f"\n{len(todo)} of them are on the hot path still, each to be replaced so:\n" + "\n".join(todo))
+    if waits_todo:
+        print(f"\n{len(waits_todo)} of the waits are still to move, each so:\n" + "\n".join(waits_todo))
     return 0
 
 

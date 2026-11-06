@@ -1,13 +1,16 @@
 //! Durable state in SQLite (WAL), with no lock between its callers (goal 5 of the API runtime
 //! program, plan 01a1a59c2aae): what may write goes as a message to the one connection that writes,
-//! owned by a thread of its own ([`Store::call`]), and a read takes a read-only connection of its own
-//! on the blocking pool ([`Store::read`]), so reads run side by side, with each other and with the
-//! writer, and never wait behind a write. The async runtime is never stalled by disk I/O. Logs are
-//! *not* stored here (see `logs.rs`).
+//! owned by a thread of its own ([`Store::call`]), which commits the calls waiting for it together
+//! (a group: one transaction, each call in a savepoint of its own); and a read takes a read-only
+//! connection of its own on the blocking pool ([`Store::read`]), so reads run side by side, with each
+//! other and with the writer, and never wait behind a write. The WAL is checkpointed on a thread of
+//! its own, off the writer's. The async runtime is never stalled by disk I/O. Logs are *not* stored
+//! here (see `logs.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -64,48 +67,153 @@ impl Drop for Inner {
     }
 }
 
-/// What the writer's thread runs: a call, with the connection and, with the cluster group, the
-/// watch on what it writes.
-type WriteCall = Box<dyn FnOnce(&mut Connection, Option<&capture::Watch>) + Send>;
+/// What the writer's thread is sent.
+enum Errand {
+    /// A call that may write ([`Store::call`]; `local`, [`Store::call_local`]: past the cluster group),
+    /// run in its turn in the transaction of the group of calls it's committed with, in a savepoint of
+    /// its own ([`Writing::group`]).
+    Call { call: Box<dyn Call>, local: bool },
+    /// What runs by itself, outside any transaction, once the calls sent before it are committed:
+    /// [`Store::now`], and a read of a store in memory, whose one connection is the writer's.
+    Alone(Box<dyn FnOnce(&mut Connection) + Send>),
+}
+
+/// A job, with when it was sent.
+type Sent = (Errand, Instant);
+
+/// A call to the writer's thread, with its caller's answer.
+trait Call: Send {
+    /// Runs it on `conn`: what it returned kept for its caller until its group's commit is known.
+    fn run(self: Box<Self>, conn: &mut Connection) -> Ran;
+    /// Answers it without running it: why not.
+    fn refuse(self: Box<Self>, why: &anyhow::Error);
+}
+
+/// `f`, and where its caller waits for what it returned ([`Store::write`]).
+struct Asked<F, R> {
+    f: F,
+    answer: futures::channel::oneshot::Sender<anyhow::Result<R>>,
+}
+
+impl<F, R> Call for Asked<F, R>
+where
+    F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    fn run(self: Box<Self>, conn: &mut Connection) -> Ran {
+        let Asked { f, answer } = *self;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))) {
+            Ok(out) => Ran {
+                kept: true,
+                tell: Box::new(move |told: Told| {
+                    let _ = answer.send(told.answer(out));
+                }),
+            },
+            // A call that panics answers with an error, what it wrote taken back; the writer goes on.
+            Err(_) => Ran {
+                kept: false,
+                tell: Box::new(move |_: Told| {
+                    let _ = answer.send(Err(anyhow::anyhow!("a store call panicked")));
+                }),
+            },
+        }
+    }
+
+    fn refuse(self: Box<Self>, why: &anyhow::Error) {
+        let Asked { answer, .. } = *self;
+        let _ = answer.send(Err(anyhow::anyhow!("{why:#}")));
+    }
+}
+
+/// What a call did in its group: whether what it wrote stays (it returned, `Ok` or `Err`, and keeps
+/// what it wrote as it left it, as calls always have) or is taken back (it panicked), and how its
+/// caller is told once its group's commit is known.
+struct Ran {
+    kept: bool,
+    tell: Tell,
+}
+
+/// How a call's caller is told, once its group's commit is known.
+type Tell = Box<dyn FnOnce(Told) + Send>;
+
+/// How a call's group ended for it.
+enum Told {
+    /// Committed: it's answered with what it returned.
+    Committed,
+    /// What it wrote is gone, for this: one that returned `Ok` is answered with it, one that failed
+    /// with its own error.
+    Lost(Arc<anyhow::Error>),
+}
+
+impl Told {
+    fn answer<R>(self, out: anyhow::Result<R>) -> anyhow::Result<R> {
+        match (self, out) {
+            (Told::Committed, out) | (Told::Lost(_), out @ Err(_)) => out,
+            (Told::Lost(why), Ok(_)) => Err(anyhow::anyhow!("{why:#}")),
+        }
+    }
+}
+
+/// How large a group of calls the writer commits together may grow (goal 5, plan 01a1a59c2aae):
+/// calls join it while they wait, up to these.
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    /// Calls, at most.
+    calls: usize,
+    /// How long its calls may run before it commits: none joins past it.
+    time: Duration,
+}
+
+impl Bounds {
+    const DEFAULT: Bounds = Bounds { calls: GROUP_CALLS, time: GROUP_TIME };
+}
+
+/// A group's calls, at most: the cluster log takes each changed call's change as an entry of its
+/// own, from a queue of `group::QUEUED` places (past them `group::Group::append` waits), so a group
+/// within it hands its changes over without waiting on room its own changes take, when the log has
+/// kept up with the groups before.
+const GROUP_CALLS: usize = group::QUEUED;
+
+/// How long a group's calls may run before it commits: goal 10's bar, a millisecond (plan
+/// 01a1a87b2dae step 1; docs/runtime-lab.md): the most a call's answer waits, past its own run, for
+/// the calls grouped after it (but the one running as the bar passes), where alone it waited for
+/// none of them.
+const GROUP_TIME: Duration = Duration::from_millis(1);
 
 /// The one connection that writes, owned by a thread of its own (`kiln-store`): every call that may
 /// write comes to it as a message, in order, and runs in its turn, as SQLite takes one writer at a
-/// time. Its callers wait for their answer, not on a lock: a thread preempted while it holds the
-/// connection is this one, which no shard ever is.
+/// time, and the calls waiting are committed together ([`Writing::group`]). Its callers wait for
+/// their answer, not on a lock: a thread preempted while it holds the connection is this one, which
+/// no shard ever is.
 struct Writer {
-    tx: Option<std::sync::mpsc::Sender<(WriteCall, Instant)>>,
+    tx: Option<std::sync::mpsc::Sender<Sent>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The groups of calls it committed, and what it and its WAL's checkpoints' thread share, with one.
+    #[cfg(test)]
+    seen: (Arc<AtomicU64>, Option<Arc<Checkpointing>>),
 }
 
 impl Writer {
-    fn start(conn: Connection, watch: Option<capture::Watch>) -> anyhow::Result<Self> {
+    fn start(writing: Writing) -> anyhow::Result<Self> {
         // Unbounded, and bounded by its callers (goal 11, plan 01a1a87b2e56 step 3): every call is waited
         // for by whoever sent it ([`Store::write`], [`Store::now`]), so it holds at most one call for each
         // task or thread waiting on the store, each the closure that caller would hold anyway, moved here
         // rather than copied. Its count is on `/metrics` (`crate::pool_health`'s store queue).
-        let (tx, rx) = std::sync::mpsc::channel::<(WriteCall, Instant)>();
-        let thread = std::thread::Builder::new()
-            .name("kiln-store".to_owned())
-            .spawn(move || {
-                let mut conn = Counted::new(conn);
-                while let Ok((job, sent)) = rx.recv() {
-                    crate::pool_health::store_write_queued(-1);
-                    let began = Instant::now();
-                    job(&mut conn.conn, watch.as_ref());
-                    conn.look();
-                    crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
-                }
-                // The connection before the watch its hook writes into.
-                drop(conn);
-                drop(watch);
-            })
-            .context("start the store's writer")?;
-        Ok(Self { tx: Some(tx), thread: Some(thread) })
+        let (tx, rx) = std::sync::mpsc::channel::<Sent>();
+        #[cfg(test)]
+        let seen = (Arc::clone(&writing.committed), writing.checkpoints.as_ref().map(|c| Arc::clone(&c.shared)));
+        let thread = std::thread::Builder::new().name("kiln-store".to_owned()).spawn(move || writing.run(&rx)).context("start the store's writer")?;
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+            #[cfg(test)]
+            seen,
+        })
     }
 
-    /// Sends `job` to the thread: counted as waiting until the thread starts it (what goal 6's detector
+    /// Sends `job` to the thread: counted as waiting until the thread takes it (what goal 6's detector
     /// reads of the writer's backlog, `crate::pool_health::queues`).
-    fn send(&self, job: WriteCall) -> bool {
+    fn send(&self, job: Errand) -> bool {
         crate::pool_health::store_write_queued(1);
         let sent = self.tx.as_ref().is_some_and(|tx| tx.send((job, Instant::now())).is_ok());
         if !sent {
@@ -114,8 +222,14 @@ impl Writer {
         sent
     }
 
+    /// Whether its thread runs, taking calls: what `/readyz` reads of the store without sending it one (goal 6, plan
+    /// 01a1a59c2abe step 3).
+    fn running(&self) -> bool {
+        self.tx.is_some() && self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
     /// Ends its thread once the calls sent are done (on the thread itself, as the last of a store
-    /// a call held goes: it ends as that call returns).
+    /// a call held goes: it ends as that call's group is committed).
     fn stop(&mut self) {
         self.tx.take();
         if let Some(t) = self.thread.take()
@@ -124,6 +238,408 @@ impl Writer {
             let _ = t.join();
         }
     }
+}
+
+/// The writer's thread's own: its connection; with the cluster group, the watch on what its calls
+/// write and the group; what its commits change; and its WAL's checkpoints.
+struct Writing {
+    // The connection first: it goes before the watch its hook writes into.
+    conn: Counted,
+    watch: Option<capture::Watch>,
+    group: Option<Arc<group::Group>>,
+    changes: Arc<Changes>,
+    /// Calls committed in groups (a store that writes); else each by itself as it comes, outside
+    /// any transaction: a replica's, which only reads (its learner writes the file, and a transaction
+    /// here would hold the learner's writes off).
+    grouped: bool,
+    bounds: Bounds,
+    /// Its WAL's checkpoints, on a thread of their own (a database in a file).
+    checkpoints: Option<Checkpoints>,
+    committed: Arc<AtomicU64>,
+}
+
+/// What one call of a group came to ([`Writing::one`]).
+enum Came {
+    /// Run, and kept or taken back: told once its group's commit is known.
+    Ran(Done),
+    /// Not run: its savepoint couldn't be opened (told so already).
+    Refused,
+    /// The group's transaction ended inside it, or its savepoint couldn't be closed: what the calls
+    /// before it wrote may be gone with it. SQLite rolls a transaction back itself on a few errors
+    /// (the disk full, an I/O error, memory short: https://www.sqlite.org/lang_transaction.html,
+    /// "Response To Errors Within A Transaction").
+    Ended(Tell, Arc<anyhow::Error>),
+}
+
+/// A call run in its group, waiting for the group's commit.
+struct Done {
+    tell: Tell,
+    /// Through the cluster group, its change as it left the rows it touched (none past the group,
+    /// or taken back).
+    change: Option<capture::Change>,
+    /// Taken back for this (its change couldn't be read for the log): told so whatever the commit.
+    lost: Option<Arc<anyhow::Error>>,
+    /// It changed rows past the cluster group, which moves every table's count ([`Changes::anything`]).
+    moved: bool,
+}
+
+impl Writing {
+    /// The writer of `conn`, in groups within `bounds`; `wal`, the database's file, whose WAL its own
+    /// thread then checkpoints ([`Checkpoints`]).
+    fn new(conn: Connection, watch: Option<capture::Watch>, group: Option<Arc<group::Group>>, changes: Arc<Changes>, bounds: Bounds, wal: Option<&Path>) -> Self {
+        let checkpoints = wal.and_then(|path| match Checkpoints::start(&conn, path) {
+            Ok(c) => c,
+            Err(e) => {
+                // SQLite's own then, in the writer's commits, as before.
+                tracing::warn!(error = %format!("{e:#}"), "kiln.db's WAL is checkpointed in its writer's commits: its own thread couldn't start");
+                None
+            }
+        });
+        Writing { conn: Counted::new(conn), watch, group, changes, grouped: true, bounds, checkpoints, committed: Arc::default() }
+    }
+
+    /// A replica's writer: each call by itself, outside any transaction (above).
+    fn alone(conn: Connection, changes: Arc<Changes>) -> Self {
+        Writing { conn: Counted::new(conn), watch: None, group: None, changes, grouped: false, bounds: Bounds::DEFAULT, checkpoints: None, committed: Arc::default() }
+    }
+
+    fn run(mut self, rx: &std::sync::mpsc::Receiver<Sent>) {
+        // A job taken while a group gathered calls, to run once it's committed.
+        let mut held: Option<Sent> = None;
+        loop {
+            let (job, sent) = match held.take() {
+                Some(next) => next,
+                None => match rx.recv() {
+                    Ok(next) => {
+                        crate::pool_health::store_write_queued(-1);
+                        next
+                    }
+                    Err(_) => break,
+                },
+            };
+            match job {
+                Errand::Alone(f) => self.alone_job(f, sent),
+                Errand::Call { call, local } if self.grouped => held = self.group(call, local, sent, rx),
+                Errand::Call { call, local } => self.by_itself(call, local, sent),
+            }
+        }
+    }
+
+    /// A job that runs by itself, outside any transaction (the calls before it committed).
+    fn alone_job(&mut self, f: Box<dyn FnOnce(&mut Connection) + Send>, sent: Instant) {
+        let began = Instant::now();
+        // Its own panic is its caller's (`Store::now`, `Store::alone`): this only keeps the writer going.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut self.conn.conn)));
+        self.conn.look();
+        crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
+    }
+
+    /// A call by itself, outside any transaction, as it comes (a replica's writer).
+    fn by_itself(&mut self, call: Box<dyn Call>, local: bool, sent: Instant) {
+        let began = Instant::now();
+        let before = self.conn.conn.total_changes();
+        let ran = call.run(&mut self.conn.conn);
+        if !local && self.conn.conn.total_changes() != before {
+            self.changes.anything();
+        }
+        (ran.tell)(Told::Committed);
+        self.conn.look();
+        crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
+    }
+
+    /// Runs `first` and the calls waiting after it as one group (goal 5, plan 01a1a59c2aae): one
+    /// transaction, each call in a savepoint of its own ([`Writing::one`]), committed once
+    /// ([`Writing::commit`]), its callers told then, in turn. A call joins while it waits and the group
+    /// is within its [`Bounds`]; a job met among them that runs alone is given back, to run once the
+    /// group is committed. They run in the order they were sent, each seeing what those before it
+    /// wrote, as one at a time.
+    fn group(&mut self, first: Box<dyn Call>, local: bool, sent: Instant, rx: &std::sync::mpsc::Receiver<Sent>) -> Option<Sent> {
+        // IMMEDIATE: the write lock now, so what a call reads is what it writes over (a transaction
+        // that read first would be refused its write had another connection, the cluster group's,
+        // committed meanwhile).
+        if let Err(e) = self.conn.conn.execute_batch("BEGIN IMMEDIATE") {
+            first.refuse(&anyhow::Error::from(e).context("kiln.db's writer couldn't begin a transaction"));
+            return None;
+        }
+        let began = Instant::now();
+        let (mut done, mut taken, mut after) = (Vec::new(), 0usize, None);
+        let mut next = Some((first, local, sent));
+        while let Some((call, local, sent)) = next.take() {
+            taken += 1;
+            let started = Instant::now();
+            let step = self.one(call, local);
+            crate::pool_health::store_write(started.saturating_duration_since(sent), started.elapsed());
+            match step {
+                Came::Ran(d) => done.push(d),
+                Came::Refused => {}
+                Came::Ended(tell, why) => {
+                    self.abandon(done, tell, why);
+                    return None;
+                }
+            }
+            if taken >= self.bounds.calls || began.elapsed() >= self.bounds.time {
+                break;
+            }
+            match rx.try_recv() {
+                Ok((Errand::Call { call, local }, sent)) => {
+                    crate::pool_health::store_write_queued(-1);
+                    next = Some((call, local, sent));
+                }
+                Ok(other) => {
+                    crate::pool_health::store_write_queued(-1);
+                    after = Some(other);
+                }
+                Err(_) => {}
+            }
+        }
+        self.commit(done);
+        after
+    }
+
+    /// One call of a group, in a savepoint of its own: kept as it left it (it returned, `Ok` or `Err`,
+    /// as calls always have), or taken back (it panicked; or, through the cluster group, its change
+    /// can't be read for the log). Only it: the calls around it stand as they are.
+    fn one(&mut self, call: Box<dyn Call>, local: bool) -> Came {
+        let conn = &mut self.conn.conn;
+        if let Err(e) = conn.execute_batch("SAVEPOINT kiln_call") {
+            call.refuse(&anyhow::Error::from(e).context("a store call's savepoint couldn't be opened"));
+            return Came::Refused;
+        }
+        let watch = if local { None } else { self.watch.as_ref() };
+        if let Some(w) = watch {
+            w.begin();
+        }
+        // Past the cluster group (a store without it), a call that changed rows moves every table's
+        // count; through it, its rows say which tables (`Writing::commit`); a local one moves none.
+        let counts = !local && self.watch.is_none();
+        let before = conn.total_changes();
+        let ran = call.run(conn);
+        let change = watch.map(|w| w.end(conn));
+        let moved = counts && conn.total_changes() != before;
+        if conn.is_autocommit() {
+            return Came::Ended(ran.tell, Arc::new(anyhow::anyhow!("kiln.db's transaction ended inside a store call grouped with this one: SQLite rolls one back itself on a few errors (the disk full, an I/O error, memory short)")));
+        }
+        let (change, lost) = match change {
+            Some(Ok(c)) => (Some(c), None),
+            Some(Err(e)) => (None, Some(Arc::new(e))),
+            None => (None, None),
+        };
+        let keep = ran.kept && lost.is_none();
+        if let Err(e) = conn.execute_batch(if keep { "RELEASE kiln_call" } else { "ROLLBACK TO kiln_call; RELEASE kiln_call" }) {
+            return Came::Ended(ran.tell, Arc::new(anyhow::Error::from(e).context("a store call's savepoint couldn't be closed")));
+        }
+        Came::Ran(Done { tell: ran.tell, change: change.filter(|_| keep), lost, moved: keep && moved })
+    }
+
+    /// Commits a group: through the cluster group, each changed call's change numbered in turn, the
+    /// last number kept with the commit; then, committed, the tables they touched moved ([`Changes`]),
+    /// the changes handed to the log in their turn, and each caller told, in turn. A commit that fails
+    /// takes every call of the group with it, each told why.
+    fn commit(&mut self, mut done: Vec<Done>) {
+        let began = Instant::now();
+        let calls = done.len();
+        let mut numbered = Vec::new();
+        match self.keep(&mut done, &mut numbered) {
+            Ok(()) => {
+                // Committed: the tables its rows are in have changed (goal 10, plan 01a1a87b2dae step 2).
+                self.changes.touched(numbered.iter().flat_map(|(_, c): &(u64, capture::Change)| c.rows.iter()).map(|r| match r {
+                    capture::Row::Gone { table, .. } | capture::Row::Kept { table, .. } => table.as_str(),
+                }));
+                if done.iter().any(|d| d.moved) {
+                    self.changes.anything();
+                }
+                if let Some(g) = &self.group {
+                    for (seq, change) in numbered {
+                        g.append(seq, change);
+                    }
+                }
+                for d in done {
+                    (d.tell)(d.lost.map_or(Told::Committed, Told::Lost));
+                }
+                self.committed.fetch_add(1, Ordering::Relaxed);
+                crate::pool_health::store_commit(calls, began.elapsed());
+            }
+            Err(e) => {
+                if !self.conn.conn.is_autocommit() {
+                    let _ = self.conn.conn.execute_batch("ROLLBACK");
+                }
+                let why = Arc::new(e.context(format!("kiln.db didn't commit a group of {calls} store calls")));
+                tracing::error!(error = %format!("{why:#}"), "kiln.db's writer lost a group of calls");
+                for d in done {
+                    (d.tell)(Told::Lost(d.lost.unwrap_or_else(|| Arc::clone(&why))));
+                }
+            }
+        }
+        self.conn.look();
+        self.checkpoint_due();
+    }
+
+    /// The group's transaction committed: through the cluster group with its changes numbered into
+    /// `numbered` (an empty one takes no number, as a call that wrote nothing never has).
+    fn keep(&mut self, done: &mut [Done], numbered: &mut Vec<(u64, capture::Change)>) -> anyhow::Result<()> {
+        if let Some(g) = &self.group {
+            let mut seq = g.next_seq();
+            for d in done.iter_mut() {
+                if let Some(change) = d.change.take().filter(|c| !c.is_empty()) {
+                    numbered.push((seq, change));
+                    seq = seq.saturating_add(1);
+                }
+            }
+            if let Some((last, _)) = numbered.last() {
+                self.conn.conn.execute(&format!("UPDATE {} SET seq = ?1 WHERE one = 1", group::STATE), [i64::try_from(*last)?])?;
+            }
+        }
+        self.conn.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Gives up a group whose transaction ended inside a call (`tell` its caller's), or that the
+    /// writer lost track of: rolled back if it's still open, and each call told what it wrote is gone.
+    fn abandon(&mut self, done: Vec<Done>, tell: Tell, why: Arc<anyhow::Error>) {
+        if !self.conn.conn.is_autocommit() {
+            let _ = self.conn.conn.execute_batch("ROLLBACK");
+        }
+        tracing::error!(error = %format!("{why:#}"), calls = done.len() + 1, "kiln.db's writer gave up a group of calls");
+        for d in done {
+            (d.tell)(Told::Lost(d.lost.unwrap_or_else(|| Arc::clone(&why))));
+        }
+        tell(Told::Lost(why));
+        self.conn.look();
+    }
+
+    /// After a commit: the pages it wrote to the WAL counted, and the checkpoints' thread asked for one
+    /// at their mark; and with the WAL grown past [`WAL_BOUND`] frames without starting over, a
+    /// checkpoint here, between two groups, so the next starts it over ([`Checkpoints`]).
+    fn checkpoint_due(&mut self) {
+        let Some(ck) = self.checkpoints.as_mut() else { return };
+        ck.written = ck.written.saturating_add(capture::pages_written(&self.conn.conn));
+        if ck.written >= ck.mark {
+            ck.written = 0;
+            ck.ask();
+        }
+        if ck.shared.long.load(Ordering::Acquire) {
+            let began = Instant::now();
+            match checkpoint(&self.conn.conn) {
+                Ok((false, _)) => ck.shared.long.store(false, Ordering::Release),
+                // The checkpoints' thread is at it: tried again after the next group.
+                Ok((true, _)) => {}
+                Err(e) => tracing::warn!(error = %e, "kiln.db's writer couldn't checkpoint its WAL"),
+            }
+            ck.shared.inline.fetch_add(1, Ordering::Relaxed);
+            crate::pool_health::store_checkpoint(true, began.elapsed());
+        }
+    }
+}
+
+/// The WAL's checkpoints on a thread of their own (`kiln-store-ckpt`), off the writer's (goal 5, plan
+/// 01a1a59c2aae). SQLite runs one inside the commit that takes the WAL past `wal_autocheckpoint`
+/// pages (1,000 unless set: https://www.sqlite.org/wal.html#automatic_checkpoint): it copies them
+/// into the database and syncs both files (`synchronous = NORMAL`:
+/// https://www.sqlite.org/pragma.html#pragma_synchronous), and every call waiting behind that commit
+/// waits for it too. The writer's connection has that off, and asks this thread at the same mark,
+/// counting the pages its commits write to the WAL.
+///
+/// A checkpoint beside a writer that doesn't stop copies what the WAL held as it began, and the WAL
+/// starts over only when a write begins with all of it copied
+/// (https://www.sqlite.org/wal.html#avoiding_excessively_large_wal_files). When it has grown past
+/// [`WAL_BOUND`] frames without starting over, the writer checkpoints once itself, between two groups,
+/// so the next starts it over.
+struct Checkpoints {
+    /// `wal_autocheckpoint` as the writer's connection had it: the pages written between two.
+    mark: u64,
+    /// Pages the writer wrote to the WAL since it last asked for one.
+    written: u64,
+    shared: Arc<Checkpointing>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the writer and its WAL's checkpoints' thread share.
+#[derive(Default)]
+struct Checkpointing {
+    /// A checkpoint asked for.
+    asked: AtomicBool,
+    stop: AtomicBool,
+    /// The WAL held [`WAL_BOUND`] frames or more as the last checkpoint ended: it hasn't started over.
+    long: AtomicBool,
+    /// Checkpoints the thread ran, and the writer's own.
+    ran: AtomicU64,
+    inline: AtomicU64,
+}
+
+/// The WAL's frames past which the writer checkpoints itself ([`Checkpoints`]): SQLite's wal-index
+/// finds a page's frame in hash tables of 4,096 frames each (`HASHTABLE_NPAGE` in sqlite3.c;
+/// https://www.sqlite.org/walformat.html#the_wal_index_file_format), looking through them newest
+/// first, all of them for a page the WAL doesn't hold: past one, every such read looks in two.
+const WAL_BOUND: i64 = 4096;
+
+impl Checkpoints {
+    /// The checkpoints of the WAL of the database at `path`, which `writer` writes, at the mark its
+    /// connection had: none when it had them off or isn't in WAL mode. Its own are off from then on.
+    fn start(writer: &Connection, path: &Path) -> anyhow::Result<Option<Self>> {
+        let wal = writer.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?.eq_ignore_ascii_case("wal");
+        let mark: i64 = writer.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
+        let mark = u64::try_from(mark).unwrap_or(0);
+        if !wal || mark == 0 {
+            return Ok(None);
+        }
+        let conn = Connection::open(path).with_context(|| format!("open {} to checkpoint it", path.display()))?;
+        // As the writer's: the WAL synced before a checkpoint and the database after.
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        let shared = Arc::new(Checkpointing::default());
+        let thread = {
+            let shared = Arc::clone(&shared);
+            std::thread::Builder::new().name("kiln-store-ckpt".to_owned()).spawn(move || checkpointing(Counted::new(conn), &shared)).context("start kiln.db's checkpoints")?
+        };
+        let checkpoints = Self { mark, written: 0, shared, thread: Some(thread) };
+        writer.execute_batch("PRAGMA wal_autocheckpoint = 0")?;
+        // Counted from here: what opening the store wrote (its schema, its migrations) isn't the
+        // writer's (the first checkpoint comes `mark` pages on).
+        capture::pages_written(writer);
+        Ok(Some(checkpoints))
+    }
+
+    fn ask(&self) {
+        self.shared.asked.store(true, Ordering::Release);
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+}
+
+impl Drop for Checkpoints {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
+}
+
+/// The checkpoints' thread: one each time it's asked, until it's stopped.
+fn checkpointing(mut conn: Counted, s: &Checkpointing) {
+    while !s.stop.load(Ordering::Acquire) {
+        if !s.asked.swap(false, Ordering::AcqRel) {
+            std::thread::park();
+            continue;
+        }
+        let began = Instant::now();
+        match checkpoint(&conn) {
+            Ok((false, frames)) => s.long.store(frames >= WAL_BOUND, Ordering::Release),
+            // Another was running (the writer's own past the bound).
+            Ok((true, _)) => {}
+            Err(e) => tracing::warn!(error = %e, "kiln.db's WAL couldn't be checkpointed"),
+        }
+        conn.look();
+        s.ran.fetch_add(1, Ordering::Relaxed);
+        crate::pool_health::store_checkpoint(false, began.elapsed());
+    }
+}
+
+/// A checkpoint of as much of the WAL as no read still needs, waiting for no one (`PASSIVE`, as
+/// SQLite's own are): whether another was running (and this one didn't), and the frames the WAL holds.
+fn checkpoint(c: &Connection) -> rusqlite::Result<(bool, i64)> {
+    c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)))
 }
 
 /// What SQLite counts beside each cached page's own bytes, at most (`sqlite3PagerMemUsed`): its `PgHdr`, the
@@ -152,13 +668,15 @@ struct Counted {
     conn: Connection,
     held: usize,
     bound: usize,
+    /// When it was last given back for the next read ([`Reads::give`]): made, for one never used.
+    given: Instant,
 }
 
 impl Counted {
     fn new(conn: Connection) -> Self {
         let bound = cache_bound(&conn);
         crate::memory::owners::SQLITE.bound_add(bound);
-        let mut c = Self { conn, held: 0, bound };
+        let mut c = Self { conn, held: 0, bound, given: Instant::now() };
         c.look();
         c
     }
@@ -189,21 +707,66 @@ impl Drop for Counted {
     }
 }
 
+/// How long a read connection is kept open with no read taking it (goal 11, plan 01a1a87b2e56 step 5): the wait
+/// after which a pool's worker gives its caches back ([`crate::os::alloc::COLD_AFTER`]). A read takes a few
+/// milliseconds, so a connection none took in that long is one past the reads' recent peak.
+const READ_IDLE: std::time::Duration = crate::os::alloc::COLD_AFTER;
+
+/// One of [`Reads`]' places: a connection not in use, if any (a lock-free queue of one), and when the one it
+/// holds was given back, in milliseconds since the places were made (a hint for the sweep, which reads the
+/// connection's own time before it closes one).
+struct Place {
+    conn: concurrent_queue::ConcurrentQueue<Counted>,
+    given_ms: std::sync::atomic::AtomicU64,
+}
+
 /// Read-only connections to the database's file ([`Store::read`]), each taken by one read at a time
-/// and given back as it ends: a lock-free queue of those not in use, as many as the blocking pool's
+/// and given back as it ends: a place each for those not in use, as many as the blocking pool's
 /// `store` share runs reads at once. One taken when none is free (a read past them) is opened then.
+///
+/// A read takes the connection of the lowest place that has one, and one given back takes the lowest
+/// place free, so the reads at once use the low places and the high ones wait idle. Each connection
+/// holds kiln.db's whole schema parsed besides its page cache (604 KB for its 202 tables and 283
+/// indexes, and 62 KB more opened: SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), so
+/// keeping every connection a burst once opened kept as many schemas. As reads give connections back,
+/// at most once each [`READ_IDLE`], the highest place whose connection no read took in that long has it
+/// closed (goal 11, plan 01a1a87b2e56 step 5); the lowest place's, a lone read's, is kept. A read past the reads'
+/// recent peak opens one and parses the schema again: 2.0 ms at the median of 30 on fedora.
 struct Reads {
     path: std::path::PathBuf,
-    idle: concurrent_queue::ConcurrentQueue<Counted>,
+    places: Box<[Place]>,
+    /// How long a connection is kept with no read taking it: [`READ_IDLE`].
+    idle: std::time::Duration,
+    /// When the places were made: what their times count from.
+    made: Instant,
+    /// When the next sweep is due, in milliseconds since `made`.
+    sweep_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Reads {
     fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), idle: concurrent_queue::ConcurrentQueue::bounded(crate::rt::profile().pool.1.max(1)) }
+        Self::with_places(path, crate::rt::profile().pool.1.max(1), READ_IDLE)
+    }
+
+    fn with_places(path: &Path, places: usize, idle: std::time::Duration) -> Self {
+        let places = (0..places.max(1)).map(|_| Place { conn: concurrent_queue::ConcurrentQueue::bounded(1), given_ms: std::sync::atomic::AtomicU64::new(0) }).collect();
+        let reads = Self { path: path.to_path_buf(), places, idle, made: Instant::now(), sweep_ms: std::sync::atomic::AtomicU64::new(0) };
+        reads.sweep_ms.store(reads.idle_ms(), std::sync::atomic::Ordering::Relaxed);
+        reads
+    }
+
+    /// How long a connection is kept with no read taking it, in milliseconds.
+    fn idle_ms(&self) -> u64 {
+        u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Milliseconds from the places' making to `at`.
+    fn ms(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.made).as_millis()).unwrap_or(u64::MAX)
     }
 
     fn take(&self) -> anyhow::Result<Counted> {
-        if let Ok(c) = self.idle.pop() {
+        if let Some(c) = self.places.iter().find_map(|place| place.conn.pop().ok()) {
             return Ok(c);
         }
         let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
@@ -211,10 +774,62 @@ impl Reads {
         Ok(Counted::new(c))
     }
 
-    /// Back for the next read, its cache counted as the read left it (closed, past as many as are kept).
+    /// Back for the next read, its cache counted as the read left it, in the lowest place free (closed, past as
+    /// many as are kept); then the sweep, where it's due.
     fn give(&self, mut c: Counted) {
         c.look();
-        let _ = self.idle.push(c);
+        c.given = Instant::now();
+        let at = self.ms(c.given);
+        self.put(c, Some(at));
+        self.sweep(at);
+    }
+
+    /// `c` into the lowest place free, saying when it was given back where `at` says (a connection the sweep
+    /// puts back keeps its place's time); closed where every place is taken.
+    fn put(&self, mut c: Counted, at: Option<u64>) {
+        for place in self.places.iter() {
+            match place.conn.push(c) {
+                Ok(()) => {
+                    if let Some(at) = at {
+                        place.given_ms.store(at, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Err(full) => c = full.into_inner(),
+            }
+        }
+    }
+
+    /// Where a sweep is due at `now_ms` (and this read is the one to make it), closes the connection of the
+    /// highest place (not the lowest) that no read took for [`READ_IDLE`]: one a sweep, a close's cost (SQLite
+    /// freeing a schema and a cache) on one read in each `READ_IDLE`. Whether it closed one.
+    fn sweep(&self, now_ms: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let idle = self.idle_ms();
+        let due = self.sweep_ms.load(Relaxed);
+        if now_ms < due || self.sweep_ms.compare_exchange(due, now_ms.saturating_add(idle), Relaxed, Relaxed).is_err() {
+            return false;
+        }
+        for place in self.places.iter().skip(1).rev() {
+            if place.conn.is_empty() || now_ms.saturating_sub(place.given_ms.load(Relaxed)) < idle {
+                continue;
+            }
+            let Ok(c) = place.conn.pop() else { continue };
+            if c.given.elapsed() >= self.idle {
+                drop(c);
+                return true;
+            }
+            // Given back since the hint was read: kept, in the lowest place free.
+            self.put(c, None);
+            return false;
+        }
+        false
+    }
+
+    /// The connections open and not in use.
+    #[cfg(test)]
+    fn kept(&self) -> usize {
+        self.places.iter().filter(|place| !place.conn.is_empty()).count()
     }
 }
 
@@ -370,54 +985,9 @@ impl std::ops::Deref for Tx<'_> {
     }
 }
 
-/// Runs a write through the cluster group (see [`Store::call`]).
-fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, changes: &Changes, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
-    // IMMEDIATE: the write lock now, so what `f` reads is what it writes over (a transaction that
-    // read first would be refused its write had the group's thread committed meanwhile).
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    watch.begin();
-    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)));
-    let change = watch.end(conn);
-    let result = match ran {
-        Ok(r) => r,
-        Err(panic) => {
-            conn.execute_batch("ROLLBACK").ok();
-            std::panic::resume_unwind(panic)
-        }
-    };
-    let change = match change {
-        Ok(c) => c,
-        Err(e) => {
-            // What it wrote couldn't be read for the log: it isn't kept.
-            conn.execute_batch("ROLLBACK").ok();
-            return Err(e);
-        }
-    };
-    if change.is_empty() {
-        conn.execute_batch("ROLLBACK")?;
-        return result;
-    }
-    // Kept as without the group (an `f` that failed after writing keeps what it wrote), with its
-    // number; then the change goes to the log.
-    let seq = group.next_seq();
-    let kept = conn
-        .execute(&format!("UPDATE {} SET seq = ?1 WHERE one = 1", group::STATE), [i64::try_from(seq)?])
-        .map_err(anyhow::Error::from)
-        .and_then(|_| conn.execute_batch("COMMIT").map_err(anyhow::Error::from));
-    if let Err(e) = kept {
-        conn.execute_batch("ROLLBACK").ok();
-        return Err(e);
-    }
-    // Committed: the tables its rows are in have changed (goal 10, plan 01a1a87b2dae step 2).
-    changes.touched(change.rows.iter().map(|r| match r {
-        capture::Row::Gone { table, .. } | capture::Row::Kept { table, .. } => table.as_str(),
-    }));
-    group.append(seq, change);
-    result
-}
-
-/// `f` with the connection that writes, past the cluster group: when it changed rows, every table's
-/// count moves ([`Changes`]), its rows not told apart.
+/// `f` with the connection of a store whose calls run inline ([`Store::in_memory_inline`]): when it
+/// changed rows, every table's count moves ([`Changes`]), its rows not told apart.
+#[cfg(test)]
 fn counted<R>(conn: &mut Connection, changes: &Changes, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
     let before = conn.total_changes();
     let out = f(conn);
@@ -759,17 +1329,38 @@ impl Store {
     /// The store at `path`, written to directly (no cluster group): tools that run with the server
     /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let conn = Self::connect(path)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
+        Self::open_with(path, None, Bounds::DEFAULT)
     }
 
     /// The store at `path` with its writes through the cluster group, its log in `cluster`
     /// (docs/p2p.md, P1). What the log holds past the database is replayed into it first.
     pub fn open_grouped(path: &Path, cluster: &Path) -> anyhow::Result<Self> {
+        Self::open_with(path, Some(cluster), Bounds::DEFAULT)
+    }
+
+    /// [`Store::open`], or with `cluster` [`Store::open_grouped`], its writer's groups of calls
+    /// within `bounds`.
+    fn open_with(path: &Path, cluster: Option<&Path>, bounds: Bounds) -> anyhow::Result<Self> {
         let conn = Self::connect(path)?;
-        let group = group::Group::open(path, cluster).context("the cluster group")?;
-        let watch = capture::Watch::install(&conn, LOCAL)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, Some(watch))?, reads: Some(Reads::new(path)), group: Some(Arc::new(group)), path: Some(path.to_path_buf()), scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
+        let (group, watch) = match cluster {
+            Some(cluster) => {
+                let group = group::Group::open(path, cluster).context("the cluster group")?;
+                (Some(Arc::new(group)), Some(capture::Watch::install(&conn, LOCAL)?))
+            }
+            None => (None, None),
+        };
+        let changes = Arc::<Changes>::default();
+        let writer = Writer::start(Writing::new(conn, watch, group.clone(), Arc::clone(&changes), bounds, Some(path)))?;
+        Ok(Self::of(Inner {
+            changes,
+            asked: AtomicU64::new(0),
+            writer,
+            reads: Some(Reads::new(path)),
+            path: group.as_ref().map(|_| path.to_path_buf()),
+            group,
+            scratch: None,
+            revoked: arc_swap::ArcSwapOption::empty(),
+        }))
     }
 
     /// A runner's replica of kiln.db (docs/p2p.md, P2), to read: its learner alone writes it, so
@@ -778,7 +1369,9 @@ impl Store {
     pub fn open_replica(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: Some(Reads::new(path)), group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
+        let changes = Arc::<Changes>::default();
+        let writer = Writer::start(Writing::alone(conn, Arc::clone(&changes)))?;
+        Ok(Self::of(Inner { changes, asked: AtomicU64::new(0), writer, reads: Some(Reads::new(path)), group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     fn of(inner: Inner) -> Self {
@@ -808,10 +1401,17 @@ impl Store {
             }
             return Ok(store);
         }
+        Self::memory(Bounds::DEFAULT)
+    }
+
+    /// A store in memory, its writer's groups of calls within `bounds`.
+    fn memory(bounds: Bounds) -> anyhow::Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self::of(Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(conn, None)?, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
+        let changes = Arc::<Changes>::default();
+        let writer = Writer::start(Writing::new(conn, None, None, Arc::clone(&changes), bounds, None))?;
+        Ok(Self::of(Inner { changes, asked: AtomicU64::new(0), writer, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() }))
     }
 
     /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
@@ -824,23 +1424,26 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
         let idle = Connection::open_in_memory()?;
-        let inner = Inner { changes: Arc::default(), asked: std::sync::atomic::AtomicU64::new(0), writer: Writer::start(idle, None)?, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() };
+        let changes = Arc::<Changes>::default();
+        let writer = Writer::start(Writing::new(idle, None, None, Arc::clone(&changes), Bounds::DEFAULT, None))?;
+        let inner = Inner { changes, asked: AtomicU64::new(0), writer, reads: None, group: None, path: None, scratch: None, revoked: arc_swap::ArcSwapOption::empty() };
         Ok(Self { inner: Arc::new(inner), inline: Some(Arc::new(parking_lot::Mutex::new(conn))) })
     }
 
     /// Run `f` with the connection, this thread waiting for it: for what's read once as the server
     /// starts, before anything else runs (a constructor that can't wait). Only reads: a write here
-    /// would go past the cluster group.
+    /// would go past the cluster group. It runs by itself, outside any transaction, once the calls
+    /// sent before it are committed.
     pub fn now<R: Send + 'static>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static) -> anyhow::Result<R> {
         #[cfg(test)]
         if let Some(c) = &self.inline {
             return f(&mut c.lock());
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let job: WriteCall = Box::new(move |conn, _| {
+        let job = Errand::Alone(Box::new(move |conn| {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))).unwrap_or_else(|_| Err(anyhow::anyhow!("a read of the store panicked")));
             let _ = tx.send(out);
-        });
+        }));
         anyhow::ensure!(self.inner.writer.send(job), "the store's writer has stopped");
         rx.recv().map_err(|_| anyhow::anyhow!("the store's writer let a call go unanswered"))?
     }
@@ -889,10 +1492,12 @@ impl Store {
     }
 
     /// Runs `f` with the connection that writes, on its own thread, in its turn after the calls sent
-    /// before it. With the cluster group, what `f` writes goes through it: `f` runs in a transaction
-    /// while the rows it touches are noted, which commits with the write's number and sends the
-    /// rows' state (its change) to the group's log, which a restart replays. What only reads is
-    /// [`Store::read`]'s, which never waits behind a write.
+    /// before it, and answers once it's committed: the calls waiting for the writer are committed
+    /// together (goal 5, plan 01a1a59c2aae: one transaction, each call in a savepoint of its own, so
+    /// one that panics is taken back alone; one that fails keeps what it wrote, as calls always have).
+    /// With the cluster group, what `f` writes goes through it: the rows it touches are noted, and
+    /// their state (its change) goes to the group's log with the write's number, which a restart
+    /// replays. What only reads is [`Store::read`]'s, which never waits behind a write.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
@@ -905,12 +1510,13 @@ impl Store {
             yield_once().await;
             return counted(&mut c.lock(), &self.inner.changes, f);
         }
-        let (group, changes) = (self.inner.group.clone(), Arc::clone(&self.inner.changes));
-        self.write(move |conn, watch| match (watch, &group) {
-            (Some(watch), Some(group)) => through_group(conn, watch, group, &changes, f),
-            _ => counted(conn, &changes, f),
-        })
-        .await
+        self.write(false, f).await
+    }
+
+    /// Whether its writer's thread runs, taking calls (goal 6, plan 01a1a59c2abe step 3: `/readyz`, answered from
+    /// what the server knows rather than a call sent through the writer, which waited behind every write before it).
+    pub fn writer_running(&self) -> bool {
+        self.inner.writer.running()
     }
 
     /// What its committed writes have changed, a table at a time (goal 10, plan 01a1a87b2dae step 2).
@@ -923,9 +1529,10 @@ impl Store {
         self.inner.revoked.load_full()
     }
 
-    /// Keeps `revoked`, read just now, for the reads after it (`crate::identities::revoked_now`).
-    pub(crate) fn keep_revoked(&self, revoked: Arc<crate::identities::Revoked>) {
-        self.inner.revoked.store(Some(revoked));
+    /// Keeps `revoked`, read just now, for the reads after it (`crate::identities::revoked_now`): what it kept before comes
+    /// back, for its caller to let go of off the shards (every revocation, freed one by one where it's dropped).
+    pub(crate) fn keep_revoked(&self, revoked: Arc<crate::identities::Revoked>) -> Option<Arc<crate::identities::Revoked>> {
+        self.inner.revoked.swap(Some(revoked))
     }
 
     /// How many calls and reads it's been asked for, ever: what shows a read answered without it
@@ -948,7 +1555,7 @@ impl Store {
             yield_once().await;
             return f(&mut c.lock());
         }
-        self.write(move |conn, _| f(conn)).await
+        self.write(true, f).await
     }
 
     /// Runs `f`, which only reads, with a read-only connection of its own on the blocking pool's
@@ -969,7 +1576,7 @@ impl Store {
             return read_on(&c.lock(), f);
         }
         if self.inner.reads.is_none() {
-            return self.write(move |conn, _| read_on(conn, f)).await;
+            return self.alone(move |conn| read_on(conn, f)).await;
         }
         let inner = self.inner.clone();
         crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
@@ -985,20 +1592,44 @@ impl Store {
         .await?
     }
 
-    /// Sends `f` to the writer's thread and waits for its answer.
-    async fn write<R, F>(&self, f: F) -> anyhow::Result<R>
+    /// Sends `f` to the writer's thread, to run in its turn in a group of calls (`local`: past the
+    /// cluster group), and waits for its answer: once its group is committed.
+    async fn write<R, F>(&self, local: bool, f: F) -> anyhow::Result<R>
     where
-        F: FnOnce(&mut Connection, Option<&capture::Watch>) -> anyhow::Result<R> + Send + 'static,
+        F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (answer, rx) = futures::channel::oneshot::channel();
+        anyhow::ensure!(self.inner.writer.send(Errand::Call { call: Box::new(Asked { f, answer }), local }), "the store's writer has stopped");
+        rx.await.map_err(|_| anyhow::anyhow!("the store's writer let a call go unanswered"))?
+    }
+
+    /// Sends `f` to the writer's thread to run by itself, outside any transaction, once the calls
+    /// sent before it are committed (a read of a store in memory), and waits for its answer.
+    async fn alone<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
         let (tx, rx) = futures::channel::oneshot::channel();
-        let job: WriteCall = Box::new(move |conn, watch| {
-            // A call that panics answers with an error; the writer goes on with the next.
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn, watch))).unwrap_or_else(|_| Err(anyhow::anyhow!("a store call panicked")));
+        let job = Errand::Alone(Box::new(move |conn| {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))).unwrap_or_else(|_| Err(anyhow::anyhow!("a store call panicked")));
             let _ = tx.send(out);
-        });
+        }));
         anyhow::ensure!(self.inner.writer.send(job), "the store's writer has stopped");
         rx.await.map_err(|_| anyhow::anyhow!("the store's writer let a call go unanswered"))?
+    }
+
+    /// Groups of calls its writer committed (goal 5, plan 01a1a59c2aae).
+    #[cfg(test)]
+    fn groups(&self) -> u64 {
+        self.inner.writer.seen.0.load(Ordering::Relaxed)
+    }
+
+    /// What its writer and its WAL's checkpoints' thread share, with one (goal 5, plan 01a1a59c2aae).
+    #[cfg(test)]
+    fn checkpointing(&self) -> Option<&Checkpointing> {
+        self.inner.writer.seen.1.as_deref()
     }
 
     /// Runners connected just before this server started: those still marked connected (a server
@@ -2621,6 +3252,58 @@ mod tests {
     use super::*;
     use crate::pipeline;
 
+    /// Goal 11, plan 01a1a87b2e56 step 5: reads take the lowest place's connection and give it back to the lowest
+    /// place free, so the places past the reads at once wait idle; a read giving one back once a sweep is due closes
+    /// the highest place's connection idle that long, one a sweep, never the lowest place's; one given back since
+    /// is kept, and none is closed before a sweep is due. A connection holds kiln.db's whole schema (the measured
+    /// basis, [`Reads`]), so this is what's kept. The sweeps' due times are set here, not waited for.
+    #[test]
+    fn g11_s5_reads_reuse_the_lowest_places_and_close_the_idle_ones() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        drop(Store::open(&path)?);
+        let reads = Reads::with_places(&path, 4, IDLE);
+        reads.sweep_ms.store(u64::MAX, Relaxed);
+        // A burst of three reads at once opens three, given back to places 0, 1 and 2.
+        let burst: Vec<Counted> = (0..3).map(|_| reads.take()).collect::<anyhow::Result<_>>()?;
+        for c in burst {
+            reads.give(c);
+        }
+        anyhow::ensure!(reads.kept() == 3, "{} kept", reads.kept());
+        // A read at a time takes and gives back place 0's.
+        let lone = |reads: &Reads| -> anyhow::Result<()> {
+            let c = reads.take()?;
+            let n: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+            anyhow::ensure!(n > 0, "kiln.db's schema read");
+            reads.give(c);
+            Ok(())
+        };
+        std::thread::sleep(IDLE * 2);
+        // Each sweep due closes one, the highest idle: place 2's, then place 1's; place 0's, the lone read's, stays.
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 2 && reads.places.get(2).is_some_and(|p| p.conn.is_empty()), "the highest idle one closed: {} kept", reads.kept());
+        anyhow::ensure!(reads.sweep_ms.load(Relaxed) >= reads.idle_ms(), "the next sweep due a wait later");
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 1 && reads.places.first().is_some_and(|p| !p.conn.is_empty()), "{} kept", reads.kept());
+        reads.sweep_ms.store(0, Relaxed);
+        lone(&reads)?;
+        anyhow::ensure!(reads.kept() == 1, "the lowest place's is kept: {} kept", reads.kept());
+        // Two at once again: the second given back just now is kept by a sweep due, and none closes before one is.
+        let (a, b) = (reads.take()?, reads.take()?);
+        reads.give(a);
+        reads.give(b);
+        reads.sweep_ms.store(0, Relaxed);
+        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "given back just now: kept");
+        reads.sweep_ms.store(u64::MAX, Relaxed);
+        std::thread::sleep(IDLE * 2);
+        anyhow::ensure!(!reads.sweep(reads.ms(Instant::now())) && reads.kept() == 2, "no sweep before it's due");
+        Ok(())
+    }
+
     /// Goal 5, plan 01a1a59c2aae step 2: a store's reads take read-only connections of their own,
     /// alongside its writer: a read sees each write committed before it, many run at once while a
     /// write holds the writer, and one that would write is refused, in a file's store and in memory.
@@ -2663,6 +3346,369 @@ mod tests {
             anyhow::ensure!(s.kv_get("k".into()).await?.as_deref() == Some("during"), "and the write once committed");
             anyhow::Ok(())
         })
+    }
+
+    /// Groups wide enough that a test says what's in each (goal 5, plan 01a1a59c2aae).
+    const WIDE: Bounds = Bounds { calls: 1024, time: Duration::from_secs(60) };
+
+    /// The stores a group commit is tried on: in memory, in a file, and in a file through the cluster
+    /// group, each writer's groups within `bounds`.
+    fn three(dir: &Path, bounds: Bounds) -> anyhow::Result<Vec<(&'static str, Store)>> {
+        Ok(vec![
+            ("in memory", Store::memory(bounds)?),
+            ("in a file", Store::open_with(&dir.join("file.db"), None, bounds)?),
+            ("through the cluster group", Store::open_with(&dir.join("grouped.db"), Some(dir.join("cluster").as_path()), bounds)?),
+        ])
+    }
+
+    /// Runs `calls` on `s` with its writer held first (by a job that runs alone), so that every one is
+    /// waiting as it's let go: each sent in turn while it's held (a join of fewer than 30 polls its
+    /// futures in turn, each sending its call the first time), then the writer let go. What each
+    /// returned, in turn.
+    async fn queued<T, Fut: std::future::Future<Output = T>>(s: &Store, calls: Vec<Fut>) -> anyhow::Result<Vec<T>> {
+        let (held_tx, held) = futures::channel::oneshot::channel::<()>();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let holder = s.alone(move |_| {
+            let _ = held_tx.send(());
+            let _ = go.recv_timeout(Duration::from_secs(30));
+            Ok(())
+        });
+        let rest = async {
+            let _ = held.await;
+            let go = async {
+                let _ = go_tx.send(());
+            };
+            futures::join!(futures::future::join_all(calls), go).0
+        };
+        let (held, out) = futures::join!(holder, rest);
+        held?;
+        Ok(out)
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): the calls waiting for the writer are committed
+    /// together, in one group, in the order they were sent, each seeing what those before it wrote,
+    /// and each caller answered with what its own returned: in memory, in a file, and through the
+    /// cluster group, where each write still has its number.
+    #[test]
+    fn g5_s2_a_group_commits_the_calls_waiting_in_the_order_they_were_sent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = three(dir.path(), WIDE)?;
+        crate::rt::block_on(async move {
+            for (kind, s) in stores {
+                let before = s.groups();
+                let n: i64 = 24;
+                let calls: Vec<_> = (0..n)
+                    .map(|i| {
+                        s.call(move |c| {
+                            // The calls kept before it: its place, when they ran in turn.
+                            let seen: i64 = c.query_row("SELECT COUNT(*) FROM kv WHERE k LIKE 'order-%'", [], |r| r.get(0))?;
+                            c.execute("INSERT INTO kv (k, v) VALUES (?1, ?2)", params![format!("order-{i:02}"), seen.to_string()])?;
+                            Ok(seen)
+                        })
+                    })
+                    .collect();
+                let seen = queued(&s, calls).await?.into_iter().collect::<anyhow::Result<Vec<i64>>>()?;
+                anyhow::ensure!(seen == (0..n).collect::<Vec<_>>(), "{kind}: each saw those sent before it: {seen:?}");
+                anyhow::ensure!(s.groups() - before == 1, "{kind}: the calls waiting were one group, not {}", s.groups() - before);
+                for i in 0..n {
+                    let kept = s.kv_get(format!("order-{i:02}")).await?;
+                    anyhow::ensure!(kept == Some(i.to_string()), "{kind}: order-{i:02} kept as {kept:?}");
+                }
+                if s.grouped() {
+                    s.flush_group()?;
+                    anyhow::ensure!(s.group_standing().map(|(seq, _)| seq) == Some(u64::try_from(n)?), "{kind}: each write its number: {:?}", s.group_standing());
+                }
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// A panic injected into a store call, as a bug would raise it.
+    #[allow(clippy::panic)]
+    fn injected() -> anyhow::Result<()> {
+        panic!("injected into a store call")
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): one call's failure is its own. In one group, a
+    /// call that panics is taken back (what it wrote is gone) and answered so; one that fails keeps
+    /// what it wrote, as calls always have, and is answered with its own error; through the cluster
+    /// group, one whose change can't be logged (it touched this node's own tables) is taken back; and
+    /// the calls around them are committed and answered with what they returned.
+    #[test]
+    fn g5_s2_one_calls_failure_is_its_own() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = three(dir.path(), WIDE)?;
+        crate::rt::block_on(async move {
+            for (kind, s) in stores {
+                let before = s.groups();
+                let calls: Vec<futures::future::BoxFuture<'_, anyhow::Result<&'static str>>> = vec![
+                    Box::pin(s.call(|c| {
+                        c.execute("INSERT INTO kv (k, v) VALUES ('before', 'x')", [])?;
+                        Ok("before")
+                    })),
+                    Box::pin(s.call(|c| {
+                        c.execute("INSERT INTO kv (k, v) VALUES ('panicked', 'x')", [])?;
+                        injected()?;
+                        Ok("panicked")
+                    })),
+                    Box::pin(s.call(|c| -> anyhow::Result<&'static str> {
+                        c.execute("INSERT INTO kv (k, v) VALUES ('failed', 'x')", [])?;
+                        anyhow::bail!("failed after writing")
+                    })),
+                    Box::pin(s.call_local(|c| {
+                        c.execute("INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('local', 1, 2)", [])?;
+                        Ok("local")
+                    })),
+                    Box::pin(s.call(|c| {
+                        c.execute("INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('stray', 1, 2)", [])?;
+                        Ok("stray")
+                    })),
+                    Box::pin(s.call(|c| {
+                        c.execute("INSERT INTO kv (k, v) VALUES ('after', 'x')", [])?;
+                        Ok("after")
+                    })),
+                ];
+                let out: Vec<Result<&str, String>> = queued(&s, calls).await?.into_iter().map(|r| r.map_err(|e| format!("{e:#}"))).collect();
+                anyhow::ensure!(s.groups() - before == 1, "{kind}: one group, not {}", s.groups() - before);
+                let grouped = s.grouped();
+                let fits = match out.as_slice() {
+                    [Ok("before"), Err(panicked), Err(failed), Ok("local"), stray, Ok("after")] => {
+                        panicked.contains("panicked")
+                            && failed.contains("failed after writing")
+                            && match stray {
+                                Err(e) => grouped && e.contains("this node's own tables"),
+                                Ok(s) => !grouped && *s == "stray",
+                            }
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(fits, "{kind}: each answered with its own: {out:?}");
+                for (k, kept) in [("before", true), ("panicked", false), ("failed", true), ("after", true)] {
+                    anyhow::ensure!(s.kv_get(k.into()).await?.is_some() == kept, "{kind}: {k} {}", if kept { "kept" } else { "taken back" });
+                }
+                let legs: Vec<String> = s.read(|c| Ok(c.prepare("SELECT leg FROM ci_log_indexed ORDER BY leg")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)).await?;
+                anyhow::ensure!(legs == if grouped { vec!["local"] } else { vec!["local", "stray"] }, "{kind}: this node's own rows {legs:?}");
+                if grouped {
+                    s.flush_group()?;
+                    anyhow::ensure!(s.group_standing().map(|(seq, _)| seq) == Some(3), "{kind}: before, failed and after numbered: {:?}", s.group_standing());
+                }
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): a group's transaction that ends inside a call
+    /// (SQLite rolls one back itself on a few errors; here the call's own `ROLLBACK`) takes what the
+    /// calls before it in the group wrote with it, and each of them is told so; the calls after it are
+    /// a group of their own.
+    #[test]
+    fn g5_s2_a_transaction_ended_inside_a_call_is_told_to_each_call_it_took() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = three(dir.path(), WIDE)?;
+        crate::rt::block_on(async move {
+            for (kind, s) in stores {
+                let calls: Vec<futures::future::BoxFuture<'_, anyhow::Result<()>>> = vec![
+                    Box::pin(s.kv_set("lost".into(), "x".into())),
+                    Box::pin(s.call(|c| Ok(c.execute_batch("ROLLBACK")?))),
+                    Box::pin(s.kv_set("kept".into(), "x".into())),
+                ];
+                let out: Vec<Result<(), String>> = queued(&s, calls).await?.into_iter().map(|r| r.map_err(|e| format!("{e:#}"))).collect();
+                let told = |r: &Result<(), String>| r.as_ref().is_err_and(|e| e.contains("transaction ended inside a store call"));
+                anyhow::ensure!(matches!(out.as_slice(), [a, b, Ok(())] if told(a) && told(b)), "{kind}: {out:?}");
+                anyhow::ensure!(s.kv_get("lost".into()).await?.is_none() && s.kv_get("kept".into()).await?.is_some(), "{kind}: what was told");
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): a call answered is on disk. Each caller of a
+    /// group, as it's answered, finds its row from a connection of its own to the file; and the store
+    /// opened again has every one, through the cluster group with each its number.
+    #[test]
+    fn g5_s2_a_call_answered_is_on_disk() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cluster = dir.path().join("cluster");
+        for grouped in [false, true] {
+            let db = dir.path().join(if grouped { "grouped.db" } else { "file.db" });
+            let s = Store::open_with(&db, grouped.then_some(cluster.as_path()), WIDE)?;
+            let n: i64 = 20;
+            let groups = crate::rt::block_on({
+                let (s, db) = (s.clone(), db.clone());
+                async move {
+                    let before = s.groups();
+                    let calls: Vec<_> = (0..n)
+                        .map(|i| {
+                            let (s, db) = (s.clone(), db.clone());
+                            async move {
+                                let k = format!("durable-{i:02}");
+                                s.kv_set(k.clone(), "x".into()).await?;
+                                // Answered, so committed: a connection of its own to the file sees it.
+                                let v: Option<String> = Connection::open(db.as_path())?.query_row("SELECT v FROM kv WHERE k = ?1", [&k], |r| r.get(0)).optional()?;
+                                anyhow::ensure!(v.as_deref() == Some("x"), "{k} answered but not on disk");
+                                anyhow::Ok(())
+                            }
+                        })
+                        .collect();
+                    for r in queued(&s, calls).await? {
+                        r?;
+                    }
+                    anyhow::Ok(s.groups() - before)
+                }
+            })?;
+            anyhow::ensure!(groups == 1, "grouped {grouped}: one group, not {groups}");
+            drop(s);
+            let again = if grouped { Store::open_grouped(&db, &cluster)? } else { Store::open(&db)? };
+            let kept: i64 = crate::rt::block_on({
+                let again = again.clone();
+                async move { again.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM kv WHERE k LIKE 'durable-%'", [], |r| r.get(0))?)).await }
+            })?;
+            anyhow::ensure!(kept == n, "grouped {grouped}: {kept} of {n} kept once opened again");
+            if grouped {
+                let seq: i64 = Connection::open(db.as_path())?.query_row(&format!("SELECT seq FROM {}", group::STATE), [], |r| r.get(0))?;
+                anyhow::ensure!(seq == n, "each write its number: {seq}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): a write is read after its answer. Each caller
+    /// of a group reads its own write once answered, from a read connection of its own
+    /// (`Store::read`), and its table's count ([`Changes`], what reads kept in memory go by) has
+    /// moved by then.
+    #[test]
+    fn g5_s2_a_write_is_read_after_its_answer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = three(dir.path(), WIDE)?;
+        crate::rt::block_on(async move {
+            for (kind, s) in stores {
+                let at = s.changes().of(&["kv"]);
+                let calls: Vec<_> = (0..20)
+                    .map(|i| {
+                        let s = s.clone();
+                        async move {
+                            let k = format!("ryw-{i:02}");
+                            s.kv_set(k.clone(), i.to_string()).await?;
+                            anyhow::ensure!(s.changes().of(&["kv"]) != at, "{kind}: kv's count moved before {k} was answered");
+                            let read = s.kv_get(k.clone()).await?;
+                            anyhow::ensure!(read == Some(i.to_string()), "{kind}: {k} read as {read:?} after its answer");
+                            anyhow::Ok(())
+                        }
+                    })
+                    .collect();
+                for r in queued(&s, calls).await? {
+                    r?;
+                }
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): a group holds at most its calls and its time.
+    /// Nine calls waiting, three a group at most, are three groups; with no time at all, nine, each
+    /// call its own.
+    #[test]
+    fn g5_s2_a_group_holds_at_most_its_calls_and_its_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            for (bounds, groups) in [(Bounds { calls: 3, time: Duration::from_secs(60) }, 3), (Bounds { calls: 1024, time: Duration::ZERO }, 9)] {
+                let s = Store::memory(bounds)?;
+                let before = s.groups();
+                let calls: Vec<_> = (0..9).map(|i| s.kv_set(format!("b{i}"), "x".into())).collect();
+                for r in queued(&s, calls).await? {
+                    r?;
+                }
+                anyhow::ensure!(s.groups() - before == groups, "{bounds:?}: {} groups, not {groups}", s.groups() - before);
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (group commit): what runs alone (a read of a store in memory,
+    /// `Store::now`) waits for the calls sent before it to be committed, and sees them; the calls
+    /// after it are a group of their own.
+    #[test]
+    fn g5_s2_what_runs_alone_waits_for_the_calls_before_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::memory(WIDE)?;
+            let before = s.groups();
+            let calls: Vec<futures::future::BoxFuture<'_, anyhow::Result<Option<String>>>> = vec![
+                Box::pin(async { s.kv_set("first".into(), "1".into()).await.map(|()| None::<String>) }),
+                Box::pin(s.kv_get("first".into())),
+                Box::pin(async { s.kv_set("second".into(), "2".into()).await.map(|()| None::<String>) }),
+            ];
+            let out: Vec<Result<Option<String>, String>> = queued(&s, calls).await?.into_iter().map(|r| r.map_err(|e| format!("{e:#}"))).collect();
+            anyhow::ensure!(matches!(out.as_slice(), [Ok(None), Ok(Some(v)), Ok(None)] if v == "1"), "{out:?}");
+            anyhow::ensure!(s.groups() - before == 2, "the calls before and after it: {} groups", s.groups() - before);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (audit writes batched by the group commit): audit rows written
+    /// at once (docs/ci.md W19-R05: requests' rows, a socket's) are committed together, one group, in
+    /// the order they came.
+    #[test]
+    fn g5_s2_audit_rows_written_at_once_are_one_commit() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::memory(WIDE)?;
+            let before = s.groups();
+            let rows: Vec<_> = (0..16).map(|i| crate::audit::write(&s, crate::audit::Entry { principal: "user:ada".into(), action: format!("row-{i:02}"), result: "ok".into(), ..Default::default() })).collect();
+            queued(&s, rows).await?;
+            anyhow::ensure!(s.groups() - before == 1, "{} groups for 16 rows", s.groups() - before);
+            let actions: Vec<String> = s.read(|c| Ok(c.prepare("SELECT action FROM audit2 ORDER BY id")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)).await?;
+            anyhow::ensure!(actions == (0..16).map(|i| format!("row-{i:02}")).collect::<Vec<_>>(), "in the order they came: {actions:?}");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2 (checkpoints off the writer): the writer's connection
+    /// checkpoints nothing itself (`wal_autocheckpoint` 0); with the WAL said to be past its bound, the
+    /// writer checkpoints once itself, between two groups, and the write after starts the WAL over (it
+    /// writes at the WAL's start: the file doesn't grow); and past SQLite's mark of WAL pages, the
+    /// checkpoints' own thread checkpoints.
+    #[test]
+    fn g5_s2_the_wal_is_checkpointed_off_the_writer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cluster = dir.path().join("cluster");
+        for grouped in [false, true] {
+            let db = dir.path().join(if grouped { "grouped.db" } else { "file.db" });
+            let wal = dir.path().join(if grouped { "grouped.db-wal" } else { "file.db-wal" });
+            let s = Store::open_with(&db, grouped.then_some(cluster.as_path()), Bounds::DEFAULT)?;
+            let own: i64 = s.now(|c| Ok(c.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?))?;
+            anyhow::ensure!(own == 0, "grouped {grouped}: the writer's own checkpoints off: {own}");
+            let ck = s.checkpointing().ok_or_else(|| anyhow::anyhow!("a file's store has its checkpoints' thread"))?;
+            let set = |k: &'static str, v: String| {
+                let s = s.clone();
+                crate::rt::block_on(async move { s.kv_set(k.into(), v).await })
+            };
+            // Its thread never asked yet (a few pages written), the WAL said to be past its bound. A
+            // caller is answered before its commit's checkpoint (which it doesn't wait for), and the
+            // writer takes the next call once that's done: so with "over" answered, "bound"'s is.
+            set("first", "x".into())?;
+            ck.long.store(true, Ordering::Release);
+            set("bound", "x".into())?;
+            let before = std::fs::metadata(wal.as_path())?.len();
+            set("over", "x".into())?;
+            let after = std::fs::metadata(wal.as_path())?.len();
+            anyhow::ensure!(ck.inline.load(Ordering::Relaxed) == 1 && !ck.long.load(Ordering::Acquire), "grouped {grouped}: the writer checkpointed once ({} times), the WAL no longer said to be long", ck.inline.load(Ordering::Relaxed));
+            anyhow::ensure!(after == before, "grouped {grouped}: the WAL started over, its file {before} bytes then {after}");
+            anyhow::ensure!(ck.ran.load(Ordering::Relaxed) == 0, "grouped {grouped}: its thread not asked yet");
+            // Past the mark (1,000 pages): 64 KiB values, each on pages of its own.
+            crate::rt::block_on({
+                let s = s.clone();
+                async move {
+                    for i in 0..70 {
+                        s.kv_set(format!("big-{i:02}"), "v".repeat(64 << 10)).await?;
+                    }
+                    anyhow::Ok(())
+                }
+            })?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while ck.ran.load(Ordering::Relaxed) == 0 {
+                anyhow::ensure!(Instant::now() < deadline, "grouped {grouped}: no checkpoint ran on its thread");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            anyhow::ensure!(ck.inline.load(Ordering::Relaxed) == 1, "grouped {grouped}: the writer checkpointed only past the bound");
+        }
+        Ok(())
     }
 
     #[test]
@@ -2956,13 +4002,15 @@ mod tests {
             for (name, ephemeral, connected) in [("kiln-done-1", true, false), ("kiln-busy-1", true, false), ("kiln-live-1", true, true), ("kiln-grace-1", true, false), ("box", false, false)] {
                 s.upsert_agent(row(name, ephemeral, connected)).await?;
             }
+            // The jobs' run and its repository with them: a call runs inside its group's transaction,
+            // where `PRAGMA foreign_keys` changes nothing (goal 5, plan 01a1a59c2aae).
             s.call(|c| {
                 c.execute_batch(
-                    "PRAGMA foreign_keys = OFF;
+                    "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('repo', 'acme/app', 'https://example.invalid/acme/app.git', 0);
+                     INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('r', 'repo', 1, 'ci', 'push', 'main', 'abc', 'running', 0);
                      INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent) VALUES
                        ('j1', 'r', 'build', 'build', 'succeeded', '[]', '[]', '{}', 'kiln-done-1'),
-                       ('j2', 'r', 'test', 'test', 'running', '[]', '[]', '{}', 'kiln-busy-1');
-                     PRAGMA foreign_keys = ON;",
+                       ('j2', 'r', 'test', 'test', 'running', '[]', '[]', '{}', 'kiln-busy-1');",
                 )?;
                 Ok(())
             })

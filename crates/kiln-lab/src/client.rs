@@ -9,12 +9,40 @@ use std::time::Duration;
 /// means to see (a minute: `kiln_route_seconds`' last bucket), so a stall is measured, not cut.
 pub const PATIENCE: Duration = Duration::from_secs(90);
 
-/// An answer: its status and body, and its `Retry-After` (whole seconds) where it has one.
+/// An answer: its status and body, its `Retry-After` (whole seconds) where it has one, and what the server said of
+/// its own time with the request, where it was asked ([`Http::timed`]).
 pub struct Answer {
     pub status: u16,
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
+    pub server: Option<ServerTime>,
 }
+
+/// What the server said of its time with a request (kiln's `Server-Timing`: `wait;dur=…, took;dur=…`, milliseconds):
+/// how long it waited before its handler started, from its head's arrival, where the server knew, and how long the
+/// handler took, in microseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerTime {
+    pub wait_us: Option<u64>,
+    pub took_us: u64,
+}
+
+impl ServerTime {
+    /// From a `Server-Timing` value: none without a `took`.
+    pub fn parse(v: &str) -> Option<ServerTime> {
+        let us = |name: &str| {
+            v.split(',').find_map(|m| m.trim().strip_prefix(name)?.strip_prefix(";dur=")?.trim().parse::<f64>().ok()).filter(|ms| ms.is_finite() && *ms >= 0.0).map(|ms| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let us = (ms * 1e3).round() as u64;
+                us
+            })
+        };
+        Some(ServerTime { wait_us: us("wait"), took_us: us("took")? })
+    }
+}
+
+/// The request header that asks kiln for a request's own timing (kiln's `crate::api::ASK_TIMING`).
+const ASK_TIMING: &str = "Kiln-Timing: 1\r\n";
 
 /// One HTTP/1.1 connection to the server, kept open between requests and opened again when the
 /// server closes it.
@@ -27,11 +55,20 @@ pub struct Http {
     /// a browser takes packed (brotli, gzip), and what it asks for (a browser asks for a page).
     accept: &'static str,
     wants: &'static str,
+    /// Whether it asks the server for each request's own timing ([`Http::timed`]).
+    timing: bool,
 }
 
 impl Http {
     pub fn new(port: u16, token: &str) -> Self {
-        Self { port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*" }
+        Self { port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*", timing: false }
+    }
+
+    /// One that asks the server, with each request, how long it waited for its handler and how long that took
+    /// ([`Answer::server`]; goal 10, plan 01a1a87b2dae step 5: a slow read split into the server's share and the
+    /// rest, the hops and the transfer).
+    pub fn timed(self) -> Self {
+        Self { timing: true, ..self }
     }
 
     /// One that asks as a browser loading pages does: a page, packed (Chromium's `Accept` for a
@@ -55,6 +92,9 @@ impl Http {
     /// closed is opened again once.
     pub fn send(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: {}\r\nAccept-Encoding: {}\r\n", self.port, self.token, self.wants, self.accept);
+        if self.timing {
+            head.push_str(ASK_TIMING);
+        }
         if let Some(b) = body {
             head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()));
         }
@@ -97,11 +137,11 @@ impl Http {
         if let Some(b) = body {
             s.write_all(b).map_err(|_| Closed)?;
         }
-        let (status, close, body, retry_after) = read_response(s, buf)?;
+        let (status, close, body, retry_after, server) = read_response(s, buf)?;
         if close {
             *conn = None;
         }
-        Ok(Answer { status, body, retry_after })
+        Ok(Answer { status, body, retry_after, server })
     }
 }
 
@@ -130,8 +170,10 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// One response off `s` (what's left over stays in `buf`): its status, whether the server closes
-/// the connection after it, its body (chunks joined) and its `Retry-After` in whole seconds.
-fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>, Option<Duration>)> {
+/// the connection after it, its body (chunks joined), its `Retry-After` in whole seconds and its
+/// `Server-Timing` ([`ServerTime`]).
+#[allow(clippy::type_complexity)]
+fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>, Option<Duration>, Option<ServerTime>)> {
     let head_end = loop {
         if let Some(i) = find(buf, b"\r\n\r\n") {
             break i;
@@ -143,7 +185,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
     let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or_default()).into_owned();
     buf.drain(..head_end + 4);
     let status: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow::anyhow!("no status in {head:?}"))?;
-    let (mut length, mut retry_after) = (None, None);
+    let (mut length, mut retry_after, mut server) = (None, None, None);
     let (mut chunked, mut close) = (false, false);
     for line in head.lines().skip(1) {
         let Some((k, v)) = line.split_once(':') else { continue };
@@ -153,6 +195,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
             "transfer-encoding" => chunked = v.contains("chunked"),
             "connection" => close = v.contains("close"),
             "retry-after" => retry_after = v.parse::<u64>().ok().map(Duration::from_secs),
+            "server-timing" => server = ServerTime::parse(&v),
             _ => {}
         }
     }
@@ -191,7 +234,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
         close = true;
         std::mem::take(buf)
     };
-    Ok((status, close, body, retry_after))
+    Ok((status, close, body, retry_after, server))
 }
 
 /// A WebSocket to the server (RFC 6455): frames out masked, as a client's are.

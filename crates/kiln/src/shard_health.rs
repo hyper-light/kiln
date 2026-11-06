@@ -19,7 +19,9 @@
 //! - **Busy** (`kiln_shard_busy_seconds_total`): the CPU time the shard's thread has run, so its rate
 //!   is the share of the time the shard was on the CPU (Linux and macOS; Windows keeps a thread's
 //!   times at the scheduler's tick, so no series there). Time the host held a ready shard off the
-//!   CPU isn't busy: it shows in the delay, and as `host` slow polls.
+//!   CPU isn't busy: it shows in the delay, and as `host` slow polls. Read from hyper-rt's task clock
+//!   with no system call where the shard has one (Linux), else the OS's clock for the thread
+//!   ([`CpuClock`]; goal 9, plan 01a1a87b2cec step 5).
 //! - **Slow polls** (`kiln_shard_slow_polls_total`, by `cause`): hyper-rt's long polls, each one that
 //!   held its shard past twice the step quantum (`crate::rt::STEP_BUDGET_NS`, 266.7 µs, so past 533
 //!   µs), attributed as the runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU),
@@ -42,7 +44,8 @@
 //!   the lab reports per request): its steps, its parks by what ended them (`kiln_shard_wakeups_total{by}`) and
 //!   those withdrawn, the wakes it took in and those its thread made (`kiln_shard_wakes_sent_total{to}`), the kicks
 //!   it sent and was saved, the threads it unparked; its readiness registrations, and its tasks' TCP accepts,
-//!   reads and writes, with those that moved nothing (`kiln_shard_socket_calls_idle_total{call}`).
+//!   reads and writes, with those that moved nothing (`kiln_shard_socket_calls_idle_total{call}`). Copied at the
+//!   probe's first wake and every [`COUNTS_EVERY`]th after: these families move every 100 ms, the rest every wake.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -54,6 +57,14 @@ use crate::metrics::Histogram;
 /// How often each probe wakes, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): Node's default
 /// sampling of its loop's delay (research 01a1a59c2a6a, f8).
 pub const PERIOD: Duration = Duration::from_millis(10);
+
+/// Every how many of its wakes a probe copies what its shard's parks, wakes and calls cost it ([`Wakes`], [`Calls`],
+/// [`ParkTimes`]: 34 counts) to `/metrics`, its first wake among them (goal 9, plan 01a1a87b2cec step 5): every 10th,
+/// so those families move every 100 ms at [`PERIOD`]. The lab reads them as differences across its window (kiln-lab's
+/// `window_s`: 60 s, 10 s at the shortest), so a copy up to 100 ms old moves a window's count by 2 × 0.1 s / 10 s = 2%
+/// at the most, 0.3% over the default. The delay, how late, the most late, the last wake, the CPU time and the tasks
+/// stay each wake's own: goal 9's step 1 reads those at every wake.
+pub const COUNTS_EVERY: u64 = 10;
 
 /// How late a probe ran, in seconds (goal 9, plan 01a1a87b2cec step 1): a shard's ready work is to run within
 /// a millisecond at p99.9 (Ada, 2026-11-05), so the buckets resolve that millisecond: 25 µs apart to 250 µs,
@@ -96,6 +107,8 @@ pub struct Shard {
     calls: CallCells,
     /// How long its parks lasted ([`ParkTimes`]), as the probe last copied them.
     parks: ParkCells,
+    /// What its spin before a park did ([`Spins`]), as the probe last copied it.
+    spins: SpinCells,
 }
 
 /// What a shard's parks and wakes cost it, as hyper-rt counts them on the shard (goal 9, plan 01a1a87b2cec step
@@ -264,6 +277,41 @@ impl ParkCells {
     }
 }
 
+/// What a shard's spin before a park did, as hyper-rt counts it on the shard (goal 9, plan 01a1a87b2cec step 4;
+/// `hyper_rt::park_spin`): its spins, those that found work before they ran out (each a park, its wake and its
+/// senders' kick saved), the time they spun (CPU its busy share counts), and the spin in force. All 0 where none was
+/// asked for (`KILN_RT_SPIN`, `crate::rt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spins {
+    pub spins: u64,
+    pub hits: u64,
+    pub spun_ns: u64,
+    pub now_ns: u64,
+}
+
+impl Spins {
+    fn of(c: &hyper_rt::shard_loop::Counters) -> Self {
+        Self { spins: c.park_spins, hits: c.park_spin_hits, spun_ns: c.park_spin_ns, now_ns: c.park_spin_now_ns }
+    }
+}
+
+/// [`Spins`] as the probe stores them: an atomic each, in [`Spins`]' order.
+#[derive(Default)]
+struct SpinCells([AtomicU64; 4]);
+
+impl SpinCells {
+    fn store(&self, spins: &Spins) {
+        for (cell, n) in self.0.iter().zip([spins.spins, spins.hits, spins.spun_ns, spins.now_ns]) {
+            cell.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> Spins {
+        let [spins, hits, spun_ns, now_ns] = self.0.each_ref().map(|cell| cell.load(Ordering::Relaxed));
+        Spins { spins, hits, spun_ns, now_ns }
+    }
+}
+
 impl Shard {
     fn new() -> Self {
         Self {
@@ -285,18 +333,20 @@ impl Shard {
             wakes: WakeCells::default(),
             calls: CallCells::default(),
             parks: ParkCells::default(),
+            spins: SpinCells::default(),
         }
     }
 
-    /// A probe's wake, `late` after its timer fell due, at `now`; on the shard, so what it reads of
-    /// the shard is the shard's own. The CPU time its thread has run, where the OS keeps it.
-    fn note(&self, late: Duration, now: Instant) -> Option<u64> {
+    /// A probe's wake, `late` after its timer fell due, at `now`, with the shard's counts as the wake read them
+    /// (`counters`) and its thread's CPU time (`cpu`, [`CpuClock`]); on the shard, so what it reads of the shard is
+    /// the shard's own.
+    fn note(&self, late: Duration, now: Instant, counters: Option<&hyper_rt::shard_loop::Counters>, cpu: Option<u64>) {
         let late_ns = nanos(late);
         self.delay.observe(late.as_secs_f64());
         self.late_ns.store(late_ns, Ordering::Relaxed);
         self.most_late_ns.fetch_max(late_ns, Ordering::Relaxed);
         self.last_ns.store(nanos(now.saturating_duration_since(base())), Ordering::Relaxed);
-        if let Some(c) = hyper_rt::futures::shard_counters() {
+        if let Some(c) = counters {
             self.polls.store(c.polls, Ordering::Relaxed);
             self.slow_task.store(c.long_steps.saturating_sub(c.blocked_steps), Ordering::Relaxed);
             self.slow_blocking.store(c.blocked_steps, Ordering::Relaxed);
@@ -304,21 +354,23 @@ impl Shard {
             self.slow_unknown.store(c.unattributed_steps, Ordering::Relaxed);
             self.longest_poll_ns.store(c.longest_step_ns, Ordering::Relaxed);
             self.overrun_ns.store(c.scheduler_overrun_ns, Ordering::Relaxed);
-            let tasks = held_tasks(&c);
+            let tasks = held_tasks(c);
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
-            self.wakes.store(&Wakes::of(&c));
-            self.calls.store(&Calls::of(&c));
-            self.parks.store(&ParkTimes::of(&c));
+            // At its first wake and every [`COUNTS_EVERY`]th after (this wake's number is its delay's count).
+            if self.delay.count().saturating_sub(1).is_multiple_of(COUNTS_EVERY) {
+                self.wakes.store(&Wakes::of(c));
+                self.calls.store(&Calls::of(c));
+                self.parks.store(&ParkTimes::of(c));
+                self.spins.store(&Spins::of(c));
+            }
         }
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
             self.quantum_ns.store(q, Ordering::Relaxed);
         }
-        let cpu = thread_cpu_ns();
         if let Some(cpu) = cpu {
             self.cpu_ns.store(cpu, Ordering::Relaxed);
         }
-        cpu
     }
 
     /// How late its probes ran, each noted.
@@ -339,6 +391,11 @@ impl Shard {
     /// How long its parks have lasted, as its probe last copied them ([`ParkTimes`]).
     pub fn parks(&self) -> ParkTimes {
         self.parks.load()
+    }
+
+    /// What its spin before a park did, as its probe last copied it ([`Spins`]).
+    pub fn spins(&self) -> Spins {
+        self.spins.load()
     }
 
     /// What the shard's probe has noted, as it stands.
@@ -484,17 +541,64 @@ pub fn start(period: Duration) -> usize {
 /// Shard `i`'s probe: wakes every `period` on its shard's timers and notes how late it ran.
 async fn probe(i: usize, period: Duration) {
     let Some(me) = shards().get(i) else { return };
+    wake_every(me, i, period, u64::MAX).await;
+}
+
+/// `me`'s probe on shard `i`, for `wakes` wakes: each a `period` after the last one ran, noted with how late it ran
+/// however idle the shard (goal 9, plan 01a1a87b2cec step 1's samples: none skipped).
+async fn wake_every(me: &Shard, i: usize, period: Duration, wakes: u64) {
     let mut due = Instant::now() + period;
-    loop {
+    let mut clock = CpuClock::Unchosen;
+    for _ in 0..wakes {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
         let late = now.saturating_duration_since(due);
-        let cpu = me.note(late, now);
+        // The shard's counts, read once a wake: noted for `/metrics` and handed to what it sheds, which read a copy
+        // of its own (goal 9, plan 01a1a87b2cec step 5).
+        let counters = hyper_rt::futures::shard_counters();
+        let cpu = clock.read();
+        me.note(late, now, counters.as_ref(), cpu);
         // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4).
-        crate::overload::tick(i, late, cpu);
+        crate::overload::tick(i, late, cpu, counters.as_ref());
+        // Whether its host holds its wakes, and so whether it nudges its CPU (goal 8, plan 01a1a59c2b29 step 7).
+        crate::nudge::tick(i, now, counters.as_ref());
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;
+    }
+}
+
+/// Where a probe reads its shard thread's CPU time (goal 9, plan 01a1a87b2cec step 5): hyper-rt's task clock, read with
+/// no call (`hyper_rt::futures::thread_run_ns`), where the shard has one (Linux, where the OS opened the event); else the
+/// OS's clock for the thread ([`thread_cpu_ns`]: `clock_gettime`, a call at every wake of every shard, 155 ns on the
+/// lab's machine by hyper-rt's `task_clock` notes). Chosen at the probe's first reading and kept: the two count from
+/// different starts (the task clock from its opening, as the shard's thread began), so the busy counter never mixes
+/// them. Both run while the thread runs, in its system calls too (`tests`), so the busy share means what it meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuClock {
+    Unchosen,
+    Task,
+    Os,
+}
+
+impl CpuClock {
+    /// The shard thread's CPU time now, nanoseconds, by the clock chosen (at the first reading: the task clock where the
+    /// shard has one). None where neither keeps it, or where the task clock's page stopped offering it.
+    fn read(&mut self) -> Option<u64> {
+        match self {
+            CpuClock::Task => hyper_rt::futures::thread_run_ns(),
+            CpuClock::Os => thread_cpu_ns(),
+            CpuClock::Unchosen => match hyper_rt::futures::thread_run_ns() {
+                Some(ns) => {
+                    *self = CpuClock::Task;
+                    Some(ns)
+                }
+                None => {
+                    *self = CpuClock::Os;
+                    thread_cpu_ns()
+                }
+            },
+        }
     }
 }
 
@@ -575,7 +679,26 @@ pub fn render(o: &mut String) {
     render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
     render_calls(o, &all.iter().map(Shard::calls).collect::<Vec<_>>(), &help);
     render_parks(o, &all.iter().map(|s| (s.parks(), s.wakes().parks)).collect::<Vec<_>>(), &help);
+    render_spins(o, &all.iter().map(Shard::spins).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+}
+
+/// The families of what each shard's spin before a park did ([`Spins`]; goal 9, plan 01a1a87b2cec step 4), from `all`,
+/// each shard's in the runtime's order: its spins and their hits, the time they spun, and the spin in force.
+fn render_spins(o: &mut String, all: &[Spins], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    type Value = fn(&Spins) -> String;
+    let families: [(&str, &str, &str, Value); 4] = [
+        ("kiln_shard_spins_total", "counter", "Idle moments each shard spun before it parked (KILN_RT_SPIN; none where it wasn't asked for).", |s: &Spins| s.spins.to_string()),
+        ("kiln_shard_spin_hits_total", "counter", "Of those, the spins that found work before they ran out: each a park, its wake and its senders' kick saved.", |s: &Spins| s.hits.to_string()),
+        ("kiln_shard_spin_seconds_total", "counter", "The time each shard's spins before its parks spun: CPU its busy share counts.", |s: &Spins| secs(Duration::from_nanos(s.spun_ns)).to_string()),
+        ("kiln_shard_spin_window_seconds", "gauge", "The spin before a park each shard makes now: the one its own gaps make cheapest in CPU where it sizes itself, the asked one where fixed, 0 for none.", |s: &Spins| secs(Duration::from_nanos(s.now_ns)).to_string()),
+    ];
+    for (name, kind, h, value) in families {
+        help(o, name, kind, h);
+        for (i, s) in all.iter().enumerate() {
+            let _ = writeln!(o, "{name}{{shard=\"{i}\"}} {}", value(s));
+        }
+    }
 }
 
 /// `kiln_shard_park_seconds`: how long each shard's parks lasted ([`ParkTimes`]; goal 9, plan 01a1a87b2cec step 5), a
@@ -852,6 +975,111 @@ mod tests {
         ] {
             assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what a shard's spin before a park did is on `/metrics`, each count in its
+    /// place, its time and the spin in force in seconds, and survives the probe's atomics as it was; a shard asked for
+    /// none says zeros.
+    #[test]
+    fn g9_s4_each_shards_spins_before_its_parks_are_on_metrics() {
+        let c = hyper_rt::shard_loop::Counters { park_spins: 10, park_spin_hits: 4, park_spin_ns: 120_000, park_spin_now_ns: 16_000, ..Default::default() };
+        let spins = Spins::of(&c);
+        assert_eq!(spins, Spins { spins: 10, hits: 4, spun_ns: 120_000, now_ns: 16_000 });
+        let cells = SpinCells::default();
+        cells.store(&spins);
+        assert_eq!(cells.load(), spins);
+        let mut o = String::new();
+        render_spins(&mut o, &[spins, Spins::default()], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_spins_total counter",
+            "kiln_shard_spins_total{shard=\"0\"} 10",
+            "kiln_shard_spin_hits_total{shard=\"0\"} 4",
+            "kiln_shard_spin_seconds_total{shard=\"0\"} 0.00012",
+            "# TYPE kiln_shard_spin_window_seconds gauge",
+            "kiln_shard_spin_window_seconds{shard=\"0\"} 0.000016",
+            "kiln_shard_spins_total{shard=\"1\"} 0",
+            "kiln_shard_spin_window_seconds{shard=\"1\"} 0",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5, the probe's own cost cut with its samples as step 1 has them: a probe on a
+    /// shard wakes every period, each wake noted with how late it ran however idle the shard (none skipped), and the
+    /// shard's counts as that wake read them (the one copy it hands on to what the shard sheds).
+    #[test]
+    fn g9_s5_the_probe_wakes_every_period_and_notes_every_wake() -> anyhow::Result<()> {
+        let _ = base();
+        crate::rt::block_on(async {
+            let me = Shard::new();
+            let wakes = 10_u64;
+            let start = Instant::now();
+            // No overload watch for this shard (its index is none): the shard's samples alone.
+            wake_every(&me, usize::MAX, PERIOD, wakes).await;
+            let took = start.elapsed();
+            let s = me.snapshot();
+            anyhow::ensure!(s.probes == wakes, "{} of {wakes} wakes noted", s.probes);
+            anyhow::ensure!(took >= PERIOD * u32::try_from(wakes)?, "{wakes} wakes a period apart took {took:?}");
+            anyhow::ensure!(me.delay().sum_us() >= s.late.as_micros().try_into()?, "each wake's delay noted: {s:?}");
+            anyhow::ensure!(s.polls > 0 && s.tasks > 0 && s.since_probe.is_some(), "the shard's counts as its wakes read them: {s:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a probe copies what its shard's parks, wakes and calls cost it at its first
+    /// wake and every [`COUNTS_EVERY`]th after (those families move every 100 ms), while each wake's own samples (its
+    /// delay, the shard's polls) are noted at every wake as before.
+    #[test]
+    fn g9_s5_a_probe_copies_parks_wakes_and_calls_every_tenth_wake() -> anyhow::Result<()> {
+        let _ = base();
+        crate::rt::block_on(async {
+            let me = Shard::new();
+            wake_every(&me, usize::MAX, PERIOD, 1).await;
+            let first = (me.wakes(), me.calls(), me.parks());
+            anyhow::ensure!(first.0.steps > 0, "copied at the first wake: {first:?}");
+            wake_every(&me, usize::MAX, PERIOD, COUNTS_EVERY - 1).await;
+            let polls = me.snapshot().polls;
+            anyhow::ensure!((me.wakes(), me.calls(), me.parks()) == first, "copied again before its {COUNTS_EVERY}th wake after");
+            wake_every(&me, usize::MAX, PERIOD, 1).await;
+            anyhow::ensure!(me.wakes().steps > first.0.steps, "not copied again at its {COUNTS_EVERY}th wake after");
+            let s = me.snapshot();
+            anyhow::ensure!(s.probes == COUNTS_EVERY + 1 && s.polls > polls, "each wake noted all the same: {s:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a probe reads its shard thread's CPU time from hyper-rt's task clock, with no
+    /// call, where the shard has one, else from the OS's clock for the thread, and keeps to the one it chose. Over the
+    /// same stretch of spinning and system calls the task clock runs as the OS's does, the calls' time in the kernel
+    /// with the rest, so the busy share means what it meant; and the probe's samples are as they were.
+    #[test]
+    fn g9_s5_a_probe_reads_its_threads_cpu_time_from_the_task_clock() -> anyhow::Result<()> {
+        let _ = base();
+        crate::rt::block_on(async {
+            let mut clock = CpuClock::Unchosen;
+            let first = clock.read();
+            let task = hyper_rt::futures::thread_run_ns().is_some();
+            anyhow::ensure!(clock == if task { CpuClock::Task } else { CpuClock::Os }, "{clock:?} chosen, the task clock there: {task}");
+            if let (true, Some(os0), Some(t0)) = (task, thread_cpu_ns(), clock.read()) {
+                // A file's metadata asked again and again (system calls, their time in the kernel) until the thread has
+                // run 20 ms on the CPU, or for 2 s on a loaded machine.
+                let began = Instant::now();
+                let mut calls = 0_u64;
+                while thread_cpu_ns().unwrap_or(os0).saturating_sub(os0) < 20_000_000 && began.elapsed() < Duration::from_secs(2) {
+                    calls += u64::from(std::fs::metadata("/").is_ok());
+                }
+                let (os, t) = (thread_cpu_ns().unwrap_or(os0).saturating_sub(os0), clock.read().unwrap_or(t0).saturating_sub(t0));
+                anyhow::ensure!(os.abs_diff(t) <= (os / 10).max(2_000_000), "over {calls} calls the OS's clock ran {os} ns, the task clock {t} ns");
+            }
+            anyhow::ensure!(clock.read() >= first, "the chosen clock only moves on");
+            let me = Shard::new();
+            wake_every(&me, usize::MAX, PERIOD, 3).await;
+            let s = me.snapshot();
+            anyhow::ensure!(s.probes == 3 && (s.busy.is_some() || first.is_none()), "three wakes noted, with the thread's CPU time: {s:?}");
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what hyper-rt counts of a shard's arms and socket calls becomes its

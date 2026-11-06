@@ -297,7 +297,7 @@ impl Reporter {
 
     /// Scan in the background and send the sessions when they changed. `terminals` maps each
     /// kiln terminal's shell pid to its session id.
-    pub fn scan(&self, terminals: HashMap<u32, String>, up: async_channel::Sender<crate::exec::Up>) {
+    pub fn scan(&self, terminals: HashMap<u32, String>, up: crate::memory::queue::Sender<crate::exec::Up>) {
         if self.scanning.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -320,7 +320,7 @@ impl Reporter {
     }
 
     /// Answer the server's request for a session's whole view (timeline, state, changeset).
-    pub fn view(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
+    pub fn view(&self, req: u64, pid: u32, up: crate::memory::queue::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
         crate::rt::spawn(async move {
             let json = crate::rt::blocking(move || scanner.lock().view(pid)).await.ok().flatten().map(|v| v.to_string());
@@ -330,7 +330,7 @@ impl Reporter {
 
     /// Answer the server's request for this machine's past sessions (`running`: the harness ids
     /// of kiln's own sessions here).
-    pub fn history(&self, req: u64, kind: Option<String>, limit: usize, running: HashSet<String>, up: async_channel::Sender<crate::exec::Up>) {
+    pub fn history(&self, req: u64, kind: Option<String>, limit: usize, running: HashSet<String>, up: crate::memory::queue::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
         crate::rt::spawn(async move {
             let past = crate::rt::blocking(move || scanner.lock().history(kind.as_deref(), limit, &running)).await.ok();
@@ -340,7 +340,7 @@ impl Reporter {
     }
 
     /// Answer the server's request for a session's recent messages.
-    pub fn transcript(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
+    pub fn transcript(&self, req: u64, pid: u32, up: crate::memory::queue::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
         crate::rt::spawn(async move {
             let entries = crate::rt::blocking(move || scanner.lock().transcript(pid)).await.ok().flatten();

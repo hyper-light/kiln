@@ -156,8 +156,9 @@ pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, tested: O
 /// taken into the trail (W27-R09). Its digest.
 async fn keep(hub: &Hub, repo_id: &str, land: &Land) -> anyhow::Result<String> {
     let payload = statement::payload(&landing::statement(land)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bundle = crate::identities::sign_as(&hub.pki, "server", landing::PAYLOAD_LAND, &payload)?;
     let digest = statement::digest(landing::PAYLOAD_LAND, &payload);
+    // Signed on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = crate::identities::sign_as_off(&hub.pki, "server", landing::PAYLOAD_LAND, payload).await?;
     let signer = kiln_ci::identity::chain::Identity::new(hub.pki.organization(), kiln_ci::identity::chain::Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
     let (repo_id, trunk, head, candidate, base, d, at) = (repo_id.to_owned(), land.trunk.clone(), land.to.clone(), land.candidate.clone(), land.base.clone(), digest.clone(), crate::util::now_unix());
     hub.store

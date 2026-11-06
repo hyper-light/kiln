@@ -318,7 +318,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.add",
-            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, on subagents while there's room. One that says nothing is ordered before it goes (kiln asks the agent: goals_order). Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
+            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, each on a subagent of the agent's while there's room, the agent coordinating. One that says nothing goes in turn, on the agent, after the goals before it. Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsAdd>(),
@@ -363,7 +363,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.order",
-            summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, on subagents of yours while there's room, and you coordinate. While they can, kiln asks you to order the goals that say nothing before any of them goes: say only what you're sure of from the goals, the conversation and the code, and give every goal it asks about its needs. A loop of waiting is refused.",
+            summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, each on a subagent of yours while there's room, and you coordinate. A goal that says nothing goes in turn, on you, after the goals before it: say what it waits for, only what you're sure of from the goals, the conversation and the code, so it can go side by side. A loop of waiting is refused.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsOrder>(),

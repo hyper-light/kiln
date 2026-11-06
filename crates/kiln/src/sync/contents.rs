@@ -219,11 +219,11 @@ impl Contents {
     }
 
     /// Content `hash` as a stream, with its size (`None`: not held).
-    pub fn stream(&self, hash: &str) -> Option<(u64, async_channel::Receiver<Bytes>)> {
+    pub fn stream(&self, hash: &str) -> Option<(u64, crate::memory::queue::Receiver<Bytes>)> {
         let size = self.size(hash)?;
         if size == 0 {
-            let (_, rx) = async_channel::bounded(1);
-            return Some((0, rx));
+            // No sender: it ends at once.
+            return Some((0, crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1).1));
         }
         Some((size, crate::blobs::io::read_stream(Arc::clone(&self.blobs), key(hash), Some(hash.to_ascii_lowercase()), 0, size.saturating_sub(1))))
     }

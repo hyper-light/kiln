@@ -84,11 +84,16 @@ impl Histogram {
         }
     }
 
+    /// One observation: its own bucket's count (the first bound at or past it; past the last, `+Inf`'s count alone), the
+    /// count and the sum. Each bucket keeps the observations that fell in it alone, summed up to each bound as they're
+    /// read ([`Histogram::cumulative`], `render`): an observation was added to every bucket at or past it, a locked add
+    /// to each (goal 9, plan 01a1a87b2cec step 5: a shard's probe's delay, 40 of its 44 buckets every 10 ms on every
+    /// shard; each request's latency classes). The bounds go up, as every family's list does and the exposition wants.
     pub fn observe(&self, secs: f64) {
-        for (b, c) in self.bounds.iter().zip(&self.buckets) {
-            if secs <= *b {
-                c.fetch_add(1, Ordering::Relaxed);
-            }
+        // NaN is at or under no bound: `+Inf`'s alone, as it was.
+        let i = if secs.is_nan() { self.bounds.len() } else { self.bounds.partition_point(|b| *b < secs) };
+        if let Some(c) = self.buckets.get(i) {
+            c.fetch_add(1, Ordering::Relaxed);
         }
         self.count.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -105,19 +110,24 @@ impl Histogram {
         self.sum_us.load(Ordering::Relaxed)
     }
 
-    /// Observations so far at or under each bound, in the bounds' order (cumulative, as rendered).
+    /// Observations so far at or under each bound, in the bounds' order (cumulative, as rendered): each bucket's own
+    /// summed up to it ([`Histogram::observe`]).
     pub fn cumulative(&self) -> Vec<(f64, u64)> {
-        self.bounds.iter().zip(&self.buckets).map(|(b, c)| (*b, c.load(Ordering::Relaxed))).collect()
+        let mut under = 0_u64;
+        self.bounds
+            .iter()
+            .zip(&self.buckets)
+            .map(|(b, c)| {
+                under = under.saturating_add(c.load(Ordering::Relaxed));
+                (*b, under)
+            })
+            .collect()
     }
 
     pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
-        for (b, c) in self.bounds.iter().zip(&self.buckets) {
-            let _ = writeln!(
-                out,
-                "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {}",
-                c.load(Ordering::Relaxed)
-            );
+        for (b, under) in self.cumulative() {
+            let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {under}");
         }
         let n = self.count.load(Ordering::Relaxed);
         let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
@@ -981,6 +991,32 @@ mod tests {
         assert!(out.contains(r#"{repo="hyper-light/kiln",machine="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_id="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_name="adas-macbook-pro-3.local"} 3"#), "{out}");
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: an observation adds to its own bucket alone, and the histogram reads and renders
+    /// as when it added to every bucket at or past it: each bound's count of observations at or under it, on a bound and
+    /// past the last (`+Inf` alone), NaN in none, the count and sum; every bucket list the crate keeps goes up, as
+    /// finding the bucket by a binary search needs.
+    #[test]
+    fn g9_s5_an_observation_adds_to_its_bucket_and_reads_as_before() {
+        let shard = crate::shard_health::DELAY_BUCKETS;
+        for bounds in [DURATION_BUCKETS, QUEUE_BUCKETS, DELIVERY_BUCKETS, LATENCY_BUCKETS, STALL_BUCKETS, shard] {
+            assert!(bounds.windows(2).all(|w| w.first() < w.get(1)), "{bounds:?} go up");
+        }
+        let h = Histogram::new(shard);
+        let seen = [0.0, 0.000005, 0.00001, 0.00012, 0.000125, 0.0002, 0.0009, 0.001, 0.0035, 2.0, 59.9, 60.0, 75.0, f64::NAN, -1.0];
+        for s in seen {
+            h.observe(s);
+        }
+        let want: Vec<(f64, u64)> = shard.iter().map(|b| (*b, seen.iter().filter(|s| **s <= *b).count() as u64)).collect();
+        assert_eq!(h.cumulative(), want);
+        assert_eq!(h.count(), seen.len() as u64);
+        let mut out = String::new();
+        h.render(&mut out, "d", "s=\"0\"");
+        for (b, n) in &want {
+            assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"{b}\"}} {n}")), "{b}: {n} not in\n{out}");
+        }
+        assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"+Inf\"}} {}", seen.len())), "{out}");
+    }
+
     #[test]
     fn a_labelled_histogram_renders_each_series_whole() {
         let h = HistogramVec::new(&["repo"], LATENCY_BUCKETS);
@@ -1314,6 +1350,7 @@ pub fn render() -> String {
     render_wire(&mut o);
     render_tls(&mut o);
     crate::shard_health::render(&mut o);
+    crate::nudge::render(&mut o);
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
