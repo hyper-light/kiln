@@ -1831,6 +1831,52 @@ hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' p
   `Mirror::upsert` (the copies' metas and index), `tungstenite::protocol::WebSocketContext::buffer_frame`,
   and with `prof_accum` the sites whose frees make `dirty`.
 
+### Kiln's own holders, cut largest first (step 5, part 4)
+
+rt9's glibc lab build held 478 MB (anonymous 378): of kiln's own owners on `/metrics` the bus 7.74 MB,
+`session_entries` 6.86, `sqlite` 4.06, `session_segments` 1.66, `ui_events` 0.72. Each cut below is an
+estimate for the realistic profile (8 agent pages' sockets, 4 runners, 32 copies keeping about 47,000
+events, 14,000 observe series), and for production's shape (134 copies, 10 runners) where it differs.
+
+| Cut | Est. MB, lab (production) | Basis |
+| --- | --- | --- |
+| A copy's meta keeps its digest in an `AtomicU64` (0 until made), not a `OnceLock<u64>`: 88 bytes, not 96 | 0.4 (0.7) | 8 bytes for each event a copy keeps |
+| A copy's index: buckets of a `u32` key (half of the id's keyed SipHash) and a `u32` place, hashed by the key's own bits (`copies::Spread`) | 0.6 (1.0) | 8 bytes a bucket, not 16: a 5,000-event copy's table of 8,192 buckets is 72 KiB, not 136 |
+| The UI's sockets write 16 KiB at a time (`http::ws::SOCKET_WRITE`, a TLS record), and a packed snapshot goes in frames of 16 KiB (`api::SNAPSHOT_FRAME`), its pieces still made 128 KiB at a time | 0.85 (more: each page's events socket) | tungstenite's write buffer keeps the most it held: 131 KiB for each agent page after its snapshot, 128 to 256 KiB for an events socket |
+| A runner's process makes none of the server's route and leg histograms (`route_latency::ROUTES`, `LEGS`, made by the first work they time), so its registry renders none of their series | 0.55 to 0.7 (1.4 to 1.8) | 502 series of zeros a runner (10 x 22, 6 x 47), each a series of its own in the server's observe store, about 270 to 350 bytes |
+| observe's head and newest times grow by a quarter (`index::grow`), not doubling | 0 (1.3 after a restart) | a reopen sizes them exactly, and the next new series doubled them: 128 bytes a series |
+
+What each risks, for the lab to say: the socket writes are 8 times as many for a snapshot (a 3 MB one is about
+200 writes of 16 KiB, not 25 of 128 KiB): watch attach p50 and p99 and the CPU a request. A server's very first
+`/metrics` answer, before any request was timed, lacks the route families' series (each family is still said with
+its TYPE).
+
+**What's left of kiln's own, and what it needs:**
+- **The bus** (7.74 MB in rt9, and Quiver's slots beside it): each watched session's topic keeps its newest 2048
+  frames (`live::RETAIN`, from CP-T2.1, not derived), though every viewer has read all but a few: a viewer reads from
+  its snapshot's offset on, and one that joins later reads from the end. Quiver keeps a topic's newest messages by
+  count and bytes alone, and makes each 64 KiB segment's 256 slots (about 96 bytes each by their types, 24 KiB) as it opens it, of which
+  the lab's frames (about 730 bytes framed) fill about 89: about 2.9 MB more than the bus's own count. Two ways:
+  - Quiver lets a topic's messages go before an offset (`Topics::trim`, as `let_go_past_retention` does with a
+    floor), kiln-seams' `Bus` and `SimBus` take it, and each live feed trims to its slowest viewer's offset (each
+    viewer's last read kept in an atomic the feed reads at a publish), a segment at a time: est. 9 to 10 MB less in
+    the lab, the bus about a segment a topic; viewers behind are as they were. That's Quiver's API (vendored, its
+    product's to take), and a slot array grown with its segment would take the other 16 KiB a segment.
+  - kiln alone: a smaller `RETAIN`, derived from how far behind the lab's viewers fall (`bus.delivery_top_ms` times
+    a topic's frames a second): a viewer further behind takes a catch-up (only what changed since its revision,
+    packed) where it took frames. Less memory for every topic, more catch-ups for slow viewers: a call for Ada.
+- **observe's block directories**: 48 bytes a series for each block, about 0.67 MB a block (1 to 3 in a lab round,
+  about 10 with production's retention, 6 to 7 MB): in-memory copies of what each block's file indexes.
+- **The server's own histograms in observe**: every bucket of every histogram is a series, each written every 15 s
+  whether or not it moved (about 1,200 on the server). Dropping a bucket that equals the one below it changes what a
+  query of the buckets sees, so it's observe's query side to agree first.
+- Production only: a terminal's replay (up to 256 KiB, one message) and a snapshot for a client that doesn't ask
+  `z=gzip` (frames up to 256 KiB) still leave their socket's buffer that large; the events socket's two lanes make
+  their 4,096 places each as it subscribes (128 KiB a socket); observe's queue to its peers makes its 16,384 places
+  as it starts (256 KiB); uploads stay in memory up to 30 minutes after their message (up to 512 MiB).
+- To rank the rest, one heap profile round of the merged tree (above), looking also for `quiver::ephemeral::Segment::new`
+  (the slots), `kiln_obs::block` (the directories) and `kiln_http::buf` (the write buffers kept per thread).
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
