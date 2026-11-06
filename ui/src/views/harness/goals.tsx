@@ -31,7 +31,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Tries } from "@/lib/tries";
 import { Link } from "@/lib/router";
-import { canPlan, canPlanNow, fromLines, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, goalStand, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
@@ -336,16 +336,6 @@ function AgentGoals({ agent, harness, working, store, onOpenTask }: { agent: str
   );
 }
 
-/** Where a goal stands, as its node shows it: under way and the agent at work, working; under way while it's
- * idle, or to come, only sketched. */
-function standOf(g: GoalItem, paused: boolean, working: boolean): Stand {
-  if (g.status === "met") return "met";
-  if (g.status === "unmet") return "unmet";
-  if (g.status === "skipped") return "skipped";
-  if (g.status === "active") return paused ? "paused" : working ? "working" : "waiting";
-  return "waiting";
-}
-
 function GoalPanel({
   agent,
   harness,
@@ -618,7 +608,7 @@ function GoalPanel({
                     const { status, away, busy } = lineOf(g, partsOf(g, items), working);
                     // The goal under way while you've paused the stack: paused, not under way.
                     const held = status === "active" && stack?.state === "paused";
-                    const stand = standOf({ ...g, status }, held, busy);
+                    const stand = goalStand({ ...g, status }, held, busy);
                     const planner = planners.get(g.id);
                     // Asked for, or at it: not to ask again.
                     const planning = planner?.kind === "asked" || planner?.kind === "planning";
