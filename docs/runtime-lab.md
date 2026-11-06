@@ -1856,15 +1856,15 @@ its TYPE).
   frames (`live::RETAIN`, from CP-T2.1, not derived), though every viewer has read all but a few: a viewer reads from
   its snapshot's offset on, and one that joins later reads from the end. Quiver keeps a topic's newest messages by
   count and bytes alone, and makes each 64 KiB segment's 256 slots (about 96 bytes each by their types, 24 KiB) as it opens it, of which
-  the lab's frames (about 730 bytes framed) fill about 89: about 2.9 MB more than the bus's own count. Two ways:
-  - Quiver lets a topic's messages go before an offset (`Topics::trim`, as `let_go_past_retention` does with a
-    floor), kiln-seams' `Bus` and `SimBus` take it, and each live feed trims to its slowest viewer's offset (each
-    viewer's last read kept in an atomic the feed reads at a publish), a segment at a time: est. 9 to 10 MB less in
-    the lab, the bus about a segment a topic; viewers behind are as they were. That's Quiver's API (vendored, its
-    product's to take), and a slot array grown with its segment would take the other 16 KiB a segment.
-  - kiln alone: a smaller `RETAIN`, derived from how far behind the lab's viewers fall (`bus.delivery_top_ms` times
-    a topic's frames a second): a viewer further behind takes a catch-up (only what changed since its revision,
-    packed) where it took frames. Less memory for every topic, more catch-ups for slow viewers: a call for Ada.
+  the lab's frames (about 730 bytes framed) fill about 89: about 2.9 MB more than the bus's own count. Not cut:
+  - Letting what every viewer has read go would take Quiver an operation of its own (a topic's messages let go
+    before an offset), which would cost Quiver itself: each call takes the topic's lock that every publish takes, so
+    its publishes wait behind it, and its API, simulator and conformance suite grow. Growing a segment's slots as it
+    fills, for the other 16 KiB a segment, would put an allocation on its publish's path. Quiver holds itself to a
+    tenth of NATS's, Redis's and Kafka's p99 and p99.9, and Ada's word (2026-11-06) is that a change costing Quiver
+    any of its performance isn't made. What it would have given: est. 9 to 10 MB in the lab.
+  - A smaller `RETAIN` is kiln's alone, but it changes what a slow viewer gets: one further behind than the topic
+    keeps takes a catch-up (only what changed since its revision, packed) where it took frames. Not made: Ada's call.
 - **observe's block directories**: 48 bytes a series for each block, about 0.67 MB a block (1 to 3 in a lab round,
   about 10 with production's retention, 6 to 7 MB): in-memory copies of what each block's file indexes.
 - **The server's own histograms in observe**: every bucket of every histogram is a series, each written every 15 s
