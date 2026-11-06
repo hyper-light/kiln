@@ -7,9 +7,12 @@
 //! quiet sleep's own wake ([`crate::quiet`]) against the quiet sleep's site. Their sum is the shard's
 //! `woken_by_timer`.
 //!
-//! **One writer, any reader, no lock**, as [`crate::slow`]'s table: each shard keeps one on its registry entry, which
-//! only the shard writes, once a timer wake; an entry's site is set once and its count is a relaxed atomic. A table
-//! that is full counts what doesn't fit with no site.
+//! The same table counts the kicks that found the shard parked by the task each woke, at its spawn site ([`kicked_tasks`]:
+//! who another thread wakes on a parked shard; kiln's goal 9 step 5, the shards' ~1,750 kicks a second, g9p16).
+//!
+//! **No lock**, as [`crate::slow`]'s table: each shard keeps them on its registry entry; an entry's site is set once (a
+//! site's first count, which may race another's first for a free entry where other threads write, the loser going on to
+//! the next) and its count is a relaxed atomic. A table that is full counts what doesn't fit with no site.
 
 use std::panic::Location;
 use std::sync::OnceLock;
@@ -22,22 +25,22 @@ use crate::registry::{self, SlotHolder};
 /// one.
 pub const ENTRIES: usize = crate::slow::ENTRIES;
 
-/// One entry: a site set once, and the wakes it made.
+/// One entry: a site set once, and its count.
 #[derive(Debug, Default)]
 struct Entry {
     site: OnceLock<&'static Location<'static>>,
-    wakes: AtomicU64,
+    count: AtomicU64,
 }
 
-/// A shard's table of timer wakes by site (see the module's notes).
+/// A shard's table of counts by site (see the module's notes).
 #[derive(Debug)]
-pub(crate) struct TimerSites {
+pub(crate) struct SiteCounts {
     entries: Box<[Entry]>,
-    /// The wakes of a site a full table had no entry for, and those of no site.
+    /// The counts of a site a full table had no entry for, and those of no site.
     rest: AtomicU64,
 }
 
-impl Default for TimerSites {
+impl Default for SiteCounts {
     fn default() -> Self {
         Self {
             entries: (0..ENTRIES).map(|_| Entry::default()).collect(),
@@ -55,9 +58,9 @@ fn start(site: &Location<'_>, n: usize) -> usize {
     usize::try_from(mixed).ok().and_then(|m| m.checked_rem(n)).unwrap_or(0)
 }
 
-impl TimerSites {
-    /// One timer wake of the shard, by the timer armed at `site` (none: no timer fell due, or none was kept): the
-    /// shard's own call.
+impl SiteCounts {
+    /// One more of `site`'s (none: no site, or none kept): a timer wake by the timer armed there, the shard's own call;
+    /// a kick that found the shard parked by the task spawned there, any thread's.
     pub(crate) fn note(&self, site: Option<&'static Location<'static>>) {
         let Some(site) = site else {
             self.rest.fetch_add(1, Ordering::Relaxed);
@@ -65,55 +68,61 @@ impl TimerSites {
         };
         let n = self.entries.len();
         let first = start(site, n);
-        let found = (0..n)
-            .filter_map(|i| self.entries.get(first.wrapping_add(i).checked_rem(n)?))
-            .find(|entry| entry.site.get().is_none_or(|s| *s == site));
-        match found {
-            // The shard is the table's only writer: a free entry it finds is still free as it sets the site.
-            Some(entry) => {
+        for i in 0..n {
+            let Some(entry) = first.wrapping_add(i).checked_rem(n).and_then(|at| self.entries.get(at)) else { continue };
+            if entry.site.get().is_none() {
                 let _ = entry.site.set(site);
-                entry.wakes.fetch_add(1, Ordering::Relaxed);
             }
-            None => {
-                self.rest.fetch_add(1, Ordering::Relaxed);
+            // Set here, or by another writer's race for it to its own site: then on to the next.
+            if entry.site.get().is_some_and(|s| *s == site) {
+                entry.count.fetch_add(1, Ordering::Relaxed);
+                return;
             }
         }
+        self.rest.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Every site with a wake counted, then the rest (no site), as they stand: any thread's.
-    pub(crate) fn read(&self) -> Vec<TimerWakes> {
+    /// Every site with a count, then the rest (no site), as they stand: any thread's.
+    pub(crate) fn read(&self) -> Vec<SiteCount> {
         let rest = self.rest.load(Ordering::Relaxed);
         self.entries
             .iter()
             .filter_map(|entry| {
-                let wakes = entry.wakes.load(Ordering::Relaxed);
-                (wakes > 0).then(|| TimerWakes { site: entry.site.get().copied(), wakes })
+                let count = entry.count.load(Ordering::Relaxed);
+                (count > 0).then(|| SiteCount { site: entry.site.get().copied(), count })
             })
-            .chain((rest > 0).then_some(TimerWakes { site: None, wakes: rest }))
+            .chain((rest > 0).then_some(SiteCount { site: None, count: rest }))
             .collect()
     }
 }
 
-/// The timer wakes of one site of a shard, since the shard started.
+/// One site's count of a shard's, since the shard started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimerWakes {
-    /// Where the timer was armed; none for the wakes no timer fell due for, and those a full table had no entry for.
+pub struct SiteCount {
+    /// Where the timer was armed, or the woken task spawned; none for the counts of no site, and those a full table had
+    /// no entry for.
     pub site: Option<&'static Location<'static>>,
-    /// Parks it ended.
-    pub wakes: u64,
+    /// Timer wakes, or kicks claimed, since the shard started.
+    pub count: u64,
 }
 
-/// The timer wakes of the shard `holder` names, by site, as they stand (any thread; nothing of the shard's own is
-/// touched). Empty for a holder no longer registered.
-pub fn timer_wakes(holder: SlotHolder) -> Vec<TimerWakes> {
+/// The timer wakes of the shard `holder` names, by where each timer was armed, as they stand (any thread; nothing of the
+/// shard's own is touched). Empty for a holder no longer registered.
+pub fn timer_wakes(holder: SlotHolder) -> Vec<SiteCount> {
     registry::with_holder(holder, |entry| entry.timer_sites.read()).unwrap_or_default()
+}
+
+/// The kicks that found the shard `holder` names parked, by where the task each woke was spawned (none: a control
+/// message's, or a task with no site kept), as they stand. Empty for a holder no longer registered.
+pub fn kicked_tasks(holder: SlotHolder) -> Vec<SiteCount> {
+    registry::with_holder(holder, |entry| entry.kicked_tasks.read()).unwrap_or_default()
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
-    impl TimerSites {
+    impl SiteCounts {
         /// A table of `n` entries (a full one, in a test, without `ENTRIES` sites).
         fn with_entries(n: usize) -> Self {
             Self { entries: (0..n).map(|_| Entry::default()).collect(), rest: AtomicU64::new(0) }
@@ -132,20 +141,20 @@ mod tests {
         let a = here();
         let b = here();
         let c = here();
-        let table = TimerSites::default();
+        let table = SiteCounts::default();
         for site in [Some(a), Some(b), Some(a), None] {
             table.note(site);
         }
         let mut read = table.read();
-        read.sort_by_key(|w| std::cmp::Reverse(w.wakes));
-        assert_eq!(read, vec![TimerWakes { site: Some(a), wakes: 2 }, TimerWakes { site: Some(b), wakes: 1 }, TimerWakes { site: None, wakes: 1 }]);
-        let full = TimerSites::with_entries(2);
+        read.sort_by_key(|w| std::cmp::Reverse(w.count));
+        assert_eq!(read, vec![SiteCount { site: Some(a), count: 2 }, SiteCount { site: Some(b), count: 1 }, SiteCount { site: None, count: 1 }]);
+        let full = SiteCounts::with_entries(2);
         for site in [a, b, c, c] {
             full.note(Some(site));
         }
         let read = full.read();
-        assert_eq!(read.iter().map(|w| w.wakes).sum::<u64>(), 4, "{read:?}");
-        assert_eq!(read.iter().filter(|w| w.site.is_none()).map(|w| w.wakes).sum::<u64>(), 2, "{read:?}");
+        assert_eq!(read.iter().map(|w| w.count).sum::<u64>(), 4, "{read:?}");
+        assert_eq!(read.iter().filter(|w| w.site.is_none()).map(|w| w.count).sum::<u64>(), 2, "{read:?}");
     }
 
     fn config() -> crate::runtime::RuntimeConfig {
@@ -174,8 +183,8 @@ mod tests {
     const ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// The wakes `table` counted against the place in this file at `line`.
-    fn at_line(table: &[TimerWakes], line: u32) -> u64 {
-        table.iter().filter(|w| w.site.is_some_and(|s| s.file() == file!() && s.line() == line)).map(|w| w.wakes).sum()
+    fn at_line(table: &[SiteCount], line: u32) -> u64 {
+        table.iter().filter(|w| w.site.is_some_and(|s| s.file() == file!() && s.line() == line)).map(|w| w.count).sum()
     }
 
     /// Kiln's goal 9, plan 01a1a87b2cec step 5: a parked shard's timer wake counts against where its sleep was asked
@@ -206,9 +215,60 @@ mod tests {
         let table = timer_wakes(holder);
         assert!(at_line(&table, slept) >= 1, "the sleep's: {table:?}");
         assert!(at_line(&table, deadline) >= 1, "the deadline's: {table:?}");
-        assert!(table.iter().any(|w| w.site == Some(wrapped) && w.wakes >= 1), "the wrapper's caller's: {table:?}");
+        assert!(table.iter().any(|w| w.site == Some(wrapped) && w.count >= 1), "the wrapper's caller's: {table:?}");
         assert!(at_line(&table, quiet) >= 1, "the quiet sleep's: {table:?}");
-        assert_eq!(table.iter().map(|w| w.wakes).sum::<u64>(), counters.woken_by_timer, "every timer wake counted: {table:?}, {counters:?}");
+        assert_eq!(table.iter().map(|w| w.count).sum::<u64>(), counters.woken_by_timer, "every timer wake counted: {table:?}, {counters:?}");
+        rt.shutdown().unwrap();
+    }
+
+    /// A future pending until `open` is set, handing its waker over each time it waits.
+    struct Gate {
+        open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wakers: std::sync::mpsc::Sender<std::task::Waker>,
+    }
+
+    impl std::future::Future for Gate {
+        type Output = ();
+
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.open.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(());
+            }
+            let _ = self.wakers.send(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a kick that finds a shard parked counts against where the task it wakes
+    /// was spawned. Do: on a running runtime's idle shard, a task spawned at a known place waits on a gate; the test's
+    /// thread opens it and wakes the task once the shard is announced parked. Expect: one kick at the task's spawn site
+    /// (its claim: the parked shard's system call), and every kick the shard's senders claimed counted somewhere.
+    #[test]
+    fn g9_s5_a_kick_that_finds_a_shard_parked_counts_against_the_woken_tasks_spawn_site() {
+        let rt = crate::runtime::Runtime::start(&config()).unwrap();
+        let shard = rt.shard_ids()[0];
+        let holder = rt.holder_of(shard).unwrap();
+        let (wakers_tx, wakers) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Gate { open: std::sync::Arc::clone(&open), wakers: wakers_tx };
+        let spawned = line!() + 1;
+        rt.spawn_on(shard, async move {
+            gate.await;
+            let _ = done_tx.send(());
+        })
+        .unwrap();
+        let waker = wakers.recv_timeout(ANSWER).unwrap();
+        while !crate::registry::with_entry(shard.0, |entry| entry.parking.parked()).unwrap_or(true) {
+            std::hint::spin_loop();
+        }
+        open.store(true, Ordering::SeqCst);
+        waker.wake();
+        done.recv_timeout(ANSWER).unwrap();
+        let table = kicked_tasks(holder);
+        assert_eq!(at_line(&table, spawned), 1, "the woken task's: {table:?}");
+        let claimed: u64 = crate::registry::kicks_from(holder).unwrap().iter().map(|(claimed, _)| claimed).sum();
+        assert_eq!(table.iter().map(|w| w.count).sum::<u64>(), claimed, "every claimed kick counted: {table:?}");
         rt.shutdown().unwrap();
     }
 }

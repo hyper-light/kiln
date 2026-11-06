@@ -854,15 +854,31 @@ fn render_timer_wakes(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &st
     if shards().is_empty() {
         return;
     }
+    timer_wakes_series(o, &site_rows(hyper_rt::timer_sites::timer_wakes), help);
+    kicked_tasks_series(o, &site_rows(hyper_rt::timer_sites::kicked_tasks), help);
+}
+
+/// Each shard's counts by site from `read` (its table, `hyper_rt::timer_sites`), keyed by shard and `file:line:column`.
+fn site_rows(read: fn(hyper_rt::SlotHolder) -> Vec<hyper_rt::timer_sites::SiteCount>) -> std::collections::BTreeMap<(usize, String), u64> {
     let mut rows: std::collections::BTreeMap<(usize, String), u64> = std::collections::BTreeMap::new();
     for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
-        for w in hyper_rt::timer_sites::timer_wakes(holder) {
+        for w in read(holder) {
             let site = w.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
             let n = rows.entry((i, site)).or_default();
-            *n = n.saturating_add(w.wakes);
+            *n = n.saturating_add(w.count);
         }
     }
-    timer_wakes_series(o, &rows, help);
+    rows
+}
+
+/// `kiln_shard_kicked_tasks_total{shard,site}`: the kicks that found each shard parked, by where the task each woke was
+/// spawned (empty: a control message's), from its rows (goal 9, plan 01a1a87b2cec step 5: who other threads wake on a
+/// parked shard). Their sum is the claimed kicks, `kiln_shard_kicks_in_total{found="parked"}`.
+fn kicked_tasks_series(o: &mut String, rows: &std::collections::BTreeMap<(usize, String), u64>, help: &dyn Fn(&mut String, &str, &str, &str)) {
+    help(o, "kiln_shard_kicked_tasks_total", "counter", "Kicks that found each shard parked, by where the task each woke was spawned (file:line:column; empty for a control message's): their sum is kiln_shard_kicks_in_total found=parked.");
+    for ((i, site), n) in rows {
+        let _ = writeln!(o, "kiln_shard_kicked_tasks_total{{shard=\"{i}\",site=\"{}\"}} {n}", escape(site));
+    }
 }
 
 /// [`render_timer_wakes`]'s family from its rows (each shard and site's wakes).
@@ -1477,7 +1493,12 @@ mod tests {
         timer_wakes_series(&mut o, &rows, &|o: &mut String, name: &str, kind: &str, _: &str| {
             let _ = writeln!(o, "# TYPE {name} {kind}");
         });
+        kicked_tasks_series(&mut o, &rows, &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
         for line in [
+            "# TYPE kiln_shard_kicked_tasks_total counter",
+            "kiln_shard_kicked_tasks_total{shard=\"0\",site=\"crates/kiln/src/hub.rs:10:5\"} 7",
             "# TYPE kiln_shard_timer_wakes_total counter",
             "kiln_shard_timer_wakes_total{shard=\"0\",site=\"crates/kiln/src/hub.rs:10:5\"} 7",
             "kiln_shard_timer_wakes_total{shard=\"0\",site=\"\"} 1",

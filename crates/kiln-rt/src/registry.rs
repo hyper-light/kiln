@@ -130,7 +130,10 @@ pub struct Entry {
     pub(crate) slow: crate::slow::SlowTable,
     /// The shard's timer wakes, by where each timer was armed: the shard writes it after a park a timer ended, any
     /// thread reads it (`crate::timer_sites`, kiln's goal 9).
-    pub(crate) timer_sites: crate::timer_sites::TimerSites,
+    pub(crate) timer_sites: crate::timer_sites::SiteCounts,
+    /// The kicks that found the shard parked, by where the task each woke was spawned: any thread writes it as its kick
+    /// is claimed, any reads it (`crate::timer_sites::kicked_tasks`, kiln's goal 9).
+    pub(crate) kicked_tasks: crate::timer_sites::SiteCounts,
 }
 
 impl Entry {
@@ -170,9 +173,18 @@ impl Entry {
         location(at)
     }
 
-    /// Called inside the existing parking fence protocol, after payload publication.
-    fn kick_parked(&self) {
-        self.parking.kick_if_parked_from(crate::parking::sender(), || self.kick_now());
+    /// Called inside the existing parking fence protocol, after payload publication. A kick claimed is counted by the task
+    /// it wakes, `woken`, where it was spawned (none: a control message's), on the shard's table (kiln's goal 9, plan
+    /// 01a1a87b2cec step 5: who other threads wake on a parked shard).
+    fn kick_parked(&self, woken: Option<&'static std::panic::Location<'static>>) {
+        let mut claimed = false;
+        self.parking.kick_if_parked_from(crate::parking::sender(), || {
+            claimed = true;
+            self.kick_now();
+        });
+        if claimed {
+            self.kicked_tasks.note(woken);
+        }
     }
 
     /// The kick of a park claimed: the driver's, or the owner's thread in driverless cleanup. Counted on the
@@ -212,7 +224,7 @@ impl Entry {
         summary.fetch_or(1u64 << bit, Ordering::AcqRel);
         self.abandons_marked.store(true, Ordering::Release);
         self.control_pending.publish();
-        self.kick_parked();
+        self.kick_parked(None);
         true
     }
 }
@@ -586,7 +598,8 @@ pub(crate) fn register_runtime_slot(
                 .collect(),
             os_thread: AtomicU64::new(0),
             slow: crate::slow::SlowTable::default(),
-            timer_sites: crate::timer_sites::TimerSites::default(),
+            timer_sites: crate::timer_sites::SiteCounts::default(),
+            kicked_tasks: crate::timer_sites::SiteCounts::default(),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,
@@ -773,7 +786,7 @@ fn push_movable_onto(
     match entry.movable.push(request) {
         Pushed::Queued => {
             entry.control_pending.publish();
-            entry.kick_parked();
+            entry.kick_parked(None);
             Ok(())
         }
         Pushed::Full(request) | Pushed::Closed(request) => Err(request),
@@ -987,7 +1000,7 @@ pub fn wake(word: Encoded) {
         if entry.exited.load(Ordering::Acquire) || !entry.wakes.set(word.slot()) {
             return false;
         }
-        entry.kick_parked();
+        entry.kick_parked(entry.spawned_at(word.slot()));
         true
     });
     if landed != Some(true) {
@@ -1034,7 +1047,7 @@ pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
         // The flag before the mark: the drain that takes the mark (AcqRel) then sees the flag.
         entry.stop.store(true, Ordering::Release);
         entry.control_pending.publish();
-        entry.kick_parked();
+        entry.kick_parked(None);
     })
     .ok_or(RtError::ShardGone { shard: target })
 }
@@ -1051,7 +1064,7 @@ fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), R
     match entry.control.push(message) {
         Pushed::Queued => {
             entry.control_pending.publish();
-            entry.kick_parked();
+            entry.kick_parked(None);
             Ok(())
         }
         Pushed::Full(_) => Err(RtError::ControlFull { shard: target }),
