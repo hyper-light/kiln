@@ -1397,6 +1397,18 @@ impl Turns {
         }
     }
 
+    /// [`Turns::after`], its poll ended there whether or not other work wants the shard: the shards' table of what
+    /// held them counts a poll from its start to its end, though [`maybe_yield`] let it go on, so a loop that goes on
+    /// unasked runs a poll of up to two quanta and a piece, a quantum after the driver's last harvest before the shard
+    /// is wanted (goal 9, plan 01a1a87b2cec step 3: rt9's server tasks, 0.3 to 1.4 ms on the CPU in a poll). Its
+    /// cost, a turn of the shard's loop a quantum, where nothing else waits.
+    pub async fn yield_after(&mut self) {
+        if self.over() {
+            hyper_rt::futures::yield_now().await;
+            *self = Self::new();
+        }
+    }
+
     /// The loop's next item off `rx`: one waiting already goes on in this turn; one it waited for starts its turn
     /// afresh, as the wait gave its shard to its other work, as the copies' owners take their inboxes
     /// (`crate::harness::copies`). `None` once `rx` is closed and empty. Goal 10, plan 01a1a87b2dae step 5: the
@@ -2390,6 +2402,54 @@ mod tests {
         assert!(t.over_at(at(150), STEP_BUDGET_NS), "a 130 µs piece ending at 150 µs: the next as long ends at 280 µs");
         // Off a shard there's no quantum: never over.
         assert!(!Turns::new().over());
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 3): a loop that gives its turns up with `yield_after` ends its poll with its
+    /// turn, whether or not anything else wants its shard: of pieces that each take at least `PIECE`, a turn is over
+    /// once the time done and a next piece as long reach the quantum, so no poll runs more than `quantum / PIECE`
+    /// pieces, rounded up, less one. The host holding the thread only makes pieces longer, and turns shorter.
+    #[test]
+    fn g9_s3_a_loops_poll_ends_with_its_turn_though_nothing_else_asks_for_its_shard() -> anyhow::Result<()> {
+        block_on(async {
+            const PIECE: Duration = Duration::from_micros(40);
+            let piece_ns = u64::try_from(PIECE.as_nanos()).unwrap_or(u64::MAX);
+            let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
+            anyhow::ensure!(quantum_ns > 0, "a shard has a quantum");
+            // Four quanta of pieces: polls enough to look at.
+            let n = quantum_ns.saturating_mul(4) / piece_ns + 1;
+            let (done, most_quantum_ns) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(quantum_ns)));
+            let work = {
+                let (done, most_quantum_ns) = (Arc::clone(&done), Arc::clone(&most_quantum_ns));
+                async move {
+                    let mut turns = Turns::new();
+                    for _ in 0..n {
+                        let until = Instant::now() + PIECE;
+                        while Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+                        // The quantum as the turn reads it (the shard's online estimate may move).
+                        most_quantum_ns.fetch_max(hyper_rt::futures::step_budget_ns().unwrap_or(0), Ordering::SeqCst);
+                        done.fetch_add(1, Ordering::SeqCst);
+                        turns.yield_after().await;
+                    }
+                }
+            };
+            let mut work = std::pin::pin!(work);
+            let (mut polls, mut most_in_a_poll) = (0u64, 0u64);
+            std::future::poll_fn(|cx| {
+                let before = done.load(Ordering::SeqCst);
+                let polled = work.as_mut().poll(cx);
+                polls += 1;
+                most_in_a_poll = most_in_a_poll.max(done.load(Ordering::SeqCst).saturating_sub(before));
+                polled
+            })
+            .await;
+            let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(piece_ns).saturating_sub(1);
+            anyhow::ensure!(done.load(Ordering::SeqCst) == n, "every piece ran");
+            anyhow::ensure!(most_in_a_poll <= bound.max(1), "a poll ran {most_in_a_poll} pieces of at least {PIECE:?}, past its turn's {bound}");
+            anyhow::ensure!(polls > 1, "{n} pieces in one poll");
+            Ok(())
+        })
     }
 
     /// Goal 10 (plan 01a1a87b2dae step 5): a loop takes an item waiting already in the turn it has, and starts its
