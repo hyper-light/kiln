@@ -74,6 +74,9 @@ hot = [
   # What the net thread hands the hub, fanned out to its loops, one a shard, and a runner's order kept across
   # them (goal 10, plan 01a1a87b2dae step 4).
   "crates/kiln/src/wire/fan.rs",
+  # A runner's session loops, one a shard: each agent session's frames from its server, taken on the shard that owns it,
+  # and what blue/green has them hand the runner's control loop (runner-fan).
+  "crates/kiln/src/agent/loops.rs",
   # A runner's front door with a replica of kiln's records (docs/p2p.md, the peer-to-peer
   # unification's P2): every request it answers from the replica, and the learner behind it.
   "crates/kiln/src/frontdoor/replica.rs",

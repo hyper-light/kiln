@@ -1336,7 +1336,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         prompted: std::sync::atomic::AtomicBool::new(false),
     });
     let run = Arc::clone(&s);
-    crate::rt::spawn(async move {
+    // On the shard that owns it, where its lane runs and its frames are taken (runner-fan): its pipes are served there too
+    // (`crate::proc::spawn_duplex_in_pool`, from this task).
+    crate::rt::spawn_owner(super::host::owner_shard(&s.id), async move {
         let id = run.id.clone();
         if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items, adopt)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");

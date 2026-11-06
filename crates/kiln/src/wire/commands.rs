@@ -1,5 +1,8 @@
 //! Commands from the server to a runner process (docs/wire.md, "Commands"). Each is an item of
-//! one of that process's two command streams. The process answers it once it applied it: an
+//! one of that process's command streams: its own two, or, to a process that takes them
+//! (`CAP_SESSION_STREAMS`; runner-fan), an agent session's own two for what's for that session
+//! (`session_of`), which the loop on the shard that owns the session takes, in the session's
+//! order, waiting for no other session's. The process answers it once it applied it: an
 //! ACK, or a NACK saying why not. It goes again under its number until then, and the process
 //! takes it once however often it comes.
 //!
@@ -12,7 +15,7 @@
 //!   surprise. Within a live link, a live command goes again like any item.
 //!
 //! Each stream's name carries the server's incarnation and a generation (`p:<born>.<gen>`,
-//! `l:<born>.<gen>`). A runner process that started again has neither stream. Its parked commands
+//! `l:<born>.<gen>`; a session's own, `p:<born>.<gen>/<session>`). A runner process that started again has neither stream. Its parked commands
 //! not yet answered go again on a new generation, and its live ones end unanswered. On the
 //! runner, a stream's newer generation, or a server that started again, lets go of those before
 //! it, and an item of one let go of that comes late is dropped ([`Current`]).
@@ -96,7 +99,8 @@ impl Answer {
     }
 }
 
-/// Which of a runner process's two command streams a command rides.
+/// Which of its command streams a command rides, by how it waits while its runner is away: of its runner process's own, or
+/// of its agent session's own (a runner announcing `CAP_SESSION_STREAMS`; runner-fan).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Parked,
@@ -111,24 +115,69 @@ struct Waiting {
 
 struct Stream {
     prefix: &'static str,
+    /// The agent session it's one of the own streams of (runner-fan): none for its runner process's own.
+    session: Option<String>,
     generation: u64,
     waiting: BTreeMap<Seq, Waiting>,
 }
 
 impl Stream {
-    fn new(prefix: &'static str) -> Self {
-        Self { prefix, generation: 1, waiting: BTreeMap::new() }
+    fn new(prefix: &'static str, session: Option<&str>) -> Self {
+        Self { prefix, session: session.map(str::to_owned), generation: 1, waiting: BTreeMap::new() }
     }
 
     fn name(&self, born: u64) -> String {
-        format!("{}:{born}.{}", self.prefix, self.generation)
+        match &self.session {
+            Some(session) => format!("{}:{born}.{}/{session}", self.prefix, self.generation),
+            None => format!("{}:{born}.{}", self.prefix, self.generation),
+        }
+    }
+}
+
+/// A runner process's command streams of one owner, one for each way a command waits: its own, or an agent session's.
+struct Pair {
+    parked: Stream,
+    live: Stream,
+}
+
+impl Pair {
+    fn new(session: Option<&str>) -> Self {
+        Self { parked: Stream::new("p", session), live: Stream::new("l", session) }
+    }
+
+    fn of(&mut self, kind: Kind) -> &mut Stream {
+        match kind {
+            Kind::Parked => &mut self.parked,
+            Kind::Live => &mut self.live,
+        }
+    }
+
+    /// Its stream named `name` (under incarnation `born`), and its kind.
+    fn named(&mut self, name: &str, born: u64) -> Option<(Kind, &mut Stream)> {
+        if self.parked.name(born) == name {
+            Some((Kind::Parked, &mut self.parked))
+        } else if self.live.name(born) == name {
+            Some((Kind::Live, &mut self.live))
+        } else {
+            None
+        }
+    }
+
+    fn into_waiting(self) -> impl Iterator<Item = Waiting> {
+        self.parked.waiting.into_values().chain(self.live.waiting.into_values())
     }
 }
 
 struct Peer {
     tx: Sender,
-    parked: Stream,
-    live: Stream,
+    /// Its own streams: every command it takes, but an agent session's where it takes those on the session's own.
+    own: Pair,
+    /// Each agent session's own streams, from the session's first command there (runner-fan): to a runner process that
+    /// takes them (`lanes`), so the runner takes each session's commands on the loop of the shard that owns the session,
+    /// in their order, and no session's waits for another's.
+    sessions: HashMap<String, Pair>,
+    /// It takes an agent session's commands on the session's own streams (`CAP_SESSION_STREAMS`).
+    lanes: bool,
     /// The link is up: the runner process is connected, and may not have said what it has yet.
     link: bool,
     /// The link is up and the runner has said what it has.
@@ -215,7 +264,7 @@ impl Commands {
 
     fn peer(&mut self, peer: PeerId) -> &mut Peer {
         let (room, patience) = (self.room, self.patience);
-        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false, wire: false, coming: None })
+        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), own: Pair::new(None), sessions: HashMap::new(), lanes: false, link: false, up: false, wire: false, coming: None })
     }
 
     /// Whether runner process `peer` takes commands on the channel (it said so, or sent a frame of
@@ -248,7 +297,7 @@ impl Commands {
                 }
                 Vec::new()
             }
-            Some(_) => self.peers.remove(&peer).map(|p| p.parked.waiting.into_values().chain(p.live.waiting.into_values()).map(|w| (w.body, w.answer)).collect()).unwrap_or_default(),
+            Some(_) => self.peers.remove(&peer).map(|p| waiting_of(p).map(|w| (w.body, w.answer)).collect()).unwrap_or_default(),
             None => Vec::new(),
         }
     }
@@ -295,10 +344,17 @@ impl Commands {
         p.coming = None;
     }
 
-    /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`: its answer comes on the
-    /// receiver. A live command to a runner that's away (its link down), or one past the room, is
-    /// answered at once; one to a runner that has just connected goes once it has said what it has.
-    pub fn push(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, now: Instant) -> oneshot::Receiver<Answer> {
+    /// Runner process `peer` takes an agent session's commands on the session's own streams (`on`: its `Caps` say
+    /// `CAP_SESSION_STREAMS`; runner-fan), or not.
+    pub fn lanes(&mut self, peer: PeerId, on: bool) {
+        self.peer(peer).lanes = on;
+    }
+
+    /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`, for agent session `session` where it's one of a
+    /// session's (`session_lane`): on the session's own streams to a runner process that takes them, else on the process's
+    /// own. Its answer comes on the receiver. A live command to a runner that's away (its link down), or one past the room,
+    /// is answered at once; one to a runner that has just connected goes once it has said what it has.
+    pub fn push(&mut self, peer: PeerId, kind: Kind, session: Option<&str>, body: Vec<u8>, now: Instant) -> oneshot::Receiver<Answer> {
         let (tx, rx) = oneshot::channel();
         let born = self.born;
         let p = self.peer(peer);
@@ -311,11 +367,12 @@ impl Commands {
             let _ = tx.send(Answer::Unreachable { why: format!("it's too large to send: {} bytes, more than the {ITEM_MOST} a command carries", body.len()) });
             return rx;
         }
-        let stream = match kind {
-            Kind::Parked => &mut p.parked,
-            Kind::Live => &mut p.live,
+        let Peer { tx: sender, own, sessions, lanes, .. } = p;
+        let stream = match session.filter(|_| *lanes) {
+            Some(session) => sessions.entry(session.to_owned()).or_insert_with(|| Pair::new(Some(session))).of(kind),
+            None => own.of(kind),
         };
-        match p.tx.push(&stream.name(born), body.clone()) {
+        match sender.push(&stream.name(born), body.clone()) {
             Ok(seq) => {
                 stream.waiting.insert(seq, Waiting { answer: tx, body, at: now });
             }
@@ -340,16 +397,11 @@ impl Commands {
             p.link = true;
             p.up = true;
         }
+        let Peer { tx: sender, own, sessions, .. } = p;
         for e in events {
             match e {
                 Event::Answered { stream, seq, outcome } => {
-                    let s = if stream == p.parked.name(born) {
-                        &mut p.parked
-                    } else if stream == p.live.name(born) {
-                        &mut p.live
-                    } else {
-                        continue;
-                    };
+                    let Some((_, s)) = pair_of(own, sessions, &stream).and_then(|pair| pair.named(&stream, born)) else { continue };
                     if let Some(w) = s.waiting.remove(&seq) {
                         let _ = w.answer.send(match outcome {
                             Outcome::Taken => Answer::Taken,
@@ -360,10 +412,8 @@ impl Commands {
                 // The runner has less of a stream than it answered: it started again. Its parked
                 // commands not yet answered go again on a new generation; its live ones end.
                 Event::Regressed { stream, .. } => {
-                    if stream == p.parked.name(born) {
-                        restart(p, Kind::Parked, born, true);
-                    } else if stream == p.live.name(born) {
-                        restart(p, Kind::Live, born, true);
+                    if let Some((kind, s)) = pair_of(own, sessions, &stream).and_then(|pair| pair.named(&stream, born)) {
+                        restart_stream(sender, s, kind, born, true);
                     }
                 }
             }
@@ -388,8 +438,23 @@ impl Commands {
     /// answered ends unreachable.
     pub fn gone(&mut self, peer: PeerId, why: &str) {
         let Some(p) = self.peers.remove(&peer) else { return };
-        for w in p.parked.waiting.into_values().chain(p.live.waiting.into_values()) {
+        for w in waiting_of(p) {
             let _ = w.answer.send(Answer::Unreachable { why: why.to_owned() });
+        }
+    }
+
+    /// Agent session `session` closed for good (its close answered): its own streams go, on every runner process, what
+    /// still waited on them ending unreachable, so a process that ran many sessions keeps no streams of those gone
+    /// (runner-fan).
+    pub fn forget_session(&mut self, session: &str) {
+        let born = self.born;
+        for p in self.peers.values_mut() {
+            let Some(pair) = p.sessions.remove(session) else { continue };
+            p.tx.drop_stream(&pair.parked.name(born));
+            p.tx.drop_stream(&pair.live.name(born));
+            for w in pair.into_waiting() {
+                let _ = w.answer.send(Answer::Unreachable { why: format!("session {session} closed") });
+            }
         }
     }
 
@@ -399,36 +464,61 @@ impl Commands {
         let born = self.born;
         let mut out = Vec::new();
         for (peer, p) in &mut self.peers {
-            let stale: Vec<Seq> = p.parked.waiting.iter().filter(|(_, w)| now.saturating_duration_since(w.at) >= PARK_FOR).map(|(s, _)| *s).collect();
-            if !stale.is_empty() {
+            let Peer { tx: sender, own, sessions, .. } = p;
+            for parked in std::iter::once(&mut own.parked).chain(sessions.values_mut().map(|pair| &mut pair.parked)) {
+                let stale: Vec<Seq> = parked.waiting.iter().filter(|(_, w)| now.saturating_duration_since(w.at) >= PARK_FOR).map(|(s, _)| *s).collect();
+                if stale.is_empty() {
+                    continue;
+                }
                 // Its runner never came back for them: the stream starts over without them.
                 for seq in stale {
-                    if let Some(w) = p.parked.waiting.remove(&seq) {
+                    if let Some(w) = parked.waiting.remove(&seq) {
                         let _ = w.answer.send(Answer::Unreachable { why: "its runner didn't come back in time".into() });
                     }
                 }
-                restart(p, Kind::Parked, born, true);
+                restart_stream(sender, parked, Kind::Parked, born, true);
             }
-            out.extend(p.tx.poll(now).into_iter().map(|f| (*peer, f)));
+            out.extend(sender.poll(now).into_iter().map(|f| (*peer, f)));
         }
         out
     }
 
     /// Commands waiting for an answer, across every runner process.
     pub fn waiting(&self) -> usize {
-        self.peers.values().map(|p| p.parked.waiting.len() + p.live.waiting.len()).sum()
+        self.peers
+            .values()
+            .map(|p| std::iter::once(&p.own).chain(p.sessions.values()).map(|pair| pair.parked.waiting.len().saturating_add(pair.live.waiting.len())).sum::<usize>())
+            .sum()
     }
 }
 
-/// Starts one of `p`'s streams over on a new generation: a parked stream with what it hadn't had
-/// answered, in order; a live one empty, what it hadn't had answered ending unanswered (`went`:
-/// it may have reached the runner), or unreachable (it can't have).
+/// What every stream of runner process `p` holds waiting, its own and its sessions'.
+fn waiting_of(p: Peer) -> impl Iterator<Item = Waiting> {
+    p.own.into_waiting().chain(p.sessions.into_values().flat_map(Pair::into_waiting))
+}
+
+/// Of a runner process's streams, its own or an agent session's, those stream `name` is one of.
+fn pair_of<'a>(own: &'a mut Pair, sessions: &'a mut HashMap<String, Pair>, name: &str) -> Option<&'a mut Pair> {
+    match session_of(name) {
+        Some(session) => sessions.get_mut(session),
+        None => Some(own),
+    }
+}
+
+/// Starts every stream of `p`'s of `kind` over on a new generation, its own and each of its sessions' ([`restart_stream`]).
 fn restart(p: &mut Peer, kind: Kind, born: u64, went: bool) {
-    let stream = match kind {
-        Kind::Parked => &mut p.parked,
-        Kind::Live => &mut p.live,
-    };
-    p.tx.drop_stream(&stream.name(born));
+    let Peer { tx, own, sessions, .. } = p;
+    restart_stream(tx, own.of(kind), kind, born, went);
+    for pair in sessions.values_mut() {
+        restart_stream(tx, pair.of(kind), kind, born, went);
+    }
+}
+
+/// Starts `stream` (one of `tx`'s, of `kind`) over on a new generation: a parked stream with what it hadn't had answered,
+/// in order; a live one empty, what it hadn't had answered ending unanswered (`went`: it may have reached the runner), or
+/// unreachable (it can't have).
+fn restart_stream(tx: &mut Sender, stream: &mut Stream, kind: Kind, born: u64, went: bool) {
+    tx.drop_stream(&stream.name(born));
     let waiting = std::mem::take(&mut stream.waiting);
     stream.generation = stream.generation.saturating_add(1);
     let name = stream.name(born);
@@ -440,7 +530,7 @@ fn restart(p: &mut Peer, kind: Kind, born: u64, went: bool) {
             Kind::Live => {
                 let _ = w.answer.send(Answer::Unreachable { why: "its runner went away before it said what it has".into() });
             }
-            Kind::Parked => match p.tx.push(&name, w.body.clone()) {
+            Kind::Parked => match tx.push(&name, w.body.clone()) {
                 Ok(seq) => {
                     stream.waiting.insert(seq, w);
                 }
@@ -471,11 +561,23 @@ pub fn session_of(stream: &str) -> Option<&str> {
     after.split_once('/').map(|(_, session)| session).filter(|s| !s.is_empty())
 }
 
-/// A command stream's kind, its server's incarnation and its generation, from its name.
-fn named(stream: &str) -> Option<(&'static str, u64, u64)> {
+/// A command stream's kind, its server's incarnation, its generation and the agent session it's one of the own streams of
+/// (none: its runner process's own), from its name.
+fn named(stream: &str) -> Option<(&'static str, u64, u64, Option<&str>)> {
     let prefix = prefix_of(stream)?;
-    let (born, generation) = stream.split_once(':')?.1.split_once('.')?;
-    Some((prefix, born.parse().ok()?, generation.parse().ok()?))
+    let (born, rest) = stream.split_once(':')?.1.split_once('.')?;
+    let generation = rest.split_once('/').map_or(rest, |(g, _)| g);
+    Some((prefix, born.parse().ok()?, generation.parse().ok()?, session_of(stream)))
+}
+
+/// Whether, `by` having come as a newer stream ([`Stand::Newer`]), the receiver lets go of command stream `stream`: an
+/// older generation of the same kind of the same owner (its runner process, or one agent session), or any of another
+/// incarnation of its server.
+pub fn superseded(by: &str, stream: &str) -> bool {
+    match (named(by), named(stream)) {
+        (Some((kind, born, _, session)), Some((k, b, _, s))) => b != born || (k == kind && s == session),
+        _ => false,
+    }
 }
 
 /// How many incarnations of its server a runner remembers having let go of.
@@ -486,11 +588,12 @@ const GONE_KEPT: usize = 16;
 /// of a server that started again let go of the old server's. An item of a stream let go of that
 /// comes late (held up below the channel, or sent twice) is dropped, not taken: its server dropped
 /// that stream as it started the next, so nothing waits for its answer, and taken anew it would be
-/// applied a second time.
+/// applied a second time. Each kind of each owner's streams has its generation: the runner process's
+/// own, and each agent session's own (runner-fan), each taken by the loop that takes that owner's.
 #[derive(Default)]
 pub struct Current {
-    /// By kind: the incarnation and generation of the newest stream.
-    newest: HashMap<&'static str, (u64, u64)>,
+    /// By kind and owner (none: the runner process): the incarnation and generation of the newest stream.
+    newest: HashMap<(&'static str, Option<String>), (u64, u64)>,
     /// Incarnations let go of, the newest last.
     gone: VecDeque<u64>,
 }
@@ -498,10 +601,10 @@ pub struct Current {
 /// What a stream an item came on is to its runner ([`Current::of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stand {
-    /// The newest of its kind, or not a command stream: the item goes as it comes.
+    /// The newest of its kind and owner, or not a command stream: the item goes as it comes.
     Current,
-    /// Newer than the newest of its kind (`Receiver::forget_where` lets go of the others).
-    Newer(&'static str),
+    /// Newer than the newest of its kind and owner: the receiver lets go of what it supersedes ([`superseded`]).
+    Newer,
     /// One let go of: the item is dropped.
     Gone,
 }
@@ -511,19 +614,20 @@ impl Current {
         Self::default()
     }
 
-    /// What `stream`, the one an item came on, is: the newest of its kind from now when it's newer.
+    /// What `stream`, the one an item came on, is: the newest of its kind and owner from now when it's newer.
     pub fn of(&mut self, stream: &str) -> Stand {
-        let Some((prefix, born, generation)) = named(stream) else { return Stand::Current };
+        let Some((prefix, born, generation, session)) = named(stream) else { return Stand::Current };
         if self.gone.contains(&born) {
             return Stand::Gone;
         }
-        match self.newest.get(prefix).copied() {
+        let key = (prefix, session.map(str::to_owned));
+        match self.newest.get(&key).copied() {
             Some((b, g)) if b == born && generation == g => return Stand::Current,
             Some((b, g)) if b == born && generation < g => return Stand::Gone,
             _ => {}
         }
         // A newer generation, or another incarnation (one that started since: a server's that
-        // ended sends nothing more), whose kinds let go of the old one's too.
+        // ended sends nothing more), whose streams let go of the old one's too.
         let old: Vec<u64> = self.newest.values().map(|(b, _)| *b).filter(|b| *b != born).collect();
         for b in old {
             if !self.gone.contains(&b) {
@@ -534,8 +638,13 @@ impl Current {
             self.gone.pop_front();
         }
         self.newest.retain(|_, (b, _)| *b == born);
-        self.newest.insert(prefix, (born, generation));
-        Stand::Newer(prefix)
+        self.newest.insert(key, (born, generation));
+        Stand::Newer
+    }
+
+    /// Agent session `session` ended here: what's known of its own streams goes (runner-fan).
+    pub fn forget_session(&mut self, session: &str) {
+        self.newest.retain(|(_, s), _| s.as_deref() != Some(session));
     }
 }
 
@@ -606,9 +715,9 @@ mod tests {
                 if let Frame::Item { stream, seq, low, body } = f {
                     match self.current.of(&stream) {
                         Stand::Gone => continue,
-                        Stand::Newer(prefix) => {
+                        Stand::Newer => {
                             let keep = stream.clone();
-                            self.rx.forget_where(|s| s != keep && prefix_of(s) == Some(prefix));
+                            self.rx.forget_where(|s| s != keep && superseded(&keep, s));
                         }
                         Stand::Current => {}
                     }
@@ -640,8 +749,8 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.on_frame(1, r.rx.have());
-        let mut cancel = c.push(1, Kind::Parked, b"cancel a".to_vec(), base);
-        let mut unknown = c.push(1, Kind::Parked, b"cancel nothing".to_vec(), base);
+        let mut cancel = c.push(1, Kind::Parked, None, b"cancel a".to_vec(), base);
+        let mut unknown = c.push(1, Kind::Parked, None, b"cancel nothing".to_vec(), base);
         for a in r.deliver(c.poll(base), |b| b == b"cancel nothing") {
             c.on_frame(1, a);
         }
@@ -663,10 +772,10 @@ mod tests {
         c.on_frame(PEER, r.rx.have());
         let refused = || crate::metrics::net().toward(PEER).iter().filter(|d| d.lane == "control" && d.reason == "refused").map(|d| d.frames).sum::<u64>();
         let before = refused();
-        let mut large = c.push(PEER, Kind::Live, vec![7; ITEM_MOST + 1], base);
+        let mut large = c.push(PEER, Kind::Live, None, vec![7; ITEM_MOST + 1], base);
         assert!(matches!(answer(&mut large), Some(Answer::Unreachable { why }) if why.contains("too large")));
         assert_eq!(refused(), before + 1, "counted as a frame let go toward its runner");
-        let mut next = c.push(PEER, Kind::Live, b"interrupt".to_vec(), base);
+        let mut next = c.push(PEER, Kind::Live, None, b"interrupt".to_vec(), base);
         for a in r.deliver(c.poll(base), |_| false) {
             c.on_frame(PEER, a);
         }
@@ -683,9 +792,9 @@ mod tests {
         c.down(1);
         assert!(c.is_away(1), "its link is down");
         // Away (its link down): the live command ends at once, the parked one waits.
-        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), base);
+        let mut keys = c.push(1, Kind::Live, None, b"keys".to_vec(), base);
         assert!(matches!(answer(&mut keys), Some(Answer::Unreachable { .. })));
-        let mut cancel = c.push(1, Kind::Parked, b"cancel a".to_vec(), base);
+        let mut cancel = c.push(1, Kind::Parked, None, b"cancel a".to_vec(), base);
         assert!(c.poll(base).is_empty(), "nothing goes while it's away");
         c.connected(1);
         assert!(c.poll(base).is_empty(), "nothing goes before the runner says what it has");
@@ -711,7 +820,7 @@ mod tests {
         c.connected(1);
         c.down(1);
         c.coming(1, base);
-        let mut assign = c.push(1, Kind::Live, b"assign".to_vec(), base);
+        let mut assign = c.push(1, Kind::Live, None, b"assign".to_vec(), base);
         assert_eq!(answer(&mut assign), None, "not refused: it's here, saying what it keeps");
         c.connected(1);
         c.on_frame(1, r.rx.have());
@@ -723,11 +832,11 @@ mod tests {
         // One that never says so in time, having said it keeps the channel before, is as away.
         c.down(1);
         c.coming(1, base);
-        let mut late = c.push(1, Kind::Live, b"late".to_vec(), base);
+        let mut late = c.push(1, Kind::Live, None, b"late".to_vec(), base);
         assert!(c.not_wire(1).is_empty(), "nothing goes the old way for it");
         assert!(matches!(answer(&mut late), Some(Answer::Unreachable { .. })), "it never went");
         assert!(c.keeps(1), "its parked ones still wait for it");
-        assert!(matches!(answer(&mut c.push(1, Kind::Live, b"later".to_vec(), base)), Some(Answer::Unreachable { .. })), "away now");
+        assert!(matches!(answer(&mut c.push(1, Kind::Live, None, b"later".to_vec(), base)), Some(Answer::Unreachable { .. })), "away now");
     }
 
     /// A runner from before the channel never says it keeps it: what waited for it goes the way
@@ -738,8 +847,8 @@ mod tests {
         let mut c = Commands::new(7);
         c.coming(2, base);
         assert!(c.keeps(2), "it may keep it: it hasn't said");
-        let mut retire = c.push(2, Kind::Parked, b"retire".to_vec(), base);
-        let mut assign = c.push(2, Kind::Live, b"assign".to_vec(), base);
+        let mut retire = c.push(2, Kind::Parked, None, b"retire".to_vec(), base);
+        let mut assign = c.push(2, Kind::Live, None, b"assign".to_vec(), base);
         assert!(c.overdue(t(base, 1000)).is_empty(), "within its time to say");
         assert_eq!(c.overdue(base + COMING_FOR), vec![2]);
         let waited = c.not_wire(2);
@@ -761,7 +870,7 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.connected(1);
-        let mut assign = c.push(1, Kind::Live, b"assign".to_vec(), base);
+        let mut assign = c.push(1, Kind::Live, None, b"assign".to_vec(), base);
         assert_eq!(answer(&mut assign), None, "not refused: its runner is here");
         assert!(c.poll(base).is_empty(), "nor sent before it says what it has");
         c.on_frame(1, r.rx.have());
@@ -773,7 +882,7 @@ mod tests {
         // Its link drops before it says what it has: nothing went, so it never reached it.
         let mut c = Commands::new(7);
         c.connected(2);
-        let mut lost = c.push(2, Kind::Live, b"assign".to_vec(), base);
+        let mut lost = c.push(2, Kind::Live, None, b"assign".to_vec(), base);
         c.down(2);
         assert!(matches!(answer(&mut lost), Some(Answer::Unreachable { .. })), "never sent: unreachable, not unanswered");
         assert_eq!(c.waiting(), 0);
@@ -785,8 +894,8 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.on_frame(1, r.rx.have());
-        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), base);
-        let mut close = c.push(1, Kind::Parked, b"close s".to_vec(), base);
+        let mut keys = c.push(1, Kind::Live, None, b"keys".to_vec(), base);
+        let mut close = c.push(1, Kind::Parked, None, b"close s".to_vec(), base);
         // Sent, and the runner took both, but its answers were lost with the link.
         let _lost = r.deliver(c.poll(base), |_| false);
         c.down(1);
@@ -800,7 +909,7 @@ mod tests {
         assert_eq!(answer(&mut close), Some(Answer::Taken));
         assert_eq!(r.took, vec![b"keys".to_vec(), b"close s".to_vec()], "each taken once");
         // A live command on the new link goes on its new stream.
-        let mut more = c.push(1, Kind::Live, b"more keys".to_vec(), t(base, 60));
+        let mut more = c.push(1, Kind::Live, None, b"more keys".to_vec(), t(base, 60));
         for a in r.deliver(c.poll(t(base, 60)), |_| false) {
             c.on_frame(1, a);
         }
@@ -815,7 +924,7 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.on_frame(1, r.rx.have());
-        let mut model = c.push(1, Kind::Live, b"model".to_vec(), base);
+        let mut model = c.push(1, Kind::Live, None, b"model".to_vec(), base);
         let frames = c.poll(base);
         let copy = frames.clone();
         // Taken; its answer lost with the link, which drops.
@@ -824,7 +933,7 @@ mod tests {
         assert!(matches!(answer(&mut model), Some(Answer::Unanswered { .. })));
         // Back, and the next live command goes on the stream's next generation.
         c.on_frame(1, r.rx.have());
-        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), t(base, 50));
+        let mut keys = c.push(1, Kind::Live, None, b"keys".to_vec(), t(base, 50));
         for a in r.deliver(c.poll(t(base, 50)), |_| false) {
             c.on_frame(1, a);
         }
@@ -837,19 +946,19 @@ mod tests {
     #[test]
     fn a_runner_lets_go_of_a_server_that_started_again_and_of_older_generations() {
         let mut cur = Current::new();
-        assert_eq!(cur.of("l:7.1"), Stand::Newer("l"));
+        assert_eq!(cur.of("l:7.1"), Stand::Newer);
         assert_eq!(cur.of("l:7.1"), Stand::Current);
-        assert_eq!(cur.of("p:7.1"), Stand::Newer("p"));
-        assert_eq!(cur.of("l:7.3"), Stand::Newer("l"), "a newer generation");
+        assert_eq!(cur.of("p:7.1"), Stand::Newer);
+        assert_eq!(cur.of("l:7.3"), Stand::Newer, "a newer generation");
         assert_eq!(cur.of("l:7.2"), Stand::Gone, "an older one");
         assert_eq!(cur.of("l:7.1"), Stand::Gone);
         assert_eq!(cur.of("p:7.1"), Stand::Current, "the other kind goes on");
         // The server started again (another incarnation): the old one's streams are let go of,
         // both kinds, whatever their generation.
-        assert_eq!(cur.of("l:9.1"), Stand::Newer("l"));
+        assert_eq!(cur.of("l:9.1"), Stand::Newer);
         assert_eq!(cur.of("p:7.1"), Stand::Gone);
         assert_eq!(cur.of("l:7.4"), Stand::Gone);
-        assert_eq!(cur.of("p:9.1"), Stand::Newer("p"));
+        assert_eq!(cur.of("p:9.1"), Stand::Newer);
         assert_eq!(cur.of("l:9.1"), Stand::Current);
         // Not a command stream: as it comes.
         assert_eq!(cur.of("s:abc#1"), Stand::Current);
@@ -861,12 +970,12 @@ mod tests {
         let mut c = Commands::new(7);
         let mut r = Runner::new();
         c.on_frame(1, r.rx.have());
-        let mut first = c.push(1, Kind::Parked, b"one".to_vec(), base);
+        let mut first = c.push(1, Kind::Parked, None, b"one".to_vec(), base);
         for a in r.deliver(c.poll(base), |_| false) {
             c.on_frame(1, a);
         }
         assert_eq!(answer(&mut first), Some(Answer::Taken));
-        let mut second = c.push(1, Kind::Parked, b"two".to_vec(), t(base, 10));
+        let mut second = c.push(1, Kind::Parked, None, b"two".to_vec(), t(base, 10));
         c.down(1);
         // It started again: it has nothing of the stream it had answered one of.
         let mut r = Runner::new();
@@ -888,14 +997,14 @@ mod tests {
         let mut r = Runner::new();
         c.connected(1);
         c.on_frame(1, r.rx.have());
-        let mut one = c.push(1, Kind::Parked, b"one".to_vec(), base);
+        let mut one = c.push(1, Kind::Parked, None, b"one".to_vec(), base);
         for a in r.deliver(c.poll(base), |_| false) {
             c.on_frame(1, a);
         }
         assert_eq!(answer(&mut one), Some(Answer::Taken));
         // Sent, never answered: the process that had them is gone.
-        let mut two = c.push(1, Kind::Parked, b"two".to_vec(), t(base, 10));
-        let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), t(base, 10));
+        let mut two = c.push(1, Kind::Parked, None, b"two".to_vec(), t(base, 10));
+        let mut keys = c.push(1, Kind::Live, None, b"keys".to_vec(), t(base, 10));
         let _gone_with_it = c.poll(t(base, 10));
         // The new process: its link, then what it has (nothing).
         c.connected(1);
@@ -921,8 +1030,8 @@ mod tests {
         let mut c = Commands::with(7, ROOM, Duration::from_millis(100));
         let mut r = Runner::new();
         c.on_frame(1, r.rx.have());
-        let mut a = c.push(1, Kind::Live, b"a".to_vec(), base);
-        let mut b = c.push(1, Kind::Live, b"b".to_vec(), base);
+        let mut a = c.push(1, Kind::Live, None, b"a".to_vec(), base);
+        let mut b = c.push(1, Kind::Live, None, b"b".to_vec(), base);
         // The first item never arrives: the second is past a gap, and the runner wants the first.
         let frames: Vec<_> = c.poll(base).into_iter().skip(1).collect();
         for f in r.deliver(frames, |_| false) {
@@ -934,7 +1043,7 @@ mod tests {
         assert_eq!((answer(&mut a), answer(&mut b)), (Some(Answer::Taken), Some(Answer::Taken)));
         assert_eq!(r.took, vec![b"a".to_vec(), b"b".to_vec()]);
         // An answer lost: the command goes again once its patience is up, and is answered again, not taken twice.
-        let mut d = c.push(1, Kind::Live, b"d".to_vec(), t(base, 20));
+        let mut d = c.push(1, Kind::Live, None, b"d".to_vec(), t(base, 20));
         let _lost = r.deliver(c.poll(t(base, 20)), |_| false);
         assert!(c.poll(t(base, 50)).is_empty(), "not before its patience is up");
         for f in r.deliver(c.poll(t(base, 130)), |_| false) {
@@ -949,16 +1058,99 @@ mod tests {
         let base = Instant::now();
         let mut c = Commands::new(7);
         c.connected(1);
-        let mut parked = c.push(1, Kind::Parked, b"cancel".to_vec(), base);
+        let mut parked = c.push(1, Kind::Parked, None, b"cancel".to_vec(), base);
         c.gone(1, "it was retired");
         assert_eq!(answer(&mut parked), Some(Answer::Unreachable { why: "it was retired".into() }));
         assert!(!c.keeps(1));
         // Past its parking: a parked command whose runner never came back ends unreachable.
         let mut c = Commands::new(7);
         c.connected(2);
-        let mut late = c.push(2, Kind::Parked, b"close".to_vec(), base);
+        let mut late = c.push(2, Kind::Parked, None, b"close".to_vec(), base);
         let _ = c.poll(base + PARK_FOR);
         assert!(matches!(answer(&mut late), Some(Answer::Unreachable { .. })));
+    }
+
+    /// runner-fan (P): to a runner process that takes them (`CAP_SESSION_STREAMS`), a session's commands go on the session's
+    /// own streams, and what isn't a session's on the process's; each is answered on its own, the session's command taken
+    /// though the process's is refused; to one that doesn't take them, all on the process's, as before.
+    #[test]
+    fn runner_fan_a_sessions_commands_go_on_its_own_streams_to_a_runner_that_takes_them() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.on_frame(1, r.rx.have());
+        c.lanes(1, true);
+        let mut interrupt = c.push(1, Kind::Live, Some("s1"), b"interrupt".to_vec(), base);
+        let mut assign = c.push(1, Kind::Live, None, b"assign".to_vec(), base);
+        let frames = c.poll(base);
+        let streams: Vec<String> = frames.iter().filter_map(|(_, f)| if let Frame::Item { stream, .. } = f { Some(stream.clone()) } else { None }).collect();
+        assert_eq!(streams.iter().filter(|s| *s == "l:7.1/s1").count(), 1, "{streams:?}");
+        assert_eq!(streams.iter().filter(|s| *s == "l:7.1").count(), 1, "{streams:?}");
+        for a in r.deliver(frames, |b| b == b"assign") {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut interrupt), Some(Answer::Taken));
+        assert!(matches!(answer(&mut assign), Some(Answer::Refused { .. })));
+        // One that doesn't take them: on its own streams.
+        let mut d = Commands::new(7);
+        let r2 = Runner::new();
+        d.on_frame(2, r2.rx.have());
+        let _close = d.push(2, Kind::Parked, Some("s2"), b"close".to_vec(), base);
+        let streams: Vec<String> = d.poll(base).into_iter().filter_map(|(_, f)| if let Frame::Item { stream, .. } = f { Some(stream) } else { None }).collect();
+        assert_eq!(streams, vec!["p:7.1".to_owned()]);
+    }
+
+    /// runner-fan (P): a session's own streams keep the process's rules: its live command ends unanswered when the link
+    /// drops, its parked one waits and goes again on a new generation, a runner that started again has it on a new one
+    /// too; and once the session is closed for good, its streams go, what still waited ending unreachable.
+    #[test]
+    fn runner_fan_a_sessions_own_streams_go_down_restart_and_go_with_it() {
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let r = Runner::new();
+        c.on_frame(1, r.rx.have());
+        c.lanes(1, true);
+        let mut live = c.push(1, Kind::Live, Some("s1"), b"keys".to_vec(), base);
+        let mut parked = c.push(1, Kind::Parked, Some("s1"), b"approve".to_vec(), base);
+        let _ = c.poll(base);
+        c.down(1);
+        assert!(matches!(answer(&mut live), Some(Answer::Unanswered { .. })), "the link dropped before it answered");
+        assert_eq!(answer(&mut parked), None, "a parked one waits for its runner");
+        // Back: the runner says it has nothing of the session's parked stream past what it had; the command goes again.
+        let mut r = Runner::new();
+        c.connected(1);
+        c.on_frame(1, r.rx.have());
+        for a in r.deliver(c.poll(base), |_| false) {
+            c.on_frame(1, a);
+        }
+        assert_eq!(answer(&mut parked), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"approve".to_vec()]);
+        // Closed for good: what still waits on its streams ends.
+        let mut late = c.push(1, Kind::Parked, Some("s1"), b"edit".to_vec(), base);
+        c.forget_session("s1");
+        assert!(matches!(answer(&mut late), Some(Answer::Unreachable { .. })));
+        assert_eq!(c.waiting(), 0);
+    }
+
+    /// runner-fan (P): on the runner, each kind of each owner's streams has a generation of its own: a session's newer
+    /// generation lets go of its older ones, never another session's or the process's; another incarnation of the server
+    /// lets go of every stream of the old one.
+    #[test]
+    fn runner_fan_each_owners_streams_have_their_own_generations() {
+        let mut cur = Current::new();
+        assert_eq!(cur.of("l:7.1/a"), Stand::Newer);
+        assert_eq!(cur.of("l:7.1/b"), Stand::Newer);
+        assert_eq!(cur.of("l:7.1"), Stand::Newer);
+        assert_eq!(cur.of("l:7.2/a"), Stand::Newer, "a's newer generation");
+        assert_eq!(cur.of("l:7.1/a"), Stand::Gone);
+        assert_eq!(cur.of("l:7.1/b"), Stand::Current, "b's goes on");
+        assert_eq!(cur.of("l:7.1"), Stand::Current, "the process's goes on");
+        assert!(superseded("l:7.2/a", "l:7.1/a") && !superseded("l:7.2/a", "l:7.1/b") && !superseded("l:7.2/a", "l:7.1") && !superseded("l:7.2/a", "p:7.1/a"));
+        assert!(superseded("l:9.1", "p:7.3/b"), "another incarnation lets go of every stream of the old");
+        cur.forget_session("b");
+        assert_eq!(cur.of("l:7.1/b"), Stand::Newer, "forgotten: its next is new again");
+        assert_eq!(cur.of("l:9.1/a"), Stand::Newer);
+        assert_eq!(cur.of("l:7.2/a"), Stand::Gone, "the old incarnation's");
     }
 
     /// runner-fan: a session's own command streams name it after their generation, whatever its id holds; a runner

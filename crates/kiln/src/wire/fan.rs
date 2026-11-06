@@ -303,6 +303,12 @@ pub fn peek(kind: crate::net::Kind, lane: u32, data: &[u8]) -> Head<'_> {
 pub trait Heads: Send + 'static {
     /// What frame `data`, of `kind` on `lane`, is, read off its head, none of it copied.
     fn head<'a>(&self, kind: crate::net::Kind, lane: u32, data: &'a [u8]) -> Head<'a>;
+
+    /// Whether it hands any frame to a session's loop ([`Head::Session`]): a fan whose heads never do has its control loop
+    /// alone, no queue of a session loop's left for nothing to take (whose end would close the queues' room for all).
+    fn sessions(&self) -> bool {
+        true
+    }
 }
 
 /// The server's fan: its runners' frames ([`peek`]).
@@ -316,6 +322,21 @@ impl Heads for Runners {
 
 /// A runner's fan: its server's frames ([`peek_server`]).
 pub struct Server;
+
+/// A fan that hands everything to its control loop, in the order it came: a peer that reads what came as it came (the net
+/// thread's own tests, tests/hostile.rs's runner, a bench's server that takes nothing), where no frame is any session
+/// loop's.
+pub struct InOrder;
+
+impl Heads for InOrder {
+    fn head<'a>(&self, _: crate::net::Kind, _: u32, _: &'a [u8]) -> Head<'a> {
+        Head::Plain
+    }
+
+    fn sessions(&self) -> bool {
+        false
+    }
+}
 
 impl Heads for Server {
     fn head<'a>(&self, kind: crate::net::Kind, lane: u32, data: &'a [u8]) -> Head<'a> {
@@ -667,7 +688,7 @@ impl<H: Heads> Fan<H> {
     /// hold no more of what the link sent than they did (`crate::net::EVENTS_BYTES`). With the loops' ends.
     pub fn with(heads: H, shards: usize, bound: usize) -> (Fan<H>, Loops) {
         let shards = shards.max(1);
-        let loops = session_loop(shards);
+        let loops = if heads.sessions() { session_loop(shards) } else { session_loop(CONTROL) };
         let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::NET_EVENTS, bound));
         let (senders, queues): (Vec<_>, Vec<_>) = (0..loops).map(|_| crate::memory::queue::bounded_in::<Routed>(&room)).unzip();
         let marks = Arc::new(Marks::new(loops));
@@ -807,6 +828,22 @@ mod tests {
         Ok(())
     }
 
+    /// runner-fan: a fan that hands everything to its control loop (`InOrder`: a peer that reads what came as it came) has
+    /// that loop alone, so no queue made for nothing is dropped (the last receiver of any queue in the room closes it for
+    /// all), and whatever comes goes there, in order.
+    #[test]
+    fn runner_fan_an_in_order_fan_has_its_control_loop_alone() -> anyhow::Result<()> {
+        let (mut fan, loops) = Fan::with(InOrder, 4, 1 << 20);
+        anyhow::ensure!(loops.queues.len() == 1, "{} queues", loops.queues.len());
+        for n in 0..3u64 {
+            anyhow::ensure!(fan.hand(to_runner(&session_message("s", n))?).is_ok(), "handed");
+        }
+        let rx = loops.queues.first().ok_or_else(|| anyhow::anyhow!("no control loop"))?;
+        let got: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok()).map(|r| r.n).collect();
+        anyhow::ensure!(got == vec![1, 2, 3], "{got:?}");
+        Ok(())
+    }
+
     /// runner-fan: the lists a runner's fan reads its server's frames by name `ServerMsg`'s variants as they are, each in one
     /// list at most, and the tags they're read by are the ones postcard writes.
     #[test]
@@ -884,9 +921,24 @@ mod tests {
     /// named `hold.0` until one named `hold.1` is taken (10 s at most): what's to be taken beside it, not after
     /// it, then is, whatever the machine's load. Back once all are taken: what was taken, and by which loop.
     fn take_all(shards: usize, events: Vec<NetEvent>, slow: Duration, hold: Option<(Named, Named)>) -> anyhow::Result<Vec<(usize, PeerId, String, Instant, Instant)>> {
+        take_all_with(Runners, runners_frame, shards, events, slow, hold)
+    }
+
+    /// A runner's frame as [`take_all`] names it: its head, then its message's name.
+    fn runners_frame(kind: Kind, lane: u32, data: &[u8]) -> String {
+        format!("{:?}/{}", peek(kind, lane, data), crate::proto::read_agent(data).map(|m| crate::wire::agent_name(&m)).unwrap_or("?"))
+    }
+
+    /// A server's frame on its runner as [`take_all_with`] names it (runner-fan): its head there, then its message's name.
+    fn servers_frame(kind: Kind, lane: u32, data: &[u8]) -> String {
+        format!("{:?}/{}", peek_server(kind, lane, data).0, crate::proto::read_server(data).map(|m| crate::wire::server_name(&m)).unwrap_or("?"))
+    }
+
+    /// [`take_all`] through a fan of `heads` (either end's), each frame named by `name`.
+    fn take_all_with<H: Heads>(heads: H, name: fn(Kind, u32, &[u8]) -> String, shards: usize, events: Vec<NetEvent>, slow: Duration, hold: Option<(Named, Named)>) -> anyhow::Result<Vec<(usize, PeerId, String, Instant, Instant)>> {
         let count = events.len();
         crate::rt::block_on(async move {
-            let (mut fan, loops) = Fan::new(shards, 1 << 20);
+            let (mut fan, loops) = Fan::with(heads, shards, 1 << 20);
             let taken: Taken = Arc::default();
             let Loops { queues, marks } = loops;
             for (me, rx) in queues.into_iter().enumerate() {
@@ -896,13 +948,9 @@ mod tests {
                         marks.wait(&after).await;
                         let began = Instant::now();
                         let (peer, what) = match &ev {
-                            NetEvent::Frame { peer, data, kind, lane, .. } => (*peer, format!("{:?}", peek(*kind, *lane, data))),
+                            NetEvent::Frame { peer, data, kind, lane, .. } => (*peer, name(*kind, *lane, data)),
                             NetEvent::Connected { peer, .. } => (*peer, "Connected".to_owned()),
                             NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => (*peer, "Closed".to_owned()),
-                        };
-                        let what = match &ev {
-                            NetEvent::Frame { data, .. } => format!("{what}/{}", crate::proto::read_agent(data).map(|m| crate::wire::agent_name(&m)).unwrap_or("?")),
-                            _ => what,
                         };
                         if me != CONTROL {
                             if let Some(((hp, hw), (up, uw))) = &hold
@@ -1145,6 +1193,107 @@ mod tests {
                     let update = |w: &str| w.starts_with("Session");
                     let ordered = (update(w) && (what == "Barrier" || what == "Reader")) || (w == "Barrier" && update(what)) || (update(w) && w == what);
                     assert!(!ordered || began >= ended, "seed {seed}: {peer}'s {what} (event {i}) was taken before its {w} (event {j}) was");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A server's frame for its runner, on the agent session lane, as the server sends it.
+    fn to_runner(msg: &crate::proto::ServerMsg) -> anyhow::Result<NetEvent> {
+        Ok(NetEvent::Frame { peer: crate::net::SERVER_PEER, lane: crate::proto::LANE_TERM, kind: Kind::Term, data: crate::proto::encode(msg)?, at: Instant::now() })
+    }
+
+    /// A command for session `id`, item `seq` of its own live command stream.
+    fn session_command(id: &str, seq: u64) -> anyhow::Result<crate::proto::ServerMsg> {
+        let cmd = crate::proto::ServerMsg::HarnessCmd { session: id.into(), json: "{\"type\":\"interrupt\"}".into() };
+        Ok(crate::proto::ServerMsg::Wire(Frame::Item { stream: format!("l:7.1/{id}"), seq, low: seq.saturating_sub(1), body: crate::proto::encode(&cmd)? }))
+    }
+
+    /// A message for session `id`, as the server sends it (its inbox takes it once).
+    fn session_message(id: &str, n: u64) -> crate::proto::ServerMsg {
+        crate::proto::ServerMsg::HarnessSend { session: id.into(), epoch: 1, json: format!("{{\"type\":\"send\",\"id\":\"m{n}\",\"text\":\"x\"}}") }
+    }
+
+    /// runner-fan: on a runner, a session's message and a command on its own command stream reach the loop on the shard
+    /// that owns it without waiting behind another session's: session `a`'s loop held on its message until session `b`'s
+    /// command is taken (10 s at most), `b`'s message and command are taken on their own loop while `a`'s first frame still
+    /// is, and each session's frames in their order on its own loop.
+    #[test]
+    fn runner_fan_a_sessions_frames_reach_its_shard_without_waiting_behind_anothers() -> anyhow::Result<()> {
+        let shards = 2;
+        let (a, b) = (owned_by(0, shards, 0), owned_by(1, shards, 1));
+        let events = vec![to_runner(&session_message(&a, 1))?, to_runner(&session_command(&a, 1)?)?, to_runner(&session_message(&b, 1))?, to_runner(&session_command(&b, 1)?)?];
+        let peer = crate::net::SERVER_PEER;
+        let hold = ((peer, format!("Session({a:?})/HarnessSend")), (peer, format!("Session({b:?})/Wire")));
+        let taken = take_all_with(Server, servers_frame, shards, events, Duration::from_millis(20), Some(hold))?;
+        let of = |id: &str| taken.iter().filter(|t| t.2.starts_with(&format!("Session({id:?})"))).collect::<Vec<_>>();
+        let (fa, fb) = (of(&a), of(&b));
+        anyhow::ensure!(fa.len() == 2 && fb.len() == 2, "each frame taken once: {:?}", taken.iter().map(|t| (t.0, t.2.clone())).collect::<Vec<_>>());
+        anyhow::ensure!(fa.iter().all(|t| t.0 == session_loop(0)) && fb.iter().all(|t| t.0 == session_loop(1)), "each session's on its owner's loop");
+        let a_first = fa.first().map(|t| t.4).ok_or_else(|| anyhow::anyhow!("a's first"))?;
+        anyhow::ensure!(fb.iter().all(|t| t.4 <= a_first), "b's frames waited for a's message");
+        anyhow::ensure!(fa.windows(2).all(|w| w.first().zip(w.get(1)).is_some_and(|(x, y)| y.3 >= x.4)), "a's in order");
+        Ok(())
+    }
+
+    /// runner-fan: random schedules of a server's frames through a runner's fan, each loop taking its own as long as a random
+    /// draw says. Every frame is taken once; no barrier (a session's command on the process's own stream, the server's caps)
+    /// before the session frames handed over before it; no session frame before the barriers before it; each session's
+    /// frames (its messages, the commands on its own stream) in their order.
+    #[test]
+    fn runner_fan_random_schedules_keep_the_servers_order_on_its_runner() -> anyhow::Result<()> {
+        use crate::proto::ServerMsg;
+        for seed in 0..12u64 {
+            let mut rng = Rng(seed);
+            let shards = 1 + usize::try_from(rng.below(3)).unwrap_or(0);
+            let sessions: Vec<String> = (0..4).map(|i| format!("sess-{seed}-{i}")).collect();
+            let mut seqs: HashMap<usize, u64> = HashMap::new();
+            let mut events = Vec::new();
+            for n in 0..40u64 {
+                let i = usize::try_from(rng.below(4)).unwrap_or(0);
+                let id = sessions.get(i).map_or("x", String::as_str);
+                let m = match rng.below(7) {
+                    0 => ServerMsg::Caps { caps: 0 },
+                    1 => ServerMsg::Cluster { json: "{}".into(), raft: vec![1] },
+                    2 => ServerMsg::Wire(Frame::Item { stream: "l:7.1".into(), seq: n + 1, low: n, body: crate::proto::encode(&ServerMsg::HarnessClose { session: id.into() })? }),
+                    3 => ServerMsg::Wire(Frame::Item { stream: "p:7.1".into(), seq: n + 1, low: n, body: crate::proto::encode(&ServerMsg::Cancel { job: "j".into(), reason: "r".into() })? }),
+                    4 => {
+                        let seq = seqs.entry(i).or_insert(0);
+                        *seq += 1;
+                        session_command(id, *seq)?
+                    }
+                    _ => session_message(id, n),
+                };
+                events.push(to_runner(&m)?);
+            }
+            let handed: Vec<String> = events.iter().map(|ev| if let NetEvent::Frame { data, kind, lane, .. } = ev { format!("{:?}", peek_server(*kind, *lane, data).0) } else { String::new() }).collect();
+            let taken = take_all_with(Server, servers_frame, shards, events, Duration::from_millis(1 + rng.below(4)), None)?;
+            anyhow::ensure!(taken.len() == handed.len(), "seed {seed}: {} of {} taken", taken.len(), handed.len());
+            let mut place: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, h) in handed.iter().enumerate() {
+                place.entry(h.clone()).or_default().push(i);
+            }
+            let mut when: Vec<Option<(Instant, Instant)>> = vec![None; handed.len()];
+            let mut next: HashMap<String, usize> = HashMap::new();
+            let mut by_start: Vec<_> = taken.iter().collect();
+            by_start.sort_by_key(|t| t.3);
+            for t in by_start {
+                let key = t.2.split('/').next().unwrap_or("").to_owned();
+                let k = next.entry(key.clone()).or_insert(0);
+                let i = place.get(&key).and_then(|p| p.get(*k)).copied().ok_or_else(|| anyhow::anyhow!("seed {seed}: {key} taken more often than handed"))?;
+                *k += 1;
+                if let Some(w) = when.get_mut(i) {
+                    *w = Some((t.3, t.4));
+                }
+            }
+            for (i, what) in handed.iter().enumerate() {
+                let Some((began, _)) = when.get(i).copied().flatten() else { anyhow::bail!("seed {seed}: frame {i} never taken") };
+                for (j, w) in handed.iter().enumerate().take(i) {
+                    let Some((_, ended)) = when.get(j).copied().flatten() else { continue };
+                    let session = |h: &str| h.starts_with("Session");
+                    let ordered = (session(w) && what == "Barrier") || (w == "Barrier" && session(what)) || (session(w) && w == what);
+                    anyhow::ensure!(!ordered || began >= ended, "seed {seed}: {what} (frame {i}) was taken before {w} (frame {j}) was");
                 }
             }
         }

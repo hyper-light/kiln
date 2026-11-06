@@ -4517,7 +4517,13 @@ impl Registry {
             // Closed there, or once its machine is back; one its machine doesn't run is gone there.
             Some(Location::Machine(machine)) => {
                 use crate::wire::commands::Answer;
-                matches!(hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await, Answer::Taken | Answer::Sent | Answer::Parked)
+                let answer = hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+                // Closed there: its own command streams go, as the runner lets go of them (runner-fan).
+                if answer == Answer::Taken {
+                    let session = id.to_owned();
+                    hub.cmds.tell(move |c| c.forget_session(&session));
+                }
+                matches!(answer, Answer::Taken | Answer::Sent | Answer::Parked)
             }
         };
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.

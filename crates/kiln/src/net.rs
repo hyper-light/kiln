@@ -396,6 +396,14 @@ impl NetHandle {
         self.tx.send(out).await.is_ok()
     }
 
+    /// A handle with no net thread behind it, whose commands a test reads off the queue it's given (runner-fan: what a
+    /// runner's session loop sends its server).
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, crate::memory::queue::Receiver<Out>) {
+        let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, OUT_BYTES);
+        (Self { tx }, rx)
+    }
+
     /// What the endpoint measures now (its counts, each peer's path and connection), asked of the
     /// net thread and answered on its next turn; none if it does not answer `within`. Blocks: for a
     /// thread of its own, never the runtime's.
@@ -588,8 +596,8 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (the server's hub loops, `crate::wire::fan`;
-/// a runner's one loop) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
+/// The bytes of transport events the net thread hands its owner (its loops, `crate::wire::fan`: the server's
+/// hub loops, a runner's) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
 /// connection's receive window ([`WINDOW`]), what the
 /// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
 /// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
@@ -603,20 +611,9 @@ pub const EVENTS_BYTES: usize = WINDOW as usize;
 /// 16,384 places took 0.9 MB of an idle server's heap made up front (research 01a1a87b2e57, f10).
 pub const OUT_BYTES: usize = WINDOW as usize;
 
-/// Start a net thread. Returns the command handle and the event stream.
-pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
-    start_bounded(spec, OUT_BYTES, EVENTS_BYTES)
-}
-
-/// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
-/// two windows of frames).
-pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
-    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
-    Ok((start_with(spec, out, Box::new(etx))?, erx))
-}
-
-/// [`start`], what comes in handed to `hand`: the server's hub loops, one a shard (`crate::wire::fan`; goal 10,
-/// plan 01a1a87b2dae step 4). Its commands bounded at `out` bytes.
+/// Starts a net thread, what comes in handed to `hand`: the loops that take it, one a shard (`crate::wire::fan`; goal 10,
+/// plan 01a1a87b2dae step 4): the server's hub loops, a runner's (runner-fan: its one queue and loop went). Its commands
+/// bounded at `out` bytes. Returns its command handle.
 pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result<NetHandle> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
@@ -631,25 +628,12 @@ pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result
 /// before it's done loses what it carried. True once taken; false when the owner is gone.
 pub type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
 
-/// Who takes what the net thread hands over: its owner's one queue ([`start`]), or the server's hub
-/// loops, each event to the loop that takes it (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4).
+/// Who takes what the net thread hands over: the loops of its owner's that take it, each event to the loop that takes it
+/// (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4), the server's hub loops or a runner's (runner-fan).
 pub trait Hand: Send {
     /// `ev`, handed over now if there's room for it; else its handing once there is, or none when
     /// whoever takes it is gone.
     fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>>;
-}
-
-impl Hand for crate::memory::queue::Sender<NetEvent> {
-    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>> {
-        match self.try_send(ev) {
-            Ok(()) => Ok(()),
-            Err(async_channel::TrySendError::Full(ev)) => {
-                let tx = self.clone();
-                Err(Some(Box::pin(async move { tx.send(ev).await.is_ok() })))
-            }
-            Err(async_channel::TrySendError::Closed(_)) => Err(None),
-        }
-    }
 }
 
 /// What the net thread hands its events to, kept across its loop's incarnations: the thread's alone.
@@ -1658,15 +1642,30 @@ mod tests {
         assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
-    async fn next_event(rx: &crate::memory::queue::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
+    /// A net thread whose events its owner takes in the order they came, from one queue bounded at `events` bytes: the fan's
+    /// control loop, nothing routed past it (`crate::wire::fan::InOrder`; runner-fan: the single queue went).
+    fn start_in_order(spec: Spec, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+        let (fan, loops) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, events);
+        let net = start_with(spec, OUT_BYTES, Box::new(fan))?;
+        let rx = loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?;
+        Ok((net, rx))
+    }
+
+    /// [`start_in_order`], its queue bounded as a runner's or the server's is ([`EVENTS_BYTES`]).
+    fn in_order(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+        start_in_order(spec, EVENTS_BYTES)
+    }
+
+    async fn next_event(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, deadline: Instant) -> anyhow::Result<NetEvent> {
         crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))?
+            .map(|r| r.ev)
             .map_err(|_| anyhow::anyhow!("event stream closed"))
     }
 
     /// The server's next `Connected`, skipping other events; `None` once `within` passes.
-    async fn connected_within(rx: &crate::memory::queue::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
+    async fn connected_within(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, within: Duration) -> Option<PeerId> {
         let deadline = Instant::now() + within;
         loop {
             match next_event(rx, deadline).await {
@@ -1689,8 +1688,8 @@ mod tests {
             let old_key = crate::pki::fingerprints(&old.cert_pem)?.key;
             let addr = |s: std::net::UdpSocket| s.local_addr();
             let a1 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (srv, srv_ev) = start(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, _agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr: a1 }).await;
             let peer = connected_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("never connected"))?;
             srv.command(Out::RevokeKeys { keys: vec![old_key.clone()], why: "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into() }).await;
@@ -1705,10 +1704,10 @@ mod tests {
             assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a revoked key comes back: refused");
             // A server started with the key revoked (a restart reading the store).
             let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
+            let (_srv2, srv2_ev) = in_order(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
             agent.command(Out::Connect { addr: a2 }).await;
             assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
-            let (agent2, _ev2) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            let (agent2, _ev2) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
             agent2.command(Out::Connect { addr: a2 }).await;
             assert!(connected_within(&srv2_ev, Duration::from_secs(10)).await.is_some(), "the same name with a new key connects");
             Ok(())
@@ -1816,8 +1815,8 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             for f in agent_faults {
                 agent.command(Out::Shed(f)).await;
             }
@@ -1854,12 +1853,12 @@ mod tests {
                 // Every event that came: the first waited for (or a tick), then all the others.
                 let mut evs: Vec<(bool, NetEvent)> = Vec::new();
                 evs.extend(futures::select_biased! {
-                    ev = srv_ev.recv().fuse() => ev.ok().map(|e| (true, e)),
-                    ev = agent_ev.recv().fuse() => ev.ok().map(|e| (false, e)),
+                    ev = srv_ev.recv().fuse() => ev.ok().map(|e| (true, e.ev)),
+                    ev = agent_ev.recv().fuse() => ev.ok().map(|e| (false, e.ev)),
                     () = crate::rt::sleep(Duration::from_millis(50)).fuse() => None,
                 });
-                evs.extend(std::iter::from_fn(|| srv_ev.try_recv().ok()).map(|e| (true, e)));
-                evs.extend(std::iter::from_fn(|| agent_ev.try_recv().ok()).map(|e| (false, e)));
+                evs.extend(std::iter::from_fn(|| srv_ev.try_recv().ok()).map(|e| (true, e.ev)));
+                evs.extend(std::iter::from_fn(|| agent_ev.try_recv().ok()).map(|e| (false, e.ev)));
                 // Each side's frames to the other, and what it takes of the other's.
                 let mut answers: Vec<(bool, Frame)> = Vec::new();
                 for ev in evs {
@@ -2006,8 +2005,8 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("slow-owner")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("slow-owner")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -2100,8 +2099,8 @@ mod tests {
             let addr = probe.local_addr()?;
             drop(probe);
             WATCHED.lock().unwrap_or_else(PoisonError::into_inner).push(addr);
-            let (_srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("turn-order")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            let (_srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("turn-order")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -2156,14 +2155,16 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             // The owner's queue bounded at a mebibyte (goal 11, plan 01a1a87b2e56 step 3: in bytes, not
             // events), so what's sent below fills it and leaves the net thread more to hold.
             const ROOM: usize = 1 << 20;
-            let (agent, agent_ev) = start_bounded(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, OUT_BYTES, ROOM)?;
-            // Full: no room for one more of the frames below (each eight bytes, counted with its place).
-            let one = weight(&NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }).saturating_add(crate::memory::queue::PLACE);
-            let full = |rx: &crate::memory::queue::Receiver<NetEvent>| rx.held().saturating_add(one) > rx.bound();
+            let (agent, agent_ev) = start_in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, ROOM)?;
+            // Full: no room for one more of the frames below (each eight bytes, counted with its place and what the fan
+            // hands with it).
+            let routed = crate::wire::fan::Routed { ev: NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }, n: 0, after: Vec::new(), handed: Instant::now() };
+            let one = crate::memory::queue::Weigh::weight(&routed).saturating_add(crate::memory::queue::PLACE);
+            let full = |rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>| rx.held().saturating_add(one) > rx.bound();
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -2225,9 +2226,9 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             let agent_leaf = pki.issue_local("bench-1")?;
-            let (agent, agent_ev) = start(Spec {
+            let (agent, agent_ev) = in_order(Spec {
                 bind: "127.0.0.1:0".parse()?,
                 ca_der: pki.ca_der.clone(),
                 leaf: agent_leaf,

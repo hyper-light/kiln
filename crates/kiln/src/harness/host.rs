@@ -431,6 +431,14 @@ pub struct Host {
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
 pub const LANE: usize = 1024;
 
+/// The runtime's shard that owns agent session `id` (`super::copies::owner_of` of the shards a fan has session loops for):
+/// where its tasks run (its harness's drive, its lane) and where its frames are taken (a runner's session loop,
+/// `crate::wire::fan`; the server's copy of it, `super::copies`), so a frame for it crosses no other thread on its way to
+/// it (runner-fan). They ran wherever its opening ran: every session of a runner on its loop's shard.
+pub fn owner_shard(id: &str) -> usize {
+    super::copies::owner_of(id, crate::wire::fan::shards())
+}
+
 /// Longest a move waits for what its sessions' lanes hold to be done before it reads what their
 /// inboxes took: a lane can wait on a sink nobody drains while its runner hands its sessions over.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
@@ -1255,7 +1263,8 @@ impl Host {
         lanes.insert(id.to_owned(), (tx, ended.clone()));
         let before = self.ending.lock().remove(id);
         let (me, id) = (self.me.clone(), id.to_owned());
-        crate::rt::spawn(async move {
+        // On its session's own shard, beside its harness's task and the loop that takes its frames (runner-fan).
+        crate::rt::spawn_owner(owner_shard(&id), async move {
             if let Some(before) = before {
                 let _ = before.recv().await;
             }

@@ -127,7 +127,9 @@ async fn scratch() -> anyhow::Result<Arc<Hub>> {
     })
     .await??;
     let pki = Arc::new(pki);
-    let (net, _events) = kiln::net::start(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+    let (fan, _events) = kiln::wire::fan::Fan::with(kiln::wire::fan::InOrder, 1, kiln::net::EVENTS_BYTES);
+    let net = kiln::net::start_with(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, kiln::net::OUT_BYTES, Box::new(fan))?;
     let logs = kiln::logs::Logs::new(dir.join("logs"), 1 << 20);
     Hub::new_on(kiln::rt::clock(), Arc::new(cfg), store, logs, net, pki, "resident-admin-token".into(), "resident-join-token".into(), kiln::rt::Shutdown::new())
 }
