@@ -301,6 +301,33 @@ shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-ti
   log once every shard has answered, and in `/healthz/server` (`priority.realtime`: asked, shards, took,
   refused, why). It never fails for it. A kernel with real-time group scheduling (`CONFIG_RT_GROUP_SCHED`)
   refuses it too where the server's cgroup has no real-time runtime (fedora's and adacachy's kernels have none).
+- **Each shard on a CPU of its own, the server's other threads kept off them** (goal 9, plan `01a1a87b2cec` step
+  4, 2026-11-06; `crate::rt::realtime`). A real-time thread hands a CPU it shares over only as its class allows,
+  and on two counts that's past the 1 ms the shards' delay is held to. Beside another shard of its priority, only at
+  the class's round-robin quantum, `sched_rr_timeslice_ms` (100 ms), where the normal class shares the CPU by the
+  shards' slices. Beside a thread of the server's own, only once that thread is moved: a real-time thread's
+  `sched_yield` lets only real-time threads of its priority run, and a shard waits for other threads' progress by
+  yielding, as concurrent-queue (under async-channel and kiln's own queues) waits for a push under way with a
+  `yield_now` loop; a normal thread preempted mid-push on the shard's CPU would wait there, the shard spinning,
+  until the load balancer moved it or the fair server's share came round. So before the runtime starts, the server
+  asks a thread of its own whether the class is granted (the kernel's answer, the thread then ending), and where it
+  is, fixes the shards first:
+  - on its declared cores (`[server] cores`, "Cores of its own"), where they give each shard one and keep a core
+    for its other threads;
+  - else on CPUs the machine's topology gives (`crate::rt::class_cpus`, from `crate::os::cpu_topology`): its
+    fastest first (a hybrid machine's performance cores where its kernel lists the core types, whatever a favoured
+    core's capacity says; else the kernel's `cpu_capacity`), the next class only where the fastest has too few, one
+    thread of each physical core (SMT siblings share one core's pipeline), in the last-level cache holding most of
+    them, then the next, the kernel's order within each, the first kept for its other threads, which keep every CPU but the shards'
+    (`keep_threads_off`, `keep_apart`, `keep_child_off_shards`, as for declared cores). On production's machine,
+    one thread each of cores 1-4 (CPUs 1-4), CPU 0 kept; for the lab's server held to fedora's efficiency cores,
+    17-20, 16 kept.
+  - Where neither gives each shard a CPU of its own (fewer such cores than a shard each and one more, or declared
+    cores that put two shards on one CPU, unless root set the quantum within the bar), no shard asks: they run at
+    the normal class with their slice, and the server says why at once, in its log and in `priority.realtime.held`;
+    it gives the room up then, as no shard will. Placed, `priority.realtime.place` says where, and the line said
+    once every shard has answered names the CPUs. Where the class isn't granted at all, each shard asks as before
+    and says why it was refused. macOS and Windows have no such class to place: unchanged.
 - **Its cost.** A real-time shard keeps its CPU from normal threads for as long as it runs, a long poll (goal
   9's slow polls) too: it belongs with shards that give up their CPU on time, as kiln's do at their step, and
   that await other threads' work rather than spin on it. Normal threads keep a share of a CPU real-time threads
@@ -343,7 +370,8 @@ winner is the bare-metal default where it needs no more than the installer can g
   the new config with a line saying why, and the unit's `LimitRTPRIO=1`; a config it keeps, it leaves, saying
   whether this install could grant the class and how to turn it on. Where the unit can't grant it, it stays off,
   and the install says what it would take. `[server] realtime = false` turns it off. `Config::default()` (tests,
-  `kiln up`, containers, Kubernetes) keeps it off.
+  `kiln up`, containers, Kubernetes) keeps it off. Granted, the shards take it each on a CPU of its own, the
+  server's other threads kept off them ("A real-time class for the shards"), or not at all, said why.
 - **Cores of its own stay declared** (`[server] cores`): how many the server needs, and which, is its machine's
   and its load's to say, and cores held for it sit idle whenever it does. Declared on a system install, they're
   a partition.
@@ -367,7 +395,10 @@ Its basis:
   service manager's limit; refused, the server runs as without it and says why.
 - **Its risk is bounded:** the lowest real-time priority, below the kernel's own real-time threads; reset on
   fork; the room given up once the shards asked; shards that give their CPU back at their step and park when
-  idle; normal threads keep the fair server's share.
+  idle; normal threads keep the fair server's share; and each shard on a CPU no other shard and no other thread of
+  the server's runs on, so neither waits on a real-time shard's turn (2026-11-06: before, a shard yielding while it
+  waited on a thread of the server's own preempted on its CPU could hold that thread there until the load balancer
+  moved it; `rt::tests::g9_s4_a_yielding_real_time_thread_holds_a_normal_one_on_its_cpu` shows it on the kernel).
 
 It rests on the kernel's rules and step 7's lab, not yet on a lab A/B of the class itself: no lab machine
 granted it (fedora's user manager has `RLIMIT_RTPRIO` 0). The A/B that decides it is in docs/runtime-lab.md
@@ -379,9 +410,11 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 
 - **The A/B on fedora:** one root command gives the lab's units the room (docs/runtime-lab.md), or a `limits.d`
   entry, which takes a new user manager there (a restart of fedora's runner).
-- **Production:** its unit (`kiln-server.service`, a system unit with `User=`) needs `LimitRTPRIO=1` and its
-  config `[server] realtime = true`; `[server] cores` there would also need a partition, which its hand-written
-  unit doesn't make (the installer's does), and a choice of cores.
+- **Production:** its unit (`kiln-server.service`, a system unit with `User=`) needs `LimitRTPRIO=1` (a drop-in,
+  `kiln-server.service.d/realtime.conf`) and its config `[server] realtime = true`, with a binary that places the
+  shards as above (docs/runtime-lab.md, "What production grants the shards, and what's missing": today it grants
+  the weights alone, no class and no pinning); `[server] cores` there would also need a partition, which its
+  hand-written unit doesn't make (the installer's does), and a choice of cores.
 - **A partition on fedora's lab,** `preempt=full` at boot there, and `isolated` partitions (no load balancing
   on the shards' cores) anywhere: root's.
 
@@ -771,7 +804,8 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   (a `limits.d` entry, then a new service manager), or installs the server system-wide. `preempt=full` at
   boot, on a lazy kernel.
 - Production (a hand-written system unit with `User=`): `LimitRTPRIO=1` in its unit and `[server] realtime
-  = true` in its config, a deploy ("The bare-metal default", above).
+  = true` in its config, a deploy of a binary that places the shards ("The bare-metal default", above; the exact
+  drop-in, what shows it took and how to take it back: docs/runtime-lab.md, "Ada's call").
 - The lab: its machine's kernel is lazy and it has no root there, so its A/Bs of the partition and of the
   real-time class wait on the owner (research `01a1a87b2cee` f17, f18: rtkit refuses this user a
   real-time class there). The real-time A/B needs one root command there (docs/runtime-lab.md, "Goal 8
@@ -849,6 +883,18 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   gives a partition's cores back. `os::tests::g9_s4_legs_and_agents_in_a_partition_keep_off_the_shards_cores`,
   `os::tests::g9_s4_the_real_time_room_is_given_up_whole` (Linux: a process's `RLIMIT_RTPRIO` to 0, soft and
   hard, read back from `/proc`), `os::cgroup::tests::g9_s4_the_partition_a_server_runs_in`.
+- Goal 9, plan `01a1a87b2cec` step 4, the class's placement (2026-11-06): `rt::tests::g9_s4_shards_in_the_class_take_cpus_of_their_own`
+  (production's machine gives 1-4, 0 kept, every other CPU the server's other threads'; the lab's 16-31 gives 17-20;
+  fedora whole its performance cores, one thread of each; the cache holding most cores first; two cores for two
+  shards and the rest, or none read, is no place); `g9_s4_the_class_is_held_back_where_a_shard_would_share_its_cpu`
+  (two shards on a CPU at a 100 ms quantum, or the server's other threads beside them, held back and said why; a
+  quantum within the bar allowed; a CPU each fixed and said where); `g9_s4_whether_the_class_is_granted_is_asked_of_the_kernel`
+  (granted with `RLIMIT_RTPRIO` room, refused without it naming the grant, the asking thread's class its own);
+  `g9_s4_a_yielding_real_time_thread_holds_a_normal_one_on_its_cpu` (where granted: a real-time thread yielding
+  for 1 ms lets a normal thread on its CPU make no progress, where at the normal class it runs at once);
+  `g9_s4_the_real_time_class_is_said_as_the_shards_took_it` (where they took it, and a class held back, said);
+  `os::tests::g9_s4_a_cpus_place_reads_as_linux_writes_it`, `g9_s4_the_round_robin_quantum_reads_as_linux_writes_it`,
+  `g9_s4_this_machines_cpus_are_placed`.
 - Goal 9, plan `01a1a87b2cec` step 4, the shard's own wake path: kiln-rt's `park_spin::tests` (the cap a park
   bound past the cheapest wake, the window's share to five points; long gaps or free parks never spin; the spin the
   cheapest in CPU on the window's gaps, worked by hand; the chosen spin never costing more than parking, over a

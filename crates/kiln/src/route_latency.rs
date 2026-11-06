@@ -161,7 +161,8 @@ pub enum RunnerLeg {
     /// session loops' wait from the control loop's.
     ToControl,
     /// From the network thread taking a frame off its link to handing it to its loop's queue (`crate::wire::fan`): the
-    /// net thread's own hold of it, the rest of its batch read and its turn's sends made first. `to_loop` includes it;
+    /// net thread's own hold of it, the rest of its batch read (its turn's sends come after: goal 10, plan 01a1a87b2dae
+    /// step 5, `crate::net`'s receive turn). `to_loop` includes it;
     /// what's past it there is the queue's, its loop's wake and its shard's (goal 10, plan 01a1a87b2dae step 4: rt9's
     /// and g9p16's `to_loop` was 8 to 10 ms at p99 where each event's hold at the loop was 0.08 to 0.2 ms, and the
     /// shards ran their ready work within 0.45 ms at p99.9: only this tells where the frames waited).

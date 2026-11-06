@@ -402,21 +402,16 @@ impl NetHandle {
     }
 }
 
-/// What making a message's frames took at the slowest seen ([`send_made`]): half a mebibyte's in 1.4 ms on the CPU,
-/// in a poll (rt9's lab, the server's cluster and observe loops on their shards). Bytes, then nanoseconds.
-const MADE_SLOWEST: (u64, u64) = (512 * 1024, 1_400_000);
+/// What making messages' frames takes, by the bytes it copies ([`send_made`]): learned from this process's own makes, on
+/// its shards and on the compute pool, as a runner frame's read is (`crate::wire::payload::Expect`, RFC 6298's estimator;
+/// goal 9, plan 01a1a87b2cec step 5). Consts-audit R2: it was rt9's slowest seen, half a mebibyte in 1.4 ms, fixed in
+/// code, and a batch was made where it was up to what that made within a slow poll (100 µs): 37,449 bytes. Making a frame
+/// copies a message's bytes as postcard writes them, alike for the cluster group's and observe's: one for both.
+pub(crate) static MADE: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
 
-/// The most bytes of messages [`send_made`] makes into frames where it is, on its shard, not on the compute pool: what
-/// making at the slowest seen ([`MADE_SLOWEST`]) does within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs), 37,449
-/// bytes. A batch of more goes to the pool as before (goal 9, plan 01a1a87b2cec step 5: every batch did, though most are
-/// one write's few short messages to the cluster group's learners, a few hundred bytes each, whose hand-off, a wake of a
-/// pool's thread, the shard's park while it waits and its wake when the job is done, cost the shard several times what
-/// copying them does, once for every write kiln.db takes).
-pub const MADE_HERE_MOST: usize = (hyper_rt::slow::SLOW_POLL_NS as u128 * MADE_SLOWEST.0 as u128 / MADE_SLOWEST.1 as u128) as usize;
-
-/// What making the frames of `bytes` of messages is expected to take at the slowest seen ([`MADE_SLOWEST`]), nanoseconds.
-fn made_ns(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(MADE_SLOWEST.1) / MADE_SLOWEST.0
+/// Whole nanoseconds since `t`.
+fn nanos_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
@@ -424,13 +419,16 @@ fn made_ns(bytes: usize) -> u64 {
 /// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
 /// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
 /// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
-/// messages is made on the compute pool, unless what `weigh` says they copy is within [`MADE_HERE_MOST`], when it's
-/// made where it is, its turn ended first if that wouldn't fit it (`rt::Turns::before`; goal 9, plan 01a1a87b2cec step
-/// 5). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard is
-/// given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends
-/// within the quantum. Returns once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no
-/// lock (goal 5, plan 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
-pub async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, make: F, mut send: S)
+/// messages is made where it is where that's expected to fit a turn (the shard's quantum) and to cost no more than handing
+/// it to the compute pool and back, by what `weigh` says its messages copy at the rate `costs` learned
+/// (`crate::wire::payload::Expect::on_shard`, `crate::rt::Sides`), its turn ended first if that wouldn't fit what's left of
+/// it (`rt::Turns::before`), else on the compute pool;
+/// either way what it took teaches `costs` (goal 9, plan 01a1a87b2cec step 5; consts-audit R2). The messages waiting
+/// behind one are taken with it while the loop's turn lasts, and between sends the shard is given up once the turn is
+/// over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends within the quantum. Returns
+/// once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no lock (goal 5, plan
+/// 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
+pub(crate) async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, costs: &crate::wire::payload::Expect, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -467,15 +465,34 @@ where
             }
         }
         if !batch.is_empty() {
-            let made = if bytes <= MADE_HERE_MOST {
-                turns.before(made_ns(bytes)).await;
-                Ok(batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>())
-            } else {
-                let make = Arc::clone(&make);
-                let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
-                // The wait for the pool ended the poll: the sends start a turn of their own.
-                turns = crate::rt::Turns::new();
-                made
+            let len = u64::try_from(bytes).unwrap_or(u64::MAX);
+            let made = match costs.on_shard(len) {
+                // Within a turn and no dearer here than the pool's round trip: made where it is, its turn ended first where it
+                // won't fit what's left.
+                Some(expected) => {
+                    turns.before(expected).await;
+                    let began = Instant::now();
+                    let made = batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>();
+                    costs.learn(len, nanos_since(began), true);
+                    Ok(made)
+                }
+                None => {
+                    let make = Arc::clone(&make);
+                    // Each message's making timed where it's made, on the pool's thread: the batch's, summed, teaches the
+                    // rate as one made here does, its waits for the pool left out.
+                    let made = crate::rt::compute_map(batch, move |(peer, x)| {
+                        let began = Instant::now();
+                        let frames = (*make)(x);
+                        (peer, frames, nanos_since(began))
+                    })
+                    .await;
+                    // The wait for the pool ended the poll: the sends start a turn of their own.
+                    turns = crate::rt::Turns::new();
+                    made.map(|made| {
+                        costs.learn(len, made.iter().map(|(_, _, ns)| *ns).fold(0, u64::saturating_add), false);
+                        made.into_iter().map(|(peer, frames, _)| (peer, frames)).collect::<Vec<_>>()
+                    })
+                }
             };
             match made {
                 Ok(made) => {
@@ -658,6 +675,36 @@ impl crate::memory::queue::Weigh for Out {
             Out::Copy(path) => path.as_os_str().len(),
             Out::Disconnect { .. } | Out::Connect { .. } | Out::Rebuild | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
         })
+    }
+}
+
+/// What a net thread did, in its order, as a test reads it back (goal 10, plan 01a1a87b2dae step 5).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// A receive turn's start.
+    Turn,
+    /// The events it took off its driver.
+    Received(usize),
+    /// Events handed to the owner, at a hand-over that handed any.
+    Handed(usize),
+    /// A receive turn's sends starting: before its first write.
+    Sends,
+}
+
+/// The net threads whose steps a test reads, by the address their socket is bound to, named before they start.
+#[cfg(test)]
+static WATCHED: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+
+/// The watched net threads' steps, each with its address.
+#[cfg(test)]
+static STEPS: Mutex<Vec<(SocketAddr, Step)>> = Mutex::new(Vec::new());
+
+/// Notes `step` of the net thread bound to `at` (none: not watched).
+#[cfg(test)]
+fn stamp(at: Option<SocketAddr>, step: Step) {
+    if let Some(at) = at {
+        STEPS.lock().unwrap_or_else(PoisonError::into_inner).push((at, step));
     }
 }
 
@@ -1019,6 +1066,8 @@ async fn run_loop(
     if let AnyDriver::Server(d) = &driver {
         tracing::info!(addr = ?d.local_addr(), "QUIC listening (hyper-transport on hyper-rt, mTLS)");
     }
+    #[cfg(test)]
+    let me = with_driver!(&driver, d => d.local_addr().ok()).filter(|at| WATCHED.lock().unwrap_or_else(PoisonError::into_inner).contains(at));
     // An agent's dial to the server: hyper-transport keeps at most one per peer and ignores a
     // second `connect` while one is pending, so the loop tracks it to replace or abandon it.
     let mut dial = Dial::Idle;
@@ -1051,6 +1100,8 @@ async fn run_loop(
     };
     let mut peers: HashSet<PeerId> = HashSet::new();
     let mut holding = false;
+    // This turn took what came in: it goes to the owner before the turn's sends.
+    let mut received = false;
 
     enum Ev {
         Cmd(Option<Out>),
@@ -1061,8 +1112,14 @@ async fn run_loop(
     }
 
     loop {
+        #[cfg(test)]
+        let before = held.len();
         if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
             return Ok(Exit::Closed);
+        }
+        #[cfg(test)]
+        if held.len() < before {
+            stamp(me, Step::Handed(before.saturating_sub(held.len())));
         }
         let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };
         if hold != holding {
@@ -1231,18 +1288,18 @@ async fn run_loop(
             }
             Ev::Driver(ev) => {
                 let ev = ev.map_err(|e| anyhow::anyhow!("driver: {e}"))?;
+                #[cfg(test)]
+                stamp(me, Step::Turn);
                 with_driver!(&mut driver, d => {
                     on_event(d.endpoint(), ev, &mut events, &mut outbox);
                     while let Some(ev) = d.endpoint().poll_event() {
                         on_event(d.endpoint(), ev, &mut events, &mut outbox);
                     }
-                    if !outbox.is_empty() {
-                        flush_outbox(d.endpoint(), &mut outbox);
-                        if let Err(e) = d.flush() {
-                            tracing::debug!(error = %e, "flush");
-                        }
-                    }
                 });
+                #[cfg(test)]
+                stamp(me, Step::Received(events.len()));
+                // Its sends wait for what came to go to the owner, below.
+                received = true;
             }
             Ev::DialDeadline => {
                 if let Dial::Dialing { addr, .. } = dial {
@@ -1296,6 +1353,33 @@ async fn run_loop(
             }
             held_bytes = held_bytes.saturating_add(weight(&ev));
             held.push_back(ev);
+        }
+        // What came in this turn goes to the owner before the turn's sends (goal 10, plan 01a1a87b2dae step 5): its frames
+        // are on their loops' queues, the shards they wake already on their way, while this thread flushes its outbox,
+        // which waited for a lane's room (a peer not reading what it was sent, a bulk lane's window) and may then copy
+        // and send a great deal. They went to the owner only at the next turn of this loop, after those sends: part of
+        // the `net` leg of a runner's wait (`crate::route_latency::RunnerLeg::Net`). The hand-over is this loop's top's,
+        // made here first; what it couldn't hand (the owner's queue full) waits there, as before.
+        if std::mem::take(&mut received) {
+            #[cfg(test)]
+            let before = held.len();
+            if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
+                return Ok(Exit::Closed);
+            }
+            #[cfg(test)]
+            if held.len() < before {
+                stamp(me, Step::Handed(before.saturating_sub(held.len())));
+            }
+            if !outbox.is_empty() {
+                #[cfg(test)]
+                stamp(me, Step::Sends);
+                with_driver!(&mut driver, d => {
+                    flush_outbox(d.endpoint(), &mut outbox);
+                    if let Err(e) = d.flush() {
+                        tracing::debug!(error = %e, "flush");
+                    }
+                });
+            }
         }
     }
 }
@@ -1413,8 +1497,11 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                // Each message weighed past what's made where it is ([`MADE_HERE_MOST`]): every batch goes to the pool.
-                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| MADE_HERE_MOST + 1, make, send));
+                // Making taught dearer than any round trip to the pool (a byte's in all the time there is): every batch goes
+                // there, each teaching its eighth, which leaves it dearer still (consts-audit R2).
+                let dear = crate::wire::payload::Expect::nothing_yet();
+                dear.learn(1, u64::MAX, false);
+                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| 1, &dear, make, send));
                 std::future::poll_fn(|cx| {
                     let before = sends.load(Ordering::SeqCst);
                     let polled = work.as_mut().poll(cx);
@@ -1434,27 +1521,36 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a batch of short messages, whose making copies no more than [`MADE_HERE_MOST`],
-    /// is made where it is, on its shard, with no hand-off to the compute pool and back; a batch past it still goes to the
-    /// pool. Either way what's sent is what came, in the order it came, each message's frames in theirs.
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R2: a batch is made on its shard where it fits a turn and is cheaper
+    /// there, by what making frames is learned to take in this process (it was rt9's slowest seen, fixed in code), against the
+    /// shard's quantum and the compute pool's round trip as the process learned it. Do: hand a job to the pool from the shard, so the round trip is learned; then send 16 messages of 512
+    /// bytes each three times: with nothing learned of making them, with making learned fast (a mebibyte in a microsecond),
+    /// and learned slow (a byte in a millisecond). Expect: with nothing learned, the first goes to the pool and teaches what
+    /// making takes; learned fast, every one is made on the shard, no hand-off; learned slow, every one goes to the pool;
+    /// each time, what's sent is what came, in the order it came, each message's frames in theirs.
     #[test]
-    fn g9_s5_a_batch_of_short_messages_is_made_where_it_is() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    fn g9_s5_r2_a_batch_is_made_where_its_cheaper_by_what_making_is_learned_to_take() -> anyhow::Result<()> {
+        use crate::wire::payload::Expect;
         crate::rt::block_on(async {
             const MESSAGES: u32 = 16;
-            // A cluster write's few hundred bytes a learner; and one message past the bound, alone or not.
-            for (each, here) in [(512usize, true), (MADE_HERE_MOST + 1, false)] {
+            const EACH: usize = 512;
+            crate::rt::compute(|| ()).await?;
+            anyhow::ensure!(crate::rt::POOL_TRIP.mean().is_some(), "the pool's round trip learned");
+            let (fresh, fast, slow) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
+            fast.learn(1 << 20, 1_000, true);
+            slow.learn(1, 1_000_000, false);
+            for (costs, learned) in [(&fresh, "nothing learned"), (&fast, "learned fast"), (&slow, "learned slow")] {
                 let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
                 for m in 0..MESSAGES {
                     tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
                 }
                 drop(tx);
-                let (on_shard, off_shard) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                // Where each message was made, in the order made.
+                let made_on = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let make = {
-                    let (on, off) = (Arc::clone(&on_shard), Arc::clone(&off_shard));
+                    let made_on = Arc::clone(&made_on);
                     move |m: u32| {
-                        let made_on = if crate::rt::on_shard() { &on } else { &off };
-                        made_on.fetch_add(1, Ordering::SeqCst);
+                        made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(crate::rt::on_shard());
                         vec![m.to_be_bytes().to_vec(), vec![0xff]]
                     }
                 };
@@ -1463,19 +1559,18 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), move |_: &u32| each, make, send).await;
+                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), |_: &u32| EACH, costs, make, send).await;
                 let expected: Vec<(PeerId, Vec<u8>)> = (0..MESSAGES).flat_map(|m| [(u64::from(m % 3), m.to_be_bytes().to_vec()), (u64::from(m % 3), vec![0xff])]).collect();
-                anyhow::ensure!(sent == expected, "{each} bytes a message: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
-                let (on, off) = (on_shard.load(Ordering::SeqCst), off_shard.load(Ordering::SeqCst));
-                let all = u64::from(MESSAGES);
-                if here {
-                    anyhow::ensure!((on, off) == (all, 0), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch is made where it is");
-                } else {
-                    anyhow::ensure!((on, off) == (0, all), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch goes to the pool");
+                anyhow::ensure!(sent == expected, "{learned}: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+                let made_on = made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let here = made_on.iter().filter(|on| **on).count();
+                match learned {
+                    "learned fast" => anyhow::ensure!(here == made_on.len(), "{learned}: {here} of {} made on the shard, where each is cheaper there", made_on.len()),
+                    "learned slow" => anyhow::ensure!(here == 0, "{learned}: {here} of {} made on the shard, where each is cheaper on the pool", made_on.len()),
+                    _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
                 }
             }
-            anyhow::ensure!(MADE_HERE_MOST == 37_449, "half a mebibyte in 1.4 ms, within 100 µs: {MADE_HERE_MOST}");
-            anyhow::ensure!(made_ns(MADE_HERE_MOST) <= hyper_rt::slow::SLOW_POLL_NS, "the most made here is made within a slow poll at the slowest seen");
+            anyhow::ensure!(fresh.on_shard_with(1, crate::rt::Sides { quantum_ns: None, trip_ns: None }).is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }
@@ -1931,6 +2026,81 @@ mod tests {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Of a net thread's `steps` (`STEPS`, its own), the first receive turn that took events and then made sends: how many
+    /// it took, and how many events had gone to its owner when its sends began. `None` while no such turn has come.
+    fn handed_before_sends(steps: &[Step]) -> Option<(usize, usize)> {
+        let (mut took, mut handed) = (0usize, 0usize);
+        for s in steps {
+            match *s {
+                Step::Turn => (took, handed) = (0, 0),
+                Step::Received(n) => (took, handed) = (n, 0),
+                Step::Handed(n) => handed = handed.saturating_add(n),
+                Step::Sends if took > 0 => return Some((took, handed)),
+                Step::Sends => {}
+            }
+        }
+        None
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: what comes in while the net thread has sends waiting (a frame its outbox holds,
+    /// here held back late by a test build's fault) goes to the owner before the turn that took it begins those sends,
+    /// counted off the thread's own steps: every event the turn took handed over before its first write. They went at
+    /// the next turn of the loop, after the sends, and none had when the sends began. Every frame still reaches the
+    /// owner, in order, and the one held goes to its peer.
+    #[test]
+    fn g10_s5_a_turn_hands_what_came_in_to_its_owner_before_its_sends() -> anyhow::Result<()> {
+        /// Shape: tries at a turn that takes a frame while one waits in the outbox (held back late for `LATE_FOR`, 20 ms,
+        /// where a frame takes well under a millisecond each way on loopback), each a frame the server holds and one the
+        /// agent sends.
+        const TRIES: u32 = 64;
+        /// Shape: the lane the server's frames go on, held back late, apart from the agent's.
+        const HELD: u32 = 1;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            WATCHED.lock().unwrap_or_else(PoisonError::into_inner).push(addr);
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("turn-order")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr }).await;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            loop {
+                if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
+                    break;
+                }
+            }
+            // Every frame the server sends on its lane held back late: one waits in its outbox until the next, or 20 ms.
+            srv.command(Out::Shed(Shed { lane: HELD, variant: None, every: 1, act: Act::Late })).await;
+            let steps = || STEPS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|(at, _)| *at == addr).map(|(_, s)| *s).collect::<Vec<_>>();
+            for i in 0..TRIES {
+                anyhow::ensure!(srv.send(peer, HELD, Kind::Control, i.to_le_bytes().to_vec()).await, "the server's thread is gone");
+                anyhow::ensure!(agent.send(SERVER_PEER, 0, Kind::Control, i.to_le_bytes().to_vec()).await, "the agent's thread is gone");
+                // Its frame at the server's owner.
+                loop {
+                    if let NetEvent::Frame { lane: 0, data, .. } = next_event(&srv_ev, deadline).await? {
+                        anyhow::ensure!(data == i.to_le_bytes(), "frame {:?} where {i} was next", data);
+                        break;
+                    }
+                }
+                if let Some((took, handed)) = handed_before_sends(&steps()) {
+                    anyhow::ensure!(handed >= took, "a turn took {took} events with sends waiting and began its sends with {handed} handed over: {:?}", steps());
+                    // The frame held back went to its peer too.
+                    loop {
+                        if let NetEvent::Frame { lane, .. } = next_event(&agent_ev, deadline).await?
+                            && lane == HELD
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            anyhow::bail!("no turn took a frame while one waited in the outbox, in {TRIES} tries: {:?}", steps())
         })
     }
 

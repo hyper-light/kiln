@@ -11,7 +11,7 @@ use kiln_ci::identity::custody::{Body, Kind, to_value};
 use kiln_ci::identity::statement::{Statement, Subject};
 use serde_json::Value;
 
-use crate::convo::feed::Custodian;
+use crate::convo::feed::{Ack, Custodian};
 use crate::hub::Hub;
 
 /// The bytes of receipts waiting for the task that keeps them, at the most (goal 11, plan 01a1a87b2e56 step
@@ -30,7 +30,7 @@ pub fn install(hub: &Arc<Hub>) {
         let w = Arc::downgrade(hub);
         // On the next shard round-robin, not the one the server starts on (goal 9, plan 01a1a87b2cec step 3).
         crate::rt::spawn_spread(async move {
-            while let Ok(Receipt { given, receipt, came_from }) = rx.recv().await {
+            while let Ok(Receipt { given, receipt, came_from, ack }) = rx.recv().await {
                 let Some(hub) = w.upgrade() else { return };
                 // The runner's hand-on as the batch carried it, then kiln's receipt of what came, signed
                 // off the shards (goal 9, plan 01a1a87b2cec step 3): both read in one job, kept in one
@@ -44,6 +44,11 @@ pub fn install(hub: &Arc<Hub>) {
                         }
                     }
                     Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a record of a conversation feed's batch couldn't be kept"),
+                }
+                // The batch's Ack, once its records are kept (or said not kept): its runner's next batch at its store's tip
+                // waited for it (consts-audit R4).
+                if let Some(ack) = ack {
+                    ack.said().await;
                 }
             }
         });
@@ -74,11 +79,13 @@ struct Taker {
     tx: crate::memory::queue::Sender<Receipt>,
 }
 
-/// A batch's records for that task: its runner's hand-on, kiln's receipt to sign, what it came over.
+/// A batch's records for that task: its runner's hand-on, kiln's receipt to sign, what it came over, and the batch's Ack,
+/// said once they're kept.
 struct Receipt {
     given: Value,
     receipt: Statement,
     came_from: String,
+    ack: Option<Ack>,
 }
 
 /// Counts what's written to it, keeping none of it.
@@ -97,11 +104,11 @@ impl std::io::Write for Count {
 
 impl crate::memory::queue::Weigh for Receipt {
     /// Its place, the hand-on's tree (`crate::harness::weigh::value`), the receipt as its JSON's bytes
-    /// (counted as written, nothing kept) and where it came from.
+    /// (counted as written, nothing kept), where it came from, and its Ack.
     fn weight(&self) -> usize {
         let mut receipt = Count(0);
         let _ = serde_json::to_writer(&mut receipt, &self.receipt);
-        size_of::<Receipt>().saturating_add(crate::harness::weigh::value(&self.given)).saturating_add(receipt.0).saturating_add(self.came_from.len())
+        size_of::<Receipt>().saturating_add(crate::harness::weigh::value(&self.given)).saturating_add(receipt.0).saturating_add(self.came_from.len()).saturating_add(self.ack.as_ref().map_or(0, Ack::bytes))
     }
 }
 
@@ -110,14 +117,21 @@ impl Custodian for Taker {
         Box::pin(async { None })
     }
 
-    fn received(&self, machine: &str, hand_on: &str, thing: Subject) {
-        let (Some(hub), Ok(given)) = (self.hub.upgrade(), serde_json::from_str::<Value>(hand_on)) else { return };
-        let Some(giver) = crate::runner::custody::giver_of(&given) else { return };
+    /// Its receipt to the task that keeps receipts, with the batch's Ack, which that task says once it's kept (consts-audit
+    /// R4): the runner's next batch at its store's tip waits for it, so the receipts waiting never outnumber the batches on
+    /// their way. One it can't read is answered at once, as one let go is.
+    fn received(&self, machine: &str, hand_on: &str, thing: Subject, ack: Option<Ack>) -> Option<Ack> {
+        let (Some(hub), Ok(given)) = (self.hub.upgrade(), serde_json::from_str::<Value>(hand_on)) else { return ack };
+        let Some(giver) = crate::runner::custody::giver_of(&given) else { return ack };
         let server = super::server_uri(&hub.pki.organization());
         let body = Body { from: Some(giver), why: "a batch of a runner's conversation store, taken into kiln's".into(), ..Body::new(Kind::Received, &server) };
         let receipt = Statement { subject: vec![thing], follows: vec![crate::runner::custody::digest_of(&given)], ..Statement::new(to_value(&body)) };
-        if self.tx.try_send(Receipt { given, receipt, came_from: format!("runner {machine}") }).is_err() {
-            tracing::warn!(target: "kiln.custody", %machine, "kiln is behind keeping its receipts of conversation feeds' batches: this one is let go, its hand-on unanswered");
+        match self.tx.try_send(Receipt { given, receipt, came_from: format!("runner {machine}"), ack }) {
+            Ok(()) => None,
+            Err(async_channel::TrySendError::Full(r) | async_channel::TrySendError::Closed(r)) => {
+                tracing::warn!(target: "kiln.custody", %machine, "kiln is behind keeping its receipts of conversation feeds' batches: this one is let go, its hand-on unanswered");
+                r.ack
+            }
         }
     }
 }
@@ -156,7 +170,9 @@ impl Custodian for ToMirror {
         })
     }
 
-    fn received(&self, _machine: &str, _hand_on: &str, _thing: Subject) {}
+    fn received(&self, _machine: &str, _hand_on: &str, _thing: Subject, ack: Option<Ack>) -> Option<Ack> {
+        ack
+    }
 }
 
 #[cfg(test)]
@@ -164,11 +180,43 @@ mod tests {
     use super::*;
     use crate::memory::queue::Weigh as _;
 
+    /// Consts-audit R4 (goal 9, plan 01a1a87b2cec step 5): kiln's receipt of a runner's batch goes to the task that keeps
+    /// receipts with the batch's Ack, which that task says once the receipt is kept: the runner's next batch at its store's
+    /// tip waits for it, so the receipts waiting never outnumber the batches on their way and a slow kiln.db grows the
+    /// batches. A receipt let go for want of room, and a hand-on it can't read, have their Ack handed back, said at once. Do:
+    /// a taker with room for one receipt; three batches received, the third's hand-on not one. Expect: the first's Ack waits
+    /// with its receipt, none handed back; the second's and the third's handed back.
+    #[test]
+    fn r4_a_receipt_carries_its_batchs_ack_to_be_said_once_its_kept() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, payload};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (tx, rx) = crate::memory::queue::places::<Receipt>(&crate::memory::owners::CUSTODY_RECEIPTS, 1);
+            let taker = Taker { hub: Arc::downgrade(&hub), tx };
+            let (to, _answers) = crate::memory::queue::places::<crate::convo::feed::Out>(&crate::memory::owners::CHANNELS, 4);
+            let ack = |rev: u64| Some(Ack::of(crate::convo::feed::Msg::Ack { store: "s1".into(), rev }, 7, to.clone()));
+            let thing = |n: u64| crate::convo::feed::batch_thing("s1", n, n + 1, &crate::util::sha256_hex(&n.to_be_bytes()));
+            // A runner's hand-on, as a bundle's JSON (unsigned: what's read of it here is who gave it).
+            let st = Statement { subject: vec![thing(0)], ..Statement::new(serde_json::json!({ "v": 1, "kind": "handed-on", "by": "kiln://hyper-light/person/ada/machine/box/instance/i", "to": "kiln://hyper-light/server" })) };
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload(&st).unwrap_or_default());
+            let hand_on = serde_json::json!({ "dsseEnvelope": { "payloadType": PAYLOAD_CUSTODY, "payload": encoded, "signatures": [] } }).to_string();
+            let given: Value = serde_json::from_str(&hand_on)?;
+            anyhow::ensure!(crate::runner::custody::giver_of(&given).is_some(), "its giver read: {hand_on}");
+            anyhow::ensure!(taker.received("box", &hand_on, thing(1), ack(1)).is_none(), "the first's Ack waits with its receipt");
+            anyhow::ensure!(taker.received("box", &hand_on, thing(2), ack(2)).is_some(), "the second, let go for want of room: its Ack handed back");
+            anyhow::ensure!(taker.received("box", "not a hand-on", thing(3), ack(3)).is_some(), "a hand-on it can't read: its Ack handed back");
+            let waiting = rx.try_recv().map_err(|_| anyhow::anyhow!("no receipt waiting"))?;
+            anyhow::ensure!(waiting.ack.is_some() && waiting.came_from == "runner box", "the receipt waiting carries its batch's Ack");
+            Ok(())
+        })
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 3: a receipt waiting for the task weighs its hand-on, its receipt
     /// and where it came from, so its queue is bounded in bytes whatever the bundles' sizes.
     #[test]
     fn g11_s3_a_receipt_weighs_its_hand_on() {
-        let receipt = |n: usize| Receipt { given: serde_json::json!({ "bundle": "b".repeat(n) }), receipt: Statement::new(serde_json::json!({ "why": "a test" })), came_from: "runner m1".into() };
+        let receipt = |n: usize| Receipt { given: serde_json::json!({ "bundle": "b".repeat(n) }), receipt: Statement::new(serde_json::json!({ "why": "a test" })), came_from: "runner m1".into(), ack: None };
         assert_eq!(receipt(5000).weight() - receipt(0).weight(), 5000);
         assert!(receipt(0).weight() > size_of::<Receipt>() + "runner m1".len(), "the receipt's own JSON counts");
         assert_eq!(RECEIPTS_BYTES, crate::convo::feed::HEARD_BYTES);
