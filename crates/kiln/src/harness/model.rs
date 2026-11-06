@@ -12,8 +12,9 @@ pub const OUTPUT_MAX: usize = 24 * 1024;
 pub const TEXT_MAX: usize = 256 * 1024;
 
 /// One item of the timeline. Upserted by `id`: a tool call is first sent running, then again
-/// with its result; a streaming reply grows until it is final.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// with its result; a streaming reply grows until it is final. Read by hand, as its derive would
+/// read it (see its `Deserialize`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Event {
     pub id: String,
@@ -87,6 +88,336 @@ pub enum Level {
     Info,
     Warn,
     Error,
+}
+
+/// An event read as serde's derive reads one (its `body` flattened, `Body` tagged by `kind`: the same events, the
+/// same refusals), without the two buffers the derive reads it into first: every field it doesn't name itself, read
+/// whole into one (the flattened body's), then all of those but the tag again into another (the tagged body's), each
+/// text copied into each. Here the body is read from the map as it comes, once its tag has come, the event's own
+/// fields taken out wherever they are; only a field of its body that comes before its tag is kept aside (as JSON)
+/// until the tag says what the body is. Every writer of an event puts its tag first of its body's fields (serde's
+/// serializer writes the event's own fields, then the tag, then the body's), so none is. Goal 9, plan 01a1a87b2cec
+/// step 5: an agent session's events are most of what its runner sends, each read on the hub's loop (rt9's calm
+/// profile: the runners' updates' JSON 1.1% of the process's samples, a fifth of the loop's own).
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_map(EventVisitor)
+    }
+}
+
+/// [`Body`]'s variants, in its order.
+#[derive(Clone, Copy)]
+enum BodyKind {
+    User,
+    Assistant,
+    Thinking,
+    Tool,
+    Notice,
+}
+
+impl BodyKind {
+    const ALL: [BodyKind; 5] = [BodyKind::User, BodyKind::Assistant, BodyKind::Thinking, BodyKind::Tool, BodyKind::Notice];
+    /// Their tags (`rename_all = "snake_case"`), in their order: what an unknown one is told it isn't, as the derive
+    /// tells it.
+    const TAGS: [&'static str; 5] = ["user", "assistant", "thinking", "tool", "notice"];
+}
+
+/// A body's tag as the derive reads it (its variant identifier, read from what the derive kept of it): by name, or by
+/// its variant's index; anything else refused in the derive's words.
+struct Tag(BodyKind);
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(TagVisitor)
+    }
+}
+
+struct TagVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TagVisitor {
+    type Value = Tag;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("variant identifier")
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Tag, E> {
+        usize::try_from(v).ok().and_then(|i| BodyKind::ALL.get(i)).map(|k| Tag(*k)).ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(v), &"variant index 0 <= i < 5"))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Tag, E> {
+        BodyKind::TAGS.iter().position(|t| *t == v).and_then(|i| BodyKind::ALL.get(i)).map(|k| Tag(*k)).ok_or_else(|| E::unknown_variant(v, &BodyKind::TAGS))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Tag, E> {
+        match std::str::from_utf8(v) {
+            Ok(v) => self.visit_str(v),
+            Err(_) => Err(E::unknown_variant(&String::from_utf8_lossy(v), &BodyKind::TAGS)),
+        }
+    }
+}
+
+/// An event's own fields, by name.
+#[derive(Clone, Copy)]
+enum Own {
+    Id,
+    Seq,
+    At,
+    Parent,
+    By,
+}
+
+impl Own {
+    fn name(self) -> &'static str {
+        match self {
+            Own::Id => "id",
+            Own::Seq => "seq",
+            Own::At => "at",
+            Own::Parent => "parent",
+            Own::By => "by",
+        }
+    }
+}
+
+/// What a key of an event's map names: one of its own fields, its body's tag, or a field of its body (borrowed from
+/// what's read where it can be).
+enum Key<'de> {
+    Own(Own),
+    Kind,
+    Body(std::borrow::Cow<'de, str>),
+}
+
+impl<'k> Key<'k> {
+    /// The key `name` names, but a body's field.
+    fn named(name: &str) -> Option<Key<'k>> {
+        Some(match name {
+            "id" => Key::Own(Own::Id),
+            "seq" => Key::Own(Own::Seq),
+            "at" => Key::Own(Own::At),
+            "parent" => Key::Own(Own::Parent),
+            "by" => Key::Own(Own::By),
+            "kind" => Key::Kind,
+            _ => return None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Key<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_identifier(KeyVisitor)
+    }
+}
+
+struct KeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for KeyVisitor {
+    type Value = Key<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("field identifier")
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Key<'de>, E> {
+        Ok(Key::named(v).unwrap_or(Key::Body(std::borrow::Cow::Borrowed(v))))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Key<'de>, E> {
+        Ok(Key::named(v).unwrap_or_else(|| Key::Body(std::borrow::Cow::Owned(v.to_owned()))))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Key<'de>, E> {
+        Ok(Key::named(&v).unwrap_or(Key::Body(std::borrow::Cow::Owned(v))))
+    }
+}
+
+/// An event's own fields as they're read: each once at most, as the derive allows.
+#[derive(Default)]
+struct OwnFields {
+    id: Option<String>,
+    seq: Option<u64>,
+    at: Option<i64>,
+    parent: Option<Option<String>>,
+    by: Option<Option<String>>,
+}
+
+impl OwnFields {
+    /// Field `f`'s value, the next of `map`'s: a second of it refused as the derive refuses it, before its value is read.
+    fn take<'de, A: serde::de::MapAccess<'de>>(&mut self, f: Own, map: &mut A) -> Result<(), A::Error> {
+        use serde::de::Error as _;
+        let had = match f {
+            Own::Id => self.id.is_some(),
+            Own::Seq => self.seq.is_some(),
+            Own::At => self.at.is_some(),
+            Own::Parent => self.parent.is_some(),
+            Own::By => self.by.is_some(),
+        };
+        if had {
+            return Err(A::Error::duplicate_field(f.name()));
+        }
+        match f {
+            Own::Id => self.id = Some(map.next_value()?),
+            Own::Seq => self.seq = Some(map.next_value()?),
+            Own::At => self.at = Some(map.next_value()?),
+            Own::Parent => self.parent = Some(map.next_value()?),
+            Own::By => self.by = Some(map.next_value()?),
+        }
+        Ok(())
+    }
+
+    /// The event of these fields and `body`: the first field it must have that's missing refused as the derive refuses
+    /// it, in its order.
+    fn event<E: serde::de::Error>(self, body: Body) -> Result<Event, E> {
+        let id = self.id.ok_or_else(|| E::missing_field("id"))?;
+        let seq = self.seq.ok_or_else(|| E::missing_field("seq"))?;
+        let at = self.at.ok_or_else(|| E::missing_field("at"))?;
+        Ok(Event { id, seq, at, parent: self.parent.flatten(), by: self.by.flatten(), body })
+    }
+
+    /// [`OwnFields::event`]'s refusal, with no body to make one of.
+    fn missing<E: serde::de::Error>(&self) -> Result<(), E> {
+        if self.id.is_none() {
+            return Err(E::missing_field("id"));
+        }
+        if self.seq.is_none() {
+            return Err(E::missing_field("seq"));
+        }
+        if self.at.is_none() {
+            return Err(E::missing_field("at"));
+        }
+        Ok(())
+    }
+}
+
+struct EventVisitor;
+
+impl<'de> serde::de::Visitor<'de> for EventVisitor {
+    type Value = Event;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("struct Event")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Event, A::Error> {
+        use serde::de::Error as _;
+        let mut own = OwnFields::default();
+        // Its body's fields that come before its tag, as they came.
+        let mut early: Vec<(String, serde_json::Value)> = Vec::new();
+        loop {
+            match map.next_key::<Key<'de>>()? {
+                Some(Key::Own(f)) => own.take(f, &mut map)?,
+                Some(Key::Body(name)) => early.push((name.into_owned(), map.next_value()?)),
+                // Its tag: its body read from what came of it before, then from the rest as it comes.
+                Some(Key::Kind) => {
+                    let Tag(kind) = map.next_value()?;
+                    let rest = Rest { early: early.into_iter(), held: None, map, own: &mut own };
+                    let body = body_of(kind, serde::de::value::MapAccessDeserializer::new(rest))?;
+                    return own.event(body);
+                }
+                // No tag at all: what of its own is missing first, then the tag, as the derive says them.
+                None => {
+                    own.missing::<A::Error>()?;
+                    return Err(A::Error::missing_field("kind"));
+                }
+            }
+        }
+    }
+}
+
+/// An event's map as its body reads it, once its tag has come: the body's fields that came before the tag first, as
+/// they came, then the rest as it comes, the event's own fields taken out wherever they are and a second tag refused,
+/// as the derive refuses it.
+struct Rest<'a, A> {
+    early: std::vec::IntoIter<(String, serde_json::Value)>,
+    /// The value of the early field whose key was just read.
+    held: Option<serde_json::Value>,
+    map: A,
+    own: &'a mut OwnFields,
+}
+
+impl<'de, A: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for Rest<'_, A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, A::Error> {
+        use serde::de::{Error as _, IntoDeserializer as _};
+        if let Some((name, value)) = self.early.next() {
+            self.held = Some(value);
+            return seed.deserialize(name.into_deserializer()).map(Some);
+        }
+        loop {
+            match self.map.next_key::<Key<'de>>()? {
+                None => return Ok(None),
+                Some(Key::Own(f)) => self.own.take(f, &mut self.map)?,
+                Some(Key::Kind) => return Err(A::Error::duplicate_field("kind")),
+                Some(Key::Body(name)) => return seed.deserialize(name.into_deserializer()).map(Some),
+            }
+        }
+    }
+
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+        use serde::de::Error as _;
+        match self.held.take() {
+            Some(value) => seed.deserialize(value).map_err(A::Error::custom),
+            None => self.map.next_value_seed(seed),
+        }
+    }
+}
+
+/// The body of kind `kind`, its fields read from `rest` (the event's map past its tag, its own fields out of it).
+/// Each variant's fields as [`Body`] declares them, with the same defaults: kept in step with it (`tests`, every
+/// variant read back as the derive reads it).
+fn body_of<'de, D: serde::Deserializer<'de>>(kind: BodyKind, rest: D) -> Result<Body, D::Error> {
+    #[derive(Deserialize)]
+    struct UserOf {
+        text: String,
+        #[serde(default)]
+        images: u32,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        origin: Option<String>,
+        #[serde(default)]
+        attachments: Vec<String>,
+        #[serde(default)]
+        reply_to: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct AssistantOf {
+        text: String,
+        #[serde(default)]
+        streaming: bool,
+    }
+    #[derive(Deserialize)]
+    struct ThinkingOf {
+        text: String,
+        #[serde(default)]
+        streaming: bool,
+        #[serde(default)]
+        redacted: bool,
+    }
+    #[derive(Deserialize)]
+    struct NoticeOf {
+        level: Level,
+        text: String,
+    }
+    Ok(match kind {
+        BodyKind::User => {
+            let UserOf { text, images, client_id, origin, attachments, reply_to } = UserOf::deserialize(rest)?;
+            Body::User { text, images, client_id, origin, attachments, reply_to }
+        }
+        BodyKind::Assistant => {
+            let AssistantOf { text, streaming } = AssistantOf::deserialize(rest)?;
+            Body::Assistant { text, streaming }
+        }
+        BodyKind::Thinking => {
+            let ThinkingOf { text, streaming, redacted } = ThinkingOf::deserialize(rest)?;
+            Body::Thinking { text, streaming, redacted }
+        }
+        BodyKind::Tool => Body::Tool(Box::new(ToolCall::deserialize(rest)?)),
+        BodyKind::Notice => {
+            let NoticeOf { level, text } = NoticeOf::deserialize(rest)?;
+            Body::Notice { level, text }
+        }
+    })
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -2203,6 +2534,139 @@ pub fn clip_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an event reads as serde's derive (its body flattened, tagged by `kind`) read it,
+    /// the derive kept here for it: every kind of body, as written (its tag after the event's own fields), with its own
+    /// fields after its body's, its tag first, its tag last, fields it doesn't know about it, a key written escaped, from
+    /// a JSON value, and inside an update; and the same refusals, in the same words: a kind it doesn't know, no tag, a
+    /// field it must have missing, one given twice, the wrong type, not a map.
+    #[test]
+    fn g9_s5_an_event_reads_as_serdes_derive_read_it() -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Derived {
+            id: String,
+            seq: u64,
+            at: i64,
+            #[serde(default)]
+            parent: Option<String>,
+            #[serde(default)]
+            by: Option<String>,
+            #[serde(flatten)]
+            body: Body,
+        }
+        let derived = |json: &str| -> Result<Event, serde_json::Error> {
+            let Derived { id, seq, at, parent, by, body } = serde_json::from_str(json)?;
+            Ok(Event { id, seq, at, parent, by, body })
+        };
+        // The words of a refusal, where it was said left out (the derive says it once it has read the whole map).
+        let words = |r: Result<Event, serde_json::Error>| r.err().map(|e| e.to_string().split(" at line").next().unwrap_or_default().to_owned());
+        // `pairs` as a JSON object, in their order.
+        let object = |pairs: &[(&str, &serde_json::Value)]| -> anyhow::Result<String> {
+            let fields: Vec<String> = pairs.iter().map(|(k, v)| Ok(format!("{}:{}", serde_json::to_string(k)?, serde_json::to_string(v)?))).collect::<anyhow::Result<_>>()?;
+            Ok(format!("{{{}}}", fields.join(",")))
+        };
+        let tool = ToolCall {
+            tool_id: "t1".into(),
+            name: "mcp__github__search".into(),
+            tool: ToolKind::Mcp,
+            title: "deadline".into(),
+            detail: Some("in kiln".into()),
+            input: serde_json::json!({"q": "deadline", "n": [1, 2.5, null], "deep": {"kind": "not the tag"}}),
+            status: ToolStatus::Done,
+            output: Some("a\nb".into()),
+            truncated: true,
+            diffs: vec![FileDiff { path: "src/a.rs".into(), created: true, hunks: vec![Hunk { old_start: 1, old_lines: 1, new_start: 1, new_lines: 2, lines: vec!["-a".into(), "+b".into(), "+c".into()] }] }],
+            todos: vec![Todo { text: "read the deadline".into(), status: "in_progress".into() }],
+            task: Some("task-1".into()),
+            exit_code: Some(-1),
+            started: 5,
+            ended: Some(9),
+            server: Some("github".into()),
+            tool_short: Some("search".into()),
+            skill: Some("review".into()),
+            runner: Some("linux/amd64".into()),
+        };
+        let bodies = [
+            Body::User { text: "fix the deadline".into(), images: 2, client_id: Some("c1".into()), origin: Some("human".into()), attachments: vec!["a.png".into()], reply_to: Some("e0".into()) },
+            Body::User { text: "hi".into(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None },
+            Body::Assistant { text: "the retry loop reads its deadline".into(), streaming: true },
+            Body::Assistant { text: String::new(), streaming: false },
+            Body::Thinking { text: "hmm".into(), streaming: true, redacted: true },
+            Body::Thinking { text: String::new(), streaming: false, redacted: false },
+            Body::Tool(Box::new(tool)),
+            Body::Notice { level: Level::Warn, text: "compacted".into() },
+        ];
+        const OWN: [&str; 5] = ["id", "seq", "at", "parent", "by"];
+        let unknown = serde_json::json!({"x": [1]});
+        for (n, body) in bodies.into_iter().enumerate() {
+            for (parent, by) in [(None, None), (Some("t0".to_owned()), Some("Claude Code".to_owned()))] {
+                let e = Event { id: format!("e{n}"), seq: u64::try_from(n)?, at: -7, parent, by, body: body.clone() };
+                let written = serde_json::to_string(&e)?;
+                anyhow::ensure!(serde_json::from_str::<Event>(&written)? == e && derived(&written)? == e, "as written: {written}");
+                let value = serde_json::to_value(&e)?;
+                anyhow::ensure!(Event::deserialize(&value)? == e && serde_json::from_value::<Event>(value.clone())? == e, "from a value: {written}");
+                let update = format!(r#"{{"t":"events","events":[{written},{written}]}}"#);
+                anyhow::ensure!(serde_json::from_str::<super::super::core::Update>(&update)? == super::super::core::Update::Events { events: vec![e.clone(), e.clone()] }, "in an update: {written}");
+                // Its pairs, each kind apart: its own, its tag, its body's.
+                let pairs: Vec<(&str, &serde_json::Value)> = value.as_object().into_iter().flatten().map(|(k, v)| (k.as_str(), v)).collect();
+                let own: Vec<(&str, &serde_json::Value)> = pairs.iter().copied().filter(|(k, _)| OWN.contains(k)).collect();
+                let tag: Vec<(&str, &serde_json::Value)> = pairs.iter().copied().filter(|(k, _)| *k == "kind").collect();
+                let fields: Vec<(&str, &serde_json::Value)> = pairs.iter().copied().filter(|(k, _)| !OWN.contains(k) && *k != "kind").collect();
+                let half = fields.get(..fields.len() / 2).unwrap_or_default();
+                let rest = fields.get(fields.len() / 2..).unwrap_or_default();
+                let orders = [
+                    // Its tag first, its own last.
+                    [tag.clone(), fields.clone(), own.clone()].concat(),
+                    // Its own about its body's fields, its tag among them.
+                    [own.get(..1).unwrap_or_default().to_vec(), tag.clone(), half.to_vec(), own.get(1..).unwrap_or_default().to_vec(), rest.to_vec()].concat(),
+                    // Its tag last: its body's fields before it.
+                    [own.clone(), fields.clone(), tag.clone()].concat(),
+                    // Fields it doesn't know, about its tag.
+                    [vec![("before", &unknown)], own.clone(), tag.clone(), vec![("after", &unknown)], fields.clone()].concat(),
+                ];
+                for order in orders {
+                    let json = object(&order)?;
+                    anyhow::ensure!(serde_json::from_str::<Event>(&json)? == e && derived(&json)? == e, "reordered: {json}");
+                }
+            }
+        }
+        // Taken alike: a key written escaped is the key it says; a tag may be its variant's index, as the derive reads it.
+        for taken in [r#"{"id":"e1","seq":1,"at":2,"kind":"assistant","text":"x"}"#, r#"{"id":"e1","seq":1,"at":2,"kind":1,"text":"x"}"#, r#"{"id":"e1","text":"x","seq":1,"kind":"assistant","at":2,"text2":"y"}"#] {
+            anyhow::ensure!(serde_json::from_str::<Event>(taken)? == derived(taken)?, "{taken}");
+        }
+        // Refused alike, in the same words.
+        for refused in [
+            r#"{"id":"e1","seq":1,"at":2,"kind":"telepathy","text":"x"}"#,
+            r#"{"seq":1,"at":2,"kind":"assistant","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"kind":"assistant","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"assistant"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"notice","text":"x","level":"loud"}"#,
+            r#"{"id":"e1","id":"e2","seq":1,"at":2,"kind":"assistant","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"assistant","text":"x","text":"y"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"assistant","kind":"user","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"text":"x","kind":"assistant","kind":"user"}"#,
+            r#"{"id":1,"seq":1,"at":2,"kind":"assistant","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"assistant","text":5}"#,
+            r#"{"id":"e1","seq":1,"at":2,"text":5,"kind":"assistant"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":5,"text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":-1,"text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":1.5,"text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":null,"text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":"1","text":"x"}"#,
+            r#"{"id":"e1","seq":1,"at":2,"kind":{"a":1},"text":"x"}"#,
+            r#"[1]"#,
+            r#""e1""#,
+            "null",
+        ] {
+            let (mine, theirs) = (serde_json::from_str::<Event>(refused), derived(refused));
+            anyhow::ensure!(mine.is_err() && theirs.is_err(), "{refused}: {mine:?} and {theirs:?}");
+            let (mine, theirs) = (words(mine), words(theirs));
+            anyhow::ensure!(mine == theirs, "{refused}: said {mine:?}, the derive {theirs:?}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_subagent_s_perms_never_let_it_do_more_than_what_it_s_under() {

@@ -1397,6 +1397,44 @@ impl Turns {
         }
     }
 
+    /// After a piece of the loop's work: as [`Turns::after`], its turn over once its next piece would pass its step's
+    /// quantum, but its poll ends there too, whether or not anything else wants the shard now (`yield_now`, where
+    /// `after` asks `maybe_yield`). Goal 9, plan 01a1a87b2cec step 3: no poll past the quantum. Told that nothing
+    /// wanted the shard, the hub's net loop went on into its next turn in the same poll, and a burst of runners' frames
+    /// held its shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end
+    /// costs a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else
+    /// is ready: once a quantum at the most, and only while frames wait.
+    pub async fn end(&mut self) {
+        if self.over() {
+            hyper_rt::futures::yield_now().await;
+            *self = Self::new();
+        }
+    }
+
+    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a runner
+    /// frame's read: `crate::wire::payload::expected_ns`): where that, after a piece as long as the longest this turn has
+    /// done, would take the turn past its step's quantum, the turn ends first, its poll with it ([`Turns::end`]), and the
+    /// piece is the next turn's first. A turn's first piece goes whatever it's expected to take: no turn would take it
+    /// sooner. Goal 9, plan 01a1a87b2cec step 3: a turn of short pieces took one long read last, past the quantum, the
+    /// pieces before it having said nothing of it.
+    pub async fn before(&mut self, expected_ns: u64) {
+        if expected_ns > 0 && hyper_rt::futures::step_budget_ns().is_some_and(|q| self.wont_fit_at(Instant::now(), q, expected_ns)) {
+            hyper_rt::futures::yield_now().await;
+            *self = Self::new();
+        }
+    }
+
+    /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
+    /// looked at), the longest one's time again and `expected_ns` more would take the turn past `quantum_ns`.
+    fn wont_fit_at(&self, now: Instant, quantum_ns: u64, expected_ns: u64) -> bool {
+        // One task's: loads alone, nothing changed (the piece is the next look's).
+        if self.looked_ns.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
+        at_ns.saturating_add(self.piece_ns.load(Ordering::Relaxed)).saturating_add(expected_ns) >= quantum_ns
+    }
+
     /// The loop's next item off `rx`: one waiting already goes on in this turn; one it waited for starts its turn
     /// afresh, as the wait gave its shard to its other work, as the copies' owners take their inboxes
     /// (`crate::harness::copies`). `None` once `rx` is closed and empty. Goal 10, plan 01a1a87b2dae step 5: the
@@ -2390,6 +2428,49 @@ mod tests {
         assert!(t.over_at(at(150), STEP_BUDGET_NS), "a 130 µs piece ending at 150 µs: the next as long ends at 280 µs");
         // Off a shard there's no quantum: never over.
         assert!(!Turns::new().over());
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 3): a turn that's over ends its poll whether or not anything else wants the shard
+    /// (`end`), where `after` goes on in the same poll when nothing does; and a piece expected to run past the quantum
+    /// waits for the next turn (`before`), never a turn's first, nor one that fits.
+    #[test]
+    fn g9_s3_a_turn_over_ends_its_poll_and_a_piece_that_wont_fit_waits_for_the_next() -> anyhow::Result<()> {
+        // Of 100 µs pieces against 266.666 µs: one done, the next 100 µs and 60 µs more of its read ends at 260 µs, within;
+        // 70 µs more, at 270 µs, past. Never before the turn's first piece is done, whatever it's expected to take.
+        let t = Turns::new();
+        let at = |us: u64| t.began + Duration::from_micros(us);
+        assert!(!t.wont_fit_at(at(0), STEP_BUDGET_NS, 10_000_000), "a turn's first piece goes whatever it's expected to take");
+        assert!(!t.over_at(at(100), STEP_BUDGET_NS), "100 µs done and the next as long: 200 µs, within");
+        assert!(!t.wont_fit_at(at(100), STEP_BUDGET_NS, 60_000), "100 + 100 + 60 µs: within");
+        assert!(t.wont_fit_at(at(100), STEP_BUDGET_NS, 70_000), "100 + 100 + 70 µs: past");
+        assert_eq!((t.looked_ns.load(Ordering::Relaxed), t.piece_ns.load(Ordering::Relaxed)), (100_000, 100_000), "asking changed nothing: the turn is where it was");
+        block_on(async {
+            // Over: the poll ends (pending once) though nothing else is on the shard, and the next turn starts afresh.
+            let mut turns = Turns::new();
+            turns.began = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or(turns.began);
+            {
+                let mut end = std::pin::pin!(turns.end());
+                anyhow::ensure!(futures::poll!(end.as_mut()).is_pending(), "an over turn's poll ends there");
+                anyhow::ensure!(futures::poll!(end.as_mut()).is_ready(), "and goes on at the next");
+            }
+            anyhow::ensure!(turns.began.elapsed() < Duration::from_secs(1), "the next turn starts afresh");
+            // Not over: it goes on in the same poll.
+            let mut fresh = Turns::new();
+            anyhow::ensure!(futures::poll!(std::pin::pin!(fresh.end())).is_ready(), "a turn with room goes on");
+            // A piece done (a microsecond's), then one expected to take a second: given up first; one expected to take
+            // nothing goes on.
+            let mut turns = Turns::new();
+            turns.began = Instant::now().checked_sub(Duration::from_micros(1)).unwrap_or(turns.began);
+            anyhow::ensure!(!turns.over(), "a microsecond's piece leaves the turn room");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.before(0))).is_ready(), "nothing more expected: it goes on");
+            {
+                let mut before = std::pin::pin!(turns.before(1_000_000_000));
+                anyhow::ensure!(futures::poll!(before.as_mut()).is_pending(), "a piece that won't fit waits for the next turn");
+                anyhow::ensure!(futures::poll!(before.as_mut()).is_ready(), "which it starts");
+            }
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.before(1_000_000_000))).is_ready(), "the next turn's first piece goes whatever it's expected to take");
+            Ok(())
+        })
     }
 
     /// Goal 10 (plan 01a1a87b2dae step 5): a loop takes an item waiting already in the turn it has, and starts its
