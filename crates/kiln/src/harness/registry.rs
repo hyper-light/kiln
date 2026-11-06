@@ -5807,9 +5807,10 @@ mod tests {
 
     /// Session `id`'s updates from its runner with its events out of their numbers' order, drawn from `draws`, taken into
     /// `model` as they'd be taken. Its new events (`top` + 1 on, `fresh` of them) and those its copy lacks among its older
-    /// ones (`late`) come in any order, in batches of one to four, each new one's words streamed after it in two parts;
-    /// now and then a batch goes again as the copy has it (a runner's resend); and every eighth batch one of its `oldest`
-    /// is said again in other words, and given more words after.
+    /// ones (`late`) come in any order, in batches of one to four, and one in ten of sixteen to thirty-nine (an owner's turn
+    /// may run out in one, its rest coming back to it: goal 9, plan 01a1a87b2cec step 3), each new one's words streamed after
+    /// it in two parts; now and then a batch goes again as the copy has it (a runner's resend); and every eighth batch one
+    /// of its `oldest` is said again in other words, and given more words after.
     fn out_of_order(id: &str, draws: &mut Draws, top: u64, fresh: u64, late: &[u64], oldest: &[u64], model: &mut std::collections::BTreeMap<String, (u64, String)>) -> Vec<Update> {
         let mut due: Vec<u64> = (top + 1..=top + fresh).chain(late.iter().copied()).collect();
         for i in (1..due.len()).rev() {
@@ -5822,7 +5823,8 @@ mod tests {
         };
         let (mut rest, mut batches) = (due.as_slice(), Vec::<Vec<u64>>::new());
         while !rest.is_empty() {
-            let (batch, after) = rest.split_at((1 + draws.below(4)).min(rest.len()));
+            let size = if draws.below(10) == 0 { 16 + draws.below(24) } else { 1 + draws.below(4) };
+            let (batch, after) = rest.split_at(size.min(rest.len()));
             rest = after;
             let events = batch
                 .iter()
