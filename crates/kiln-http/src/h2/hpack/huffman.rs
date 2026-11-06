@@ -130,6 +130,44 @@ pub(crate) fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     if accept { Ok(()) } else { Err(()) }
 }
 
+/// Why [`decode_bounded`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bounded {
+    /// Not a valid Huffman string.
+    Invalid,
+    /// It decodes to more than the bound.
+    Over,
+}
+
+/// [`decode`], stopping as soon as the string would decode to more than `max` bytes: what it
+/// reserves and writes is at most `max` (QPACK's field-by-field budget, goal 4 step 2: a Huffman
+/// string is sized before it's materialised, never decoded whole and then measured). The shortest
+/// code is five bits, so a string decodes to at most `src.len() * 8 / 5` bytes.
+pub(crate) fn decode_bounded(src: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), Bounded> {
+    let t = table();
+    out.reserve((src.len() * 8 / 5).min(max));
+    let start = out.len();
+    let mut state = 0usize;
+    let mut accept = true;
+    for &b in src {
+        for nibble in [b >> 4, b & 0xf] {
+            let step = t.get(state).and_then(|s| s.get(usize::from(nibble))).copied().ok_or(Bounded::Invalid)?;
+            if step.flags & FAIL != 0 {
+                return Err(Bounded::Invalid);
+            }
+            if step.flags & EMIT != 0 {
+                if out.len() - start >= max {
+                    return Err(Bounded::Over);
+                }
+                out.push(step.sym);
+            }
+            state = usize::from(step.next);
+            accept = step.flags & ACCEPT != 0;
+        }
+    }
+    if accept { Ok(()) } else { Err(Bounded::Invalid) }
+}
+
 /// The length of `src` Huffman-coded.
 #[cfg(test)]
 pub(crate) fn encoded_len(src: &[u8]) -> usize {

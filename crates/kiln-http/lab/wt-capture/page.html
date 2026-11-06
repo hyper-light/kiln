@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>wt</title>
+<pre id="log"></pre>
+<script>
+  // Goal 4 steps 1 and 7 (plan 01a1a832eb597110a6dcfda227981604): open a WebTransport session,
+  // echo a bidi stream, a uni stream and a datagram, then close; report what happened.
+  // ?info=<url> names where the door's {url|port, hash(es), ticket} come from (default /info).
+  const out = { ua: navigator.userAgent, steps: [], ok: false };
+  const log = (s) => {
+    out.steps.push(s);
+    document.getElementById("log").textContent += s + "\n";
+  };
+  const hex = (h) => new Uint8Array(h.match(/../g).map((b) => parseInt(b, 16)));
+  const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const text = (u) => new TextDecoder().decode(u);
+  async function readAll(readable) {
+    const r = readable.getReader();
+    let got = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await r.read();
+      if (done) return got;
+      const n = new Uint8Array(got.length + value.length);
+      n.set(got);
+      n.set(value, got.length);
+      got = n;
+    }
+  }
+  async function run() {
+    const q = new URLSearchParams(location.search);
+    const info = await (await fetch(q.get("info") || "/info", { credentials: "same-origin" })).json();
+    const hashes = (info.hashes || [info.hash]).map((h) => ({ algorithm: "sha-256", value: h.length === 64 ? hex(h) : b64(h) }));
+    const url = info.url || `https://127.0.0.1:${info.port}/wt?ticket=${info.ticket || "t".repeat(43)}`;
+    log("url " + url.replace(/ticket=[^&]+/, "ticket=…"));
+    if (typeof WebTransport === "undefined") throw new Error("no WebTransport in this browser");
+    const wt = new WebTransport(url, { serverCertificateHashes: hashes, allowPooling: false, requireUnreliable: true });
+    let drained = false;
+    if (wt.draining) wt.draining.then(() => { drained = true; log("draining"); });
+    await wt.ready;
+    log("ready protocol=" + (wt.protocol ?? "?") + " reliability=" + (wt.reliability ?? "?"));
+    // Bidi echo.
+    const bidi = await wt.createBidirectionalStream();
+    const w = bidi.writable.getWriter();
+    await w.write(new TextEncoder().encode("hello-bidi"));
+    await w.close();
+    const back = text(await readAll(bidi.readable));
+    log("bidi " + back);
+    // Uni echo: ours out, the server's back.
+    const uni = await wt.createUnidirectionalStream();
+    const uw = uni.getWriter();
+    await uw.write(new TextEncoder().encode("hello-uni"));
+    await uw.close();
+    const incoming = wt.incomingUnidirectionalStreams.getReader();
+    const { value: inUni } = await incoming.read();
+    const uniBack = text(await readAll(inUni));
+    log("uni " + uniBack);
+    // Datagram echo (Safari 26.4 has createWritable, others datagrams.writable).
+    const dw = wt.datagrams.createWritable ? wt.datagrams.createWritable().getWriter() : wt.datagrams.writable.getWriter();
+    const dr = wt.datagrams.readable.getReader();
+    let dgram = "";
+    for (let i = 0; i < 20 && !dgram; i++) {
+      await dw.write(new TextEncoder().encode("hello-dgram"));
+      const r = await Promise.race([dr.read(), new Promise((res) => setTimeout(() => res(null), 250))]);
+      if (r && r.value) dgram = text(r.value);
+    }
+    log("dgram " + dgram);
+    if (q.get("wait_drain")) {
+      for (let i = 0; i < 40 && !drained; i++) await new Promise((r) => setTimeout(r, 100));
+      log("drained " + drained);
+    }
+    wt.close({ closeCode: 7, reason: "bye" });
+    const closed = await wt.closed;
+    log("closed " + JSON.stringify(closed));
+    out.ok = back === "hello-bidi" && uniBack === "hello-uni" && dgram === "hello-dgram";
+    out.drained = drained;
+  }
+  run()
+    .catch((e) => log("error " + (e && (e.name + ": " + e.message + (e.source ? " source=" + e.source : "") + (e.streamErrorCode != null ? " code=" + e.streamErrorCode : "")))))
+    .finally(async () => {
+      out.done = true;
+      window.__result = out;
+      try {
+        await fetch("/result", { method: "POST", body: JSON.stringify(out) });
+      } catch (e) {}
+    });
+</script>

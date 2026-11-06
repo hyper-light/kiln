@@ -11,7 +11,8 @@
  * Previous/Now/next walk the horizon. No effects: times tick on the resource's poll; the horizon
  * holds while the row is open, until Now catches it up.
  */
-import { shipApi, type ShipCommit, type ShipMark } from "@/api/ship";
+import type { ShipCommit, ShipMark } from "@/api/ship";
+import { DETAIL_OPTS, shipCommit } from "../live";
 import { glyphOf, shipGroups } from "../model";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { clockTime, formatDuration } from "@/lib/format";
@@ -183,7 +184,7 @@ function LaneRow({ group, lane, at, span, detail, now }: { group: string; lane: 
 /** The dropdown's Lanes: the item's groups on one horizon — Review's marks first, Ship's own as
  * they arrive — with Previous / Now / next walking it and Fit/Detail picking the room. */
 export function ShipLanes({ commit }: { commit: ShipCommit }) {
-  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
+  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipCommit(commit.repo, commit.sha, s), DETAIL_OPTS);
   const [walk, setWalk] = React.useState(0);
   const [fit, setFit] = React.useState(true);
   const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroups(detail.data)].filter((g): g is ShipLaneGroup => g != null && g.lanes.length > 0), [detail.data]);

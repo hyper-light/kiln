@@ -378,9 +378,14 @@ impl Disks {
     }
 }
 
-/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, what the system says
-/// is available elsewhere.
+/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, on macOS what it
+/// counts as available itself (free and inactive pages alone said 37 GB were when a Mac's memory ran
+/// out, on 2026-11-05), what the system says is available elsewhere.
 fn mem_free() -> f64 {
+    #[cfg(target_os = "macos")]
+    if let Some(free) = crate::os::contain::memory_free() {
+        return free;
+    }
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()))
