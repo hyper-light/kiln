@@ -239,8 +239,12 @@ static REALTIME_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
 /// don't ask, and the server says why. Call it before the runtime starts, on the thread that starts it: later
 /// calls change nothing.
 pub fn realtime(on: bool) {
+    // Once the runtime started its shards asked or didn't, and once placed they stay where they are.
+    if RT.get().is_some() || REALTIME_PLACE.get().is_some() {
+        return;
+    }
     REALTIME.store(on, Ordering::Relaxed);
-    if !on || REALTIME_PLACE.get().is_some() {
+    if !on {
         return;
     }
     let place = realtime_place();
