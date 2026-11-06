@@ -163,7 +163,7 @@ pub static CI_GRAPHS: Owner = Owner::new("ci_graphs");
 /// are read up to 32 MiB). Past it the lists read longest ago go: read from the host again when asked.
 pub static PULL_LISTS: Owner = Owner::new("pull_lists");
 
-/// observe's grok rules compiled (`crate::observe::pipeline::grok::Lazy`), each counted at what its regex's
+/// observe's grok rules compiled (`crate::observe::pipeline::grok::Kept`), each counted at what its regex's
 /// lazy DFA may keep for one thread searching it (forward and reverse caches at regex's capacity, 2 MiB
 /// each; regex reports no figure of what they hold). For each further thread searching a rule at once it
 /// may keep that again. Let go with their pipeline.

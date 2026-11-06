@@ -164,6 +164,24 @@ impl Corpus {
     fn lines(&mut self, n: usize) -> String {
         (0..n).map(|_| format!("{}\n", self.take(44).replace('\n', " "))).collect()
     }
+
+    /// The next `n` bytes of it, as [`Corpus::take`] cuts them, for what the person or the agent says (a
+    /// prompt, a text), past any slice kiln takes for a mention of a file (`kiln::harness::files::mentioned`).
+    /// A slice cut at a byte count can begin inside a path, and a file a message mentions brings each cold
+    /// open of its session a frame of what's kept of it. Once fa3b55d7b78 moved kiln's source, the median
+    /// session's 34th text began `/ci.md W27-R08).` (cut from a comment's `docs/ci.md`): one frame more in
+    /// each of its cold opens, past the whole session's budget (W21-R15). The shapes ([`Shape`]) count no
+    /// mentions, and the budgets were set with none.
+    fn said(&mut self, n: usize) -> String {
+        // Once round the corpus at the most: kiln's source isn't all mentions.
+        for _ in 0..self.text.len() / n.max(1) {
+            let text = self.take(n);
+            if kiln::harness::files::mentioned(&text).is_empty() {
+                return text;
+            }
+        }
+        self.take(n)
+    }
 }
 
 /// A session of `shape` for the stand-in to replay in `cwd` (`.fake-replay.jsonl`, the files it
@@ -224,13 +242,13 @@ fn lay_session(shape: &Shape, corpus: &mut Corpus, cwd: &Path, every_ms: u64) ->
         // The texts spread evenly between the calls.
         let due = (i + 1) * shape.texts / shape.tools.max(1);
         while texts < due {
-            lines.push(json!({ "turn": turn, "kind": "text", "text": corpus.take(sized(texts, TEXT)) }).to_string());
+            lines.push(json!({ "turn": turn, "kind": "text", "text": corpus.said(sized(texts, TEXT)) }).to_string());
             texts += 1;
         }
     }
     lines.push(json!({ "turn": shape.turns, "kind": "text", "text": END }).to_string());
     std::fs::write(cwd.join(".fake-replay.jsonl"), lines.join("\n") + "\n")?;
-    Ok((0..shape.turns).map(|t| corpus.take(sized(t, PROMPT))).collect())
+    Ok((0..shape.turns).map(|t| corpus.said(sized(t, PROMPT))).collect())
 }
 
 /// The last thing a replayed session says.

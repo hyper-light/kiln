@@ -1873,7 +1873,6 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "crossbeam-deque",
- "crossbeam-utils",
  "hyper-measure",
  "libc",
  "loom",

@@ -1,7 +1,6 @@
 //! HTTP/1.1 and HTTP/2 server: kiln-http's connections on hyper-rt. Each accepted connection is one
-//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side), or run
-//! where the server's placement puts them (goal 7, `crate::placement`: on a less delayed shard, or as
-//! movable tasks), their responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
+//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side), their
+//! responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -225,25 +224,24 @@ where
     }
 }
 
-/// A request's handler run where the server's placement puts it (goal 7, `crate::placement`): in this task,
-/// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
-/// answered. A `demoted` request (its head read in a more urgent class's turn) takes its own class's turn
-/// first where it stays in this task (goal 6, plan 01a1a59c2abe step 3).
+/// A request's handler, run in its connection's task (goal 7's A/B kept it there: docs/runtime-lab.md, "Goal 7:
+/// placement"). A `demoted` request (its head read in a more urgent class's turn) first gives way to a more urgent
+/// task waiting on the shard (`hyper_rt::coop::give_way`), so a person's page woken meanwhile goes first; else it ran
+/// on in Critical's turn, and a page queued behind every API call read before it; with none waiting it goes on at
+/// once, its place kept (goal 6, plan 01a1a59c2abe step 3).
 /// A request's future as its connection keeps and polls it (both HTTP/1.1's and HTTP/2's; goal 9, plan 01a1a87b2cec
-/// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, its placement,
-/// the connection's slot for it) moves a pointer. Each moved the handler's whole future as it was first polled:
-/// 36 KB a layer at rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's
-/// step 5 (the router boxed apart). Boxed, it's copied once, into its box. Its answer's body goes to the connection
-/// in its guard as it is, not boxed again (`crate::overload::Guarded`).
+/// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, the connection's
+/// slot for it) moves a pointer. Each moved the handler's whole future as it was first polled: 36 KB a layer at
+/// rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's step 5 (the router
+/// boxed apart). Boxed, it's copied once, into its box. Its answer's body goes to the connection in its guard as it
+/// is, not boxed again (`crate::overload::Guarded`).
 fn answer<H: Handler>(handler: Arc<H>, req: Request, serving: crate::overload::Serving) -> impl Future<Output = http::Response<crate::overload::Guarded>> + Send + 'static {
     let handling = Box::pin(handler.handle(req));
-    async move { crate::overload::while_sent(placed(serving.class(), serving.demoted(), handling).await, serving) }
-}
-
-async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Future<Output = Response> + Send + 'static) -> Response {
-    match crate::placement::request(class, demoted, handling).await {
-        Some(resp) => resp,
-        None => text(StatusCode::SERVICE_UNAVAILABLE, "the server is stopping"),
+    async move {
+        if serving.demoted() {
+            hyper_rt::coop::give_way().await;
+        }
+        crate::overload::while_sent(handling.await, serving)
     }
 }
 

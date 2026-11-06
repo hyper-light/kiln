@@ -232,7 +232,7 @@ fn ingest_all(hub: &Arc<Hub>, there: &Location, updates: Vec<Update>) -> anyhow:
     let (h, there) = (Arc::clone(hub), there.clone());
     kiln::rt::block_on(async move {
         for u in updates {
-            h.harness.ingest_from(&h, &there, ID, u, false).await;
+            h.harness.ingest_from(&there, ID, u, false).await;
         }
         h.harness.applied(ID).await;
         Ok(())

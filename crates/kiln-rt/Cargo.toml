@@ -21,9 +21,6 @@ pin-project-lite = "0.2.17"
 # The compute pool's queues (src/compute.rs, kiln's departure, ORIGIN.md): Chase and Lev's work-stealing deque
 # and a lock-free injector, no lock on any path; already in kiln's lock file through rayon.
 crossbeam-deque = "0.8"
-# A movable task's future in its header, taken and put back by whoever its state word names owner (src/movable.rs,
-# kiln's goal 7): crossbeam's lock-free cell, a pointer swapped; already in kiln's lock file under crossbeam-deque.
-crossbeam-utils = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of

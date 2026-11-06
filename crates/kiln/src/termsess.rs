@@ -716,7 +716,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: crate::mem
         // up by its step quantum now.
         let mut turns = crate::rt::Turns::new();
         loop {
-            turns.after().await;
+            turns.end().await;
             let ev = futures::select_biased! {
                 () = s.close.cancelled().fuse() => Ev::Close,
                 () = s.gap.notified().fuse() => Ev::Gap,

@@ -3241,7 +3241,7 @@ impl Hub {
             // and says nothing of where the session runs: whoever waits for it is told, and
             // the session's messages still go where it runs.
             u @ crate::harness::core::Update::Inbox { .. } => {
-                self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
+                self.harness.ingest_from(&crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
             }
             // The rest goes to the shard that owns the session's copy, which judges it there and
             // takes it, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4;
@@ -4265,10 +4265,11 @@ impl Hub {
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
         // Its turns on its shard: a queue that finds no runner was walked whole in one poll, every second; one job's
-        // pick at a time now, the shard given up once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+        // pick at a time now, its poll ended once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3: no
+        // poll past the quantum, `rt::Turns::end`).
         let mut turns = crate::rt::Turns::new();
         for job in queued {
-            turns.after().await;
+            turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
             if !runs.contains_key(&job.run_id) {
                 let r = self.store.run(job.run_id.clone()).await?;
@@ -4908,13 +4909,13 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let there = Location::Machine("box".into());
             let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
-            hub.harness.ingest(&hub, &there, "s1", open()).await;
+            hub.harness.ingest(&there, "s1", open()).await;
             let mut events = hub.harness_events.subscribe(16)?;
             let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
             hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
             let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
             anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("harness")) && told.pointer("/info/refused/counts/0/wire") == Some(&serde_json::json!("runner_payload")), "{told}");
-            hub.harness.ingest(&hub, &there, "s1", open()).await;
+            hub.harness.ingest(&there, "s1", open()).await;
             let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
             Ok(())
@@ -6013,7 +6014,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let at = Location::Machine("fedora".into());
             for s in ["held", "gone"] {
-                hub.harness.ingest(&hub, &at, s, Update::Open { info: Box::new(Info { id: s.into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&at, s, Update::Open { info: Box::new(Info { id: s.into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             }
             hub.harness.machine_lost(&hub, "fedora").await;
             hub.store.upsert_agent(record("fedora", "fedora", false)).await?;
