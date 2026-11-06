@@ -228,7 +228,7 @@ impl<T: Clone + Weigh + Send + Sync + 'static> Lanes<T> {
         owner.add(places);
         owner.bound_add(places.saturating_add(self.shared.bytes));
         let pending = (0..self.shared.lanes).map(|_| VecDeque::new()).collect();
-        Ok(Reader { shared: Arc::clone(&self.shared), account, lanes: rxs.into_boxed_slice(), pending, per_lane, next: 0, places, counted: true })
+        Ok(Reader { shared: Arc::clone(&self.shared), account, lanes: rxs.into_boxed_slice(), pending, per_lane, next: 0, places, counted: true, over: None })
     }
 
     /// [`Lanes::subscribe`], or a reader whose lanes have already ended when the runtime has no channel to give
@@ -236,7 +236,7 @@ impl<T: Clone + Weigh + Send + Sync + 'static> Lanes<T> {
     pub fn subscribe_or_ended(&self, per_lane: usize) -> Reader<T> {
         self.subscribe(per_lane).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "a reader of kiln's fan-out couldn't have a channel: it ends at once");
-            Reader { shared: Arc::clone(&self.shared), account: Arc::new(Account { queued: AtomicUsize::new(0), lost: AtomicU64::new(0), lost_up_to: AtomicU64::new(0) }), lanes: Box::new([]), pending: Box::new([]), per_lane: 0, next: 0, places: 0, counted: false }
+            Reader { shared: Arc::clone(&self.shared), account: Arc::new(Account { queued: AtomicUsize::new(0), lost: AtomicU64::new(0), lost_up_to: AtomicU64::new(0) }), lanes: Box::new([]), pending: Box::new([]), per_lane: 0, next: 0, places: 0, counted: false, over: None }
         })
     }
 }
@@ -265,6 +265,21 @@ pub struct Reader<T> {
     places: usize,
     /// Whether it's in the list and counted (a reader refused a channel is neither).
     counted: bool,
+    /// Its start over, where a turn left it ([`Reader::start_over`]).
+    over: Option<Over<T>>,
+}
+
+/// A reader's start over under way ([`Reader::start_over`]), taken an item at a time across its task's turns: the newest
+/// number it lost, how many it missed so far (those let go of for it, and those it held from before them), the lane it's at,
+/// what it keeps of that lane so far (what's newer than its loss, in the order it came), whether that lane's held-back items
+/// were all looked at, and how many it took off that lane's channel.
+struct Over<T> {
+    up_to: u64,
+    missed: u64,
+    lane: usize,
+    kept: VecDeque<Arc<Kept<T>>>,
+    held: bool,
+    taken: usize,
 }
 
 /// What one look at a lane found.
@@ -285,8 +300,11 @@ impl<T: Clone> Reader<T> {
 
     /// The next item if one waits: `TryRecvError::Empty` when none does; `Overflowed` and `Closed` as [`Reader::recv`]'s.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        if let Some(n) = self.start_over() {
-            return Err(TryRecvError::Overflowed(n));
+        match self.start_over(false) {
+            Some(Ok(n)) => return Err(TryRecvError::Overflowed(n)),
+            // Never, unbounded: none waits.
+            Some(Err(())) => return Err(TryRecvError::Empty),
+            None => {}
         }
         let n = self.lanes.len();
         let mut ended = 0;
@@ -298,8 +316,10 @@ impl<T: Clone> Reader<T> {
                 Looked::Ended => ended += 1,
             }
         }
-        if let Some(n) = self.start_over() {
-            return Err(TryRecvError::Overflowed(n));
+        match self.start_over(false) {
+            Some(Ok(n)) => return Err(TryRecvError::Overflowed(n)),
+            Some(Err(())) => return Err(TryRecvError::Empty),
+            None => {}
         }
         if ended == n { Err(TryRecvError::Closed) } else { Err(TryRecvError::Empty) }
     }
@@ -307,8 +327,14 @@ impl<T: Clone> Reader<T> {
     /// [`Reader::recv`]'s poll: its lanes in turn, each lane's own wait registering the task with it (and
     /// looking again after), so a send on any of them wakes it.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        if let Some(n) = self.start_over() {
-            return Poll::Ready(Err(RecvError::Overflowed(n)));
+        match self.start_over(true) {
+            Some(Ok(n)) => return Poll::Ready(Err(RecvError::Overflowed(n))),
+            // Its turn spent starting over: the rest at its next, the shard given up meanwhile.
+            Some(Err(())) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            None => {}
         }
         let n = self.lanes.len();
         let mut ended = 0;
@@ -321,8 +347,13 @@ impl<T: Clone> Reader<T> {
             }
         }
         // A loss counted after its first look (the senders found no room): said now.
-        if let Some(n) = self.start_over() {
-            return Poll::Ready(Err(RecvError::Overflowed(n)));
+        match self.start_over(true) {
+            Some(Ok(n)) => return Poll::Ready(Err(RecvError::Overflowed(n))),
+            Some(Err(())) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            None => {}
         }
         if ended == n { Poll::Ready(Err(RecvError::Closed)) } else { Poll::Pending }
     }
@@ -355,35 +386,61 @@ impl<T: Clone> Reader<T> {
     }
 
     /// When it lost some since it last said so: what it holds from before its last loss let go of, what's newer
-    /// held back for it in the order it came, and how many it missed in all.
-    fn start_over(&mut self) -> Option<u64> {
-        let lost = self.account.lost.swap(0, Ordering::AcqRel);
-        if lost == 0 {
-            return None;
-        }
-        let up_to = self.account.lost_up_to.load(Ordering::Acquire);
-        let mut skipped = 0u64;
-        for k in 0..self.lanes.len() {
-            // What it held back before, and what its lane holds now (as many as a lane holds at the most).
-            let mut held: VecDeque<Arc<Kept<T>>> = self.pending.get_mut(k).map(std::mem::take).unwrap_or_default();
-            for _ in 0..self.per_lane {
-                match self.lanes.get_mut(k).map(ChannelReceiver::try_recv) {
-                    Some(Ok(Some(kept))) => held.push_back(kept),
-                    _ => break,
-                }
+    /// held back for it in the order it came, and how many it missed in all. Looked through an item at a time, and where
+    /// it's `bounded` (a task's poll), given up as its turn ends (the shard's step quantum: `crate::rt::Turns`) with the
+    /// rest for the next (`Err`): a lane holds as many as it was asked for (the hub's events, 4,096), and a reader that
+    /// lost some looked through all of them in one poll (goal 9, plan 01a1a87b2cec step 3: the host statuses' loop held
+    /// its shard 0.73 ms on the CPU in g9p16's rounds with hogs, the server's own tasks' longest).
+    fn start_over(&mut self, bounded: bool) -> Option<Result<u64, ()>> {
+        if self.over.is_none() {
+            let lost = self.account.lost.swap(0, Ordering::AcqRel);
+            if lost == 0 {
+                return None;
             }
-            for kept in held {
-                if kept.seq >= up_to {
+            let up_to = self.account.lost_up_to.load(Ordering::Acquire);
+            self.over = Some(Over { up_to, missed: lost, lane: 0, kept: VecDeque::new(), held: false, taken: 0 });
+        }
+        let turn = bounded.then(crate::rt::Turns::new);
+        loop {
+            let over = self.over.as_mut()?;
+            let k = over.lane;
+            if k >= self.lanes.len() {
+                let missed = over.missed;
+                self.over = None;
+                return Some(Ok(missed));
+            }
+            if turn.as_ref().is_some_and(crate::rt::Turns::over) {
+                return Some(Err(()));
+            }
+            // What it held back before, then what its lane holds now (as many as a lane holds at the most).
+            let mut next = None;
+            if !over.held {
+                next = self.pending.get_mut(k).and_then(VecDeque::pop_front);
+                over.held = next.is_none();
+            }
+            if next.is_none()
+                && over.held
+                && over.taken < self.per_lane
+                && let Some(Ok(Some(item))) = self.lanes.get_mut(k).map(ChannelReceiver::try_recv)
+            {
+                over.taken += 1;
+                next = Some(item);
+            }
+            match next {
+                Some(item) if item.seq >= over.up_to => over.kept.push_back(item),
+                Some(item) => {
+                    give_back(&self.account.queued, item.bytes);
+                    over.missed = over.missed.saturating_add(1);
+                }
+                // The lane looked through: what's newer than its loss is what it gives first.
+                None => {
                     if let Some(lane) = self.pending.get_mut(k) {
-                        lane.push_back(kept);
+                        *lane = std::mem::take(&mut over.kept);
                     }
-                } else {
-                    give_back(&self.account.queued, kept.bytes);
-                    skipped += 1;
+                    (over.lane, over.held, over.taken) = (k + 1, false, 0);
                 }
             }
         }
-        Some(lost.saturating_add(skipped))
     }
 }
 
@@ -564,6 +621,50 @@ mod tests {
             let woken = crate::rt::timeout(std::time::Duration::from_secs(5), waiting).await.map_err(|_| anyhow::anyhow!("the waiting reader wasn't woken"))?.map_err(|_| anyhow::anyhow!("the task ended"))?;
             anyhow::ensure!(woken == Ok(Item(0, 6, 400)), "{woken:?}");
             drop(stalled);
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a reader that lost some with a lane's worth waiting starts over across its task's
+    /// turns, its shard given up between them, where it looked through all of them in one poll: it's told how many it missed
+    /// as before (those lost, and those it held from before them), then has what came after its loss.
+    #[test]
+    fn g9_s3_a_reader_starting_over_looks_through_its_lanes_in_turns() -> anyhow::Result<()> {
+        static OWNER: Owner = Owner::new("test_lanes_turns");
+        crate::rt::block_on(async {
+            let fan = Lanes::<Item>::new(&OWNER, 1, 1 << 30);
+            // The hub's events' lanes, as each of their readers asks (`crate::hub::EVENTS`).
+            let per_lane = crate::hub::EVENTS;
+            let mut slow = fan.subscribe(per_lane)?;
+            // A lane's worth held, then ten more lost past it.
+            let sent = u64::try_from(per_lane)? + 10;
+            for n in 1..=sent {
+                fan.send(0, Item(0, n, 0));
+            }
+            let mut polls = 0u32;
+            let first = std::future::poll_fn(|cx| {
+                polls += 1;
+                slow.poll_recv(cx)
+            })
+            .await;
+            anyhow::ensure!(matches!(first, Err(RecvError::Overflowed(n)) if n == sent), "every one missed: {first:?}");
+            fan.send(0, Item(0, sent + 1, 0));
+            anyhow::ensure!(slow.recv().await == Ok(Item(0, sent + 1, 0)), "it goes on from after its loss");
+            // Its lane's worth looked through in more than one poll where looking through it whole takes past a quantum (as
+            // `try_recv`, unbounded, looks through another lane's worth here); in one where it takes less.
+            let quantum = std::time::Duration::from_nanos(hyper_rt::futures::step_budget_ns().unwrap_or(crate::rt::STEP_BUDGET_NS));
+            let one = {
+                let again = Lanes::<Item>::new(&OWNER, 1, 1 << 30);
+                let mut r = again.subscribe(per_lane)?;
+                for n in 1..=sent {
+                    again.send(0, Item(0, n, 0));
+                }
+                let began = std::time::Instant::now();
+                anyhow::ensure!(matches!(r.try_recv(), Err(TryRecvError::Overflowed(n)) if n == sent), "unbounded, the same");
+                began.elapsed()
+            };
+            anyhow::ensure!(one < quantum || polls > 1, "a lane's worth took {one:?} and was looked through in {polls} poll(s)");
+            drop(slow);
             Ok(())
         })
     }
