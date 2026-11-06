@@ -239,15 +239,29 @@ fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec
     }
 }
 
+/// How often [`checker`]'s thread looks at the payloads waiting for it: as fresh as the shards' own counts on `/metrics`
+/// ([`crate::shard_health::COUNTS_AGE`], 100 ms), since kiln-lab reads `kiln_wire_ignored_fields_total` as a window's
+/// difference too, so a field counted that late moves a window's count by 2% at the most. Its thread isn't woken for a
+/// payload (goal 9, plan 01a1a87b2cec step 5): it waited on its queue, so each payload handed to it woke it, a system call
+/// (a futex's wake) on the hub's shard for each runner message, and a switch to the thread and back. Looking every 100
+/// ms, it wakes 10 times a second however many come, and what waits meanwhile is far within [`CHECKS_MOST`] (the lab's
+/// runners send about a thousand payloads a second, a few KiB each: some MiB a second).
+const CHECK_EVERY: Duration = crate::shard_health::COUNTS_AGE;
+
 /// The thread that looks for the unknown fields of payloads read on the shards, started the first time
-/// one is; none where it couldn't start (said so).
+/// one is; none where it couldn't start (said so). It looks at what waits every [`CHECK_EVERY`], never
+/// woken by what's handed to it.
 fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
     static TX: OnceLock<Option<crate::memory::queue::Sender<Check>>> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST);
         let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
-            while let Ok(c) = rx.recv_blocking() {
-                say_unknown(c.wire, c.of, &(c.find)(&c.json));
+            loop {
+                match rx.try_recv() {
+                    Ok(c) => say_unknown(c.wire, c.of, &(c.find)(&c.json)),
+                    Err(async_channel::TryRecvError::Empty) => std::thread::sleep(CHECK_EVERY),
+                    Err(async_channel::TryRecvError::Closed) => break,
+                }
             }
         });
         match started {
@@ -1490,6 +1504,39 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a payload handed to the checker's thread wakes no thread. The thread looks at
+    /// what waits for it every [`CHECK_EVERY`] and never waits on its queue, so no wait of its is listed there for a
+    /// payload handed over to wake (each did, a futex's wake on the hub's shard for every runner message); and each
+    /// payload is still looked at, its unknown fields counted.
+    #[test]
+    fn g9_s5_a_payload_handed_to_the_checker_wakes_no_thread() -> anyhow::Result<()> {
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        struct One {
+            a: u32,
+        }
+        let Some(tx) = checker() else { anyhow::bail!("no checker's thread started") };
+        // A wire no other test reads JSON on, so the count is this test's alone.
+        let wire = Wire::EventsDown;
+        let before = crate::metrics::wire().ignored.get(&[wire.name()]);
+        const HANDED: u64 = 6;
+        for n in 0..HANDED {
+            // Time for the thread to look at what was handed before and go idle again: a thread that waits on its
+            // queue lists its wait then (a hand-over's wake takes every wait listed, so it's looked for before one).
+            std::thread::sleep(2 * CHECK_EVERY);
+            anyhow::ensure!(tx.takers_listed() == 0, "the checker's thread waits on its queue: payload {n} handed over would wake it");
+            check_owned(wire, "One", format!(r#"{{"a":{n},"looked_at":true}}"#), unknown_in::<One>);
+        }
+        // Each came with one field `One` doesn't have: each counted once the thread has looked, within a look or two of
+        // the last (30 s for a loaded machine's).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < HANDED {
+            anyhow::ensure!(Instant::now() < deadline, "the payloads handed to the checker weren't all looked at");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        anyhow::ensure!(tx.takers_listed() == 0, "the checker's thread waits on its queue");
+        Ok(())
     }
 
     /// No handler reads JSON of its own: in the hub, the runner and the harness's host, a read of

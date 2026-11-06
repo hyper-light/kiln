@@ -11,6 +11,7 @@
 pub mod channel;
 pub mod commands;
 pub mod events;
+pub mod fan;
 pub mod keep;
 pub mod link;
 pub mod payload;

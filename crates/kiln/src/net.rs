@@ -402,16 +402,35 @@ impl NetHandle {
     }
 }
 
+/// What making a message's frames took at the slowest seen ([`send_made`]): half a mebibyte's in 1.4 ms on the CPU,
+/// in a poll (rt9's lab, the server's cluster and observe loops on their shards). Bytes, then nanoseconds.
+const MADE_SLOWEST: (u64, u64) = (512 * 1024, 1_400_000);
+
+/// The most bytes of messages [`send_made`] makes into frames where it is, on its shard, not on the compute pool: what
+/// making at the slowest seen ([`MADE_SLOWEST`]) does within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs), 37,449
+/// bytes. A batch of more goes to the pool as before (goal 9, plan 01a1a87b2cec step 5: every batch did, though most are
+/// one write's few short messages to the cluster group's learners, a few hundred bytes each, whose hand-off, a wake of a
+/// pool's thread, the shard's park while it waits and its wake when the job is done, cost the shard several times what
+/// copying them does, once for every write kiln.db takes).
+pub const MADE_HERE_MOST: usize = (hyper_rt::slow::SLOW_POLL_NS as u128 * MADE_SLOWEST.0 as u128 / MADE_SLOWEST.1 as u128) as usize;
+
+/// What making the frames of `bytes` of messages is expected to take at the slowest seen ([`MADE_SLOWEST`]), nanoseconds.
+fn made_ns(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(MADE_SLOWEST.1) / MADE_SLOWEST.0
+}
+
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
 /// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
-/// none, and it's dropped), its frames made on the compute pool (`make`), and each handed to `send`. A frame is a copy
-/// of its message's bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes),
-/// which made on a shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe
-/// loops). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard
-/// is given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its
-/// polls ends within the quantum. Returns once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose
-/// waits take no lock (goal 5, plan 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
-pub async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, make: F, mut send: S)
+/// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
+/// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
+/// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
+/// messages is made on the compute pool, unless what `weigh` says they copy is within [`MADE_HERE_MOST`], when it's
+/// made where it is, its turn ended first if that wouldn't fit it (`rt::Turns::before`; goal 9, plan 01a1a87b2cec step
+/// 5). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard is
+/// given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends
+/// within the quantum. Returns once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no
+/// lock (goal 5, plan 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
+pub async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -435,18 +454,29 @@ where
             },
         };
         let mut batch = Vec::new();
+        // What making the batch's frames copies.
+        let mut bytes = 0usize;
         let mut next = Some(first);
         while let Some(m) = next.take() {
-            batch.extend(route(m));
+            if let Some((peer, x)) = route(m) {
+                bytes = bytes.saturating_add(weigh(&x));
+                batch.push((peer, x));
+            }
             if !turns.over() {
                 next = out.try_recv().ok();
             }
         }
         if !batch.is_empty() {
-            let make = Arc::clone(&make);
-            let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
-            // The wait for the pool ended the poll: the sends start a turn of their own.
-            turns = crate::rt::Turns::new();
+            let made = if bytes <= MADE_HERE_MOST {
+                turns.before(made_ns(bytes)).await;
+                Ok(batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>())
+            } else {
+                let make = Arc::clone(&make);
+                let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
+                // The wait for the pool ended the poll: the sends start a turn of their own.
+                turns = crate::rt::Turns::new();
+                made
+            };
             match made {
                 Ok(made) => {
                     for (peer, frames) in made {
@@ -559,19 +589,49 @@ pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Rec
 /// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
 /// two windows of frames).
 pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
+    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
+    Ok((start_with(spec, out, Box::new(etx))?, erx))
+}
+
+/// [`start`], what comes in handed to `hand`: the server's hub loops, one a shard (`crate::wire::fan`; goal 10,
+/// plan 01a1a87b2dae step 4). Its commands bounded at `out` bytes.
+pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result<NetHandle> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
     let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
-    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
-    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
-    Ok((NetHandle { tx }, erx))
+    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, hand))?;
+    Ok(NetHandle { tx })
 }
 
 /// An event being handed to the loop's owner: kept across turns of the loop, as a send dropped
 /// before it's done loses what it carried. True once taken; false when the owner is gone.
-type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+pub type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+
+/// Who takes what the net thread hands over: its owner's one queue ([`start`]), or the server's hub
+/// loops, each event to the loop that takes it (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4).
+pub trait Hand: Send {
+    /// `ev`, handed over now if there's room for it; else its handing once there is, or none when
+    /// whoever takes it is gone.
+    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>>;
+}
+
+impl Hand for crate::memory::queue::Sender<NetEvent> {
+    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>> {
+        match self.try_send(ev) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Full(ev)) => {
+                let tx = self.clone();
+                Err(Some(Box::pin(async move { tx.send(ev).await.is_ok() })))
+            }
+            Err(async_channel::TrySendError::Closed(_)) => Err(None),
+        }
+    }
+}
+
+/// What the net thread hands its events to, kept across its loop's incarnations: the thread's alone.
+type Owner = std::rc::Rc<std::cell::RefCell<Box<dyn Hand>>>;
 
 /// What an event takes of memory: its place and, a frame, its bytes.
 fn weight(ev: &NetEvent) -> usize {
@@ -603,17 +663,16 @@ impl crate::memory::queue::Weigh for Out {
 
 /// Hands `held` to the owner in order: as many as it has room for, the next one waiting in
 /// `handing` when it has no more. False when the owner is gone.
-fn hand_over(etx: &crate::memory::queue::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+fn hand_over(owner: &Owner, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+    // Taken here alone, on this thread, and never across an await: what's held waits a turn should it be.
+    let Ok(mut hand) = owner.try_borrow_mut() else { return true };
     while handing.is_none() {
         let Some(ev) = held.pop_front() else { break };
         *held_bytes = held_bytes.saturating_sub(weight(&ev));
-        match etx.try_send(ev) {
+        match hand.hand(ev) {
             Ok(()) => {}
-            Err(async_channel::TrySendError::Full(ev)) => {
-                let etx = etx.clone();
-                *handing = Some(Box::pin(async move { etx.send(ev).await.is_ok() }));
-            }
-            Err(async_channel::TrySendError::Closed(_)) => return false,
+            Err(Some(h)) => *handing = Some(h),
+            Err(None) => return false,
         }
     }
     true
@@ -664,8 +723,9 @@ impl Carry {
     }
 }
 
-fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::memory::queue::Sender<NetEvent>) {
+fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, hand: Box<dyn Hand>) {
     let spec = Arc::new(spec);
+    let owner: Owner = std::rc::Rc::new(std::cell::RefCell::new(hand));
     let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
@@ -677,7 +737,7 @@ fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial), std::mem::take(&mut carry)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), std::rc::Rc::clone(&owner), Arc::clone(&last_dial), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
@@ -951,7 +1011,7 @@ where
 async fn run_loop(
     spec: Arc<Spec>,
     rx: crate::memory::queue::Receiver<Out>,
-    etx: crate::memory::queue::Sender<NetEvent>,
+    owner: Owner,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
     carry: Carry,
 ) -> anyhow::Result<Exit> {
@@ -1001,7 +1061,7 @@ async fn run_loop(
     }
 
     loop {
-        if !hand_over(&etx, &mut held, &mut held_bytes, &mut handing) {
+        if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
             return Ok(Exit::Closed);
         }
         let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };
@@ -1306,10 +1366,10 @@ mod tests {
     use super::*;
 
     /// Goal 9, plan 01a1a87b2cec step 3: what `send_made` sends is what came, in the order it came and each message's
-    /// frames in theirs, less what had nowhere to go; the frames are made off the shards (on the compute pool); and no
-    /// poll of it runs more sends than its turn has room for, though nothing else asks for its shard: each send here
-    /// takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding the thread only makes
-    /// sends longer, and turns shorter).
+    /// frames in theirs, less what had nowhere to go; the frames of messages long to make are made off the shards (on
+    /// the compute pool); and no poll of it runs more sends than its turn has room for, though nothing else asks for its
+    /// shard: each send here takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding
+    /// the thread only makes sends longer, and turns shorter).
     #[test]
     fn g9_s3_frames_are_made_off_the_shards_and_sent_in_order_in_turns() -> anyhow::Result<()> {
         use std::future::Future as _;
@@ -1353,7 +1413,8 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                let mut work = std::pin::pin!(send_made(&rx, route, make, send));
+                // Each message weighed past what's made where it is ([`MADE_HERE_MOST`]): every batch goes to the pool.
+                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| MADE_HERE_MOST + 1, make, send));
                 std::future::poll_fn(|cx| {
                     let before = sends.load(Ordering::SeqCst);
                     let polled = work.as_mut().poll(cx);
@@ -1369,6 +1430,52 @@ mod tests {
             let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(send_ns).saturating_sub(1).max(1);
             anyhow::ensure!(most_in_a_poll <= bound, "a poll ran {most_in_a_poll} sends of at least {SEND:?}, past its turn's {bound}");
             anyhow::ensure!(polls > 1, "{} sends in one poll", sent.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a batch of short messages, whose making copies no more than [`MADE_HERE_MOST`],
+    /// is made where it is, on its shard, with no hand-off to the compute pool and back; a batch past it still goes to the
+    /// pool. Either way what's sent is what came, in the order it came, each message's frames in theirs.
+    #[test]
+    fn g9_s5_a_batch_of_short_messages_is_made_where_it_is() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        crate::rt::block_on(async {
+            const MESSAGES: u32 = 16;
+            // A cluster write's few hundred bytes a learner; and one message past the bound, alone or not.
+            for (each, here) in [(512usize, true), (MADE_HERE_MOST + 1, false)] {
+                let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
+                for m in 0..MESSAGES {
+                    tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
+                }
+                drop(tx);
+                let (on_shard, off_shard) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                let make = {
+                    let (on, off) = (Arc::clone(&on_shard), Arc::clone(&off_shard));
+                    move |m: u32| {
+                        let made_on = if crate::rt::on_shard() { &on } else { &off };
+                        made_on.fetch_add(1, Ordering::SeqCst);
+                        vec![m.to_be_bytes().to_vec(), vec![0xff]]
+                    }
+                };
+                let mut sent: Vec<(PeerId, Vec<u8>)> = Vec::new();
+                let send = |peer: PeerId, frame: Vec<u8>| {
+                    sent.push((peer, frame));
+                    async { true }
+                };
+                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), move |_: &u32| each, make, send).await;
+                let expected: Vec<(PeerId, Vec<u8>)> = (0..MESSAGES).flat_map(|m| [(u64::from(m % 3), m.to_be_bytes().to_vec()), (u64::from(m % 3), vec![0xff])]).collect();
+                anyhow::ensure!(sent == expected, "{each} bytes a message: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+                let (on, off) = (on_shard.load(Ordering::SeqCst), off_shard.load(Ordering::SeqCst));
+                let all = u64::from(MESSAGES);
+                if here {
+                    anyhow::ensure!((on, off) == (all, 0), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch is made where it is");
+                } else {
+                    anyhow::ensure!((on, off) == (0, all), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch goes to the pool");
+                }
+            }
+            anyhow::ensure!(MADE_HERE_MOST == 37_449, "half a mebibyte in 1.4 ms, within 100 µs: {MADE_HERE_MOST}");
+            anyhow::ensure!(made_ns(MADE_HERE_MOST) <= hyper_rt::slow::SLOW_POLL_NS, "the most made here is made within a slow poll at the slowest seen");
             Ok(())
         })
     }
