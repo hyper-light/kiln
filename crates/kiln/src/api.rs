@@ -7322,7 +7322,8 @@ mod tests {
             let from = hub.feed.head();
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
-            hub.emit_harness("s1", &serde_json::to_vec(&info)?, 0);
+            // Its text held, as its copy holds it until its next info: the sockets read it.
+            let _info = hub.emit_harness("s1", &serde_json::to_vec(&info)?);
             hub.emit(&ServerEvent::Terminals);
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());

@@ -1792,6 +1792,9 @@ pub struct Mirror {
     /// The events socket's feed's number of its info's last `harness` frame (0: none yet), which its next lets
     /// go of (`crate::hub::Hub::emit_harness`; goal 11, plan 01a1a87b2e56 step 5).
     pub(super) harness_at: u64,
+    /// That frame's text, which the feed lends it (`crate::wire::events::feed::Lent`): held until its next is in
+    /// the feed, then let go of, so the feed's readers pass over this one (goal 9, plan 01a1a87b2cec step 5).
+    pub(super) harness: Option<crate::wire::events::feed::Lent>,
     /// When this server opened it, until its machine announces it: a report from the machine
     /// that left it out was made before its open got there, and doesn't end it.
     pub(super) opened_at: Option<std::time::Instant>,
@@ -1936,6 +1939,7 @@ impl Mirror {
             reset_at: 0,
             started_over_pending: false,
             harness_at: 0,
+            harness: None,
             opened_at: None,
             slot,
             info_json: encoding,
@@ -2250,7 +2254,10 @@ impl Mirror {
     /// number: true when that one had another id (the timeline went another way), which its viewers
     /// can't see from the event alone.
     pub fn upsert(&mut self, e: Arc<Entry>) -> bool {
-        let Some(id) = e.id().map(str::to_owned) else { return false };
+        // Its id read where the entry keeps it, held by a reference of this call's own (goal 9, plan 01a1a87b2cec step
+        // 5: a copy of it was made for each event taken in).
+        let held = Arc::clone(&e);
+        let Some(id) = held.id() else { return false };
         let ev = Ev { entry: e, at: self.rev };
         let found = self.index.get(&self.events, &id);
         if found.is_some_and(|i| self.events.change(i, |slot| *slot = ev.clone())) {

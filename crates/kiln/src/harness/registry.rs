@@ -300,6 +300,20 @@ impl Head {
     }
 }
 
+/// Event `e`'s JSON, as `serde_json::to_string` writes it, written into room made for it once (goal 9, plan
+/// 01a1a87b2cec step 5). `to_string` starts with 128 bytes and doubles them as it writes, so an event of the lab's
+/// 3.5 KB (the stand-in's mean reply) was copied into five larger buffers on its way out, each past what glibc keeps in
+/// a thread's own cache (1,032 bytes), so each a trip to its arena. The room is what the event weighs
+/// (`super::weigh::event`: its place, each text, each tool input's node and keys, more than its JSON's keys, quotes
+/// and commas take), and an eighth more for its texts' escapes: a newline (two bytes in JSON) every eighth byte
+/// at the most before it would grow again, where the stand-in's replies have one every 17 words (its `words`).
+fn event_json(e: &super::model::Event) -> Option<String> {
+    let weight = super::weigh::event(e);
+    let mut out = Vec::with_capacity(weight.saturating_add(weight / 8));
+    serde_json::to_writer(&mut out, e).ok()?;
+    String::from_utf8(out).ok()
+}
+
 impl Entry {
     /// `value`, its JSON written out now.
     pub(super) fn new(value: Value) -> Self {
@@ -329,7 +343,7 @@ impl Entry {
     /// as well (the conversation store's row), when anyone keeps it. One that can't be written out is
     /// `null`, as before.
     pub(super) fn of_event(e: &super::model::Event, keep: Option<&mut dyn FnMut(String)>) -> Self {
-        let Ok(text) = serde_json::to_string(e) else { return Self::written(Value::Null, "null".to_owned()) };
+        let Some(text) = event_json(e) else { return Self::written(Value::Null, "null".to_owned()) };
         crate::memory::SESSION_ENTRIES.add(text.len());
         let body: Box<str> = match keep {
             Some(keep) => {
@@ -2824,7 +2838,11 @@ impl Registry {
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get_mut(id) {
-            m.harness_at = hub.emit_harness(id, m.info_encoded(), m.harness_at);
+            // Its new info's frame in the feed, its text held here; its last one's let go of only now, so a reader
+            // passes over that one once this one's in (goal 9, plan 01a1a87b2cec step 5).
+            let lent = hub.emit_harness(id, m.info_encoded());
+            m.harness_at = lent.seq();
+            m.harness = Some(lent);
         }
         if let Some(c) = thaw {
             s.want_thaw(id, c);
@@ -2923,6 +2941,11 @@ impl Registry {
     /// Session `id` is held by runner process `instance` of its machine, as that process said:
     /// kept (across restarts too) once it changes.
     pub fn held_by(&self, id: &str, instance: &str) {
+        // Held so already, as nearly every update finds it: told by the holders' copy, with no copy of the id made to
+        // ask (goal 9, plan 01a1a87b2cec step 5: one was made for each update its owner took).
+        if self.holders.load().get(id).is_some_and(|h| h == instance) {
+            return;
+        }
         self.held_by_all(std::slice::from_ref(&id.to_owned()), instance);
     }
 
@@ -4786,9 +4809,91 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: what a runner's update costs its session's owner on its shard, in allocations
+    /// (each block and reallocation) and their bytes, as the lab's agents send them (their machines keep their own
+    /// stores, `shipped`): a reply of 1 KB, a state that changes what its info shows, and the same state again, each
+    /// unwatched and watched (after one of each, so what the first makes once, a viewer's topic, is made). Said for
+    /// the hand-over, and held to what the cuts left: a reply is written into room made for it once (it was copied into
+    /// four larger buffers on its way, from serde_json's 128 bytes) and its id isn't copied to find its place.
+    #[test]
+    fn g9_s5_what_an_update_costs_its_owner() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        use crate::os::counted::{Made, made};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
+            // A reply of 1,020 bytes: past what glibc keeps a thread (1,032 bytes, its JSON with it), and short of what's
+            // written off the shard however slowly a test's build writes it.
+            let reply = |n: u64| Event { id: format!("msg_lab_1_{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: "the retry loop reads its deadline ".repeat(30), streaming: false } };
+            // A copy with events already, as the lab's are.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=40).map(reply).collect() }).await;
+            let state = |doing: &str| State { summary: "the retry loop reads its deadline".into(), doing: Some(doing.to_owned()), ..State::default() };
+            // What `u` costs its owner, taken as a runner's update is (`Hub::runner_update`'s `take_from`), and whether it
+            // was taken whole (none of it left to take later, or written off the shard).
+            let cost = |u: Update| {
+                let (h, from) = (Arc::clone(&hub), there.clone());
+                async move {
+                    let owner = Arc::clone(&h);
+                    h.harness
+                        .sessions
+                        .on("s", move |s| {
+                            let before = made();
+                            let rest = owner.harness.take_from(s, &owner, &from, "s", u, true, &|_| false);
+                            let after = made();
+                            let whole = rest.is_none();
+                            drop(rest);
+                            (Made { blocks: after.blocks.saturating_sub(before.blocks), bytes: after.bytes.saturating_sub(before.bytes) }, whole)
+                        })
+                        .await
+                        .unwrap_or_default()
+                }
+            };
+            let mut said = Vec::new();
+            let mut seq = 41;
+            for watched in [false, true] {
+                let attached = if watched { Some(hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?) } else { None };
+                let doing = |n: u64| format!("Reading part{n}.rs");
+                // One of each first.
+                cost(Update::Events { events: vec![reply(seq)] }).await;
+                cost(Update::State { state: Box::new(state(&doing(seq))) }).await;
+                seq += 1;
+                let event = cost(Update::Events { events: vec![reply(seq)] }).await;
+                let changed = cost(Update::State { state: Box::new(state(&doing(seq))) }).await;
+                let again = cost(Update::State { state: Box::new(state(&doing(seq))) }).await;
+                seq += 1;
+                said.push((watched, event, changed, again));
+                drop(attached);
+            }
+            for (watched, (event, _), (changed, _), (again, _)) in &said {
+                eprintln!(
+                    "g9_s5 an update's cost to its owner, {}: a reply {} allocations, {} bytes; a changed state {}, {}; the same state again {}, {}",
+                    if *watched { "watched" } else { "unwatched" },
+                    event.blocks,
+                    event.bytes,
+                    changed.blocks,
+                    changed.bytes,
+                    again.blocks,
+                    again.bytes
+                );
+            }
+            anyhow::ensure!(said.iter().all(|(_, e, c, a)| e.1 && c.1 && a.1), "each taken whole, on the shard: {said:?}");
+            // Held to what's left (measured 2026-11-06 on the owner's thread, where nothing else runs while one is
+            // taken): a reply 13 allocations unwatched, 17 watched (its frame, and the bus's copies of it); a changed
+            // state 26 and 32; the same state again 13. Before goal 9 step 5's cuts here a reply was five more: its id copied
+            // to find its place, and its JSON's 1.1 KB copied into four larger buffers on its way out (serde_json's 128
+            // bytes doubled to 2,048), each a reallocation.
+            for (watched, (e, _), (c, _), (a, _)) in &said {
+                let (reply, changed, again) = if *watched { (17, 32, 13) } else { (13, 26, 13) };
+                anyhow::ensure!(e.blocks <= reply && c.blocks <= changed && a.blocks <= again, "watched {watched}: {e:?} {c:?} {a:?}");
+            }
+            Ok(())
+        })
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 5: each change of a session's info lets go of its last `harness` frame in the
-    /// events socket's feed (`crate::wire::events::feed::Feed::push_over`): its copy keeps the newest frame's number,
-    /// and a page reading the feed from before them all is sent the newest alone.
+    /// events socket's feed (its copy held that frame's text, `crate::wire::events::feed::Feed::push_lent`): its copy
+    /// keeps the newest frame's number, and a page reading the feed from before them all is sent the newest alone.
     #[test]
     fn g11_s5_a_sessions_info_frame_lets_go_of_its_last_in_the_feed() -> anyhow::Result<()> {
         use crate::harness::model::State;
