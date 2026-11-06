@@ -5124,12 +5124,13 @@ mod tests {
             // step 5's Windows and macOS runs, 2026-11-06). So the session's states are taught short first (its own, and its
             // owners' for a first: `Mirror::said_took`), and a reply its owners judge long to write (every session's replies
             // teach them: `super::super::copies::long_to_write`) waits, its shard given up, while replies of another session
-            // are taken as any are, until it's judged short: within the half minute this module's other waits allow.
+            // are taken as any are, until it's judged short.
             hub.harness.ingest(&hub, &there, "fill", Update::Open { info: Box::new(Info { id: "fill".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
             let fills = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let cost = |u: Update| {
                 let (h, from, fills) = (Arc::clone(&hub), there.clone(), Arc::clone(&fills));
                 async move {
+                    // Only bounds a hang: past it the test fails rather than waits forever.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
                         let (owner, at, u) = (Arc::clone(&h), from.clone(), u.clone());
@@ -6177,7 +6178,7 @@ mod tests {
     /// waited for the message to end, and the loop held shard 0 with every test waiting on it (goal 4, plan 01a1a59c2a9c step
     /// 5's macOS runs, 2026-11-06: the owners learned writing on the clock there, the pacer's stops with it). A turn that
     /// takes nothing waits, its shard given up, while events of another session are taken as any are, until the owners judge
-    /// the event short again: within the half minute this module's other waits allow. The turns that take one are the five.
+    /// the event short again. The turns that take one are the five.
     #[test]
     fn g9_s3_an_update_is_taken_in_turns() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
@@ -6190,6 +6191,7 @@ mod tests {
             }
             let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() });
             let (mut took, mut fills) = (Vec::new(), 0);
+            // Only bounds a hang: past it the test fails rather than waits forever.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while let Some(i) = next.take() {
                 anyhow::ensure!(std::time::Instant::now() < deadline, "turns took nothing for 30 s: {took:?} taken before");
