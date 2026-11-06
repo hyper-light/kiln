@@ -215,47 +215,85 @@ impl Asked {
 }
 
 /// Whether a type is text that compresses: JSON, text, JavaScript, SVG, XML. Not event streams (they
-/// stream), nor what's packed already (images, video, archives, fonts).
+/// stream), nor what's packed already (images, video, archives, fonts). Its name compared without regard
+/// to ASCII case where it is, not lowered into a copy first (goal 9, plan 01a1a87b2cec step 5: a string
+/// made for every answer of the API, twice).
 fn compressible(content_type: &str) -> bool {
-    let t = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
-    if t == "text/event-stream" {
+    let t = content_type.split(';').next().unwrap_or_default().trim().as_bytes();
+    let is = |name: &str| t.eq_ignore_ascii_case(name.as_bytes());
+    let starts = |head: &str| t.get(..head.len()).is_some_and(|h| h.eq_ignore_ascii_case(head.as_bytes()));
+    let ends = |tail: &str| t.len().checked_sub(tail.len()).and_then(|at| t.get(at..)).is_some_and(|e| e.eq_ignore_ascii_case(tail.as_bytes()));
+    let holds = |part: &str| t.windows(part.len()).any(|w| w.eq_ignore_ascii_case(part.as_bytes()));
+    if is("text/event-stream") {
         return false;
     }
-    t.starts_with("text/") || t.ends_with("json") || t.ends_with("+json") || t.contains("javascript") || t.ends_with("xml") || t == "image/svg+xml"
+    // `+json` ends in `json`.
+    starts("text/") || ends("json") || holds("javascript") || ends("xml") || is("image/svg+xml")
 }
 
 fn has_token(h: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
     h.get_all(name).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(|t| t.trim().eq_ignore_ascii_case(token))
 }
 
-/// The weak ETag of a body: its SHA-256's first 128 bits. SHA-256 (already kiln's hash) and not a
-/// faster non-cryptographic one: a 304 for a changed body would show a person stale data, and a
-/// body someone else can write to (a run's title) mustn't be made to collide with an older one.
-pub fn etag_of(body: &[u8]) -> String {
+/// The bytes of the SHA-256 a weak ETag names (its first 128 bits), and so twice as many hex digits.
+const ETAG_DIGEST: usize = 16;
+
+/// A weak ETag's bytes: `W/"`, the digest's hex digits, `"`.
+const ETAG_LEN: usize = r#"W/""#.len() + 2 * ETAG_DIGEST + r#"""#.len();
+
+/// The weak ETag of a body, as its bytes: its SHA-256's first 128 bits. SHA-256 (already kiln's hash) and
+/// not a faster non-cryptographic one: a 304 for a changed body would show a person stale data, and a body
+/// someone else can write to (a run's title) mustn't be made to collide with an older one. Written into one
+/// buffer of its length, which its header value takes as it is (goal 9, plan 01a1a87b2cec step 5: the
+/// digest's hex, then `W/"…"` of it, then the header value's copy, three allocations an answer).
+fn etag_bytes(body: &[u8]) -> Vec<u8> {
     use sha2::Digest as _;
     let d = sha2::Sha256::digest(body);
-    format!("W/\"{}\"", hex::encode(d.get(..16).unwrap_or_default()))
+    let mut hexed = [0u8; 2 * ETAG_DIGEST];
+    // The digest's first bytes always fill the room: SHA-256's are 32.
+    let _ = hex::encode_to_slice(d.get(..ETAG_DIGEST).unwrap_or_default(), &mut hexed);
+    let mut tag = Vec::with_capacity(ETAG_LEN);
+    tag.extend_from_slice(br#"W/""#);
+    tag.extend_from_slice(&hexed);
+    tag.push(b'"');
+    tag
 }
 
-/// Whether `If-None-Match` holds `etag`, by the weak comparison `GET` uses (RFC 9110 §13.1.2).
+/// The weak ETag of a body ([`etag_bytes`]), as text.
+pub fn etag_of(body: &[u8]) -> String {
+    String::from_utf8(etag_bytes(body)).unwrap_or_default()
+}
+
+/// The weak ETag of a body ([`etag_bytes`]) as a header value: its buffer taken as it is, never copied (it's
+/// as long as it was made, so its bytes are that allocation), and checked as a header value's are.
+fn etag_value(body: &[u8]) -> Option<HeaderValue> {
+    HeaderValue::from_maybe_shared(Bytes::from(etag_bytes(body))).ok()
+}
+
+/// Whether `If-None-Match` holds `etag`, by the weak comparison `GET` uses (RFC 9110 §13.1.2): each compared
+/// where it is, nothing copied.
 fn holds(validators: &str, etag: &str) -> bool {
-    let bare = |t: &str| t.trim().trim_start_matches("W/").to_owned();
+    fn bare(t: &str) -> &str {
+        t.trim().trim_start_matches("W/")
+    }
     let want = bare(etag);
     validators.split(',').any(|t| t.trim() == "*" || bare(t) == want)
 }
 
 /// What [`finish`] worked out for a body.
 enum Done {
-    NotModified(String),
-    Answer { etag: Option<String>, packed: Option<(Coding, Vec<u8>)> },
+    NotModified(HeaderValue),
+    Answer { etag: Option<HeaderValue>, packed: Option<(Coding, Vec<u8>)> },
 }
 
 fn work(body: &[u8], tag: bool, validators: Option<&str>, coding: Option<Coding>) -> io::Result<Done> {
-    let etag = tag.then(|| etag_of(body));
-    if let (Some(e), Some(v)) = (&etag, validators)
-        && holds(v, e)
-    {
-        return Ok(Done::NotModified(e.clone()));
+    let etag = if tag { etag_value(body) } else { None };
+    let unchanged = match (&etag, validators) {
+        (Some(e), Some(v)) => e.to_str().is_ok_and(|e| holds(v, e)),
+        _ => false,
+    };
+    if unchanged && let Some(e) = etag {
+        return Ok(Done::NotModified(e));
     }
     let packed = match coding {
         // Sent only when it's smaller: a body that doesn't compress goes as it is.
@@ -305,39 +343,76 @@ fn plan(asked: &Asked, resp: &Response) -> Option<Plan> {
 }
 
 /// Whether [`finish`] leaves `resp`, the answer to a request that asked `asked`, as it is: told from its head and its
-/// body's length before any future is made for it, so `crate::api`'s handler makes none for an answer nothing changes
-/// (goal 9, plan 01a1a87b2cec step 5: a boxed future a request on the serve path).
+/// body's length alone, before its body is read ([`finish_here`] gives such an answer back at once, as it came).
 pub fn untouched(asked: &Asked, resp: &Response) -> bool {
     plan(asked, resp).is_none()
 }
 
 /// The API's answer to a request that asked `asked`, compressed and validated as the module says.
 pub async fn finish(asked: Asked, resp: Response) -> Response {
-    let Some(Plan { tag, len, big, coding }) = plan(&asked, &resp) else { return resp };
+    match finish_here(asked, resp) {
+        Finished::Now(resp) => resp,
+        Finished::Later(later) => finish_later(later).await,
+    }
+}
+
+/// [`finish`]'s answer as far as it goes here: done, or (a body long to hash or compress) left for the compute
+/// pool ([`finish_later`]).
+pub enum Finished {
+    Now(Response),
+    Later(Later),
+}
+
+/// An answer [`finish_here`] left for the compute pool, with what it worked out of it.
+pub struct Later {
+    parts: http::response::Parts,
+    bytes: Bytes,
+    tag: bool,
+    big: bool,
+    coding: Option<Coding>,
+    validators: Option<String>,
+}
+
+/// [`finish`] as far as it goes without waiting: an answer it leaves as it is, or works out here (its body fits a
+/// step's quantum, [`inline`]), done; one whose body's work doesn't fit, left for [`finish_later`]. So `crate::api`'s
+/// handler makes a future for an answer only where its work goes to the compute pool (goal 9, plan 01a1a87b2cec
+/// step 5: every answer finish changed was a boxed future, its work done in that future's first poll).
+pub fn finish_here(asked: Asked, resp: Response) -> Finished {
+    let Some(Plan { tag, len, big, coding }) = plan(&asked, &resp) else { return Finished::Now(resp) };
     let (mut parts, body) = resp.into_parts();
     let bytes = match whole(body, len) {
         Ok(b) => b,
-        Err(body) => return Response::from_parts(parts, body),
+        Err(body) => return Finished::Now(Response::from_parts(parts, body)),
     };
     if !tag && coding.is_none() {
         // It varies with what's accepted, though this asker takes no coding.
         vary(&mut parts.headers);
-        return Response::from_parts(parts, srv::full(bytes));
+        return Finished::Now(Response::from_parts(parts, srv::full(bytes)));
     }
-    let validators = asked.validators.clone();
     let cost = match coding {
         Some(Coding::Br) => Work::Br,
         _ => Work::Gzip,
     };
-    let done = if inline(cost, len) {
-        work(&bytes, tag, validators.as_deref(), coding)
-    } else {
-        let b = bytes.clone();
-        match crate::rt::compute(move || work(&b, tag, validators.as_deref(), coding)).await {
-            Ok(r) => r,
-            Err(e) => Err(io::Error::other(e)),
-        }
+    if !inline(cost, len) {
+        return Finished::Later(Later { parts, bytes, tag, big, coding, validators: asked.validators });
+    }
+    let done = work(&bytes, tag, asked.validators.as_deref(), coding);
+    Finished::Now(answered(parts, bytes, big, done))
+}
+
+/// The rest of [`finish`] for an answer [`finish_here`] left: its body's work on the compute pool.
+pub async fn finish_later(later: Later) -> Response {
+    let Later { parts, bytes, tag, big, coding, validators } = later;
+    let b = bytes.clone();
+    let done = match crate::rt::compute(move || work(&b, tag, validators.as_deref(), coding)).await {
+        Ok(r) => r,
+        Err(e) => Err(io::Error::other(e)),
     };
+    answered(parts, bytes, big, done)
+}
+
+/// The answer of `parts` and `bytes` as [`work`] worked it out (`done`).
+fn answered(mut parts: http::response::Parts, bytes: Bytes, big: bool, done: io::Result<Done>) -> Response {
     let cache = |h: &mut HeaderMap| {
         if !h.contains_key(header::CACHE_CONTROL) {
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
@@ -347,9 +422,7 @@ pub async fn finish(asked: Asked, resp: Response) -> Response {
         Ok(Done::NotModified(etag)) => {
             let mut r = srv::status(StatusCode::NOT_MODIFIED);
             let h = r.headers_mut();
-            if let Ok(v) = HeaderValue::from_str(&etag) {
-                h.insert(header::ETAG, v);
-            }
+            h.insert(header::ETAG, etag);
             for name in [header::CACHE_CONTROL, header::VARY, header::EXPIRES, header::CONTENT_LOCATION] {
                 for v in parts.headers.get_all(&name) {
                     h.append(name.clone(), v.clone());
@@ -362,7 +435,7 @@ pub async fn finish(asked: Asked, resp: Response) -> Response {
             r
         }
         Ok(Done::Answer { etag, packed }) => {
-            if let Some(etag) = etag.and_then(|e| HeaderValue::from_str(&e).ok()) {
+            if let Some(etag) = etag {
                 parts.headers.insert(header::ETAG, etag);
                 cache(&mut parts.headers);
             }
@@ -683,6 +756,57 @@ pub(crate) mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what finishing a small answer allocates, and that it's done here, no future
+    /// made. A GET answered 200 with a body under a quantum's work (/healthz's "ok", a tiny JSON) is validated with
+    /// two allocations: its ETag, written in place and taken whole by its header value, and its body boxed again
+    /// (it was a boxed future, the type lowered into a copy twice, the digest's hex, `W/"…"` of it and the header
+    /// value's copy before). One it leaves as it is allocates nothing. The ETag and the 304 are as they were.
+    #[test]
+    fn g9_s5_a_small_answer_is_finished_here_in_two_allocations() -> anyhow::Result<()> {
+        let finished = |asked: Asked, resp: Response| -> anyhow::Result<(Response, u64)> {
+            let before = crate::os::counted::made().blocks;
+            let done = finish_here(asked, resp);
+            let made = crate::os::counted::made().blocks.saturating_sub(before);
+            match done {
+                Finished::Now(r) => Ok((r, made)),
+                Finished::Later(_) => anyhow::bail!("a small answer was left for the compute pool"),
+            }
+        };
+        let br = [("accept-encoding", "gzip, br")];
+        for (what, resp, body) in [("/healthz's", srv::text(StatusCode::OK, "ok"), b"ok".to_vec()), ("a tiny JSON", srv::json(StatusCode::OK, &serde_json::json!({"ok": true})), br#"{"ok":true}"#.to_vec())] {
+            let (r, made) = finished(Asked::of(&get(&br)), resp)?;
+            anyhow::ensure!(made == 2, "{what}: {made} allocations");
+            anyhow::ensure!(header(&r, header::ETAG) == Some(etag_of(&body).as_str()), "{what}: {:?}", header(&r, header::ETAG));
+            anyhow::ensure!(header(&r, header::CACHE_CONTROL) == Some("private, no-cache") && header(&r, header::VARY).is_none(), "{what}");
+            let sent = crate::rt::block_on(body_of(r))?;
+            anyhow::ensure!(sent == body, "{what}: {sent:?}");
+        }
+        // Its ETag as it was written before: `W/"`, the hex of the first 16 bytes of its SHA-256, `"`.
+        {
+            use sha2::Digest as _;
+            let d = sha2::Sha256::digest(b"ok");
+            anyhow::ensure!(etag_of(b"ok") == format!("W/\"{}\"", hex::encode(d.get(..16).unwrap_or_default())), "{}", etag_of(b"ok"));
+        }
+        // Left as it is (a tiny answer to a POST): nothing allocated.
+        let mut post = get(&br);
+        *post.method_mut() = Method::POST;
+        let (r, made) = finished(Asked::of(&post), srv::json(StatusCode::OK, &serde_json::json!({"ok": true})))?;
+        anyhow::ensure!(made == 0 && r.headers().get(header::ETAG).is_none(), "untouched: {made} allocations");
+        // Asked again with its ETag: a 304, the validator compared where it is.
+        let etag = etag_of(b"ok");
+        for inm in [etag.clone(), etag.trim_start_matches("W/").to_owned(), format!("\"other\", {etag}"), "*".to_owned()] {
+            let (r, _) = finished(Asked::of(&get(&[("if-none-match", &inm)])), srv::text(StatusCode::OK, "ok"))?;
+            anyhow::ensure!(r.status() == StatusCode::NOT_MODIFIED && header(&r, header::ETAG) == Some(etag.as_str()), "{inm}: {}", r.status());
+        }
+        let (r, _) = finished(Asked::of(&get(&[("if-none-match", "W/\"other\"")])), srv::text(StatusCode::OK, "ok"))?;
+        anyhow::ensure!(r.status() == StatusCode::OK, "another validator: {}", r.status());
+        // Types told without regard to case, as they were lowered before.
+        for (t, yes) in [("Application/JSON; charset=utf-8", true), ("application/problem+json", true), ("TEXT/plain", true), ("text/event-stream", false), ("Text/Event-Stream", false), ("application/javascript", true), ("image/svg+xml", true), ("application/xml", true), ("image/png", false), ("", false)] {
+            anyhow::ensure!(compressible(t) == yes, "{t}: {}", compressible(t));
+        }
+        Ok(())
     }
 
     #[test]
