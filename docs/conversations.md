@@ -50,7 +50,11 @@ For each agent session (kiln's id):
   store lets no record go before that: it holds back every session that ended since the oldest
   close not archived yet, for at most 30 days past `keep_closed_days`, when that archive is given
   up (`kiln_blobs_archives_given_up_total`).
-- **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
+- **The harness's record** is numbered among each file's non-empty lines, from 0. Its files are
+  looked at once their session flushes its harness's updates (once the store has them), and
+  between, each at its own pace: the time between its lines, as its looks find them; a quiet file
+  is looked at again after as long as it's been quiet, so less and less often (`convo/record.rs`;
+  it looked at every file every second). A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
   that was replaced since (shorter, or not ending with the line kept) starts over. A store that

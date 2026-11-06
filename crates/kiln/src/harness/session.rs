@@ -1041,7 +1041,8 @@ impl Session {
         // The harness it runs in now (a switch changes it), else the one it started in.
         let kind = harness.as_deref().and_then(|name| Kind::all().iter().find(|k| k.name == name)).or_else(|| Kind::get(&first))?;
         let harness_session = own.filter(|h| !h.is_empty())?;
-        Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session })
+        let active_ms = self.info.lock().last_activity;
+        Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session, active_ms })
     }
 
     pub fn resume_spec(&self) -> Spec {
@@ -1444,7 +1445,10 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Se
         }
     }
     if !updates.is_empty() {
-        s.info.lock().last_activity = crate::util::now_ms();
+        let now = crate::util::now_ms();
+        s.info.lock().last_activity = now;
+        // Its harness wrote: the recorder looks at its record's files once the store has these (consts-audit B3).
+        crate::convo::record::active(now);
     }
     for u in updates {
         if sink.send((s.id.clone(), u)).await.is_err() {

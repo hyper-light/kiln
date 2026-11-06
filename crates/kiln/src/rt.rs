@@ -2470,6 +2470,19 @@ impl<'a> Listen<'a> {
         Arc::clone(&held.place)
     }
 
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify.
+    pub fn wait(mut self) {
+        let waker = crate::memory::queue::thread_waker();
+        while !self.over() {
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return;
+            }
+            std::thread::park();
+        }
+    }
+
     /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
     /// notify came.
     pub fn wait_deadline(mut self, until: Instant) -> bool {

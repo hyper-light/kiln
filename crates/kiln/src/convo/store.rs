@@ -534,6 +534,12 @@ impl Store {
         &self.queue
     }
 
+    /// Told of each commit (and of rows let go of, the writer gone): a thread of its own waits on what's returned for
+    /// the store to take more in (`crate::convo::record`'s recorder, consts-audit B3).
+    pub fn commits(&self) -> crate::rt::Listen<'_> {
+        self.queue.room.listen()
+    }
+
     /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
     /// most.
     fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
