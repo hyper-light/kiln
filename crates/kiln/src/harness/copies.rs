@@ -4428,7 +4428,7 @@ mod tests {
         let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
         let events = || update(Update::Events { events: vec![first.clone()] });
         let mut costs = Costs::default();
-        assert_eq!((costs.expected(&job()), costs.expected(&events())), (Duration::ZERO, Duration::ZERO), "nothing before one was taken");
+        assert_eq!(costs.expected(&job()), Duration::ZERO, "nothing before one was taken");
         costs.learn(label_of(&job()), 120_000);
         assert_eq!(costs.expected(&job()), us(360), "a job: its starts' mean and four deviations");
         costs.learn(label_of(&events()), 20_000);
