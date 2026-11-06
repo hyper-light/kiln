@@ -66,6 +66,7 @@ use crate::metrics::Histogram;
 /// - **The lab's tail of the shards' delay** (goal 9's bar, its p99.9 over a round): kiln-lab rests a p99.9 on ten
 ///   samples past it or more (`kiln-lab`'s `TAIL_REQUESTS`), so a round's window of the realistic profile (60 s, its
 ///   four shards) holds 10,000 probes or more at a period up to 24 ms ([`TAIL_PROBES`], [`lab_period_bound`]).
+///
 /// The watchdog's is the shorter: the period is its limit. What reads each period stays within it too: overload's
 /// tolerance (1 s) spans 58 periods; headroom's tolerance for the server's delay is a period (`crate::headroom`); the
 /// nudge reads its shard's run wait once a period (`crate::nudge`).
