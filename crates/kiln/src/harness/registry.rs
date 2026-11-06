@@ -5108,30 +5108,62 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
-            // A reply of 1,020 bytes: past what glibc keeps a thread (1,032 bytes, its JSON with it), and short of what's
-            // written off the shard however slowly a test's build writes it.
+            // A reply of 1,020 bytes: past what glibc keeps a thread (1,032 bytes, its JSON with it).
             let reply = |n: u64| Event { id: format!("msg_lab_1_{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: "the retry loop reads its deadline ".repeat(30), streaming: false } };
             // A copy with events already, as the lab's are.
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=40).map(reply).collect() }).await;
             let state = |doing: &str| State { summary: "the retry loop reads its deadline".into(), doing: Some(doing.to_owned()), ..State::default() };
             // What `u` costs its owner, taken as a runner's update is (`Hub::runner_update`'s `take_from`), and whether it
             // was taken whole (none of it left to take later, or written off the shard).
+            //
+            // Measured where it's taken, on the shard, whatever the host's clock. Off Linux what writing out takes is learned
+            // on the clock (`super::super::copies::Timer`; Windows has no finer one), so a state or a reply the host held past
+            // a slow poll there was learned as long, and the next went off the shard unmeasured (goal 4, plan 01a1a59c2a9c
+            // step 5's Windows and macOS runs, 2026-11-06). So the session's states are taught short first (its own, and its
+            // owners' for a first: `Mirror::said_took`), and a reply its owners judge long to write (every session's replies
+            // teach them: `super::super::copies::long_to_write`) waits, its shard given up, while replies of another session
+            // are taken as any are, until it's judged short: within the half minute this module's other waits allow.
+            hub.harness.ingest(&hub, &there, "fill", Update::Open { info: Box::new(Info { id: "fill".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
+            let fills = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let cost = |u: Update| {
-                let (h, from) = (Arc::clone(&hub), there.clone());
+                let (h, from, fills) = (Arc::clone(&hub), there.clone(), Arc::clone(&fills));
                 async move {
-                    let owner = Arc::clone(&h);
-                    h.harness
-                        .sessions
-                        .on("s", move |s| {
-                            let before = made();
-                            let rest = owner.harness.take_from(s, &owner, &from, "s", u, true, &|_| false);
-                            let after = made();
-                            let whole = rest.is_none();
-                            drop(rest);
-                            (Made { blocks: after.blocks.saturating_sub(before.blocks), bytes: after.bytes.saturating_sub(before.bytes) }, whole)
-                        })
-                        .await
-                        .unwrap_or_default()
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        let (owner, at, u) = (Arc::clone(&h), from.clone(), u.clone());
+                        let measured = h
+                            .harness
+                            .sessions
+                            .on("s", move |s| {
+                                if let Update::Events { events } = &u
+                                    && events.first().is_some_and(super::super::copies::long_to_write)
+                                {
+                                    return None;
+                                }
+                                let said = s.said();
+                                if let Some(m) = s.get_mut("s") {
+                                    while m.said(&u, &said).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) {
+                                        m.said_took(&u, std::time::Duration::ZERO, &said);
+                                    }
+                                }
+                                let before = made();
+                                let rest = owner.harness.take_from(s, &owner, &at, "s", u, true, &|_| false);
+                                let after = made();
+                                let whole = rest.is_none();
+                                drop(rest);
+                                Some((Made { blocks: after.blocks.saturating_sub(before.blocks), bytes: after.bytes.saturating_sub(before.bytes) }, whole))
+                            })
+                            .await
+                            .flatten();
+                        if let Some(m) = measured {
+                            return m;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return (Made::default(), false);
+                        }
+                        let n = fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+                        h.harness.ingest(&h, &from, "fill", Update::Events { events: vec![reply(n)] }).await;
+                    }
                 }
             };
             let mut said = Vec::new();
@@ -5162,7 +5194,7 @@ mod tests {
                     again.bytes
                 );
             }
-            anyhow::ensure!(said.iter().all(|(_, e, c, a)| e.1 && c.1 && a.1), "each taken whole, on the shard: {said:?}");
+            anyhow::ensure!(said.iter().all(|(_, e, c, a)| e.1 && c.1 && a.1), "each taken whole, on the shard (none made and not whole: a reply judged long to write for 30 s): {said:?}");
             // Held to what's left (measured 2026-11-06 on the owner's thread, where nothing else runs while one is
             // taken): a reply 13 allocations unwatched, 17 watched (its frame, and the bus's copies of it); a changed
             // state 26 and 32; the same state again 13. Before goal 9 step 5's cuts here a reply was five more: its id copied
@@ -6136,6 +6168,14 @@ mod tests {
     /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at
     /// the least, the rest coming back to take next. Five events by turns that each run out at once take
     /// five turns, and the copy has each once, in order, as one turn would have left it.
+    ///
+    /// Each turn is a message of its own to the owner, as the owner's own turns are (`super::super::copies::own`), so its
+    /// shard is given up between them. Taken in one message, a turn that handed its event off the shard took nothing (judged
+    /// long to write out: `super::super::copies::long_to_write`, by what every owner of the process learned), its hand-off
+    /// waited for the message to end, and the loop held shard 0 with every test waiting on it (goal 4, plan 01a1a59c2a9c step
+    /// 5's macOS runs, 2026-11-06: the owners learned writing on the clock there, the pacer's stops with it). A turn that
+    /// takes nothing waits, its shard given up, while events of another session are taken as any are, until the owners judge
+    /// the event short again: within the half minute this module's other waits allow. The turns that take one are the five.
     #[test]
     fn g9_s3_an_update_is_taken_in_turns() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
@@ -6143,22 +6183,34 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
             let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
-            let ingest = Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() };
-            let h = Arc::clone(&hub);
-            let turns = hub
-                .harness
-                .sessions
-                .on("s", move |s| {
-                    let (mut turns, mut next) = (0, Some(ingest));
-                    while let Some(i) = next.take() {
-                        turns += 1;
-                        next = h.harness.apply(s, &h, i, &|_| true);
-                    }
-                    turns
-                })
-                .await;
-            anyhow::ensure!(turns == Some(5), "taken in {turns:?} turns");
+            for id in ["s", "fill"] {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            }
+            let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() });
+            let (mut took, mut fills) = (Vec::new(), 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while let Some(i) = next.take() {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "turns took nothing for 30 s: {took:?} taken before");
+                let h = Arc::clone(&hub);
+                let turn = hub
+                    .harness
+                    .sessions
+                    .on("s", move |s| {
+                        let had = s.get("s").map_or(0, |m| m.events.len());
+                        let rest = h.harness.apply(s, &h, i, &|_| true);
+                        (rest, s.get("s").map_or(0, |m| m.events.len()).saturating_sub(had))
+                    })
+                    .await;
+                let Some((rest, n)) = turn else { anyhow::bail!("no owner took the turn") };
+                if n > 0 {
+                    took.push(n);
+                } else {
+                    fills += 1;
+                    hub.harness.ingest(&hub, &there, "fill", Update::Events { events: vec![said(fills)] }).await;
+                }
+                next = rest;
+            }
+            anyhow::ensure!(took == [1; 5], "the turns that took events took {took:?} ({fills} took none)");
             let names: Vec<String> = (1..=5).map(|n| format!("m{n}")).collect();
             anyhow::ensure!(copy_of(&hub, "s") == names, "the copy: {:?}", copy_of(&hub, "s"));
             Ok(())
