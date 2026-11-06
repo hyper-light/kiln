@@ -4,7 +4,8 @@
 # numbers step 6's plan gives it: a job that failed by name (a server that didn't come up, drivers
 # that left no result), or one left out (a memory freeze). Each runs again on its own seeds under its
 # own number (`--first-round R --rounds 1`), the targets missing the same round together.
-#   fill.py MATRIX.json TAG PARTS_OUT
+#   fill.py MATRIX.json TAG PARTS_OUT [--no-baseline-streams]   (the flag: kiln today's rounds and the
+#   requests' only, while s2 measures the baselines' streams and bursts again)
 import collections, json, sys
 
 TARGETS = ("kiln-today", "h2o-h2", "caddy-h2", "h2o-h3", "caddy-h3")
@@ -19,7 +20,8 @@ def plan(case, prof, browser):
     return 5, 8
 
 
-matrix, tag, out = sys.argv[1:]
+matrix, tag, out = sys.argv[1:4]
+no_sb = "--no-baseline-streams" in sys.argv[4:]
 have = collections.defaultdict(set)
 for j in json.load(open(matrix))["jobs"]:
     have[(j["case"], j["condition"], j["browser"], j["target"])].add(j["round"])
@@ -31,6 +33,8 @@ for case in ("stream", "burst", "request"):
                 rounds, k = plan(case, prof, browser)
                 for t in TARGETS:
                     if browser == "webkit" and t.endswith("-h3"):
+                        continue
+                    if no_sb and t != "kiln-today" and case != "request":
                         continue
                     for r in sorted(set(range(rounds)) - have[(case, f"{prof}/{loss}", browser, t)]):
                         groups[(prof, loss, case, browser, r, k)].append(t)
