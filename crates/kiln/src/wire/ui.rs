@@ -59,13 +59,18 @@ impl From<SessionFrame> for SessionDown {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SessionFrame {
     /// The session whole follows. `born`: the server process's incarnation, in a snapshot (a live
-    /// `open`, a runner announcing the session again, has none).
+    /// `open`, a runner announcing the session again, has none). `window`: to a viewer that asked
+    /// for a window (`?window=1`), the events that follow are its newest alone, and this says where
+    /// they begin (docs/wire.md, "Windows").
     Open {
         #[cfg_attr(test, ts(as = "crate::harness::session::Info"))]
         info: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         born: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        window: Option<EventsWindow>,
     },
     /// Only what changed since the revision the viewer asked for (`?after=`) follows, then `synced`.
     Resumed {
@@ -165,7 +170,7 @@ impl SessionFrame {
     pub fn of(u: &Update) -> Self {
         let json = |v: Result<Value, serde_json::Error>| v.unwrap_or(Value::Null);
         match u {
-            Update::Open { info, .. } => SessionFrame::Open { info: json(serde_json::to_value(info)), born: None },
+            Update::Open { info, .. } => SessionFrame::Open { info: json(serde_json::to_value(info)), born: None, window: None },
             Update::Closed => SessionFrame::Closed,
             Update::State { state } => SessionFrame::State { state: json(serde_json::to_value(state)) },
             Update::Meta { meta } => SessionFrame::Meta { meta: json(serde_json::to_value(meta)) },
@@ -181,6 +186,54 @@ impl SessionFrame {
             Update::Reset { from } => SessionFrame::Reset { from: *from },
         }
     }
+}
+
+/// Where a viewer's window of a session's events begins (docs/wire.md, "Windows";
+/// `crate::harness::window`): the number of its first event, and whether there are events before
+/// it to ask for (`GET /api/harness/sessions/:id/timeline?before=`). An older page says the same of
+/// itself ([`TimelinePage`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct EventsWindow {
+    /// The number (`seq`) of its first event; None when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub before: Option<u64>,
+    /// There's more before it.
+    pub more: bool,
+}
+
+/// An older page of a session's events (`GET /api/harness/sessions/:id/timeline?before=`): those
+/// just before `before`, oldest first, whole turns where they fit (`crate::harness::window`), and
+/// where it begins in turn, to ask for the page before it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct TimelinePage {
+    #[cfg_attr(test, ts(as = "Vec<crate::harness::model::Event>"))]
+    pub events: Vec<Value>,
+    #[serde(flatten)]
+    pub window: EventsWindow,
+}
+
+/// What a lean tool call (`?lean=1`, `crate::harness::window::lean`) left out, in bytes as the
+/// whole call has them: its output, its input (sent `null`), and its diffs' lines (each diff
+/// sent with no hunks, its lines added and taken out said as [`HeldLines`]). The whole call comes on
+/// demand: `GET /api/harness/sessions/:id/events/:event`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct HeldBack {
+    pub output: u64,
+    pub input: u64,
+    /// Its diffs' hunks' lines, counted.
+    pub lines: u64,
+}
+
+/// What a lean call's diff says of its hunks, held back ([`HeldBack`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct HeldLines {
+    pub add: u64,
+    pub del: u64,
 }
 
 /// What became of a command that was taken (`crate::harness::asked`).

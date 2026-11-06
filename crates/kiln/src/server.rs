@@ -217,6 +217,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
         // W28-R59: each commit's verdict, worked out again as its lane's runs end.
         child!("ci-verdicts", h => crate::ci::verdict::verdict_loop(h));
+        // W21-R15: Ship's rows go down the events sockets as they change, for its pages to take in place.
+        child!("ship-rows", h => crate::ship::rows_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
         child!("previews", h => crate::ci::previews::run(h));
         child!("review-replies", h => crate::ci::replies::run(h));
@@ -253,6 +255,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         // WebRTC to streams' viewers, on its own UDP port (docs/previews.md, "Streams").
         if cfg.server.webrtc_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
             child!("webrtc", h => crate::harness::webrtc::run(h));
+        }
+        // The HTTP/3 WebTransport door, on its own UDP port, off until declared (goal 4 step 6).
+        if cfg.server.h3_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            child!("h3-door", h => crate::h3door::run(h));
         }
     }
     // Observe (docs/observe.md): not in `kiln workflow run`'s own server, which runs CI alone.

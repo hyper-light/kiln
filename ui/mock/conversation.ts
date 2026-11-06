@@ -239,6 +239,74 @@ const onDisk = new Map<string, Buffer>([
 
 /** The long session's files, as the server serves them: a kept copy by its content (for good), or
  *  a mentioned path read now; both take `Range`. */
+/* -------------------------------------------- windows (docs/wire.md, "Windows"), as the server cuts them */
+
+/** The server's bounds (crates/kiln/src/harness/window.rs, T3 Code's): about 1 MiB, 10 turns (20 a page), 500 events. */
+const WINDOW_BYTES = 1 << 20;
+const WINDOW_TURNS = 10;
+const PAGE_TURNS = 20;
+const WINDOW_ROWS = 500;
+const begins = (e: HEvent) => e.kind === "user" && !e.parent;
+const LEAN_KINDS = new Set(["shell", "read", "search", "web", "edit"]);
+
+/** A settled tool call without its bodies, as `?lean=1` sends it (`window::lean`); anything else as it is. */
+function leanOf(e: HEvent): HEvent {
+  if (e.kind !== "tool" || !LEAN_KINDS.has(e.tool) || e.status === "running" || e.status === "pending" || e.status === "error" || (e.exit_code ?? 0) !== 0) return e;
+  const output = e.output?.length ?? 0;
+  const input = e.input && !(typeof e.input === "object" && !Array.isArray(e.input) && Object.keys(e.input).length === 0) ? JSON.stringify(e.input).length : 0;
+  const lines = (e.diffs ?? []).reduce((n, d) => n + d.hunks.reduce((m, h) => m + h.lines.length, 0), 0);
+  if (output === 0 && input === 0 && lines === 0) return e;
+  const rest: Record<string, unknown> = { ...e };
+  delete rest.output;
+  const diffs = e.diffs?.map((d) => {
+    const all = d.hunks.flatMap((h) => h.lines);
+    return { ...d, hunks: [], add: all.filter((l) => l.startsWith("+")).length, del: all.filter((l) => l.startsWith("-")).length };
+  });
+  return { ...rest, input: null, ...(diffs ? { diffs } : {}), held: { output, input, lines } } as unknown as HEvent;
+}
+
+/** Where a window of `all[..end]` begins (`window::start`). */
+function windowStart(all: HEvent[], end: number, turns: number, lean: boolean): number {
+  let [bytes, rows, held] = [0, 0, 0];
+  let whole: number | null = null;
+  for (let i = end - 1; i >= 0; i--) {
+    const e = all[i]!;
+    const n = JSON.stringify(lean ? leanOf(e) : e).length;
+    if (rows > 0 && (bytes + n > WINDOW_BYTES || rows >= WINDOW_ROWS)) return whole ?? i + 1;
+    bytes += n;
+    rows += 1;
+    if (begins(e)) {
+      held += 1;
+      whole = i;
+      if (held >= turns) return i;
+    }
+  }
+  return 0;
+}
+
+/** `GET /api/harness/sessions/demo-long/timeline?before=&lean=` and `.../events/:event`: its older pages and its events whole. */
+export function handleLongTimeline(path: string, url: URL, res: ServerResponse): boolean {
+  const json = (code: number, v: unknown) => {
+    res.writeHead(code, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(v));
+    return true;
+  };
+  const one = /^\/api\/harness\/sessions\/demo-long\/events\/([^/]+)$/.exec(path);
+  if (one) {
+    const e = events.find((x) => x.id === decodeURIComponent(one[1]!));
+    return e ? json(200, e) : json(404, { error: "no such event" });
+  }
+  if (path !== "/api/harness/sessions/demo-long/timeline") return false;
+  const before = Number(url.searchParams.get("before"));
+  if (!Number.isFinite(before)) return json(400, { error: "before is the number of the first event the viewer has" });
+  const lean = url.searchParams.get("lean") === "1";
+  const end = events.findIndex((e) => e.seq >= before);
+  const stop = end < 0 ? events.length : end;
+  const begin = windowStart(events, stop, PAGE_TURNS, lean);
+  const page = events.slice(begin, stop).map((e) => (lean ? leanOf(e) : e));
+  return json(200, { events: page, ...(page[0] ? { before: page[0].seq } : {}), more: begin > 0 });
+}
+
 export function handleLongFiles(path: string, url: URL, req: IncomingMessage, res: ServerResponse): boolean {
   const byContent = /^\/api\/harness\/sessions\/demo-long\/files\/([0-9a-f]{64})$/.exec(path);
   if (!byContent && path !== "/api/harness/sessions/demo-long/file") return false;
@@ -747,7 +815,7 @@ export function sendAway(ms: number) {
   setTimeout(() => broadcast({ t: "state", state: state() }), ms + 50);
 }
 
-export function handleLongSession(ws: WebSocket, id: string, packed = false, patches = false): boolean {
+export function handleLongSession(ws: WebSocket, id: string, packed = false, patches = false, view: { window: boolean; lean: boolean } = { window: false, lean: false }): boolean {
   if (id !== ID) return false;
   if (Date.now() < knownAt) {
     // Not known here yet (its machine hasn't reconnected): what the server says, then it hangs up.
@@ -763,15 +831,18 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
     live.streaming = false;
   }
   const first = state();
+  // A viewer that asks for a window (`?window=1`) gets its newest events alone, and where they begin; lean (`?lean=1`), settled calls without their bodies.
+  const begin = view.window ? windowStart(events, events.length, WINDOW_TURNS, view.lean) : 0;
+  const sent = events.slice(begin).map((e) => (view.lean ? leanOf(e) : e));
   const frames: unknown[] = [
-    { t: "open", info },
+    view.window ? { t: "open", info, window: { ...(sent[0] ? { before: sent[0].seq } : {}), more: begin > 0 } } : { t: "open", info },
     { t: "meta", meta },
     { t: "state", state: first },
   ];
   // What's kept of the files its messages mention, ahead of the events (MOCK_FILES=0: none yet).
   if (process.env.MOCK_FILES !== "0") frames.push({ t: "files", files: kept });
   // Events in batches, as the server cuts them (by size); the last frame says it's complete.
-  for (let i = 0; i < events.length; i += 120) frames.push({ t: "events", events: events.slice(i, i + 120) });
+  for (let i = 0; i < sent.length; i += 120) frames.push({ t: "events", events: sent.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });
   // A viewer that unpacks gzip (`?z=gzip`): the whole snapshot packed in one message, a frame a line, as the server sends it.
   if (packed && slow === 0) {

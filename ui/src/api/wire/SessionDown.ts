@@ -4,6 +4,7 @@ import type { AckOutcome } from "./AckOutcome";
 import type { AgentInfo } from "./AgentInfo";
 import type { AgentState } from "./AgentState";
 import type { Event } from "./Event";
+import type { EventsWindow } from "./EventsWindow";
 import type { FileChange } from "./FileChange";
 import type { FileKey } from "./FileKey";
 import type { InboxAnswer } from "./InboxAnswer";
@@ -19,7 +20,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
  * (docs/wire.md, "Revisions"). Every frame the socket sends is one, and so is every frame of the
  * session's feed on the bus: the registry and its viewers share it.
  */
-export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
+export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, window?: EventsWindow, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
 /**
  * What its inbox said, when it took a message (`accepted`).
  */

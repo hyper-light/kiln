@@ -96,6 +96,9 @@ export interface ShipPage {
   next_cursor: number | null;
   /** With a page the server read from memory. */
   pace?: ShipPace;
+  /** Whom its rows were picked for (a `ship` frame's `whose` is held against it); a server that
+   * sends `ship` frames says it (W21-R15, views/ship/live.ts). */
+  viewer?: string[];
 }
 
 /** A build part's state (`Part` in kiln_cd::journey): `none` when nothing built it. */
@@ -131,6 +134,10 @@ export interface ShipDetail extends ShipCommit {
   replant?: { name: string; state: string; why: string }[];
   /** Every job of the commit, either engine's, as the jobs pane acts on them (docs/ci.md W26-R21, R22). */
   jobs?: ShipJob[];
+  /** The version of what it shows beyond its row: a `ship` frame of the same `dv` changes only the row's part (W21-R15). */
+  dv?: string;
+  /** As a page's. */
+  viewer?: string[];
 }
 
 /** What can be done to a commit's jobs together (`POST /api/ship/jobs`). */

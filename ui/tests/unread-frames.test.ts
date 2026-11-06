@@ -105,7 +105,7 @@ await test("the events socket applies no frame with an unknown tag or that isn't
   events.start();
   try {
     const ws = Socket.all.at(-1)!;
-    assert.match(ws.url, /\/api\/events$/);
+    assert.match(ws.url, /\/api\/events(\?|$)/);
     ws.onopen?.();
     ws.frame({ type: "hologram", run: { id: "r1" } });
     ws.text("{not json");
