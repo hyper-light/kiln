@@ -5676,7 +5676,14 @@ fn pre_encoded(json: bytes::Bytes) -> Response {
 /// sees by lineage, found as it reads.
 async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
     if crate::harness::lineage::sees_all(caller) {
-        return pre_encoded(hub.harness.list_json());
+        // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
+        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`).
+        let (json, etag) = hub.harness.list_tagged();
+        let mut r = pre_encoded(json);
+        if let Some(etag) = etag {
+            r.headers_mut().insert(header::ETAG, etag);
+        }
+        return r;
     }
     srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
 }
