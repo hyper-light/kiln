@@ -467,6 +467,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 // Every request comes in through here: accepting is Critical, and costs little (goal 6,
                 // plan 01a1a59c2abe step 3).
                 let _ = hyper_rt::coop::set_class(crate::overload::Class::Critical);
+                // Each connection taken is a piece of the listener's turn, which ends its poll once it's over: a burst
+                // taken in one poll held the shard 0.3 to 0.44 ms on the CPU in rt9's rounds (goal 9, plan
+                // 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -483,6 +487,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             crate::rt::spawn_connection(async move {
                                 crate::http::server::serve_accepted(stream, api, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             // e.g. EMFILE: back off briefly instead of spinning.
@@ -513,6 +518,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, mirror = prefix.as_deref().unwrap_or("-"), "the registry listening");
                 let only = Arc::new(crate::ci::registry::Only { hub, prefix });
+                // A burst of connections taken in turns, as the main listener's (goal 9, plan 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -524,6 +531,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             crate::rt::spawn_spread(async move {
                                 crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "the registry's accept failed");
@@ -558,6 +566,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, https = tls.is_some(), "the OIDC issuer listening");
                 let only = Arc::new(crate::ci::oidc::Only::new(hub));
+                // A burst of connections taken in turns, as the main listener's (goal 9, plan 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -569,6 +579,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             crate::rt::spawn_spread(async move {
                                 crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "the issuer's accept failed");

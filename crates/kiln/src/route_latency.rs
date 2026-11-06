@@ -14,7 +14,8 @@
 //!   over to the hub starting on it, then to the hub having applied it; and runners' and their jobs'
 //!   own HTTP routes (enrolling, sync's contents, artifacts, CI's runtime services), as requests are.
 //!
-//! Every histogram is atomics only ([`Histogram`]): no lock on any path that times or reads one.
+//! Every histogram is atomics only ([`crate::metrics::Histogram`], a copy for each shard: [`PerShard`]): no lock on any
+//! path that times or reads one.
 //! Time a request waited in its socket while its shard was busy shows in `kiln_shard_delay_seconds`
 //! (`crate::shard_health`): the runtime doesn't say when a task was woken.
 
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use http::Method;
 
-use crate::metrics::{Histogram, STALL_BUCKETS};
+use crate::metrics::{PerShard, STALL_BUCKETS};
 
 /// What the server's work is, as timed here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,15 +61,16 @@ impl Class {
     }
 }
 
-/// Each class's histograms, in [`Class::ALL`]'s order.
+/// Each class's histograms, in [`Class::ALL`]'s order: each shard times its work into copies of its own, summed as
+/// they're read ([`PerShard`]; goal 9, plan 01a1a87b2cec step 5).
 pub struct Routes {
-    wait: [Histogram; 5],
-    took: [Histogram; 5],
+    wait: [PerShard; 5],
+    took: [PerShard; 5],
 }
 
 impl Routes {
     fn new() -> Self {
-        Self { wait: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)), took: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)) }
+        Self { wait: std::array::from_fn(|_| PerShard::new(STALL_BUCKETS)), took: std::array::from_fn(|_| PerShard::new(STALL_BUCKETS)) }
     }
 
     /// Work of `class` that waited `wait` (where it's known) and took `took`.
@@ -95,22 +97,25 @@ impl Routes {
     /// `took`: a batch of frames written with one write.
     pub fn observe_took(&self, class: Class, took: Duration, n: u64) {
         if let Some(h) = self.took.get(class.index()) {
-            for _ in 0..n {
-                h.observe(took.as_secs_f64());
-            }
+            h.observe_n(took.as_secs_f64(), n);
         }
     }
 
     /// `class`'s histograms: how long its work waited, and took.
-    pub fn of(&self, class: Class) -> Option<(&Histogram, &Histogram)> {
+    pub fn of(&self, class: Class) -> Option<(&PerShard, &PerShard)> {
         Some((self.wait.get(class.index())?, self.took.get(class.index())?))
     }
 }
 
+/// The server's route histograms, made by the first of its work they time (a request, a runner's message).
+/// A process that serves none, a runner's, never makes them, so its registry renders none of them: they
+/// were 220 series of zeros a runner, every 15 s into observe, each kept there as a series of its own
+/// (goal 11, plan 01a1a87b2e56 step 5).
+static ROUTES: OnceLock<Routes> = OnceLock::new();
+
 /// The server's.
 pub fn routes() -> &'static Routes {
-    static R: OnceLock<Routes> = OnceLock::new();
-    R.get_or_init(Routes::new)
+    ROUTES.get_or_init(Routes::new)
 }
 
 /// The legs of a runner's message's wait, apart (goal 10, plan 01a1a87b2dae step 4: the runner class's wait
@@ -174,11 +179,11 @@ impl RunnerLeg {
 
 /// Each leg's histogram, in [`RunnerLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
 /// shards' delay is (`crate::shard_health::DELAY_BUCKETS`): a leg's p99 sits about a millisecond.
-pub struct Legs([Histogram; RunnerLeg::ALL.len()]);
+pub struct Legs([PerShard; RunnerLeg::ALL.len()]);
 
 impl Legs {
     fn new() -> Self {
-        Self(std::array::from_fn(|_| Histogram::new(crate::shard_health::DELAY_BUCKETS)))
+        Self(std::array::from_fn(|_| PerShard::new(crate::shard_health::DELAY_BUCKETS)))
     }
 
     /// A runner's message spent `took` on `leg`.
@@ -188,15 +193,18 @@ impl Legs {
         }
     }
 
-    pub fn of(&self, leg: RunnerLeg) -> Option<&Histogram> {
+    pub fn of(&self, leg: RunnerLeg) -> Option<&PerShard> {
         self.0.get(leg.index())
     }
 }
 
+/// The server's runner-wait legs, made by the first runner's message its hub times: as [`ROUTES`], none in a
+/// runner's process (282 series of zeros it rendered; goal 11, plan 01a1a87b2e56 step 5).
+static LEGS: OnceLock<Legs> = OnceLock::new();
+
 /// The server's.
 pub fn legs() -> &'static Legs {
-    static L: OnceLock<Legs> = OnceLock::new();
-    L.get_or_init(Legs::new)
+    LEGS.get_or_init(Legs::new)
 }
 
 /// A runner's message spent `took` on `leg`, on the server's histograms.
@@ -317,21 +325,26 @@ fn runners(segs: &[&str]) -> bool {
     )
 }
 
-/// The `kiln_route_*` families, in the exposition.
+/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`]).
 pub fn render(o: &mut String) {
-    let r = routes();
+    render_of(o, ROUTES.get(), LEGS.get());
+}
+
+/// The families of `routes` and `legs`: each said, with its TYPE, whether or not it's made (as every family of
+/// the registry is, before anything happened), and its series where it's made, so a runner's process renders none.
+fn render_of(o: &mut String, routes: Option<&Routes>, legs: Option<&Legs>) {
     let _ = writeln!(
         o,
         "# HELP kiln_route_wait_seconds How long the server's work waited before its handler started, by class (page, api_read, api_write, websocket, runner).\n# TYPE kiln_route_wait_seconds histogram"
     );
     for c in Class::ALL {
-        if let Some((wait, _)) = r.of(c) {
+        if let Some((wait, _)) = routes.and_then(|r| r.of(c)) {
             wait.render(o, "kiln_route_wait_seconds", &format!("class=\"{}\"", c.name()));
         }
     }
     let _ = writeln!(o, "# HELP kiln_route_seconds How long the server's work took once its handler started, by class.\n# TYPE kiln_route_seconds histogram");
     for c in Class::ALL {
-        if let Some((_, took)) = r.of(c) {
+        if let Some((_, took)) = routes.and_then(|r| r.of(c)) {
             took.render(o, "kiln_route_seconds", &format!("class=\"{}\"", c.name()));
         }
     }
@@ -339,9 +352,8 @@ pub fn render(o: &mut String) {
         o,
         "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it); held, the loop's own time with each event it takes, its waits included (what the frames behind it wait for), every event's; and of each agent session's update whose runner said how long it held it, runner (from the runner taking it in to making its frame, on the runner's clock) and server (from its frame's arrival to its owner done with it, on the server's).\n# TYPE kiln_runner_wait_leg_seconds histogram"
     );
-    let l = legs();
     for leg in RunnerLeg::ALL {
-        if let Some(h) = l.of(leg) {
+        if let Some(h) = legs.and_then(|l| l.of(leg)) {
             h.render(o, "kiln_runner_wait_leg_seconds", &format!("leg=\"{}\"", leg.name()));
         }
     }
@@ -438,7 +450,7 @@ mod tests {
         l.observe(RunnerLeg::InLoop, Duration::from_micros(40));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
-        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
         assert_eq!(counts, vec![0, 1, 2, 0, 0, 0]);
         // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
         let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
@@ -462,7 +474,7 @@ mod tests {
         let l = Legs::new();
         l.observe(RunnerLeg::Held, Duration::from_micros(150));
         l.observe(RunnerLeg::Held, Duration::from_micros(6_000));
-        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
         assert_eq!(counts, vec![0, 0, 0, 2, 0, 0]);
         let under = |bound: f64| l.of(RunnerLeg::Held).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(0.00025), under(0.001)), (Some(1), Some(1)), "150 µs under a quarter millisecond, 6 ms past a millisecond");
@@ -484,7 +496,7 @@ mod tests {
         l.observe(RunnerLeg::Runner, Duration::from_micros(80));
         l.observe(RunnerLeg::Runner, Duration::from_micros(74_000));
         l.observe(RunnerLeg::Server, Duration::from_micros(900));
-        let count = |leg| l.of(leg).map_or(0, Histogram::count);
+        let count = |leg| l.of(leg).map_or(0, PerShard::count);
         assert_eq!((count(RunnerLeg::Runner), count(RunnerLeg::Server), count(RunnerLeg::Held)), (2, 1, 0), "each its own");
         let under = |leg, bound: f64| l.of(leg).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(RunnerLeg::Runner, 0.0001), under(RunnerLeg::Runner, 0.05)), (Some(1), Some(1)), "80 µs under a tenth of a millisecond, 74 ms past 50");
@@ -516,5 +528,29 @@ mod tests {
         assert_eq!(made, 0, "{made} allocations");
         assert_eq!(told, [Some(Class::ApiRead), Some(Class::ApiWrite), Some(Class::Runner), Some(Class::Page), Some(Class::ApiRead), None]);
         assert_eq!(class_of(&Method::GET, "/api/harness/sessions/a/files/src/kiln/lib/http/server.rs", false), Some(Class::ApiRead), "deeper than any route");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a process that times none of the server's work (a runner's)
+    /// renders none of its route and leg histograms' series, where it rendered them all as zeros: 502 series a
+    /// runner, each a series of its own in observe. Each family is still said with its TYPE; the server renders
+    /// every series, every class and leg, once they're made.
+    #[test]
+    fn g11_s5_heap_a_process_that_times_none_of_the_servers_work_renders_none_of_it() {
+        let mut none = String::new();
+        render_of(&mut none, None, None);
+        assert!(none.lines().all(|l| l.starts_with('#')), "series of nothing made: {none}");
+        for family in ["kiln_route_wait_seconds", "kiln_route_seconds", "kiln_runner_wait_leg_seconds"] {
+            assert!(none.contains(&format!("# TYPE {family} histogram")), "{family} said with its TYPE");
+        }
+        let mut made = String::new();
+        render_of(&mut made, Some(&Routes::new()), Some(&Legs::new()));
+        // A histogram's series: a bucket each bound, `+Inf`, `_sum` and `_count`.
+        let routes = Class::ALL.len() * 2 * (STALL_BUCKETS.len() + 3);
+        let legs = RunnerLeg::ALL.len() * (crate::shard_health::DELAY_BUCKETS.len() + 3);
+        let series = made.lines().filter(|l| !l.starts_with('#')).count();
+        assert_eq!((series, routes, legs), (routes + legs, 220, 282), "every class's and leg's, zeros and all");
+        for c in Class::ALL {
+            assert!(made.contains(&format!("kiln_route_wait_seconds_count{{class=\"{}\"}} 0", c.name())), "{}", c.name());
+        }
     }
 }

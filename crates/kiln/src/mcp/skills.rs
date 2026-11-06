@@ -6,6 +6,7 @@
 //! and describes it, and the files it links.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -69,15 +70,35 @@ fn describe(s: &Skill) -> Value {
     })
 }
 
+/// Every skill described ([`describe`], each of its files' SHA-256 among it), in [`SKILLS`]' order.
+static DESCRIBED: OnceLock<Vec<Value>> = OnceLock::new();
+
+/// [`DESCRIBED`], made once a process: what's built in never changes, and each list hashed every
+/// file of every skill again (goal 10, plan 01a1a87b2dae step 5).
+fn described() -> &'static [Value] {
+    DESCRIBED.get_or_init(|| SKILLS.iter().map(describe).collect())
+}
+
+/// The skills described on the compute pool, where they aren't yet: a request on a shard that
+/// asks first has them hashed there, not on its shard (goal 10, plan 01a1a87b2dae step 5).
+pub async fn made() {
+    if DESCRIBED.get().is_none() {
+        let _ = crate::rt::compute(|| {
+            described();
+        })
+        .await;
+    }
+}
+
 /// Every skill, as `skills/list` gives them.
 pub fn list() -> Vec<Value> {
-    SKILLS.iter().map(describe).collect()
+    described().to_vec()
 }
 
 /// One skill by name or by its `SKILL.md` URI.
 pub fn get(key: &str) -> Option<Value> {
     let name = key.strip_prefix("skill://").map(|r| r.split('/').next().unwrap_or("")).unwrap_or(key);
-    SKILLS.iter().find(|s| s.name == name).map(describe)
+    SKILLS.iter().position(|s| s.name == name).and_then(|i| described().get(i)).cloned()
 }
 
 /// Every file, as MCP resources.
@@ -159,5 +180,21 @@ mod tests {
             assert!(plans.contains(part), "kiln-plans: {part}");
         }
         assert!(get("skill://kiln-diagnose/SKILL.md").is_some());
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the skills, described once, are described as each was
+    /// when it was described for each list: the list, and each one got by its name and its URI;
+    /// a name kiln has no skill of gets none.
+    #[test]
+    fn g10_s5_skills_described_once_are_described_as_each_time() {
+        let fresh: Vec<Value> = SKILLS.iter().map(describe).collect();
+        assert_eq!(list(), fresh);
+        assert_eq!(list(), fresh, "and again, from what was kept");
+        for (s, want) in SKILLS.iter().zip(&fresh) {
+            assert_eq!(get(s.name).as_ref(), Some(want), "{}", s.name);
+            assert_eq!(get(&format!("skill://{}/SKILL.md", s.name)).as_ref(), Some(want), "{}", s.name);
+        }
+        assert_eq!(get("kiln-nothing"), None);
+        assert_eq!(get("skill://kiln-nothing/SKILL.md"), None);
     }
 }

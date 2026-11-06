@@ -28,7 +28,7 @@ const LEAST_GROWTH: usize = 4;
 /// on), so a column grown by a quarter takes the class its length needs and leaves at most a quarter of it unused
 /// (an eighth on average), where `Vec`'s doubling leaves up to half (a quarter on average). Each element is still
 /// copied a bounded number of times as the column grows: at most 1 / (1 - 1/1.25) = 5, against doubling's 2.
-fn grow<T>(v: &mut Vec<T>, more: usize) {
+pub(crate) fn grow<T>(v: &mut Vec<T>, more: usize) {
     if v.len().saturating_add(more) > v.capacity() {
         v.reserve_exact((v.len() / 4).max(more).max(LEAST_GROWTH));
     }

@@ -46,11 +46,19 @@ fn log_config() -> LogConfig {
         max_groups: 8,
         group_entries: 1 << 18,
         group_bytes: 1 << 27,
-        group_cache: 1 << 23,
+        group_cache: CACHE_BYTES,
         queue_submissions: 32,
         waits: Waits::Measured,
     }
 }
+
+/// Recent entries the group's handle keeps in memory: one append, at most a message's bytes (kiln's goal 11,
+/// plan 01a1a87b2e56 step 5). The replica keeps past it whatever it has yet to apply and whatever a member in
+/// step has yet to acknowledge (hyper-durable's `Replica::keep`, through `LogStore::keep_after`), so it serves
+/// only a member out of step, one that dropped and probes or one the apply point has passed: its next append
+/// comes from memory, and one further behind takes an append's entries from the file at a time. A sole voter
+/// (kiln on one machine) is read by no member. It was 8 MiB, twice the largest append.
+const CACHE_BYTES: u64 = MESSAGE_BYTES as u64;
 
 type Member = Replica<GroupStore<DeviceFile>, Machine, Unbounded>;
 
@@ -354,6 +362,16 @@ impl Driver {
 mod tests {
     use super::*;
     use crate::state::{ClusterDef, Command};
+
+    /// The group's handle keeps one append of recent entries in memory, the largest a member is sent; nothing else
+    /// of the log's layout moves, so a log made with the 8 MiB cache reopens with this one (kiln's goal 11, plan
+    /// 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_cd_log_keeps_one_append_in_memory() {
+        let config = log_config();
+        assert_eq!(config.group_cache, MESSAGE_BYTES as u64, "the largest append");
+        assert_eq!((config.segment_bytes, config.max_segments, config.max_groups), (1 << 20, 256, 8), "the file's layout as it was");
+    }
 
     #[test]
     fn a_sole_member_commits_and_reopens_with_what_it_committed() -> Result<()> {

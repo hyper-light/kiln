@@ -304,7 +304,9 @@ mod tests {
             });
             Ok(url)
         };
-        let figures = |late_s: f64, probes: u64, held_s: f64| ("200 OK", format!(r#"{{"delay_s":0.002,"late_s":{late_s},"probes":{probes},"held_s":{held_s},"period_s":0.01}}"#));
+        // A server probed at this build's own period: what it measured is read as it is.
+        let period_s = crate::shard_health::PERIOD.as_secs_f64();
+        let figures = |late_s: f64, probes: u64, held_s: f64| ("200 OK", format!(r#"{{"delay_s":0.002,"late_s":{late_s},"probes":{probes},"held_s":{held_s},"period_s":{period_s}}}"#));
         // 100 probes ran 0.25 s late in all between the first two reads: 2.5 ms on average. Then none
         // ran, a shard held 40 ms past its period: the hold. Then 100 ran 10 ms late in all while one
         // shard was held 30 ms (serving one long request): the mean, 0.1 ms, not the hold.

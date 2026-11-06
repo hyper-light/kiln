@@ -119,6 +119,23 @@ pub fn parts(id: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + 
     })
 }
 
+/// A message to a learner in its frames, each made as it's asked for ([`Learners::frames`]).
+pub type Frames = Box<dyn Iterator<Item = (Msg, Vec<u8>)> + Send>;
+
+/// A message's frames as the server sends them on the sync lane: each a [`crate::proto::ServerMsg::Cluster`], its
+/// words beside the part of the group's message it carries, a whole message's words written once by the caller
+/// (`whole`: goal 9, plan 01a1a87b2cec step 5). Each a copy of up to [`PART`] of the message: made on the compute pool
+/// (the hub's cluster loop, `crate::net::send_made`; goal 9, plan 01a1a87b2cec step 3).
+pub fn encoded(frames: Frames, whole: &str) -> Vec<Vec<u8>> {
+    let whole_msg = Msg::Raft { id: 0, part: 0, parts: 0 };
+    frames
+        .filter_map(|(msg, raft)| {
+            let json = if msg == whole_msg { whole.to_owned() } else { encode(&msg) };
+            crate::proto::encode(&crate::proto::ServerMsg::Cluster { json, raft }).ok()
+        })
+        .collect()
+}
+
 /// The token a runner fetches copies of kiln.db with: signed by the server's key, for it.
 pub fn token(key: &str, machine: &str) -> String {
     crate::util::hmac_hex(key.as_bytes(), format!("cluster:{machine}").as_bytes())
@@ -517,14 +534,20 @@ impl Learners {
         }
     }
 
-    /// A message to learner `member`, in its frames, each made as it's asked for ([`parts`]).
-    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + Send + use<> {
+    /// A message to learner `member`, in its frames, each made as it's asked for ([`parts`]): its number taken here,
+    /// in the order the messages come, and nothing copied, decoded or changed (a test build's fault) until its first
+    /// frame is asked for, so whoever asks makes them where it asks (the hub's cluster loop, on the compute pool: goal
+    /// 9, plan 01a1a87b2cec step 3).
+    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> Frames {
         let after = if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) { self.changes_after.lock().get(&member).copied() } else { None };
-        let bytes = match after {
-            Some(after) => changed_in_transit(bytes, after),
-            None => bytes,
-        };
-        parts(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::new(std::iter::once(bytes).flat_map(move |bytes| {
+            let bytes = match after {
+                Some(after) => changed_in_transit(bytes, after),
+                None => bytes,
+            };
+            parts(id, bytes)
+        }))
     }
 
     /// `machine`'s learner, held by runner process `peer`, checks the log's checkpoints, holding the
@@ -684,6 +707,32 @@ async fn fetch_copy(http: &Client, url: &str, token: &str, dest: &Path) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a learner's message's frames, made where they're asked for (the hub's cluster
+    /// loop asks on the compute pool), are the frames the loop made on its shard: a whole message in one, its words
+    /// the whole one's written once; a long one in its parts, in their order, numbered in the order the messages
+    /// came; a small one left uncopied until it's encoded.
+    #[test]
+    fn g9_s3_frames_made_off_the_shard_are_those_the_loop_made() -> anyhow::Result<()> {
+        let learners = Learners::default();
+        let whole = encode(&Msg::Raft { id: 0, part: 0, parts: 0 });
+        let small = vec![7u8; 1000];
+        let at = small.as_ptr();
+        let mut uncopied = learners.frames(1, small);
+        anyhow::ensure!(matches!(uncopied.next(), Some((Msg::Raft { id: 0, part: 0, parts: 0 }, b)) if b.as_ptr() == at), "a small one whole, uncopied");
+        let small = vec![7u8; 1000];
+        let long: Vec<u8> = (0..(PART * 2 + 17)).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        for bytes in [small, long.clone(), long] {
+            let id = learners.next.load(std::sync::atomic::Ordering::Relaxed);
+            let before: Vec<Vec<u8>> = frames(id, bytes.clone())
+                .into_iter()
+                .map(|(msg, raft)| crate::proto::encode(&crate::proto::ServerMsg::Cluster { json: encode(&msg), raft }))
+                .collect::<anyhow::Result<_>>()?;
+            let made = encoded(learners.frames(1, bytes), &whole);
+            anyhow::ensure!(made == before, "message {id}: {} frames made, {} before", made.len(), before.len());
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_big_message_goes_in_parts_and_comes_back_whole() {

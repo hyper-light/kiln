@@ -22,6 +22,13 @@ const BLOCK: usize = 4096;
 pub const GROUPS: usize = 32;
 /// Bytes the file may take (it grows as it is used).
 const DISK: u64 = 2 << 30;
+/// Recent entries the log keeps in memory, shared evenly by its groups: one append a group (goal 11, plan
+/// 01a1a87b2e56 step 5), 8 MiB, as it was. A replica keeps past its share whatever it has yet to apply and
+/// whatever a copy in step has yet to acknowledge (hyper-durable's `Replica::keep`, through
+/// `LogStore::keep_after`), so the share serves only a copy out of step, one that dropped and probes or one the
+/// apply point has passed: its next append, at most [`super::group::APPEND`], comes from memory, and one further
+/// behind takes an append's entries from the file at a time.
+const CACHE_BYTES: u64 = GROUPS as u64 * super::group::APPEND;
 
 /// What the log is laid out by. Every value is fixed: a log reopens with the facts it was made with.
 fn config(align: Alignment) -> anyhow::Result<Config> {
@@ -37,7 +44,7 @@ fn config(align: Alignment) -> anyhow::Result<Config> {
         cadence_bytes: CADENCE_BYTES,
         uncommitted_entries: 512,
         uncommitted_bytes: 4 << 20,
-        cache_bytes: 8 << 20,
+        cache_bytes: CACHE_BYTES,
     })
     .map_err(|e| anyhow::anyhow!("the sync log's settings: {e:?}"))
 }
@@ -133,6 +140,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         anyhow::bail!("the replica never got there")
+    }
+
+    /// The sync log keeps one append of each group's recent entries in memory: 8 MiB for its 32 groups, as it had
+    /// (goal 11, plan 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_sync_log_keeps_one_append_a_group_in_memory() -> anyhow::Result<()> {
+        let config = config(Alignment::new(BLOCK).map_err(|e| anyhow::anyhow!("{e:?}"))?)?;
+        assert_eq!(config.max_groups, GROUPS);
+        assert_eq!(config.group_cache, group::APPEND, "an append a group");
+        assert_eq!(CACHE_BYTES, 8 << 20, "the log's cache as it was");
+        Ok(())
     }
 
     #[test]

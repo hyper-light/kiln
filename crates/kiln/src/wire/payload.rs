@@ -129,6 +129,26 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
         check_later(wire, of, json, unknown_in::<T>);
         return Ok(read);
     }
+    read_by_tree(wire, of, json)
+}
+
+/// [`payload`] of JSON the reader holds and has no more use for: on a shard, read straight into its type, then handed
+/// as it is to [`checker`]'s thread to look for its unknown fields in, where `payload` copies it for that (goal 9, plan
+/// 01a1a87b2cec step 5: each runner payload's text was copied whole on the hub's loop for its check). The same value,
+/// and the same refusal of what can't be read.
+pub fn payload_owned<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: String) -> Result<T, Box<Unreadable>> {
+    if crate::rt::on_shard()
+        && let Ok(read) = serde_json::from_str::<T>(&json)
+    {
+        check_owned(wire, of, json, unknown_in::<T>);
+        return Ok(read);
+    }
+    read_by_tree(wire, of, &json)
+}
+
+/// [`payload`]'s read off a shard, and of what couldn't be read straight on one: through a JSON tree, so what can't be
+/// read is refused saying why, and what of it the type doesn't keep is found as it's read.
+fn read_by_tree<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
     let came: Value = serde_json::from_str(json).map_err(|e| {
         Box::new(Unreadable {
             of,
@@ -180,23 +200,33 @@ struct Check {
 const CHECKS_MOST: usize = crate::net::EVENTS_BYTES;
 
 impl crate::memory::queue::Weigh for Check {
-    /// Its place and its payload's text.
+    /// Its place and its payload's text, with the room its buffer has past it ([`payload_owned`] hands on the
+    /// buffer its frame came in).
     fn weight(&self) -> usize {
-        size_of::<Check>().saturating_add(self.json.len())
+        size_of::<Check>().saturating_add(self.json.capacity())
     }
 }
 
 /// The payloads let go unlooked at for want of room ([`CHECKS_MOST`]).
 static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Hands a payload read on a shard to [`checker`]'s thread to look for its unknown fields in; where
-/// there's no such thread, they're looked for here, as before.
+/// Hands a payload read on a shard to [`checker`]'s thread to look for its unknown fields in, a copy of
+/// it; where there's no such thread, they're looked for here, as before.
 fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>) {
-    let Some(tx) = checker() else {
+    if checker().is_none() {
         say_unknown(wire, of, &find(json));
         return;
+    }
+    check_owned(wire, of, json.to_owned(), find);
+}
+
+/// [`check_later`] of a payload the reader has no more use for: handed on as it is.
+fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec<String>) {
+    let Some(tx) = checker() else {
+        say_unknown(wire, of, &find(&json));
+        return;
     };
-    match tx.try_send(Check { wire, of, json: json.to_owned(), find }) {
+    match tx.try_send(Check { wire, of, json, find }) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(_)) => {
             let n = CHECKS_LET_GO.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
@@ -436,9 +466,53 @@ fn kind_of(data: &[u8]) -> usize {
     KINDS - 1
 }
 
-/// What reading `data`, a runner's message, is expected to take, by its kind ([`KIND_COSTS`]).
+/// Format: the kinds of agent session update whose reads are expected apart ([`UPDATE_COSTS`]), by the tag each is
+/// written with (`crate::harness::core::Update`'s `t`, in its order; a test holds them to what it writes).
+const UPDATE_TAGS: [&str; 11] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch"];
+
+/// What reading an agent session's update of each kind is expected to take: an [`Expect`] for each of [`UPDATE_TAGS`]
+/// (goal 9, plan 01a1a87b2cec step 3), as [`KIND_COSTS`] keeps one for each kind of message. Their JSON costs a byte
+/// far apart: a change's hunks and a session's state are many short fields, an event's reply one long text. Under one
+/// expectation for all of them, a long change was read on the shard at the rate the long replies before it had set.
+static UPDATE_COSTS: [Expect; UPDATE_TAGS.len()] = [const { Expect::nothing_yet() }; UPDATE_TAGS.len()];
+
+/// The kind of agent session update `json` is: its tag's place in [`UPDATE_TAGS`], where the tag comes first, as every
+/// writer of an update puts it (serde's tagged serializer: `crate::harness::core::Update`); none for an update that says
+/// it otherwise, or a kind this build doesn't know.
+fn update_kind(json: &[u8]) -> Option<usize> {
+    let rest = json.strip_prefix(br#"{"t":""#)?;
+    let tag = rest.get(..rest.iter().position(|b| *b == b'"')?)?;
+    UPDATE_TAGS.iter().position(|t| t.as_bytes() == tag)
+}
+
+/// What reading `data`, a runner's message, is expected to take, by its kind ([`KIND_COSTS`]); an agent session's
+/// update by its own kind ([`UPDATE_COSTS`]).
 fn costs_of(data: &[u8]) -> &'static Expect {
+    if let Some(update) = crate::proto::harness_at(data)
+        && let Some(costs) = update_kind(update.json).and_then(|k| UPDATE_COSTS.get(k))
+    {
+        return costs;
+    }
     KIND_COSTS.get(kind_of(data)).unwrap_or(&REST_COSTS)
+}
+
+/// What reading runner frame `data` is expected to hold the shard for, nanoseconds: its own read ([`read_frame`]) and, a
+/// channel item's, the read of the message it carries ([`read_item`]), each where it's expected to be read on the shard,
+/// and nothing for one expected to be read off it. A loop gives its shard up before a frame whose read would take its turn
+/// past its quantum (`crate::rt::Turns::before`; goal 9, plan 01a1a87b2cec step 3): a turn of short pieces took a long
+/// read last, past the quantum, its pieces so far having said nothing of it.
+pub fn expected_ns(data: &[u8]) -> u64 {
+    expected_by(data, costs_of)
+}
+
+/// [`expected_ns`] by the expectations `costs` gives each message.
+fn expected_by<'a>(data: &[u8], costs: impl Fn(&[u8]) -> &'a Expect) -> u64 {
+    let on_shard = |data: &[u8]| {
+        let ns = costs(data).expected(u64::try_from(data.len()).unwrap_or(u64::MAX));
+        if ns > hyper_rt::slow::SLOW_POLL_NS { 0 } else { ns }
+    };
+    let carried = crate::proto::item_at(data).map_or(0, |item| on_shard(item.body));
+    on_shard(data).saturating_add(carried)
 }
 
 /// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
@@ -481,12 +555,12 @@ pub async fn read_item(body: Vec<u8>) -> Item {
 async fn read_frame_by(expect: &Expect, data: Vec<u8>, hello: bool) -> Frame {
     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
     let (frame, took) = if expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS {
-        match crate::rt::compute(move || timed(|| read_now(&data, hello))).await {
+        match crate::rt::compute(move || timed(|| read_now(data, hello))).await {
             Ok(read) => read,
             Err(e) => return Frame::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("it couldn't be read off the shard: {e:#}") }),
         }
     } else {
-        timed(|| read_now(&data, hello))
+        timed(|| read_now(data, hello))
     };
     expect.learn(len, took);
     frame
@@ -499,9 +573,10 @@ fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
     (frame, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// [`read_frame`]'s work, where it runs.
-fn read_now(data: &[u8], hello: bool) -> Frame {
-    match crate::proto::read_agent(data) {
+/// [`read_frame`]'s work, where it runs: a channel item's body and an update's JSON kept in the frame's own buffer
+/// (`crate::proto::read_agent_owned`; goal 9, plan 01a1a87b2cec step 5).
+fn read_now(data: Vec<u8>, hello: bool) -> Frame {
+    match crate::proto::read_agent_owned(data) {
         Err(e) => Frame::Unreadable(e),
         Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
         Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
@@ -576,53 +651,53 @@ impl Carries for AgentMsg {
     fn read(self) -> Result<Carried<Self, FromRunner>, Box<Unreadable>> {
         const W: Wire = Wire::RunnerPayload;
         let read = match self {
-            AgentMsg::AiSessions { json } => FromRunner::AiSessions(payload(W, "AiSessions", &json)?),
+            AgentMsg::AiSessions { json } => FromRunner::AiSessions(payload_owned(W, "AiSessions", json)?),
             AgentMsg::AiTranscript { req, json } => FromRunner::Answer(Answer { of: "AiTranscript", req, json }),
             // Its runner's stamp, off its end first: the update is read as one without it (goal 10, plan
             // 01a1a87b2dae step 5).
             AgentMsg::Harness { session, mut json } => {
                 let taken = super::stamp::take(&mut json);
-                match payload(W, "Harness", &json) {
+                match payload_owned(W, "Harness", json) {
                     Ok(update) => FromRunner::Harness { session, update, taken },
                     Err(e) => return Err(e.about(&session)),
                 }
             }
-            AgentMsg::HarnessInventory { json } => FromRunner::HarnessInventory(payload(W, "HarnessInventory", &json)?),
+            AgentMsg::HarnessInventory { json } => FromRunner::HarnessInventory(payload_owned(W, "HarnessInventory", json)?),
             AgentMsg::AiView { req, json } => FromRunner::Answer(Answer { of: "AiView", req, json }),
             AgentMsg::HarnessTaskOutput { req, json } => FromRunner::Answer(Answer { of: "HarnessTaskOutput", req, json }),
             AgentMsg::DirList { req, json } => FromRunner::Answer(Answer { of: "DirList", req, json: Some(json) }),
             AgentMsg::HarnessHistory { req, json } => FromRunner::Answer(Answer { of: "HarnessHistory", req, json }),
-            AgentMsg::Sync { json, raft } => FromRunner::Sync { msg: payload(W, "Sync", &json)?, raft },
-            AgentMsg::FrontDoorStatus { json } => FromRunner::FrontDoorStatus(payload(W, "FrontDoorStatus", &json)?),
-            AgentMsg::JobEvent { job, json } => FromRunner::JobEvent { job, event: payload(W, "JobEvent", &json)? },
-            AgentMsg::Facts { json } => FromRunner::Facts(payload(W, "Facts", &json)?),
-            AgentMsg::ReachHello { json } => FromRunner::ReachHello(payload(W, "ReachHello", &json)?),
+            AgentMsg::Sync { json, raft } => FromRunner::Sync { msg: payload_owned(W, "Sync", json)?, raft },
+            AgentMsg::FrontDoorStatus { json } => FromRunner::FrontDoorStatus(payload_owned(W, "FrontDoorStatus", json)?),
+            AgentMsg::JobEvent { job, json } => FromRunner::JobEvent { job, event: payload_owned(W, "JobEvent", json)? },
+            AgentMsg::Facts { json } => FromRunner::Facts(payload_owned(W, "Facts", json)?),
+            AgentMsg::ReachHello { json } => FromRunner::ReachHello(payload_owned(W, "ReachHello", json)?),
             AgentMsg::ReachAsk { req, json } => {
                 let ask = payload(W, "ReachAsk", &json).map_err(|e| e.waits(Waits::Asking(req)))?;
                 FromRunner::ReachAsk { req, ask, raw: serde_json::from_str(&json).unwrap_or_default() }
             }
-            AgentMsg::Convo { json, data } => FromRunner::Convo { msg: payload(W, "Convo", &json)?, data },
-            AgentMsg::Power { json } => FromRunner::Power(payload(W, "Power", &json)?),
+            AgentMsg::Convo { json, data } => FromRunner::Convo { msg: payload_owned(W, "Convo", json)?, data },
+            AgentMsg::Power { json } => FromRunner::Power(payload_owned(W, "Power", json)?),
             AgentMsg::Answer { req, json } => FromRunner::Answer(Answer { of: "Answer", req, json }),
-            AgentMsg::HarnessFileData { req, json, data } => FromRunner::HarnessFileData { req, answer: payload(W, "HarnessFileData", &json).map_err(|e| e.waits(Waits::Answering(req)))?, data },
-            AgentMsg::StreamEvent { stream, json } => FromRunner::StreamEvent { stream, event: payload(W, "StreamEvent", &json)? },
-            AgentMsg::Executor { json } => FromRunner::Executor(payload(W, "Executor", &json)?),
-            AgentMsg::Undeployed { json } => FromRunner::Undeployed(payload(W, "Undeployed", &json)?),
-            AgentMsg::Cluster { json, raft } => FromRunner::Cluster { msg: payload(W, "Cluster", &json)?, raft },
-            AgentMsg::WorkState { json } => FromRunner::WorkState(payload(W, "WorkState", &json)?),
-            AgentMsg::AgentLimit { json } => FromRunner::AgentLimit(payload(W, "AgentLimit", &json)?),
-            AgentMsg::Identity { json } => FromRunner::Identity(payload(W, "Identity", &json)?),
-            AgentMsg::Observe { json, bytes } => FromRunner::Observe { msg: payload(W, "Observe", &json)?, bytes },
-            AgentMsg::HeadroomStatus { json } => FromRunner::HeadroomStatus(payload(W, "HeadroomStatus", &json)?),
-            AgentMsg::LegResults { job, bundles } => FromRunner::LegResults { job, bundles: payload(W, "LegResults", &bundles)? },
+            AgentMsg::HarnessFileData { req, json, data } => FromRunner::HarnessFileData { req, answer: payload_owned(W, "HarnessFileData", json).map_err(|e| e.waits(Waits::Answering(req)))?, data },
+            AgentMsg::StreamEvent { stream, json } => FromRunner::StreamEvent { stream, event: payload_owned(W, "StreamEvent", json)? },
+            AgentMsg::Executor { json } => FromRunner::Executor(payload_owned(W, "Executor", json)?),
+            AgentMsg::Undeployed { json } => FromRunner::Undeployed(payload_owned(W, "Undeployed", json)?),
+            AgentMsg::Cluster { json, raft } => FromRunner::Cluster { msg: payload_owned(W, "Cluster", json)?, raft },
+            AgentMsg::WorkState { json } => FromRunner::WorkState(payload_owned(W, "WorkState", json)?),
+            AgentMsg::AgentLimit { json } => FromRunner::AgentLimit(payload_owned(W, "AgentLimit", json)?),
+            AgentMsg::Identity { json } => FromRunner::Identity(payload_owned(W, "Identity", json)?),
+            AgentMsg::Observe { json, bytes } => FromRunner::Observe { msg: payload_owned(W, "Observe", json)?, bytes },
+            AgentMsg::HeadroomStatus { json } => FromRunner::HeadroomStatus(payload_owned(W, "HeadroomStatus", json)?),
+            AgentMsg::LegResults { job, bundles } => FromRunner::LegResults { job, bundles: payload_owned(W, "LegResults", bundles)? },
             AgentMsg::LegSignature { job, nonce, bundle, error } => {
                 let bundle = match bundle {
-                    Some(b) => Some(payload(W, "LegSignature", &b)?),
+                    Some(b) => Some(payload_owned(W, "LegSignature", b)?),
                     None => None,
                 };
                 FromRunner::LegSignature { job, nonce, bundle, error }
             }
-            AgentMsg::Custody { json } => FromRunner::Custody(payload(W, "Custody", &json)?),
+            AgentMsg::Custody { json } => FromRunner::Custody(payload_owned(W, "Custody", json)?),
             m @ (AgentMsg::Hello(_)
             | AgentMsg::Heartbeat { .. }
             | AgentMsg::Sample(_)
@@ -1315,6 +1390,102 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(30);
             while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
                 anyhow::ensure!(Instant::now() < deadline, "the unknown field read on a shard wasn't counted");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: each kind of agent session update has its own expectation, found by the tag its
+    /// writer puts first; the kinds are every one `Update` has, in its order, as its tag names it. An update that says its
+    /// tag elsewhere, or a kind this build doesn't know, shares the expectation of runners' updates as a whole; every other
+    /// message keeps its kind's.
+    #[test]
+    fn g9_s3_each_kind_of_session_update_has_its_own_expectation() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        // `Update`'s variants, as its table has them (every one, matched without a catch-all), in snake case.
+        let tags: Vec<String> = crate::wire::update_classes()
+            .iter()
+            .map(|(name, _)| name.chars().enumerate().fold(String::new(), |mut s, (i, c)| {
+                if c.is_ascii_uppercase() && i > 0 {
+                    s.push('_');
+                }
+                s.push(c.to_ascii_lowercase());
+                s
+            }))
+            .collect();
+        anyhow::ensure!(tags == UPDATE_TAGS, "the kinds of update are {tags:?}");
+        let harness = |u: &Update| -> anyhow::Result<Vec<u8>> { crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? }) };
+        let events = Update::Events { events: Vec::new() };
+        let patch = Update::ChangesPatch { set: Vec::new(), gone: Vec::new() };
+        for (u, tag) in [(&Update::Closed, "closed"), (&Update::Reset { from: Some(3) }, "reset"), (&events, "events"), (&patch, "changes_patch")] {
+            let json = serde_json::to_string(u)?;
+            anyhow::ensure!(update_kind(json.as_bytes()) == UPDATE_TAGS.iter().position(|t| *t == tag), "{json}: its kind");
+            let data = harness(u)?;
+            anyhow::ensure!(UPDATE_TAGS.iter().position(|t| *t == tag).and_then(|k| UPDATE_COSTS.get(k)).is_some_and(|e| std::ptr::eq(costs_of(&data), e)), "{json}: its own expectation");
+        }
+        anyhow::ensure!(!std::ptr::eq(costs_of(&harness(&events)?), costs_of(&harness(&patch)?)), "each kind its own");
+        // Its tag elsewhere, or a kind this build doesn't know: runners' updates' expectation, as before.
+        let whole = KIND_COSTS.get(kind_of(&harness(&events)?)).unwrap_or(&REST_COSTS);
+        for said in [r#"{"events":[],"t":"events"}"#, r#"{"t":"teleport"}"#, r#"{ "t":"events","events":[]}"#, "", "{"] {
+            let data = crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: said.into() })?;
+            anyhow::ensure!(std::ptr::eq(costs_of(&data), whole), "{said}: runners' updates' expectation");
+        }
+        let term = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![1; 8] })?;
+        anyhow::ensure!(std::ptr::eq(costs_of(&term), KIND_COSTS.get(kind_of(&term)).unwrap_or(&REST_COSTS)), "another message its kind's");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a frame is expected to hold the shard for is its read where that's expected on
+    /// the shard, and a channel item's frame adds the read of the message it carries; a read expected past a slow poll is
+    /// done off the shard, so it adds nothing; nothing's expected of what nothing has been learned of.
+    #[test]
+    fn g9_s3_a_frames_expected_hold_counts_the_message_its_item_carries() -> anyhow::Result<()> {
+        use crate::wire::channel::Frame;
+        let body = crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: r#"{"t":"closed"}"#.into() })?;
+        let item = crate::proto::encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq: 2, low: 1, body: body.clone() }))?;
+        let len = |b: &[u8]| u64::try_from(b.len()).unwrap_or(u64::MAX);
+        // A frame read at 10 ns a byte, its message at 20.
+        let (frames, messages) = (Expect::default(), Expect::default());
+        let costs = |data: &[u8]| if crate::proto::harness_at(data).is_some() { &messages } else { &frames };
+        anyhow::ensure!(expected_by(&item, costs) == 0, "nothing learned, nothing expected");
+        frames.learn(1_000, 10_000);
+        messages.learn(1_000, 20_000);
+        anyhow::ensure!(expected_by(&body, costs) == 20 * len(&body), "a message alone: its own read");
+        anyhow::ensure!(expected_by(&item, costs) == 10 * len(&item) + 20 * len(&body), "an item: its frame's read and its message's");
+        // Its message's read expected past a slow poll: done off the shard, so the item's frame alone holds it.
+        let slow = Expect::default();
+        slow.learn(1, hyper_rt::slow::SLOW_POLL_NS);
+        let off = |data: &[u8]| if crate::proto::harness_at(data).is_some() { &slow } else { &frames };
+        anyhow::ensure!(expected_by(&item, off) == 10 * len(&item), "a message read off the shard adds nothing");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a payload the reader hands over reads as one it lends, on a shard and off one: the
+    /// same value, the same refusal of what can't be read; and its unknown fields are still counted, by the checker's
+    /// thread, the text handed to it as it came.
+    #[test]
+    fn g9_s5_a_payload_handed_over_reads_as_one_lent() -> anyhow::Result<()> {
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        struct Two {
+            a: u32,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            b: Option<String>,
+        }
+        const CASES: [&str; 6] = [r#"{"a":1,"b":"x"}"#, r#"{"a":1,"a":2}"#, r#"{"a":"one"}"#, r#"{"a":1"#, "", r#"{"a":1,"handed":[1],"empty":null}"#];
+        // A wire no other test reads JSON on, so the count is this test's alone.
+        let wire = Wire::LogDown;
+        let lent: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
+        let handed: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload_owned::<Two>(wire, "Two", (*j).to_owned())).collect();
+        anyhow::ensure!(handed == lent, "off a shard: handed over {handed:?}, lent {lent:?}");
+        let before = crate::metrics::wire().ignored.get(&[wire.name()]);
+        crate::rt::block_on(async move {
+            let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload_owned::<Two>(wire, "Two", (*j).to_owned())).collect();
+            anyhow::ensure!(on == lent, "on a shard {on:?}, off one {lent:?}");
+            // `handed` came with something in it (`empty` didn't): counted once its thread has looked.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
+                anyhow::ensure!(Instant::now() < deadline, "the unknown field of a payload handed over wasn't counted");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             Ok(())

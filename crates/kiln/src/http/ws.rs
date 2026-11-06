@@ -68,14 +68,28 @@ pub fn accept_limited(
 /// whole: tungstenite's reader grows its buffer to the frame's length as the frame comes.
 const COMMANDS_READ: usize = 16 << 10;
 
+/// What a socket of the UI's writes at a time: a TLS record's most, as it reads ([`COMMANDS_READ`]; RFC 8446
+/// §5.1), what a TLS connection writes a record of anyway. tungstenite gathers frames in its write buffer until
+/// they pass `write_buffer_size` (128 KiB by default) before it writes any, and the buffer keeps the most it ever
+/// held while the socket is open (it's drained, never shrunk): after a packed snapshot's 128 KiB frames, 131 KiB
+/// for each agent's page in the lab's realistic profile, and an events socket's batch 128 to 256 KiB (goal 11,
+/// plan 01a1a87b2e56 step 5). At this, a socket keeps this and the largest frame it sent, and its senders send
+/// what's large in frames of at most this (`crate::api`'s packed snapshots).
+pub const SOCKET_WRITE: usize = 16 << 10;
+
 /// [`accept`] for a socket whose peer sends little, reading [`COMMANDS_READ`] bytes at a time: people's commands
 /// (an agent's page), a terminal's keystrokes and resizes, a page's notes of what it couldn't read (the events
 /// socket, a job's and a deployment's logs). Each such socket saves 112 KiB of tungstenite's 128 KiB, made up
-/// front for as long as it's open (goal 11, plan 01a1a87b2e56 step 5).
+/// front for as long as it's open (goal 11, plan 01a1a87b2e56 step 5); and it writes [`SOCKET_WRITE`] at a time.
 pub fn accept_commands(
     req: Request,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
-    handshake(req, limits(16 << 20).read_buffer_size(COMMANDS_READ), true)
+    handshake(req, commands_config(), true)
+}
+
+/// A socket's of [`accept_commands`]: its message's limit, and its reads and writes a TLS record at a time.
+fn commands_config() -> WebSocketConfig {
+    limits(16 << 20).read_buffer_size(COMMANDS_READ).write_buffer_size(SOCKET_WRITE)
 }
 
 /// [`accept`], with the WebSocket's settings given whole (the browser protocol's socket bounds its
@@ -600,6 +614,49 @@ mod tests {
         let mut server = tungstenite::WebSocket::from_raw_socket(Cursor::new(wire), tungstenite::protocol::Role::Server, Some(config));
         let got = server.read()?.into_text()?;
         anyhow::ensure!(got.as_str() == big, "{} bytes came of {}", got.len(), big.len());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a commands socket writes what it gathers once that passes
+    /// [`SOCKET_WRITE`], not tungstenite's 128 KiB: frames of a few KiB, sent without a flush, reach the
+    /// connection in writes of at most that and a frame, so the writer's buffer, which keeps the most it ever
+    /// held, holds no more. With tungstenite's default none of them is written yet.
+    #[test]
+    fn g11_s5_heap_a_commands_socket_writes_16_kib_at_a_time() -> anyhow::Result<()> {
+        /// A connection that takes each write whole and keeps how large it was.
+        #[derive(Default)]
+        struct Wire {
+            writes: Vec<usize>,
+        }
+        impl std::io::Read for Wire {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl std::io::Write for Wire {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(b.len());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let frame = "x".repeat(3 << 10);
+        let fed = 4 * SOCKET_WRITE / frame.len();
+        let wrote = |config: WebSocketConfig| -> anyhow::Result<Vec<usize>> {
+            let mut socket = tungstenite::WebSocket::from_raw_socket(Wire::default(), tungstenite::protocol::Role::Server, Some(config));
+            for _ in 0..fed {
+                socket.write(tungstenite::Message::text(frame.clone()))?;
+            }
+            Ok(socket.get_ref().writes.clone())
+        };
+        let writes = wrote(commands_config())?;
+        // A server's frame of 126 to 65,535 bytes: 2 bytes of head and 2 of length.
+        let most = SOCKET_WRITE + frame.len() + 4;
+        anyhow::ensure!(writes.len() >= 3 && writes.iter().all(|w| *w <= most), "writes of at most {most}: {writes:?}");
+        let gathered = wrote(limits(16 << 20))?;
+        anyhow::ensure!(gathered.is_empty(), "tungstenite's default wrote {gathered:?} of under 128 KiB");
         Ok(())
     }
 
