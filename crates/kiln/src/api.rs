@@ -8316,9 +8316,8 @@ mod tests {
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
             hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // Two chunks' events and nine: the two sealed are packed off the owner's shard and kept compact, and the
-            // newest fifty reach into the second. A chunk's events, from the bound of what a copy keeps packed (two
-            // chunks' at a packed event's bytes).
-            let chunk = crate::harness::copies::PAGE_BYTES / (2 * crate::harness::copies::PACKED_EVENT_BYTES);
+            // newest fifty reach into the second.
+            let chunk = crate::harness::copies::CHUNK;
             let n = u64::try_from(2 * chunk + 9)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;

@@ -6351,7 +6351,7 @@ mod tests {
         let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
         let mut events = parts.events.clone();
         events.compact(None);
-        let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
+        let chunks = events.spillable(super::super::copies::EVENTS_PAGE);
         let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(events.spilled_where(&chunks, spilled) > 0, "some spilled");
