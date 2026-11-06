@@ -3614,23 +3614,25 @@ impl Registry {
     }
 
     /// Where a session runs, when one of its messages mentions `path` (a relative mention, in its
-    /// folder): a viewer may read that file from its machine, and no other.
-    pub fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
-        let listed = self.keeper.lists_path(id, path);
-        self.sessions
-            .with(id, |v| {
-                let cwd = &v.info.cwd;
-                let said = || {
-                    v.events
-                        .iter()
-                        .rev()
-                        .filter(|e| matches!(e.entry.kind(), Some("user" | "assistant")))
-                        .filter_map(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned))
-                        .any(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
-                };
-                (listed || said()).then(|| Location::clone(&v.location))
-            })
-            .flatten()
+    /// folder): a viewer may read that file from its machine, and no other. A file its keeper lists is
+    /// said on the request's shard; else its messages are looked through on the blocking pool, newest
+    /// first, each one's `text` alone read of its JSON ([`mentions_in`]; goal 11 audit A1, A3): each was
+    /// parsed whole on the request's shard, every compact chunk inflated and every spilled one read from
+    /// its file on the way, for each file the keeper doesn't list (one too big, past a budget, or from
+    /// before kiln kept files).
+    pub async fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
+        let view = self.sessions.view(id)?;
+        if self.keeper.lists_path(id, path) {
+            return Some(Location::clone(&view.location));
+        }
+        let path = path.to_owned();
+        match crate::rt::blocking(move || mentions_in(&view, &path).then(|| Location::clone(&view.location))).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::debug!(session = id, error = %format!("{e:#}"), "a session's messages weren't looked through for a file off the shard");
+                None
+            }
+        }
     }
 
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
@@ -4483,6 +4485,25 @@ fn disconnected(m: &mut Mirror) -> Info {
     }
     m.commit(|m| m.state_frame());
     Info::clone(&m.info)
+}
+
+/// Whether one of `v`'s messages (what the person or the agent said, newest first) mentions `path`, resolved in its folder
+/// ([`Registry::mentioned_where`]): each one's `text` alone read of its JSON, nothing else of it made (goal 11 audit A1).
+fn mentions_in(v: &super::copies::View, path: &str) -> bool {
+    /// A message's text, borrowed from its JSON where it has no escapes.
+    #[derive(serde::Deserialize)]
+    struct Said<'a> {
+        #[serde(borrow, default)]
+        text: Option<std::borrow::Cow<'a, str>>,
+    }
+    let cwd = &v.info.cwd;
+    v.events.iter().rev().any(|e| {
+        if !matches!(e.entry.kind(), Some("user" | "assistant")) {
+            return false;
+        }
+        let Ok(said) = serde_json::from_str::<Said<'_>>(e.entry.text()) else { return false };
+        said.text.is_some_and(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
+    })
 }
 
 /// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent

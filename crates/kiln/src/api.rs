@@ -1822,7 +1822,7 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
-    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    let location = hub.harness.mentioned_where(id, &path).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
     serve_from(hub, id, location, path, req).await
 }
 
@@ -8205,6 +8205,30 @@ mod tests {
 
     /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the
     /// admin token, taking nothing packed.
+    /// Goal 11 audit A1, A3 (goal 10, plan 01a1a87b2dae step 5): `GET .../file?path=` looks for a mention of a file the
+    /// keeper doesn't list off the request's shard. Do: a person's message showing a picture, then six chunks' events, so
+    /// its chunk is compact and spilled; the file route asked for a file no message mentions, then for the picture. Expect:
+    /// 404 for the first, and the second found (its machine is asked for it: not connected here, 502), neither inflating
+    /// anything or reading a spill file on the request's shard. Every message was parsed whole on the shard, each compact
+    /// chunk inflated and each spilled one read from its file on the way: this fails on that code.
+    #[test]
+    fn g10_a1_a_files_mention_is_looked_for_off_the_requests_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let shown = Body::User { text: "Here's the phone view: ![phone](/home/ada/shot.png)".into(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None };
+            spilled_session(&hub, Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: shown }).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            for (path, found) in [("/home/ada/never.png", false), ("/home/ada/shot.png", true)] {
+                let ((r, inflated), read) = spill_read_in(inflated_in(Arc::clone(&api).handle(lab_get(&format!("/api/harness/sessions/a/file?path={path}"))?))).await;
+                anyhow::ensure!((r.status() != StatusCode::NOT_FOUND) == found, "{path}: {}", r.status());
+                anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
+            }
+            Ok(())
+        })
+    }
+
     fn lab_get(path: &str) -> anyhow::Result<Request> {
         Ok(http::Request::builder().method(Method::GET).uri(path).header(header::AUTHORIZATION, "Bearer test-admin-token").header(header::ACCEPT_ENCODING, "identity").body(srv::Incoming::empty())?)
     }
