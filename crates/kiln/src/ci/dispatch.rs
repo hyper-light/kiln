@@ -337,6 +337,39 @@ fn dockerless_pod(sched: &Scheduler, r: &RunSt, spec: &LegSpec, route: &LegRoute
     })
 }
 
+/// KCI4033, KCI4034 (W29-R29, R30): a leg with a microVM action's step fails as it's queued when no
+/// runner of this kiln has the executor that action needs, naming the action and the executor: a
+/// Firecracker action's, or a Shards action's, which none has until Hex's shards executor is there.
+fn microvm_unrunnable(sched: &Scheduler, r: &RunSt, spec: &LegSpec) -> Option<String> {
+    fn each<'a>(steps: &'a [kiln_ci::wf::ir::Step], out: &mut Vec<&'a str>) {
+        for s in steps {
+            out.extend(s.uses.as_deref());
+            each(&s.parallel, out);
+        }
+    }
+    let actions = r.actions_for(spec);
+    let mut uses = Vec::new();
+    each(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), &mut uses);
+    for u in uses {
+        let Some(a) = actions.get(u) else { continue };
+        for needs in [wire::FIRECRACKER, wire::SHARDS] {
+            if !a.requires.iter().any(|q| q == needs) {
+                continue;
+            }
+            let (_, runners) = sched.explain_route(&LegRoute { requires: vec![needs.to_owned()], ..LegRoute::default() });
+            if runners.iter().any(|x| x.eligible) {
+                continue;
+            }
+            return Some(if needs == wire::SHARDS {
+                format!("KCI4034: `{u}` is a Shards action, and no machine runs shards microVMs yet (docs/ci.md W29-R30).")
+            } else {
+                format!("KCI4033: `{u}` is a Firecracker action, and no runner of this kiln has the `firecracker` executor (KVM, Firecracker and its guest kernel: `kiln runner setup firecracker`). Each of its calls is a microVM of its own (docs/ci.md W29-R29).")
+            });
+        }
+    }
+    None
+}
+
 /// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
 fn short_permissions(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>, granted: &kiln_ci::plan::perms::Resolved) -> Option<String> {
     let mut lines = Vec::new();
@@ -2294,7 +2327,7 @@ impl Dispatch {
         // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
         leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
         leg.finish_within = r.sup.as_ref().map(|s| s.finish_within);
-        let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
+        let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route).or_else(|| microvm_unrunnable(&self.sched, r, &spec));
         self.legs.insert(
             id.clone(),
             LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false },

@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); locks built (R23–R26: GitHub's `actions.lock` read, written and verified as the pinned `gh actions-lock` does on its own fixture and four of F-02's repositories, `.kiln/lock` for what it leaves out, one snapshot per run kept through recovery, Require lockfile and moved tags, locks in every draft, reviewed re-locks, Lock it; W29-S04 replayed on real git); code workflows built (R27: `.kiln/<name>.ts` and `.js`, their types erased as Node 24 strips them and their program planned in code mode's QuickJS, `@kiln/sdk`'s types made from the kiln dialect's schema, the tab's Code · What it makes · Plan; kiln's own nine workflows in TypeScript make what their YAML does); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); locks built (R23–R26: GitHub's `actions.lock` read, written and verified as the pinned `gh actions-lock` does on its own fixture and four of F-02's repositories, `.kiln/lock` for what it leaves out, one snapshot per run kept through recovery, Require lockfile and moved tags, locks in every draft, reviewed re-locks, Lock it; W29-S04 replayed on real git); code workflows built (R27: `.kiln/<name>.ts` and `.js`, their types erased as Node 24 strips them and their program planned in code mode's QuickJS, `@kiln/sdk`'s types made from the kiln dialect's schema, the tab's Code · What it makes · Plan; kiln's own nine workflows in TypeScript make what their YAML does); microVM actions built (R29: each call of a Firecracker action a microVM of its own, with its resources, the step's workspace in and back, out only to the hosts it names; R30's Shards actions refused with `KCI4034` until Hex's executor is there); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -11334,12 +11334,43 @@ endpoint, for a repository kiln hosts and for one on GitHub:
 
   The editor warns when a workflow that also runs on GitHub uses one (`KCI5003`): GitHub's runner
   can't. kiln's addition: GitHub's actions run only as JavaScript, Docker or composite.
+  - As built:
+    - `kiln_ci::wf::Action` reads `runs.resources` (`cpus` from 1 to 32, `memory` of at least 128
+      MiB) and `runs.egress`. A bad value is `KCI1011`. Either on another kind of action is a
+      warning (`KCI1010`), as an action's unknown keys are.
+    - A call is a step's process, as `docker run` is a Docker action's: the runner starts this
+      kiln (`/proc/self/exe microvm-call`), which boots the microVM (`runner::firecracker`) and
+      ends with the program's exit code. Its output, its cancel and its file commands are any
+      step's. Its spec, which may hold the step's secrets, is a file only the runner reads, gone
+      once read.
+    - The step's workspace and runner temp go in as two ext4 disks made from them (`mke2fs -d`),
+      mounted where a Docker action's container has its mounts: `/github/workspace`, and
+      `/github/runner_temp` with `/github/home`, `/github/workflow` and `/github/file_commands` in
+      it. Once the call has ended as it should, each disk is read out with `debugfs` and written
+      over its directory in place. Only what differs is written, so files it didn't change keep
+      their times. A call cancelled or cut short writes nothing back.
+    - Its one way out is an egress proxy of the hosts `runs.egress` names and kiln's server
+      (W18-R08). What it refuses is said in the step's log. With no `egress`, it reaches kiln's
+      server alone.
+    - Its image is `docker://` an image, pulled as a leg's microVM's is, and held to its digest
+      where the leg's locks hold it (W29-R24). A Dockerfile isn't built for a microVM yet. Its
+      microVM has 2 vCPUs and 2 GiB where `runs.resources` doesn't say.
+    - A leg that uses a resolved Firecracker action routes to a runner with
+      `executors has firecracker`. Where no runner has it, the leg fails as it's queued
+      (`KCI4033`). A local action (`./…`) is read where its step runs, and a runner without the
+      executor fails it there, with `KCI4033`. So does a leg that's itself in a microVM: microVMs
+      don't nest.
+    - The editor warns (`KCI5003`) at each step of a GitHub workflow that uses one of its
+      repository's own microVM actions (`./…`, read at the commit edited). One from another
+      repository isn't looked up as it's typed yet.
 - **W29-R30 Shards actions.** `runs.using: shards`: W29-R29's contract (a Docker action's,
   GitHub-exact) on a shards microVM, on runners with `executors has shards`. Its `image` is
   `docker://` an OCI image, or its `agentfile` names an Agentfile in the action's repository
   (W13's image builder reads both).
   - Until Hex's shards executor is there (CP-T7.2), a plan refuses with "no machine runs shards
     microVMs yet" (`KCI4034`): the row's Can't run.
+    - As built: a Shards action's leg asks for `executors has shards`. While no runner has it,
+      the leg fails as it's queued with `KCI4034`, and a runner refuses one the same way.
   - Docker actions stay refused on shards legs (KCI4030, W07-R06).
   - The editor warns with `KCI5003`, as for W29-R29's.
   - kiln's addition.
@@ -11776,8 +11807,17 @@ Its step 8, locks (R23 to R26), is built, and so is its step 9, code workflows (
   plans in 1.1 ms at p50 and 4.8 ms at p99 (1,800 calls over the nine, on a busy 32-core Linux
   runner).
 
-R28, every other language, follows as plan 01a174b2's steps 2 to 4. Next are microVM actions (R29,
-R30), the plan's step 10.
+Its step 10, microVM actions, is built (R29; R30's Shards actions refused with `KCI4034` until
+Hex's executor is there):
+- A Firecracker action's call is a microVM of its own from its image, with its resources. The
+  step's workspace and runner temp go in as disks and come back in place, and its one way out is
+  an egress proxy of the hosts it names (`w29_r29_a_firecracker_action_reaches_only_its_declared_egress`,
+  on a KVM runner with Firecracker 1.17 and its 6.1 CI kernel).
+- A leg that uses one routes to a runner with the `firecracker` executor, and fails as it's queued
+  with `KCI4033` where no runner has it.
+
+R28, every other language, follows as plan 01a174b2's steps 2 to 4. Next are the engine on in
+production (the plan's step 2, on Ada's word) and landing (its step 11).
 
 ## 4. API, events, CLI and MCP reference
 

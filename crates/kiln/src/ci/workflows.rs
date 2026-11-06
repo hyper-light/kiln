@@ -114,6 +114,14 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         }
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
+    // W29-R29, R30: GitHub runs a GitHub workflow too, and its runner can't run a microVM action.
+    if let (Some(repo), Some(w), Some(wf::FileKind::GhaWorkflow)) = (repo, &model, wf::file_kind(path)) {
+        let more = microvm_uses(hub, repo, sha, w).await;
+        if !more.is_empty() {
+            checked.diagnostics.extend(more);
+            checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
+        }
+    }
     // An overlay against the workflow it overlays, at the repository's default branch: the keys it
     // sets that the workflow hasn't (`KCI4010`), as its run would find them.
     if let (Some(repo), Some(wf::FileKind::Overlay { stem })) = (repo, wf::file_kind(path))
@@ -138,6 +146,44 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
     Ok(checked)
+}
+
+/// `KCI5003` (W29-R29, R30): each step of a GitHub workflow that uses one of this repository's
+/// microVM actions (`./…`, read at the commit edited), a warning at the step: where GitHub runs
+/// the workflow, its runner can't run them.
+async fn microvm_uses(hub: &Hub, repo: &Repo, sha: Option<&str>, w: &wf::Workflow) -> Vec<Diag> {
+    let at = match sha {
+        Some(s) => Some(s.to_owned()),
+        None => load::resolve(hub, repo, "HEAD").await.ok().flatten(),
+    };
+    let Some(at) = at else { return Vec::new() };
+    let mut kinds: HashMap<String, Option<String>> = HashMap::new();
+    let mut out = Vec::new();
+    for step in w.jobs.iter().flat_map(|j| j.steps.iter()) {
+        let Some(u) = step.uses.as_deref().filter(|u| u.starts_with("./")) else { continue };
+        let dir = u.trim_start_matches("./").trim_end_matches('/').to_owned();
+        let using = match kinds.get(&dir) {
+            Some(k) => k.clone(),
+            None => {
+                let mut found = None;
+                for name in ["action.yml", "action.yaml"] {
+                    if let Ok(text) = load::blob(hub, repo, &at, &format!("{dir}/{name}")).await {
+                        found = wf::parse_action(&text).0.map(|a| a.runs.using);
+                        break;
+                    }
+                }
+                kinds.insert(dir, found.clone());
+                found
+            }
+        };
+        let kind = match using.as_deref() {
+            Some("firecracker") => "a Firecracker",
+            Some("shards") => "a Shards",
+            _ => continue,
+        };
+        out.push(Diag::warning("KCI5003", format!("`{u}` is {kind} action, kiln's: GitHub's runner can't run it, so this step fails where GitHub runs the workflow"), step.range));
+    }
+    out
 }
 
 /// What a code workflow is made with where it's checked (W29-R27): a push of its commit to the

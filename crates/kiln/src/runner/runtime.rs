@@ -54,6 +54,19 @@ enum Run<'a> {
     Program { prog: String, args: Vec<String> },
     /// A Docker action's container (W07-R06): `docker run` with GitHub's mounts.
     Container { cli: super::docker::Cli, image: String, entrypoint: Option<String>, args: Vec<String> },
+    /// A Firecracker action's call (W29-R29): a microVM of its own, booted by this kiln.
+    MicroVm(Box<MicroVmCall>),
+}
+
+/// What a Firecracker action's call boots and runs (W29-R29): its image, its entrypoint and
+/// arguments, its microVM's size and the hosts it may reach.
+struct MicroVmCall {
+    image: String,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    egress: Vec<String>,
 }
 
 /// What a process left: how it ended, its outputs and its saved state (`$GITHUB_STATE`).
@@ -2738,9 +2751,9 @@ impl Leg {
     /// Runs a script or a program and processes what it prints and writes (W06-R05 to W06-R08).
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
-        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
+        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         // A test build's OOM killer (W22-AC04): a step on the host, killed so long after it starts.
-        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. });
+        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
@@ -2753,7 +2766,7 @@ impl Leg {
                 let (ext, body) = script_file(shell, script);
                 (Some(st.layout.temp.join(format!("{id}{ext}"))), body, shell)
             }
-            Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
+            Run::Program { .. } | Run::Container { .. } | Run::MicroVm(_) => (None, String::new(), None),
         };
         let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV", "KILN_METRICS"]
             .iter()
@@ -2801,11 +2814,16 @@ impl Leg {
         let path = leg_path(st, env.get("PATH").map(String::as_str));
         env.insert("PATH".into(), path);
         let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
+        let mut microvm_run: Option<Box<MicroVmCall>> = None;
         let (prog, args) = match (what, &file) {
             (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
             (Run::Program { prog, args }, _) => (prog, args),
             (Run::Container { cli, image, entrypoint, args }, _) => {
                 container_run = Some((cli, image, entrypoint, args));
+                (String::new(), Vec::new())
+            }
+            (Run::MicroVm(call), _) => {
+                microvm_run = Some(call);
                 (String::new(), Vec::new())
             }
             (Run::Script { .. }, None) => anyhow::bail!("no script"),
@@ -2827,6 +2845,10 @@ impl Leg {
             let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), map.server(), &inner, entrypoint.as_deref(), &image, &args);
             let mut c = Command::new(&cli.bin);
             c.args(&run_args).envs(&inner);
+            c
+        } else if let Some(call) = microvm_run {
+            let mut c = self.microvm_command(st, &id, *call, &env, deadline)?;
+            c.current_dir(wd);
             c
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
@@ -4809,8 +4831,86 @@ impl Leg {
                 }
                 Ok(ran)
             }
+            "firecracker" => {
+                // A Firecracker action (W29-R29): a Docker action's contract, each call a microVM
+                // of its own from its image, with its resources and its egress.
+                let image = action.runs.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
+                anyhow::ensure!(image.starts_with("docker://"), "`{uses}`: a Firecracker action's `runs.image` is `docker://` an image here; a Dockerfile isn't built for a microVM yet");
+                let image = match &self.a.dependency_locks {
+                    Some(locks) => format!("docker://{}", locks.image(image.trim_start_matches("docker://")).map_err(anyhow::Error::msg)?),
+                    None => image,
+                };
+                // `runs.args` see the action's own `inputs`, as a Docker action's do.
+                let saved = st.base.clone();
+                st.base.retain(|(k, _)| *k != "inputs");
+                st.base.push(("inputs", str_map(&inputs)));
+                let args: Result<Vec<String>, String> = action.runs.args.iter().map(|t| st.render(t, Site::StepWith, "runs.args")).collect();
+                st.base = saved;
+                let args = args.map_err(anyhow::Error::msg)?;
+                let call = MicroVmCall { image, entrypoint: action.runs.entrypoint.clone(), args, cpus: action.runs.cpus, memory: action.runs.memory, egress: action.runs.egress.clone() };
+                self.exec(st, idx, Run::MicroVm(Box::new(call)), wd, aenv, deadline).await
+            }
+            // W29-R30: until Hex's shards executor is there, no runner runs one.
+            "shards" => anyhow::bail!("KCI4034: `{uses}` is a Shards action, and no machine runs shards microVMs yet (docs/ci.md W29-R30)"),
             other => anyhow::bail!("`runs.using: {other}` is no kind of action this runner knows"),
         }
+    }
+
+    /// A Firecracker action's call (W29-R29) as a step's process: this kiln (`/proc/self/exe`, so
+    /// a newer one installed since doesn't take it) booting its microVM, the step's values as a
+    /// Docker action's container has them. Its spec, which may hold the step's secrets, is in a
+    /// file only this runner reads, gone once the call has read it; the pull token goes by the
+    /// environment.
+    #[cfg(target_os = "linux")]
+    fn microvm_command(&self, st: &State, id: &str, call: MicroVmCall, env: &BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Command> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let l = &st.layout;
+        let map = super::docker::PathMap::new(vec![
+            (l.workspace.clone(), "/github/workspace".into()),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.commands.clone(), "/github/file_commands".into()),
+            (l.temp.clone(), "/github/runner_temp".into()),
+        ]);
+        let mut inner = map.translate_env(env);
+        inner.remove("PATH");
+        inner.insert("HOME".into(), "/github/home".into());
+        inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+        let rt = &self.a.runtime;
+        let cache = self.work_dir.join("_firecracker");
+        let kiln = [rt.results_url.as_str(), rt.cache_url.as_str(), rt.facade_url.as_str(), rt.api_url.as_str(), rt.graphql_url.as_str()].into_iter().chain(rt.id_token_url.as_deref()).filter(|u| !u.is_empty()).map(str::to_owned).collect();
+        let spec = super::firecracker::CallSpec {
+            image: call.image,
+            entrypoint: call.entrypoint,
+            args: call.args,
+            env: inner.into_iter().collect(),
+            workspace: l.workspace.clone(),
+            temp: l.temp.clone(),
+            cpus: call.cpus,
+            memory: call.memory,
+            egress: call.egress,
+            kiln,
+            cache: cache.clone(),
+            origin: if rt.registry_url.is_empty() { rt.facade_url.clone() } else { rt.registry_url.clone() },
+            mirrors: rt.mirrors.clone(),
+            locked: self.a.dependency_locks.is_some(),
+            timeout_secs: deadline.saturating_duration_since(Instant::now()).as_secs(),
+        };
+        let calls = cache.join("calls");
+        std::fs::create_dir_all(&calls)?;
+        std::fs::set_permissions(&calls, std::fs::Permissions::from_mode(0o700))?;
+        let path = calls.join(format!("{id}.json"));
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?.write_all(&serde_json::to_vec(&spec)?)?;
+        let mut c = Command::new("/proc/self/exe");
+        c.arg(super::firecracker::CALL_ARG).arg(&path).env(super::firecracker::CALL_TOKEN, &rt.github_token);
+        Ok(c)
+    }
+
+    /// Firecracker runs on Linux alone (W29-R29).
+    #[cfg(not(target_os = "linux"))]
+    fn microvm_command(&self, _: &State, _: &str, _: MicroVmCall, _: &BTreeMap<String, String>, _: Instant) -> anyhow::Result<Command> {
+        anyhow::bail!("KCI4033: Firecracker actions run on Linux runners with KVM (docs/ci.md W29-R29)")
     }
 
     /// A composite action (W07-R07): its steps run in this leg, with their own `inputs` and

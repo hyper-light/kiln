@@ -308,12 +308,24 @@ pub struct ActionRef {
     pub docker: bool,
 }
 
+/// What a leg that uses a Firecracker action needs of its runner (W29-R29, W13-R05), and one that
+/// uses a Shards action (W29-R30).
+pub const FIRECRACKER: &str = "executors has firecracker";
+pub const SHARDS: &str = "executors has shards";
+
 impl ActionRef {
     /// Its declarations, from its metadata.
     pub fn declares(&mut self, a: &crate::wf::ir::Action) {
         self.docker = a.runs.using.eq_ignore_ascii_case("docker");
         self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
         self.requires = a.requires.clone();
+        // A microVM action's calls are microVMs of their own (W29-R29, R30): a leg that uses one
+        // runs where its executor is.
+        for (using, needs) in [("firecracker", FIRECRACKER), ("shards", SHARDS)] {
+            if a.runs.using.eq_ignore_ascii_case(using) && !self.requires.iter().any(|q| q == needs) {
+                self.requires.push(needs.to_owned());
+            }
+        }
         self.permissions = match &a.permissions {
             Some(crate::wf::ir::Permissions::ReadAll) => vec![("*".into(), "read".into())],
             Some(crate::wf::ir::Permissions::WriteAll) => vec![("*".into(), "write".into())],

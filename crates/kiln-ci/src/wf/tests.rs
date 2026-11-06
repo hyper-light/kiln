@@ -421,4 +421,16 @@ fn w29_r29_r30_microvm_actions_read() {
     assert!(ok("name: f\nruns:\n  using: firecracker\n").iter().any(|m| m.contains("needs `runs.image`")));
     assert!(ok("name: s\nruns:\n  using: shards\n").iter().any(|m| m.contains("`runs.agentfile`")));
     assert!(ok("name: q\nruns:\n  using: qemu\n  image: x\n").iter().any(|m| m.contains("firecracker or shards")));
+    // Its microVM's size and its ways out, as written.
+    let runs = super::parse_action(fc).0.map(|a| a.runs).unwrap_or_default();
+    assert_eq!((runs.cpus, runs.memory, runs.egress), (Some(4), Some(8 << 30), vec!["static.crates.io".to_owned()]));
+    // A bad value is an error; a key it doesn't take is a warning, as an action's unknown keys are.
+    let said = |text: &str| super::parse_action(text).1.into_iter().map(|d| (d.is_error(), d.message)).collect::<Vec<_>>();
+    for (bad, says, error) in [("{ cpus: 0 }", "from 1 to 32", true), ("{ cpus: 33 }", "from 1 to 32", true), ("{ memory: 64m }", "at least 128 MiB", true), ("{ memory: lots }", "at least 128 MiB", true), ("4", "a mapping", true), ("{ gpus: 1 }", "takes `cpus` and `memory`", false)] {
+        let d = said(&format!("name: f\nruns:\n  using: firecracker\n  image: docker://alpine:3.20\n  resources: {bad}\n"));
+        assert!(d.iter().any(|(e, m)| *e == error && m.contains(says)), "{bad}: {d:?}");
+    }
+    // A Docker action has neither: they're a microVM's.
+    let docker = said("name: d\nruns:\n  using: docker\n  image: docker://alpine:3.20\n  resources: { cpus: 2 }\n  egress: [example.com]\n");
+    assert_eq!(docker.iter().filter(|(e, m)| !e && m.contains("kiln's microVM actions")).count(), 2, "{docker:?}");
 }

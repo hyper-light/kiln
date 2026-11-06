@@ -600,4 +600,9 @@ pub struct ActionRuns {
     pub args: Vec<Tpl>,
     pub env: Vec<(String, Tpl)>,
     pub steps: Vec<Step>,
+    /// kiln's microVM actions (W29-R29, R30): `resources`' vCPUs and memory (bytes), each where
+    /// it's given, and `egress`, the hosts its microVM may reach, and nothing else (W18-R08).
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub egress: Vec<String>,
 }

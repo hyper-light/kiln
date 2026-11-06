@@ -513,6 +513,12 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
         return kiln::runner::jail::main();
     }
+    // A Firecracker action's call (W29-R29): a step's process, booting the action's microVM and
+    // ending with its program's exit code.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(kiln::runner::firecracker::CALL_ARG) {
+        return kiln::runner::firecracker::call_main(std::env::args_os().nth(2));
+    }
     // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
     // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {

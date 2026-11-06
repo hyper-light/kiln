@@ -269,6 +269,22 @@ fn w29_r03_pipelines_read_model() -> anyhow::Result<()> {
         assert_eq!(field(row(&rows, path).unwrap_or(&Value::Null), "commit"), changed, "{list}");
     }
     assert_eq!(field(row(&rows, ".kiln/ci.yaml").unwrap_or(&Value::Null), "commit"), head, "{list}");
+
+    // W29-R29, R30: a GitHub workflow that uses this repository's microVM actions is warned at each
+    // of their steps (`KCI5003`): GitHub's runner can't run them. Its other actions are no matter.
+    let gha = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: ./.kiln/actions/fuzz\n      - uses: ./.kiln/actions/sandbox\n      - uses: ./.github/actions/setup\n";
+    let (st, body) = http(s.port, "POST", "/api/ci/validate", &s.admin, Some(&json!({ "path": ".github/workflows/vm.yml", "content": gha, "repo": "acme/app" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let checked: Value = serde_json::from_str(&body)?;
+    let warned: Vec<(u64, String)> = checked
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|d| d.get("code") == Some(&json!("KCI5003")))
+        .map(|d| (d.pointer("/range/start/line").and_then(Value::as_u64).unwrap_or_default(), field(d, "severity").to_owned()))
+        .collect();
+    assert_eq!(warned, vec![(7, "warning".to_owned()), (8, "warning".to_owned())], "{body}");
     Ok(())
 }
 
