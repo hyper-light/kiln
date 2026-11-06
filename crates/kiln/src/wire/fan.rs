@@ -957,7 +957,8 @@ mod tests {
                                 && *hp == peer
                                 && *hw == what
                             {
-                                let until = Instant::now() + Duration::from_secs(10);
+                                // The bound only ends a hang (a frame the held one waits behind never comes).
+                                let until = Instant::now() + Duration::from_secs(300);
                                 loop {
                                     let seen = taken.lock().map(|t| t.iter().any(|x| x.1 == *up && x.2 == *uw)).unwrap_or(false);
                                     if seen || Instant::now() >= until {
@@ -979,13 +980,19 @@ mod tests {
                 // Nothing here is full: a queue of a megabyte.
                 anyhow::ensure!(fan.hand(ev).is_ok(), "the fan refused an event");
             }
-            let until = Instant::now() + Duration::from_secs(30);
+            // However long a loaded machine's loops take over them (30 s for all ran out under load, runner-fan's run of
+            // 2026-11-06), the wait gives up only once they take none for a hang's bound.
+            let stall = Duration::from_secs(300);
+            let (mut moved, mut still_since) = (0, Instant::now());
             loop {
                 let done = taken.lock().map(|t| t.len()).unwrap_or(0);
                 if done >= count {
                     break;
                 }
-                anyhow::ensure!(Instant::now() < until, "{done} of {count} events taken in 30 s");
+                if done > moved {
+                    (moved, still_since) = (done, Instant::now());
+                }
+                anyhow::ensure!(still_since.elapsed() < stall, "{done} of {count} events taken, then nothing for {stall:?}");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             let out = taken.lock().map(|t| t.clone()).unwrap_or_default();

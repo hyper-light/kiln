@@ -789,14 +789,8 @@ mod tests {
             tx.try_send(routed("gone-2", 7)?).map_err(|_| anyhow::anyhow!("queue"))?;
             let watched = Arc::clone(&marks);
             let lp = crate::rt::spawn(session_loop(Arc::clone(&s), 1, rx, Arc::clone(&marks)));
-            let until = Instant::now() + Duration::from_secs(10);
-            let handed = loop {
-                if let Ok(h) = deferred.try_recv() {
-                    break h;
-                }
-                anyhow::ensure!(Instant::now() < until, "nothing handed over in 10 s");
-                crate::rt::sleep(Duration::from_millis(5)).await;
-            };
+            // The bound only ends a hang: a loaded machine hands it over in what time it takes.
+            let handed = crate::rt::timeout(Duration::from_secs(300), deferred.recv()).await.map_err(|_| anyhow::anyhow!("nothing handed over"))?.map_err(|_| anyhow::anyhow!("the control loop's end of the hand-over closed"))?;
             anyhow::ensure!(handed.0 == 0 && handed.1 == 7, "its place and number: {:?}", (handed.0, handed.1));
             anyhow::ensure!(watched.taken(1) == 0, "the control loop marks it, once it applied it");
             anyhow::ensure!(!std::iter::from_fn(|| own_rx.try_recv().ok()).any(|u| matches!(u, Up::Term(AgentMsg::Harness { ref session, .. }) if session == "gone-2")), "not applied here");
