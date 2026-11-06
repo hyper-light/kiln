@@ -5735,7 +5735,8 @@ async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R
     use crate::wire::ui::{EventsWindow, TimelinePage};
     let Some(before) = q.get("before").and_then(|b| b.parse::<u64>().ok()) else { return Err(err(StatusCode::BAD_REQUEST, "before is the number of the first event the viewer has")) };
     let lean = q.get("lean").is_some_and(|v| v == "1");
-    let page = match hub.harness.page(id, before, lean).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
+    let page = hub.harness.page(id, before, lean).await.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let page = match page.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
         Paged::Page { events, window } => TimelinePage { events: events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect(), window },
         Paged::Store { before, floor } => {
             let Some(store) = hub.harness.convo.clone() else { return Ok(srv::json(StatusCode::OK, &TimelinePage { events: Vec::new(), window: EventsWindow::default() })) };
@@ -5767,7 +5768,7 @@ fn store_page(events: Vec<serde_json::Value>, read: usize, floor: u64) -> crate:
 /// one (`?lean=1` on its socket or its pages) held back, asked for when a person opens it. From the
 /// server's copy, else (`seq`: its number) the conversation store.
 async fn harness_event(hub: &Hub, id: &str, event: &str, q: &HashMap<String, String>) -> R {
-    if let Some(text) = hub.harness.event_text(id, event) {
+    if let Some(text) = hub.harness.event_text(id, event).await.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))? {
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(srv::json(StatusCode::OK, &v));
     }

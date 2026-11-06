@@ -134,7 +134,9 @@ const TIMING: Timing = Timing { span: Duration::from_millis(500), round: Duratio
 /// A change of learners that hasn't applied in this long is proposed again.
 const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// The group's messages waiting for the links to the runners, at most (past them, they're
-/// dropped: Raft sends what's needed again).
+/// dropped: Raft sends what's needed again). Kept where the group's thread, their one sender, sends
+/// them: their queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5: a bounded one
+/// makes every place as it's made, concurrent-queue writing each one's stamp, 160 KiB of them).
 const OUTGOING: usize = 4096;
 /// How many times a learner tries to fetch a copy of the database before its replica stops.
 const FETCH_TRIES: u32 = 4;
@@ -514,7 +516,7 @@ impl Group {
             disk: hyper_durable::Disk::Flushed,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
-        let (out_tx, outgoing) = async_channel::bounded(OUTGOING);
+        let (out_tx, outgoing) = async_channel::unbounded();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
@@ -1096,7 +1098,7 @@ impl Driver {
             for m in out.messages.drain(..) {
                 let (to, snapshot) = (m.to, m.msg_type == MessageType::MsgSnapshot);
                 // A message the links can't take now is dropped: Raft sends what's needed again.
-                let sent = self.outgoing.try_send((to, m.encode_to_vec())).is_ok();
+                let sent = crate::memory::send_within(&self.outgoing, OUTGOING, || (to, m.encode_to_vec()));
                 if snapshot {
                     // The image is only where the group stands (the learner fetches the database).
                     self.replica.report_snapshot(to, sent).ok();
