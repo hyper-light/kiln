@@ -1132,7 +1132,7 @@ pub(crate) fn item_at(b: &[u8]) -> Option<ItemAt<'_>> {
         return None;
     }
     let ((stream, seq, low, body), left) = postcard::take_from_bytes::<(&str, u64, u64, &[u8])>(rest).ok()?;
-    left.is_empty().then(|| ItemAt { stream, seq, low, body, at: b.len().saturating_sub(body.len()) })
+    left.is_empty().then_some(ItemAt { stream, seq, low, body, at: b.len().saturating_sub(body.len()) })
 }
 
 /// An agent session's update as its frame's bytes hold it ([`harness_at`]).
@@ -1155,7 +1155,7 @@ pub(crate) fn harness_at(b: &[u8]) -> Option<HarnessAt<'_>> {
         return None;
     }
     let ((session, json), left) = postcard::take_from_bytes::<(&str, &[u8])>(rest).ok()?;
-    left.is_empty().then(|| HarnessAt { variant: u64::from(variant), session, json, at: b.len().saturating_sub(json.len()) })
+    left.is_empty().then_some(HarnessAt { variant: u64::from(variant), session, json, at: b.len().saturating_sub(json.len()) })
 }
 
 /// The variants a frame read in place is known by ([`read_agent_owned`]): `AgentMsg::Harness`'s index on the wire,

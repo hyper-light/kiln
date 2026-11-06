@@ -1310,8 +1310,10 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   JSON stay in the frame's buffer, moved down in place, not copied out twice (`proto::read_agent_owned`);
   a payload goes to its unknown-field check as it is, not copied (`wire::payload::payload_owned`); a
   session's update on the channel goes to its owner without a runner message's whole handling again and
-  nothing boxed for it (`Hub::on_session_update`); and a frame's runner is looked up without its name
-  copied (`Hub::said_hello`).
+  nothing boxed for it (`Hub::on_session_update`); a frame's runner is looked up without its name
+  copied (`Hub::said_hello`); and an agent session's event is read without serde's two buffers of it
+  (its flattened body's, then its tagged body's, each text copied into each: `harness::model::Event`'s
+  `Deserialize`, written out as READY 11 wrote `Update`'s).
 - **A runner's Build in pieces, its mirrors' file off the shards** (`hub::build`): the hub's loop took a
   runner process's Build in one poll of ten things (its process, its legs' receipt, its upgrades, its
   front door, sync's, observe's and the cluster's announcements, the conversation store's mirrors and a
