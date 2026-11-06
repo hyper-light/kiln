@@ -807,7 +807,7 @@ impl Snapshot {
         let p = &self.parts;
         let frames = p.meta_bytes.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
         let events = p.events.chunks().iter().map(|c| {
-            let texts = c.metas().last().map_or(0, |m| m.off + m.len);
+            let texts = c.texts_len();
             match (packed, c.packed(), c.spilled_bytes()) {
                 (false, _, _) => texts,
                 (true, Some(s), _) => s.deflated.len(),
@@ -846,7 +846,7 @@ impl Snapshot {
         let brought: Vec<usize> = p.events.metas().enumerate().skip(p.from).filter(|(_, m)| p.since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
         let (mut from, mut size) = (0usize, 0usize);
         for (i, at) in brought.iter().enumerate() {
-            let n = if p.lean { p.events.get(*at).map_or(0, |e| e.entry.sent(true).len()) } else { p.events.meta(*at).map_or(0, |m| m.len) };
+            let n = if p.lean { p.events.get(*at).map_or(0, |e| e.entry.sent(true).len()) } else { p.events.meta(*at).map_or(0, |m| m.text_len()) };
             if size + n > EVENTS_FRAME && i > from {
                 parts.push(Part::Events(from..i));
                 from = i;
@@ -877,7 +877,7 @@ impl Snapshot {
             Part::Files => self.files.as_ref().map_or(0, String::len),
             Part::Events(batch) => write::envelope("events", Some("events"), None) + write::strs_len(self.batch(plan, batch).iter().map(|e| e.sent(p.lean))),
             // Its texts joined, and the `[` and `]` around them.
-            Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).and_then(|c| c.metas().last()).map_or(0, |m| m.off + m.len) + "[]".len(),
+            Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).map_or(0, |c| c.texts_len()) + "[]".len(),
         }
     }
 
@@ -924,7 +924,7 @@ impl Snapshot {
     /// (goal 11, plan 01a1a87b2e56 step 5). Read where the snapshot is made, on the blocking pool.
     fn read_from_store(&self, c: &super::copies::Chunk) -> std::io::Result<Vec<u8>> {
         let (store, id) = self.store.as_ref().ok_or_else(|| std::io::Error::other("no conversation store to read it from"))?;
-        let (Some(first), Some(last)) = (c.metas().first().and_then(|m| m.seq), c.metas().last().and_then(|m| m.seq)) else {
+        let (Some(first), Some(last)) = (c.metas().first().and_then(|m| m.seq()), c.metas().last().and_then(|m| m.seq())) else {
             return Err(std::io::Error::other("its events have no numbers to read them by"));
         };
         let n = usize::try_from(last.saturating_sub(first).saturating_add(1)).unwrap_or(usize::MAX);
@@ -955,7 +955,7 @@ impl Snapshot {
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
         let plan = self.plan();
         let chunks = self.parts.events.chunks();
-        let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.metas().last().map_or(0, |m| m.off + m.len) / 4, |s| s.deflated.len())).sum::<usize>();
+        let room = chunks.iter().map(|c| c.packed().map_or_else(|| c.texts_len() / 4, |s| s.deflated.len())).sum::<usize>();
         let mut gz = super::packed::Gzip::new(room);
         // The frames between the chunks, deflated together.
         let mut loose: Vec<u8> = Vec::new();
@@ -5759,7 +5759,7 @@ mod tests {
         }
         let parts = m.view().parts();
         let segments: usize = parts.events.chunks().iter().filter(|c| c.is_full()).filter_map(|c| c.pack().ok().map(|s| s.deflated.len())).sum();
-        let texts: usize = parts.events.chunks().iter().map(|c| c.metas().last().map_or(0, |m| m.off + m.len)).sum();
+        let texts: usize = parts.events.chunks().iter().map(|c| c.texts_len()).sum();
         let s = Snapshot { parts: m.view().parts(), files: None, store: None };
         anyhow::ensure!(s.weight(false) == texts, "as frames, its texts: {} of {texts}", s.weight(false));
         anyhow::ensure!(s.weight(true) >= segments && s.weight(true) < texts, "packed, its segments: {} of {segments}", s.weight(true));
