@@ -798,8 +798,8 @@ impl NetMetrics {
 pub struct WireMetrics {
     pub refused: CounterVec,
     /// Fields this build doesn't know in payloads it read, taken (`crate::wire::payload`), by
-    /// `wire`: one for each such field of each payload looked at, at most one of a kind (a message's
-    /// variant) every 100 ms and every one of a kind that comes less often.
+    /// `wire`: one for each such field of each payload looked at, one of a kind (a message's variant)
+    /// at a time, the next once the last is done (on a shard, with the compute pool's spare time).
     pub ignored: CounterVec,
     /// The payloads looked at for such fields, by `wire` ([`WireMetrics::ignored`]'s): with it, a rate.
     pub checked: CounterVec,
@@ -828,14 +828,19 @@ fn render_wire(o: &mut String) {
     wire().refused.render(o, "kiln_wire_refused_total");
     let _ = writeln!(
         o,
-        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each payload looked at (at most one of a kind every 100 ms, every message of a kind that comes less often; kiln_wire_checked_payloads_total counts them).\n# TYPE kiln_wire_ignored_fields_total counter"
+        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each payload looked at (one of a kind at a time, the next once the last is done; kiln_wire_checked_payloads_total counts them).\n# TYPE kiln_wire_ignored_fields_total counter"
     );
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
     let _ = writeln!(
         o,
-        "# HELP kiln_wire_checked_payloads_total Payloads kiln looked at for fields it didn't know, by wire: at most one of a kind (a message's variant) every 100 ms, every message of a kind that comes less often.\n# TYPE kiln_wire_checked_payloads_total counter"
+        "# HELP kiln_wire_checked_payloads_total Payloads kiln looked at for fields it didn't know, by wire: one of a kind (a message's variant) at a time, the next once the last is done.\n# TYPE kiln_wire_checked_payloads_total counter"
     );
     wire().checked.render(o, "kiln_wire_checked_payloads_total");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_checks_waiting Payloads read on the shards waiting to be looked at for fields kiln doesn't know, which the compute pool's workers do only with time to spare (as one finds no job): a pool that's never free leaves them waiting.\n# TYPE kiln_wire_checks_waiting gauge\nkiln_wire_checks_waiting {}",
+        crate::wire::payload::checks_waiting()
+    );
 }
 
 /// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan
@@ -1496,7 +1501,6 @@ pub fn render() -> String {
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
-    crate::placement::render(&mut o);
     // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
     // count, and the most it can hold with what it holds, never past [bus] memory.
     let bus = bus_memory(bus_gauges());
@@ -1504,8 +1508,9 @@ pub fn render() -> String {
     // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
     let search = kiln_search::memory();
     let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
-    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is
-    // (`crate::harness::copies::PAGE_BYTES`; goal 11, plan 01a1a87b2e56 step 3).
+    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is: its
+    // newest page's sealed chunks at the largest segment packed so far (`crate::harness::copies::segments_bound`;
+    // goal 11, plan 01a1a87b2e56 step 3, learned: goal 11 audit A4).
     let segments_bound = Some(crate::harness::copies::segments_bound()).filter(|b| *b > 0);
     crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, segments_bound), ("search_indexes", search.0, search.1)]);
     // What the copies keep on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).

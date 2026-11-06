@@ -25,7 +25,7 @@
 //!   server without `kiln_shard_delay_by_seconds` still is. A wake whose start the shard doesn't know (a
 //!   socket's readiness, a completion) gives no sample. A shard held for good stops probing:
 //!   `kiln_shard_stalled_seconds` says how long since its probe last ran, before any late wake can be
-//!   noted (a parked shard's probe waits up to a period more for a wake, `delay_now`).
+//!   noted (a parked shard's probe waits up to a period more for a wake, [`Snapshot::held`]).
 //! - **Busy** (`kiln_shard_busy_seconds_total`): the CPU time the shard's thread has run, so its rate
 //!   is the share of the time the shard was on the CPU (Linux and macOS; Windows keeps a thread's
 //!   times at the scheduler's tick, so no series there). Time the host held a ready shard off the
@@ -64,16 +64,16 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::Histogram;
 
-/// How often each probe runs, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): the longest period that still sees
-/// what the probe must (goal 9, plan 01a1a87b2cec step 5: each wake a park and a turn of the shard's loop, CPU in its
-/// busy share; 10 ms, Node's default sampling and goal 1's first pick, was about 0.001 of each shard's). Its sleep is a
+/// How often each probe runs: the longest period that still sees what the probe must (goal 9, plan 01a1a87b2cec
+/// step 5: each wake a park and a turn of the shard's loop, CPU in its busy share; 10 ms, Node's default sampling and
+/// goal 1's first pick, was about 0.001 of each shard's). The server's are always on, at this period. Its sleep is a
 /// quiet one, so a shard woken by work within a period isn't woken for it, and one parked a period with no wake at all
 /// is ([`wake_every`]):
 /// - **Every hold hyper-rt's watchdog reports** ([`watchdog_limit`], `hyper_rt::watch`): it reports a poll held past
 ///   its limit, a step's worth of polls each a quantum ([`crate::rt::STEP_BATCH`] × [`crate::rt::STEP_BUDGET_NS`],
 ///   17.07 ms), looking every half of it. A probe due at most that long after the last is due inside every such hold,
-///   so the delay ([`DELAY_BUCKETS`]) shows each, and a hold under way shows in `kiln_shard_stalled_seconds` and in
-///   placement's overdue ([`delay_now`]) within the limit, before the watchdog's report of it.
+///   so the delay ([`DELAY_BUCKETS`]) shows each, and a hold under way shows in `kiln_shard_stalled_seconds` within
+///   the limit, before the watchdog's report of it.
 /// - **The lab's tail of the shards' delay** (goal 9's bar, its p99.9 over a round): kiln-lab rests a p99.9 on ten
 ///   samples past it or more (`kiln-lab`'s `TAIL_REQUESTS`), so a round's window of the realistic profile (60 s, its
 ///   four shards) holds 10,000 probes or more at a period up to 24 ms ([`TAIL_PROBES`], [`lab_period_bound`]).
@@ -603,27 +603,6 @@ fn base() -> Instant {
 
 static SHARDS: OnceLock<Box<[Shard]>> = OnceLock::new();
 
-/// The probes' period, nanoseconds, once [`start`] has run (0 before).
-static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
-
-/// Shard `i`'s delay now, for placing work on the less delayed of two shards (goal 7, plan 01a1a59c2aea step 1):
-/// how late its latest probe ran, or, when its next probe is overdue, how long overdue it is, so a shard held
-/// right now shows it before its probe runs again. A shard parked now is never overdue: idle, its probe waits for
-/// its next wake or a period with none ([`wake_every`]). `None` with no probe noted (none started, or none ran
-/// yet). Reads two atomics and the clock, and, only once its probe is past due, its parking ([`parked`]).
-pub fn delay_now(i: usize) -> Option<Duration> {
-    let s = shards().get(i)?;
-    let last = s.last_ns.load(Ordering::Relaxed);
-    if last == 0 {
-        return None;
-    }
-    let late = s.late_ns.load(Ordering::Relaxed);
-    let due = last.saturating_add(PERIOD_NS.load(Ordering::Relaxed));
-    let overdue = nanos(base().elapsed()).saturating_sub(due);
-    let overdue = if overdue > 0 && parked(i) { 0 } else { overdue };
-    Some(Duration::from_nanos(late.max(overdue)))
-}
-
 /// Whether shard `i` of the runtime is parked now: announced parked in its driver's wait, its wake not yet run
 /// (hyper-rt's `Parking::parked`, an observer's snapshot read through the shard's registry entry); false with no such
 /// shard.
@@ -641,15 +620,6 @@ pub fn shards() -> &'static [Shard] {
     SHARDS.get().map_or(&[], |s| &s[..])
 }
 
-/// The probes' period from `KILN_SHARD_PROBE_MS` (`0`: none), else [`PERIOD`].
-pub fn period_from_env() -> Option<Duration> {
-    match std::env::var("KILN_SHARD_PROBE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(PERIOD),
-    }
-}
-
 /// Starts a probe on every shard, waking every `period`: once a process; later calls do nothing.
 /// How many shards took theirs.
 pub fn start(period: Duration) -> usize {
@@ -663,7 +633,6 @@ pub fn start(period: Duration) -> usize {
     }
     let _ = base();
     let period = period.max(Duration::from_millis(1));
-    PERIOD_NS.store(nanos(period), Ordering::Relaxed);
     let mut started = 0;
     for i in 0..shards.len() {
         if crate::rt::spawn_on(i, probe(i, period)) {

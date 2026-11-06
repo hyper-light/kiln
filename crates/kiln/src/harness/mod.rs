@@ -64,6 +64,7 @@ pub mod port;
 pub mod queued;
 pub mod registry;
 pub mod relocate;
+pub mod returning;
 pub mod screen;
 pub mod session;
 pub mod subagent;

@@ -782,21 +782,6 @@ fn push_movable_onto(
     }
 }
 
-/// Kicks the shard `holder` names when it is parked (the parking protocol's sender side, after the payload is
-/// published, `crate::parking`): whether it was. Movable tasks queued where a parked shard should look for them
-/// (`crate::movable`, kiln's goal 7).
-pub(crate) fn kick_if_parked(holder: SlotHolder) -> bool {
-    with_holder(holder, |entry| {
-        let mut kicked = false;
-        entry.parking.kick_if_parked_from(crate::parking::sender(), || {
-            kicked = true;
-            entry.kick_now();
-        });
-        kicked
-    })
-    .unwrap_or(false)
-}
-
 /// The kicks sent to the shard `holder` names, by who sent them (`crate::parking::KickFrom::ALL`'s order): each claimed
 /// (a system call) and saved (the shard awake); none for a holder no longer registered (kiln's goal 9, plan
 /// 01a1a87b2cec step 5).

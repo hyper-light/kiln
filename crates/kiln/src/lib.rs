@@ -61,7 +61,6 @@ pub mod os;
 pub mod password;
 pub mod pipeline;
 pub mod pki;
-pub mod placement;
 pub mod goals;
 pub mod plans;
 pub mod programs;

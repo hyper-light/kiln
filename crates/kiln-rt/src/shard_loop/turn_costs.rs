@@ -336,3 +336,46 @@ fn g9_s5_a_wake_from_a_park_takes_one_step() {
     assert!(steps * 2 < waits * 3, "{steps} steps for {waits} waits: an idle step after each wake");
     rt.shutdown().unwrap();
 }
+
+/// Kiln's goal 9, plan 01a1a87b2cec step 5 (legacy audit, 2026-11-06): a wake from a park takes one step on a local
+/// runtime's loop too ([`LocalRuntime::block_on`], what each of kiln's net threads runs on), as on a runtime's shard
+/// ([`g9_s5_a_wake_from_a_park_takes_one_step`]). Do: a local runtime on the OS's driver, its root waiting on a gate
+/// `WAKES` times, another thread opening the gate and waking it each time after a pause, so the loop has parked. Count
+/// the shard's steps and waits over them, from the root. Expect: about a step a wait, fewer than three for two, where
+/// block_on took two a wake (its own, then an idle one that found nothing before the park).
+#[test]
+fn g9_s5_a_wake_from_a_park_takes_one_step_in_block_on() {
+    const WAKES: u64 = 32;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let (wakers_tx, wakers) = channel::<Waker>();
+    let open = Arc::new(AtomicBool::new(false));
+    let opener = {
+        let open = Arc::clone(&open);
+        std::thread::spawn(move || {
+            for _ in 0..WAKES {
+                let waker = wakers.recv_timeout(ANSWER).unwrap();
+                pause(GAP);
+                open.store(true, Ordering::SeqCst);
+                waker.wake_by_ref();
+            }
+        })
+    };
+    let (steps, waits) = rt
+        .block_on(async move {
+            let counters = || crate::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+            let before = counters();
+            for _ in 0..WAKES {
+                Gate {
+                    open: Arc::clone(&open),
+                    wakers: wakers_tx.clone(),
+                }
+                .await;
+            }
+            let after = counters();
+            (after.steps - before.steps, after.waits - before.waits)
+        })
+        .unwrap();
+    opener.join().unwrap();
+    assert!(waits >= WAKES, "{waits} waits for {WAKES} wakes from another thread");
+    assert!(steps * 2 < waits * 3, "{steps} steps for {waits} waits: an idle step after each wake");
+}

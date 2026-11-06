@@ -3,13 +3,12 @@
 //! of primitives the rest of kiln uses.
 //!
 //! * One process-wide [`hyper_rt::Runtime`], started on first use with the sizing chosen by
-//!   [`configure`] (server, agent or CLI). There is no preemption, and shards take each other's work
-//!   only where the server's placement makes its requests movable tasks (goal 7, `crate::placement`),
-//!   so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and
-//!   below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
+//!   [`configure`] (server, agent or CLI). There is no preemption, and shards don't take each other's
+//!   admitted work, so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the
+//!   shards and below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
-//!   registered); spawns from outside the runtime are spread round-robin over the shards. Accepted
-//!   connections go where the placement says ([`spawn_connection`]).
+//!   registered); spawns from outside the runtime and accepted connections ([`spawn_connection`]) are
+//!   spread round-robin over the shards.
 //! * A task gives up its shard on time with no hand-placed yields: hyper-rt charges its leaf futures
 //!   (sockets, timers, its channels) to the polling task, and the cross-task primitives here charge
 //!   the same budget (`hyper_rt::coop`, kiln's goal 6), so a loop whose waits are always ready yields
@@ -123,19 +122,8 @@ impl Profile {
         if let Some(n) = std::env::var("KILN_RT_TASKS").ok().and_then(|v| v.parse::<usize>().ok()) {
             self.tasks_per_shard = n.clamp(256, 1 << 20);
         }
-        // The blocking pool's places, `dns,store,fs` (the lab's A/B of share sizes on one build).
-        if let Some(pool) = std::env::var("KILN_RT_BLOCKING").ok().as_deref().and_then(places) {
-            self.pool = pool;
-        }
         self
     }
-}
-
-/// `dns,store,fs` as three counts of places, each at least one.
-fn places(v: &str) -> Option<(usize, usize, usize)> {
-    let mut it = v.split(',').map(|n| n.trim().parse::<usize>().ok().filter(|n| *n > 0));
-    let pool = (it.next()??, it.next()??, it.next()??);
-    it.next().is_none().then_some(pool)
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
@@ -915,8 +903,8 @@ pub const SHARE_FS: &str = "fs";
 pub const SHARE_STORE: &str = "store";
 
 struct Rt {
-    /// Held for the life of the process: dropping it would stop the shards.
-    runtime: Runtime,
+    /// Held for the life of the process, never read: dropping it would stop the shards.
+    _runtime: Runtime,
     holders: Vec<SlotHolder>,
     next: AtomicUsize,
 }
@@ -1019,7 +1007,7 @@ fn start() -> Result<Rt, String> {
         keep_apart(&holders);
     }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
-    Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
+    Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
 }
 
 /// Keeps the process's other threads off its shards' cores for as long as it runs ([`pin`]; goal 9,
@@ -1112,11 +1100,6 @@ pub fn shard_holders() -> Vec<SlotHolder> {
 /// [`shard_holders`], borrowed: empty when the runtime couldn't start.
 pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
-}
-
-/// What the runtime's movable tasks did so far (goal 7, `crate::placement`); `None` when it couldn't start.
-pub fn movable_stats() -> Option<hyper_rt::movable::Stats> {
-    rt().ok().map(|rt| rt.runtime.movable_stats())
 }
 
 /// Whether the caller runs on a hyper-rt shard (inside a task).
@@ -1314,17 +1297,14 @@ where
     JoinHandle { rx, abort }
 }
 
-/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
-/// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
-/// task starting Critical: its first request's head must be read before the request's class is known, and
-/// reading a head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does (goal 7's A/B kept
+/// round-robin, docs/runtime-lab.md, "Goal 7: placement"); its task starting Critical: its first request's head
+/// must be read before the request's class is known, and reading a head costs little
+/// (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
 #[track_caller]
 pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
-    let critical = hyper_rt::coop::Class::Critical;
-    let steered = crate::placement::get().steers()
-        && crate::placement::connection_shard().is_some_and(|holder| hyper_rt::runtime::submit_movable_as(holder, critical, bootstrap(&slot)).is_ok());
-    if steered || submit_spread_as(&slot, critical) || submit(&slot) {
+    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -1487,7 +1467,7 @@ fn nanos_since(t: Instant) -> u64 {
 /// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
 /// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
 /// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
-/// trip ([`POOL_TRIP`]), every session copy's quiet gaps (`crate::harness::copies`).
+/// trip ([`POOL_TRIP`]).
 pub struct Smoothed {
     mean: AtomicU64,
     dev: AtomicU64,
@@ -1508,12 +1488,6 @@ impl Smoothed {
     /// Its variation, nanoseconds: 0 until a sample was learned.
     pub fn dev(&self) -> u64 {
         self.dev.load(Ordering::Relaxed)
-    }
-
-    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none until a sample was
-    /// learned.
-    pub fn bound(&self) -> Option<u64> {
-        self.mean().map(|mean| mean.saturating_add(self.dev().saturating_mul(4)))
     }
 
     /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
@@ -1762,21 +1736,13 @@ impl Turns {
         Self { began: Instant::now(), looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
     }
 
-    /// After a piece of the loop's work: its turn given up once its next piece would pass its step's quantum.
-    pub async fn after(&mut self) {
-        if self.over() {
-            maybe_yield().await;
-            *self = Self::new();
-        }
-    }
-
-    /// After a piece of the loop's work: as [`Turns::after`], its turn over once its next piece would pass its step's
-    /// quantum, but its poll ends there too, whether or not anything else wants the shard now (`yield_now`, where
-    /// `after` asks `maybe_yield`). Goal 9, plan 01a1a87b2cec step 3: no poll past the quantum. Told that nothing
-    /// wanted the shard, the hub's net loop went on into its next turn in the same poll, and a burst of runners' frames
-    /// held its shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end
-    /// costs a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else
-    /// is ready: once a quantum at the most, and only while frames wait.
+    /// After a piece of the loop's work: its turn over once its next piece would pass its step's quantum, and its poll
+    /// with it, whether or not anything else wants the shard now (`yield_now`). Goal 9, plan 01a1a87b2cec step 3: no
+    /// poll past the quantum. Told that nothing wanted the shard (`maybe_yield`, which every loop took until
+    /// 2026-11-06), a loop went on into its next turn in the same poll: a burst of runners' frames held the hub's net
+    /// loop's shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end costs
+    /// a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else is
+    /// ready: once a quantum at the most, and only while work waits.
     pub async fn end(&mut self) {
         if self.over() {
             hyper_rt::futures::yield_now().await;
@@ -1852,7 +1818,7 @@ impl Turns {
     }
 
     /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
-    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
+    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::end`].
     pub fn over(&self) -> bool {
         hyper_rt::futures::step_budget_ns().is_some_and(|q| self.over_at(Instant::now(), q))
     }
@@ -1875,6 +1841,13 @@ impl Default for Turns {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
+    /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
+    pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
@@ -1882,6 +1855,8 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
+    BLOCKING_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
     rt()?;
     let (tx, rx) = futures::channel::oneshot::channel::<R>();
     let job: Arc<Mutex<Option<(F, futures::channel::oneshot::Sender<R>)>>> = Arc::new(Mutex::new(Some((f, tx))));
@@ -1986,9 +1961,9 @@ impl<T: Send + 'static> Bridge<T> {
 
 impl<T: Send + 'static> Drop for Bridge<T> {
     fn drop(&mut self) {
-        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another shard than its
-        // helper's (a movable task's bridge, the task moved since: goal 7, `hyper_rt::movable`), it is cancelled
-        // there by a message, so its wait doesn't outlive what it waited for.
+        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another thread than its
+        // helper's shard (a future that held it, dropped there), it is cancelled there by a message, so its wait
+        // doesn't outlive what it waited for.
         if hyper_rt::futures::shard_id().is_some_and(|here| here.0 == self.task.0.shard()) {
             let _ = hyper_rt::futures::cancel(self.task);
         } else {
@@ -1999,8 +1974,8 @@ impl<T: Send + 'static> Drop for Bridge<T> {
 
 /// `fut` polled under its own task's waker, which hyper-rt's leaves need (a connect, a socket's readiness wait):
 /// as it is where its caller's poll is native, else in a helper task on this shard ([`Bridge`]) that wakes the
-/// caller when it ends: a movable task's poll (goal 7, `hyper_rt::movable`), or one through a combinator's own
-/// waker. Refused (`NotOnShardThread`) off the runtime's shards.
+/// caller when it ends: a poll through a combinator's own waker. Refused (`NotOnShardThread`) off the runtime's
+/// shards.
 pub async fn native<F>(fut: F) -> Result<F::Output, RtError>
 where
     F: Future + 'static,
@@ -2858,8 +2833,8 @@ mod tests {
     }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): a turn that's over ends its poll whether or not anything else wants the shard
-    /// (`end`), where `after` goes on in the same poll when nothing does; and a piece expected to run past the quantum
-    /// waits for the next turn (`before`), never a turn's first, nor one that fits.
+    /// (`end`); and a piece expected to run past the quantum waits for the next turn (`before`), never a turn's first,
+    /// nor one that fits.
     #[test]
     fn g9_s3_a_turn_over_ends_its_poll_and_a_piece_that_wont_fit_waits_for_the_next() -> anyhow::Result<()> {
         // Of 100 µs pieces against 266.666 µs: one done, the next 100 µs and 60 µs more of its read ends at 260 µs, within;
@@ -3575,17 +3550,6 @@ mod tests {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let _ = (here, there);
         Ok(())
-    }
-
-    /// Goal 3, plan 01a1a59c2a8e step 4: the blocking pool's places from `KILN_RT_BLOCKING`, `dns,store,fs`
-    /// (the lab's A/B of share sizes on one build): three counts of at least one, or nothing taken.
-    #[test]
-    fn g3_s4_the_blocking_pools_places_from_the_environment() {
-        assert_eq!(places("4,2,8"), Some((4, 2, 8)));
-        assert_eq!(places(" 1, 3 ,12"), Some((1, 3, 12)));
-        for refused in ["", "4,2", "4,2,8,1", "0,2,8", "a,2,8", "4,,8", "-1,2,8"] {
-            assert_eq!(places(refused), None, "{refused:?}");
-        }
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share

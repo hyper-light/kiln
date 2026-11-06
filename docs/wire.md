@@ -245,10 +245,11 @@ its certificate and address), a person, an agent session, or an address. What it
 variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
 message isn't refused: that's how peers of different versions work together. It's taken, counted
 in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each payload looked at), and
-logged once an hour for each wire and field; it's never audited. At most one payload of a kind (a
-message's variant) is looked at every 100 ms, and every message of a kind that comes less often:
-a field every message of a kind carries is in one looked at within 100 ms of its first.
-`kiln_wire_checked_payloads_total{wire}` counts the payloads looked at.
+logged once an hour for each wire and field; it's never audited. One payload of a kind (a message's
+variant) is looked at at a time, the next once the last is done: off a shard where it's read, on one
+by the compute pool's workers with time to spare (one that finds no job takes one before it rests).
+`kiln_wire_checked_payloads_total{wire}` counts the payloads looked at, and `kiln_wire_checks_waiting`
+those waiting for a worker's spare time.
 
 What a runner's or the server's frame carries as JSON is read once, where the frame is read
 (`crate::wire::payload_of`): each variant that carries JSON names its type there, and its handler
@@ -480,6 +481,14 @@ copy keeps; an older one gets its last 200, to show. The server has none of its 
 any more, and the first `Have` it sends says so. Each stream then starts again as above, sending
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
+
+A session the store has none of (the store is off, or no feed had brought any of it yet) has no
+copy until its runner is back and sends it whole. A viewer's attach to such a session waits; it
+isn't told the session is closed. It waits while the store's copies and the server's own sessions
+are still being listed. It also waits while a runner connected just before the start hasn't said
+what it holds, and while one has said it holds that session (its Open is on its way). It waits no
+longer than those runners' grace to come back, the one their jobs get. Once the session's copy is
+there, the viewer gets it as it stands, and the rest of what its runner sends as it comes.
 
 `tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
 every few seconds, watched by four viewers. The lab then:

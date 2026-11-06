@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests of the release's code layout scripts (goal 11, plan 01a1a87b2e56 step 5): ci/release/bolt.sh,
-ci/release/zig-relocs.sh, ci/release/build.sh's KILN_RELEASE_BOLT and scripts/memory_lab/bolt-hook.sh, each
+ci/release/zig-relocs.sh, ci/release/build.sh's KILN_RELEASE_BOLT, scripts/memory_lab/bolt-hook.sh, and the pipeline
+and its A/B (scripts/memory_lab/bolt-lab.sh, bolt-read.py), each
 "do X, expect Y". Offline: zig, llvm-bolt and LLVM's release are stand-ins made here; the tests that need a C
 compiler, readelf, zstd or Linux's /proc skip without them.
 
@@ -40,7 +41,7 @@ def script(path: Path, body: str) -> Path:
 
 class Scripts(unittest.TestCase):
     def test_g11_s5_every_script_parses(self) -> None:
-        for s in (BOLT, RELOCS, BUILD, HOOK):
+        for s in (BOLT, RELOCS, BUILD, HOOK, ROOT / "scripts" / "memory_lab" / "bolt-lab.sh"):
             r = run(["bash", "-n", str(s)])
             self.assertEqual(r.returncode, 0, f"{s}: {r.stderr}")
 
@@ -426,6 +427,108 @@ class BuildSwitch(unittest.TestCase):
             self.assertIn("relocs, a profile's path or an order's", r.stderr)
 
 
+@unittest.skipUnless(
+    shutil.which("cc") and shutil.which("readelf") and shutil.which("strip") and os.uname().machine == "x86_64" and sys.platform.startswith("linux"),
+    "takes cc, readelf and strip on x86-64 Linux",
+)
+class BuildBolt(unittest.TestCase):
+    """build.sh's KILN_RELEASE_BOLT end to end, its tools stand-ins (zig's venv, cargo-zigbuild, rustup, llvm-bolt) in a
+    copy of ci/release: the relocations build in a cargo-zigbuild cache of its own, and a layout shipped only as the same
+    program."""
+
+    ID = "00112233445566778899aabbccddeeff00112233"
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        root = self.dir / "tree"
+        (root / "ci" / "release").mkdir(parents=True)
+        for f in (BUILD, BOLT, RELOCS):
+            shutil.copy2(f, root / "ci" / "release" / f.name)
+        (root / "ui" / "dist" / "client").mkdir(parents=True)
+        (root / "ui" / "dist" / "client" / "_shell.html").write_text("<html></html>\n")
+        self.build = root / "ci" / "release" / "build.sh"
+        self.src = self.dir / "kiln.c"
+        self.src.write_text(
+            "#include <stdio.h>\n#include <string.h>\n#ifndef VERSION\n#define VERSION \"kiln 1.2.3\"\n#endif\n"
+            'int main(int c, char **v) { if (c > 1 && !strcmp(v[1], "--version")) { puts(VERSION); return 0; } return 1; }\n'
+        )
+        self.env_seen = self.dir / "zigbuild.env"
+        zig = self.dir / "zig-home"
+        (zig / "bin").mkdir(parents=True)
+        script(zig / "bin" / "python", '[ "$*" = "-m ziglang version" ] && echo 0.17.0\n')
+        # cargo-zigbuild's zigbuild: notes what it was given, and builds "kiln" as zig-relocs.sh would link it.
+        script(
+            zig / "bin" / "cargo-zigbuild",
+            f"""[ "$1" = --help ] && exit 0
+env | grep -E '^(CARGO_ZIGBUILD_[A-Z_]+|CARGO_TARGET_DIR|CARGO_PROFILE_RELEASE_STRIP|KILN_LINK_ORDER)=' | sort > {self.env_seen}
+out=$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release
+mkdir -p "$out/deps"
+cc -O1 -no-pie -Wl,--emit-relocs -Wl,--build-id=0x{self.ID} -o "$out/deps/kiln-0123456789abcdef" {self.src} && cp "$out/deps/kiln-0123456789abcdef" "$out/kiln"
+""",
+        )
+        tools = self.dir / "path"
+        tools.mkdir()
+        script(tools / "rustup", "exit 0\n")
+        bolt = self.dir / "bolt-tools"
+        bolt.mkdir()
+        # llvm-bolt: the same build laid out elsewhere (its text moved, its build id's last bit flipped as llvm-bolt patches
+        # it), saying LAID_OUT_VERSION.
+        script(
+            bolt / "llvm-bolt",
+            f"""case $1 in --version) echo "  LLVM version 23.1.4"; exit 0 ;; esac
+out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+cc -O1 -no-pie -Wl,--emit-relocs -Wl,--build-id=0x{self.ID[:-2]}32 -Wl,-Ttext-segment=0x800000 "-DVERSION=\\"${{LAID_OUT_VERSION:-kiln 1.2.3}}\\"" -o "$out" {self.src}
+echo "           123456789 : executed instructions"
+""",
+        )
+        script(bolt / "perf2bolt", "exit 0\n")
+        script(bolt / "merge-fdata", 'cat "$@"\n')
+        probe = subprocess.run(["cc", "-no-pie", "-Wl,-Ttext-segment=0x800000", f"-Wl,--build-id=0x{self.ID}", "-o", str(self.dir / "probe"), str(self.src)], capture_output=True)
+        if probe.returncode != 0:
+            self.skipTest("this cc's linker takes no -Ttext-segment or explicit build id")
+        self.env = {
+            "KILN_ZIG_HOME": str(zig),
+            "KILN_UI_SERVER": "off",
+            "KILN_DIST": str(self.dir / "dist"),
+            "CARGO_TARGET_DIR": str(self.dir / "target"),
+            "KILN_BOLT_BIN": str(bolt),
+            "PATH": f"{tools}:{os.environ['PATH']}",
+            "TMPDIR": str(self.dir),
+        }
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+
+    def test_g11_s5_the_relocations_build_keeps_a_zigbuild_cache_of_its_own(self) -> None:
+        r = run([str(self.build), "x86_64-unknown-linux-musl"], env={**self.env, "KILN_RELEASE_BOLT": "relocs"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        seen = dict(l.split("=", 1) for l in self.env_seen.read_text().splitlines())
+        bolt_dir = self.dir / "target" / "bolt"
+        # Its own cache, so no other build of the target on the machine rewrites the wrapper that runs zig-relocs.sh.
+        self.assertEqual(seen.get("CARGO_ZIGBUILD_CACHE_DIR"), str(bolt_dir / "zigbuild"))
+        self.assertTrue(seen["CARGO_ZIGBUILD_ZIG_COMMAND"].endswith("ci/release/zig-relocs.sh"))
+        self.assertEqual((seen["CARGO_TARGET_DIR"], seen["CARGO_PROFILE_RELEASE_STRIP"]), (str(bolt_dir), "false"))
+        shipped = self.dir / "dist" / "kiln-x86_64-unknown-linux-musl"
+        self.assertNotIn(".symtab", run(["readelf", "-SW", str(shipped)]).stdout, "the release as it ships: stripped")
+        self.assertEqual(build_id(shipped), self.ID, "its build id the unstripped one's, as perf2bolt matches them")
+        self.assertEqual((bolt_dir / "x86_64-unknown-linux-musl" / "release" / "kiln.linked-order").read_text().strip(), "none")
+
+    def test_g11_s5_a_layout_ships_only_as_the_same_program(self) -> None:
+        prof = self.dir / "kiln.fdata"
+        prof.write_text("1 main 0 1 main 4 0 7\n")
+        shipped = self.dir / "dist" / "kiln-x86_64-unknown-linux-musl"
+        r = run([str(self.build), "x86_64-unknown-linux-musl"], env={**self.env, "KILN_RELEASE_BOLT": str(prof)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("laid out (build id", r.stdout + r.stderr, "bolt.sh same said so")
+        self.assertEqual(run([str(shipped), "--version"]).stdout.strip(), "kiln 1.2.3")
+        self.assertTrue((self.dir / "target" / "bolt" / "x86_64-unknown-linux-musl" / "release" / "kiln.bolt.txt").exists())
+        # A layout that isn't the same program fails the build, and doesn't stay in dist/.
+        r = run([str(self.build), "x86_64-unknown-linux-musl"], env={**self.env, "KILN_RELEASE_BOLT": str(prof), "LAID_OUT_VERSION": "kiln 9.9.9"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("says 'kiln 9.9.9'", r.stderr)
+        self.assertFalse(shipped.exists())
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "the hook reads Linux's /proc")
 class Hook(unittest.TestCase):
     """bolt-hook.sh: the binary's resident pages by mapping as the window ends, and an instrumented window."""
@@ -724,6 +827,434 @@ class Kinds(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         r = run([sys.executable, "-I", str(KINDS), "1", "2", "3"])
         self.assertEqual(r.returncode, 2)
+
+
+LAB = ROOT / "scripts" / "memory_lab" / "bolt-lab.sh"
+READ = ROOT / "scripts" / "memory_lab" / "bolt-read.py"
+
+
+class Record(unittest.TestCase):
+    """bolt.sh record and lbr (goal 11 step 5, the pipeline whole): LBR where this machine's perf records branch stacks,
+    else cycles:u samples with their call graphs, and which it took said."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.calls = self.dir / "perf.calls"
+        # A perf with branch stacks when LBR=1: a recording's -j opens then, and its sample type says BRANCH_STACK.
+        self.perf = script(
+            self.dir / "perf",
+            f"""printf '%s\\n' "$*" >> {self.calls}
+arg() {{ local want=$1 prev=; shift; for a in "$@"; do [ "$prev" = "$want" ] && echo "$a"; prev=$a; done; }}
+case $1 in
+  record)
+    case " $* " in *" -j "*) [ "${{LBR:-0}}" = 1 ] || {{ echo "PMU Hardware or event type doesn't support branch stack sampling." >&2; exit 255; }} ;; esac
+    case " $* " in *" -j "*) echo branches > "$(arg -o "$@")" ;; *) echo samples > "$(arg -o "$@")" ;; esac ;;
+  evlist) if grep -q branches "$(arg -i "$@")"; then echo "cycles:u: sample_type: IP|TID|BRANCH_STACK"; else echo "cycles:u: sample_type: IP|TID"; fi ;;
+esac
+""",
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+
+    def record(self, kind: str | None, lbr: str) -> subprocess.CompletedProcess[str]:
+        args = [str(BOLT), "record", "4242", str(self.dir / "perf.data")] + ([kind] if kind else [])
+        return run(args, env={"PERF": str(self.perf), "LBR": lbr, "TMPDIR": str(self.dir), "BOLT_EVENT": ""})
+
+    def recorded(self) -> str:
+        return next(l for l in self.calls.read_text().splitlines() if " -p 4242 " in f" {l} ")
+
+    def test_g11_s5_auto_records_branch_stacks_where_the_cpu_has_them(self) -> None:
+        r = self.record(None, "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("-e cycles:u -j any,u -p 4242", self.recorded(), "BOLT's README's recording")
+        self.assertIn("with its branch stacks (LBR", r.stderr)
+        self.assertEqual(list(self.dir.glob("bolt-lbr.*")), [], "the probe's recording isn't left behind")
+
+    def test_g11_s5_auto_records_samples_with_call_graphs_where_it_has_none(self) -> None:
+        r = self.record("auto", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = self.recorded()
+        self.assertNotIn(" -j ", f" {rec} ")
+        self.assertIn("-e cycles:u --call-graph dwarf -p 4242", rec)
+        self.assertIn("samples with their call graphs, this machine's perf recording no branch stacks", r.stderr)
+
+    def test_g11_s5_a_kind_asked_for_is_taken_without_asking_perf(self) -> None:
+        r = self.record("samples", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1, "no probe")
+        self.assertIn("--call-graph dwarf", self.recorded())
+        r = self.record("bogus", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("auto, lbr or samples", r.stderr)
+
+    def test_g11_s5_lbr_says_whether_this_machine_records_branch_stacks(self) -> None:
+        env = {"PERF": str(self.perf), "TMPDIR": str(self.dir), "BOLT_EVENT": ""}
+        yes, no = run([str(BOLT), "lbr"], env={**env, "LBR": "1"}), run([str(BOLT), "lbr"], env={**env, "LBR": "0"})
+        self.assertEqual((yes.returncode, no.returncode), (0, 1))
+        self.assertIn("branch stacks: yes", yes.stdout)
+        self.assertIn("branch stacks: no", no.stdout)
+
+
+class ProfileSays(unittest.TestCase):
+    """bolt.sh profile: each recording said to hold branch records, or samples alone, which perf2bolt takes with -ba."""
+
+    def test_g11_s5_each_recording_is_said_lbr_or_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            dd, tools = Path(d), Path(d, "tools")
+            tools.mkdir()
+            calls = dd / "perf2bolt.calls"
+            script(tools / "llvm-bolt", "echo '  LLVM version 23.1.4'\n")
+            script(tools / "perf2bolt", f'printf "%s\\n" "$*" >> {calls}\nwhile [ $# -gt 0 ]; do if [ "$1" = -o ]; then shift; echo "1 f 0 1 f 4 0 7" > "$1"; fi; shift; done\n')
+            script(tools / "merge-fdata", 'cat "$@"\n')
+            perf = script(dd / "perf", 'case $1 in evlist) i=$(printf "%s\\n" "$@" | sed -n "/^-i$/{n;p}"); if grep -q lbr "$i"; then echo "sample_type: IP|BRANCH_STACK"; else echo "sample_type: IP"; fi ;; esac\n')
+            a, b = dd / "a.data", dd / "b.data"
+            a.write_text("lbr")
+            b.write_text("plain")
+            r = run([str(BOLT), "profile", "/bin/true", str(dd / "out.fdata"), str(a), str(b)], env={"KILN_BOLT_BIN": str(tools), "PERF": str(perf)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(f"{a}: branch records (LBR)", r.stderr)
+            self.assertIn(f"{b}: samples alone, no branch records: perf2bolt's basic aggregation (--ba)", r.stderr)
+            first, second = calls.read_text().splitlines()
+            self.assertNotIn("--ba", first)
+            self.assertIn("--ba", second)
+            self.assertNotIn(" -w ", f" {first} ", "no YAML unless asked")
+
+    def test_g11_s5_the_yaml_comes_from_the_same_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            dd, tools = Path(d), Path(d, "tools")
+            tools.mkdir()
+            calls = dd / "perf2bolt.calls"
+            script(tools / "llvm-bolt", "echo '  LLVM version 23.1.4'\n")
+            script(
+                tools / "perf2bolt",
+                f'printf "%s\\n" "$*" >> {calls}\nwhile [ $# -gt 0 ]; do case $1 in -o) shift; echo "1 f 0 1 f 4 0 7" > "$1" ;; -w) shift; echo "--- yaml" > "$1" ;; esac; shift; done\n',
+            )
+            script(tools / "merge-fdata", 'cat "$@"\n')
+            perf = script(dd / "perf", 'case $1 in evlist) echo "sample_type: IP|BRANCH_STACK" ;; esac\n')
+            a, b = dd / "a.data", dd / "b.data"
+            a.write_text("lbr")
+            b.write_text("lbr")
+            env = {"KILN_BOLT_BIN": str(tools), "PERF": str(perf), "BOLT_PROFILE_YAML": str(dd / "out.yaml")}
+            r = run([str(BOLT), "profile", "/bin/true", str(dd / "out.fdata"), str(a), str(b)], env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len(calls.read_text().splitlines()), 2, "one perf2bolt a recording, not two")
+            self.assertEqual((dd / "out.fdata").read_text(), "1 f 0 1 f 4 0 7\n" * 2)
+            self.assertEqual((dd / "out.yaml").read_text(), "--- yaml\n" * 2, "the recordings' YAML merged too")
+            self.assertEqual(sorted(p.name for p in dd.glob("out.*") if not p.name.endswith(".log")), ["out.fdata", "out.yaml"], "no parts left")
+
+
+def bolt_tools(d: Path, log: str, calls: Path) -> Path:
+    """Stand-ins for BOLT's three tools: an llvm-bolt that copies its input to its output and says `log`."""
+    tools = d / "tools"
+    tools.mkdir()
+    script(
+        tools / "llvm-bolt",
+        f"""case $1 in --version) echo "  LLVM version 23.1.4"; exit 0 ;; esac
+printf '%s\\n' "$*" >> {calls}
+out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+cp "$1" "$out"
+# llvm-bolt's note: its command line, this machine's paths in it.
+printf 'BOLT revision: <unknown>, command line: llvm-bolt %s' "$*" > "$out.note"
+objcopy --add-section .note.bolt_info="$out.note" "$out" && rm -f "$out.note"
+cat <<'LOG'
+{log}LOG
+""",
+    )
+    script(tools / "perf2bolt", "exit 0\n")
+    script(tools / "merge-fdata", 'cat "$@"\n')
+    return tools
+
+
+@unittest.skipUnless(
+    shutil.which("cc") and shutil.which("readelf") and shutil.which("strip") and shutil.which("objcopy") and os.uname().machine == "x86_64",
+    "takes cc, readelf, strip and objcopy on x86-64",
+)
+class Covered(unittest.TestCase):
+    """bolt.sh optimize: BOLT's README's options and safe ICF, and what the profile covered said beside the log."""
+
+    LOG = (
+        "BOLT-INFO: enabling lite mode\n"
+        "BOLT-INFO: 4123 out of 180000 functions in the binary (2.3%) have non-empty execution profile\n"
+        "BOLT-INFO: splitting separates 2400000 hot bytes from 9000000 cold bytes (21.05% of split functions is hot).\n"
+        "BOLT-INFO: ICF folded 300 out of 180000 functions in 3 passes. 0 functions had jump tables.\n"
+        "BOLT-WARNING: one warning\n"
+        "BOLT-INFO: program-wide dynostats after all optimizations before SCTC and FOP (no change):\n\n"
+        "           123456789 : executed instructions\n"
+        "BOLT-INFO: program-wide dynostats after all optimizations:\n"
+        "           120000000 : executed instructions (-2.8%)\n"
+    )
+
+    def optimize(self, dd: Path, log: str) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        (dd / "built").mkdir()
+        (dd / "dist").mkdir()
+        src, binary = dd / "m.c", dd / "built" / "kiln"
+        src.write_text("int main(void) { return 0; }\n")
+        subprocess.run(["cc", "-Wl,--emit-relocs", "-o", str(binary), str(src)], check=True)
+        tools = bolt_tools(dd, log, dd / "bolt.calls")
+        prof = dd / "kiln.fdata"
+        prof.write_text("1 main 0 1 main 4 0 7\n")
+        out = dd / "dist" / "kiln-x86_64-unknown-linux-musl"
+        return run([str(BOLT), "optimize", str(binary), str(prof), str(out)], env={"KILN_BOLT_BIN": str(tools)}), binary, out
+
+    def test_g11_s5_a_log_without_warnings_is_said_as_none(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            r, binary, out = self.optimize(Path(d), self.LOG.replace("BOLT-WARNING: one warning\n", ""))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("warnings: 0", Path(f"{binary}.bolt.txt").read_text())
+            self.assertTrue(out.exists())
+
+    def test_g11_s5_the_profiles_coverage_is_said_beside_the_log_not_in_dist(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            dd = Path(d)
+            r, binary, out = self.optimize(dd, self.LOG)
+            calls = dd / "bolt.calls"
+            self.assertEqual(r.returncode, 0, r.stderr)
+            said = Path(f"{binary}.bolt.txt").read_text()
+            self.assertIn("instructions: 123456789 ", said, "the first count, the profile's, before BOLT changed anything")
+            for want in ("llvm-bolt: 23.1.4", "have non-empty execution profile", "enabling lite mode", "splitting separates", "ICF folded", "warnings: 1"):
+                self.assertIn(want, said)
+            self.assertEqual([p.name for p in (dd / "dist").iterdir()], [out.name], "dist/ holds the binary alone: build.sh's SHA256SUMS takes every kiln-*")
+            opts = calls.read_text()
+            for o in ("-reorder-blocks=ext-tsp", "-reorder-functions=cdsort", "-split-functions", "-split-all-cold", "-split-eh", "-dyno-stats", "-icf=safe"):
+                self.assertIn(o, opts.split())
+            self.assertNotIn("-use-gnu-stack", opts, "musl sizes its threads' stacks by PT_GNU_STACK")
+            self.assertIn(".note.bolt_info", run(["readelf", "-SW", f"{binary}.bolt"]).stdout, "llvm-bolt's own output has its note")
+            self.assertNotIn(".note.bolt_info", run(["readelf", "-SW", str(out)]).stdout, "the shipped layout doesn't: one build and one profile, one layout's bytes")
+
+
+@unittest.skipUnless(
+    shutil.which("cc") and shutil.which("readelf") and os.uname().machine == "x86_64" and sys.platform.startswith("linux"),
+    "takes cc and readelf on x86-64 Linux",
+)
+class Same(unittest.TestCase):
+    """bolt.sh same: one build id and one `--version`, its code moved: a layout of the build, not another build."""
+
+    ID = "00112233445566778899aabbccddeeff00112233"
+
+    def build(self, d: Path, name: str, version: str = "kiln 1.2.3", build_id: str = ID, moved: bool = False) -> Path:
+        src = d / f"{name}.c"
+        src.write_text(
+            "#include <stdio.h>\n#include <string.h>\n"
+            f'int main(int c, char **v) {{ if (c > 1 && !strcmp(v[1], "--version")) {{ puts("{version}"); return 0; }} return 1; }}\n'
+        )
+        out = d / name
+        cmd = ["cc", "-O1", "-no-pie", f"-Wl,--build-id=0x{build_id}", "-o", str(out), str(src)] + (["-Wl,-Ttext-segment=0x800000"] if moved else [])
+        if subprocess.run(cmd, capture_output=True).returncode != 0:
+            self.skipTest("this cc's linker takes no -Ttext-segment or explicit build id")
+        return out
+
+    def test_g11_s5_a_layout_of_the_build_is_the_same_program(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            a, b = self.build(Path(d), "a"), self.build(Path(d), "b", moved=True)
+            r = run([str(BOLT), "same", str(a), str(b)])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("both 'kiln 1.2.3'", r.stdout)
+            # llvm-bolt patches its output's build id, its last bit flipped ("BOLT-INFO: patched build-id (flipped
+            # last bit)", 23.1.4 on kiln's release, 2026-11-06): still the build's.
+            bolted = self.build(Path(d), "bolted", build_id=self.ID[:-2] + "32", moved=True)
+            r = run([str(BOLT), "same", str(a), str(bolted)])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("its last bit flipped as BOLT patches it", r.stdout)
+
+    def test_g11_s5_the_build_itself_another_build_or_another_version_isnt(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            dd = Path(d)
+            a = self.build(dd, "a")
+            r = run([str(BOLT), "same", str(a), str(a)])
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("not laid out", r.stderr)
+            other = self.build(dd, "other", build_id="ff" * 20, moved=True)
+            r = run([str(BOLT), "same", str(a), str(other)])
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("isn't a layout of", r.stderr)
+            says = self.build(dd, "says", version="kiln 9.9.9", moved=True)
+            r = run([str(BOLT), "same", str(a), str(says)])
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("says 'kiln 9.9.9'", r.stderr)
+
+
+# A stand-in kiln-lab: notes its arguments and its hook's environment, and writes a run as kiln-lab does (run.json, and each
+# round's hook folder with what bolt-hook.sh would have left: a recording when its record asks for one, sections.txt).
+STANDIN_LAB = """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+d = Path(os.environ["STANDIN_DIR"])
+with open(d / "calls", "a") as f:
+    f.write(" ".join(args) + "\\n")
+with open(d / "envs", "a") as f:
+    f.write(" ".join(f"{k}={os.environ.get(k, '')}" for k in ("BOLT_RECORD", "KILN_LAB_HOOK", "BOLT_SH", "BOLT_FREQ")) + "\\n")
+opt = lambda k, default=None: args[args.index(k) + 1] if k in args else default
+out = Path(opt("--out"))
+labels = [opt("--label", "build")] if args[0] == "run" else [opt("--label-a"), opt("--label-b")]
+sections = {
+    labels[0]: ".text size_kb=180000 resident_kb=96000 file_kb=96000 anon_kb=0 windows=1500 of=2800\\n.rodata size_kb=32000 resident_kb=6000 file_kb=6000 anon_kb=0 windows=200 of=500\\ntotal size_kb=230000 resident_kb=104000 file_kb=104000 anon_kb=0 windows=1750 of=3600\\n",
+    labels[-1]: ".text size_kb=5000 resident_kb=4000 file_kb=4000 anon_kb=0 windows=70 of=80\\n.text.cold size_kb=9000 resident_kb=200 file_kb=200 anon_kb=0 windows=10 of=150\\n.bolt.org.text size_kb=180000 resident_kb=10000 file_kb=10000 anon_kb=0 windows=200 of=2800\\n.bolt.org.rodata size_kb=32000 resident_kb=3000 file_kb=3000 anon_kb=0 windows=90 of=500\\n.rodata size_kb=100 resident_kb=100 file_kb=100 anon_kb=0 windows=3 of=3\\n.rodata.cold size_kb=40 resident_kb=40 file_kb=40 anon_kb=0 windows=1 of=2\\ntotal size_kb=244000 resident_kb=22000 file_kb=22000 anon_kb=0 windows=500 of=3700\\n",
+}
+rounds, index = [], 0
+for i in range(int(opt("--rounds", "8"))):
+    for label in labels:
+        index += 1
+        hook = out / "rounds" / f"{index:03d}-{label}.hook"
+        hook.mkdir(parents=True, exist_ok=True)
+        if os.environ.get("BOLT_RECORD") in ("auto", "lbr", "samples"):
+            (hook / "perf.data").write_text("recorded")
+            (hook / "perf.log").write_text(f"bolt.sh: recording process {1000 + index} with its branch stacks (LBR: -e cycles:u -j any,u)\\n")
+        (hook / "sections.txt").write_text(sections[label])
+        errors = float(os.environ.get("STANDIN_ERRORS_B", "0")) if label == labels[-1] and len(labels) > 1 else 0.0
+        cpu = 7.0 + i if label == labels[-1] and len(labels) > 1 else 9.0 + i
+        rounds.append({"build": label, "index": index, "numbers": {"server.cpu_ms_per_request": cpu, "server.rss_file_mb": 100.0, "api_read.p50_ms": 0.2, "api_read.errors": errors}})
+out.mkdir(parents=True, exist_ok=True)
+failures = [os.environ["STANDIN_FAIL"]] if os.environ.get("STANDIN_FAIL") else []
+(out / "run.json").write_text(json.dumps({"rounds": rounds, "failures": failures}))
+"""
+
+
+class Lab(unittest.TestCase):
+    """bolt-lab.sh: the pipeline's stages (record, bolt, smoke, ab) as the lab runs them, against stand-ins."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.lab = self.dir / "kiln-lab"
+        self.lab.write_text(STANDIN_LAB)
+        self.lab.chmod(0o755)
+        self.bolt_calls = self.dir / "bolt.calls"
+        # A bolt.sh: `same` as SAME says; profile and optimize leave what the real one does, optimize's coverage INS.
+        self.bolt = script(
+            self.dir / "bolt.sh",
+            f"""printf '%s\\n' "$*" >> {self.bolt_calls}
+case $1 in
+  same) exit "${{SAME:-0}}" ;;
+  check) exit 0 ;;
+  profile) echo profile > "$3"; if [ -n "${{BOLT_PROFILE_YAML:-}}" ]; then echo yaml > "$BOLT_PROFILE_YAML"; fi; if [ -n "${{MORE:-}}" ]; then echo "BOLT-WARNING: BOLT is estimated to optimize better with ${{MORE}}x more samples. Please consider increasing sampling rate" > "$3.1.log"; fi ;;
+  optimize) echo bolted > "$4"; printf 'layout\\ninstructions: %s (-dyno-stats)\\n' "${{INS:-0}}" > "$2.bolt.txt" ;;
+esac
+""",
+        )
+        bin_dir = self.dir / "path"
+        bin_dir.mkdir()
+        # taskset noted, then what it runs run.
+        script(bin_dir / "taskset", f'printf "%s\\n" "$*" >> {self.dir}/taskset.calls\nshift 2\nexec "$@"\n')
+        self.env = {"UNIT": "none", "BOLT_SH": str(self.bolt), "STANDIN_DIR": str(self.dir), "PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(self.dir / "tmp")}
+        self.kiln, self.bolted = self.dir / "kiln", self.dir / "kiln.bolt"
+        for b in (self.kiln, self.bolted):
+            script(b, "echo kiln 1.2.3\n")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+
+    def go(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        # The lab's own placement unless a test says otherwise: none of the caller's.
+        clean = {k: v for k, v in os.environ.items() if k not in ("LAB_CPUS", "SERVER_CPUS", "LAYOUT", "SHARDS", "ROUNDS", "HOGS", "BOLT_RECORD", "UNIT_WEIGHT")}
+        return subprocess.run([str(LAB), *args], env={**clean, **self.env, **env}, capture_output=True, text=True, timeout=120)
+
+    def calls(self) -> list[str]:
+        return (self.dir / "calls").read_text().splitlines()
+
+    def test_g11_s5_the_ab_runs_calm_then_hogs_in_productions_layout(self) -> None:
+        out = self.dir / "ab"
+        r = self.go("ab", str(self.kiln), str(self.bolted), str(self.lab), str(out))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.bolt_calls.read_text().splitlines()[0], f"same {self.kiln} {self.bolted}", "the same program first")
+        calm, hogs = self.calls()
+        common = f"ab --a {self.kiln} --b {self.bolted} --label-a release --label-b bolt --env-a KILN_RT_SHARDS=4 --env-b KILN_RT_SHARDS=4 --profile realistic --rounds 8"
+        self.assertEqual(calm, f"{common} --hogs 0 --layout production --server-cpus 16-31 --out {out}/calm/run")
+        self.assertEqual(hogs, f"{common} --hogs 1x --layout production --server-cpus 16-31 --out {out}/hogs/run")
+        self.assertEqual({l.split()[1] for l in (self.dir / "taskset.calls").read_text().splitlines()}, {"0-15"}, "the lab's clients on their own CPUs")
+        self.assertTrue(all(l.startswith("BOLT_RECORD=none ") for l in (self.dir / "envs").read_text().splitlines()), "no profiling in an A/B's rounds")
+        read = (out / "read.md").read_text()
+        self.assertIn(f"## {out}/calm/run", read)
+        self.assertIn(f"## {out}/hogs/run", read)
+
+    def test_g11_s5_an_ab_of_a_build_that_isnt_the_release_laid_out_doesnt_start(self) -> None:
+        r = self.go("ab", str(self.kiln), str(self.bolted), str(self.lab), str(self.dir / "ab"), SAME="1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.dir / "calls").exists(), "no round run")
+
+    def test_g11_s5_the_placement_is_the_callers_beside_production(self) -> None:
+        # adacachy, beside production: the shared layout at the unit's weight, nothing pinned.
+        r = self.go("smoke", str(self.kiln), str(self.bolted), str(self.lab), str(self.dir / "s"), LAB_CPUS="", SERVER_CPUS="", LAYOUT="shared")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (smoke,) = self.calls()
+        self.assertIn("--profile small --rounds 1 --hogs 0 --layout shared --out", smoke)
+        self.assertNotIn("--server-cpus", smoke)
+        self.assertFalse((self.dir / "taskset.calls").exists())
+
+    def test_g11_s5_the_smoke_passes_only_when_the_bolted_build_runs_as_the_release_does(self) -> None:
+        r = self.go("smoke", str(self.kiln), str(self.bolted), str(self.lab), str(self.dir / "s1"))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("release and bolt each ran their rounds, errors 0 and 0", r.stdout)
+        r = self.go("smoke", str(self.kiln), str(self.bolted), str(self.lab), str(self.dir / "s2"), STANDIN_ERRORS_B="3")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bolt answered 3 requests with errors, release 0", r.stdout)
+        r = self.go("smoke", str(self.kiln), str(self.bolted), str(self.lab), str(self.dir / "s3"), STANDIN_FAIL="round 2 (bolt): the server exited")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the server exited", r.stdout)
+
+    def test_g11_s5_record_profiles_every_round_from_the_servers_start_each_call_in_a_folder_of_its_own(self) -> None:
+        out = self.dir / "prof"
+        for _ in range(2):
+            r = self.go("record", str(self.kiln), str(self.lab), str(out), "2")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        first, second = self.calls()
+        self.assertEqual(first, f"run --kiln {self.kiln} --label release --env KILN_RT_SHARDS=4 --profile realistic --rounds 2 --hogs 0 --layout production --server-cpus 16-31 --out {out}/prof-1/run")
+        self.assertTrue(second.endswith(f"--out {out}/prof-2/run"))
+        envs = (self.dir / "envs").read_text().splitlines()
+        self.assertTrue(all(l.startswith("BOLT_RECORD=auto ") for l in envs), "LBR where the CPU has it")
+        self.assertTrue(all(l.endswith(" BOLT_FREQ=max") for l in envs), "as often as the kernel lets perf sample")
+        self.assertIn("2 bolt.sh: recording the server with its branch stacks", r.stderr, "which perf took, said")
+        r = self.go("record", str(self.kiln), str(self.lab), str(out), "0")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_g11_s5_bolt_derives_the_rounds_bolts_two_measures_ask_for(self) -> None:
+        out = self.dir / "prof"
+        r = self.go("record", str(self.kiln), str(self.lab), str(out), "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        relocs = self.dir / "kiln.relocs"
+        relocs.write_text("relocs")
+        # 300M instructions in 2 rounds: 150M a round, so the README's 1B takes 7; perf2bolt asks for no more.
+        r = self.go("bolt", str(relocs), str(out), INS="300000000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((out / "rounds.txt").read_text().strip(), "rounds=2 instructions=300000000 more=0 readme=7 bolt=0 needed=7")
+        self.assertIn("record ... 5, then bolt again", r.stderr)
+        self.assertEqual((out / "kiln.bolt").read_text(), "bolted\n")
+        steps = [l.split()[0] for l in self.bolt_calls.read_text().splitlines()]
+        self.assertEqual(steps, ["check", "profile", "optimize"], "one pass of perf2bolt, then the layout")
+        self.assertEqual((out / "kiln.yaml").read_text(), "yaml\n", "the YAML for later commits from the same pass")
+        # perf2bolt's own estimate for a round's recording, 7.5x more samples: 8 rounds, more than the README's.
+        r = self.go("bolt", str(relocs), str(out), INS="300000000", MORE="7.5")
+        self.assertEqual((out / "rounds.txt").read_text().strip(), "rounds=2 instructions=300000000 more=7.5 readme=7 bolt=8 needed=8")
+        # Enough already by both: no more rounds.
+        for log in out.glob("kiln.fdata.*.log"):
+            log.unlink()
+        r = self.go("bolt", str(relocs), str(out), INS="2000000000")
+        self.assertEqual((out / "rounds.txt").read_text().strip(), "rounds=2 instructions=2000000000 more=0 readme=1 bolt=0 needed=2")
+
+
+class Read(unittest.TestCase):
+    """bolt-read.py ab: the A/B's numbers and the binary's pages by section, each the median of a build's rounds."""
+
+    def test_g11_s5_the_code_is_every_text_section_and_each_is_read_by_pages_and_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            dd = Path(d)
+            lab = dd / "kiln-lab"
+            lab.write_text(STANDIN_LAB)
+            lab.chmod(0o755)
+            run([str(lab), "ab", "--a", "a", "--b", "b", "--label-a", "release", "--label-b", "bolt", "--rounds", "2", "--out", str(dd / "run")], env={"STANDIN_DIR": d})
+            r = run([sys.executable, "-I", str(READ), "ab", "release", "bolt", str(dd / "run")])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # B's code: .text 4000 + .text.cold 200 + .bolt.org.text 10000 KiB, windows 70 + 10 + 200 of 80 + 150 + 2800.
+            self.assertIn("| code (every .text section) | 96,000 | 24,000 | 1,500 of 2,800 | 14,200 | 3,550 | 280 of 3,030 |", r.stdout)
+            self.assertIn("| .bolt.org.text | - | - | - | 10,000 | 2,500 | 200 of 2,800 |", r.stdout)
+            # BOLT's own: the original .rodata renamed .bolt.org.rodata, its new .rodata and .rodata.cold, together.
+            self.assertIn("| .rodata (and .bolt.org.rodata, .rodata.cold) | 6,000 | 1,500 | 200 of 500 | 3,140 | 785 | 94 of 505 |", r.stdout)
+            # Medians of rounds: A 9 and 10 ms, B 7 and 8.
+            self.assertIn("| server.cpu_ms_per_request | 9.500 | 7.500 | 0.789 |", r.stdout)
+            self.assertIn("rounds with sections.txt: release 2, bolt 2", r.stdout)
+            bad = run([sys.executable, "-I", str(READ), "ab", "release", "bolt", str(dd / "nothing")])
+            self.assertEqual(bad.returncode, 1)
+            self.assertEqual(run([sys.executable, "-I", str(READ)]).returncode, 2)
 
 
 if __name__ == "__main__":

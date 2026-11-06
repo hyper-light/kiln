@@ -1028,11 +1028,6 @@ impl Shard {
                 reading = last;
                 continue;
             }
-            // Idle: movable tasks waiting in the shared queues or a sibling's take this shard's turn first
-            // (`crate::movable`, kiln's goal 7).
-            if self.desk.movable.look(&self.desk) {
-                continue;
-            }
             // A spinning shard is awake: a quiet sleep falling due ends its spin as a timer would ([`crate::quiet`]).
             let awake_deadline_ns = self.awake_deadline(outcome.next_deadline_ns);
             if self.spin_after_activity(awake_deadline_ns) {
@@ -1376,7 +1371,6 @@ impl Shard {
                 .desk
                 .entry
                 .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-            || self.desk.movable.shared_waiting()
     }
 
     /// One loop iteration without blocking.
@@ -1580,14 +1574,14 @@ impl Shard {
     }
 
     /// Whether a step that did work left nothing for the next to find, as the idle step after it would find it
-    /// ([`Shard::run`]): no task ready, those that woke themselves among them, and no input pending as of `last`,
+    /// ([`Shard::run`], `LocalRuntime::block_on`): no task ready, those that woke themselves among them, and no input pending as of `last`,
     /// the step's last reading of the clock (none: the clock now). Then the loop goes on as after an idle step, to
     /// the park: half of a server shard's steps were that idle one, each reading its inputs, its wheel and its
     /// judgments to find nothing (kiln's goal 9, plan 01a1a87b2cec step 5: 44.6 steps to 22.9 parks a request in
     /// kiln's lab, g9p16). What that step left for the park is left here too: its clock, and the driver owed its
     /// look where readiness waits are registered ([`Shard::read_inputs`]). The park announces itself and looks at its
     /// inbox again as it always does, so a wake sent after this look is never lost ([`crate::parking`]).
-    fn left_nothing(&mut self, last: Option<Reading>) -> bool {
+    pub(crate) fn left_nothing(&mut self, last: Option<Reading>) -> bool {
         if !self.core.real_time || self.core.driver_lost || self.core.exited || !self.desk.local.is_empty() {
             return false;
         }
@@ -1712,16 +1706,8 @@ impl Shard {
         // halved every shard's batch (`benchmark-results/rtloop-async-fill-bisect-20261010`).
         let mut cpu_before = None;
         let pending = self.has_inbound();
-        // Movable tasks a sibling or a thread off the runtime put on the shared queues, re-read after the announcement
-        // as the entry's flags are (`crate::movable`, kiln's goal 7).
-        let movable = self.desk.movable.pool();
         let parked = entry.parking.park_unless_pending(
-            || {
-                pending
-                    || entry.wakes.is_pending()
-                    || entry.control_pending.is_pending()
-                    || movable.as_ref().is_some_and(|pool| pool.shared_waiting())
-            },
+            || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
             || {
                 if learns {
                     switches_before_wait = attribution::voluntary_switches_now();

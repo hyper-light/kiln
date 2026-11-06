@@ -308,6 +308,9 @@ pub struct QuicSample {
     pub frames_dropped: u64,
     /// Endpoint responses dropped at their bound, since then.
     pub responses_dropped: u64,
+    /// Frames whose buffer no spare held, allocated or grown on the net thread, since then (goal 11's audit,
+    /// row B22: `crate::net_budget::Spares::fresh`).
+    pub frames_allocated: u64,
     /// Each peer with a connection: its name, its path now and what its connection counted.
     pub peers: Vec<PeerSample>,
 }
@@ -349,6 +352,7 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> 
         streams_refused: st.streams_refused,
         frames_dropped: st.frames_dropped,
         responses_dropped: st.responses_dropped,
+        frames_allocated: ep.budget().fresh(),
         peers: Vec::new(),
     };
     ep.directory().each(&mut |peer, name| {
@@ -584,8 +588,9 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
-/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
+/// The bytes of transport events the net thread hands its owner (the server's hub loops, `crate::wire::fan`;
+/// a runner's one loop) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`WINDOW`]), what the
 /// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
 /// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
 /// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
@@ -678,18 +683,21 @@ impl crate::memory::queue::Weigh for Out {
     }
 }
 
-/// What a net thread did, in its order, as a test reads it back (goal 10, plan 01a1a87b2dae step 5).
+/// What a net thread did, in its order, as a test reads it back (goal 10, plan 01a1a87b2dae step 5), with the
+/// datagrams its driver had sent where a step says so.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
-    /// A receive turn's start.
-    Turn,
+    /// A receive turn's start, as its driver hands out the turn's first event.
+    Turn(u64),
     /// The events it took off its driver.
     Received(usize),
     /// Events handed to the owner, at a hand-over that handed any.
     Handed(usize),
-    /// A receive turn's sends starting: before its first write.
-    Sends,
+    /// A receive turn's sends starting.
+    Sends(u64),
+    /// A receive turn's sends made.
+    Sent(u64),
 }
 
 /// The net threads whose steps a test reads, by the address their socket is bound to, named before they start.
@@ -839,12 +847,18 @@ macro_rules! with_driver {
     };
 }
 
+/// The datagrams `driver` has sent, on its listener and its peers' sockets (a test's [`Step`]s).
+#[cfg(test)]
+fn sent_by(driver: &AnyDriver) -> u64 {
+    with_driver!(driver, d => d.stats().sent.saturating_add(d.peer_stats().sent))
+}
+
 /// Builds the endpoint and binds its socket; must run on the net thread's shard.
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
-    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares as many and as large as its frames have had out at once (goal 11's audit, row B22: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 });
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {
@@ -1129,8 +1143,9 @@ async fn run_loop(
         let pending = !outbox.is_empty();
         let ev = {
             let cmd = rx.recv().fuse();
-            // `event()` is cancel-safe: dropping it when another branch wins loses nothing.
-            let drv = async { with_driver!(&mut driver, d => d.event().await) }.fuse();
+            // `received()` is cancel-safe: dropping it when another branch wins loses nothing. The event it hands
+            // out comes before its turn's sends, which this loop makes once it has handed the turn's events over.
+            let drv = async { with_driver!(&mut driver, d => d.received().await) }.fuse();
             let handed = async {
                 match handing.as_mut() {
                     Some(h) => h.await,
@@ -1289,7 +1304,7 @@ async fn run_loop(
             Ev::Driver(ev) => {
                 let ev = ev.map_err(|e| anyhow::anyhow!("driver: {e}"))?;
                 #[cfg(test)]
-                stamp(me, Step::Turn);
+                stamp(me, Step::Turn(sent_by(&driver)));
                 with_driver!(&mut driver, d => {
                     on_event(d.endpoint(), ev, &mut events, &mut outbox);
                     while let Some(ev) = d.endpoint().poll_event() {
@@ -1298,7 +1313,7 @@ async fn run_loop(
                 });
                 #[cfg(test)]
                 stamp(me, Step::Received(events.len()));
-                // Its sends wait for what came to go to the owner, below.
+                // Its sends, the driver's own among them, wait for what came to go to the owner, below.
                 received = true;
             }
             Ev::DialDeadline => {
@@ -1355,11 +1370,15 @@ async fn run_loop(
             held.push_back(ev);
         }
         // What came in this turn goes to the owner before the turn's sends (goal 10, plan 01a1a87b2dae step 5): its frames
-        // are on their loops' queues, the shards they wake already on their way, while this thread flushes its outbox,
-        // which waited for a lane's room (a peer not reading what it was sent, a bulk lane's window) and may then copy
-        // and send a great deal. They went to the owner only at the next turn of this loop, after those sends: part of
-        // the `net` leg of a runner's wait (`crate::route_latency::RunnerLeg::Net`). The hand-over is this loop's top's,
-        // made here first; what it couldn't hand (the owner's queue full) waits there, as before.
+        // are on their loops' queues, the shards they wake already on their way, while this thread sends. The turn's sends
+        // are the driver's own, which `received` left to this loop (the acknowledgements and retransmissions its receives
+        // and timers made, the data they let go: `hyper_rt_transport::Driver::poll_received`, kiln's change to the
+        // vendored driver), and its outbox's, which waited for a lane's room (a peer not reading what it was sent, a bulk
+        // lane's window) and may then copy and send a great deal. They went to the owner only after both: the driver sent
+        // before it handed out the turn's first event, and this loop flushed its outbox before it handed any over, part of
+        // the `net` leg of a runner's wait (`crate::route_latency::RunnerLeg::Net`) and of every frame's way to its viewer.
+        // The hand-over is this loop's top's, made here first; what it couldn't hand (the owner's queue full) waits there,
+        // as before. The sends are made here, in the same turn, every time: until they are none of them leaves.
         if std::mem::take(&mut received) {
             #[cfg(test)]
             let before = held.len();
@@ -1370,16 +1389,18 @@ async fn run_loop(
             if held.len() < before {
                 stamp(me, Step::Handed(before.saturating_sub(held.len())));
             }
-            if !outbox.is_empty() {
-                #[cfg(test)]
-                stamp(me, Step::Sends);
-                with_driver!(&mut driver, d => {
+            #[cfg(test)]
+            stamp(me, Step::Sends(sent_by(&driver)));
+            with_driver!(&mut driver, d => {
+                if !outbox.is_empty() {
                     flush_outbox(d.endpoint(), &mut outbox);
-                    if let Err(e) = d.flush() {
-                        tracing::debug!(error = %e, "flush");
-                    }
-                });
-            }
+                }
+                if let Err(e) = d.flush() {
+                    tracing::debug!(error = %e, "flush");
+                }
+            });
+            #[cfg(test)]
+            stamp(me, Step::Sent(sent_by(&driver)));
         }
     }
 }
@@ -2029,35 +2050,49 @@ mod tests {
         })
     }
 
-    /// Of a net thread's `steps` (`STEPS`, its own), the first receive turn that took events and then made sends: how many
-    /// it took, and how many events had gone to its owner when its sends began. `None` while no such turn has come.
-    fn handed_before_sends(steps: &[Step]) -> Option<(usize, usize)> {
-        let (mut took, mut handed) = (0usize, 0usize);
-        for s in steps {
-            match *s {
-                Step::Turn => (took, handed) = (0, 0),
-                Step::Received(n) => (took, handed) = (n, 0),
-                Step::Handed(n) => handed = handed.saturating_add(n),
-                Step::Sends if took > 0 => return Some((took, handed)),
-                Step::Sends => {}
-            }
-        }
-        None
+    /// A receive turn of a net thread's, read off its steps (`STEPS`).
+    #[derive(Debug, Default)]
+    struct TurnSeen {
+        /// The datagrams its driver had sent as it handed out the turn's first event, as the turn's sends began, and
+        /// once they were made.
+        at_event: u64,
+        at_sends: Option<u64>,
+        after: Option<u64>,
+        /// The events it took, and how many events had gone to the owner when its sends began.
+        took: usize,
+        handed: usize,
     }
 
-    /// Goal 10, plan 01a1a87b2dae step 5: what comes in while the net thread has sends waiting (a frame its outbox holds,
-    /// here held back late by a test build's fault) goes to the owner before the turn that took it begins those sends,
-    /// counted off the thread's own steps: every event the turn took handed over before its first write. They went at
-    /// the next turn of the loop, after the sends, and none had when the sends began. Every frame still reaches the
-    /// owner, in order, and the one held goes to its peer.
+    /// `steps`' receive turns, in order.
+    fn turns_of(steps: &[Step]) -> Vec<TurnSeen> {
+        let mut turns: Vec<TurnSeen> = Vec::new();
+        for step in steps {
+            match (*step, turns.last_mut()) {
+                (Step::Turn(sent), _) => turns.push(TurnSeen { at_event: sent, ..TurnSeen::default() }),
+                (Step::Received(n), Some(t)) => t.took = n,
+                (Step::Handed(n), Some(t)) if t.at_sends.is_none() => t.handed = t.handed.saturating_add(n),
+                (Step::Sends(sent), Some(t)) => t.at_sends = Some(sent),
+                (Step::Sent(sent), Some(t)) => t.after = Some(sent),
+                _ => {}
+            }
+        }
+        turns
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: what a receive turn takes goes to the owner before any of the turn's sends,
+    /// the driver's own among them (`hyper_rt_transport::Driver::received`, kiln's change to the vendored driver), read
+    /// off the server's own steps. Every event a turn took was handed over when its sends began, and nothing was sent
+    /// between its driver handing out the turn's first event and those sends. The turn that took the agent's connection,
+    /// whose receives made the server's next flight (the handshake's end, its acknowledgement of the agent's), handed
+    /// the event over with that flight still to go, and sent it after: its driver had sent none of it as it handed the
+    /// event out. Before, the driver sent it first (`Driver::event`), and the loop flushed its outbox before it handed
+    /// the turn's events over. Every frame still reaches the owner, in order.
     #[test]
-    fn g10_s5_a_turn_hands_what_came_in_to_its_owner_before_its_sends() -> anyhow::Result<()> {
-        /// Shape: tries at a turn that takes a frame while one waits in the outbox (held back late for `LATE_FOR`, 20 ms,
-        /// where a frame takes well under a millisecond each way on loopback), each a frame the server holds and one the
-        /// agent sends.
-        const TRIES: u32 = 64;
-        /// Shape: the lane the server's frames go on, held back late, apart from the agent's.
-        const HELD: u32 = 1;
+    fn g10_s5_a_turn_hands_what_came_in_to_its_owner_before_its_first_send() -> anyhow::Result<()> {
+        /// Shape: frames the agent sends once connected.
+        const FRAMES: u32 = 16;
+        /// Shape: how often the test reads the server's steps while its last turn's sends are being made.
+        const READ_EVERY: Duration = Duration::from_millis(1);
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(dir.path())?;
@@ -2065,42 +2100,44 @@ mod tests {
             let addr = probe.local_addr()?;
             drop(probe);
             WATCHED.lock().unwrap_or_else(PoisonError::into_inner).push(addr);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (_srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("turn-order")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
-            let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
             loop {
                 if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
                     break;
                 }
             }
-            // Every frame the server sends on its lane held back late: one waits in its outbox until the next, or 20 ms.
-            srv.command(Out::Shed(Shed { lane: HELD, variant: None, every: 1, act: Act::Late })).await;
-            let steps = || STEPS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|(at, _)| *at == addr).map(|(_, s)| *s).collect::<Vec<_>>();
-            for i in 0..TRIES {
-                anyhow::ensure!(srv.send(peer, HELD, Kind::Control, i.to_le_bytes().to_vec()).await, "the server's thread is gone");
+            for i in 0..FRAMES {
                 anyhow::ensure!(agent.send(SERVER_PEER, 0, Kind::Control, i.to_le_bytes().to_vec()).await, "the agent's thread is gone");
-                // Its frame at the server's owner.
+            }
+            for i in 0..FRAMES {
                 loop {
                     if let NetEvent::Frame { lane: 0, data, .. } = next_event(&srv_ev, deadline).await? {
                         anyhow::ensure!(data == i.to_le_bytes(), "frame {:?} where {i} was next", data);
                         break;
                     }
                 }
-                if let Some((took, handed)) = handed_before_sends(&steps()) {
-                    anyhow::ensure!(handed >= took, "a turn took {took} events with sends waiting and began its sends with {handed} handed over: {:?}", steps());
-                    // The frame held back went to its peer too.
-                    loop {
-                        if let NetEvent::Frame { lane, .. } = next_event(&agent_ev, deadline).await?
-                            && lane == HELD
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
             }
-            anyhow::bail!("no turn took a frame while one waited in the outbox, in {TRIES} tries: {:?}", steps())
+            // The turns that took them, each with its sends made: those come after the hand-over the test saw.
+            let turns = loop {
+                let steps: Vec<Step> = STEPS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|(at, _)| *at == addr).map(|(_, s)| *s).collect();
+                let turns: Vec<TurnSeen> = turns_of(&steps).into_iter().filter(|t| t.after.is_some()).collect();
+                if turns.iter().map(|t| t.took).sum::<usize>() > usize::try_from(FRAMES)? {
+                    break turns;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the server's turns never took the connection and every frame: {:?}", turns_of(&steps));
+                crate::rt::sleep(READ_EVERY).await;
+            };
+            for t in &turns {
+                anyhow::ensure!(t.handed >= t.took, "a turn took {} events and began its sends with {} handed over: {turns:?}", t.took, t.handed);
+                anyhow::ensure!(t.at_sends == Some(t.at_event), "a turn sent between its driver handing out its first event and its sends: {turns:?}");
+            }
+            let connection = turns.iter().find(|t| t.took > 0).ok_or_else(|| anyhow::anyhow!("no turn took anything: {turns:?}"))?;
+            anyhow::ensure!(connection.after > connection.at_sends, "the turn that took the agent's connection had nothing left to send as it handed it over: its driver sent first: {turns:?}");
+            Ok(())
         })
     }
 

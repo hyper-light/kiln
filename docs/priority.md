@@ -123,10 +123,10 @@ probes off, is no reading, never a breach.
   its probe runs, its lateness in the total; the hold itself is the answer only when no probe ran
   at all since the last look. In the lab such holds reached 10 to 38 ms calm, the server's own
   work, which slowing kiln's can't shorten.
-- **Its tolerance:** the shards' own clock, their probes' period (17.07 ms, `KILN_SHARD_PROBE_MS`; 10 ms before goal
-  9 step 5 derived it from hyper-rt's watchdog's limit, docs/runtime-lab.md):
+- **Its tolerance:** the shards' own clock, their probes' period (17.07 ms; 10 ms before goal 9 step 5
+  derived it from hyper-rt's watchdog's limit, docs/runtime-lab.md):
   ready work a whole period late on average is a server behind its own work. A server probed at
-  another period is measured against its own.
+  another period (another build's) is measured against its own.
 - **Its window:** trouble is caught within the platform's time (1 s), as every other target's is, so
   its probes keep that pace, and a probe still out is harm only once it's out that long (what it
   answers is what the server measured, not how long asking took).
@@ -422,10 +422,9 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 
 `[server] nudge` is what a shard has in the real-time class's place where that's refused, needing no privilege
 (goal 8, plan `01a1a59c2b29` step 7; goal 6, plan `01a1a59c2abe` step 3; `hyper_rt::compute::nudge_current_thread`,
-`crate::nudge`). It's off until declared (docs/ci.md §0.3, "Opt-in automation"): `"off"` (or `false`) is the
-default; `"auto"` is the mode a config declares, and `"on"` (or `true`, as it was before it had a mode) the other.
-`KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any other value is on, as the flag read it), and
-`KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+`crate::nudge`). It's off until declared (docs/ci.md §0.3, "Opt-in automation"): `"off"` is the default;
+`"auto"` is the mode a config declares, and `"on"` the other. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`,
+or a flag's word, `1` or `0`; any other is refused), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 
 - **What a nudge is.** A nudged shard's waits in its driver end by its period, the step quantum less the timers'
   tick (166.7 µs; goal 9, plan `01a1a87b2cec` step 4: `crate::rt::nudge_period_ns`), so with its timer slack (that
@@ -483,7 +482,7 @@ default; `"auto"` is the mode a config declares, and `"on"` (or `true`, as it wa
   (`kiln_shard_run_wait_seconds_total`) and its last period's held wait a wake (`kiln_shard_held_wake_seconds`).
 - **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound. A Linux kernel that keeps no
   thread's wait for a CPU (no `CONFIG_SCHED_INFO`) refuses `auto`, saying why; `on` works there. `auto` judges
-  at its shards' probes, so a server whose probes are off (`KILN_SHARD_PROBE_MS=0`) never nudges on its own.
+  at its shards' probes, which every server runs.
 - **Off until declared.** What kiln decides on its own is off until declared (docs/ci.md §0.3, "Opt-in
   automation"), so `Config::default`'s `nudge` is `off` and `auto` is the mode a config declares. The lab's A/B
   (docs/runtime-lab.md, "Goal 6 step 3 and goal 8 step 7: the nudge on its own") says what `auto` costs a calm

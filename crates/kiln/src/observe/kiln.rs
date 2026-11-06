@@ -315,8 +315,8 @@ const QUIC_SAMPLE_WAIT: Duration = Duration::from_millis(500);
 /// lost and acknowledged, congestion events, black holes, UDP datagrams and bytes each way, STREAM
 /// frames each way, RESET_STREAM frames each way, and frames that say this side or the peer was
 /// held by flow control (DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED). The endpoint's own:
-/// connections and exchanges open (gauges), streams refused, lane frames dropped, responses dropped
-/// (counters). Names follow qlog's recovery metrics (`draft-ietf-quic-qlog-quic-events`,
+/// connections and exchanges open (gauges), streams refused, lane frames dropped, responses dropped and
+/// frames whose buffer was allocated, no spare holding it (counters). Names follow qlog's recovery metrics (`draft-ietf-quic-qlog-quic-events`,
 /// `recovery:metrics_updated`: `smoothed_rtt`, `min_rtt`, `congestion_window`, `ssthresh`,
 /// `pacing_rate`).
 pub fn quic_points(out: &mut Vec<(SeriesKey, Vec<(i64, f64)>)>, host: &str, s: &crate::net::QuicSample, ts: i64) {
@@ -326,6 +326,7 @@ pub fn quic_points(out: &mut Vec<(SeriesKey, Vec<(i64, f64)>)>, host: &str, s: &
     point(out, "kiln.quic.streams_refused", Kind::Counter, &own, ts, s.streams_refused as f64);
     point(out, "kiln.quic.frames_dropped", Kind::Counter, &own, ts, s.frames_dropped as f64);
     point(out, "kiln.quic.responses_dropped", Kind::Counter, &own, ts, s.responses_dropped as f64);
+    point(out, "kiln.quic.frames_allocated", Kind::Counter, &own, ts, s.frames_allocated as f64);
     for p in &s.peers {
         let tags = [("host", host), ("peer", p.name.as_str())];
         let (f, c) = (&p.path, &p.conn);
@@ -437,7 +438,7 @@ mod tests {
             probe_timeout: Duration::from_millis(60),
         };
         let s =
-            crate::net::QuicSample { connections: 1, exchanges: 4, streams_refused: 2, frames_dropped: 0, responses_dropped: 0, peers: vec![crate::net::PeerSample { name: "r1".into(), path, conn }] };
+            crate::net::QuicSample { connections: 1, exchanges: 4, streams_refused: 2, frames_dropped: 0, responses_dropped: 0, frames_allocated: 5, peers: vec![crate::net::PeerSample { name: "r1".into(), path, conn }] };
         let mut out = Vec::new();
         quic_points(&mut out, "server-1", &s, 1_000);
         let got: std::collections::BTreeMap<String, (Kind, Vec<(String, String)>, f64)> = out
@@ -467,6 +468,7 @@ mod tests {
             ("kiln.quic.connections", Kind::Gauge, &own, 1.0),
             ("kiln.quic.exchanges", Kind::Gauge, &own, 4.0),
             ("kiln.quic.streams_refused", Kind::Counter, &own, 2.0),
+            ("kiln.quic.frames_allocated", Kind::Counter, &own, 5.0),
         ] {
             let g = got.get(metric);
             assert!(g.is_some(), "{metric} not written: {:?}", got.keys().collect::<Vec<_>>());

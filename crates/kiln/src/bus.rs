@@ -25,51 +25,19 @@ pub struct Config {
     pub topic_bytes: u64,
 }
 
-/// What the bus lab measured (goal 11, plan 01a1a87b2e56 step 3; docs/runtime-lab.md, "Measuring the bus's
-/// bound"). The run was bus6, on fedora on 2026-11-05, of rt6's tree (`705fb481bfb`): kiln-lab's realistic profile
-/// in production's layout, 8 rounds calm and 8 with hogs. Each round's server had `[bus] memory` at 1 GiB, which
-/// none reached: no round refused a frame or sent a lag notice. The bus was sampled each second of every round
-/// (`scripts/memory_lab/`). Its busiest second held 12,157,694 bytes for 11 topics.
-mod lab {
-    /// The most the bus held for each topic it held, framing included, at any second of the 16 rounds:
-    /// 10,622,030 bytes for 8 topics, in a round with hogs.
-    pub const TOPIC_SHARE: u64 = 1_327_754;
-    /// The most one topic asked the bus to keep (`kiln_bus_topic_bytes_peak`): a feed's newest 2048 frames, their
-    /// keys and payloads.
-    pub const TOPIC_PEAK: u64 = 3_672_418;
-}
-
-/// The sessions production held (2026-11-05: 134 live feeds, kiln-lab's `Profile::many`). A topic is a watched
-/// session's feed, so these are the topics production holds when every one of its sessions is watched at once.
-const TOPICS_HELD: u64 = 134;
-
 /// Room for one more of Quiver's largest messages with its framing: half the least a node takes
 /// (`quiver::NodeConfig::MEMORY_MIN`, two of them and a segment), 1,083,392 bytes.
 const LARGEST: u64 = (quiver::NodeConfig::MEMORY_MIN / 2) as u64;
 
-const MIB: u64 = 1 << 20;
-
-/// `n` rounded up to a whole MiB.
-const fn up_to_mib(n: u64) -> u64 {
-    n.div_ceil(MIB).saturating_mul(MIB)
-}
-
-/// The larger of `a` and `b`, in a constant.
-const fn larger(a: u64, b: u64) -> u64 {
-    if a > b { a } else { b }
-}
-
-/// The default `[bus] memory`: the lab's most for each topic ([`lab::TOPIC_SHARE`]), times as many topics as
-/// production's sessions ([`TOPICS_HELD`]), with room for one more of Quiver's largest messages ([`LARGEST`]),
-/// never below the least a node takes, and rounded up to a MiB: 179,306,496 bytes (171 MiB). That's the most for
-/// a server of production's size. A server holding fewer topics holds less, because each topic is held to
-/// `topic_bytes` ([`QuiverBus::bound`]). The lab's 11 topics took 12.2 MB at the most.
-pub const MEMORY: u64 = up_to_mib(larger(lab::TOPIC_SHARE.saturating_mul(TOPICS_HELD).saturating_add(LARGEST), quiver::NodeConfig::MEMORY_MIN as u64));
-/// The default `[bus] topic_bytes`: the largest topic the lab measured ([`lab::TOPIC_PEAK`]), with room for one
-/// more of the largest message a topic takes (a payload at `quiver_api::PAYLOAD_MAX`; a feed's frames have no
-/// key). It is never below that message, since Quiver refuses a message larger than `topic_bytes`, and is rounded
-/// up to a MiB: 5 MiB. A topic past it keeps fewer than its 2048 frames, so its viewers fall behind sooner.
-pub const TOPIC_BYTES: u64 = up_to_mib(larger(lab::TOPIC_PEAK.saturating_add(quiver_api::PAYLOAD_MAX as u64), quiver_api::PAYLOAD_MAX as u64));
+/// The default `[bus] memory`: 256 MiB, Quiver's own as CP-T2.1 set it (d06090634d8). Goal 11 cut it to the bus
+/// lab's 171 MiB (b167fb82145), a ceiling the lab never reached. Quiver's budget is a counter, so the ceiling costs
+/// nothing at rest, and lowering it could only cost Quiver room it would use (a topic refused, its viewers starting
+/// over): Ada's rule is that no change costs Quiver's performance (goal 11's audit, row C10). What the bus can hold
+/// follows the topics it holds anyway ([`QuiverBus::bound`]).
+pub const MEMORY: u64 = 256 << 20;
+/// The default `[bus] topic_bytes`: 16 MiB, Quiver's own as CP-T2.1 set it, as [`MEMORY`] is: goal 11 cut it to 5
+/// MiB, past which a watched session's oldest frames go and its slow viewers fall behind.
+pub const TOPIC_BYTES: u64 = 16 << 20;
 
 /// The most Quiver charges a message past its key and payload, 86 bytes:
 /// - its Focal batch's header: 56 bytes (`focal_bus::batch::HEADER`);
@@ -297,22 +265,19 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: the defaults are the bus lab's, the numbers docs/bus.md and
-    /// docs/runtime-lab.md give.
-    /// - A server takes them as they are.
-    /// - With the lab's 11 topics, each a feed of 2048 frames, the bound covers what the lab's busiest second held.
-    /// - With production's sessions, every one watched, the limit binds.
+    /// Goal 11's audit, row C10: the defaults are Quiver's own as CP-T2.1 set them, the numbers docs/bus.md gives,
+    /// and a server takes them as they are. What the bus lab measured (bus6, 2026-11-05: its busiest second
+    /// 12,157,694 B for 11 topics, its largest topic 3,672,418 B) is within them, with room for one more of the
+    /// largest message a topic takes, where goal 11's 5 MiB left a topic 1.4 MiB past what it measured.
     #[test]
-    fn g11_s3_the_bus_defaults_are_derived_from_the_bus_lab() -> anyhow::Result<()> {
-        anyhow::ensure!((MEMORY, TOPIC_BYTES) == (179_306_496, 5 << 20), "the defaults docs/bus.md gives: {MEMORY}, {TOPIC_BYTES}");
+    fn g11_c10_the_bus_defaults_are_quivers_own() -> anyhow::Result<()> {
+        anyhow::ensure!((MEMORY, TOPIC_BYTES) == (256 << 20, 16 << 20), "the defaults docs/bus.md gives: {MEMORY}, {TOPIC_BYTES}");
         let bus = quiver(&SimClock::new())?;
         anyhow::ensure!(u64::try_from(bus.stats().memory_limit)? == MEMORY, "a server's bus takes the default");
         futures::executor::block_on(bus.create("feed", Topic { class: Class::Ephemeral, retain: crate::harness::live::RETAIN }))?;
-        let limit = usize::try_from(MEMORY)?;
-        let at = |topics: usize| bus.bound(&quiver::Stats { topics, memory_limit: limit, ..quiver::Stats::default() });
-        let busiest = 12_157_694;
-        anyhow::ensure!(at(11) >= busiest, "11 topics are bound at {}, under the {busiest} bytes the lab's 11 held", at(11));
-        anyhow::ensure!(at(usize::try_from(TOPICS_HELD)?) == MEMORY, "production's every session watched is bound by the limit");
+        let at = |topics: usize| bus.bound(&quiver::Stats { topics, memory_limit: usize::try_from(MEMORY).unwrap_or(usize::MAX), ..quiver::Stats::default() });
+        anyhow::ensure!(at(11) >= 12_157_694, "11 topics are bound at {}, under the bytes the lab's 11 held", at(11));
+        anyhow::ensure!(TOPIC_BYTES >= 3_672_418 + u64::try_from(quiver_api::PAYLOAD_MAX)?, "the lab's largest topic and one more of the largest message");
         Ok(())
     }
 
