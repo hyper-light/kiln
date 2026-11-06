@@ -413,11 +413,6 @@ impl NetHandle {
 /// copies a message's bytes as postcard writes them, alike for the cluster group's and observe's: one for both.
 pub(crate) static MADE: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
 
-/// Whole nanoseconds since `t`.
-fn nanos_since(t: Instant) -> u64 {
-    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
 /// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
 /// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
@@ -475,9 +470,10 @@ where
                 // won't fit what's left.
                 Some(expected) => {
                     turns.before(expected).await;
-                    let began = Instant::now();
-                    let made = batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>();
-                    costs.learn(len, nanos_since(began), true);
+                    // Its cost to the thread, as a frame's read is learned (`crate::wire::payload`'s `timed`; goal 9, plan
+                    // 01a1a87b2cec step 5): a loaded host's preemptions left out.
+                    let (made, spent) = hyper_rt::futures::spent(|| batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>());
+                    costs.learn(len, spent.compute_cost_ns(), true);
                     Ok(made)
                 }
                 None => {
@@ -485,9 +481,8 @@ where
                     // Each message's making timed where it's made, on the pool's thread: the batch's, summed, teaches the
                     // rate as one made here does, its waits for the pool left out.
                     let made = crate::rt::compute_map(batch, move |(peer, x)| {
-                        let began = Instant::now();
-                        let frames = (*make)(x);
-                        (peer, frames, nanos_since(began))
+                        let (frames, spent) = hyper_rt::futures::spent(|| (*make)(x));
+                        (peer, frames, spent.compute_cost_ns())
                     })
                     .await;
                     // The wait for the pool ended the poll: the sends start a turn of their own.
