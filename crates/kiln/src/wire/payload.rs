@@ -1415,7 +1415,7 @@ mod tests {
             }))
             .collect();
         anyhow::ensure!(tags == UPDATE_TAGS, "the kinds of update are {tags:?}");
-        let harness = |u: &Update| -> anyhow::Result<Vec<u8>> { Ok(crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? })?) };
+        let harness = |u: &Update| -> anyhow::Result<Vec<u8>> { crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? }) };
         let events = Update::Events { events: Vec::new() };
         let patch = Update::ChangesPatch { set: Vec::new(), gone: Vec::new() };
         for (u, tag) in [(&Update::Closed, "closed"), (&Update::Reset { from: Some(3) }, "reset"), (&events, "events"), (&patch, "changes_patch")] {
