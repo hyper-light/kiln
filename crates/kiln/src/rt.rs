@@ -1254,37 +1254,40 @@ fn nanos_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
-/// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
-/// nanoseconds. Smoothed as RFC 6298 (§2) smooths a round trip: its mean (a new sample's weight 1/8) and its variation
-/// (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). What [`here`] weighs work kept
-/// on a shard against (consts-audit B1: that was a slow poll, `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the
-/// pool's round trip was). Every shard's tasks teach it: each a load and a store, so a race between two loses one sample
-/// at the most, and no lock is taken.
-pub struct PoolTrip {
+/// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
+/// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
+/// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
+/// trip ([`POOL_TRIP`]), every session copy's quiet gaps (`crate::harness::copies`).
+pub struct Smoothed {
     mean: AtomicU64,
     dev: AtomicU64,
     learned: AtomicBool,
 }
 
-impl PoolTrip {
-    /// A [`PoolTrip`] with nothing learned.
+impl Smoothed {
+    /// A [`Smoothed`] with nothing learned.
     pub const fn nothing_yet() -> Self {
         Self { mean: AtomicU64::new(0), dev: AtomicU64::new(0), learned: AtomicBool::new(false) }
     }
 
-    /// Its mean, nanoseconds: none until a round trip was learned.
+    /// Its mean, nanoseconds: none until a sample was learned.
     pub fn mean(&self) -> Option<u64> {
         self.learned.load(Ordering::Relaxed).then(|| self.mean.load(Ordering::Relaxed))
     }
 
-    /// Its variation, nanoseconds: 0 until a round trip was learned.
+    /// Its variation, nanoseconds: 0 until a sample was learned.
     pub fn dev(&self) -> u64 {
         self.dev.load(Ordering::Relaxed)
     }
 
-    /// A round trip took `took` nanoseconds past its job's run. As RFC 6298 (§2.3) takes a round trip: its variation
-    /// first, against the mean before it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8.
+    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none until a sample was
+    /// learned.
+    pub fn bound(&self) -> Option<u64> {
+        self.mean().map(|mean| mean.saturating_add(self.dev().saturating_mul(4)))
+    }
+
+    /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
+    /// it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8.
     pub fn learn(&self, took: u64) {
         let (mean, dev) = if self.learned.load(Ordering::Relaxed) {
             let (mean, dev) = (self.mean.load(Ordering::Relaxed), self.dev.load(Ordering::Relaxed));
@@ -1298,9 +1301,12 @@ impl PoolTrip {
     }
 }
 
-/// The compute pool's round trip as shards' tasks see it ([`PoolTrip`]): learned from every job a task on a shard hands it
-/// ([`compute`]).
-pub static POOL_TRIP: PoolTrip = PoolTrip::nothing_yet();
+/// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
+/// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
+/// smoothed ([`Smoothed`]). Learned from every job a task on a shard hands the pool; what [`here`] weighs work kept on a
+/// shard against (consts-audit B1: that was a slow poll, `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the pool's
+/// round trip was).
+pub static POOL_TRIP: Smoothed = Smoothed::nothing_yet();
 
 /// The round trip work done where it's asked is weighed against ([`here`]): on a shard, the compute pool's
 /// ([`POOL_TRIP`], none until learned); off one, none to save (`u64::MAX`): work there is done where it is.
@@ -3463,7 +3469,7 @@ mod tests {
     /// work goes to a pool nothing's been learned of, whose first job teaches it; off a shard work stays where it is.
     #[test]
     fn b1_work_is_done_where_its_cheaper_against_the_pools_learned_round_trip() -> anyhow::Result<()> {
-        let trip = PoolTrip::nothing_yet();
+        let trip = Smoothed::nothing_yet();
         anyhow::ensure!(trip.mean().is_none() && !here_against(1, trip.mean()), "nothing learned of the pool: there, which teaches it");
         anyhow::ensure!(here_against(0, trip.mean()), "nothing expected of the work: where it is, which learns it");
         // RFC 6298's arithmetic: 40 µs, then 8 µs. The first sets the mean and half of it the variation; then the variation

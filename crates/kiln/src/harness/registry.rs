@@ -2822,6 +2822,8 @@ impl Registry {
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
         m.rev = m.rev.saturating_add(1);
+        // Its gap since its last change learned, and when it falls idle scheduled (consts-audit R1).
+        m.changed(std::time::Instant::now(), &said.idle);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
             // viewers from before start over too.
@@ -3573,9 +3575,12 @@ impl Registry {
         let (sid, added) = (id.to_owned(), added.to_vec());
         self.sessions
             .on(id, move |s| {
+                let said = s.said();
                 if let Some(m) = s.get_mut(&sid) {
                     // A revision of its own, past what its viewers have: else they'd take it as had.
                     m.rev = m.rev.saturating_add(1);
+                    // A change: when it falls idle scheduled from now (consts-audit R1).
+                    m.changed(std::time::Instant::now(), &said.idle);
                     m.commit(|m| {
                         let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Files { files: added }, rev: Some(m.rev) }.text();
                         Some(super::copies::payload_of(&text, m.rev))
