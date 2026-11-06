@@ -1109,7 +1109,7 @@ mod tests {
         anyhow::ensure!(kept == usize::try_from(ROWS + 1)?, "{kept} of {} rows read", ROWS + 1);
         // A read can't be answered before its batch is due unless it rouses the writer; a commit held up by the disk can
         // make one late anyway, so it's tried up to ten times for three.
-        let (mut before_due, mut tried) = (0u64, 0u64);
+        let (mut before_due, mut tried, mut answered) = (0u64, 0u64, Vec::new());
         while before_due < 3 && tried < 10 {
             tried += 1;
             let sent = Instant::now();
@@ -1117,11 +1117,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             let read = st.kept("a2", 100)?.map_or(0, |k| k.events.len());
             anyhow::ensure!(read == usize::try_from(tried)?, "the read saw {read} rows of {tried}");
+            answered.push(sent.elapsed());
             if sent.elapsed() < Duration::from_millis(COMMIT_MS) {
                 before_due += 1;
             }
         }
-        anyhow::ensure!(before_due >= 3, "{before_due} of {tried} reads answered before their batch was due: not roused");
+        anyhow::ensure!(before_due >= 3, "{before_due} of {tried} reads answered before their batch was due, after its first row: {answered:?}");
         Ok(())
     }
 

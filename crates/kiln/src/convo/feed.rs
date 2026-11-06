@@ -1492,28 +1492,31 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 5: a feed holding what its store committed is woken by none of the commits meanwhile
     /// ([`Store::watch`]: a task of its own took each commit's word and passed it on, both woken for every commit), and ships
-    /// them all once its hold has passed. Do: a feed at its store's tip with a hold of 4 s; ten commits a writer's commit
-    /// apart (`COMMIT_MS`); count its wakes over them. Expect: the first commit's, which starts its hold, and one a second
-    /// for its wait's own bound (none here unless the commits take that long), not one a commit; every event at the server.
+    /// them all once its hold has passed. Do: a feed at its store's tip with a hold of 8 s; up to ten commits a writer's
+    /// commit apart (`COMMIT_MS`), each waited for, while half the hold lasts (a loaded disk holds a commit for hundreds of
+    /// ms); count its wakes over them. Expect: the first commit's, which starts its hold, and one a second for its wait's
+    /// own bound, not one a commit (more commits than that, so a wake a commit would show); every event at the server.
     #[test]
     fn g9_s5_a_feed_holding_what_came_is_woken_by_no_commit_meanwhile() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            const HOLD: Duration = Duration::from_secs(4);
+            const HOLD: Duration = Duration::from_secs(8);
             const COMMITS: u64 = 10;
             let (_r, runner) = super::super::store::scratch()?;
             let (_s, server) = super::super::store::scratch()?;
             let (ship, out, mut partial) = shipper_at_tip(&runner, &server, Hold { every: HOLD, bytes: SHIP_AT_BYTES }).await?;
             let (first, before) = (Instant::now(), ship.stats.wakes());
-            for i in 2..2 + COMMITS {
-                runner.send("a1", &said(&format!("m{i}"), i, "the deadline"));
+            let (mut commits, mut took_for, mut wakes) = (0u64, Duration::ZERO, 0u64);
+            while commits < COMMITS && first.elapsed() < HOLD / 2 {
+                commits += 1;
+                runner.send("a1", &said(&format!("m{}", commits + 1), commits + 1, "the deadline"));
                 runner.sync()?;
+                (took_for, wakes) = (first.elapsed(), ship.stats.wakes().saturating_sub(before));
                 crate::rt::sleep(Duration::from_millis(super::super::store::COMMIT_MS)).await;
             }
-            let (took_for, wakes) = (first.elapsed(), ship.stats.wakes().saturating_sub(before));
-            anyhow::ensure!(took_for < HOLD, "the commits took {took_for:?}, past the hold: nothing to tell from it");
             let most = 1 + took_for.as_secs() + 1;
-            anyhow::ensure!(wakes <= most, "{wakes} wakes over {COMMITS} commits in {took_for:?} while it held them (at most {most})");
-            let all = usize::try_from(1 + COMMITS)?;
+            anyhow::ensure!(commits > most, "{commits} commits in half the hold, against at most {most} wakes: too few to tell a wake a commit from none");
+            anyhow::ensure!(wakes <= most, "{wakes} wakes over {commits} commits in {took_for:?} while it held them (at most {most})");
+            let all = usize::try_from(1 + commits)?;
             while server.kept("a1", 20)?.map_or(0, |k| k.events.len()) < all {
                 let (json, data) = crate::rt::timeout(HOLD * 2, out.recv()).await??;
                 for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
