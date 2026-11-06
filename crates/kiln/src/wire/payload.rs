@@ -16,9 +16,10 @@
 //! A field a known payload has that this build doesn't know is taken, as docs/wire.md says (JSON,
 //! so either side can add fields): counted in `kiln_wire_ignored_fields_total{wire}`, one for each
 //! such field of each payload looked at, and logged once an hour for each wire and field. It's never
-//! refused or audited. At most one payload of a kind (a wire and a message's variant) is looked at
-//! every [`CHECK_EVERY`] (100 ms), and every one of a kind that comes less often ([`looks_at`]); those
-//! looked at are counted in `kiln_wire_checked_payloads_total{wire}`. serde can't say which fields it
+//! refused or audited. One payload of a kind (a wire and a message's variant) is looked at at a time,
+//! the next once the last is done ([`looks_at`]): off a shard where it's read, on one by the compute
+//! pool's workers with time to spare ([`check_spare`]); those looked at are counted in
+//! `kiln_wire_checked_payloads_total{wire}`, and those waiting in `kiln_wire_checks_waiting`. serde can't say which fields it
 //! ignored inside an internally tagged enum (it reads one whole first), and most of these payloads are
 //! one, so they're found by writing the value read back and seeing what of what came it lacks.
 
@@ -121,39 +122,41 @@ fn message_of(json: &str) -> Option<String> {
 /// have are taken, counted and said in the log ([`Ignored`]), of a payload looked at ([`looks_at`]).
 ///
 /// On a shard it's read straight into its type, with no JSON tree between, and its unknown fields are
-/// looked for off the shard, by [`checker`]'s thread (goal 9, plan 01a1a87b2cec step 5: looking read each
+/// looked for off the shard, by the compute pool's spare time ([`check_spare`]; goal 9, plan 01a1a87b2cec step 5: looking read each
 /// runner message's JSON into a tree, the type out of that, and the type back into another tree to
 /// compare, on the hub's shard). Off one, one looked at is read through a tree, its unknown fields found
 /// as it's read, and the rest straight. What can't be read straight is read the way it always was, so
 /// it's refused, and said why, as before.
 pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
     let look = looks_at(wire, of);
-    if (!look || crate::rt::on_shard())
+    if (look.is_none() || crate::rt::on_shard())
         && let Ok(read) = serde_json::from_str::<T>(json)
     {
-        if look {
-            check_later(wire, of, json, unknown_in::<T>);
+        if let Some(looking) = look {
+            check_later(wire, of, json, unknown_in::<T>, looking);
         }
         return Ok(read);
     }
-    read_by_tree(wire, of, json, look)
+    // Looked at here, if at all: its kind's next is looked at once this read is done (`look` let go).
+    read_by_tree(wire, of, json, look.is_some())
 }
 
 /// [`payload`] of JSON the reader holds and has no more use for: on a shard, read straight into its type, then handed
-/// as it is to [`checker`]'s thread to look for its unknown fields in, where `payload` copies it for that (goal 9, plan
+/// as it is to the compute pool's spare time to look for its unknown fields in ([`check_spare`]), where `payload` copies it for that (goal 9, plan
 /// 01a1a87b2cec step 5: each runner payload's text was copied whole on the hub's loop for its check). The same value,
 /// and the same refusal of what can't be read.
 pub fn payload_owned<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: String) -> Result<T, Box<Unreadable>> {
     let look = looks_at(wire, of);
-    if (!look || crate::rt::on_shard())
+    if (look.is_none() || crate::rt::on_shard())
         && let Ok(read) = serde_json::from_str::<T>(&json)
     {
-        if look {
-            check_owned(wire, of, json, unknown_in::<T>);
+        if let Some(looking) = look {
+            check_owned(wire, of, json, unknown_in::<T>, looking);
         }
         return Ok(read);
     }
-    read_by_tree(wire, of, &json, look)
+    // Looked at here, if at all: its kind's next is looked at once this read is done (`look` let go).
+    read_by_tree(wire, of, &json, look.is_some())
 }
 
 /// [`payload`]'s read off a shard of one looked at, and of what couldn't be read straight: through a JSON tree, so what can't
@@ -231,20 +234,43 @@ fn found(wire: Wire, of: &'static str, fields: &[String]) {
 /// load a of 1/2). A kind past them is looked at every time, as every payload was.
 const KINDS_LOOKED: usize = 4 * KINDS;
 
-/// A kind's place in [`LOOKED`]: its key (a hash of its wire and variant, never 0; 0: free) and when one of it was last
-/// looked at (nanoseconds since [`looked_base`], plus one; 0: never).
+/// A kind's place in [`LOOKED`]: its key (a hash of its wire and variant, never 0; 0: free) and whether a payload of it is
+/// being looked at now ([`Looking`]).
 struct Looked {
     kind: std::sync::atomic::AtomicU64,
-    at: std::sync::atomic::AtomicU64,
+    busy: std::sync::atomic::AtomicBool,
 }
 
-/// When each kind of payload was last looked at ([`looks_at`]), claimed a kind a place as it first comes, with no lock.
-static LOOKED: [Looked; KINDS_LOOKED] = [const { Looked { kind: std::sync::atomic::AtomicU64::new(0), at: std::sync::atomic::AtomicU64::new(0) } }; KINDS_LOOKED];
+/// Whether each kind of payload is being looked at now ([`looks_at`]), claimed a kind a place as it first comes, with no lock.
+static LOOKED: [Looked; KINDS_LOOKED] = [const { Looked { kind: std::sync::atomic::AtomicU64::new(0), busy: std::sync::atomic::AtomicBool::new(false) } }; KINDS_LOOKED];
 
-/// What [`LOOKED`]'s times count from.
-fn looked_base() -> Instant {
-    static BASE: OnceLock<Instant> = OnceLock::new();
-    *BASE.get_or_init(Instant::now)
+/// A look at a payload under way ([`looks_at`]): its kind's place in [`LOOKED`], let go as it ends (dropped: done, or the
+/// payload let go), so the kind's next payload is looked at. None for a kind past the table, looked at every time.
+pub(crate) struct Looking(Option<&'static Looked>);
+
+impl Drop for Looking {
+    fn drop(&mut self) {
+        if let Some(place) = self.0 {
+            place.busy.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// The place of the kind of payload of variant `of` on `wire` in [`LOOKED`], claimed for it as it first comes: none where
+/// the table holds no room for it.
+fn place_of(wire: Wire, of: &str) -> Option<&'static Looked> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = kind_key(wire, of);
+    let start = usize::try_from(key % KINDS_LOOKED as u64).unwrap_or(0);
+    // Its place read first, and claimed only where free: a compare-and-swap that finds its kind there takes the line as a
+    // write would, from every shard that reads the kind.
+    (0..KINDS_LOOKED).filter_map(|i| LOOKED.get((start + i) % KINDS_LOOKED)).find(|p| match p.kind.load(Relaxed) {
+        0 => match p.kind.compare_exchange(0, key, Relaxed, Relaxed) {
+            Ok(_) => true,
+            Err(held) => held == key,
+        },
+        held => held == key,
+    })
 }
 
 /// A kind's key in [`LOOKED`]: FNV-1a's 64 bits of its wire's name and its variant, apart, never 0.
@@ -256,34 +282,28 @@ fn kind_key(wire: Wire, of: &str) -> u64 {
     h.max(1)
 }
 
-/// Whether a payload of variant `of` on `wire` is looked at for fields this build doesn't know: at most one of a kind every
-/// [`CHECK_EVERY`], and every one of a kind that comes less often (goal 9, plan 01a1a87b2cec step 5: every payload was,
-/// each handed to [`checker`]'s thread from the shard that read it, 0.14% of the lab's samples on the shards, and read into
-/// trees twice more there, 2.9%, a quarter of the shards' own). A field a kind's every message carries is still in one
-/// looked at within [`CHECK_EVERY`] of its first; one only some carry, in time. Taken with a compare-and-swap, so of
-/// payloads of a kind at once only one is looked at.
-fn looks_at(wire: Wire, of: &str) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let key = kind_key(wire, of);
-    let start = usize::try_from(key % KINDS_LOOKED as u64).unwrap_or(0);
-    // Its place read first, and claimed only where free: a compare-and-swap that finds its kind there takes the line as a
-    // write would, from every shard that reads the kind.
-    let Some(place) = (0..KINDS_LOOKED).filter_map(|i| LOOKED.get((start + i) % KINDS_LOOKED)).find(|p| match p.kind.load(Relaxed) {
-        0 => match p.kind.compare_exchange(0, key, Relaxed, Relaxed) {
-            Ok(_) => true,
-            Err(held) => held == key,
-        },
-        held => held == key,
-    }) else {
-        return true;
-    };
-    let now = u64::try_from(looked_base().elapsed().as_nanos()).unwrap_or(u64::MAX).saturating_add(1);
-    let last = place.at.load(Relaxed);
-    let every = u64::try_from(CHECK_EVERY.as_nanos()).unwrap_or(u64::MAX);
-    if last != 0 && now.saturating_sub(last) < every {
-        return false;
+/// Whether a payload of variant `of` on `wire` is looked at for fields this build doesn't know, and its look ([`Looking`]):
+/// one of a kind at a time, the next once the last is done (consts-audit R3; goal 9, plan 01a1a87b2cec step 5). A checker
+/// with time to spare looks at a kind's every payload; one with none at the first of them, the rest read straight while it
+/// waits. It was one of a kind every 100 ms (`CHECK_EVERY`, the shards' counts' age on /metrics), whatever the checker had
+/// time for: every payload had been, each handed to a thread of its own from the shard that read it, 0.14% of the lab's
+/// samples on the shards, and read into trees twice more there, 2.9%, a quarter of the shards' own. Taken with a
+/// compare-and-swap, so of payloads of a kind at once only one is looked at. A kind past the table's room is looked at every
+/// time, as every payload was.
+fn looks_at(wire: Wire, of: &str) -> Option<Looking> {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let Some(place) = place_of(wire, of) else { return Some(Looking(None)) };
+    // Read first: a kind under way is the common case, and a compare-and-swap would take the line from the checker.
+    if place.busy.load(Relaxed) {
+        return None;
     }
-    place.at.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
+    place.busy.compare_exchange(false, true, Acquire, Relaxed).is_ok().then_some(Looking(Some(place)))
+}
+
+/// Whether a look at a payload of variant `of` on `wire` is under way (a test's).
+#[cfg(test)]
+fn looking(wire: Wire, of: &str) -> bool {
+    place_of(wire, of).is_some_and(|p| p.busy.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Counts `fields`, what a message of variant `of` on `wire` carried that this build doesn't know, and
@@ -306,17 +326,20 @@ fn unknown_in<T: DeserializeOwned + Serialize>(json: &str) -> Vec<String> {
     serde_json::to_value(&read).map(|kept| unknown_fields(&came, &kept)).unwrap_or_default()
 }
 
-/// A payload read on a shard, for [`checker`]'s thread to look for its unknown fields in (`find`).
+/// A payload read on a shard, for the compute pool's spare time to look for its unknown fields in (`find`), and its look
+/// under way, which its kind's next waits for ([`Looking`]).
 struct Check {
     wire: Wire,
     of: &'static str,
     json: String,
     find: fn(&str) -> Vec<String>,
+    _looking: Looking,
 }
 
-/// The most bytes of payloads waiting for [`checker`]'s thread: as many as the hub's loop keeps waiting
-/// from runners (`crate::net::EVENTS_BYTES`), so it falls no further behind than the hub may. Past it, one
-/// is let go unlooked at, counted, and said at each power of two.
+/// The most bytes of payloads waiting to be looked at ([`check_spare`]): as many as the hub's loop keeps waiting from
+/// runners (`crate::net::EVENTS_BYTES`), so they fall no further behind than the hub may. One of a kind at a time waits
+/// ([`looks_at`]), so it's past this only with that many bytes of kinds. Past it, one is let go unlooked at, counted, and
+/// said at each power of two.
 const CHECKS_MOST: usize = crate::net::EVENTS_BYTES;
 
 impl crate::memory::queue::Weigh for Check {
@@ -330,69 +353,83 @@ impl crate::memory::queue::Weigh for Check {
 /// The payloads let go unlooked at for want of room ([`CHECKS_MOST`]).
 static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Hands a payload read on a shard to [`checker`]'s thread to look for its unknown fields in, a copy of
-/// it; where there's no such thread, they're looked for here, as before.
-fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>) {
-    if checker().is_none() {
+/// Hands a payload read on a shard to the compute pool's spare time to look for its unknown fields in ([`check_spare`]), a
+/// copy of it; where there's no such pool's spare time to hand it to, they're looked for here, as before. `looking`: its
+/// look, let go once it's done.
+fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>, looking: Looking) {
+    if checks().is_none() {
         found(wire, of, &find(json));
         return;
     }
-    check_owned(wire, of, json.to_owned(), find);
+    check_owned(wire, of, json.to_owned(), find, looking);
 }
 
 /// [`check_later`] of a payload the reader has no more use for: handed on as it is.
-fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec<String>) {
-    let Some(tx) = checker() else {
+fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec<String>, looking: Looking) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((tx, _)) = checks() else {
         found(wire, of, &find(&json));
         return;
     };
-    match tx.try_send(Check { wire, of, json, find }) {
+    // Counted before it's handed over, so a worker that takes it at once never counts below none.
+    CHECKS_WAITING.fetch_add(1, Relaxed);
+    match tx.try_send(Check { wire, of, json, find, _looking: looking }) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(_)) => {
-            let n = CHECKS_LET_GO.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+            CHECKS_WAITING.fetch_sub(1, Relaxed);
+            let n = CHECKS_LET_GO.fetch_add(1, Relaxed).saturating_add(1);
             if n.is_power_of_two() {
-                tracing::warn!(let_go = n, "runners' messages weren't looked at for fields this build doesn't know: their checker is behind");
+                tracing::warn!(let_go = n, "runners' messages weren't looked at for fields this build doesn't know: the compute pool has had no time to spare");
             }
         }
-        // Its thread is gone: looked for here.
-        Err(async_channel::TrySendError::Closed(c)) => found(c.wire, c.of, &(c.find)(&c.json)),
+        // None to take it any more: looked for here.
+        Err(async_channel::TrySendError::Closed(c)) => {
+            CHECKS_WAITING.fetch_sub(1, Relaxed);
+            found(c.wire, c.of, &(c.find)(&c.json));
+        }
     }
 }
 
-/// How often [`checker`]'s thread looks at the payloads waiting for it: as fresh as the shards' own counts on `/metrics`
-/// ([`crate::shard_health::COUNTS_AGE`], 100 ms), since kiln-lab reads `kiln_wire_ignored_fields_total` as a window's
-/// difference too, so a field counted that late moves a window's count by 2% at the most. Its thread isn't woken for a
-/// payload (goal 9, plan 01a1a87b2cec step 5): it waited on its queue, so each payload handed to it woke it, a system call
-/// (a futex's wake) on the hub's shard for each runner message, and a switch to the thread and back. Looking every 100
-/// ms, it wakes 10 times a second however many come, and what waits meanwhile is far within [`CHECKS_MOST`] (the lab's
-/// runners send about a thousand payloads a second, a few KiB each: some MiB a second).
-const CHECK_EVERY: Duration = crate::shard_health::COUNTS_AGE;
+/// Payloads waiting to be looked at ([`check_spare`]): what `kiln_wire_checks_waiting` says. A compute pool with no time to
+/// spare (or none: no job ends, so no worker finds itself free) leaves them waiting (consts-audit R3).
+static CHECKS_WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The thread that looks for the unknown fields of payloads read on the shards, started the first time
-/// one is; none where it couldn't start (said so). It looks at what waits every [`CHECK_EVERY`], never
-/// woken by what's handed to it.
-fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
-    static TX: OnceLock<Option<crate::memory::queue::Sender<Check>>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST);
-        let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
-            loop {
-                match rx.try_recv() {
-                    Ok(c) => found(c.wire, c.of, &(c.find)(&c.json)),
-                    Err(async_channel::TryRecvError::Empty) => std::thread::sleep(CHECK_EVERY),
-                    Err(async_channel::TryRecvError::Closed) => break,
-                }
+/// How many payloads wait to be looked at, for `/metrics`.
+pub fn checks_waiting() -> u64 {
+    CHECKS_WAITING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Payloads read on the shards waiting to be looked at, for the compute pool's workers to take in their spare time
+/// ([`check_spare`], `hyper_rt::idle::when_spare`; consts-audit R3), made the first time one is: a worker that finds no job
+/// takes one before it rests, so none waits for a wake, and none is looked at but with time a worker had to spare. It was
+/// a thread of its own, looking every 100 ms (`CHECK_EVERY`, the shards' counts' age on /metrics) and sleeping between
+/// (goal 9, plan 01a1a87b2cec step 5: woken for each, it had cost a futex's wake on the hub's shard a payload). None where
+/// the process gave the pool's spare time to other work (said so): looked for where they're read, as before.
+fn checks() -> Option<&'static (crate::memory::queue::Sender<Check>, crate::memory::queue::Receiver<Check>)> {
+    static CHECKS: OnceLock<Option<(crate::memory::queue::Sender<Check>, crate::memory::queue::Receiver<Check>)>> = OnceLock::new();
+    CHECKS
+        .get_or_init(|| {
+            if !hyper_rt::idle::when_spare(check_spare) {
+                tracing::warn!("the compute pool's spare time is another's: fields this build doesn't know in runners' messages are looked for where they're read");
+                return None;
             }
-        });
-        match started {
-            Ok(_) => Some(tx),
-            Err(e) => {
-                tracing::warn!(error = %e, "no thread to look for fields this build doesn't know in runners' messages: looked for on the shards");
-                None
-            }
+            Some(crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST))
+        })
+        .as_ref()
+}
+
+/// The compute pool's spare work ([`checks`]): a payload waiting looked at, its kind's next looked at once it's done (its
+/// [`Looking`] let go). Whether one waited.
+fn check_spare() -> bool {
+    let Some((_, rx)) = checks() else { return false };
+    match rx.try_recv() {
+        Ok(c) => {
+            CHECKS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            found(c.wire, c.of, &(c.find)(&c.json));
+            true
         }
-    })
-    .as_ref()
+        Err(_) => false,
+    }
 }
 
 /// Why `T` couldn't be read from what came: a tag it doesn't know is `unknown`, the rest
@@ -1696,15 +1733,16 @@ mod tests {
         crate::rt::block_on(async move {
             let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
             anyhow::ensure!(on == off, "on a shard {on:?}, off one {off:?}");
-            // At most one payload of a kind is looked at every CHECK_EVERY ([`looks_at`]): the one with `new`, read again on a
-            // shard once one has passed, is.
-            crate::rt::sleep(CHECK_EVERY).await;
+            // One payload of a kind is looked at at a time ([`looks_at`]): the one with `new`, read again on a shard once the
+            // last look is done, is.
+            until_looked(wire, "Two").await?;
             let newer = CASES.last().copied().unwrap_or_default();
             anyhow::ensure!(payload::<Two>(wire, "Two", newer).is_ok(), "{newer} wasn't read");
-            // `new` came with something in it (`empty` didn't): counted once its thread has looked.
+            // `new` came with something in it (`empty` didn't): counted once the pool's spare time has looked.
             let deadline = Instant::now() + Duration::from_secs(30);
             while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
                 anyhow::ensure!(Instant::now() < deadline, "the unknown field read on a shard wasn't counted");
+                spare_turn().await?;
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             Ok(())
@@ -1801,15 +1839,16 @@ mod tests {
         crate::rt::block_on(async move {
             let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload_owned::<Two>(wire, "Two", (*j).to_owned())).collect();
             anyhow::ensure!(on == lent, "on a shard {on:?}, off one {lent:?}");
-            // At most one payload of a kind is looked at every CHECK_EVERY ([`looks_at`]): the one with `handed`, handed over
-            // again on a shard once one has passed, is.
-            crate::rt::sleep(CHECK_EVERY).await;
+            // One payload of a kind is looked at at a time ([`looks_at`]): the one with `handed`, handed over again on a shard
+            // once the last look is done, is.
+            until_looked(wire, "Two").await?;
             let newer = CASES.last().copied().unwrap_or_default();
             anyhow::ensure!(payload_owned::<Two>(wire, "Two", newer.to_owned()).is_ok(), "{newer} wasn't read");
-            // `handed` came with something in it (`empty` didn't): counted once its thread has looked.
+            // `handed` came with something in it (`empty` didn't): counted once the pool's spare time has looked.
             let deadline = Instant::now() + Duration::from_secs(30);
             while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
                 anyhow::ensure!(Instant::now() < deadline, "the unknown field of a payload handed over wasn't counted");
+                spare_turn().await?;
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             Ok(())
@@ -1961,36 +2000,53 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a payload handed to the checker's thread wakes no thread. The thread looks at
-    /// what waits for it every [`CHECK_EVERY`] and never waits on its queue, so no wait of its is listed there for a
-    /// payload handed over to wake (each did, a futex's wake on the hub's shard for every runner message); and each
-    /// payload is still looked at, its unknown fields counted.
+    /// A job for the compute pool: its worker, free once it's done, takes the payloads waiting to be looked at
+    /// ([`check_spare`]) before it rests.
+    async fn spare_turn() -> anyhow::Result<()> {
+        crate::rt::compute(|| ()).await
+    }
+
+    /// Until the look at a payload of variant `of` on `wire` under way is done, the pool given turns meanwhile: 30 s at the
+    /// most.
+    async fn until_looked(wire: Wire, of: &str) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while looking(wire, of) {
+            anyhow::ensure!(Instant::now() < deadline, "the look at a {of} on {} wasn't done in 30 s", wire.name());
+            spare_turn().await?;
+            crate::rt::sleep(Duration::from_millis(1)).await;
+        }
+        Ok(())
+    }
+
+    /// Consts-audit R3 (goal 9, plan 01a1a87b2cec step 5): a payload handed over to be looked at wakes no thread and is looked
+    /// at with the compute pool's spare time: no thread waits on what's waiting (each wait there would be woken by a payload
+    /// handed over, a futex's wake on the hub's shard). Do: hand payloads over, each with a field the type doesn't have; then
+    /// give the pool jobs. Expect: no wait listed as each is handed over; each counted once a worker is free.
     #[test]
-    fn g9_s5_a_payload_handed_to_the_checker_wakes_no_thread() -> anyhow::Result<()> {
+    fn g9_s5_r3_a_payload_handed_over_wakes_no_thread_and_is_looked_at_with_spare_time() -> anyhow::Result<()> {
         #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
         struct One {
             a: u32,
         }
-        let Some(tx) = checker() else { anyhow::bail!("no checker's thread started") };
+        let Some((tx, _)) = checks() else { anyhow::bail!("no spare time to look with") };
         // A wire no other test reads JSON on, so the count is this test's alone.
         let wire = Wire::EventsDown;
         let before = crate::metrics::wire().ignored.get(&[wire.name()]);
         const HANDED: u64 = 6;
         for n in 0..HANDED {
-            // Time for the thread to look at what was handed before and go idle again: a thread that waits on its
-            // queue lists its wait then (a hand-over's wake takes every wait listed, so it's looked for before one).
-            std::thread::sleep(2 * CHECK_EVERY);
-            anyhow::ensure!(tx.takers_listed() == 0, "the checker's thread waits on its queue: payload {n} handed over would wake it");
-            check_owned(wire, "One", format!(r#"{{"a":{n},"looked_at":true}}"#), unknown_in::<One>);
+            anyhow::ensure!(tx.takers_listed() == 0, "a thread waits on what's waiting: payload {n} handed over would wake it");
+            check_owned(wire, "One", format!(r#"{{"a":{n},"looked_at":true}}"#), unknown_in::<One>, Looking(None));
         }
-        // Each came with one field `One` doesn't have: each counted once the thread has looked, within a look or two of
-        // the last (30 s for a loaded machine's).
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < HANDED {
-            anyhow::ensure!(Instant::now() < deadline, "the payloads handed to the checker weren't all looked at");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        anyhow::ensure!(tx.takers_listed() == 0, "the checker's thread waits on its queue");
+        crate::rt::block_on(async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < HANDED {
+                anyhow::ensure!(Instant::now() < deadline, "the payloads handed over weren't all looked at");
+                spare_turn().await?;
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::Ok(())
+        })?;
+        anyhow::ensure!(tx.takers_listed() == 0, "a thread waits on what's waiting");
         Ok(())
     }
 
@@ -2000,64 +2056,38 @@ mod tests {
         a: u32,
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: at most one payload of a kind is looked at every [`CHECK_EVERY`] ([`looks_at`]), and
-    /// a field every message of the kind carries is in one looked at within [`CHECK_EVERY`] of its first. Do: payloads of
-    /// one kind about a millisecond apart, off a shard (looked at where they're read), for three CHECK_EVERYs, none with the
-    /// field; then each with it, until it's counted. Expect: one looked at a CHECK_EVERY at the most, and at least one; the
-    /// field counted within a CHECK_EVERY of the first that carried it, and one send's gap (the test's own thread's turns).
+    /// Consts-audit R3 (goal 9, plan 01a1a87b2cec step 5): one payload of a kind is looked at at a time, the next once the
+    /// last is done, with no time between (it was one of a kind every 100 ms). Do: claim a kind's look; read payloads of it,
+    /// each with a field the type doesn't have, on a shard; let the look go; read one more; then read payloads off a shard,
+    /// where each is looked at as it's read. Expect: none looked at while the look is under way, each read straight; the one
+    /// after it looked at; off a shard, a checker free at once, every one looked at.
     #[test]
-    fn g9_s5_a_field_every_message_of_a_kind_carries_is_looked_at_within_one_check_every() -> anyhow::Result<()> {
+    fn g9_s5_r3_one_payload_of_a_kind_is_looked_at_at_a_time_the_next_once_its_done() -> anyhow::Result<()> {
         // A wire no other test reads JSON on, so its counts are this test's alone.
         let wire = Wire::BpDown;
-        let checked = || crate::metrics::wire().checked.get(&[wire.name()]);
-        let ignored = || crate::metrics::wire().ignored.get(&[wire.name()]);
-        let (began, looked_before) = (Instant::now(), checked());
-        let mut sent = 0u64;
-        while began.elapsed() < 3 * CHECK_EVERY {
-            payload::<OneField>(wire, "One", &format!(r#"{{"a":{sent}}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
-            sent += 1;
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let (took, looked) = (began.elapsed(), checked().saturating_sub(looked_before));
-        let most = u64::try_from(took.as_nanos() / CHECK_EVERY.as_nanos()).unwrap_or(u64::MAX).saturating_add(1);
-        anyhow::ensure!(sent > most, "{sent} payloads over {took:?}: too few to tell one looked at a CHECK_EVERY from each");
-        anyhow::ensure!((1..=most).contains(&looked), "{looked} of {sent} payloads of a kind looked at over {took:?} (at most {most})");
-        let (first, counted_before) = (Instant::now(), ignored());
-        let (mut last_sent, mut gap) = (first, Duration::ZERO);
-        while ignored() == counted_before {
-            anyhow::ensure!(first.elapsed() < 10 * CHECK_EVERY, "a field every message carries wasn't counted in {:?}", first.elapsed());
-            gap = gap.max(last_sent.elapsed());
-            last_sent = Instant::now();
-            payload::<OneField>(wire, "One", r#"{"a":1,"new":true}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let within = last_sent.saturating_duration_since(first);
-        anyhow::ensure!(within <= CHECK_EVERY + gap, "the field was in one looked at {within:?} after its first (a send's gap {gap:?})");
-        Ok(())
-    }
-
-    /// Goal 9, plan 01a1a87b2cec step 5: every payload of a kind that comes less often than once a [`CHECK_EVERY`] is looked
-    /// at, and another kind's beside it is its own. Do: five rounds a CHECK_EVERY and a little apart, each a payload of one
-    /// kind and one of another at once, every one with a field the type doesn't have. Expect: all ten looked at, each field
-    /// counted.
-    #[test]
-    fn g9_s5_every_message_of_a_kind_that_comes_less_often_is_looked_at() -> anyhow::Result<()> {
-        // A wire no other test reads JSON on, so its counts are this test's alone.
-        let wire = Wire::BpUp;
-        let checked = || crate::metrics::wire().checked.get(&[wire.name()]);
-        let ignored = || crate::metrics::wire().ignored.get(&[wire.name()]);
-        let (looked_before, counted_before) = (checked(), ignored());
-        const ROUNDS: u64 = 5;
-        for n in 0..ROUNDS {
-            if n > 0 {
-                std::thread::sleep(CHECK_EVERY + Duration::from_millis(10));
+        let checked = move || crate::metrics::wire().checked.get(&[wire.name()]);
+        crate::rt::block_on(async move {
+            let held = looks_at(wire, "Held").ok_or_else(|| anyhow::anyhow!("the kind's look was under way already"))?;
+            anyhow::ensure!(looks_at(wire, "Held").is_none() && looking(wire, "Held"), "a second look of a kind while one is under way");
+            let looked = checked();
+            for n in 0..16u32 {
+                let read = payload::<OneField>(wire, "Held", &format!(r#"{{"a":{n},"new":true}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
+                anyhow::ensure!(read == OneField { a: n }, "read as {read:?}");
             }
-            for of in ["Rare", "Beside"] {
-                payload::<OneField>(wire, of, &format!(r#"{{"a":{n},"new":true}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
+            anyhow::ensure!(checked() == looked, "looked at while its kind's look was under way");
+            drop(held);
+            anyhow::ensure!(!looking(wire, "Held"), "its look let go");
+            payload::<OneField>(wire, "Held", r#"{"a":16,"new":true}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
+            until_looked(wire, "Held").await?;
+            anyhow::ensure!(checked() == looked + 1, "the next after it, looked at: {} looked at", checked().saturating_sub(looked));
+            anyhow::Ok(())
+        })?;
+        // Off a shard, each is looked at as it's read: its look done before the next comes.
+        let looked = checked();
+        for n in 0..16u32 {
+            payload::<OneField>(wire, "Free", &format!(r#"{{"a":{n},"new":true}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        let (looked, counted) = (checked().saturating_sub(looked_before), ignored().saturating_sub(counted_before));
-        anyhow::ensure!(looked == 2 * ROUNDS && counted == 2 * ROUNDS, "{looked} looked at and {counted} fields counted of {} payloads", 2 * ROUNDS);
+        anyhow::ensure!(checked().saturating_sub(looked) == 16, "{} of 16 looked at by a checker free at once", checked().saturating_sub(looked));
         Ok(())
     }
 
