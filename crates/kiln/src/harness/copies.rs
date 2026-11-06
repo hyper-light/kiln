@@ -376,6 +376,13 @@ pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static WARMED_ON_SHARD: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Chunks whose texts' length was added up from their metas on this thread ([`Chunk::texts_len`]): goal 11, plan
+    /// 01a1a87b2e56 step 5's test of a snapshot's weight (the memory audit's row A5).
+    pub(crate) static TEXTS_FROM_METAS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What the reads of its copy's newest page kept of a compact chunk's texts joined ([`Chunk::page_texts`]):
 /// those from byte `from` of them on. A read keeps them whole, from 0 (goal 11 audit A8), and so does the
 /// compaction that makes them for a copy being read ([`Chunk::warm`], from where the reads before reached).
@@ -484,6 +491,8 @@ impl Chunk {
 
     /// Its texts joined, in bytes: each one's, and a `,` between each two.
     pub fn texts_len(&self) -> usize {
+        #[cfg(test)]
+        TEXTS_FROM_METAS.with(|n| n.set(n.get() + 1));
         self.meta.iter().map(Meta::text_len).sum::<usize>() + self.meta.len().saturating_sub(1)
     }
 
@@ -701,6 +710,18 @@ impl Chunk {
     /// Its segment's bytes on disk, once spilled.
     pub fn spilled_bytes(&self) -> Option<usize> {
         self.spilled.as_ref().map(super::spill::Spilled::bytes)
+    }
+
+    /// Its texts joined, in bytes, where its segment says them without its metas being read (goal 11, plan 01a1a87b2e56
+    /// step 5, the memory audit's row A5): what [`Chunk::texts_len`] reckons, as the segment it keeps in memory or the one
+    /// it spilled holds them inflated. None for one with no segment (the newest, one the packer hasn't come to, one changed).
+    pub fn segment_texts_len(&self) -> Option<usize> {
+        let len = match (self.packed.get(), &self.spilled) {
+            (Some(s), _) => s.len,
+            (None, Some(s)) => s.texts_len(),
+            (None, None) => return None,
+        };
+        Some(usize::try_from(len).unwrap_or(usize::MAX))
     }
 
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
@@ -1558,18 +1579,25 @@ impl Events {
         Reading { events: self, read: None }
     }
 
-    /// Whether the events changed after revision `after` fit a window's bounds (`super::window`), as a viewer that
-    /// takes them `lean` is sent them: what a window's resume is held to (`super::registry::Parts::resolved`).
-    pub(super) fn fit_since(&self, after: u64, lean: bool) -> bool {
-        let (mut rows, mut bytes) = (0usize, 0usize);
-        let mut reading = self.reading();
-        for (i, m) in self.metas().enumerate() {
-            if m.at <= after {
-                continue;
-            }
-            rows += 1;
-            bytes = bytes.saturating_add(if lean { reading.get(i).map_or(0, |e| e.entry.sent(true).len()) } else { m.text_len() });
-            if rows > super::window::ROWS || bytes > super::window::BYTES {
+    /// Its events read as a viewer that takes them `lean` is sent them, each once ([`Sending`]).
+    pub fn sending(&self, lean: bool) -> Sending<'_> {
+        Sending { events: self, lean, read: std::collections::BTreeMap::new(), inflated: None }
+    }
+
+    /// Whether the events changed after revision `after` fit a window's bounds (`super::window`), as `sending` sends them:
+    /// what a window's resume is held to (`super::registry::Parts::resolved`). Counted from their metas first, so past a
+    /// window's rows none is read; each read is kept in `sending` for what takes it next (goal 11, plan 01a1a87b2e56 step 5,
+    /// the memory audit's row A2a).
+    pub(super) fn fit_since(&self, after: u64, sending: &mut Sending<'_>) -> bool {
+        let changed = || self.metas().enumerate().filter(move |(_, m)| m.at > after);
+        if changed().nth(super::window::ROWS).is_some() {
+            return false;
+        }
+        let mut bytes = 0usize;
+        for (i, m) in changed() {
+            let n = if sending.lean { sending.get(i).map_or(0, |(s, _)| s.text(true).len()) } else { m.text_len() };
+            bytes = bytes.saturating_add(n);
+            if bytes > super::window::BYTES {
                 return false;
             }
         }
@@ -1577,10 +1605,115 @@ impl Events {
     }
 
     /// Where a window of the events before `end` begins, holding at most `turns` turns (`super::window::start_at`),
-    /// as a viewer that takes them `lean` is sent them: read from `end` back, each compact chunk inflated once.
-    pub(super) fn window_start(&self, end: usize, turns: usize, lean: bool) -> usize {
-        let mut reading = self.reading();
-        super::window::start_at(end, turns, |i| reading.get(i).map(|e| (e.entry.sent(lean).len(), e.entry.kind() == Some("user") && e.entry.on_main_thread())))
+    /// as `sending` sends them: read from `end` back, each compact chunk inflated once, each event read kept in
+    /// `sending` for what takes it next (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A2a).
+    pub(super) fn window_start(&self, end: usize, turns: usize, sending: &mut Sending<'_>) -> usize {
+        let lean = sending.lean;
+        super::window::start_at(end, turns, |i| sending.get(i).map(|(s, begins)| (s.text(lean).len(), begins)))
+    }
+}
+
+/// One of a copy's events as a viewer is sent it ([`Sending`]): read once for what sends it (goal 11, plan 01a1a87b2e56
+/// step 5, the memory audit's row A2a).
+pub enum Sent {
+    /// One its chunk keeps as it is: its entry, which keeps its lean form once made, for every viewer after.
+    Kept(Arc<Entry>),
+    /// One of a compact chunk's, read again from its segment: its JSON as the viewer it was read for is sent it (its lean
+    /// form, or its text), its own.
+    Read(Box<str>),
+}
+
+impl Sent {
+    /// Its JSON as a viewer that takes events `lean` is sent it: `lean` as it was read, for one read again.
+    pub fn text(&self, lean: bool) -> &str {
+        match self {
+            Sent::Kept(e) => e.sent(lean),
+            Sent::Read(t) => t,
+        }
+    }
+
+    /// [`Sent::text`], owned.
+    pub fn into_text(self, lean: bool) -> String {
+        match self {
+            Sent::Kept(e) => e.sent(lean).to_owned(),
+            Sent::Read(t) => t.into_string(),
+        }
+    }
+}
+
+/// A copy's events read as a viewer is sent them, each once for all of what sends it (goal 11, plan 01a1a87b2e56 step 5;
+/// the memory audit's row A2a). The UI's window (`?window=1&lean=1`) was read four times an attach: finding where it begins
+/// (`Events::window_start`), its frames' sizes, then each frame's room and its writing, and each time each of its compact
+/// chunks was inflated again and every one of their events made an entry (its text copied, its head read) and read whole
+/// for its lean form, a lean form being kept only by an event in memory. Here an event read is kept until it's taken
+/// ([`Sending::take`]): what finds the window, then the plan, then the writing read it once. A compact chunk is inflated
+/// once for its events read in turn, and nothing is made of those of its events not read; an event of one is read as it's
+/// sent alone (`super::registry::sent_of_text`: its lean form, or its text copied once), its whole JSON read only for a
+/// tool's lean form. What it keeps is what's been read and not taken, a window's at the most.
+pub struct Sending<'a> {
+    events: &'a Events,
+    lean: bool,
+    /// The events read and not yet taken, by their place, and whether each begins a person's turn.
+    read: std::collections::BTreeMap<usize, (Sent, bool)>,
+    /// The compact chunk inflated last: where it is among the chunks, its texts joined, and where each of its events'
+    /// texts begins in them.
+    inflated: Option<(usize, Vec<u8>, Vec<usize>)>,
+}
+
+impl Sending<'_> {
+    /// Event `i` as sent, and whether it begins a person's turn: read now, or as it was read before. Kept until it's taken.
+    /// None past the events, or where a compact chunk's segment can't be read.
+    pub fn get(&mut self, i: usize) -> Option<(&Sent, bool)> {
+        if !self.read.contains_key(&i) {
+            let made = self.read_now(i)?;
+            self.read.insert(i, made);
+        }
+        self.read.get(&i).map(|(s, begins)| (s, *begins))
+    }
+
+    /// Whether event `i` was read and is kept.
+    pub fn has(&self, i: usize) -> bool {
+        self.read.contains_key(&i)
+    }
+
+    /// Event `i` as sent, its own: as it was read before, or read now (and kept by none).
+    pub fn take(&mut self, i: usize) -> Option<Sent> {
+        match self.read.remove(&i) {
+            Some((s, _)) => Some(s),
+            None => self.read_now(i).map(|(s, _)| s),
+        }
+    }
+
+    /// Event `i` read: an entry kept in memory as it is (its lean form made now, off the shards, and kept on it for every
+    /// viewer after); one of a compact chunk's from its texts, the chunk inflated if it isn't the one inflated last.
+    fn read_now(&mut self, i: usize) -> Option<(Sent, bool)> {
+        let events = self.events;
+        let (c, k) = events.place(i)?;
+        let chunk = events.chunk(c)?;
+        if !chunk.is_compact() {
+            let e = &chunk.evs.get(k)?.entry;
+            let _ = e.sent(self.lean);
+            return Some((Sent::Kept(Arc::clone(e)), e.kind() == Some("user") && e.on_main_thread()));
+        }
+        if self.inflated.as_ref().is_none_or(|(was, ..)| *was != c) {
+            let joined = chunk.joined().ok()?.into_owned();
+            let mut at = 0usize;
+            let starts = chunk
+                .meta
+                .iter()
+                .map(|m| {
+                    let from = at;
+                    at = at.saturating_add(m.text_len()).saturating_add(1);
+                    from
+                })
+                .collect();
+            self.inflated = Some((c, joined, starts));
+        }
+        let (_, joined, starts) = self.inflated.as_ref()?;
+        let from = *starts.get(k)?;
+        let text = joined.get(from..from.checked_add(chunk.meta.get(k)?.text_len())?).and_then(|b| std::str::from_utf8(b).ok())?;
+        let (sent, begins) = super::registry::sent_of_text(text, self.lean);
+        Some((Sent::Read(sent), begins))
     }
 }
 
@@ -1901,9 +2034,11 @@ impl View {
             let floor = floor_of(&self.state);
             return if older && before > floor { Paged::Store { before, floor } } else { Paged::Page { events: Vec::new(), window: crate::wire::ui::EventsWindow { before: None, more: false } } };
         }
-        let begin = self.events.window_start(end, super::window::PAGE_TURNS, lean);
-        let mut reading = self.events.reading();
-        let events = (begin..end).filter_map(|i| reading.get(i).map(|e| e.entry.sent(lean).to_owned())).collect();
+        // Its events read once, for where it begins and for what it brings (goal 11, plan 01a1a87b2e56 step 5, the memory
+        // audit's row A2a: twice, each compact chunk among them inflated and its events read whole again).
+        let mut sending = self.events.sending(lean);
+        let begin = self.events.window_start(end, super::window::PAGE_TURNS, &mut sending);
+        let events = (begin..end).filter_map(|i| sending.take(i).map(|s| s.into_text(lean))).collect();
         Paged::Page { events, window: self.window_at(begin, older) }
     }
 
