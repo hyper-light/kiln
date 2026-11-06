@@ -2192,6 +2192,18 @@ impl Registry {
         self.sessions.with(id, |v| v.events_page(before, limit)).flatten()
     }
 
+    /// [`Registry::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
+    /// ([`super::copies::View::events_page_kept`]; goal 10, plan 01a1a87b2dae step 5). No such session: `Cannot`.
+    pub fn events_page_kept(&self, id: &str, before: Option<u64>, limit: usize) -> Result<Vec<bytes::Bytes>, super::copies::Unread> {
+        self.sessions.with(id, |v| v.events_page_kept(before, limit)).unwrap_or(Err(super::copies::Unread::Cannot))
+    }
+
+    /// Session `id`'s newest view, held: for what's read of it off the shards (a page whose compact chunk's texts
+    /// are made there: goal 10, plan 01a1a87b2dae step 5).
+    pub fn view_held(&self, id: &str) -> Option<Arc<super::copies::View>> {
+        self.sessions.view(id)
+    }
+
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
         #[cfg(not(test))]
         super::acp::warm_models();
@@ -5200,6 +5212,7 @@ mod tests {
     fn updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
@@ -5294,6 +5307,7 @@ mod tests {
     fn g4_s5_runner_updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event, State};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
@@ -5820,6 +5834,443 @@ mod tests {
             anyhow::ensure!(packing.next_piece(size)?.is_none(), "none once it's all out");
         }
         Ok(())
+    }
+
+    /// A real panic, as a bug would raise it (as `crate::sup`'s tests raise one).
+    #[allow(clippy::panic)]
+    fn injected(what: &str) {
+        panic!("injected: {what}")
+    }
+
+    /// Every shard kept busy, as the existing step 5 tests keep them: tasks that hold it 200 µs a step, giving it up only to
+    /// what wants it, until the flag they're given goes false.
+    fn busy_shards() -> Arc<std::sync::atomic::AtomicBool> {
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for _ in 0..crate::rt::shard_count().max(1) * 2 {
+            let busy = Arc::clone(&busy);
+            crate::rt::spawn_spread(async move {
+                while busy.load(std::sync::atomic::Ordering::Acquire) {
+                    let t = std::time::Instant::now();
+                    while t.elapsed() < std::time::Duration::from_micros(200) {
+                        std::hint::spin_loop();
+                    }
+                    crate::rt::maybe_yield().await;
+                }
+            });
+        }
+        busy
+    }
+
+    /// An update of session `session` as its runner sends it, for its owner to judge and take (`Registry::from_runner`).
+    fn from_box(session: &str, update: Update) -> super::super::copies::RunnerUpdate {
+        super::super::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: session.to_owned(), update, shipped: false, arrived: None, handed: None, taken: None }
+    }
+
+    /// Event `q` of session `id` (named `{id}-e{q}`), saying `text`.
+    fn said_as(id: &str, q: u64, text: &str) -> crate::harness::model::Event {
+        use crate::harness::model::{Body, Event};
+        Event { id: format!("{id}-e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.to_owned(), streaming: false } }
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: an owner restarted mid-stream, its work on a copy cut short by a panic (a bug in a
+    /// change: its shard catches it, and the owner goes on with its next message, `Shard::take`), loses nothing after it and
+    /// leaves no viewer behind. A job changes a session's copy and panics before the change goes out, between its runner's
+    /// updates: each update after it is taken, in order, with the change the panic cut short; and a viewer that watched
+    /// throughout ends with what the copy has (sent back to a snapshot of it: a change half made goes to no one as a frame).
+    #[test]
+    fn g4_s5_an_owner_goes_on_after_a_change_that_panicked_and_its_viewers_with_it() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |q: u64| said_as("p", q, &format!("line {q}"));
+            hub.harness.ingest(&hub, &there, "p", Update::Open { info: Box::new(Info { id: "p".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.ingest(&hub, &there, "p", Update::Events { events: (1..=5).map(said).collect() }).await;
+            // A viewer watching throughout: joined before the panic.
+            let done = Arc::new(AtomicBool::new(false));
+            let viewer = crate::rt::spawn(watch(Arc::clone(&hub), "p".into(), std::time::Duration::ZERO, Arc::clone(&done)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while hub.harness.sessions.on("p", |s| s.get("p").map(|m| m.feed.viewers())).await.flatten().unwrap_or(0) == 0 {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the viewer never joined");
+                crate::rt::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            // A change made to the copy, and a panic before it goes out.
+            let cut = Arc::new(Entry::of_event(&said(6), None));
+            let panics = Msg::Run(Box::new(move |s: &mut Shard| {
+                if let Some(m) = s.get_mut("p") {
+                    m.rev += 1;
+                    m.upsert(cut);
+                    injected("a change to a session's copy, cut short before it went out");
+                }
+            }));
+            anyhow::ensure!(hub.harness.sessions.send("p", panics).await, "its owner took the job");
+            // Its runner goes on.
+            for q in 7..=12 {
+                hub.harness.ingest_from(&hub, &there, "p", Update::Events { events: vec![said(q)] }, false).await;
+            }
+            hub.harness.settled().await;
+            done.store(true, Ordering::Release);
+            let want: Vec<(String, String)> = (1..=12).map(|q| (format!("p-e{q}"), format!("line {q}"))).collect();
+            anyhow::ensure!(said_in(&hub, "p") == want, "the copy: {:?}", said_in(&hub, "p"));
+            let (_, seen, _) = crate::rt::timeout(std::time::Duration::from_secs(30), viewer).await.map_err(|_| anyhow::anyhow!("the viewer never caught up"))?.map_err(|_| anyhow::anyhow!("the viewer ended"))??;
+            anyhow::ensure!(seen == want, "the viewer ends with {:?}", seen.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the server's owners started again mid-stream (the server restarted, its copies gone
+    /// with it) make no copy of part of a session from what its runner sends before it announces the session again (the
+    /// runner is asked for all of it instead). Its Open and whole history then make the copy whole, and the stream goes on
+    /// from there: every event once, in order, with its words.
+    #[test]
+    fn g4_s5_owners_started_again_mid_stream_make_no_copy_of_part_of_a_session() -> anyhow::Result<()> {
+        use crate::harness::model::State;
+        crate::rt::block_on(async {
+            let open = Update::Open { info: Box::new(Info { id: "r".into(), kind: "claude".into(), ..Info::default() }), since: None };
+            let line = |q: u64| said_as("r", q, &format!("line {q}"));
+            // The first server takes its first twenty.
+            let first = crate::hub::tests::scratch_hub().await?;
+            first.harness.from_runner(from_box("r", open.clone())).await;
+            first.harness.from_runner(from_box("r", Update::Events { events: (1..=20).map(line).collect() })).await;
+            first.harness.settled().await;
+            anyhow::ensure!(said_in(&first, "r").len() == 20, "the first server's copy: {} events", said_in(&first, "r").len());
+            // Started again: new owners, no copies; the stream goes on before its runner announces the session again.
+            let again = crate::hub::tests::scratch_hub().await?;
+            let stream = |hub: Arc<Hub>, qs: std::ops::RangeInclusive<u64>| async move {
+                for q in qs {
+                    hub.harness.from_runner(from_box("r", Update::Events { events: vec![said_as("r", q, "")] })).await;
+                    hub.harness.from_runner(from_box("r", Update::Stream { id: format!("r-e{q}"), text: format!("line {q}") })).await;
+                }
+            };
+            stream(Arc::clone(&again), 21..=25).await;
+            again.harness.from_runner(from_box("r", Update::State { state: Box::new(State { summary: "mid-stream".into(), ..State::default() }) })).await;
+            again.harness.settled().await;
+            anyhow::ensure!(again.harness.info("r").is_none() && again.harness.list().is_empty(), "a copy made of part of a session: {:?}", said_in(&again, "r"));
+            // Its runner announces it again with all of it, as asked, and goes on.
+            again.harness.from_runner(from_box("r", open)).await;
+            again.harness.from_runner(from_box("r", Update::Events { events: (1..=25).map(line).collect() })).await;
+            stream(Arc::clone(&again), 26..=30).await;
+            again.harness.settled().await;
+            let want: Vec<(String, String)> = (1..=30).map(|q| (format!("r-e{q}"), format!("line {q}"))).collect();
+            anyhow::ensure!(said_in(&again, "r") == want, "{:?}", said_in(&again, "r"));
+            Ok(())
+        })
+    }
+
+    /// A test's draws: xorshift64 from a seed other than zero.
+    struct Draws(u64);
+
+    impl Draws {
+        /// The next draw below `n` (one at the least).
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
+        }
+    }
+
+    /// What taking `u` does to a copy's events as `model` has them (by id: each one's number and words), taken alone in
+    /// its turn: an event replaces the one under its id, words go onto the event under theirs.
+    fn modeled(model: &mut std::collections::BTreeMap<String, (u64, String)>, u: &Update) {
+        use crate::harness::model::Body;
+        match u {
+            Update::Events { events } => {
+                for e in events {
+                    let text = if let Body::Assistant { text, .. } = &e.body { text.clone() } else { String::new() };
+                    model.insert(e.id.clone(), (e.seq, text));
+                }
+            }
+            Update::Stream { id, text } => {
+                if let Some((_, words)) = model.get_mut(id) {
+                    words.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Session `id`'s updates from its runner with its events out of their numbers' order, drawn from `draws`, taken into
+    /// `model` as they'd be taken. Its new events (`top` + 1 on, `fresh` of them) and those its copy lacks among its older
+    /// ones (`late`) come in any order, in batches of one to four, and one in ten of sixteen to thirty-nine (an owner's turn
+    /// may run out in one, its rest coming back to it: goal 9, plan 01a1a87b2cec step 3), each new one's words streamed after
+    /// it in two parts; now and then a batch goes again as the copy has it (a runner's resend); and every eighth batch one
+    /// of its `oldest` is said again in other words, and given more words after.
+    fn out_of_order(id: &str, draws: &mut Draws, top: u64, fresh: u64, late: &[u64], oldest: &[u64], model: &mut std::collections::BTreeMap<String, (u64, String)>) -> Vec<Update> {
+        let mut due: Vec<u64> = (top + 1..=top + fresh).chain(late.iter().copied()).collect();
+        for i in (1..due.len()).rev() {
+            due.swap(i, draws.below(i + 1));
+        }
+        let mut updates = Vec::new();
+        let mut take = |model: &mut std::collections::BTreeMap<String, (u64, String)>, u: Update| {
+            modeled(model, &u);
+            updates.push(u);
+        };
+        let (mut rest, mut batches) = (due.as_slice(), Vec::<Vec<u64>>::new());
+        while !rest.is_empty() {
+            let size = if draws.below(10) == 0 { 16 + draws.below(24) } else { 1 + draws.below(4) };
+            let (batch, after) = rest.split_at(size.min(rest.len()));
+            rest = after;
+            let events = batch
+                .iter()
+                .map(|q| {
+                    let text = if *q > top { String::new() } else { format!("late {q}") };
+                    said_as(id, *q, &text)
+                })
+                .collect();
+            take(model, Update::Events { events });
+            for q in batch.iter().filter(|q| **q > top) {
+                for part in ["a", "b"] {
+                    take(model, Update::Stream { id: format!("{id}-e{q}"), text: format!("{q}{part}") });
+                }
+            }
+            batches.push(batch.to_vec());
+            if draws.below(4) == 0 {
+                let again = batches.get(draws.below(batches.len())).cloned().unwrap_or_default();
+                let events = again.iter().filter_map(|q| model.get(&format!("{id}-e{q}")).map(|(_, words)| said_as(id, *q, words))).collect();
+                take(model, Update::Events { events });
+            }
+            if batches.len().is_multiple_of(8)
+                && let Some(q) = oldest.get(draws.below(oldest.len()))
+            {
+                take(model, Update::Events { events: vec![said_as(id, *q, &format!("said again at batch {}", batches.len()))] });
+                take(model, Update::Stream { id: format!("{id}-e{q}"), text: " and more".into() });
+            }
+        }
+        updates
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a runner's events that reach their session's owner out of their numbers' order end
+    /// in it, once each. Eight sessions on busy shards, half of them long (their older chunks kept compact, some spilled),
+    /// each sent through the owners' runner path (`Registry::from_runner`): new events in batches in any order, some
+    /// batches sent again; on the long ones, events their copies lack among their older ones and new words for their
+    /// oldest, each such change read back, or the events made again with it in, off the owner's shard while the updates
+    /// behind it wait (goal 9, plan 01a1a87b2cec step 3); and words streamed into events old and new. Each copy ends as
+    /// taking its updates one at a time, in the order sent, makes it: every event once, in its number's place, with its
+    /// newest words; its index finds each where it is; and a viewer of it ends with what it has.
+    #[test]
+    fn g4_s5_events_that_come_out_of_order_end_in_their_numbers_order_once_each() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            // A copy's chunk (`super::copies`): the square root of the most it keeps. A long copy has six and a few.
+            let chunk = u64::try_from((MAX_EVENTS + MAX_EVENTS / 4).isqrt())?;
+            let (old, fresh) = (chunk * 6 + 9, 60u64);
+            let late: Vec<u64> = (1..=old).filter(|q| q % 11 == 7).collect();
+            let oldest: Vec<u64> = (1..=chunk / 2).filter(|q| !late.contains(q)).collect();
+            let ids: Vec<String> = (0..8).map(|n| format!("o{n}")).collect();
+            let mut plans = Vec::new();
+            for (k, id) in ids.iter().enumerate() {
+                let long = k.is_multiple_of(2);
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                let mut model = std::collections::BTreeMap::new();
+                if long {
+                    let first = Update::Events { events: (1..=old).filter(|q| !late.contains(q)).map(|q| said_as(id, q, &format!("line {q}"))).collect() };
+                    modeled(&mut model, &first);
+                    hub.harness.ingest(&hub, &there, id, first).await;
+                    // Its older chunks packed and kept compact, as its owner keeps them once the packer is done.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while hub.harness.sessions.with(id, |v| v.events.chunks().iter().filter(|c| c.is_compact()).count()).unwrap_or(0) < 3 {
+                        anyhow::ensure!(std::time::Instant::now() < deadline, "{id}'s older chunks were never kept compact");
+                        crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
+                let mut draws = Draws(0x2545_f491_4f6c_dd1d ^ u64::try_from(k + 1)?.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let (top, late, oldest) = if long { (old, late.as_slice(), oldest.as_slice()) } else { (0, &[][..], &[][..]) };
+                let updates = out_of_order(id, &mut draws, top, fresh, late, oldest, &mut model);
+                plans.push((id.clone(), updates, model));
+            }
+            let busy = busy_shards();
+            let done = Arc::new(AtomicBool::new(false));
+            let mut viewers = Vec::new();
+            for (k, id) in ids.iter().enumerate() {
+                viewers.push(crate::rt::spawn(watch(Arc::clone(&hub), id.clone(), std::time::Duration::from_millis(u64::try_from(k)? * 9), Arc::clone(&done))));
+            }
+            let (sent_tx, sent_rx) = async_channel::unbounded::<()>();
+            let mut models = Vec::new();
+            for (id, updates, model) in plans {
+                let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
+                let session = id.clone();
+                crate::rt::spawn_spread(async move {
+                    for u in updates {
+                        hub.harness.from_runner(from_box(&session, u)).await;
+                    }
+                    let _ = sent.send(()).await;
+                });
+                models.push((id, model));
+            }
+            drop(sent_tx);
+            for _ in 0..ids.len() {
+                crate::rt::timeout(std::time::Duration::from_secs(120), sent_rx.recv()).await.map_err(|_| anyhow::anyhow!("a runner's updates were never all handed over"))??;
+            }
+            hub.harness.settled().await;
+            done.store(true, Ordering::Release);
+            busy.store(false, Ordering::Release);
+            for (id, model) in &models {
+                let mut want: Vec<(u64, String, String)> = model.iter().map(|(e, (q, words))| (*q, e.clone(), words.clone())).collect();
+                want.sort();
+                let want: Vec<(String, String)> = want.into_iter().map(|(_, e, words)| (e, words)).collect();
+                let got = said_in(&hub, id);
+                anyhow::ensure!(got == want, "{id}: {} events of {}, the first out of place {:?}", got.len(), want.len(), got.iter().zip(&want).find(|(a, b)| a != b));
+                let i = id.clone();
+                let indexed = hub.harness.sessions.on(id, move |s| s.get(&i).map(|m| m.events.metas().enumerate().all(|(at, meta)| m.index.get(&m.events, meta.id()) == Some(at)))).await.flatten();
+                anyhow::ensure!(indexed == Some(true), "{id}'s index doesn't find each event where it is");
+            }
+            for v in viewers {
+                let (id, seen, _) = crate::rt::timeout(std::time::Duration::from_secs(30), v).await.map_err(|_| anyhow::anyhow!("a viewer never caught up"))?.map_err(|_| anyhow::anyhow!("a viewer ended"))??;
+                let has = said_in(&hub, &id);
+                anyhow::ensure!(seen == has, "{id}'s viewer has {} events, the copy {}: {:?}", seen.len(), has.len(), seen.iter().zip(&has).find(|(a, b)| a != b));
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: many sessions on few shards, their runners' updates handed over by one loop, as the
+    /// hub's loop hands them over (each after the one before it, round the sessions), the shards busy: two hundred and
+    /// fifty-six sessions on the test runtime's owners (two) each take every event once, in order, with its words in the
+    /// order they came and its last state; the viewers of every sixteenth end with what their copies have; and the
+    /// sessions' list and what the copies say they keep name every one, each through its newest event.
+    #[test]
+    fn g4_s5_many_sessions_handed_over_by_one_loop_keep_their_order() -> anyhow::Result<()> {
+        use crate::harness::model::State;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (count, per) = (256usize, 12u64);
+            let ids: Vec<String> = (0..count).map(|n| format!("l{n}")).collect();
+            for id in &ids {
+                hub.harness.from_runner(from_box(id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None })).await;
+            }
+            hub.harness.settled().await;
+            let busy = busy_shards();
+            let done = Arc::new(AtomicBool::new(false));
+            let mut viewers = Vec::new();
+            for (j, id) in ids.iter().step_by(16).enumerate() {
+                viewers.push(crate::rt::spawn(watch(Arc::clone(&hub), id.clone(), std::time::Duration::from_millis(u64::try_from(j)? * 5), Arc::clone(&done))));
+            }
+            for q in 1..=per {
+                for id in &ids {
+                    hub.harness.from_runner(from_box(id, Update::Events { events: vec![said_as(id, q, "")] })).await;
+                    for part in ["a", "b"] {
+                        hub.harness.from_runner(from_box(id, Update::Stream { id: format!("{id}-e{q}"), text: format!("{q}{part}") })).await;
+                    }
+                    if q.is_multiple_of(4) {
+                        hub.harness.from_runner(from_box(id, Update::State { state: Box::new(State { summary: format!("through {q}"), ..State::default() }) })).await;
+                    }
+                }
+            }
+            hub.harness.settled().await;
+            done.store(true, Ordering::Release);
+            busy.store(false, Ordering::Release);
+            for id in &ids {
+                let want: Vec<(String, String)> = (1..=per).map(|q| (format!("{id}-e{q}"), format!("{q}a{q}b"))).collect();
+                anyhow::ensure!(said_in(&hub, id) == want, "{id}'s copy: {:?}", said_in(&hub, id).iter().take(4).collect::<Vec<_>>());
+                let summary = hub.harness.sessions.with(id, |v| v.info.summary.clone());
+                anyhow::ensure!(summary.as_deref() == Some(format!("through {per}").as_str()), "{id}'s last state: {summary:?}");
+            }
+            let listed: Vec<Value> = serde_json::from_slice(&hub.harness.list_json())?;
+            let kept = hub.harness.kept_on("box");
+            anyhow::ensure!(listed.len() == count && kept.len() == count && kept.iter().all(|k| k.seq == per), "{} listed, {} kept, the least kept through {:?}", listed.len(), kept.len(), kept.iter().map(|k| k.seq).min());
+            for v in viewers {
+                let (id, seen, _) = crate::rt::timeout(std::time::Duration::from_secs(30), v).await.map_err(|_| anyhow::anyhow!("a viewer never caught up"))?.map_err(|_| anyhow::anyhow!("a viewer ended"))??;
+                anyhow::ensure!(seen == said_in(&hub, &id), "{id}'s viewer has {} events, the copy {}", seen.len(), said_in(&hub, &id).len());
+            }
+            Ok(())
+        })
+    }
+
+    /// What a held view says of its copy, as a viewer and the API would have it: its snapshot's frames (made on the blocking
+    /// pool, as a viewer's are), its newest page of events, its digests, its revision and how many events it holds.
+    type ViewSays = (Vec<String>, Option<bytes::Bytes>, crate::proto::KeptSession, u64, usize);
+
+    async fn said_by(view: Arc<super::super::copies::View>) -> anyhow::Result<ViewSays> {
+        crate::rt::blocking(move || (Snapshot { parts: view.parts(), files: None, store: None }.frames(), view.events_json(None, 50), view.kept("old"), view.rev, view.events.len())).await
+    }
+
+    /// Each view in `held` (with what it was taken after) still says what it said then, now that `now`.
+    async fn still_say(held: &[(String, Arc<super::super::copies::View>, ViewSays)], now: &str) -> anyhow::Result<()> {
+        for (after, view, was) in held {
+            let says = said_by(Arc::clone(view)).await?;
+            anyhow::ensure!(&says == was, "the view held after {after} says another thing now that {now}: revision {} and {} events then, {} and {} now", was.3, was.4, says.3, says.4);
+        }
+        Ok(())
+    }
+
+    /// Session `old`'s view held, now that `now`: those held before checked first.
+    async fn hold_view(hub: &Hub, held: &mut Vec<(String, Arc<super::super::copies::View>, ViewSays)>, now: &str) -> anyhow::Result<()> {
+        still_say(held, now).await?;
+        let view = hub.harness.sessions.view("old").ok_or_else(|| anyhow::anyhow!("no copy once {now}"))?;
+        let says = said_by(Arc::clone(&view)).await?;
+        held.push((now.to_owned(), view, says));
+        Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: readers holding old copies keep what they took. A reader holds its session's view
+    /// after each of these, while the copy's owner goes on: events taken in (their chunks then sealed, packed, kept compact
+    /// and spilled), an old event said again (its chunk read back off the owner's shard), one put in late among the others
+    /// (the events made again off the shard), words streamed into the newest, a long session's oldest let go of (the chunk
+    /// the cut fell in made again off the shard), its runner going on from before its newest, a reset, and the session
+    /// ending. Each view held makes, at each of those after it and once the session is gone, the snapshot, newest page and
+    /// digests it made when it was taken; and once the last is let go of, the copy's spill file goes too.
+    #[test]
+    fn g4_s5_readers_holding_old_copies_keep_what_they_took() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |since: Option<u64>| Update::Open { info: Box::new(Info { id: "old".into(), kind: "claude".into(), ..Info::default() }), since };
+            // Its events numbered `r`, but the seventh (put in late).
+            let events = |r: std::ops::RangeInclusive<u64>| Update::Events { events: r.filter(|q| *q != 7).map(|q| said_as("old", q, &format!("line {q}"))).collect() };
+            // A copy's chunk (`super::copies`): the square root of the most it keeps.
+            let chunk = u64::try_from((MAX_EVENTS + MAX_EVENTS / 4).isqrt())?;
+            let n = chunk * 7 + 9;
+            let mut held = Vec::new();
+            hub.harness.ingest(&hub, &there, "old", open(None)).await;
+            hub.harness.ingest(&hub, &there, "old", events(1..=n)).await;
+            hold_view(&hub, &mut held, "events were taken in").await?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while hub.harness.sessions.with("old", |v| v.events.chunks().iter().filter(|c| c.is_spilled()).count()).unwrap_or(0) == 0 {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "no chunk was ever spilled");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            hold_view(&hub, &mut held, "its older chunks were spilled").await?;
+            hub.harness.ingest(&hub, &there, "old", Update::Events { events: vec![said_as("old", 5, "said again")] }).await;
+            hold_view(&hub, &mut held, "an old event was said again").await?;
+            hub.harness.ingest(&hub, &there, "old", Update::Events { events: vec![said_as("old", 7, "late")] }).await;
+            hold_view(&hub, &mut held, "one was put in late").await?;
+            hub.harness.ingest(&hub, &there, "old", Update::Stream { id: format!("old-e{n}"), text: " and more".into() }).await;
+            hold_view(&hub, &mut held, "words were streamed into the newest").await?;
+            // Past the most a copy keeps, five hundred at a time: its oldest let go of.
+            let past = u64::try_from(MAX_EVENTS + MAX_EVENTS / 4)? + 1;
+            let mut from = n + 1;
+            while from <= past {
+                let to = (from + 499).min(past);
+                hub.harness.ingest(&hub, &there, "old", events(from..=to)).await;
+                from = to + 1;
+            }
+            let first = hub.harness.sessions.with("old", |v| v.events.meta(0).and_then(|m| m.seq)).flatten();
+            anyhow::ensure!(first.is_some_and(|q| q > 1), "its oldest weren't let go of: it begins at {first:?}");
+            hold_view(&hub, &mut held, "its oldest were let go of").await?;
+            hub.harness.ingest(&hub, &there, "old", open(Some(past - chunk))).await;
+            hold_view(&hub, &mut held, "its runner went on from before its newest").await?;
+            hub.harness.ingest(&hub, &there, "old", Update::Reset { from: None }).await;
+            hold_view(&hub, &mut held, "it was reset").await?;
+            hub.harness.ingest(&hub, &there, "old", Update::Closed).await;
+            anyhow::ensure!(hub.harness.sessions.view("old").is_none(), "the session never ended");
+            still_say(&held, "the session ended").await?;
+            // Every view let go of: the copy's spill file goes too.
+            drop(held);
+            let spill = hub.harness.dir.join("spill");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::fs::read_dir(&spill)?.count() > 0 {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the spill file outlived the session and its views");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
     }
 
     /* ------------------------------------------------- windows (docs/wire.md, "Windows") */

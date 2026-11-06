@@ -67,16 +67,6 @@ async fn seen(cx: &Cx, id: &str) -> Result<Info, Fail> {
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
     let (machine, harness, state, parent, run) = (s("machine"), s("harness"), s("state"), s("parent"), s("plan_run"));
-    // Whoever sees every session reads each info as its owner shares it, none copied (goal 9, plan 01a1a87b2cec step 5);
-    // anyone else, those `lineage::seen` lets them.
-    let (shared, seen);
-    let all: Vec<&Info> = if lineage::sees_all(&cx.caller) {
-        shared = cx.hub.harness.list_shared();
-        shared.iter().map(|i| &**i).collect()
-    } else {
-        seen = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await;
-        seen.iter().collect()
-    };
     let keep = |i: &Info| {
         // A card's helper (`super::about`) is the card's: no agent of these.
         i.helper.is_none()
@@ -85,26 +75,37 @@ async fn list(cx: Cx, v: Value) -> Out {
             && parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p))
             && run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r))
     };
+    // Whoever sees every session reads each info as its owner shares it, none copied (goal 9, plan 01a1a87b2cec step 5);
+    // anyone else, those `lineage::seen` lets them.
+    let infos: Vec<std::sync::Arc<Info>> = if lineage::sees_all(&cx.caller) {
+        cx.hub.harness.list_shared().into_iter().filter(|i| keep(i)).collect()
+    } else {
+        lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await.into_iter().filter(|i| keep(i)).map(std::sync::Arc::new).collect()
+    };
     let wanted = |b: &Value| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st));
-    let agents = briefs(all, keep, wanted, crate::rt::consume_budget).await;
-    Ok(json!({"agents": agents}))
+    let agents = briefs(infos, wait::brief, wanted).await;
+    // `{"agents": [...]}` with the briefs moved in: `json!` would serialize them into a new tree, a copy of every
+    // brief on the shard (goal 10, plan 01a1a87b2dae step 5).
+    let mut out = serde_json::Map::new();
+    out.insert("agents".into(), Value::Array(agents));
+    Ok(Value::Object(out))
 }
 
-/// The briefs (`wait::brief`) of the agents of `infos` that `keep` keeps and whose brief `wanted` wants, in their
-/// order, one a piece: after each, `turn`, the shard's (`crate::rt::consume_budget`: its turn given up once spent,
-/// while something else wants the shard). Goal 10, plan 01a1a87b2dae step 5: `agents_list` made them all in one
-/// poll, holding its shard 1.2 ms a call at the mean and 7 ms at the longest in g11alloc2's calm rounds, the longest
-/// of any request there, and every read on that shard waited behind it.
-async fn briefs<'a, F: std::future::Future<Output = ()>>(infos: impl IntoIterator<Item = &'a Info>, keep: impl Fn(&Info) -> bool, wanted: impl Fn(&Value) -> bool, mut turn: impl FnMut() -> F) -> Vec<Value> {
-    let mut out = Vec::new();
-    for i in infos.into_iter().filter(|i| keep(i)) {
-        let b = wait::brief(i);
-        if wanted(&b) {
-            out.push(b);
+/// The briefs `make` makes (`wait::brief`) of `infos` whose brief `wanted` wants, in their order, made on the compute
+/// pool (`crate::rt::compute_map`, an agent a unit, its thread given up between any two where another job waits) and
+/// handed back to the shard in one hop (goal 10, plan 01a1a87b2dae step 5). Made on the request's shard, `agents_list`
+/// held it 1.2 ms a call made at once (g11alloc2's calm rounds), and 0.31 ms a poll at the mean made a brief at a
+/// time with its turn taken after each (rt9's): a turn taken after a brief ends past the quantum where the brief
+/// does. Where the pool can't take them, they're made here.
+async fn briefs(infos: Vec<std::sync::Arc<Info>>, make: fn(&Info) -> Value, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let made = match crate::rt::compute_map(infos.clone(), move |i: std::sync::Arc<Info>| make(&i)).await {
+        Ok(made) => made,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "the agents' briefs weren't made off the shard: made here");
+            infos.iter().map(|i| make(i)).collect()
         }
-        turn().await;
-    }
-    out
+    };
+    made.into_iter().filter(|b| wanted(b)).collect()
 }
 
 /// What a state says that `agents.get` leaves out: catalogs and lists only a console needs.
@@ -1141,35 +1142,38 @@ pub mod input {
 mod tests {
     use super::*;
 
-    /// Goal 10, plan 01a1a87b2dae step 5: `agents.list` makes each agent's brief a piece of its own, the shard's turn
-    /// taken after each one made, so a long list gives its shard up between agents as a long computation does; the
-    /// agents it gives, their order and its filters are as they were.
+    /// Goal 10, plan 01a1a87b2dae step 5: `agents.list` makes its agents' briefs on the compute pool, none on the shard
+    /// that asks for them, and has them back in one hop: each made once, the agents it gives, their order and its
+    /// filter on what each brief says as they were made at once.
     #[test]
-    fn g10_s5_agents_list_takes_its_shards_turn_between_agents() {
+    fn g10_s5_agents_list_makes_its_briefs_off_the_shard() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static ON_SHARD: AtomicUsize = AtomicUsize::new(0);
+        fn counted(i: &Info) -> Value {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            if crate::rt::on_shard() {
+                ON_SHARD.fetch_add(1, Ordering::Relaxed);
+            }
+            wait::brief(i)
+        }
         let info = |n: usize| Info { id: format!("a{n}"), kind: if n.is_multiple_of(2) { "claude" } else { "codex" }.into(), ..Info::default() };
-        let infos: Vec<Info> = (0..5).map(info).chain(std::iter::once(Info { helper: Some("a card's".into()), ..info(6) })).collect();
-        let at_once = |keep: &dyn Fn(&Info) -> bool, wanted: &dyn Fn(&Value) -> bool| infos.iter().filter(|i| keep(i)).map(wait::brief).filter(|b| wanted(b)).collect::<Vec<Value>>();
-        let turns = std::cell::Cell::new(0usize);
-        let turn = || {
-            turns.set(turns.get() + 1);
-            std::future::ready(())
-        };
-        // As `list` keeps them: every agent but a card's helper.
-        let keep = |i: &Info| i.helper.is_none();
-        let all = |_: &Value| true;
-        let made = futures::FutureExt::now_or_never(briefs(&infos, keep, all, turn));
-        assert_eq!(made, Some(at_once(&keep, &all)), "the same briefs, in order");
-        assert_eq!(turns.get(), 5, "a turn after each agent's brief");
-        // A filter on what it is, and one on its brief: a turn for each brief made, whether wanted or not.
-        turns.set(0);
-        let claude = |i: &Info| i.helper.is_none() && i.kind == "claude";
-        let none = |_: &Value| false;
-        assert_eq!(futures::FutureExt::now_or_never(briefs(&infos, claude, none, turn)), Some(Vec::new()));
-        assert_eq!(turns.get(), 3, "three claude agents' briefs made");
-        turns.set(0);
-        let made = futures::FutureExt::now_or_never(briefs(&infos, claude, all, turn));
-        assert_eq!(made, Some(at_once(&claude, &all)));
-        assert_eq!(made.map(|m| m.len()), Some(3));
+        let infos: Vec<Arc<Info>> = (0..5).map(|n| Arc::new(info(n))).collect();
+        let at_once: Vec<Value> = infos.iter().map(|i| wait::brief(i)).collect();
+        let claude: Vec<Value> = at_once.iter().filter(|b| b.get("kind") == Some(&json!("claude"))).cloned().collect();
+        let (all, some, none) = crate::rt::block_on(async move {
+            let all = briefs(infos.clone(), counted, |_: &Value| true).await;
+            let some = briefs(infos.clone(), counted, |b: &Value| b.get("kind") == Some(&json!("claude"))).await;
+            let none = briefs(infos, counted, |_: &Value| false).await;
+            Ok((all, some, none))
+        })?;
+        assert_eq!(all, at_once, "the same briefs, in order");
+        assert_eq!((some.len(), some), (3, claude), "those its filter wants, in order");
+        assert!(none.is_empty(), "none wanted");
+        assert_eq!(MADE.load(Ordering::Relaxed), 15, "each agent's brief made once a call");
+        assert_eq!(ON_SHARD.load(Ordering::Relaxed), 0, "none made on a shard");
+        Ok(())
     }
 
     #[test]

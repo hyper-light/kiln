@@ -173,38 +173,58 @@ pub struct Arm {
     pub var: &'static str,
     /// Its value.
     pub value: &'static str,
-    /// The part of `kiln_memory_allocator_bytes{kind}` it moves, which caps what a candidate saves: one whose part
-    /// held under 2 MB in A's rounds is skipped.
+    /// The part of `kiln_memory_allocator_bytes{kind}` it moves (the lab's `server.allocator.<kind>_mb`), which caps
+    /// what it can save: an arm whose part A's rounds held at less than the noise of the lab's anonymous memory is
+    /// skipped, as no value of it could move that memory beyond noise.
     pub moves: &'static str,
     /// A candidate for the settings compiled in, once it holds every latency number calm and with hogs; else a
     /// reading of a floor and its cost, which says why kiln's setting stands.
     pub candidate: bool,
 }
 
-/// The arms, in the order the lab runs them: the candidates by what they can save, then the readings. Each value is
-/// derived (the tests hold each one to its derivation):
+/// The muzzy decay TUNING.md pairs with the dirty decay kiln keeps (goal 11, plan 01a1a87b2e56 step 5): both of its
+/// examples that set the two set them alike, its memory-first one ("High resource consumption application,
+/// prioritizing memory usage") to 5 s each, its CPU-first one to 30 s each. Step 4 took the memory-first dirty decay
+/// ([`DIRTY_DECAY_MS`]) and its muzzy decay at 0 ([`MUZZY_DECAY_MS`]): the `lazy-free` arm reads what that 0 keeps out
+/// of resident memory, and what it costs in pages faulted in anew.
+pub const PAIRED_MUZZY_DECAY_MS: u32 = DIRTY_DECAY_MS;
+
+/// The arena count midway between jemalloc's floor (one, every thread in it) and [`NARENAS`] (goal 11, plan
+/// 01a1a87b2e56 step 5): the `bisect-arenas` arm's, the next count where `one-arena` saves past the lab's noise but
+/// a latency number is worse beyond it. jemalloc gives a thread the arena with the fewest threads as it first
+/// allocates (`arena_choose_hard`), so an arena's threads are the process's in turn, the shards among them.
+pub const BISECT_NARENAS: u32 = (1 + NARENAS) / 2;
+
+/// The arms: the candidates by what they can save, then the readings; docs/runtime-lab.md's plan ("The A/B of
+/// jemalloc's settings: the lab plan") runs them in its order, three of them only on an earlier arm's result. Each
+/// value is derived (the tests hold each one to its derivation), and each changes one of step 4's settings
+/// ([`JEMALLOC_CONF`]), or `tcache_max`, which step 4 left at jemalloc's default:
 /// - `subsecond-decay`: [`SUBSECOND_DECAY_MS`].
 /// - `pool-subsecond-decay`: the same decay for the blocking pool's arena alone ([`POOL_DECAY_VAR`]), in its place
 ///   where it's worse beyond noise: the shards' arenas keep [`DIRTY_DECAY_MS`].
 /// - `slab-caches`: `tcache_max` at [`small_maxclass`] of [`LG_PAGE`]: threads' caches keep slab regions alone.
 /// - `page-caches`: `tcache_max` at a page, TUNING.md's memory-first pick: after `slab-caches`, where `thread_caches`
-///   still holds 2 MB or more.
+///   still holds more than the lab's noise.
+/// - `bisect-arenas`: `narenas` at [`BISECT_NARENAS`]: after `one-arena`, where it saved more than the lab's noise
+///   and a latency number was worse beyond it.
 /// - `one-arena` (a reading): `narenas` at 1, every thread in one arena: what [`NARENAS`]' arenas cost in room left
 ///   in slabs (`active` less `allocated`) and in dirty pages kept apart, against the shards' waits on one another.
 /// - `no-decay` (a reading): every free purged at once, on the thread that frees: the floor of `dirty`, and its cost.
 /// - `inline-purge` (a reading): no background threads: what they purge that the arenas' own ticks don't, and what
 ///   purging costs the threads that free ([`BACKGROUND_THREAD`]'s basis).
-///
-/// `muzzy_decay_ms` has none: at 0 ([`MUZZY_DECAY_MS`]) by what resident memory counts, which a page given back
-/// lazily stays in.
-pub const ARMS: [Arm; 7] = [
+/// - `lazy-free` (a reading): `muzzy_decay_ms` at [`PAIRED_MUZZY_DECAY_MS`]: what the dirty decay purges goes with
+///   `MADV_FREE`, and stays resident as `muzzy` until it decays or the kernel takes it ([`MUZZY_DECAY_MS`]'s basis).
+///   Never a candidate in the lab, whose machine has memory to spare: resident memory can only rise.
+pub const ARMS: [Arm; 9] = [
     Arm { name: "subsecond-decay", var: CONF_VAR, value: "dirty_decay_ms:500", moves: "dirty", candidate: true },
     Arm { name: "pool-subsecond-decay", var: POOL_DECAY_VAR, value: "500", moves: "dirty", candidate: true },
     Arm { name: "slab-caches", var: CONF_VAR, value: "tcache_max:14336", moves: "thread_caches", candidate: true },
     Arm { name: "page-caches", var: CONF_VAR, value: "tcache_max:4096", moves: "thread_caches", candidate: true },
+    Arm { name: "bisect-arenas", var: CONF_VAR, value: "narenas:3", moves: "active - allocated", candidate: true },
     Arm { name: "one-arena", var: CONF_VAR, value: "narenas:1", moves: "active - allocated", candidate: false },
     Arm { name: "no-decay", var: CONF_VAR, value: "dirty_decay_ms:0", moves: "dirty", candidate: false },
     Arm { name: "inline-purge", var: CONF_VAR, value: "background_thread:false", moves: "dirty", candidate: false },
+    Arm { name: "lazy-free", var: CONF_VAR, value: "muzzy_decay_ms:5000", moves: "muzzy", candidate: false },
 ];
 
 /// jemalloc's background threads' least sleep (`BACKGROUND_THREAD_MIN_INTERVAL_NS`, src/background_thread.c): they
@@ -1301,14 +1321,23 @@ mod tests {
         assert_eq!(small_maxclass(12), Some(14_336), "4 KiB pages");
         assert_eq!(small_maxclass(16), Some(229_376), "64 KiB pages: arm64 Linux's jemalloc");
         assert_eq!(small_maxclass(u32::MAX), None);
+        // The bisection lies strictly between the floor and step 4's count; the paired muzzy decay is the dirty decay
+        // kiln keeps, past step 4's 0.
+        let (bisect, paired) = std::hint::black_box((BISECT_NARENAS, PAIRED_MUZZY_DECAY_MS));
+        assert_eq!(bisect, (1 + NARENAS) / 2);
+        assert!(1 < bisect && bisect < NARENAS, "{bisect} between 1 and {NARENAS}");
+        assert_eq!(paired, DIRTY_DECAY_MS);
+        assert!(paired > MUZZY_DECAY_MS, "the reading changes step 4's {MUZZY_DECAY_MS}");
         let want = [
             ("subsecond-decay", CONF_VAR, format!("dirty_decay_ms:{SUBSECOND_DECAY_MS}")),
             ("pool-subsecond-decay", POOL_DECAY_VAR, SUBSECOND_DECAY_MS.to_string()),
             ("slab-caches", CONF_VAR, format!("tcache_max:{}", small_maxclass(LG_PAGE).unwrap_or(0))),
             ("page-caches", CONF_VAR, format!("tcache_max:{}", 1_u64 << LG_PAGE)),
+            ("bisect-arenas", CONF_VAR, format!("narenas:{BISECT_NARENAS}")),
             ("one-arena", CONF_VAR, "narenas:1".to_owned()),
             ("no-decay", CONF_VAR, "dirty_decay_ms:0".to_owned()),
             ("inline-purge", CONF_VAR, "background_thread:false".to_owned()),
+            ("lazy-free", CONF_VAR, format!("muzzy_decay_ms:{PAIRED_MUZZY_DECAY_MS}")),
         ];
         assert_eq!(ARMS.len(), want.len());
         for (name, var, value) in &want {
@@ -1374,8 +1403,9 @@ mod tests {
     }
 
     /// Each arm given as jemalloc's settings reaches jemalloc, which takes its value over kiln's or its own default,
-    /// with kiln's other settings as they're compiled in; a decay's arm moves the pools' cold-after with it (goal 11, plan
-    /// 01a1a87b2e56 step 5). jemalloc reads its settings once, as it starts, so each runs in a process of its own.
+    /// with kiln's other settings as they're compiled in; a dirty decay's arm moves the pools' cold-after with it, and
+    /// the muzzy decay's leaves it (goal 11, plan 01a1a87b2e56 step 5). jemalloc reads its settings once, as it starts,
+    /// so each runs in a process of its own.
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     #[test]
     fn g11_s5_each_arm_reaches_jemalloc() -> anyhow::Result<()> {
@@ -1392,6 +1422,7 @@ mod tests {
         let (setting, value) = a.value.split_once(':').ok_or_else(|| anyhow::anyhow!("{}", a.name))?;
         let took = match setting {
             "dirty_decay_ms" => jemalloc_opt(c"opt.dirty_decay_ms", 0_isize).map(|v| v.to_string()),
+            "muzzy_decay_ms" => jemalloc_opt(c"opt.muzzy_decay_ms", 0_isize).map(|v| v.to_string()),
             "tcache_max" => jemalloc_opt(c"opt.tcache_max", 0_usize).map(|v| v.to_string()),
             "narenas" => jemalloc_opt(c"opt.narenas", 0_u32).map(|v| v.to_string()),
             "background_thread" => jemalloc_opt(c"opt.background_thread", true).map(|v| v.to_string()),
@@ -1400,9 +1431,12 @@ mod tests {
         anyhow::ensure!(took.as_deref() == Some(value), "{}: jemalloc took {setting} {took:?}", a.name);
         let said = said();
         anyhow::ensure!(said.contains(&format!("then {CONF_VAR}'s {})", a.value)) || said.contains("past kiln's settings"), "{said}");
+        let cold = cold_after(decay_took());
         if setting == "dirty_decay_ms" {
             let ms = value.parse::<u64>()?;
-            anyhow::ensure!(cold_after(decay_took()) == std::time::Duration::from_millis(ms).max(PURGE_EVERY), "{}", a.name);
+            anyhow::ensure!(cold == std::time::Duration::from_millis(ms).max(PURGE_EVERY), "{}", a.name);
+        } else {
+            anyhow::ensure!(cold == COLD_AFTER, "{}: the pools' workers go cold after the compiled decay, {cold:?}", a.name);
         }
         Ok(())
     }

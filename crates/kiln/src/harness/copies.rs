@@ -372,16 +372,21 @@ pub struct Chunk {
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
     /// packed chunk (`crate::memory::SESSION_ENTRIES`).
     ///
-    /// Its cell is made by the first read that keeps them, and a chunk no read paged has none (goal 9, plan
-    /// 01a1a87b2cec step 5): arc-swap pays every thread's debt slots, a locked compare-and-swap each, whenever
-    /// one of its cells is swapped or let go of, an empty one too (`Debt::pay_all`, no fast path for nothing
-    /// held). Every chunk dropped did that three times (its unpack's swap, its drop's, the cell's own), and
-    /// every event taken in at a copy's newest chunk drops one (the copy of it the view shared): rt7's calm
-    /// profile had it at 0.08% of the process, 0.5% of the shards' time, beside the copy's view's own store.
+    /// Its cell is made by the first read that keeps them, or the compaction that makes them for a copy being
+    /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap
+    /// pays every thread's debt slots, a locked compare-and-swap each, whenever one of its cells is swapped or
+    /// let go of, an empty one too (`Debt::pay_all`, no fast path for nothing held). Every chunk dropped did
+    /// that three times (its unpack's swap, its drop's, the cell's own), and every event taken in at a copy's
+    /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
+    /// process, 0.5% of the shards' time, beside the copy's view's own store.
     texts: OnceLock<ArcSwapOption<Bytes>>,
     /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
     /// alone, as chunks are compacted ([`Events::compact`]).
     paged: AtomicBool,
+    /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
+    /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
+    /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
+    page_read: AtomicBool,
 }
 
 impl Clone for Chunk {
@@ -396,7 +401,7 @@ impl Clone for Chunk {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
         let spilled = self.spilled.clone().filter(|_| self.is_compact());
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false) }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 }
 
@@ -418,7 +423,7 @@ impl Chunk {
                 m
             })
             .collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false) }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 
     pub fn len(&self) -> usize {
@@ -494,23 +499,53 @@ impl Chunk {
         }
         let made = Bytes::from(self.joined()?.into_owned());
         if self.is_compact() && self.paged.load(Ordering::SeqCst) {
-            let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
-            if was.is_none() {
-                crate::memory::SESSION_ENTRIES.add(made.len());
-                // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
-                // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
-                // with Acquire alone, where the swaps of a cell always there were all SeqCst).
-                std::sync::atomic::fence(Ordering::SeqCst);
-                if !self.paged.load(Ordering::SeqCst) {
-                    self.unpage();
-                }
-            }
+            self.keep_texts(&made);
         }
         Ok(made)
     }
 
+    /// `made`, its texts, kept for the reads of its copy's newest page unless it keeps some already (the first kept
+    /// stays), its cell made if it's the first to.
+    fn keep_texts(&self, made: &Bytes) {
+        let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
+        if was.is_none() {
+            crate::memory::SESSION_ENTRIES.add(made.len());
+            // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
+            // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
+            // with Acquire alone, where the swaps of a cell always there were all SeqCst).
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !self.paged.load(Ordering::SeqCst) {
+                self.unpage();
+            }
+        }
+    }
+
+    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), if any: what a read on a shard takes
+    /// without inflating anything (goal 10, plan 01a1a87b2dae step 5).
+    fn page_texts_kept(&self) -> Option<Bytes> {
+        self.texts.get().and_then(ArcSwapOption::load_full).map(|kept| Bytes::clone(&kept))
+    }
+
+    /// Its texts as a read of its copy's newest page keeps them ([`Chunk::page_texts`]), made now of `was`'s events
+    /// (itself before it was compacted, its events still in memory: their texts copied, nothing inflated), where it's
+    /// its copy's newest compact chunk and keeps none yet (goal 10, plan 01a1a87b2dae step 5). Its owner asks for it
+    /// where its copy's newest page was read since the last compaction ([`Events::compact`]), so the read after this
+    /// one finds them made: the first read after each compaction inflated the chunk's whole segment, a few hundred
+    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell.
+    fn warm(&self, was: &Chunk) {
+        if !self.is_compact() || was.is_compact() || !self.paged.load(Ordering::SeqCst) || self.page_kept().is_some() {
+            return;
+        }
+        let Ok(joined) = was.joined() else { return };
+        let made = Bytes::from(joined.into_owned());
+        // Where its metas say its texts end: else they aren't this chunk's (one changed since it was packed).
+        if self.meta.last().map_or(0, |m| m.off + m.len) == made.len() {
+            self.keep_texts(&made);
+        }
+    }
+
     /// Lets go of the texts a page's read kept ([`Chunk::page_texts`]); with no cell made for them, nothing to
-    /// swap. Its caller unset `paged` first, or found it unset: the fence pairs with `page_texts`' own.
+    /// swap. Its caller unset `paged` first, or found it unset: the fence pairs with `keep_texts`' own.
     fn unpage(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         if let Some(kept) = self.texts.get().and_then(|cell| cell.swap(None)) {
@@ -534,7 +569,7 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false) })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
     }
 
     /// Whether its segment is on disk (`super::spill`), not in memory.
@@ -550,7 +585,7 @@ impl Chunk {
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
     /// memory (one changed since is kept as it is).
     fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
-        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false) })
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -656,6 +691,17 @@ impl Chunk {
         self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
         self.evs.push(ev);
     }
+}
+
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
+    Cannot,
+    /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
+    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
+    Unkept,
 }
 
 /// A copy's events in order, in chunks ([`Chunk`]) of [`CHUNK`]: the first may hold fewer, once its
@@ -865,29 +911,40 @@ impl Events {
     /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
     /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
     /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. None as `texts_into` says none.
-    pub fn pieces_into(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>) -> Option<()> {
+    /// events' texts written out once. [`Unread::Cannot`] where `texts_into` says none.
+    ///
+    /// A compact chunk's segment is inflated only where `inflate` says so (step 5): a read on a shard takes the
+    /// texts its copy's reads kept, and has the others made off the shard ([`Unread::Unkept`]). An inflate is a
+    /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
+    /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
+    /// 3.6 ms on the CPU, past the shards' quantum.
+    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
         let mut i = range.start;
         while i < range.end {
-            let (c, k) = self.place(i)?;
-            let chunk = self.chunk(c)?;
-            let n = chunk.len().checked_sub(k)?.min(range.end - i);
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
+            let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
             if n == 0 || chunk.is_spilled() {
-                return None;
+                return Err(Unread::Cannot);
             }
             if i > range.start {
                 out.push(Bytes::from_static(b","));
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
-                let (from, to) = (first.off, last.off.checked_add(last.len)?);
-                let texts = chunk.page_texts().ok()?;
+                let (first, last) = (chunk.meta.get(k).ok_or(Unread::Cannot)?, chunk.meta.get(k + n - 1).ok_or(Unread::Cannot)?);
+                let (from, to) = (first.off, last.off.checked_add(last.len).ok_or(Unread::Cannot)?);
+                let texts = match chunk.page_texts_kept() {
+                    Some(kept) => kept,
+                    None if inflate => chunk.page_texts().map_err(|_| Unread::Cannot)?,
+                    None => return Err(Unread::Unkept),
+                };
                 if from > to || to > texts.len() {
-                    return None;
+                    return Err(Unread::Cannot);
                 }
+                chunk.page_read.store(true, Ordering::Relaxed);
                 out.push(texts.slice(from..to));
             } else {
-                let evs = chunk.evs.get(k..k + n)?;
+                let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
                 let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
@@ -899,7 +956,7 @@ impl Events {
             }
             i += n;
         }
-        Some(())
+        Ok(())
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -1160,15 +1217,26 @@ impl Events {
         if ready.is_empty() {
             return;
         }
+        // Whether a read of its newest page took the texts of its newest compact chunk until now: then the one this
+        // makes its newest compact chunk has its texts made now, of its events as they were (`Chunk::warm`).
+        let read = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).is_some_and(|c| c.page_read.load(Ordering::Relaxed));
         let chunks = Arc::make_mut(&mut self.older);
+        // The newest of those compacted here (they're in order), as it was.
+        let mut newest: Option<(usize, Arc<Chunk>)> = None;
         for i in ready {
             if let Some(slot) = chunks.get_mut(i)
                 && let Some(c) = slot.compacted()
             {
-                *slot = Arc::new(c);
+                newest = Some((i, std::mem::replace(slot, Arc::new(c))));
             }
         }
         self.page_newest();
+        if read
+            && let Some((i, was)) = newest
+            && let Some(now) = self.older.get(i)
+        {
+            now.warm(&was);
+        }
         self.took_out = true;
     }
 
@@ -1627,24 +1695,37 @@ impl View {
     /// 10, plan 01a1a87b2dae step 5: the lab's events reads, at p99 1.1 to 2.0 ms on rt5 calm, inflated a
     /// whole chunk's segment each, on the request's shard).
     pub fn events_page(&self, before: Option<u64>, limit: usize) -> Option<Vec<Bytes>> {
+        self.events_page_with(before, limit, true).ok()
+    }
+
+    /// [`View::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
+    /// (goal 10, plan 01a1a87b2dae step 5). [`Unread::Unkept`]: a compact chunk's texts the page needs aren't kept,
+    /// and [`View::events_page`] makes them, off the shard (the reads after take them as kept); [`Unread::Cannot`]
+    /// where `events_page` says none.
+    pub fn events_page_kept(&self, before: Option<u64>, limit: usize) -> Result<Vec<Bytes>, Unread> {
+        self.events_page_with(before, limit, false)
+    }
+
+    /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
+    fn events_page_with(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
             Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
             None => self.events.len(),
         };
         let start = end.saturating_sub(limit);
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
-            return None;
+            return Err(Unread::Cannot);
         }
         for i in start..end {
-            let m = self.events.meta(i)?;
+            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
             if m.seq.is_none() || m.id().is_empty() {
-                return None;
+                return Err(Unread::Cannot);
             }
         }
         let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_into(start..end, &mut parts)?;
+        self.events.pieces_with(start..end, &mut parts, inflate)?;
         parts.push(Bytes::from_static(b"]}"));
-        Some(parts)
+        Ok(parts)
     }
 }
 
@@ -1983,6 +2064,23 @@ impl Mirror {
         } else {
             self.slot.view.store(view);
         }
+    }
+
+    /// Whether it changed since its view last went out ([`Mirror::publish`]): its revision, or anything its view shares of
+    /// it, isn't its view's (a change copies what a view shares before it changes it).
+    fn unpublished(&self) -> bool {
+        let v = self.slot.view.load();
+        let changes = match (&self.changes, &v.changes) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        self.rev != v.rev
+            || !changes
+            || !self.events.same_as(&v.events)
+            || !Arc::ptr_eq(&self.info, &v.info)
+            || !Arc::ptr_eq(&self.location, &v.location)
+            || !Arc::ptr_eq(&self.meta, &v.meta)
+            || !Arc::ptr_eq(&self.state, &v.state)
     }
 
     /// Its info as it was last published, encoded ([`View::info_json`]): what the events socket's frame
@@ -2760,9 +2858,21 @@ impl Shard {
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
             tracing::error!(shard = self.me, panic = %crate::sup::panic_message(p.as_ref()), "a change to an agent session's copy panicked: its shard goes on");
+            self.resync_unpublished();
         }
         self.publish_board();
         rest
+    }
+
+    /// Each copy changed since its view last went out, as a change a panic cut short leaves it ([`Shard::take`]): out as
+    /// it is, its viewers sent back to a snapshot of it (the feed's resync marker), a change half made going to no one as
+    /// a frame. Its readers had it only with its next change, and its viewers never had what the cut change made (goal 4,
+    /// plan 01a1a59c2a9c step 5: `g4_s5_an_owner_goes_on_after_a_change_that_panicked_and_its_viewers_with_it`).
+    fn resync_unpublished(&mut self) {
+        for m in self.mirrors.values_mut().filter(|m| m.unpublished()) {
+            m.started_over();
+            m.commit(|_| Some(payload_of(super::live::RESYNC, 0)));
+        }
     }
 }
 
@@ -3949,6 +4059,101 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a page read on a shard (`View::events_page_kept`) inflates nothing. One
+    /// that needs a compact chunk's texts not kept yet says so (`Unread::Unkept`), and the read that makes them (off
+    /// the shard: `View::events_page`) keeps the newest compact chunk's, so the shard's read after it answers the same
+    /// bytes from them; a page of the open chunk alone needs none; one that reaches an older compact chunk, whose
+    /// texts no read keeps, says so each time; and one the copy can't say is `Unread::Cannot`, as before.
+    #[test]
+    fn g10_s5_a_page_read_on_a_shard_inflates_nothing() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Two sealed chunks, compact, and the newest open with nine: the newest fifty reach into the second.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = |limit: usize| format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(limit)..).unwrap_or_default().join(","));
+        let view = m.view();
+        let was = inflated();
+        anyhow::ensure!(view.events_page_kept(None, 50) == Err(Unread::Unkept), "its compact chunk's texts aren't kept yet");
+        anyhow::ensure!(view.events_page_kept(None, 9).map(|p| p.concat()) == Ok(page(9).into_bytes()), "the open chunk's alone: nothing to inflate");
+        anyhow::ensure!(inflated() == was, "the shard's reads inflated nothing");
+        // Made off the shard: inflated once, the newest compact chunk's texts kept.
+        let made = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page made"))?;
+        anyhow::ensure!(inflated() == was + 1, "made once");
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the kept page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was + 1, "the shard's read after it inflates nothing");
+        anyhow::ensure!(kept.concat() == made.concat() && made.concat() == page(50).into_bytes(), "the same bytes, the events' texts joined");
+        // Past the open chunk and the newest compact one, into the older: kept by no read, so made off the shard each time.
+        let long = CHUNK + 9 + 5;
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 2, "still not kept: an older chunk's never are");
+        // An event with no number: the copy can't say the page (the store answers it), kept or not.
+        m.rev = n + 1;
+        m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
+        m.publish();
+        anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Cannot), "the store's to answer");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a copy whose newest page was read since its last compaction has the texts of
+    /// the chunk its next compaction makes the newest compact one made then, of its events in memory (nothing
+    /// inflated), so the read after that compaction inflates nothing anywhere and says the same bytes; one not read
+    /// since keeps nothing more.
+    #[test]
+    fn g10_s5_a_read_copys_next_compact_chunk_is_warmed() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let push = |m: &mut Mirror, seqs: std::ops::RangeInclusive<u64>| -> anyhow::Result<()> {
+            for q in seqs {
+                m.rev = q;
+                m.upsert(entry(&format!("e{q}"), q));
+            }
+            for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            m.events.compact(None);
+            m.publish();
+            Ok(())
+        };
+        let page = |m: &Mirror| -> String {
+            let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+            format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","))
+        };
+        let kept = |m: &Mirror, i: usize| m.view().events.chunks().get(i).and_then(|c| c.page_kept());
+        let chunk = u64::try_from(CHUNK)?;
+        // Two sealed chunks, compact, the newest open with nine; its newest page read (made off the shard).
+        let mut n = 2 * chunk + 9;
+        push(&mut m, 1..=n)?;
+        anyhow::ensure!(m.view().events_page(None, 50).is_some(), "the newest page read");
+        // A chunk more compacted: the copy's page was read, so the new newest compact chunk's texts are made now.
+        push(&mut m, n + 1..=n + chunk)?;
+        n += chunk;
+        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_none(), "the newest compact chunk's texts made, the older's let go of");
+        // Another, with no read since: nothing made.
+        push(&mut m, n + 1..=n + chunk)?;
+        n += chunk;
+        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 2).is_none(), "no read since: nothing kept");
+        anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Unkept), "a read on a shard has them made off it");
+        anyhow::ensure!(m.view().events_page(None, 50).is_some(), "made, and read");
+        // Read since: the next compaction makes its texts, and the read after it inflates nothing.
+        push(&mut m, n + 1..=n + chunk)?;
+        let was = inflated();
+        let read = m.view().events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the warmed page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was, "nothing inflated: made of its events at the compaction");
+        anyhow::ensure!(read.concat() == page(&m).into_bytes(), "the same bytes as its events' texts joined");
+        Ok(())
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: a chunk has no cell for its texts until a read of its copy's newest page keeps
     /// them, so a chunk let go of without one pays arc-swap nothing (it pays every thread's debt slots as any of its
     /// cells is swapped or goes, an empty one too). None after events, sealing, packing and compacting; none in the
@@ -4343,6 +4548,7 @@ mod tests {
     /// gets the view from before at once; once the owner goes on, its readers take the new one.
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8 * MSG));
             let (bus, id) = (sim_bus(), "s1".to_owned());
@@ -4389,6 +4595,7 @@ mod tests {
     /// the order its sender sent them.
     #[test]
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count().max(1);
             let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2 * MSG));
@@ -5079,12 +5286,14 @@ mod tests {
     /// quantum or less at the median by its own clock (on the CPU where its shard's thread says, the host's time left out;
     /// the update whole took a poll of tens of milliseconds), and a job sent behind the update finds every one of its events
     /// in the copy, in order, none lost. The other task's runs aren't timed: the unit tests share the runtime's two shards,
-    /// and those that keep every shard busy on purpose (`updates_keep_their_order_and_none_is_lost_on_busy_shards`, its
-    /// runners' twin, `changes_keep_their_order_and_none_is_lost_when_shards_are_busy`) run their tasks between the owner's
-    /// turns too: run beside them, its runs were 1.29 ms apart at the median (11-06), alone within four quanta.
+    /// and the tests that keep every shard busy on purpose ran their tasks between the owner's turns too (its runs 1.29 ms
+    /// apart at the median beside them, 11-06), which goal 4's guard (`crate::hub::tests::shards_timed`) keeps apart from
+    /// this one besides.
     #[test]
     fn g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
+        // It times its own tasks' turns: no test that keeps the shards busy beside it (goal 4, plan 01a1a59c2a9c step 5).
+        let _alone = crate::hub::tests::shards_timed();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
@@ -5188,6 +5397,220 @@ mod tests {
             anyhow::ensure!(off == was + 1, "written off its owner's shard once: {was} then {off}");
             anyhow::ensure!(seqs == (1..=11).collect::<Vec<u64>>(), "in order, none lost: {seqs:?}");
             anyhow::ensure!(len.is_some_and(|l| l > large.len()) && at == Some(9) && after == Some(10), "taken as written, in its place: {len:?} {at:?} {after:?}");
+            Ok(())
+        })
+    }
+
+    /// Session `id`'s copy, made by its owner.
+    async fn opened(copies: &Copies, id: &str) {
+        let (i, info) = (id.to_owned(), Info { id: id.to_owned(), kind: "claude".into(), ..Info::default() });
+        copies.on(id, move |s| s.insert(i, Mirror::new(info, Location::Local, sim_bus()))).await;
+    }
+
+    /// Change `n` of session `id`'s copy, as its owner takes one: its revision first, then its event `n` (named for the
+    /// session, so a change taken by another copy shows), then out to its readers.
+    fn change(id: &str, n: u64) -> Msg {
+        let id = id.to_owned();
+        Msg::Run(Box::new(move |s: &mut Shard| {
+            if let Some(m) = s.get_mut(&id) {
+                m.rev += 1;
+                m.upsert(Arc::new(Entry::new(json!({"id": format!("{id}-{n}"), "seq": n}))));
+                m.commit(|_| None);
+            }
+        }))
+    }
+
+    /// Whether session `id`'s copy, as its readers find it, took changes 1 to `to` (and none of another's), once each and
+    /// in order: what it holds when it didn't.
+    fn took_in_order(copies: &Copies, id: &str, to: u64) -> Result<(), String> {
+        let (events, rev) = copies.with(id, |v| (v.events.metas().map(|m| (m.id().to_owned(), m.seq)).collect::<Vec<_>>(), v.rev)).unwrap_or_default();
+        let want: Vec<(String, Option<u64>)> = (1..=to).map(|n| (format!("{id}-{n}"), Some(n))).collect();
+        if events == want && rev == to {
+            return Ok(());
+        }
+        Err(format!("{id}: revision {rev}, {} events of {to}, the first out of place {:?}", events.len(), events.iter().zip(&want).find(|(a, b)| a != b)))
+    }
+
+    /// A shard's hold ([`hold`]): let go of as it's dropped, however its test ends.
+    struct Held {
+        holding: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        /// Whether the hold is still on.
+        fn on(&self) -> bool {
+            self.holding.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Shard `held` held by one poll that doesn't end until it's let go (its [`Held`] dropped), or half a minute on at the
+    /// latest: spinning on the shard's thread, or asleep in a call (`blocked`). Back once it's begun.
+    async fn hold(held: usize, blocked: bool) -> anyhow::Result<Held> {
+        let (holding, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let poll = {
+            let (holding, release) = (Arc::clone(&holding), Arc::clone(&release));
+            async move {
+                holding.store(true, Ordering::SeqCst);
+                let cap = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
+                    if blocked {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                holding.store(false, Ordering::SeqCst);
+            }
+        };
+        anyhow::ensure!(crate::rt::spawn_on(held, poll), "shard {held} refused the hold");
+        let hold = Held { holding, release };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !hold.on() {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "the hold never began");
+            crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        Ok(hold)
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a shard held by one long poll, or blocked in a call, holds up its own owner's
+    /// sessions and no other's. While it's held, the owner on this test's shard takes every change sent to its sessions,
+    /// each session's in order; the held owner's sessions take none, and their readers still read their views (a read that
+    /// waited on the held owner would have kept the hold on to its end). Sent by a sender a session, every inbox holding
+    /// about four changes, the held owner's senders wait for room, nothing dropped. Handed over by one loop, as the hub's
+    /// loop hands over every runner's update, every inbox with room for them all (as an owner's holds a window of runners'
+    /// messages, `crate::net::EVENTS_BYTES`), the loop goes on past the held owner (past that room it would wait for it,
+    /// and every session's changes behind it: the bound is the room). Let go, the held owner takes every change it was
+    /// sent, each session's in the order sent. With one lock over every copy, as there was, a holder held so held up every
+    /// session (the plan's f4, f5). The one test of the process that holds a shard until it's done with it: two such at
+    /// once could each hold the other's.
+    #[test]
+    fn g4_s5_a_held_shard_holds_up_its_own_sessions_and_no_others() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let shards = crate::rt::shard_count();
+            anyhow::ensure!(shards >= 2, "{shards} shards: none to hold beside this test's");
+            // This test's task goes on on the shard it began on (a task stays where it's taken in); the next is held.
+            let here = hyper_rt::futures::shard_id().and_then(|id| crate::rt::shard_holders().iter().position(|h| h.shard() == id.0)).ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let held = (here + 1) % shards;
+            let of = |k: usize| (0u32..).map(|n| format!("h{n}")).filter(|id| owner_of(id, shards) == k).take(6).collect::<Vec<_>>();
+            let (theirs, ours) = (of(held), of(here));
+            let per = 60u64;
+            for (blocked, one_loop) in [(false, false), (true, false), (false, true)] {
+                // An owner a shard, as the server has them.
+                let room = if one_loop { 2 * usize::try_from(per)? * (theirs.len() + ours.len()) * MSG } else { 4 * MSG };
+                let copies = Arc::new(Copies::start_with(sim_bus(), shards, room));
+                for id in theirs.iter().chain(&ours) {
+                    opened(&copies, id).await;
+                }
+                let holds = hold(held, blocked).await?;
+                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+                if one_loop {
+                    // This test's task the one loop, each session's change in turn.
+                    for n in 1..=per {
+                        for id in theirs.iter().chain(&ours) {
+                            anyhow::ensure!(copies.send(id, change(id, n)).await, "the owners went away");
+                        }
+                        crate::rt::maybe_yield().await;
+                    }
+                } else {
+                    // A sender a session, each on this test's shard (a task spawned from here stays here).
+                    for id in theirs.iter().chain(&ours) {
+                        let (copies, id, done) = (Arc::clone(&copies), id.clone(), done_tx.clone());
+                        drop(crate::rt::spawn(async move {
+                            for n in 1..=per {
+                                if !copies.send(&id, change(&id, n)).await {
+                                    return;
+                                }
+                            }
+                            let _ = done.send(()).await;
+                        }));
+                    }
+                }
+                drop(done_tx);
+                // Ours to the end, while theirs is held.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !ours.iter().all(|id| took_in_order(&copies, id, per).is_ok()) {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "blocked {blocked}, one loop {one_loop}: the other owner's sessions were held up too: {:?}", ours.iter().map(|id| took_in_order(&copies, id, per)).find(Result::is_err));
+                    crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                // Theirs took nothing meanwhile, and their views are read while the hold is still on.
+                for id in &theirs {
+                    let rev = copies.with(id, |v| v.rev);
+                    anyhow::ensure!(rev == Some(0), "blocked {blocked}, one loop {one_loop}: {id} took a change while its shard was held: revision {rev:?}");
+                }
+                anyhow::ensure!(holds.on(), "blocked {blocked}, one loop {one_loop}: the hold ended before the other owner's sessions were done");
+                drop(holds);
+                if !one_loop {
+                    for _ in theirs.iter().chain(&ours) {
+                        crate::rt::timeout(std::time::Duration::from_secs(30), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("a sender never got its changes in"))??;
+                    }
+                }
+                copies.settled().await;
+                for id in theirs.iter().chain(&ours) {
+                    took_in_order(&copies, id, per).map_err(|e| anyhow::anyhow!("blocked {blocked}, one loop {one_loop}: {e}"))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: many sessions on few shards. Five hundred and twelve sessions on one owner, then
+    /// on two, their changes handed over by eight senders each going round its own sessions (as the hub's loop goes
+    /// round its runners'), every owner's inbox holding about four: each session's copy takes every change once, in the
+    /// order sent, and none of another's; and each owner's board (what readers find) holds its own sessions, every one,
+    /// and no other's.
+    #[test]
+    fn g4_s5_many_sessions_on_few_shards_keep_their_order_and_none_is_lost() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
+        crate::rt::block_on(async {
+            let (count, senders, per) = (512usize, 8usize, 16u64);
+            for owners in [1usize, 2] {
+                let copies = Arc::new(Copies::start_with(sim_bus(), owners, 4 * MSG));
+                let sessions: Vec<String> = (0..count).map(|n| format!("m{owners}-{n}")).collect();
+                for id in &sessions {
+                    opened(&copies, id).await;
+                }
+                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+                for k in 0..senders {
+                    let mine: Vec<String> = sessions.iter().skip(k).step_by(senders).cloned().collect();
+                    let (copies, done) = (Arc::clone(&copies), done_tx.clone());
+                    crate::rt::spawn_spread(async move {
+                        for n in 1..=per {
+                            for id in &mine {
+                                if !copies.send(id, change(id, n)).await {
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = done.send(()).await;
+                    });
+                }
+                drop(done_tx);
+                for _ in 0..senders {
+                    crate::rt::timeout(std::time::Duration::from_secs(60), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("{owners} owners: a sender never got its changes in"))??;
+                }
+                copies.settled().await;
+                for id in &sessions {
+                    took_in_order(&copies, id, per).map_err(|e| anyhow::anyhow!("{owners} owners: {e}"))?;
+                }
+                for k in 0..owners {
+                    let mut want: Vec<&str> = sessions.iter().map(String::as_str).filter(|id| owner_of(id, owners) == k).collect();
+                    want.sort_unstable();
+                    let mut held = copies.on_shard(k, |s| s.mirrors().map(|(id, _)| id.clone()).collect::<Vec<_>>()).await.unwrap_or_default();
+                    held.sort_unstable();
+                    let mut board: Vec<String> = copies.boards.get(k).map(|b| b.load().keys().map(|id| id.to_string()).collect()).unwrap_or_default();
+                    board.sort_unstable();
+                    anyhow::ensure!(held == want && board == want, "{owners} owners: owner {k} holds {} and its board {}, of its {}", held.len(), board.len(), want.len());
+                }
+                anyhow::ensure!(copies.ids().len() == count, "{owners} owners: {} sessions found of {count}", copies.ids().len());
+            }
             Ok(())
         })
     }
