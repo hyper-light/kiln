@@ -640,6 +640,9 @@ fn main() -> ExitCode {
         }
         kiln::rt::realtime(cfg.server.realtime);
         kiln::rt::nudge(cfg.server.nudge);
+        // Transparent huge pages off for the server's process, before its runtime starts its threads, where its own
+        // runner starts no legs or agents that would inherit the switch (goal 11, plan 01a1a87b2e56 step 5).
+        tracing::info!("{}", kiln::os::thp::for_server(cfg.local_agent.enabled).said());
     }
     // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
     // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").

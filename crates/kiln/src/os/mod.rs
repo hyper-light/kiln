@@ -106,6 +106,10 @@ pub mod stack;
 #[path = "stack_none.rs"]
 pub mod stack;
 
+/// Transparent huge pages for the server's process: off where nothing it starts would inherit the switch (Linux;
+/// elsewhere there are none to turn off). Goal 11, plan 01a1a87b2e56 step 5.
+pub mod thp;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";
