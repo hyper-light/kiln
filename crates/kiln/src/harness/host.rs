@@ -2654,6 +2654,15 @@ mod tests {
             }
             let out = cmd.output()?;
             let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+            // Seen by its mark before the restart is staged, as the restart's look finds it: until its shell has exec'd it
+            // a process shows no environment on macOS, and a pyenv shim (a bash script, Apple's bash until it execs
+            // Python) stays so for a while, which a loaded machine stretches; looked at then, it wasn't taken back over
+            // (Mac Studio 2, 20 runs of 20). Looked at again until it shows, up to a hang's bound.
+            let shows = || survivors::scan(&[("left-running".to_owned(), None)]).get("left-running").is_some_and(|s| s.apart.iter().any(|r| r.pid == marked));
+            let until = std::time::Instant::now() + Duration::from_secs(300);
+            while !shows() && std::time::Instant::now() < until {
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            }
             // Each looked at as itself (as a session's harness is), not among this test process's children: the tests
             // beside it start theirs there too, and a look notes the first 64 (`survivors::MAX_RAN`), which a loaded
             // run's overlapping tests filled before this test's ("not seen").
