@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -180,6 +181,11 @@ pub struct Machine {
     pub server_mhz_before: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_mhz_after: Option<f64>,
+    /// The lab's reads an interruption cut short in the window (`crate::rx::interrupted`): its processes stopped or
+    /// frozen and let go on, or signalled. Its clients' latencies include those stops and its throughput lost them (goal 1,
+    /// plan 01a1a59c2a68 step 3: g9p21's windows, frozen by fedora's runner's headroom a fifth to a third of the time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_reads: Option<u64>,
 }
 
 fn loadavg() -> Option<[f64; 3]> {
@@ -446,6 +452,19 @@ struct Shared {
     next: AtomicU64,
     /// How long a viewer watches one agent.
     dwell: Duration,
+}
+
+/// Stops the window's clients as it goes, however the window's own thread leaves the window: at its end, on an error,
+/// in a panic. The window's scope waits for every client, so this is what makes it end (goal 1, plan 01a1a59c2a68 step
+/// 3: in goal 9's lab g9p21, round 3 calm's last scrape of /metrics failed and returned before saying stop, and the scope
+/// waited 15 minutes on clients that kept loading the server, until the lab's unit was stopped; rounds 5 calm and hogs
+/// the same).
+struct Stops<'a>(&'a AtomicBool);
+
+impl Drop for Stops<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 fn jitter(r: &mut Lcg, d: Duration) -> Duration {
@@ -833,28 +852,67 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
 /// 01a1a87b2cec step 2: a profiler of the round's server over its window): `<hook> <event> <server's pid>
 /// <folder>`, the event `fill-start`, `fill-end`, `window-start` or `window-end`, the folder one of the
 /// round's own beside its kiln's (`<round>.hook`, kept when the kiln's is removed). The lab waits for it, so
-/// it starts what lasts in the background; one that fails is said and the round goes on.
+/// it starts what lasts in the background; one that fails is said and the round goes on. It runs in a process
+/// group of its own, and one still running after `within` is stopped with its group, said, and the round goes on
+/// too (goal 1, plan 01a1a59c2a68 step 3: no wait of the lab's without an end).
 struct Hook {
     command: Option<PathBuf>,
     pid: u32,
     dir: PathBuf,
+    /// The longest the lab waits for it: [`PATIENCE`], the lab's bound on any one wait.
+    within: Duration,
 }
 
 impl Hook {
     fn from_env(fleet: &Fleet, dir: &Path) -> Self {
         let command = std::env::var_os("KILN_LAB_HOOK").filter(|c| !c.is_empty()).map(PathBuf::from);
-        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook") }
+        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook"), within: PATIENCE }
     }
 
     fn run(&self, event: &str) {
         let Some(command) = &self.command else { return };
-        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| Ok(Command::new(command).arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null()).status()?));
+        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| {
+            let mut cmd = Command::new(command);
+            cmd.arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            Ok(waited(cmd.spawn()?, self.within)?)
+        });
         match ran {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Ok(Some(status)) if status.success() => {}
+            Ok(Some(status)) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Ok(None) => eprintln!("kiln-lab: the hook's {event} still ran after {:?}: stopped, with what it started", self.within),
             Err(e) => eprintln!("kiln-lab: the hook's {event} didn't run: {e:#}"),
         }
     }
+}
+
+/// Waits for `child` up to `within`: its status, or none once `within` passed, when it's killed with what it started
+/// ([`kill_tree`]) and reaped. A wait the kill can't end either is left to itself, not waited on again.
+fn waited(mut child: Child, within: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    match rx.recv_timeout(within) {
+        Ok(status) => status.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_tree(pid);
+            let _ = rx.recv_timeout(within);
+            Ok(None)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other("its wait ended without its status")),
+    }
+}
+
+/// Kills process `pid` and what it started: its process group, which it leads (Unix: the hook's, as `crate::fleet::clean`
+/// makes the server's and the runners'), or its process tree (Windows).
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("kill").arg("-KILL").arg(format!("-{pid}")).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 /// `p`'s runners of `build` for `fleet`'s server, each its own `kiln agent` whose `claude` is the stand-in in `bin`,
@@ -919,29 +977,32 @@ pub fn fill(fleet: &Fleet, p: &Profile, names: &[String]) -> anyhow::Result<(Vec
 }
 
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
+///
+/// Each step's failure says which step it was (goal 1, plan 01a1a59c2a68 step 3: g9p21's rounds that failed said only
+/// "Interrupted system call (os error 4)").
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
-    std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("the round's folder {}", dir.display()))?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id())).context("the round's server")?;
     // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
     // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
     let hook = Hook::from_env(&fleet, dir);
     hook.run("server-up");
-    let names = runners(&mut fleet, build, p, bin)?;
+    let names = runners(&mut fleet, build, p, bin).context("the round's runners")?;
 
     // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
     // server's /metrics either side of it too: the conversation feed at its busiest, every session's
     // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
     let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
-    let fill_before = scrape(&fleet)?;
+    let fill_before = scrape(&fleet).context("the fill's first scrape of the server's /metrics")?;
     hook.run("fill-start");
-    let (opened, fill_s) = fill(&fleet, p, &names)?;
+    let (opened, fill_s) = fill(&fleet, p, &names).context("the fill")?;
     hook.run("fill-end");
-    let fill_after = scrape(&fleet)?;
+    let fill_after = scrape(&fleet).context("the fill's last scrape of the server's /metrics")?;
     let mut http = Http::new(fleet.port, &fleet.admin);
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
-        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
+        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes())).context("the MCP tools' list")?;
         let v: Value = serde_json::from_slice(&a.body).unwrap_or_default();
         let have: HashSet<String> = v.pointer("/result/tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         ["agents_list", "runners"].iter().filter(|t| have.contains(**t)).map(|t| (*t).to_owned()).collect()
@@ -963,10 +1024,12 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
 
     let mut m = machine();
     m.server_cpus.clone_from(&place.cpus);
-    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs, place, &format!("kiln-lab-hogs-{}-{index}", std::process::id()))?) } else { None };
+    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs, place, &format!("kiln-lab-hogs-{}-{index}", std::process::id())).context("the round's hogs")?) } else { None };
     type Window = (Vec<Sample>, Vec<Watch>, Scrape, Scrape, (u64, u64));
     let (samples, watches, before, after, window) = std::thread::scope(|scope| -> anyhow::Result<Window> {
         let s = &shared;
+        // However this thread leaves the window, its clients stop, so the scope that waits for them ends.
+        let _stops = Stops(&s.stop);
         let mut views = Vec::new();
         for i in 0..p.viewers {
             views.push(scope.spawn(move || viewer(s, i)));
@@ -991,13 +1054,15 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         m.cpu_pressure_before = cpu_pressure();
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
         m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
-        let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None).context("the window's first scrape of the server's /metrics")?.body));
         hook.run("window-start");
         let start = now_us();
+        let interrupted = crate::rx::interrupted();
         std::thread::sleep(Duration::from_secs(p.window_s));
         let end = now_us();
+        m.interrupted_reads = Some(crate::rx::interrupted().saturating_sub(interrupted));
         hook.run("window-end");
-        let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None).context("the window's last scrape of the server's /metrics")?.body));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
         m.mhz_after = cpu_mhz(m.affinity.as_deref());
@@ -1015,6 +1080,11 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         Ok((samples, watches, before, after, (start, end)))
     })?;
     drop(hogs_run);
+    if let Some(n) = m.interrupted_reads.filter(|n| *n > 0) {
+        eprintln!(
+            "kiln-lab: round {index}: {n} of the lab's reads were interrupted in its window: its processes were stopped or frozen (a pacer's cgroup.freeze, SIGSTOP) or signalled, so its latencies include those stops"
+        );
+    }
     let in_window: Vec<Sample> = samples.into_iter().filter(|s| s.at_us >= window.0 && s.at_us < window.1).collect();
     #[allow(clippy::cast_precision_loss)]
     let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
@@ -1512,6 +1582,91 @@ pub fn better(name: &str) -> crate::stats::Better {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 1, plan 01a1a59c2a68 step 3 (goal 9's lab g9p21, rounds 3 and 5 calm and 5 hogs): a window whose own thread
+    /// fails before it says stop (its last scrape of /metrics, there) still stops its clients, and its scope ends with
+    /// the failure rather than waiting on them while they keep loading the server. (Without [`Stops`], these clients
+    /// give up by themselves after a minute, so the test fails rather than hangs.)
+    #[test]
+    fn g1_s3_a_window_that_fails_stops_its_clients() {
+        let stop = AtomicBool::new(false);
+        let gave_up = Duration::from_secs(60);
+        let started = Instant::now();
+        let (stopped, ended) = (AtomicU64::new(0), AtomicU64::new(0));
+        let r: anyhow::Result<()> = std::thread::scope(|scope| {
+            let _stops = Stops(&stop);
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let t = Instant::now();
+                    while !stop.load(Ordering::Relaxed) && t.elapsed() < gave_up {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let to = if stop.load(Ordering::Relaxed) { &stopped } else { &ended };
+                    to.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            Err(anyhow::anyhow!("the connection was closed")).context("the window's last scrape of the server's /metrics")
+        });
+        let took = started.elapsed();
+        let e = r.err().map(|e| format!("{e:#}"));
+        assert_eq!(e.as_deref(), Some("the window's last scrape of the server's /metrics: the connection was closed"), "the window says why it failed");
+        assert_eq!((stopped.load(Ordering::Relaxed), ended.load(Ordering::Relaxed)), (4, 0), "every client was told to stop");
+        assert!(took < gave_up / 2, "the window ended in {took:?}");
+    }
+
+    /// Goal 1, plan 01a1a59c2a68 step 3: the lab waits for a hook only so long: one still running then is killed with
+    /// what it started, reaped and said, and the round goes on; one that ends is waited for and its status said.
+    #[cfg(unix)]
+    #[test]
+    fn g1_s3_a_hook_is_waited_for_only_so_long() -> anyhow::Result<()> {
+        let mut long = Command::new("sh");
+        long.args(["-c", "sleep 30 & sleep 30"]).stdin(Stdio::null());
+        std::os::unix::process::CommandExt::process_group(&mut long, 0);
+        let started = Instant::now();
+        let status = waited(long.spawn()?, Duration::from_millis(300))?;
+        let took = started.elapsed();
+        anyhow::ensure!(status.is_none(), "{status:?}");
+        anyhow::ensure!(took < Duration::from_secs(15), "a hook past its time was waited for {took:?}");
+        let status = waited(Command::new("true").spawn()?, Duration::from_secs(30))?;
+        anyhow::ensure!(status.is_some_and(|s| s.success()), "{status:?}");
+        Ok(())
+    }
+
+    /// Goal 1, plan 01a1a59c2a68 step 3: a round whose window had the lab's reads interrupted (its processes stopped or
+    /// frozen: g9p21's, by fedora's runner's headroom) says so in its report; one without says nothing of it.
+    #[test]
+    fn g1_s3_a_round_whose_lab_was_stopped_says_so() {
+        let round = |interrupted: Option<u64>| Round {
+            build: "build".into(),
+            index: 1,
+            hogs: 0,
+            machine: Machine { interrupted_reads: interrupted, ..Machine::default() },
+            fill_s: 1.0,
+            shards: 1,
+            numbers: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            held: Vec::new(),
+            fill_held: Vec::new(),
+            quantum_us: None,
+            locks: BTreeMap::new(),
+        };
+        let run = |rounds: Vec<Round>| crate::report::Run {
+            command: "kiln-lab run".into(),
+            started: "2026-11-06T14:07:00Z".into(),
+            profile: Profile::small(),
+            hogs: 0,
+            layout: "production".into(),
+            server_cpus: None,
+            rounds,
+            failures: Vec::new(),
+        };
+        let paced = crate::report::markdown(&run(vec![round(Some(7))]));
+        assert!(paced.contains("**the lab was stopped or frozen in its window** (7 of its reads interrupted)"), "{paced}");
+        for calm in [Some(0), None] {
+            let md = crate::report::markdown(&run(vec![round(calm)]));
+            assert!(!md.contains("stopped or frozen"), "{md}");
+        }
+    }
 
     /// Goal 8, plan 01a1a59c2b29 step 7 (and goal 6 step 3): each shard's nudged share of the window, their mean, and how
     /// long their host held each wake another thread or I/O made them over the window, its own timers' calm wait set

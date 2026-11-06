@@ -199,9 +199,11 @@ pub fn markdown(run: &Run) -> String {
             let load = |l: Option<[f64; 3]>| l.map_or_else(|| "?".to_owned(), |[one, five, fifteen]| format!("{one:.1} {five:.1} {fifteen:.1}"));
             let psi = |p: Option<f64>| p.map_or_else(String::new, |p| format!(", cpu some {p:.1}%"));
             let mhz = |v: Option<f64>| v.map_or_else(String::new, |v| format!(", {v:.0} MHz"));
+            // A window whose clients were stopped or frozen (goal 1, plan 01a1a59c2a68 step 3): its numbers include it.
+            let stopped = r.machine.interrupted_reads.filter(|n| *n > 0).map_or_else(String::new, |n| format!("; **the lab was stopped or frozen in its window** ({n} of its reads interrupted): its latencies include those stops"));
             let _ = writeln!(
                 o,
-                "- round {}: filled in {:.1} s; load {} then {}{}{}{}{}",
+                "- round {}: filled in {:.1} s; load {} then {}{}{}{}{}{stopped}",
                 r.index,
                 r.fill_s,
                 load(r.machine.load_before),
