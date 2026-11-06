@@ -77,10 +77,11 @@ C, no SIMD, no FTS.
 - **Turning it off:** `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as
   it did without one.
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
-  commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  flush brings `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
-  never by lock. While a batch gathers, what's flushed waits for it without waking the writer; a
-  read, a take, a close or a flush of `COMMIT_ROWS` rouses it.
+  commits in batches, self-clocked: each commit as soon as the last is durable, with everything
+  flushed meanwhile as one. An idle store commits an update at once; a busy one commits what came
+  during its last commit, so its batches grow with its load and its disk's pace. One writer thread
+  owns the database; sessions reach it by channel, never by lock. What's flushed while it commits
+  waits for it without waking it.
 - **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
   came after a number (see Replication). Each reset of a session's events is a row of its own in
   `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line
@@ -133,17 +134,13 @@ what it took, and says through where it has it.
      from every answer, so the server tells it once until a batch of it is taken. Answered each
      time, such a runner sent the same batches again for every answer, and each was answered the
      same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
-- **Batched.** A feed holds what its store commits and ships it as one batch once a tick has
-  passed since the first of it (`SHIP_EVERY`: the recorder's tick, 1 s), or at once past a
-  batch's worth (`SHIP_AT_BYTES`: `BATCH_BYTES`, 2 MiB). What it reads after it's told where to go
-  on, and what it still has to read of a backlog, go at once, as before; a copy sent back is never
-  held. The stores' own commits are as they were (`COMMIT_MS`). Each batch is a custody record of
-  both ends, kept in kiln.db, and a write the cluster group sends its learners: a batch per commit
-  made most of kiln.db's writes. So the server's store, and a mirror's copy, trail by up to a tick
-  more. What reads them can spare it: a move off a machine that's gone resumes from the harness's
-  record, whose lines reach the runner's store only at the recorder's tick already; the board looks
-  every 5 s; a mirror's copy is read only to restore from. A feed hears of its store's commits only
-  at its store's tip, holding nothing: the commits while it holds, or reads on, wake nothing.
+- **Batched.** At its store's tip a feed keeps one batch on its way: it ships the next once the
+  last is taken, with everything its store committed meanwhile as one (Nagle on the Ack). What it
+  reads after it's told where to go on, and what it still has to read of a backlog, go as its
+  window allows, as before; a copy sent back is never held. Each batch is a custody record of both
+  ends, kept in kiln.db, and a write the cluster group sends its learners: a batch per commit made
+  most of kiln.db's writes. A feed hears of its store's commits only at its store's tip, holding
+  nothing: the commits while it holds, or reads on, wake nothing.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
