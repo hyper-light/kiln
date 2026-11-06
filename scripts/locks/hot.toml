@@ -71,6 +71,9 @@ hot = [
   # The live channel (docs/wire.md): every item a runner sends over it, an agent session's updates
   # and a terminal's output among them, and its answer.
   "crates/kiln/src/wire/link.rs",
+  # What the net thread hands the hub, fanned out to its loops, one a shard, and a runner's order kept across
+  # them (goal 10, plan 01a1a87b2dae step 4).
+  "crates/kiln/src/wire/fan.rs",
   # A runner's front door with a replica of kiln's records (docs/p2p.md, the peer-to-peer
   # unification's P2): every request it answers from the replica, and the learner behind it.
   "crates/kiln/src/frontdoor/replica.rs",
@@ -284,7 +287,7 @@ why = "imports the runners' receivers' lock (by_runner, below)"
 [[allowed]]
 at = "crates/kiln/src/wire/link.rs"
 name = "by_runner"
-why = "each runner's receivers: the hub's loop alone takes it, for each item a runner sends and then its answer, in order (one task, so no shard waits on another for it); what is said again of them every few seconds by the commands loop, and as a link comes up, is read off the per-stream copies it publishes as it changes them (has), so no other task takes it"
+why = "each runner's receivers: one of the hub's loops alone takes it, for each item a runner sends and then its answer, in order (one task, so no shard waits on another for it). Each loop has a Links of its own (goal 10, plan 01a1a87b2dae step 4: a session's streams are its owner's shard's session loop's, the rest the control loop's; crate::wire::fan, Hub::links_of), so no lock is taken by two loops; what is said again of them every few seconds by the commands loop, and as a link comes up, is read off the per-stream copies each publishes as it changes them (has), so no other task takes it"
 
 # A runner's front door answering reads from its replica, and the learners behind it: the peer-to-peer
 # unification's (docs/p2p.md, P2: plan 01a1a283e14c), the custody of the cluster group added to them by

@@ -149,10 +149,27 @@ pub enum RunnerLeg {
     /// frame's whole time, what's left is the wire's: the runner's way to its link, the network, the server's
     /// net thread before the arrival.
     Server,
+    /// From a frame's loop taking it off its queue to its runner's earlier frames on the hub's other loops having
+    /// been taken, which it may not overtake (goal 10, plan 01a1a87b2dae step 4: a session's updates go to the loop on
+    /// their owner's shard and the rest to the control loop, `crate::wire::fan`): a barrier's wait (its runner's Caps,
+    /// inventory, a hand-over) for the runner's session updates before it, an update's for the barrier before it.
+    /// Observed only for a frame that had any to wait for, so its count against `to_loop`'s is how often one does;
+    /// `to_loop` leaves it out.
+    Order,
+    /// `to_loop` of the frames the hub's control loop took (goal 10, plan 01a1a87b2dae step 4): all but agent sessions'
+    /// updates, which their owners' shards' session loops take. Set against `to_loop`, every frame's, it tells the
+    /// session loops' wait from the control loop's.
+    ToControl,
+    /// From the network thread taking a frame off its link to handing it to its loop's queue (`crate::wire::fan`): the
+    /// net thread's own hold of it, the rest of its batch read and its turn's sends made first. `to_loop` includes it;
+    /// what's past it there is the queue's, its loop's wake and its shard's (goal 10, plan 01a1a87b2dae step 4: rt9's
+    /// and g9p16's `to_loop` was 8 to 10 ms at p99 where each event's hold at the loop was 0.08 to 0.2 ms, and the
+    /// shards ran their ready work within 0.45 ms at p99.9: only this tells where the frames waited).
+    Net,
 }
 
 impl RunnerLeg {
-    pub const ALL: [RunnerLeg; 6] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner, RunnerLeg::Held, RunnerLeg::Runner, RunnerLeg::Server];
+    pub const ALL: [RunnerLeg; 9] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner, RunnerLeg::Held, RunnerLeg::Runner, RunnerLeg::Server, RunnerLeg::Order, RunnerLeg::ToControl, RunnerLeg::Net];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -162,6 +179,9 @@ impl RunnerLeg {
             RunnerLeg::Held => "held",
             RunnerLeg::Runner => "runner",
             RunnerLeg::Server => "server",
+            RunnerLeg::Order => "order",
+            RunnerLeg::ToControl => "to_control",
+            RunnerLeg::Net => "net",
         }
     }
 
@@ -173,6 +193,9 @@ impl RunnerLeg {
             RunnerLeg::Held => 3,
             RunnerLeg::Runner => 4,
             RunnerLeg::Server => 5,
+            RunnerLeg::Order => 6,
+            RunnerLeg::ToControl => 7,
+            RunnerLeg::Net => 8,
         }
     }
 }
@@ -450,8 +473,13 @@ mod tests {
         l.observe(RunnerLeg::InLoop, Duration::from_micros(40));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
+        // A frame's wait for its runner's earlier ones on the hub's other loops, and the control loop's own wait: each its
+        // own leg, `to_loop`'s apart.
+        l.observe(RunnerLeg::Order, Duration::from_micros(300));
+        l.observe(RunnerLeg::ToControl, Duration::from_micros(70));
+        l.observe(RunnerLeg::Net, Duration::from_micros(20));
         let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
-        assert_eq!(counts, vec![0, 1, 2, 0, 0, 0]);
+        assert_eq!(counts, vec![0, 1, 2, 0, 0, 0, 1, 1, 1]);
         // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
         let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((at(0.001), at(0.00125)), (Some(1), Some(2)));
@@ -469,13 +497,13 @@ mod tests {
     /// with the others.
     #[test]
     fn g10_s5_the_loops_hold_of_each_event_is_a_leg_of_its_own() {
-        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["to_loop", "in_loop", "to_owner", "held", "runner", "server"]);
-        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"]);
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
         let l = Legs::new();
         l.observe(RunnerLeg::Held, Duration::from_micros(150));
         l.observe(RunnerLeg::Held, Duration::from_micros(6_000));
         let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, PerShard::count)).collect();
-        assert_eq!(counts, vec![0, 0, 0, 2, 0, 0]);
+        assert_eq!(counts, vec![0, 0, 0, 2, 0, 0, 0, 0, 0]);
         let under = |bound: f64| l.of(RunnerLeg::Held).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(0.00025), under(0.001)), (Some(1), Some(1)), "150 µs under a quarter millisecond, 6 ms past a millisecond");
         let mut o = String::new();
@@ -490,7 +518,7 @@ mod tests {
     #[test]
     fn g10_s5_the_runners_hold_and_the_servers_time_are_legs_of_their_own() {
         let names: Vec<&str> = RunnerLeg::ALL.iter().map(|l| l.name()).collect();
-        assert_eq!(names.get(names.len().saturating_sub(2)..), Some(&["runner", "server"][..]), "appended last");
+        assert_eq!(names.get(RunnerLeg::Held.index() + 1..RunnerLeg::Held.index() + 3), Some(&["runner", "server"][..]), "appended after held");
         assert_eq!((RunnerLeg::Runner.index(), RunnerLeg::Server.index()), (RunnerLeg::Held.index() + 1, RunnerLeg::Held.index() + 2));
         let l = Legs::new();
         l.observe(RunnerLeg::Runner, Duration::from_micros(80));
@@ -548,7 +576,9 @@ mod tests {
         let routes = Class::ALL.len() * 2 * (STALL_BUCKETS.len() + 3);
         let legs = RunnerLeg::ALL.len() * (crate::shard_health::DELAY_BUCKETS.len() + 3);
         let series = made.lines().filter(|l| !l.starts_with('#')).count();
-        assert_eq!((series, routes, legs), (routes + legs, 220, 282), "every class's and leg's, zeros and all");
+        // Goal 10, plan 01a1a87b2dae step 4: the legs `order`, `to_control` and `net` added 141 (3 legs of 47) to the 282
+        // there were.
+        assert_eq!((series, routes, legs), (routes + legs, 220, 423), "every class's and leg's, zeros and all");
         for c in Class::ALL {
             assert!(made.contains(&format!("kiln_route_wait_seconds_count{{class=\"{}\"}} 0", c.name())), "{}", c.name());
         }
