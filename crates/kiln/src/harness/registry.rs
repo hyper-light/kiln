@@ -2827,13 +2827,15 @@ impl Registry {
         // Its first event is long to write out (a large tool output) and wasn't written yet: the same, once its owner wrote it
         // out off the shard (goal 9, plan 01a1a87b2cec step 3: `super::copies::Shard::want_write`).
         if let Update::Events { events } = &u
-            && events.first().is_some_and(|e| written.as_ref().is_none_or(|w| !w.is(id, e)) && super::copies::long_to_write(e))
+            && events.first().is_some_and(|e| written.as_ref().is_none_or(|w| !w.is(id, e)) && super::copies::long_to_write(e, said.sides()))
         {
             let (cwd, location) = (m.info.cwd.clone(), Location::clone(&m.location));
             s.want_write(id, store.is_some(), cwd, location);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
         m.rev = m.rev.saturating_add(1);
+        // Its gap since its last change learned, and when it falls idle scheduled (consts-audit R1).
+        m.changed(std::time::Instant::now(), &said.idle);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
             // viewers from before start over too.
@@ -3003,7 +3005,7 @@ impl Registry {
                     // out is written so, it and those after it the rest (goal 9, plan 01a1a87b2cec step 3: a large tool output's
                     // JSON and row, past the step's quantum on the shard). The first was judged so above, once.
                     let tried_write = written.take().filter(|w| w.is(id, e));
-                    if tried_write.is_none() && taken > 0 && super::copies::long_to_write(e) {
+                    if tried_write.is_none() && taken > 0 && super::copies::long_to_write(e, said.sides()) {
                         write = Some((m.info.cwd.clone(), Location::clone(&m.location)));
                         break;
                     }
@@ -3082,9 +3084,10 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) && matches!(u, Update::Meta { .. }) {
-            // A meta that changed, its session's metas long to write out: its frame, the whole value written out, off the shard
-            // too (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
+        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) && matches!(u, Update::Meta { .. }) {
+            // A meta that changed, its session's metas long to write out (past a turn, or dearer than the compute pool's round
+            // trip: `super::copies::Said::sides`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
+            // 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
             m.commit_meta_off()
         } else {
             m.commit(|m| match &u {
@@ -3584,9 +3587,12 @@ impl Registry {
         let (sid, added) = (id.to_owned(), added.to_vec());
         self.sessions
             .on(id, move |s| {
+                let said = s.said();
                 if let Some(m) = s.get_mut(&sid) {
                     // A revision of its own, past what its viewers have: else they'd take it as had.
                     m.rev = m.rev.saturating_add(1);
+                    // A change: when it falls idle scheduled from now (consts-audit R1).
+                    m.changed(std::time::Instant::now(), &said.idle);
                     m.commit(|m| {
                         let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Files { files: added }, rev: Some(m.rev) }.text();
                         Some(super::copies::payload_of(&text, m.rev))
@@ -5120,6 +5126,9 @@ mod tests {
         use crate::os::counted::{Made, made};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
+            // Its owners weigh writing out on their shards against a round trip of their own, a second's: what's measured is
+            // the shard's path, wherever the tests' process learned the pool's round trip to be (consts-audit B1).
+            hub.harness.sessions.on_each(|s| s.said().pin_trip(1_000_000_000)).await;
             let there = Location::Machine("box".into());
             hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), cwd: "/work".into(), ..Info::default() }), since: None }).await;
             // A reply of 1,020 bytes: past what glibc keeps a thread (1,032 bytes, its JSON with it).
@@ -5150,14 +5159,14 @@ mod tests {
                             .harness
                             .sessions
                             .on("s", move |s| {
+                                let said = s.said();
                                 if let Update::Events { events } = &u
-                                    && events.first().is_some_and(super::super::copies::long_to_write)
+                                    && events.first().is_some_and(|e| super::super::copies::long_to_write(e, said.sides()))
                                 {
                                     return None;
                                 }
-                                let said = s.said();
                                 if let Some(m) = s.get_mut("s") {
-                                    while m.said(&u, &said).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) {
+                                    while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
                                         m.said_took(&u, std::time::Duration::ZERO, &said);
                                     }
                                 }

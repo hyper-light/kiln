@@ -669,15 +669,17 @@ impl Expect {
 /// What reading `/api/mcp`'s bodies is expected to take.
 static READING: Expect = Expect::nothing_yet();
 
-/// `body` read as JSON-RPC messages ([`rpc::body`]), joined first where it came in pieces: on the shard while that's
-/// expected (`expect`) to take less than a slow poll (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, as
-/// the hub's loop reads a runner's frames (`crate::wire::payload::read_frame`). A read is timed where it runs, so one
+/// `body` read as JSON-RPC messages ([`rpc::body`]), joined first where it came in pieces: on the shard where that's
+/// expected (`expect`) to fit a turn and cost no more than the compute pool's round trip (`crate::rt::here`; consts-audit
+/// B1: it was less than a slow poll, `hyper_rt::slow::SLOW_POLL_NS`, 100 µs), else on the compute pool, as the hub's loop
+/// reads a runner's frames (`crate::wire::payload::read_frame`). A read is timed where it runs, so one
 /// off the shard teaches it too. Goal 10, plan 01a1a87b2dae step 5: a body, up to [`rpc::BODY_MOST`] (a program up
 /// to `code::Limits::program` in it), was joined and read on its shard whatever its length.
 async fn read_body<B: bytes::Buf + Send + 'static>(expect: &Expect, mut body: B) -> rpc::Body {
     let len = body.remaining();
     let n = u64::try_from(len).unwrap_or(u64::MAX);
-    let (read, took) = if expect.expected(n) > hyper_rt::slow::SLOW_POLL_NS {
+    let expected = expect.expected(n);
+    let (read, took) = if !crate::rt::here(expected, expected) {
         match crate::rt::compute(move || timed(|| rpc::body(&body.copy_to_bytes(len)))).await {
             Ok(read) => read,
             // Its job lost (it panicked): the body unread, said so under a null id; not the sender's to be noted for.
@@ -1767,7 +1769,7 @@ mod tests {
     #[test]
     fn g10_s5_a_body_is_read_alike_wherever_it_is_read() -> anyhow::Result<()> {
         let learned = Expect::nothing_yet();
-        anyhow::ensure!(learned.expected(0) == u64::MAX && learned.expected(1) > hyper_rt::slow::SLOW_POLL_NS, "the first is read off the shard");
+        anyhow::ensure!(learned.expected(0) == u64::MAX && learned.expected(1) == u64::MAX, "the first is read off the shard: dearer than any round trip to the pool");
         learned.learn(1_000, 5_000);
         anyhow::ensure!(learned.expected(2_000) == 10_000, "{}", learned.expected(2_000));
         // Bytes 1,000 − 125 + 1,125; nanoseconds 5,000 − 625 + 625: 2.5 ns a byte.
