@@ -903,8 +903,8 @@ pub const SHARE_FS: &str = "fs";
 pub const SHARE_STORE: &str = "store";
 
 struct Rt {
-    /// Held for the life of the process: dropping it would stop the shards.
-    runtime: Runtime,
+    /// Held for the life of the process, never read: dropping it would stop the shards.
+    _runtime: Runtime,
     holders: Vec<SlotHolder>,
     next: AtomicUsize,
 }
@@ -1007,7 +1007,7 @@ fn start() -> Result<Rt, String> {
         keep_apart(&holders);
     }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
-    Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
+    Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
 }
 
 /// Keeps the process's other threads off its shards' cores for as long as it runs ([`pin`]; goal 9,
