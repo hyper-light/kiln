@@ -213,12 +213,25 @@ pub async fn list(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<Value>> {
     })
 }
 
+/// How long a repository's list is used before it's read from its host again.
+const LIST_FRESH: Duration = Duration::from_secs(60);
+/// The lists kept, in bytes at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::PULL_LISTS`): one host response's worth, as kiln reads them at the most
+/// (`crate::githost::github::App::call` reads GitHub's up to 32 MiB). Past it the lists read longest ago
+/// go, the newest kept, as each goes past its minute ([`LIST_FRESH`]): read from the host again when
+/// asked.
+const LISTS_BYTES: usize = 32 << 20;
+
 /// [`list`], read from the host at most once a minute (the inbox asks often).
 async fn list_cached(hub: &Hub, repo: &Repo) -> Vec<Value> {
-    static C: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, (Instant, Vec<Value>)>>> = std::sync::OnceLock::new();
-    let cache = C.get_or_init(Default::default);
-    if let Some((at, l)) = cache.lock().get(&repo.id)
-        && at.elapsed() < Duration::from_secs(60)
+    type Kept = HashMap<String, (Instant, Vec<Value>, usize)>;
+    static C: std::sync::OnceLock<parking_lot::Mutex<Kept>> = std::sync::OnceLock::new();
+    let cache = C.get_or_init(|| {
+        crate::memory::owners::PULL_LISTS.bound_at(LISTS_BYTES);
+        parking_lot::Mutex::default()
+    });
+    if let Some((at, l, _)) = cache.lock().get(&repo.id)
+        && at.elapsed() < LIST_FRESH
     {
         return l.clone();
     }
@@ -226,7 +239,28 @@ async fn list_cached(hub: &Hub, repo: &Repo) -> Vec<Value> {
         tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "a host's pull requests can't be read");
         Vec::new()
     });
-    cache.lock().insert(repo.id.clone(), (Instant::now(), l.clone()));
+    let bytes = l.iter().map(crate::harness::weigh::value).fold(0usize, usize::saturating_add);
+    let owner = &crate::memory::owners::PULL_LISTS;
+    let mut kept = cache.lock();
+    owner.add(bytes);
+    if let Some((_, _, before)) = kept.insert(repo.id.clone(), (Instant::now(), l.clone(), bytes)) {
+        owner.sub(before);
+    }
+    let stale: Vec<String> = kept.iter().filter(|(_, (at, _, _))| at.elapsed() >= LIST_FRESH).map(|(id, _)| id.clone()).collect();
+    for id in stale {
+        if let Some((_, _, b)) = kept.remove(&id) {
+            owner.sub(b);
+        }
+    }
+    let mut total: usize = kept.values().map(|(_, _, b)| *b).fold(0, usize::saturating_add);
+    while total > LISTS_BYTES {
+        let Some(oldest) = kept.iter().filter(|(id, _)| **id != repo.id).min_by_key(|(_, (at, _, _))| *at).map(|(id, _)| id.clone()) else { break };
+        if let Some((_, _, b)) = kept.remove(&oldest) {
+            total = total.saturating_sub(b);
+            owner.sub(b);
+        }
+    }
+    drop(kept);
     l
 }
 
@@ -703,6 +737,28 @@ pub async fn merge(hub: &Hub, repo: &Repo, number: u64, method: &str, by: &As<'_
     Ok(json!({ "merged": !merged.is_empty(), "commit": (!merged.is_empty()).then_some(merged), "method": method, "as": by.who() }))
 }
 
+/// The line an agent's words end with on a host (W26-R18): the host shows them as the account they
+/// went through (the person's, or kiln's), so the words themselves name the agent and its person.
+/// None for anyone but an agent.
+async fn agents_line(hub: &Hub, caller: Option<&crate::authz::Caller>) -> Option<String> {
+    let c = caller.filter(|c| c.kind == crate::authz::gate::Kind::Agent)?;
+    let principal = c.name.split(' ').next().unwrap_or(&c.name);
+    let session = c.agent.clone().or_else(|| principal.strip_prefix("agent:").map(str::to_owned))?;
+    let name = hub.harness.info(&session).map(|i| i.name).filter(|n| !n.trim().is_empty());
+    let mut line = kiln_ci::review::byline(&format!("agent:{session}"), name.as_deref(), None, None);
+    line.for_person = crate::ci::diffs::acting_for(&c.name).map(|p| kiln_ci::review::byline(&p, None, None, None).name);
+    line.on_a_host()
+}
+
+/// `words`, ending with `line` (its own paragraph) when there is one.
+fn signed_off(words: &str, line: Option<&str>) -> String {
+    match line {
+        Some(l) if words.trim().is_empty() => l.to_owned(),
+        Some(l) => format!("{}\n\n{l}", words.trim_end()),
+        None => words.to_owned(),
+    }
+}
+
 /// `/api/ci/repos/:repo/pulls…`: `GET` the open ones, `GET :n` one with all it has, `POST
 /// :n/comments { body, path?, line?, side?, reply_to? }`, `POST :n/reviews { verdict, body }`,
 /// `POST :n/merge { method }`; what's done is the person's on the host when they signed in with it.
@@ -733,6 +789,7 @@ pub async fn route(hub: &Hub, method: &http::Method, repo_key: &str, tail: &[&st
                 return Err((StatusCode::BAD_REQUEST, "a comment on a line names its `path`".into()));
             }
             let reply = body.get("reply_to").map(|r| r.as_str().map_or_else(|| r.to_string(), str::to_owned));
+            let said = signed_off(&said, agents_line(hub, caller).await.as_deref());
             let v = comment(hub, &repo, number(n)?, &said, line.as_ref(), reply.as_deref(), &by).await.map_err(upstream)?;
             hub.store.audit(by_name, "host.pulls.comment".into(), format!("{} #{n}", repo.name)).await;
             Ok(srv::json(StatusCode::CREATED, &v))
@@ -740,7 +797,8 @@ pub async fn route(hub: &Hub, method: &http::Method, repo_key: &str, tail: &[&st
         (&http::Method::POST, [n, "reviews"]) => {
             let asked = body.get("verdict").or_else(|| body.get("event")).and_then(Value::as_str).unwrap_or("comment");
             let verdict = Verdict::parse(asked).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{asked}`: a review is `approve`, `request_changes` or `comment`")))?;
-            let v = review(hub, &repo, number(n)?, verdict, &text("body"), &by).await.map_err(upstream)?;
+            let said = signed_off(&text("body"), agents_line(hub, caller).await.as_deref());
+            let v = review(hub, &repo, number(n)?, verdict, &said, &by).await.map_err(upstream)?;
             hub.store.audit(by_name, "host.pulls.review".into(), format!("{} #{n}: {asked}", repo.name)).await;
             Ok(srv::json(StatusCode::OK, &v))
         }

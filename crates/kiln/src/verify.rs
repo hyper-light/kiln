@@ -167,7 +167,8 @@ pub async fn vsa(hub: &Hub, repo: &str, sha: &str) -> Result<Value, Fail> {
     let name = format!("{}@{full}", r.name);
     let statement = verify::source_vsa(&verify::SourceRevision { name: &name, uri: &uri, commit: &full, refs: &refs, repository: &repository, verifier: &verifier, at, policy: &policy, passed });
     let payload = serde_json::to_vec(&statement).map_err(|e| internal(e.into()))?;
-    let bundle = crate::identities::sign_as(&hub.pki, "server", kiln_ci::attest::PAYLOAD_TYPE, &payload).map_err(internal)?;
+    // Signed on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = crate::identities::sign_as_off(&hub.pki, "server", kiln_ci::attest::PAYLOAD_TYPE, payload).await.map_err(internal)?;
     // In the trail as kiln took it (W27-R09).
     let text = bundle.to_string();
     hub.store.call(move |c| crate::trail::take(c, &text, at)).await.map_err(internal)?;

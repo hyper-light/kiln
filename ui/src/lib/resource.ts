@@ -7,8 +7,10 @@
  * - when the server says it changed (`on`: event types from /api/events), at most once a second;
  *   or, where the event itself says what changed (`apply`), with it, without loading anything;
  * - on its interval while shown (`pollMs`; not while the tab is hidden);
- * - after the event stream reconnects (the server restarted);
+ * - after the event stream reconnects without taking up where it was (`onMissed`: the server
+ *   restarted, or it was away too long): a reconnect that resumes is sent what it missed instead;
  * - on `invalidate(prefix)`, after a change made here.
+ * The event stream is asked only for the `on` types of the keys that need them (`interested`).
  * No effects: a key is subscribed to through useSyncExternalStore, and its first load starts
  * while rendering, cached, as Suspense expects.
  */
@@ -44,6 +46,11 @@ export interface SuspenseResource<T> {
   reload: () => void;
   /** Change the data here, at once (after a change the server will confirm). */
   setData: (fn: (prev: T) => T) => void;
+  /**
+   * What a press shows at once, before its request is answered (W21-R15): `setData`, and made again
+   * over what a load already on its way brings, which was read before it.
+   */
+  change: (fn: (prev: T) => T) => void;
   /** The last refresh failed, and why: the data shown is the last there was. */
   refreshError?: unknown;
 }
@@ -76,6 +83,8 @@ interface Entry {
   /** Events to apply to its data, and when they will be. */
   news: ServerEvent[];
   applying: number;
+  /** Changes presses made (`change`) while the load on its way was out: made again over what it brings. */
+  made: ((data: unknown) => unknown)[];
   /** Out of date while not shown: refreshed when it's shown again. */
   stale: boolean;
   listeners: Set<() => void>;
@@ -114,6 +123,7 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       soon: 0,
       news: [],
       applying: 0,
+      made: [],
       stale: false,
       listeners: new Set(),
       sub: () => () => undefined,
@@ -124,10 +134,34 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
     e.sub = (l) => subscribe(made, l);
     entries.set(key, e);
     prune();
+    events.changed();
   }
   e.fetcher = fetcher;
   e.opts = opts;
   return e;
+}
+
+/**
+ * `e` needs the server's events of its `on` types: it's shown, a load of it is on its way, or it
+ * holds data not yet known to be out of date (loaded ahead of being shown). One that's out of date
+ * and not shown loads again when it's shown, so it needs none.
+ */
+function interested(e: Entry): boolean {
+  return Boolean(e.opts.on?.length) && (e.listeners.size > 0 || e.promise !== null || (e.snap.has && !e.stale));
+}
+
+/** The event types the keys need now (`interested`). */
+export function wantedTypes(): Set<string> {
+  const all = new Set<string>();
+  for (const e of entries.values()) if (interested(e)) for (const t of e.opts.on ?? []) all.add(t);
+  return all;
+}
+
+/** `e` is out of date: the stream needn't bring it events till it's shown again. */
+function stale(e: Entry) {
+  if (e.stale) return;
+  e.stale = true;
+  events.changed();
 }
 
 function prune() {
@@ -180,6 +214,9 @@ function load(e: Entry): Promise<void> {
   }
   e.stale = false;
   e.again = false;
+  e.made = [];
+  // Asked for before it's fetched: what changes while it loads isn't missed.
+  events.changed();
   const p: Promise<void> = e
     .fetcher(new AbortController().signal)
     .then(
@@ -187,7 +224,10 @@ function load(e: Entry): Promise<void> {
         const first = !e.snap.has;
         // Settled for React before anyone hears of the data: the render it replays reads on at once.
         Object.assign(p, { status: "fulfilled", value: undefined });
-        set(e, { data, has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
+        // Read before what presses changed meanwhile: those changes stand over it.
+        const made = e.made;
+        e.made = [];
+        set(e, { data: made.reduce((d, fn) => fn(d), data), has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
         if (first) land();
       },
       (error: unknown) => {
@@ -204,6 +244,7 @@ function load(e: Entry): Promise<void> {
     .finally(() => {
       e.promise = null;
       e.settled = Date.now();
+      events.changed();
       if (e.again) {
         e.again = false;
         e.later = false;
@@ -220,13 +261,13 @@ function load(e: Entry): Promise<void> {
 
 function refresh(e: Entry) {
   if (e.listeners.size > 0) void load(e);
-  else e.stale = true;
+  else stale(e);
 }
 
 /** Refresh for the server's events: not sooner than `EVENT_GAP_MS` after the last load. */
 function soon(e: Entry) {
   if (e.listeners.size === 0) {
-    e.stale = true;
+    stale(e);
     return;
   }
   if (e.promise) {
@@ -254,7 +295,7 @@ function take(e: Entry, ev: ServerEvent) {
     const news = e.news;
     e.news = [];
     if (e.listeners.size === 0) {
-      e.stale = true;
+      stale(e);
       return;
     }
     let data = e.snap.data;
@@ -276,6 +317,7 @@ function subscribe(e: Entry, l: () => void) {
   e.listeners.add(l);
   e.used = Date.now();
   if (e.listeners.size === 1) {
+    events.changed();
     if (e.stale) {
       if (e.promise) e.later = true;
       else void load(e);
@@ -291,7 +333,8 @@ function subscribe(e: Entry, l: () => void) {
     if (e.listeners.size === 0) {
       if (e.poll !== null) window.clearInterval(e.poll);
       e.poll = null;
-      e.stale = true;
+      stale(e);
+      events.changed();
       e.used = Date.now();
     }
   };
@@ -316,8 +359,16 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     refreshing: snap.refreshing,
     reload: () => void load(e),
     setData: (fn) => set(e, { data: fn(e.snap.data as T), has: true }),
+    change: (fn) => changed(e, fn as (prev: unknown) => unknown),
     refreshError: snap.refreshError,
   };
+}
+
+/** `change`, of entry `e`. */
+function changed(e: Entry, fn: (prev: unknown) => unknown) {
+  if (!e.snap.has) return;
+  if (e.promise) e.made.push(fn);
+  set(e, { data: fn(e.snap.data) });
 }
 
 /**
@@ -341,6 +392,17 @@ export function loaded<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOption
   return e.promise ?? load(e);
 }
 
+/**
+ * Follows `key` outside a component, as a shown `useSuspenseResource` of it does (its first load
+ * starts now): `listener` hears each change. What a store that keeps a key current uses, and tests.
+ */
+export function watch<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T>, listener: () => void): () => void {
+  const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  const off = e.sub(listener);
+  if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
+  return off;
+}
+
 /** Refreshes every key that starts with `prefix` (all of them for ""). */
 export function invalidate(prefix = "") {
   for (const e of entries.values()) if (e.key.startsWith(prefix)) refresh(e);
@@ -352,22 +414,29 @@ export function setData<T>(key: string, fn: (prev: T) => T) {
   if (e?.snap.has) set(e, { data: fn(e.snap.data as T), has: true });
 }
 
+/** `useSuspenseResource`'s `change` from outside a component: what a press shows at once, standing over a load already on its way. */
+export function change<T>(key: string, fn: (prev: T) => T) {
+  const e = entries.get(key);
+  if (e) changed(e, fn as (prev: unknown) => unknown);
+}
+
 /** Lets the keys whose first load failed try again (`Loadable`'s Try again). */
 export function retryFailed() {
   for (const e of entries.values()) if (e.snap.failed) e.snap = { ...e.snap, failed: false, error: undefined };
 }
 
-events.on((ev) => {
+events.on(wantedTypes, (ev) => {
   if (ev.type === "resync") {
     for (const e of entries.values()) soon(e);
     return;
   }
   for (const e of entries.values()) {
     if (!e.opts.on?.includes(ev.type)) continue;
-    if (e.listeners.size === 0) e.stale = true;
+    if (e.listeners.size === 0) stale(e);
     else if (e.opts.apply) take(e, ev);
     else soon(e);
   }
 });
-// The server restarted, or the network came back: what's shown may be out of date.
-events.onReopen(() => invalidate());
+// The stream came back without what it missed (the server restarted, or it was away too long):
+// what's shown may be out of date. One that resumed was sent what it missed.
+events.onMissed(() => invalidate());

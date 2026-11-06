@@ -1,0 +1,2268 @@
+Subject: Mantle's changes: MD5, fallible digests, a digest's state, one-shot HMAC, TLS 1.3 vectored sealing, AES-CBC-HMAC, AES-192 key wrap, a cloneable LessSafeKey
+Why: Mantle (vendored at vendor/mantle, kiln's CP-T10.2) builds on these, which upstream doesn't have: S3's ETags and Content-MD5 are MD5; production code never panics (Context::try_new, try_update, try_finish); a native upload keeps its object's MD5 running across the runs it's cut into (digest::State, Context::state and resume); hmac::sign_once's one-shot HMAC (187 ns where a copied Key took 255 ns); TLS 1.3 records sealed from several slices at once; JWE's A128CBC-HS256 to A256CBC-HS512 and A192KW; LessSafeKey cloned through EVP_AEAD_CTX_copy (aws/aws-lc-rs#1165); and autotests on, so the tests these add run. Mantle made them on 1.18.1 (its vendor/UPSTREAM.md at 17eb8032); here they are on 1.18.2, the release kiln takes, where they apply unchanged.
+
+diff --git a/aws-lc-rs/Cargo.toml b/aws-lc-rs/Cargo.toml
+index eaed2ad82004c0ecf0db6a03a63116d4a7ec995e..68d10c873dc5107f5fab74412e4e6c610472dd58 100644
+--- a/aws-lc-rs/Cargo.toml
++++ b/aws-lc-rs/Cargo.toml
+@@ -28,7 +28,7 @@ exclude = [
+ autolib = false
+ autobins = false
+ autoexamples = false
+-autotests = false
++autotests = true
+ autobenches = false
+ description = "aws-lc-rs is a cryptographic library using AWS-LC for its cryptographic operations. This library strives to be API-compatible with the popular Rust library named ring."
+ homepage = "https://github.com/aws/aws-lc-rs"
+diff --git a/aws-lc-rs/src/aead.rs b/aws-lc-rs/src/aead.rs
+index 411546d1d395b421a3c510e977cd18aab186678d..e13710f8a85346c198c16c941f2c6c4f2973ec43 100644
+--- a/aws-lc-rs/src/aead.rs
++++ b/aws-lc-rs/src/aead.rs
+@@ -189,6 +189,8 @@ use core::stringify;
+ 
+ mod aead_ctx;
+ mod aes_gcm;
++// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
++pub mod cbc_hmac;
+ mod chacha;
+ pub mod chacha20_poly1305_openssh;
+ mod nonce;
+@@ -204,6 +206,9 @@ pub use self::chacha::CHACHA20_POLY1305;
+ pub use self::nonce::{Nonce, NONCE_LEN};
+ pub use self::rand_nonce::RandomizedNonceKey;
+ pub use self::tls::{TlsProtocolId, TlsRecordOpeningKey, TlsRecordSealingKey};
++// mantle: aws-lc-rs#1241 (vendor/UPSTREAM.md).
++#[cfg(not(feature = "fips"))]
++pub use self::tls::Tls13VectoredSealingKey;
+ pub use self::unbound_key::UnboundKey;
+ 
+ /// A sequences of unique nonces.
+@@ -997,6 +1002,18 @@ impl LessSafeKey {
+     }
+ }
+ 
++// mantle: `Clone` as ring's `LessSafeKey` has had since 0.17 (aws-lc-rs#1165;
++// vendor/UPSTREAM.md).
++impl Clone for LessSafeKey {
++    /// A key with its own copy of the context, made by `EVP_AEAD_CTX_copy`. Every algorithm a
++    /// `LessSafeKey` holds can be copied, so this fails only if allocation does.
++    fn clone(&self) -> Self {
++        Self {
++            key: self.key.try_clone().expect("Unable to clone LessSafeKey"),
++        }
++    }
++}
++
+ impl Debug for LessSafeKey {
+     fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+         f.debug_struct("LessSafeKey")
+@@ -1099,6 +1116,60 @@ mod tests {
+     #[cfg(feature = "fips")]
+     mod fips;
+ 
++    /// A clone seals and opens as the key it came from, each opens what the other sealed,
++    /// and a clone outlives the original and crosses threads (aws-lc-rs#1165).
++    #[test]
++    fn less_safe_key_clones_are_independent_copies() {
++        let algorithms: [(&'static Algorithm, &[u8]); 6] = [
++            (&AES_128_GCM, &[1u8; 16]),
++            (&AES_192_GCM, &[2u8; 24]),
++            (&AES_256_GCM, &[3u8; 32]),
++            (&AES_128_GCM_SIV, &[4u8; 16]),
++            (&AES_256_GCM_SIV, &[5u8; 32]),
++            (&CHACHA20_POLY1305, &[6u8; 32]),
++        ];
++        for (algorithm, key_bytes) in algorithms {
++            let key = LessSafeKey::new(UnboundKey::new(algorithm, key_bytes).unwrap());
++            let clone = key.clone();
++            assert_eq!(key.algorithm(), clone.algorithm());
++            let nonce = || Nonce::assume_unique_for_key([7u8; NONCE_LEN]);
++            let plaintext = b"sealed by one key, opened by its clone".to_vec();
++
++            let mut by_key = plaintext.clone();
++            key.seal_in_place_append_tag(nonce(), Aad::from(b"aad"), &mut by_key)
++                .unwrap();
++            let mut by_clone = plaintext.clone();
++            clone
++                .seal_in_place_append_tag(nonce(), Aad::from(b"aad"), &mut by_clone)
++                .unwrap();
++            assert_eq!(by_key, by_clone, "{algorithm:?}");
++
++            let opened = clone
++                .open_in_place(nonce(), Aad::from(b"aad"), &mut by_key)
++                .unwrap();
++            assert_eq!(opened, plaintext.as_slice());
++            let opened = key
++                .open_in_place(nonce(), Aad::from(b"aad"), &mut by_clone)
++                .unwrap();
++            assert_eq!(opened, plaintext.as_slice());
++
++            // The clone owns its context: it works after the original is gone, on another
++            // thread.
++            drop(key);
++            let handle = std::thread::spawn(move || {
++                let mut sealed = b"x".to_vec();
++                clone
++                    .seal_in_place_append_tag(nonce(), Aad::empty(), &mut sealed)
++                    .unwrap();
++                clone
++                    .open_in_place(nonce(), Aad::empty(), &mut sealed)
++                    .unwrap()
++                    .to_vec()
++            });
++            assert_eq!(handle.join().unwrap(), b"x");
++        }
++    }
++
+     #[test]
+     fn test_aes_128() {
+         let key = from_hex("000102030405060708090a0b0c0d0e0f").unwrap();
+diff --git a/aws-lc-rs/src/aead/aead_ctx.rs b/aws-lc-rs/src/aead/aead_ctx.rs
+index 082552d15ba4c29298caeb8377239f8e50af5150..af4fee787874f53297791f9ee5d9753c930a7a48 100644
+--- a/aws-lc-rs/src/aead/aead_ctx.rs
++++ b/aws-lc-rs/src/aead/aead_ctx.rs
+@@ -8,11 +8,12 @@ use crate::cipher::chacha;
+ 
+ use crate::aws_lc::{
+     evp_aead_direction_t, evp_aead_direction_t_evp_aead_open, evp_aead_direction_t_evp_aead_seal,
+-    EVP_AEAD_CTX_init, EVP_AEAD_CTX_init_with_direction, EVP_AEAD_CTX_zero, EVP_aead_aes_128_gcm,
+-    EVP_aead_aes_128_gcm_randnonce, EVP_aead_aes_128_gcm_siv, EVP_aead_aes_128_gcm_tls12,
+-    EVP_aead_aes_128_gcm_tls13, EVP_aead_aes_192_gcm, EVP_aead_aes_256_gcm,
+-    EVP_aead_aes_256_gcm_randnonce, EVP_aead_aes_256_gcm_siv, EVP_aead_aes_256_gcm_tls12,
+-    EVP_aead_aes_256_gcm_tls13, EVP_aead_chacha20_poly1305, OPENSSL_malloc, EVP_AEAD_CTX,
++    EVP_AEAD_CTX_copy, EVP_AEAD_CTX_init, EVP_AEAD_CTX_init_with_direction, EVP_AEAD_CTX_zero,
++    EVP_aead_aes_128_gcm, EVP_aead_aes_128_gcm_randnonce, EVP_aead_aes_128_gcm_siv,
++    EVP_aead_aes_128_gcm_tls12, EVP_aead_aes_128_gcm_tls13, EVP_aead_aes_192_gcm,
++    EVP_aead_aes_256_gcm, EVP_aead_aes_256_gcm_randnonce, EVP_aead_aes_256_gcm_siv,
++    EVP_aead_aes_256_gcm_tls12, EVP_aead_aes_256_gcm_tls13, EVP_aead_chacha20_poly1305,
++    OPENSSL_malloc, EVP_AEAD_CTX,
+ };
+ use crate::cipher::aes::{AES_128_KEY_LEN, AES_192_KEY_LEN, AES_256_KEY_LEN};
+ use crate::error::Unspecified;
+@@ -232,6 +233,33 @@ impl AeadCtx {
+         AeadCtx::build_context(aead, key_bytes, tag_len, direction)
+     }
+ 
++    // mantle: a copy for `Clone` on `LessSafeKey` (aws-lc-rs#1165; vendor/UPSTREAM.md).
++    /// A copy of this context in an `EVP_AEAD_CTX` of its own. AWS-LC copies every AEAD here
++    /// but the TLS record AEADs, whose nonce checks keep state; a copy of one of those, or an
++    /// allocation that fails, is an error.
++    pub(crate) fn try_clone(&self) -> Result<Self, Unspecified> {
++        let mut copy: LcPtr<EVP_AEAD_CTX> =
++            LcPtr::new(unsafe { OPENSSL_malloc(size_of::<EVP_AEAD_CTX>()) }.cast())?;
++        unsafe { EVP_AEAD_CTX_zero(copy.as_mut_ptr()) };
++        if 1 != unsafe { EVP_AEAD_CTX_copy(copy.as_mut_ptr(), self.as_ref().as_const_ptr()) } {
++            return Err(Unspecified);
++        }
++        Ok(match self {
++            AeadCtx::AES_128_GCM(_) => AeadCtx::AES_128_GCM(copy),
++            AeadCtx::AES_192_GCM(_) => AeadCtx::AES_192_GCM(copy),
++            AeadCtx::AES_256_GCM(_) => AeadCtx::AES_256_GCM(copy),
++            AeadCtx::AES_128_GCM_SIV(_) => AeadCtx::AES_128_GCM_SIV(copy),
++            AeadCtx::AES_256_GCM_SIV(_) => AeadCtx::AES_256_GCM_SIV(copy),
++            AeadCtx::AES_128_GCM_RANDNONCE(_) => AeadCtx::AES_128_GCM_RANDNONCE(copy),
++            AeadCtx::AES_256_GCM_RANDNONCE(_) => AeadCtx::AES_256_GCM_RANDNONCE(copy),
++            AeadCtx::AES_128_GCM_TLS12(_) => AeadCtx::AES_128_GCM_TLS12(copy),
++            AeadCtx::AES_256_GCM_TLS12(_) => AeadCtx::AES_256_GCM_TLS12(copy),
++            AeadCtx::AES_128_GCM_TLS13(_) => AeadCtx::AES_128_GCM_TLS13(copy),
++            AeadCtx::AES_256_GCM_TLS13(_) => AeadCtx::AES_256_GCM_TLS13(copy),
++            AeadCtx::CHACHA20_POLY1305(_) => AeadCtx::CHACHA20_POLY1305(copy),
++        })
++    }
++
+     fn build_context(
+         aead_fn: unsafe extern "C" fn() -> *const aws_lc::evp_aead_st,
+         key_bytes: &[u8],
+diff --git a/aws-lc-rs/src/aead/cbc_hmac.rs b/aws-lc-rs/src/aead/cbc_hmac.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..59d1e864281f3e60e3a11849a3ea95d856ec1c01
+--- /dev/null
++++ b/aws-lc-rs/src/aead/cbc_hmac.rs
+@@ -0,0 +1,411 @@
++// mantle: AES-CBC with HMAC-SHA-2, the content encryption JWE uses (aws-lc-rs#617;
++// vendor/UPSTREAM.md).
++
++//! Authenticated encryption with AES-CBC and HMAC-SHA-2, as RFC 7518 §5.2 defines it for
++//! JSON Web Encryption: `A128CBC-HS256`, `A192CBC-HS384` and `A256CBC-HS512`.
++//!
++//! The key's first half keys HMAC and its second half AES. Sealing pads the plaintext with
++//! PKCS #7 and encrypts it with AES-CBC under a 128-bit IV. The tag is the HMAC of the
++//! additional data, the IV, the ciphertext, and the additional data's length in bits as a
++//! 64-bit big-endian number, cut to half the HMAC's output. Opening checks the tag, in
++//! constant time, before it decrypts anything.
++//!
++//! CBC needs an IV that cannot be predicted, so [`Key::seal_in_place`] draws one at random.
++//! [`Key::less_safe_seal_in_place`] takes the caller's, for known-answer tests.
++
++use crate::cipher::{
++    self, DecryptionContext, EncryptionContext, PaddedBlockDecryptingKey, PaddedBlockEncryptingKey,
++    UnboundCipherKey,
++};
++use crate::error::Unspecified;
++use crate::iv::FixedLength;
++use crate::{constant_time, hmac, rand};
++use core::fmt::Debug;
++
++/// The length of an IV.
++pub const IV_LEN: usize = 16;
++
++/// The longest tag, `A256CBC-HS512`'s.
++const MAX_TAG_LEN: usize = 32;
++
++/// An AES-CBC with HMAC-SHA-2 algorithm.
++pub struct Algorithm {
++    name: &'static str,
++    key_len: usize,
++    cipher: &'static cipher::Algorithm,
++    mac: hmac::Algorithm,
++    tag_len: usize,
++}
++
++impl Algorithm {
++    /// The key's length in bytes: the HMAC key's and the AES key's together.
++    #[must_use]
++    pub fn key_len(&self) -> usize {
++        self.key_len
++    }
++
++    /// The tag's length in bytes.
++    #[must_use]
++    pub fn tag_len(&self) -> usize {
++        self.tag_len
++    }
++}
++
++impl Debug for Algorithm {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.write_str(self.name)
++    }
++}
++
++/// `A128CBC-HS256`: AES-128-CBC and HMAC-SHA-256, a 32-byte key and a 16-byte tag.
++pub const AES_128_CBC_HMAC_SHA_256: Algorithm = Algorithm {
++    name: "AES_128_CBC_HMAC_SHA_256",
++    key_len: 32,
++    cipher: &cipher::AES_128,
++    mac: hmac::HMAC_SHA256,
++    tag_len: 16,
++};
++
++/// `A192CBC-HS384`: AES-192-CBC and HMAC-SHA-384, a 48-byte key and a 24-byte tag.
++pub const AES_192_CBC_HMAC_SHA_384: Algorithm = Algorithm {
++    name: "AES_192_CBC_HMAC_SHA_384",
++    key_len: 48,
++    cipher: &cipher::AES_192,
++    mac: hmac::HMAC_SHA384,
++    tag_len: 24,
++};
++
++/// `A256CBC-HS512`: AES-256-CBC and HMAC-SHA-512, a 64-byte key and a 32-byte tag.
++pub const AES_256_CBC_HMAC_SHA_512: Algorithm = Algorithm {
++    name: "AES_256_CBC_HMAC_SHA_512",
++    key_len: 64,
++    cipher: &cipher::AES_256,
++    mac: hmac::HMAC_SHA512,
++    tag_len: 32,
++};
++
++/// An authentication tag.
++#[derive(Clone, Copy)]
++pub struct Tag {
++    bytes: [u8; MAX_TAG_LEN],
++    len: usize,
++}
++
++impl AsRef<[u8]> for Tag {
++    fn as_ref(&self) -> &[u8] {
++        self.bytes.get(..self.len).unwrap_or(&[])
++    }
++}
++
++impl Debug for Tag {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("Tag").finish_non_exhaustive()
++    }
++}
++
++/// An AES-CBC with HMAC-SHA-2 key, for sealing and opening.
++pub struct Key {
++    algorithm: &'static Algorithm,
++    mac: hmac::Key,
++    encrypting: PaddedBlockEncryptingKey,
++    decrypting: PaddedBlockDecryptingKey,
++}
++
++impl Key {
++    /// A key for `algorithm` from `key_bytes`, `algorithm.key_len()` bytes: the HMAC key, then
++    /// the AES key.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if `key_bytes` has the wrong length or a key cannot be made.
++    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<Self, Unspecified> {
++        if key_bytes.len() != algorithm.key_len {
++            return Err(Unspecified);
++        }
++        let (mac_key, enc_key) = key_bytes.split_at(algorithm.key_len / 2);
++        Ok(Self {
++            algorithm,
++            mac: hmac::Key::try_new(algorithm.mac, mac_key)?,
++            encrypting: PaddedBlockEncryptingKey::cbc_pkcs7(UnboundCipherKey::new(
++                algorithm.cipher,
++                enc_key,
++            )?)?,
++            decrypting: PaddedBlockDecryptingKey::cbc_pkcs7(UnboundCipherKey::new(
++                algorithm.cipher,
++                enc_key,
++            )?)?,
++        })
++    }
++
++    /// Seals `in_out` under a random IV: pads and encrypts the plaintext in place, and returns
++    /// the IV and the tag.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if no random IV can be drawn or sealing fails.
++    pub fn seal_in_place<InOut>(
++        &self,
++        aad: &[u8],
++        in_out: &mut InOut,
++    ) -> Result<([u8; IV_LEN], Tag), Unspecified>
++    where
++        InOut: AsMut<[u8]> + for<'a> Extend<&'a u8>,
++    {
++        let mut iv = [0u8; IV_LEN];
++        rand::fill(&mut iv)?;
++        let tag = self.less_safe_seal_in_place(iv, aad, in_out)?;
++        Ok((iv, tag))
++    }
++
++    /// Seals `in_out` under the caller's `iv`, which must not be predictable, as CBC
++    /// requires: pads and encrypts the plaintext in place, and returns the tag.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if sealing fails.
++    pub fn less_safe_seal_in_place<InOut>(
++        &self,
++        iv: [u8; IV_LEN],
++        aad: &[u8],
++        in_out: &mut InOut,
++    ) -> Result<Tag, Unspecified>
++    where
++        InOut: AsMut<[u8]> + for<'a> Extend<&'a u8>,
++    {
++        self.encrypting
++            .less_safe_encrypt(in_out, EncryptionContext::Iv128(FixedLength::from(iv)))?;
++        self.tag(&iv, aad, in_out.as_mut())
++    }
++
++    /// Opens `in_out`, a ciphertext sealed under `iv` with `aad`, if `tag` authenticates them,
++    /// and returns the plaintext, a prefix of `in_out`. Nothing is decrypted unless the tag
++    /// matches.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if the tag does not match, the ciphertext is not whole blocks, or
++    /// its padding is not PKCS #7's.
++    pub fn open_in_place<'in_out>(
++        &self,
++        iv: &[u8; IV_LEN],
++        aad: &[u8],
++        in_out: &'in_out mut [u8],
++        tag: &[u8],
++    ) -> Result<&'in_out mut [u8], Unspecified> {
++        let expected = self.tag(iv, aad, in_out)?;
++        constant_time::verify_slices_are_equal(expected.as_ref(), tag)?;
++        self.decrypting
++            .decrypt(in_out, DecryptionContext::Iv128(FixedLength::from(*iv)))
++    }
++
++    /// The key's algorithm.
++    #[must_use]
++    pub fn algorithm(&self) -> &'static Algorithm {
++        self.algorithm
++    }
++
++    /// `HMAC(MAC_KEY, A || IV || E || AL)` cut to the tag's length (RFC 7518 §5.2.2.1).
++    fn tag(&self, iv: &[u8; IV_LEN], aad: &[u8], ciphertext: &[u8]) -> Result<Tag, Unspecified> {
++        let aad_bits = u64::try_from(aad.len())
++            .ok()
++            .and_then(|len| len.checked_mul(8))
++            .ok_or(Unspecified)?;
++        let mut mac = hmac::Context::try_with_key(&self.mac)?;
++        mac.try_update(aad)?;
++        mac.try_update(iv)?;
++        mac.try_update(ciphertext)?;
++        mac.try_update(&aad_bits.to_be_bytes())?;
++        let full = mac.try_sign()?;
++        let len = self.algorithm.tag_len;
++        let mut tag = Tag {
++            bytes: [0u8; MAX_TAG_LEN],
++            len,
++        };
++        tag.bytes
++            .get_mut(..len)
++            .ok_or(Unspecified)?
++            .copy_from_slice(full.as_ref().get(..len).ok_or(Unspecified)?);
++        Ok(tag)
++    }
++}
++
++impl Debug for Key {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("Key")
++            .field("algorithm", &self.algorithm)
++            .finish_non_exhaustive()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        Algorithm, Key, AES_128_CBC_HMAC_SHA_256, AES_192_CBC_HMAC_SHA_384,
++        AES_256_CBC_HMAC_SHA_512, IV_LEN,
++    };
++    use crate::test::from_hex;
++
++    // RFC 7518 Appendix B: K, P, IV and A, and the ciphertext E and tag T they give.
++    const P: &str =
++        "41206369706865722073797374656d206d757374206e6f7420626520726571756972656420746f20\
++        6265207365637265742c20616e64206974206d7573742062652061626c6520746f2066616c6c2069\
++        6e746f207468652068616e6473206f662074686520656e656d7920776974686f757420696e636f6e\
++        76656e69656e6365";
++    const IV: &str = "1af38c2dc2b96ffdd86694092341bc04";
++    const A: &str =
++        "546865207365636f6e64207072696e6369706c65206f662041756775737465204b6572636b686f66\
++        6673";
++
++    struct Case {
++        algorithm: &'static Algorithm,
++        k: &'static str,
++        e: &'static str,
++        t: &'static str,
++    }
++
++    const CASES: [Case; 3] = [
++        Case {
++            algorithm: &AES_128_CBC_HMAC_SHA_256,
++            k: K_B1,
++            e: E_B1,
++            t: T_B1,
++        },
++        Case {
++            algorithm: &AES_192_CBC_HMAC_SHA_384,
++            k: K_B2,
++            e: E_B2,
++            t: T_B2,
++        },
++        Case {
++            algorithm: &AES_256_CBC_HMAC_SHA_512,
++            k: K_B3,
++            e: E_B3,
++            t: T_B3,
++        },
++    ];
++
++    const K_B1: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
++    const E_B1: &str =
++        "c80edfa32ddf39d5ef00c0b468834279a2e46a1b8049f792f76bfe54b903a9c9a94ac9b47ad2655c\
++        5f10f9aef71427e2fc6f9b3f399a221489f16362c703233609d45ac69864e3321cf82935ac4096c8\
++        6e133314c54019e8ca7980dfa4b9cf1b384c486f3a54c51078158ee5d79de59fbd34d848b3d69550\
++        a67646344427ade54b8851ffb598f7f80074b9473c82e2db";
++    const T_B1: &str = "652c3fa36b0a7c5b3219fab3a30bc1c4";
++    const K_B2: &str =
++        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627\
++        28292a2b2c2d2e2f";
++    const E_B2: &str =
++        "ea65da6b59e61edb419be62d19712ae5d303eeb50052d0dfd6697f77224c8edb000d279bdc14c107\
++        2654bd30944230c657bed4ca0c9f4a8466f22b226d1746214bf8cfc2400add9f5126e479663fc90b\
++        3bed787a2f0ffcbf3904be2a641d5c2105bfe591bae23b1d7449e532eef60a9ac8bb6c6b01d35d49\
++        787bcd57ef484927f280adc91ac0c4e79c7b11efc60054e3";
++    const T_B2: &str = "8490ac0e58949bfe51875d733f93ac2075168039ccc733d7";
++    const K_B3: &str =
++        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627\
++        28292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
++    const E_B3: &str =
++        "4affaaadb78c31c5da4b1b590d10ffbd3dd8d5d302423526912da037ecbcc7bd822c301dd67c373b\
++        ccb584ad3e9279c2e6d12a1374b77f077553df829410446b36ebd97066296ae6427ea75c2e0846a1\
++        1a09ccf5370dc80bfecbad28c73f09b3a3b75e662a2594410ae496b2e2e6609e31e6e02cc837f053\
++        d21f37ff4f51950bbe2638d09dd7a4930930806d0703b1f6";
++    const T_B3: &str = "4dd3b4c088a7f45c216839645b2012bf2e6269a8c56a816dbc1b267761955bc5";
++
++    fn iv() -> [u8; IV_LEN] {
++        from_hex(IV).unwrap().try_into().unwrap()
++    }
++
++    #[test]
++    fn rfc_7518_appendix_b() {
++        for case in &CASES {
++            let key = Key::new(case.algorithm, &from_hex(case.k).unwrap()).unwrap();
++            let aad = from_hex(A).unwrap();
++            let mut in_out = from_hex(P).unwrap();
++            let tag = key
++                .less_safe_seal_in_place(iv(), &aad, &mut in_out)
++                .unwrap();
++            assert_eq!(in_out, from_hex(case.e).unwrap(), "{:?}", case.algorithm);
++            assert_eq!(tag.as_ref(), from_hex(case.t).unwrap().as_slice());
++            assert_eq!(tag.as_ref().len(), case.algorithm.tag_len());
++
++            let opened = key
++                .open_in_place(&iv(), &aad, &mut in_out, tag.as_ref())
++                .unwrap();
++            assert_eq!(opened, from_hex(P).unwrap().as_slice());
++        }
++    }
++
++    #[test]
++    fn a_changed_byte_anywhere_is_refused_before_decrypting() {
++        for case in &CASES {
++            let key = Key::new(case.algorithm, &from_hex(case.k).unwrap()).unwrap();
++            let aad = from_hex(A).unwrap();
++            let sealed = from_hex(case.e).unwrap();
++            let tag = from_hex(case.t).unwrap();
++
++            let mut changed = sealed.clone();
++            changed[20] ^= 1;
++            assert!(key.open_in_place(&iv(), &aad, &mut changed, &tag).is_err());
++            assert_eq!(changed[21..], sealed[21..], "decrypted despite a bad tag");
++
++            let mut bad_iv = iv();
++            bad_iv[0] ^= 1;
++            assert!(key
++                .open_in_place(&bad_iv, &aad, &mut sealed.clone(), &tag)
++                .is_err());
++            let mut bad_aad = aad.clone();
++            bad_aad[0] ^= 1;
++            assert!(key
++                .open_in_place(&iv(), &bad_aad, &mut sealed.clone(), &tag)
++                .is_err());
++            let mut bad_tag = tag.clone();
++            bad_tag[0] ^= 1;
++            assert!(key
++                .open_in_place(&iv(), &aad, &mut sealed.clone(), &bad_tag)
++                .is_err());
++            // A truncated tag, or the untruncated HMAC, is not the tag.
++            assert!(key
++                .open_in_place(&iv(), &aad, &mut sealed.clone(), &tag[..tag.len() - 1])
++                .is_err());
++        }
++    }
++
++    #[test]
++    fn random_ivs_round_trip_every_length() {
++        for case in &CASES {
++            let key = Key::new(case.algorithm, &from_hex(case.k).unwrap()).unwrap();
++            let mut ivs = Vec::new();
++            for len in [0usize, 1, 15, 16, 17, 100] {
++                let plaintext: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
++                let mut in_out = plaintext.clone();
++                let (iv, tag) = key.seal_in_place(b"header", &mut in_out).unwrap();
++                assert_eq!(in_out.len(), (len / 16 + 1) * 16, "PKCS #7 always pads");
++                let opened = key
++                    .open_in_place(&iv, b"header", &mut in_out, tag.as_ref())
++                    .unwrap();
++                assert_eq!(opened, plaintext.as_slice());
++                ivs.push(iv);
++            }
++            ivs.sort_unstable();
++            ivs.dedup();
++            assert_eq!(ivs.len(), 6, "an IV repeated");
++        }
++    }
++
++    #[test]
++    fn keys_of_the_wrong_length_are_refused() {
++        for case in &CASES {
++            let len = case.algorithm.key_len();
++            assert!(Key::new(case.algorithm, &vec![0u8; len - 1]).is_err());
++            assert!(Key::new(case.algorithm, &vec![0u8; len + 1]).is_err());
++            assert!(Key::new(case.algorithm, &vec![0u8; len]).is_ok());
++        }
++    }
++
++    #[test]
++    fn ciphertext_that_is_not_whole_blocks_is_refused() {
++        let key = Key::new(&AES_128_CBC_HMAC_SHA_256, &[7u8; 32]).unwrap();
++        let mut in_out = b"seventeen bytes!!".to_vec();
++        let (iv, _) = key.seal_in_place(b"", &mut in_out).unwrap();
++        in_out.pop();
++        let tag = key.tag(&iv, b"", &in_out).unwrap();
++        assert!(key
++            .open_in_place(&iv, b"", &mut in_out, tag.as_ref())
++            .is_err());
++    }
++}
+diff --git a/aws-lc-rs/src/aead/tls.rs b/aws-lc-rs/src/aead/tls.rs
+index b446aa4da25a3a24c8119c416a91559c81d0cc55..1f8fa91b82e4a529fb872201fcb7214575a0be88 100644
+--- a/aws-lc-rs/src/aead/tls.rs
++++ b/aws-lc-rs/src/aead/tls.rs
+@@ -332,6 +332,331 @@ impl Debug for TlsRecordOpeningKey {
+     }
+ }
+ 
++// mantle: TLS 1.3 sealing from several borrowed plaintext slices (aws-lc-rs#1241;
++// vendor/UPSTREAM.md).
++#[cfg(not(feature = "fips"))]
++pub use vectored::Tls13VectoredSealingKey;
++
++#[cfg(not(feature = "fips"))]
++mod vectored {
++    use super::super::{Aad, Algorithm, AlgorithmID, NONCE_LEN};
++    use crate::aws_lc::{
++        EVP_CIPHER_CTX_ctrl, EVP_CIPHER_CTX_new, EVP_EncryptFinal_ex, EVP_EncryptInit_ex,
++        EVP_EncryptUpdate, EVP_aes_128_gcm, EVP_aes_256_gcm, EVP_CIPHER_CTX, EVP_CTRL_GCM_GET_TAG,
++    };
++    use crate::error::Unspecified;
++    use crate::ptr::LcPtr;
++    use core::ffi::c_int;
++    use core::fmt::Debug;
++    use core::ptr::{null, null_mut};
++    use zeroize::Zeroize;
++
++    /// AES-GCM sealing key for TLS 1.3 records whose plaintext lies in several borrowed slices.
++    ///
++    /// A TLS 1.3 record's plaintext often arrives in pieces: a payload in several buffers,
++    /// then the inner content type and any padding (RFC 8446 §5.2). This key seals their
++    /// concatenation as one record, in one AES-GCM invocation with one nonce and one tag,
++    /// reading each piece where it lies. Its ciphertext and tag are byte for byte those
++    /// [`super::TlsRecordSealingKey`] produces for the same record.
++    ///
++    /// The key makes each record's nonce from the record's sequence number and the traffic
++    /// IV (RFC 8446 §5.3). TLS numbers records from 0 and one apart; the key refuses any
++    /// number not above every number it has sealed, so no nonce repeats, and refuses
++    /// `u64::MAX`, after which no number could follow, as AWS-LC's own TLS 1.3 AEAD does. A
++    /// seal consumes its sequence number before it encrypts anything, and a seal that fails
++    /// after that leaves the key refusing every later seal, so no nonce is used twice even
++    /// when encryption stops partway. The caller must then replace the key.
++    ///
++    /// The caller builds the additional data (the record header), supplies the inner content
++    /// type and padding as the last plaintext slices, and keeps to the cipher suite's limit
++    /// on records per key (RFC 8446 §5.5).
++    ///
++    /// Supports `AES_128_GCM` and `AES_256_GCM`. Not available with the `fips` feature: it
++    /// runs AES-GCM through the incremental `EVP_CIPHER` interface, with the nonce chosen
++    /// here, and makes no claim of FIPS approval.
++    pub struct Tls13VectoredSealingKey {
++        ctx: LcPtr<EVP_CIPHER_CTX>,
++        algorithm: &'static Algorithm,
++        iv: [u8; NONCE_LEN],
++        next_sequence: u64,
++        /// Set when a seal has consumed its sequence number and not yet completed; a seal
++        /// that fails or unwinds leaves it set.
++        failed: bool,
++    }
++
++    // SAFETY: the key owns its `EVP_CIPHER_CTX` alone and uses it only through `&mut self`.
++    unsafe impl Send for Tls13VectoredSealingKey {}
++
++    impl Tls13VectoredSealingKey {
++        /// A key for `algorithm` from a TLS 1.3 traffic key and IV (RFC 8446 §7.3).
++        ///
++        /// # Errors
++        /// `error::Unspecified` if the algorithm is not AES-GCM, `key_bytes` is not the
++        /// algorithm's key length, `iv` is not `NONCE_LEN` bytes, or AWS-LC cannot set the key.
++        pub fn new(
++            algorithm: &'static Algorithm,
++            key_bytes: &[u8],
++            iv: &[u8],
++        ) -> Result<Self, Unspecified> {
++            let cipher = match algorithm.id {
++                AlgorithmID::AES_128_GCM => unsafe { EVP_aes_128_gcm() },
++                AlgorithmID::AES_256_GCM => unsafe { EVP_aes_256_gcm() },
++                AlgorithmID::AES_192_GCM
++                | AlgorithmID::AES_128_GCM_SIV
++                | AlgorithmID::AES_256_GCM_SIV
++                | AlgorithmID::CHACHA20_POLY1305 => return Err(Unspecified),
++            };
++            if key_bytes.len() != algorithm.key_len() {
++                return Err(Unspecified);
++            }
++            let iv: [u8; NONCE_LEN] = iv.try_into().map_err(|_| Unspecified)?;
++            let mut ctx = LcPtr::new(unsafe { EVP_CIPHER_CTX_new() })?;
++            // AWS-LC copies the key into the context.
++            if 1 != unsafe {
++                EVP_EncryptInit_ex(
++                    ctx.as_mut_ptr(),
++                    cipher,
++                    null_mut(),
++                    key_bytes.as_ptr(),
++                    null(),
++                )
++            } {
++                return Err(Unspecified);
++            }
++            Ok(Self {
++                ctx,
++                algorithm,
++                iv,
++                next_sequence: 0,
++                failed: false,
++            })
++        }
++
++        /// Seals the record with sequence number `sequence`, writing its ciphertext and then
++        /// its tag to the start of `out`.
++        ///
++        /// `aad` is the record's additional data, its header (RFC 8446 §5.2). The plaintext
++        /// is the concatenation of the slices `plaintext` yields, `plaintext_len` bytes in
++        /// all; empty slices are allowed and slices need not align to blocks. `out` must hold
++        /// at least `plaintext_len + self.algorithm().tag_len()` bytes, and nothing past them
++        /// is written.
++        ///
++        /// # Errors
++        /// `error::Unspecified` if the key has failed before, `sequence` is not above every
++        /// sequence number this key has sealed or is `u64::MAX`, `out` is too short, or the
++        /// lengths exceed what AWS-LC takes: all refused before anything is encrypted, with
++        /// `out` untouched and the key still usable. Also if the slices do not add up to
++        /// `plaintext_len`, which is found without writing past `plaintext_len`, or
++        /// AWS-LC fails: then `out` may hold part of the ciphertext, and the key refuses
++        /// every later seal.
++        pub fn seal_vectored<'p, A, P>(
++            &mut self,
++            sequence: u64,
++            aad: Aad<A>,
++            plaintext: P,
++            plaintext_len: usize,
++            out: &mut [u8],
++        ) -> Result<(), Unspecified>
++        where
++            A: AsRef<[u8]>,
++            P: IntoIterator<Item = &'p [u8]>,
++        {
++            let sealed_len = plaintext_len
++                .checked_add(self.algorithm.tag_len())
++                .ok_or(Unspecified)?;
++            let out = out.get_mut(..sealed_len).ok_or(Unspecified)?;
++            self.begin(sequence, aad.as_ref(), plaintext_len)?;
++            // SAFETY: `out` is valid for `sealed_len` bytes.
++            unsafe { self.encrypt(plaintext, plaintext_len, out.as_mut_ptr()) }
++        }
++
++        /// Seals the record as [`Self::seal_vectored`] does, appending its ciphertext and tag
++        /// to `out`.
++        ///
++        /// The sealed bytes are written into `out`'s spare capacity, reserved first, and
++        /// `out`'s length covers them only once the seal has succeeded: the bytes `out`
++        /// held are kept, and no byte is exposed before it is written.
++        ///
++        /// # Errors
++        /// As for [`Self::seal_vectored`], and if the capacity cannot be reserved, which is
++        /// refused before anything is encrypted. On any error `out` keeps its length and
++        /// contents.
++        pub fn seal_vectored_append<'p, A, P>(
++            &mut self,
++            sequence: u64,
++            aad: Aad<A>,
++            plaintext: P,
++            plaintext_len: usize,
++            out: &mut Vec<u8>,
++        ) -> Result<(), Unspecified>
++        where
++            A: AsRef<[u8]>,
++            P: IntoIterator<Item = &'p [u8]>,
++        {
++            let sealed_len = plaintext_len
++                .checked_add(self.algorithm.tag_len())
++                .ok_or(Unspecified)?;
++            out.try_reserve(sealed_len).map_err(|_| Unspecified)?;
++            self.begin(sequence, aad.as_ref(), plaintext_len)?;
++            let start = out.len();
++            let spare = out.spare_capacity_mut();
++            if spare.len() < sealed_len {
++                return Err(Unspecified);
++            }
++            // SAFETY: the spare capacity is valid for writes of `sealed_len` bytes; AWS-LC
++            // writes bytes through the pointer and never reads them first.
++            unsafe { self.encrypt(plaintext, plaintext_len, spare.as_mut_ptr().cast::<u8>())? };
++            // SAFETY: `encrypt` succeeded, so it wrote all `sealed_len` bytes after `start`.
++            unsafe { out.set_len(start + sealed_len) };
++            Ok(())
++        }
++
++        /// The key's AEAD algorithm.
++        #[must_use]
++        pub fn algorithm(&self) -> &'static Algorithm {
++            self.algorithm
++        }
++
++        /// Checks `sequence` and the lengths, consumes the sequence number, and starts the
++        /// record: its nonce, then its additional data.
++        fn begin(
++            &mut self,
++            sequence: u64,
++            aad: &[u8],
++            plaintext_len: usize,
++        ) -> Result<(), Unspecified> {
++            if self.failed || sequence < self.next_sequence || sequence == u64::MAX {
++                return Err(Unspecified);
++            }
++            // `EVP_EncryptUpdate` takes `int` lengths; each slice is at most the whole.
++            c_int::try_from(plaintext_len).map_err(|_| Unspecified)?;
++            let aad_len = c_int::try_from(aad.len()).map_err(|_| Unspecified)?;
++            // From here the sequence number is spent, and the key stays failed unless the
++            // seal completes.
++            self.next_sequence = sequence + 1;
++            self.failed = true;
++
++            // RFC 8446 §5.3: the sequence number, big-endian and left-padded to the IV's
++            // length, XORed with the IV.
++            let mut nonce = self.iv;
++            for (n, s) in nonce[NONCE_LEN - 8..]
++                .iter_mut()
++                .zip(sequence.to_be_bytes())
++            {
++                *n ^= s;
++            }
++            // With no cipher and no key, AWS-LC keeps both and starts a new message under
++            // this nonce.
++            let started = unsafe {
++                EVP_EncryptInit_ex(
++                    self.ctx.as_mut_ptr(),
++                    null(),
++                    null_mut(),
++                    null(),
++                    nonce.as_ptr(),
++                )
++            };
++            nonce.zeroize();
++            if started != 1 {
++                return Err(Unspecified);
++            }
++            if !aad.is_empty() {
++                let mut written: c_int = 0;
++                // A null output makes the input additional data.
++                if 1 != unsafe {
++                    EVP_EncryptUpdate(
++                        self.ctx.as_mut_ptr(),
++                        null_mut(),
++                        &mut written,
++                        aad.as_ptr(),
++                        aad_len,
++                    )
++                } {
++                    return Err(Unspecified);
++                }
++            }
++            Ok(())
++        }
++
++        /// Encrypts the plaintext into `out`, then writes the tag after it.
++        ///
++        /// # Safety
++        /// `out` must be valid for writes of `plaintext_len + self.algorithm.tag_len()` bytes,
++        /// and `begin` must have succeeded for this record.
++        unsafe fn encrypt<'p, P>(
++            &mut self,
++            plaintext: P,
++            plaintext_len: usize,
++            out: *mut u8,
++        ) -> Result<(), Unspecified>
++        where
++            P: IntoIterator<Item = &'p [u8]>,
++        {
++            let mut done = 0usize;
++            for piece in plaintext {
++                if piece.is_empty() {
++                    continue;
++                }
++                // A slice past the declared length is refused before it is written.
++                let end = done
++                    .checked_add(piece.len())
++                    .filter(|&end| end <= plaintext_len)
++                    .ok_or(Unspecified)?;
++                let len = c_int::try_from(piece.len()).map_err(|_| Unspecified)?;
++                let mut written: c_int = 0;
++                if 1 != EVP_EncryptUpdate(
++                    self.ctx.as_mut_ptr(),
++                    out.add(done),
++                    &mut written,
++                    piece.as_ptr(),
++                    len,
++                ) || written != len
++                {
++                    return Err(Unspecified);
++                }
++                done = end;
++            }
++            if done != plaintext_len {
++                return Err(Unspecified);
++            }
++            let mut written: c_int = 0;
++            if 1 != EVP_EncryptFinal_ex(self.ctx.as_mut_ptr(), out.add(done), &mut written)
++                || written != 0
++            {
++                return Err(Unspecified);
++            }
++            let tag_len = c_int::try_from(self.algorithm.tag_len()).map_err(|_| Unspecified)?;
++            if 1 != EVP_CIPHER_CTX_ctrl(
++                self.ctx.as_mut_ptr(),
++                EVP_CTRL_GCM_GET_TAG,
++                tag_len,
++                out.add(done).cast(),
++            ) {
++                return Err(Unspecified);
++            }
++            self.failed = false;
++            Ok(())
++        }
++    }
++
++    impl Drop for Tls13VectoredSealingKey {
++        fn drop(&mut self) {
++            self.iv.zeroize();
++        }
++    }
++
++    #[allow(clippy::missing_fields_in_debug)]
++    impl Debug for Tls13VectoredSealingKey {
++        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++            f.debug_struct("Tls13VectoredSealingKey")
++                .field("algorithm", &self.algorithm)
++                .field("next_sequence", &self.next_sequence)
++                .field("failed", &self.failed)
++                .finish()
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{TlsProtocolId, TlsRecordOpeningKey, TlsRecordSealingKey};
+diff --git a/aws-lc-rs/src/aead/unbound_key.rs b/aws-lc-rs/src/aead/unbound_key.rs
+index cdce59851294bb1730aec5b1298d6d3e1fab3617..aa322b6366b12fa7f9dabbc866dea30021d22efa 100644
+--- a/aws-lc-rs/src/aead/unbound_key.rs
++++ b/aws-lc-rs/src/aead/unbound_key.rs
+@@ -583,6 +583,17 @@ impl UnboundKey {
+     }
+ }
+ 
++impl UnboundKey {
++    // mantle: for `Clone` on `LessSafeKey` (aws-lc-rs#1165; vendor/UPSTREAM.md).
++    /// A key with its own copy of this key's context.
++    pub(crate) fn try_clone(&self) -> Result<Self, Unspecified> {
++        Ok(Self {
++            ctx: self.ctx.try_clone()?,
++            algorithm: self.algorithm,
++        })
++    }
++}
++
+ impl From<AeadCtx> for UnboundKey {
+     fn from(value: AeadCtx) -> Self {
+         let algorithm = match value {
+diff --git a/aws-lc-rs/src/digest.rs b/aws-lc-rs/src/digest.rs
+index 18e68f98804ed2532f8615f5cf3f2c8e99f49a97..cb4e94312f2138eb0075315257dcc99c678792db 100644
+--- a/aws-lc-rs/src/digest.rs
++++ b/aws-lc-rs/src/digest.rs
+@@ -33,19 +33,22 @@ use crate::{debug, derive_debug_via_id};
+ 
+ pub(crate) mod digest_ctx;
+ mod sha;
++// mantle: a digest's state at a block boundary (vendor/UPSTREAM.md).
++mod state;
+ use crate::aws_lc::{
+-    EVP_DigestFinal, EVP_DigestUpdate, EVP_sha1, EVP_sha224, EVP_sha256, EVP_sha384, EVP_sha3_256,
+-    EVP_sha3_384, EVP_sha3_512, EVP_sha512, EVP_sha512_256, EVP_MD,
++    EVP_DigestFinal, EVP_DigestUpdate, EVP_md5, EVP_sha1, EVP_sha224, EVP_sha256, EVP_sha384,
++    EVP_sha3_256, EVP_sha3_384, EVP_sha3_512, EVP_sha512, EVP_sha512_256, EVP_MD,
+ };
+ use crate::error::Unspecified;
+ use crate::ptr::ConstPointer;
+ use core::ffi::c_uint;
+ use core::mem::MaybeUninit;
+ use digest_ctx::DigestContext;
++pub use state::State;
+ pub use sha::{
+-    SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224, SHA224_OUTPUT_LEN, SHA256,
+-    SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384, SHA3_512, SHA512, SHA512_256,
+-    SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
++    MD5_FOR_LEGACY_USE_ONLY, MD5_OUTPUT_LEN, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224,
++    SHA224_OUTPUT_LEN, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384,
++    SHA3_512, SHA512, SHA512_256, SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
+ };
+ 
+ /// A context for multi-step (Init-Update-Finish) digest calculations.
+@@ -90,6 +93,21 @@ impl Context {
+         }
+     }
+ 
++    /// Constructs a new context, as `new` does, returning an error where `new` panics.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if an aws-lc digest context cannot be initialized for the given
++    /// algorithm.
++    // mantle: public fallible form of `new` (vendor/UPSTREAM.md).
++    pub fn try_new(algorithm: &'static Algorithm) -> Result<Self, Unspecified> {
++        Ok(Self {
++            algorithm,
++            digest_ctx: DigestContext::new(algorithm)?,
++            msg_len: 0u64,
++            max_input_reached: false,
++        })
++    }
++
+     /// Updates the message to digest with all the data in `data`.
+     ///
+     /// # Panics
+@@ -99,8 +117,15 @@ impl Context {
+         Self::try_update(self, data).expect("digest update failed");
+     }
+ 
++    /// Updates the message to digest with all the data in `data`, as `update` does,
++    /// returning an error where `update` panics.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if the total input would exceed the algorithm's maximum, or the
++    /// update fails.
++    // mantle: public (vendor/UPSTREAM.md).
+     #[inline]
+-    fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
++    pub fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
+         unsafe {
+             // Check if the message has reached the algorithm's maximum allowed input, or overflowed
+             // the msg_len counter.
+@@ -137,8 +162,14 @@ impl Context {
+         Self::try_finish(self).expect("EVP_DigestFinal failed")
+     }
+ 
++    /// Finalizes the digest calculation, as `finish` does, returning an error where `finish`
++    /// panics.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if the digest cannot be finalized.
++    // mantle: public (vendor/UPSTREAM.md).
+     #[inline]
+-    fn try_finish(mut self) -> Result<Digest, Unspecified> {
++    pub fn try_finish(mut self) -> Result<Digest, Unspecified> {
+         let mut output = [0u8; MAX_OUTPUT_LEN];
+         let mut out_len = MaybeUninit::<c_uint>::uninit();
+         if 1 != indicator_check!(unsafe {
+@@ -328,6 +359,8 @@ impl Algorithm {
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(crate) enum AlgorithmID {
++    // mantle: MD5 (vendor/UPSTREAM.md).
++    MD5,
+     SHA1,
+     SHA224,
+     SHA256,
+@@ -365,6 +398,7 @@ pub const MAX_CHAINING_LEN: usize = MAX_OUTPUT_LEN;
+ pub(crate) fn match_digest_type(algorithm_id: &AlgorithmID) -> ConstPointer<'_, EVP_MD> {
+     unsafe {
+         ConstPointer::new_static(match algorithm_id {
++            AlgorithmID::MD5 => EVP_md5(),
+             AlgorithmID::SHA1 => EVP_sha1(),
+             AlgorithmID::SHA224 => EVP_sha224(),
+             AlgorithmID::SHA256 => EVP_sha256(),
+@@ -385,6 +419,65 @@ mod tests {
+     #[cfg(feature = "fips")]
+     mod fips;
+ 
++    // mantle: the fallible entry points agree with the panicking ones, and refuse input past
++    // the algorithm's maximum rather than panic.
++    #[test]
++    fn fallible_entry_points_agree_and_refuse_overlong_input() {
++        for algorithm in [
++            &digest::MD5_FOR_LEGACY_USE_ONLY,
++            &digest::SHA1_FOR_LEGACY_USE_ONLY,
++            &digest::SHA256,
++            &digest::SHA512,
++            &digest::SHA3_256,
++        ] {
++            let mut ctx = digest::Context::try_new(algorithm).unwrap();
++            ctx.try_update(b"a").unwrap();
++            ctx.try_update(b"bc").unwrap();
++            let want = digest::digest(algorithm, b"abc");
++            assert_eq!(ctx.try_finish().unwrap().as_ref(), want.as_ref());
++
++            let mut ctx = digest::Context::try_new(algorithm).unwrap();
++            ctx.msg_len = algorithm.max_input_len;
++            assert!(ctx.try_update(b"x").is_err());
++            let mut ctx = digest::Context::try_new(algorithm).unwrap();
++            ctx.msg_len = u64::MAX;
++            assert!(ctx.try_update(b"x").is_err());
++        }
++    }
++
++    // mantle: RFC 1321's test suite (appendix A.5), one-shot and in pieces.
++    #[test]
++    fn md5_matches_rfc_1321() {
++        let suite: [(&[u8], &str); 7] = [
++            (b"", "d41d8cd98f00b204e9800998ecf8427e"),
++            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
++            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
++            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
++            (
++                b"abcdefghijklmnopqrstuvwxyz",
++                "c3fcd3d76192e4007dfb496cca67e13b",
++            ),
++            (
++                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
++                "d174ab98d277d9f5a5611c2c9f419d9f",
++            ),
++            (
++                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
++                "57edf4a22be3c955ac49da2e2107b67a",
++            ),
++        ];
++        for (input, want) in suite {
++            let one_shot = digest::digest(&digest::MD5_FOR_LEGACY_USE_ONLY, input);
++            assert_eq!(crate::hex::encode(one_shot.as_ref()), want);
++            let mut ctx = digest::Context::new(&digest::MD5_FOR_LEGACY_USE_ONLY);
++            for piece in input.chunks(7) {
++                ctx.update(piece);
++            }
++            assert_eq!(ctx.finish().as_ref(), one_shot.as_ref());
++            assert_eq!(one_shot.algorithm().output_len(), digest::MD5_OUTPUT_LEN);
++        }
++    }
++
+     mod max_input {
+         extern crate alloc;
+ 
+diff --git a/aws-lc-rs/src/digest/sha.rs b/aws-lc-rs/src/digest/sha.rs
+index 2d3e5a532804cdbd0f08bace3aea4ff57187daca..745b24e2c258bd99dc7b53b8deeb755afeea4d82 100644
+--- a/aws-lc-rs/src/digest/sha.rs
++++ b/aws-lc-rs/src/digest/sha.rs
+@@ -56,6 +56,31 @@ pub const SHA3_512_OUTPUT_LEN: usize = 512 / 8;
+ #[allow(clippy::cast_possible_truncation)]
+ const DIGEST_MAX_INPUT_LEN: u64 = u64::MAX;
+ 
++// mantle: MD5 for protocols that require it, such as S3's `Content-MD5` and `ETag`
++// (vendor/UPSTREAM.md).
++
++/// The length of a block for MD5, in bytes.
++const MD5_BLOCK_LEN: usize = 512 / 8;
++
++/// The length of the output of MD5, in bytes.
++pub const MD5_OUTPUT_LEN: usize = 128 / 8;
++
++/// MD5 as specified in [RFC 1321]. Its collision resistance is broken; it is here for
++/// protocols that require it, such as S3's `Content-MD5` and `ETag`.
++///
++/// [RFC 1321]: https://www.rfc-editor.org/rfc/rfc1321
++#[allow(deprecated)]
++pub const MD5_FOR_LEGACY_USE_ONLY: Algorithm = Algorithm {
++    output_len: MD5_OUTPUT_LEN,
++    chaining_len: MD5_OUTPUT_LEN,
++    block_len: MD5_BLOCK_LEN,
++    max_input_len: DIGEST_MAX_INPUT_LEN,
++
++    one_shot_hash: md5_digest,
++
++    id: AlgorithmID::MD5,
++};
++
+ /// SHA-1 as specified in [FIPS 180-4]. Deprecated.
+ ///
+ /// [FIPS 180-4]: http://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
+@@ -197,6 +222,13 @@ pub const SHA3_512: Algorithm = Algorithm {
+     id: AlgorithmID::SHA3_512,
+ };
+ 
++fn md5_digest(msg: &[u8], output: &mut [u8]) {
++    let mut ctx = Context::new(&MD5_FOR_LEGACY_USE_ONLY);
++    ctx.update(msg);
++    let digest = ctx.finish();
++    output[0..MD5_OUTPUT_LEN].copy_from_slice(digest.as_ref());
++}
++
+ fn sha1_digest(msg: &[u8], output: &mut [u8]) {
+     unsafe {
+         aws_lc::SHA1(msg.as_ptr(), msg.len(), output.as_mut_ptr());
+diff --git a/aws-lc-rs/src/digest/state.rs b/aws-lc-rs/src/digest/state.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba827d5511c99b897a44e69cdddb49ebfd463f48
+--- /dev/null
++++ b/aws-lc-rs/src/digest/state.rs
+@@ -0,0 +1,348 @@
++// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0 OR ISC
++
++// mantle: a digest's state at a block boundary, read out of a context and resumed from
++// (vendor/UPSTREAM.md).
++
++use crate::aws_lc::{MD5_CTX, SHA256_CTX, SHA512_CTX, SHA_CTX};
++use crate::digest::{Algorithm, AlgorithmID, Context, MAX_CHAINING_LEN};
++use crate::error::Unspecified;
++
++/// A digest's state between two blocks: the chaining value its compression function carries and
++/// the bytes it has taken. It is taken only where no input waits in the context's buffer, so these
++/// two are the whole state, and [`Context::resume`] goes on from it as the context it was taken
++/// from would.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub struct State {
++    algorithm: &'static Algorithm,
++    chaining: [u8; MAX_CHAINING_LEN],
++    len: u64,
++}
++
++impl core::fmt::Debug for State {
++    // A chaining value can be keyed material (HMAC's inner and outer states), so it is not shown.
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("State")
++            .field("algorithm", self.algorithm)
++            .field("len", &self.len)
++            .finish_non_exhaustive()
++    }
++}
++
++/// How a family of algorithms keeps its state in AWS-LC.
++#[derive(Clone, Copy)]
++enum Family {
++    /// `MD5_CTX`: four 32-bit words, little-endian as MD5's digest writes them.
++    Md5,
++    /// `SHA_CTX`: five 32-bit words, big-endian.
++    Sha1,
++    /// `SHA256_CTX`, for SHA-224 and SHA-256: eight 32-bit words, big-endian.
++    Sha256,
++    /// `SHA512_CTX`, for SHA-384, SHA-512 and SHA-512/256: eight 64-bit words, big-endian.
++    Sha512,
++}
++
++impl Family {
++    /// The family of `algorithm` and the bytes of its chaining value; `None` for SHA-3, whose
++    /// sponge keeps no chaining value of this kind.
++    fn of(algorithm: &Algorithm) -> Option<(Self, usize)> {
++        match algorithm.id {
++            AlgorithmID::MD5 => Some((Self::Md5, 16)),
++            AlgorithmID::SHA1 => Some((Self::Sha1, 20)),
++            AlgorithmID::SHA224 | AlgorithmID::SHA256 => Some((Self::Sha256, 32)),
++            AlgorithmID::SHA384 | AlgorithmID::SHA512 | AlgorithmID::SHA512_256 => {
++                Some((Self::Sha512, 64))
++            }
++            AlgorithmID::SHA3_256 | AlgorithmID::SHA3_384 | AlgorithmID::SHA3_512 => None,
++        }
++    }
++}
++
++impl State {
++    /// A state from its parts, as [`State::chaining`] and [`State::len`] give them.
++    ///
++    /// # Errors
++    /// `error::Unspecified` for an algorithm that keeps no such state (SHA-3), a chaining value of
++    /// another length than the algorithm's, or a length that is not a whole number of blocks or
++    /// whose count of bits does not fit 64 bits.
++    pub fn new(
++        algorithm: &'static Algorithm,
++        chaining: &[u8],
++        len: u64,
++    ) -> Result<Self, Unspecified> {
++        let (_, chaining_len) = Family::of(algorithm).ok_or(Unspecified)?;
++        let block = u64::try_from(algorithm.block_len).map_err(|_| Unspecified)?;
++        if chaining.len() != chaining_len
++            || len % block != 0
++            || len.checked_mul(8).is_none()
++            || len > algorithm.max_input_len
++        {
++            return Err(Unspecified);
++        }
++        let mut state = Self {
++            algorithm,
++            chaining: [0u8; MAX_CHAINING_LEN],
++            len,
++        };
++        state.chaining[..chaining_len].copy_from_slice(chaining);
++        Ok(state)
++    }
++
++    /// The algorithm whose state it is.
++    #[must_use]
++    pub fn algorithm(&self) -> &'static Algorithm {
++        self.algorithm
++    }
++
++    /// The chaining value: its words in the byte order the algorithm's digest writes them.
++    #[must_use]
++    pub fn chaining(&self) -> &[u8] {
++        let len = Family::of(self.algorithm).map_or(0, |(_, len)| len);
++        &self.chaining[..len]
++    }
++
++    /// The bytes digested, a whole number of blocks.
++    #[must_use]
++    pub fn len(&self) -> u64 {
++        self.len
++    }
++
++    /// Whether no byte was digested.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.len == 0
++    }
++}
++
++impl Context {
++    /// The context's state, which it holds whole only at a block boundary.
++    ///
++    /// # Errors
++    /// `error::Unspecified` while input waits in the context's buffer, past a block boundary, or
++    /// for an algorithm that keeps no such state (SHA-3).
++    pub fn state(&self) -> Result<State, Unspecified> {
++        let (family, chaining_len) = Family::of(self.algorithm).ok_or(Unspecified)?;
++        let mut chaining = [0u8; MAX_CHAINING_LEN];
++        // The context was initialized for `self.algorithm` (`DigestContext::new`), so its
++        // `md_data` points to that algorithm's context, the struct `family` names.
++        let bits = unsafe {
++            let md_data = (*self.digest_ctx.as_ptr()).md_data;
++            if md_data.is_null() {
++                return Err(Unspecified);
++            }
++            match family {
++                Family::Md5 => {
++                    let ctx = &*md_data.cast::<MD5_CTX>();
++                    if ctx.num != 0 {
++                        return Err(Unspecified);
++                    }
++                    for (out, word) in chaining.chunks_exact_mut(4).zip(ctx.h.iter()) {
++                        out.copy_from_slice(&word.to_le_bytes());
++                    }
++                    (u64::from(ctx.Nh) << 32) | u64::from(ctx.Nl)
++                }
++                Family::Sha1 => {
++                    let ctx = &*md_data.cast::<SHA_CTX>();
++                    if ctx.num != 0 {
++                        return Err(Unspecified);
++                    }
++                    for (out, word) in chaining.chunks_exact_mut(4).zip(ctx.h.iter()) {
++                        out.copy_from_slice(&word.to_be_bytes());
++                    }
++                    (u64::from(ctx.Nh) << 32) | u64::from(ctx.Nl)
++                }
++                Family::Sha256 => {
++                    let ctx = &*md_data.cast::<SHA256_CTX>();
++                    if ctx.num != 0 {
++                        return Err(Unspecified);
++                    }
++                    for (out, word) in chaining.chunks_exact_mut(4).zip(ctx.h.iter()) {
++                        out.copy_from_slice(&word.to_be_bytes());
++                    }
++                    (u64::from(ctx.Nh) << 32) | u64::from(ctx.Nl)
++                }
++                Family::Sha512 => {
++                    let ctx = &*md_data.cast::<SHA512_CTX>();
++                    // A count of bits past 64 bits is past `max_input_len`.
++                    if ctx.num != 0 || ctx.Nh != 0 {
++                        return Err(Unspecified);
++                    }
++                    for (out, word) in chaining.chunks_exact_mut(8).zip(ctx.h.iter()) {
++                        out.copy_from_slice(&word.to_be_bytes());
++                    }
++                    ctx.Nl
++                }
++            }
++        };
++        // The context's own count and AWS-LC's must agree, in whole bytes.
++        if bits % 8 != 0 || bits / 8 != self.msg_len {
++            return Err(Unspecified);
++        }
++        State::new(self.algorithm, &chaining[..chaining_len], self.msg_len)
++    }
++
++    /// A context that goes on from `state` as the context it was taken from would.
++    ///
++    /// # Errors
++    /// `error::Unspecified` if an aws-lc digest context cannot be initialized for the state's
++    /// algorithm.
++    pub fn resume(state: &State) -> Result<Self, Unspecified> {
++        let (family, _) = Family::of(state.algorithm).ok_or(Unspecified)?;
++        let bits = state.len.checked_mul(8).ok_or(Unspecified)?;
++        let mut context = Self::try_new(state.algorithm)?;
++        // `try_new` initialized the context for the state's algorithm, so its `md_data` points to
++        // the struct `family` names; every field the next update and the final padding read is
++        // set, and `num` says no input waits in the buffer.
++        unsafe {
++            let md_data = (*context.digest_ctx.as_mut_ptr()).md_data;
++            if md_data.is_null() {
++                return Err(Unspecified);
++            }
++            let low = (bits & u64::from(u32::MAX)) as u32;
++            let high = (bits >> 32) as u32;
++            match family {
++                Family::Md5 => {
++                    let ctx = &mut *md_data.cast::<MD5_CTX>();
++                    for (word, bytes) in ctx.h.iter_mut().zip(state.chaining.chunks_exact(4)) {
++                        *word = u32::from_le_bytes(bytes.try_into().map_err(|_| Unspecified)?);
++                    }
++                    ctx.Nl = low;
++                    ctx.Nh = high;
++                    ctx.num = 0;
++                }
++                Family::Sha1 => {
++                    let ctx = &mut *md_data.cast::<SHA_CTX>();
++                    for (word, bytes) in ctx.h.iter_mut().zip(state.chaining.chunks_exact(4)) {
++                        *word = u32::from_be_bytes(bytes.try_into().map_err(|_| Unspecified)?);
++                    }
++                    ctx.Nl = low;
++                    ctx.Nh = high;
++                    ctx.num = 0;
++                }
++                Family::Sha256 => {
++                    let ctx = &mut *md_data.cast::<SHA256_CTX>();
++                    for (word, bytes) in ctx.h.iter_mut().zip(state.chaining.chunks_exact(4)) {
++                        *word = u32::from_be_bytes(bytes.try_into().map_err(|_| Unspecified)?);
++                    }
++                    ctx.Nl = low;
++                    ctx.Nh = high;
++                    ctx.num = 0;
++                }
++                Family::Sha512 => {
++                    let ctx = &mut *md_data.cast::<SHA512_CTX>();
++                    for (word, bytes) in ctx.h.iter_mut().zip(state.chaining.chunks_exact(8)) {
++                        *word = u64::from_be_bytes(bytes.try_into().map_err(|_| Unspecified)?);
++                    }
++                    ctx.Nl = bits;
++                    ctx.Nh = 0;
++                    ctx.num = 0;
++                }
++            }
++        }
++        context.msg_len = state.len;
++        context.max_input_reached = state.len == state.algorithm.max_input_len;
++        Ok(context)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    extern crate alloc;
++
++    use crate::digest::{self, Context, State};
++    use alloc::vec::Vec;
++
++    const RESUMABLE: [&digest::Algorithm; 7] = [
++        &digest::MD5_FOR_LEGACY_USE_ONLY,
++        &digest::SHA1_FOR_LEGACY_USE_ONLY,
++        &digest::SHA224,
++        &digest::SHA256,
++        &digest::SHA384,
++        &digest::SHA512,
++        &digest::SHA512_256,
++    ];
++
++    /// Bytes from a linear congruential generator (Knuth's MMIX constants), so each input is the
++    /// same on every run.
++    fn generated(len: usize, seed: u64) -> Vec<u8> {
++        let mut x = seed;
++        (0..len)
++            .map(|_| {
++                x = x
++                    .wrapping_mul(6_364_136_223_846_793_005)
++                    .wrapping_add(1_442_695_040_888_963_407);
++                (x >> 56) as u8
++            })
++            .collect()
++    }
++
++    #[test]
++    fn a_digest_resumed_at_every_block_boundary_equals_the_one_shot_digest() {
++        for algorithm in RESUMABLE {
++            let block = algorithm.block_len();
++            for (seed, len) in [0, 1, block - 1, block, block + 1, 5 * block + 3, 9 * block]
++                .into_iter()
++                .enumerate()
++            {
++                let input = generated(len, seed as u64);
++                let want = digest::digest(algorithm, &input);
++                for at in (0..=len).step_by(block) {
++                    let mut first = Context::try_new(algorithm).unwrap();
++                    first.try_update(&input[..at]).unwrap();
++                    let state = first.state().unwrap();
++                    assert_eq!(state.len(), at as u64);
++                    // Through its parts, as a record keeps them.
++                    let kept = State::new(algorithm, state.chaining(), state.len()).unwrap();
++                    assert_eq!(kept, state);
++                    let mut rest = Context::resume(&kept).unwrap();
++                    rest.try_update(&input[at..]).unwrap();
++                    assert_eq!(rest.try_finish().unwrap().as_ref(), want.as_ref());
++                    // The context it was taken from goes on unchanged.
++                    first.try_update(&input[at..]).unwrap();
++                    assert_eq!(first.try_finish().unwrap().as_ref(), want.as_ref());
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn a_state_mid_block_or_of_sha3_is_refused() {
++        for algorithm in RESUMABLE {
++            let block = algorithm.block_len();
++            let mut ctx = Context::try_new(algorithm).unwrap();
++            ctx.try_update(&generated(block + 1, 7)).unwrap();
++            assert!(ctx.state().is_err());
++            let chaining_len = Context::try_new(algorithm)
++                .unwrap()
++                .state()
++                .unwrap()
++                .chaining()
++                .len();
++            let zeros = [0u8; digest::MAX_CHAINING_LEN];
++            assert!(State::new(algorithm, &zeros[..chaining_len], 1).is_err());
++            assert!(State::new(algorithm, &zeros[..chaining_len - 1], 0).is_err());
++            assert!(State::new(algorithm, &zeros[..chaining_len], u64::MAX - 63).is_err());
++        }
++        let ctx = Context::try_new(&digest::SHA3_256).unwrap();
++        assert!(ctx.state().is_err());
++        assert!(State::new(&digest::SHA3_256, &[0u8; 32], 0).is_err());
++    }
++
++    #[test]
++    fn a_fresh_state_is_the_algorithms_initial_value() {
++        // RFC 1321 §3.3: word A 01 23 45 67, B 89 ab cd ef, C fe dc ba 98, D 76 54 32 10, low
++        // byte first.
++        let md5 = Context::try_new(&digest::MD5_FOR_LEGACY_USE_ONLY)
++            .unwrap()
++            .state()
++            .unwrap();
++        assert_eq!(
++            crate::hex::encode(md5.chaining()),
++            "0123456789abcdeffedcba9876543210"
++        );
++        // FIPS 180-4 §5.3.3: SHA-256's H(0) begins 6a09e667.
++        let sha256 = Context::try_new(&digest::SHA256).unwrap().state().unwrap();
++        assert!(crate::hex::encode(sha256.chaining()).starts_with("6a09e667bb67ae85"));
++        assert!(sha256.is_empty());
++    }
++}
+diff --git a/aws-lc-rs/src/hmac.rs b/aws-lc-rs/src/hmac.rs
+index 7158ec82ccd234249ac5e5cd728e4022a532bb07..ae1f306a777e2aeac7877ca5b7c85fe70e73e9cf 100644
+--- a/aws-lc-rs/src/hmac.rs
++++ b/aws-lc-rs/src/hmac.rs
+@@ -96,7 +96,7 @@
+ //! [RFC 2104]: https://tools.ietf.org/html/rfc2104
+ 
+ use crate::aws_lc::{
+-    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update,
++    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC,
+     HMAC_CTX,
+ };
+ use crate::error::Unspecified;
+@@ -298,7 +298,8 @@ impl Key {
+         Key::try_new(algorithm, key_value).expect("Unable to create HmacContext")
+     }
+ 
+-    fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
++    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
++    pub(crate) fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
+         unsafe {
+             let mut ctx = MaybeUninit::<HMAC_CTX>::uninit();
+             HMAC_CTX_init(ctx.as_mut_ptr());
+@@ -324,6 +325,14 @@ impl Key {
+         self.ctx.as_mut_ptr()
+     }
+ 
++    // mantle: a copy that reports failure, for `Context::try_with_key` (vendor/UPSTREAM.md).
++    fn try_clone(&self) -> Result<Self, Unspecified> {
++        Ok(Self {
++            algorithm: self.algorithm,
++            ctx: self.ctx.try_clone()?,
++        })
++    }
++
+     /// The digest algorithm for the key.
+     #[inline]
+     #[must_use]
+@@ -391,8 +400,16 @@ impl Context {
+         Self::try_update(self, data).expect("HMAC_Update failed");
+     }
+ 
++    /// `with_key`, reporting a failure to copy the key instead of panicking.
++    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
++    pub(crate) fn try_with_key(signing_key: &Key) -> Result<Self, Unspecified> {
++        Ok(Self {
++            key: signing_key.try_clone()?,
++        })
++    }
++
+     #[inline]
+-    fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
++    pub(crate) fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
+         unsafe {
+             if 1 != HMAC_Update(self.key.get_hmac_ctx_ptr(), data.as_ptr(), data.len()) {
+                 return Err(Unspecified);
+@@ -425,7 +442,7 @@ impl Context {
+         Self::try_sign(self).expect("HMAC_Final failed")
+     }
+     #[inline]
+-    fn try_sign(mut self) -> Result<Tag, Unspecified> {
++    pub(crate) fn try_sign(mut self) -> Result<Tag, Unspecified> {
+         let mut output = [0u8; digest::MAX_OUTPUT_LEN];
+         let msg_len = {
+             let result = internal_sign(&mut self, &mut output)?;
+@@ -546,10 +563,91 @@ pub fn verify(key: &Key, data: &[u8], tag: &[u8]) -> Result<(), Unspecified> {
+     constant_time::verify_slices_are_equal(sign(key, data).as_ref(), tag)
+ }
+ 
++/// Calculates the HMAC of `data` under the key `key_value` in one step, writing the tag to
++/// the start of `output`, which must hold at least `algorithm.tag_len()` bytes; returns the
++/// tag.
++///
++/// This is aws-lc's one-shot `HMAC`, for a key used once: it keys, signs with and wipes a
++/// single context, where `Key::new` and then `sign_to_buffer` key one context and sign with a
++/// copy of it.
++///
++/// It is generally not safe to implement HMAC verification by comparing the return value of
++/// `sign_once` to a tag. Use `verify` for verification instead.
++///
++/// # Errors
++/// `error::Unspecified` if `output` is too small or if the HMAC operation fails.
++// mantle: added (vendor/UPSTREAM.md).
++#[inline]
++pub fn sign_once<'out>(
++    algorithm: Algorithm,
++    key_value: &[u8],
++    data: &[u8],
++    output: &'out mut [u8],
++) -> Result<&'out mut [u8], Unspecified> {
++    let tag_len = algorithm.tag_len();
++    let output = output.get_mut(..tag_len).ok_or(Unspecified)?;
++    let evp_md_type = digest::match_digest_type(&algorithm.digest_algorithm().id);
++    let mut out_len: c_uint = 0;
++    let signed = indicator_check!(unsafe {
++        HMAC(
++            evp_md_type.as_const_ptr(),
++            key_value.as_ptr().cast(),
++            key_value.len(),
++            data.as_ptr(),
++            data.len(),
++            output.as_mut_ptr(),
++            &mut out_len,
++        )
++    });
++    if signed.is_null() || usize::try_from(out_len) != Ok(tag_len) {
++        return Err(Unspecified);
++    }
++    Ok(output)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::{hmac, rand};
+ 
++    // mantle: `sign_once` against RFC 4231 §4.2 and §4.7 and against `sign`.
++    #[test]
++    fn sign_once_matches_rfc_4231_and_sign() {
++        let cases: [(&[u8], &[u8], &str); 2] = [
++            (
++                &[0x0b; 20],
++                b"Hi There",
++                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
++            ),
++            (
++                &[0xaa; 131],
++                b"Test Using Larger Than Block-Size Key - Hash Key First",
++                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
++            ),
++        ];
++        for (key, data, want) in cases {
++            let mut out = [0u8; 40];
++            let tag = hmac::sign_once(hmac::HMAC_SHA256, key, data, &mut out).unwrap();
++            assert_eq!(crate::hex::encode(&*tag), want);
++        }
++        for algorithm in [
++            hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
++            hmac::HMAC_SHA224,
++            hmac::HMAC_SHA256,
++            hmac::HMAC_SHA384,
++            hmac::HMAC_SHA512,
++        ] {
++            for key_len in [0, 1, 32, 64, 128, 129, 200] {
++                let key = vec![0x5a; key_len];
++                let mut out = [0u8; 64];
++                let tag = hmac::sign_once(algorithm, &key, b"data", &mut out).unwrap();
++                let want = hmac::sign(&hmac::Key::new(algorithm, &key), b"data");
++                assert_eq!(&*tag, want.as_ref());
++            }
++            let mut short = vec![0u8; algorithm.tag_len() - 1];
++            assert!(hmac::sign_once(algorithm, b"k", b"data", &mut short).is_err());
++        }
++    }
++
+     #[cfg(feature = "fips")]
+     mod fips;
+ 
+diff --git a/aws-lc-rs/src/key_wrap.rs b/aws-lc-rs/src/key_wrap.rs
+index efa834423e04e2fb97d434ae3fc0fa769e8e9151..d13fed4beb31ae325485183714bd5e92a7cc0891 100644
+--- a/aws-lc-rs/src/key_wrap.rs
++++ b/aws-lc-rs/src/key_wrap.rs
+@@ -53,6 +53,10 @@ pub enum BlockCipherId {
+     /// AES Block Cipher with 128-bit key.
+     Aes128,
+ 
++    // mantle: AES-192 for JWE's A192KW (aws-lc-rs#617; vendor/UPSTREAM.md).
++    /// AES Block Cipher with 192-bit key.
++    Aes192,
++
+     /// AES Block Cipher with 256-bit key.
+     Aes256,
+ }
+@@ -100,6 +104,13 @@ pub const AES_128: AesBlockCipher = AesBlockCipher {
+     key_len: 16,
+ };
+ 
++// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
++/// AES Block Cipher with 192-bit key.
++pub const AES_192: AesBlockCipher = AesBlockCipher {
++    id: BlockCipherId::Aes192,
++    key_len: 24,
++};
++
+ /// AES Block Cipher with 256-bit key.
+ pub const AES_256: AesBlockCipher = AesBlockCipher {
+     id: BlockCipherId::Aes256,
+diff --git a/aws-lc-rs/src/key_wrap/tests.rs b/aws-lc-rs/src/key_wrap/tests.rs
+index 3a97ba05bac4b63ed5f88aa127c0d2177304d9be..11cd8473093d994b9ff074c92225a0fd38a2fcae 100644
+--- a/aws-lc-rs/src/key_wrap/tests.rs
++++ b/aws-lc-rs/src/key_wrap/tests.rs
+@@ -8,7 +8,7 @@ mod fips;
+ 
+ use crate::key_wrap::AesKek;
+ 
+-use super::{BlockCipher, BlockCipherId, KeyWrap, KeyWrapPadded, AES_128, AES_256};
++use super::{BlockCipher, BlockCipherId, KeyWrap, KeyWrapPadded, AES_128, AES_192, AES_256};
+ 
+ macro_rules! block_cipher_test {
+     ($name:ident, $alg:expr, $id:expr, $key_len:literal) => {
+@@ -23,6 +23,8 @@ macro_rules! block_cipher_test {
+ 
+ block_cipher_test!(aes_128_cipher, &AES_128, BlockCipherId::Aes128, 16);
+ block_cipher_test!(aes_256_cipher, &AES_256, BlockCipherId::Aes256, 32);
++// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
++block_cipher_test!(aes_192_cipher, &AES_192, BlockCipherId::Aes192, 24);
+ 
+ #[test]
+ fn key_encryption_key_debug_impl() {
+@@ -687,3 +689,80 @@ unwrap_with_padding_input_output_invalid_test!(unwrap_padded_input_len_smaller_t
+ 
+ // Output length < Input length - 8
+ unwrap_with_padding_input_output_invalid_test!(unwrap_padded_output_len_too_small, 24, 15);
++
++// mantle: AES-192 key wrap (aws-lc-rs#617; vendor/UPSTREAM.md): RFC 3394 §4.2 and §4.4, and
++// the two examples of RFC 5649 §6, all under a 192-bit KEK.
++nist_aes_key_wrap_test!(
++    rfc3394_4_2_wrap_128_bits_with_a_192_bit_kek,
++    &AES_192,
++    &[
++        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
++        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
++    ],
++    &[
++        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
++        0xff
++    ],
++    &[
++        0x96, 0x77, 0x8b, 0x25, 0xae, 0x6c, 0xa4, 0x35, 0xf9, 0x2b, 0x5b, 0x97, 0xc0, 0x50, 0xae,
++        0xd2, 0x46, 0x8a, 0xb8, 0xa1, 0x7a, 0xd8, 0x4e, 0x5d
++    ]
++);
++
++nist_aes_key_wrap_test!(
++    rfc3394_4_4_wrap_192_bits_with_a_192_bit_kek,
++    &AES_192,
++    &[
++        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
++        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
++    ],
++    &[
++        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
++        0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
++    ],
++    &[
++        0x03, 0x1d, 0x33, 0x26, 0x4e, 0x15, 0xd3, 0x32, 0x68, 0xf2, 0x4e, 0xc2, 0x60, 0x74, 0x3e,
++        0xdc, 0xe1, 0xc6, 0xc7, 0xdd, 0xee, 0x72, 0x5a, 0x93, 0x6b, 0xa8, 0x14, 0x91, 0x5c, 0x67,
++        0x62, 0xd2
++    ]
++);
++
++nist_aes_key_wrap_with_padding_test!(
++    rfc5649_6_wrap_20_octets_with_a_192_bit_kek,
++    &AES_192,
++    &[
++        0x58, 0x40, 0xdf, 0x6e, 0x29, 0xb0, 0x2a, 0xf1, 0xab, 0x49, 0x3b, 0x70, 0x5b, 0xf1, 0x6e,
++        0xa1, 0xae, 0x83, 0x38, 0xf4, 0xdc, 0xc1, 0x76, 0xa8
++    ],
++    &[
++        0xc3, 0x7b, 0x7e, 0x64, 0x92, 0x58, 0x43, 0x40, 0xbe, 0xd1, 0x22, 0x07, 0x80, 0x89, 0x41,
++        0x15, 0x50, 0x68, 0xf7, 0x38
++    ],
++    &[
++        0x13, 0x8b, 0xde, 0xaa, 0x9b, 0x8f, 0xa7, 0xfc, 0x61, 0xf9, 0x77, 0x42, 0xe7, 0x22, 0x48,
++        0xee, 0x5a, 0xe6, 0xae, 0x53, 0x60, 0xd1, 0xae, 0x6a, 0x5f, 0x54, 0xf3, 0x73, 0xfa, 0x54,
++        0x3b, 0x6a
++    ]
++);
++
++nist_aes_key_wrap_with_padding_test!(
++    rfc5649_6_wrap_7_octets_with_a_192_bit_kek,
++    &AES_192,
++    &[
++        0x58, 0x40, 0xdf, 0x6e, 0x29, 0xb0, 0x2a, 0xf1, 0xab, 0x49, 0x3b, 0x70, 0x5b, 0xf1, 0x6e,
++        0xa1, 0xae, 0x83, 0x38, 0xf4, 0xdc, 0xc1, 0x76, 0xa8
++    ],
++    &[0x46, 0x6f, 0x72, 0x50, 0x61, 0x73, 0x69],
++    &[
++        0xaf, 0xbe, 0xb0, 0xf0, 0x7d, 0xfb, 0xf5, 0x41, 0x92, 0x00, 0xf2, 0xcc, 0xb5, 0x0b, 0xb2,
++        0x4f
++    ]
++);
++
++// mantle: a 192-bit KEK accepts only 24 key bytes.
++#[test]
++fn aes_192_kek_takes_24_bytes() {
++    assert!(AesKek::new(&AES_192, &[0u8; 16]).is_err());
++    assert!(AesKek::new(&AES_192, &[0u8; 32]).is_err());
++    assert!(AesKek::new(&AES_192, &[0u8; 24]).is_ok());
++}
+diff --git a/aws-lc-rs/tests/jwe_rfc7516.rs b/aws-lc-rs/tests/jwe_rfc7516.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..466b7db978399abe031c7c235bb7a5ebdae36b57
+--- /dev/null
++++ b/aws-lc-rs/tests/jwe_rfc7516.rs
+@@ -0,0 +1,98 @@
++// mantle: RFC 7516's JWE example A.3, decrypted and re-encrypted with the vendored crate's
++// AES key wrap and AES_128_CBC_HMAC_SHA_256 (aws-lc-rs#617; vendor/UPSTREAM.md).
++
++use aws_lc_rs::aead::cbc_hmac::{Key, AES_128_CBC_HMAC_SHA_256, IV_LEN};
++use aws_lc_rs::key_wrap::{AesKek, KeyWrap, AES_128};
++
++/// RFC 7516 A.3.7's compact serialization: the protected header, the encrypted key, the IV,
++/// the ciphertext and the tag, each BASE64URL-encoded, joined by `.`.
++const JWE: &str = "eyJhbGciOiJBMTI4S1ciLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0.\
++    6KB707dM9YTIgHtLvtgWQ8mKwboJW3of9locizkDTHzBC2IlrT1oOQ.\
++    AxY8DCtDaGlsbGljb3RoZQ.\
++    KDlTtXchhZTGufMYmOYGS4HffxPSUrfmqCHXaI9wOGY.\
++    U0m_YmjN04DJvceFICbCVQ";
++
++/// A.3.3's key-encryption key, the JWK `{"kty":"oct","k":"GawgguFyGrWKav7AX4VKUg"}`.
++const KEK: &str = "GawgguFyGrWKav7AX4VKUg";
++
++/// BASE64URL without padding (RFC 7515 §2).
++fn base64url(text: &str) -> Vec<u8> {
++    let value = |c: u8| -> u32 {
++        u32::from(match c {
++            b'A'..=b'Z' => c - b'A',
++            b'a'..=b'z' => c - b'a' + 26,
++            b'0'..=b'9' => c - b'0' + 52,
++            b'-' => 62,
++            b'_' => 63,
++            _ => panic!("not base64url: {c}"),
++        })
++    };
++    let mut out = Vec::new();
++    for chunk in text.as_bytes().chunks(4) {
++        let bits =
++            chunk.iter().fold(0u32, |acc, &c| (acc << 6) | value(c)) << (6 * (4 - chunk.len()));
++        out.extend_from_slice(&bits.to_be_bytes()[1..chunk.len()]);
++    }
++    out
++}
++
++#[test]
++fn rfc_7516_a3_decrypts_and_reencrypts_byte_for_byte() {
++    let parts: Vec<&str> = JWE.split('.').collect();
++    assert_eq!(parts.len(), 5);
++    assert_eq!(
++        base64url(parts[0]),
++        br#"{"alg":"A128KW","enc":"A128CBC-HS256"}"#
++    );
++    let encrypted_key = base64url(parts[1]);
++    let iv: [u8; IV_LEN] = base64url(parts[2]).try_into().unwrap();
++    let ciphertext = base64url(parts[3]);
++    let tag = base64url(parts[4]);
++    // A.3.5: the additional data is the protected header as sent, ASCII(BASE64URL(...)).
++    let aad = parts[0].as_bytes();
++
++    // A128KW unwraps the content-encryption key (A.3.3).
++    let mut cek = [0u8; 32];
++    let cek = AesKek::new(&AES_128, &base64url(KEK))
++        .unwrap()
++        .unwrap(&encrypted_key, &mut cek)
++        .unwrap()
++        .to_vec();
++
++    // A128CBC-HS256 opens the content (A.3.6).
++    let key = Key::new(&AES_128_CBC_HMAC_SHA_256, &cek).unwrap();
++    let mut in_out = ciphertext.clone();
++    let plaintext = key.open_in_place(&iv, aad, &mut in_out, &tag).unwrap();
++    assert_eq!(plaintext, b"Live long and prosper.");
++
++    // Both steps are deterministic, so encrypting the same inputs gives the same JWE (A.3.8).
++    let mut sealed = b"Live long and prosper.".to_vec();
++    let resealed_tag = key.less_safe_seal_in_place(iv, aad, &mut sealed).unwrap();
++    assert_eq!(sealed, ciphertext);
++    assert_eq!(resealed_tag.as_ref(), tag.as_slice());
++    let mut rewrapped = [0u8; 40];
++    let rewrapped = AesKek::new(&AES_128, &base64url(KEK))
++        .unwrap()
++        .wrap(&cek, &mut rewrapped)
++        .unwrap();
++    assert_eq!(rewrapped, encrypted_key.as_slice());
++}
++
++#[test]
++fn a_jwe_with_a_changed_header_does_not_open() {
++    let parts: Vec<&str> = JWE.split('.').collect();
++    let mut cek = [0u8; 32];
++    let cek = AesKek::new(&AES_128, &base64url(KEK))
++        .unwrap()
++        .unwrap(&base64url(parts[1]), &mut cek)
++        .unwrap()
++        .to_vec();
++    let key = Key::new(&AES_128_CBC_HMAC_SHA_256, &cek).unwrap();
++    let iv: [u8; IV_LEN] = base64url(parts[2]).try_into().unwrap();
++    // The header names A256KW instead: authenticated as additional data, it no longer matches.
++    let changed = parts[0].replace("BMTI4S1", "BMjU2S1");
++    let mut in_out = base64url(parts[3]);
++    assert!(key
++        .open_in_place(&iv, changed.as_bytes(), &mut in_out, &base64url(parts[4]))
++        .is_err());
++}
+diff --git a/aws-lc-rs/tests/tls13_vectored_seal.rs b/aws-lc-rs/tests/tls13_vectored_seal.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..791c71098124ae7e6e6ce3259fd6b1fb960bcffe
+--- /dev/null
++++ b/aws-lc-rs/tests/tls13_vectored_seal.rs
+@@ -0,0 +1,345 @@
++// mantle: tests for `Tls13VectoredSealingKey` (aws-lc-rs#1241; vendor/UPSTREAM.md).
++#![cfg(not(feature = "fips"))]
++
++use aws_lc_rs::aead::{
++    Aad, Algorithm, Nonce, Tls13VectoredSealingKey, TlsProtocolId, TlsRecordOpeningKey,
++    TlsRecordSealingKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305, NONCE_LEN,
++};
++use aws_lc_rs::test::from_hex;
++
++// The first record the server encrypts in RFC 8448's "Simple 1-RTT Handshake" (§3): four
++// handshake messages traced one by one, sealed as one record with sequence number 0 under the
++// server's handshake traffic key.
++/// `{server} derive write traffic keys for handshake data`: key expanded.
++const KEY: &str = "3fce516009c21727d0f2e4e86ee403bc";
++/// The same step's iv expanded.
++const IV: &str = "5d313eb2671276ee13000b30";
++/// `{server} construct an EncryptedExtensions handshake message`.
++const ENCRYPTED_EXTENSIONS: &str =
++    "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
++/// `{server} construct a Certificate handshake message`.
++const CERTIFICATE: &str =
++    "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e\
++    310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335\
++    395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902\
++    818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a\
++    95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda43\
++    0846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f02\
++    03010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d0101\
++    0b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a5\
++    8c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a\
++    99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b4\
++    2b4de10000";
++/// `{server} construct a CertificateVerify handshake message`.
++const CERTIFICATE_VERIFY: &str =
++    "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90\
++    db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac\
++    027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfac\
++    d42f74f3";
++/// `{server} construct a Finished handshake message`.
++const FINISHED: &str = "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
++/// `{server} send handshake record`: the complete record, header then ciphertext and tag.
++const RECORD: &str =
++    "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f33af35edf7869fcf40aa40aa2b8ea73\
++    f848a7ca07612ef9f945cb960b4068905123ea78b111b429ba9191cd05d2a389280f526134aadc7fc78c4b72\
++    9df828b5ecf7b13bd9aefb0e57f271585b8ea9bb355c7c79020716cfb9b1183ef3ab20e37d57a6b9d7477609\
++    aee6e122a4cf51427325250c7d0e509289444c9b3a648f1d71035d2ed65b0e3cdd0cbae8bf2d0b227812cbb3\
++    60987255cc744110c453baa4fcd610928d809810e4b7ed1a8fd991f06aa6248204797e36a6a73b70a2559c09\
++    ead686945ba246ab66e5edd8044b4c6de3fcf2a89441ac66272fd8fb330ef8190579b3684596c960bd596eea\
++    520a56a8d650f563aad27409960dca63d3e688611ea5e22f4415cf9538d51a200c27034272968a264ed6540c\
++    84838d89f72c24461aad6d26f59ecaba9acbbb317b66d902f4f292a36ac1b639c637ce343117b65962224531\
++    7b49eeda0c6258f100d7d961ffb138647e92ea330faeea6dfa31c7a84dc3bd7e1b7a6c7178af36879018e3f2\
++    52107f243d243dc7339d5684c8b0378bf30244da8c87c843f5e56eb4c5e8280a2b48052cf93b16499a66db7c\
++    ca71e4599426f7d461e66f99882bd89fc50800becca62d6c74116dbd2972fda1fa80f85df881edbe5a376689\
++    36b335583b599186dc5c6918a396fa48a181d6b6fa4f9d62d513afbb992f2b992f67f8afe67f76913fa388cb\
++    5630c8ca01e0c65d11c66a1e2ac4c85977b7c7a6999bbf10dc35ae69f5515614636c0b9b68c19ed2e31c0b3b\
++    66763038ebba42f3b38edc0399f3a9f23faa63978c317fc9fa66a73f60f0504de93b5b845e275592c12335ee\
++    340bbc4fddd502784016e4b3be7ef04dda49f4b440a30cb5d2af939828fd4ae3794e44f94df5a631ede42c17\
++    19bfdabf0253fe5175be898e750edc53370d2b";
++/// The inner content type of a handshake record (RFC 8446 §5.2).
++const HANDSHAKE: u8 = 0x16;
++
++const KEY_BYTES: [u8; 32] = [0x42; 32];
++const TRAFFIC_IV: [u8; NONCE_LEN] = [
++    0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30,
++];
++/// A byte the cipher does not produce for a whole run, so bytes it never wrote show.
++const UNWRITTEN: u8 = 0xAA;
++
++fn new_key(algorithm: &'static Algorithm) -> Tls13VectoredSealingKey {
++    Tls13VectoredSealingKey::new(algorithm, &KEY_BYTES[..algorithm.key_len()], &TRAFFIC_IV).unwrap()
++}
++
++/// RFC 8446 §5.3's nonce for `sequence`, as a caller of `TlsRecordSealingKey` builds it.
++fn nonce(sequence: u64) -> Nonce {
++    let mut n = TRAFFIC_IV;
++    for (b, s) in n[NONCE_LEN - 8..].iter_mut().zip(sequence.to_be_bytes()) {
++        *b ^= s;
++    }
++    Nonce::assume_unique_for_key(n)
++}
++
++fn pattern(len: usize, seed: usize) -> Vec<u8> {
++    (0..len)
++        .map(|i| u8::try_from((i * 7 + seed) % 251).unwrap())
++        .collect()
++}
++
++/// `data` cut at `cuts` (offsets in any order, taken modulo the length).
++fn pieces<'a>(data: &'a [u8], cuts: &[usize]) -> Vec<&'a [u8]> {
++    let mut at: Vec<usize> = cuts.iter().map(|c| c % (data.len() + 1)).collect();
++    at.push(0);
++    at.push(data.len());
++    at.sort_unstable();
++    at.windows(2).map(|w| &data[w[0]..w[1]]).collect()
++}
++
++#[test]
++fn rfc_8448_server_handshake_record() {
++    let messages: Vec<Vec<u8>> = [
++        ENCRYPTED_EXTENSIONS,
++        CERTIFICATE,
++        CERTIFICATE_VERIFY,
++        FINISHED,
++    ]
++    .iter()
++    .map(|h| from_hex(h).unwrap())
++    .collect();
++    let record = from_hex(RECORD).unwrap();
++    let (header, sealed) = record.split_at(5);
++    let mut slices: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
++    slices.push(&[HANDSHAKE]);
++    let len: usize = slices.iter().map(|s| s.len()).sum();
++
++    let mut key = Tls13VectoredSealingKey::new(
++        &AES_128_GCM,
++        &from_hex(KEY).unwrap(),
++        &from_hex(IV).unwrap(),
++    )
++    .unwrap();
++    let mut out = vec![UNWRITTEN; len + 16 + 3];
++    key.seal_vectored(0, Aad::from(header), slices.iter().copied(), len, &mut out)
++        .unwrap();
++    assert_eq!(&out[..len + 16], sealed);
++    assert_eq!(&out[len + 16..], &[UNWRITTEN; 3], "wrote past the record");
++
++    // The same record from the same plaintext cut elsewhere, appended after a prefix.
++    let whole: Vec<u8> = slices.concat();
++    let mut key = Tls13VectoredSealingKey::new(
++        &AES_128_GCM,
++        &from_hex(KEY).unwrap(),
++        &from_hex(IV).unwrap(),
++    )
++    .unwrap();
++    let mut appended = header.to_vec();
++    key.seal_vectored_append(
++        0,
++        Aad::from(header),
++        pieces(&whole, &[1, 15, 16, 17, 300, 657]),
++        len,
++        &mut appended,
++    )
++    .unwrap();
++    assert_eq!(appended, record);
++}
++
++#[test]
++fn records_match_tls_record_sealing_key() {
++    for algorithm in [&AES_128_GCM, &AES_256_GCM] {
++        let mut vectored = new_key(algorithm);
++        let mut contiguous = TlsRecordSealingKey::new(
++            algorithm,
++            TlsProtocolId::TLS13,
++            &KEY_BYTES[..algorithm.key_len()],
++        )
++        .unwrap();
++        let opening = TlsRecordOpeningKey::new(
++            algorithm,
++            TlsProtocolId::TLS13,
++            &KEY_BYTES[..algorithm.key_len()],
++        )
++        .unwrap();
++        let cases: [(usize, &[usize]); 8] = [
++            (0, &[]),
++            (1, &[0, 1]),
++            (15, &[3, 3, 3]),
++            (16, &[16]),
++            (17, &[1, 16]),
++            (1000, &[5, 250, 251, 999]),
++            (16385, &[1, 4096, 8191, 16384]),
++            (16640, &[13, 26, 39, 16639]),
++        ];
++        for (sequence, (len, cuts)) in (0u64..).zip(cases) {
++            let plaintext = pattern(len, usize::try_from(sequence).unwrap());
++            let header = [0x17, 0x03, 0x03, 0x40, 0x11];
++
++            let mut expected = plaintext.clone();
++            contiguous
++                .seal_in_place_append_tag(nonce(sequence), Aad::from(header), &mut expected)
++                .unwrap();
++
++            let mut out = vec![UNWRITTEN; len + algorithm.tag_len()];
++            vectored
++                .seal_vectored(
++                    sequence,
++                    Aad::from(header),
++                    pieces(&plaintext, cuts),
++                    len,
++                    &mut out,
++                )
++                .unwrap();
++            assert_eq!(out, expected, "{algorithm:?} len={len}");
++
++            let opened = opening
++                .open_in_place(nonce(sequence), Aad::from(header), &mut out)
++                .unwrap();
++            assert_eq!(opened, plaintext.as_slice());
++        }
++    }
++}
++
++#[test]
++fn sequence_numbers_strictly_increase_and_never_wrap() {
++    let mut key = new_key(&AES_128_GCM);
++    let mut out = [0u8; 17];
++    let mut seal = |key: &mut Tls13VectoredSealingKey, sequence: u64| {
++        key.seal_vectored(sequence, Aad::empty(), [&b"x"[..]], 1, &mut out)
++    };
++    assert!(seal(&mut key, 0).is_ok());
++    assert!(
++        seal(&mut key, 0).is_err(),
++        "a sequence number is sealed once"
++    );
++    assert!(seal(&mut key, 5).is_ok(), "numbers may skip");
++    assert!(seal(&mut key, 3).is_err(), "numbers only increase");
++    assert!(
++        seal(&mut key, 6).is_ok(),
++        "a refused number leaves the key usable"
++    );
++    assert!(seal(&mut key, u64::MAX).is_err(), "the number would wrap");
++    assert!(seal(&mut key, u64::MAX - 1).is_ok());
++    assert!(seal(&mut key, u64::MAX).is_err());
++}
++
++#[test]
++fn refusals_before_encrypting_leave_output_and_key_alone() {
++    let mut key = new_key(&AES_256_GCM);
++    let plaintext = pattern(100, 1);
++    let mut short = vec![UNWRITTEN; 100 + 15];
++    assert!(key
++        .seal_vectored(0, Aad::empty(), [plaintext.as_slice()], 100, &mut short)
++        .is_err());
++    assert!(short.iter().all(|&b| b == UNWRITTEN));
++    // The refused seal did not spend sequence number 0.
++    let mut out = vec![UNWRITTEN; 116];
++    key.seal_vectored(0, Aad::empty(), [plaintext.as_slice()], 100, &mut out)
++        .unwrap();
++
++    assert!(key
++        .seal_vectored(
++            1,
++            Aad::empty(),
++            [plaintext.as_slice()],
++            usize::MAX,
++            &mut out
++        )
++        .is_err());
++    key.seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 100, &mut out)
++        .unwrap();
++}
++
++#[test]
++fn slices_that_do_not_add_up_fail_the_key_without_writing_past_the_record() {
++    let plaintext = pattern(64, 2);
++    // More than declared: the extra slice is refused before it is written.
++    let mut key = new_key(&AES_128_GCM);
++    let mut out = vec![UNWRITTEN; 64 + 16 + 8];
++    let too_many = [&plaintext[..40], &plaintext[40..], &plaintext[..8]];
++    assert!(key
++        .seal_vectored(0, Aad::empty(), too_many, 64, &mut out)
++        .is_err());
++    assert!(
++        out[64..].iter().all(|&b| b == UNWRITTEN),
++        "wrote past the plaintext"
++    );
++    assert!(
++        key.seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 64, &mut out)
++            .is_err(),
++        "a key whose seal failed partway refuses every later seal"
++    );
++
++    // Fewer than declared.
++    let mut key = new_key(&AES_128_GCM);
++    let mut out = vec![UNWRITTEN; 64 + 16];
++    assert!(key
++        .seal_vectored(0, Aad::empty(), [&plaintext[..63]], 64, &mut out)
++        .is_err());
++    assert!(out[63..].iter().all(|&b| b == UNWRITTEN));
++    assert!(key
++        .seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 64, &mut out)
++        .is_err());
++}
++
++#[test]
++fn a_seal_the_plaintext_iterator_abandons_fails_the_key() {
++    let mut key = new_key(&AES_128_GCM);
++    let plaintext = pattern(32, 3);
++    let mut out = vec![0u8; 48];
++    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let slices = [&plaintext[..16], &plaintext[16..]].into_iter().map(|s| {
++            if s[0] == plaintext[16] {
++                panic!("the caller's iterator fails partway");
++            }
++            s
++        });
++        let _ = key.seal_vectored(0, Aad::empty(), slices, 32, &mut out);
++    }));
++    assert!(panicked.is_err());
++    assert!(key
++        .seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 32, &mut out)
++        .is_err());
++}
++
++#[test]
++fn appending_keeps_the_prefix_and_exposes_only_sealed_bytes() {
++    let plaintext = pattern(300, 4);
++    let mut key = new_key(&AES_128_GCM);
++    let mut out = b"prefix".to_vec();
++    out.shrink_to_fit();
++    key.seal_vectored_append(
++        0,
++        Aad::empty(),
++        pieces(&plaintext, &[7, 150]),
++        300,
++        &mut out,
++    )
++    .unwrap();
++    assert_eq!(out.len(), 6 + 300 + 16);
++    assert_eq!(&out[..6], b"prefix");
++
++    // A failed seal leaves the vector as it was.
++    let before = out.clone();
++    assert!(key
++        .seal_vectored_append(1, Aad::empty(), [&plaintext[..10]], 300, &mut out)
++        .is_err());
++    assert_eq!(out, before);
++
++    // The appended record opens.
++    let opening =
++        TlsRecordOpeningKey::new(&AES_128_GCM, TlsProtocolId::TLS13, &KEY_BYTES[..16]).unwrap();
++    let mut sealed = before[6..].to_vec();
++    let opened = opening
++        .open_in_place(nonce(0), Aad::empty(), &mut sealed)
++        .unwrap();
++    assert_eq!(opened, plaintext.as_slice());
++}
++
++#[test]
++fn keys_other_than_aes_gcm_with_a_12_byte_iv_are_refused() {
++    assert!(Tls13VectoredSealingKey::new(&CHACHA20_POLY1305, &KEY_BYTES, &TRAFFIC_IV).is_err());
++    assert!(Tls13VectoredSealingKey::new(&AES_128_GCM, &KEY_BYTES, &TRAFFIC_IV).is_err());
++    assert!(
++        Tls13VectoredSealingKey::new(&AES_128_GCM, &KEY_BYTES[..16], &TRAFFIC_IV[..8]).is_err()
++    );
++    assert!(Tls13VectoredSealingKey::new(&AES_256_GCM, &KEY_BYTES, &TRAFFIC_IV).is_ok());
++}

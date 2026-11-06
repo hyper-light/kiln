@@ -7,8 +7,8 @@ import { retriedWords, retryBody, retryChoices } from "@/api/retry";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { labelOf, useLabels } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
 
@@ -20,35 +20,27 @@ export function JobRetry({ jobId, runId }: { jobId: string; runId: string }) {
   const o = useSuspenseResource(`retry/${jobId}`, (s) => ci.legRunners(jobId, s), RUNNERS_OPTS).data;
   const navigate = useNavigate();
   const [choice, setChoice] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [go, going] = useAction(async (chosen: string) => {
+    const r = await ci.retryLeg(jobId, retryBody(chosen));
+    toast({ title: retriedWords(r), tone: "info" });
+    invalidate(`run/${runId}`);
+    invalidate(`ci-run/${runId}`);
+    invalidate("runs/");
+    invalidate(`retry/${jobId}`);
+    // A leg's retry is a new attempt of its run: its leg of the same key, there.
+    if (r.kind === "ci" && r.key) await navigate(`/runs/${encodeURIComponent(runId)}?key=${encodeURIComponent(r.key)}`, { replace: true });
+  }, "Retry failed");
   if (!o.retry.can) {
     return o.retry.why ? <p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Retry: {o.retry.why}</p> : null;
   }
   const choices = retryChoices(o);
   // A choice no longer offered (that runner went) is anywhere again.
   const chosen = choices.some((c) => c.value === choice) ? choice : "";
-  const go = async () => {
-    setBusy(true);
-    try {
-      const r = await ci.retryLeg(jobId, retryBody(chosen));
-      toast({ title: retriedWords(r), tone: "info" });
-      invalidate(`run/${runId}`);
-      invalidate(`ci-run/${runId}`);
-      invalidate("runs/");
-      invalidate(`retry/${jobId}`);
-      // A leg's retry is a new attempt of its run: its leg of the same key, there.
-      if (r.kind === "ci" && r.key) navigate(`/runs/${encodeURIComponent(runId)}?key=${encodeURIComponent(r.key)}`, { replace: true });
-    } catch (e) {
-      toast.error("Retry failed", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <div className="flex flex-wrap items-center gap-2 px-5 py-3">
       <span className="mr-auto font-mono text-[11px] text-[#a6b2c6]">{o.ran_on ? `Ran on ${labelOf(o.ran_on)}` : "Run it again"}</span>
       {choices.length > 1 && <SelectField label="Where to run it again" hideLabel value={chosen} onChange={setChoice} options={choices} className="w-72 max-w-full" />}
-      <Button size="xs" variant="primary" disabled={busy} onClick={go}>
+      <Button size="xs" variant="primary" pending={going} onClick={() => go(chosen)}>
         <RotateCcw /> Retry
       </Button>
     </div>

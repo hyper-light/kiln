@@ -149,7 +149,7 @@ async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, 
     // Its own counters and no planner, as the driver's tests have (the process's are shared).
     let metrics = crate::metrics::AgentMetrics::default();
     let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
-    let changing = async_lock::Mutex::new(());
+    let changing = crate::turn::Gate::one();
     loop {
         if !d.tick().await {
             return;

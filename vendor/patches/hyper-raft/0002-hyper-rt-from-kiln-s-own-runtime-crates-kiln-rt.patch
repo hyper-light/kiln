@@ -1,0 +1,30 @@
+Subject: hyper-rt from kiln's own runtime, crates/kiln-rt
+Why: kiln's runtime is its own copy of hyper-rt (crates/kiln-rt/ORIGIN.md), which kiln's [patch.crates-io] gives every crate that names hyper-rt. hyper-block and hyper-rt-transport take it by path, which a patch can't reach, and two path packages named hyper-rt 0.1.0 can't share a lock file (cargo: package collision in the lockfile), so their paths point at kiln's copy. hyper-rt's own folder here is upstream's, unchanged; no crate kiln builds takes it
+Kiln-only: crates/kiln-rt is kiln's own copy of hyper-rt, which no product's tree holds: Quiver, Focal's bus and Mantle take hyper-rt from their own copies
+
+diff --git a/crates/hyper-block/Cargo.toml b/crates/hyper-block/Cargo.toml
+index c823fce13c2e1ebca0b099b4fd5c0b01d0e31820..31b577419947336679a8d58160009a04196fdbbf 100644
+--- a/crates/hyper-block/Cargo.toml
++++ b/crates/hyper-block/Cargo.toml
+@@ -16,7 +16,7 @@ sim = ["dep:hyper-sim"]
+ # A kept record's checksum (`record`), the log's CRC-32C.
+ crc32c.workspace = true
+ getrandom.workspace = true
+-hyper-rt = { path = "../hyper-rt" }
++hyper-rt = { path = "../../../../crates/kiln-rt" }
+ # The simulated device's model (`sim`, test support only): hyper-sim's block device.
+ hyper-sim = { path = "../hyper-sim", optional = true }
+ thiserror.workspace = true
+diff --git a/crates/hyper-rt-transport/Cargo.toml b/crates/hyper-rt-transport/Cargo.toml
+index b46b6a7b3402c3dabf03f934450b1038984f1305..7ebf644d1b1d0a14b656eb0cb12ae2a54445f5eb 100644
+--- a/crates/hyper-rt-transport/Cargo.toml
++++ b/crates/hyper-rt-transport/Cargo.toml
+@@ -13,7 +13,7 @@ repository.workspace = true
+ oracle = ["hyper-transport/oracle"]
+ 
+ [dependencies]
+-hyper-rt = { path = "../hyper-rt" }
++hyper-rt = { path = "../../../../crates/kiln-rt" }
+ hyper-transport = { path = "../hyper-transport" }
+ hyper-datagram = { path = "../hyper-datagram" }
+ 

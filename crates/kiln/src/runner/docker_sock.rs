@@ -830,10 +830,34 @@ fn name_references(v: &mut Value, names: &mut Names, name: Option<&str>) -> bool
     changed
 }
 
-/// A container create's bind mounts, their sources on the host. Whether it changed.
+/// A container a leg's step makes through its Docker socket keeps to the work CPUs, `work`, beside a
+/// server with cores of its own (docs/priority.md, "Legs and agents keep off the server's cores";
+/// goal 8, plan 01a1a59c2b29 step 7), as the leg's own containers do, unless it names CPUs of its own
+/// (`CpusetCpus`). Whether it changed `host` (a create's `HostConfig`).
+fn work_cpuset(host: &mut serde_json::Map<String, Value>, work: Option<&[usize]>) -> bool {
+    let Some(work) = work.filter(|w| !w.is_empty()) else { return false };
+    if host.get("CpusetCpus").and_then(Value::as_str).is_some_and(|c| !c.trim().is_empty()) {
+        return false;
+    }
+    host.insert("CpusetCpus".to_owned(), Value::from(super::cpus::list(work)));
+    true
+}
+
+/// A container create's bind mounts, their sources on the host, and its CPU weight a leg's
+/// (docs/priority.md) unless it asks for its own, as its CPUs are beside a server with cores of its
+/// own ([`work_cpuset`]). Whether it changed.
 fn translate_create(v: &mut Value, paths: &Paths) -> bool {
     let Some(config) = v.get_mut("HostConfig") else { return false };
     let mut changed = false;
+    if let Some(o) = config.as_object_mut()
+        && o.get("CpuShares").and_then(Value::as_i64).unwrap_or(0) == 0
+    {
+        o.insert("CpuShares".to_owned(), Value::from(super::docker::LEG_CPU_SHARES));
+        changed = true;
+    }
+    if let Some(o) = config.as_object_mut() {
+        changed |= work_cpuset(o, crate::os::work_cpus().as_deref());
+    }
     // The names the leg's own containers have for the host and kiln's server, as its job
     // container has them (BuildKit's fetches a build's git context from kiln through them), but
     // a name the container gives itself. One sharing another's network has that one's hosts.
@@ -1645,14 +1669,26 @@ mod tests {
             hosts(serde_json::json!({"HostConfig": {"ExtraHosts": ["host.docker.internal=192.168.1.9"]}}), &p)?,
             serde_json::json!(["host.docker.internal=192.168.1.9", "kiln.localhost:host-gateway"])
         );
-        // One on another container's network, or none, takes no hosts of its own.
+        // One on another container's network, or none, takes no hosts of its own: the leg's CPU
+        // weight alone (docs/priority.md).
         let shared = serde_json::json!({"HostConfig": {"NetworkMode": "container:abc"}});
-        assert_eq!(translated(&serde_json::to_vec(&shared)?, &p), None);
-        // Nothing to change, or not JSON: on as it came.
+        assert_eq!(translated(&serde_json::to_vec(&shared)?, &p).map(|o| serde_json::from_slice::<serde_json::Value>(&o).ok()), Some(Some(weighted(shared))));
+        // Nothing else to change: the leg's CPU weight alone; one it asks for itself stays; not
+        // JSON: on as it came.
         let same = serde_json::json!({"HostConfig": {"Binds": ["/work/w/1234/ripgrep:/src"], "ExtraHosts": ["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"]}});
-        assert_eq!(translated(&serde_json::to_vec(&same)?, &p), None);
+        assert_eq!(translated(&serde_json::to_vec(&same)?, &p).map(|o| serde_json::from_slice::<serde_json::Value>(&o).ok()), Some(Some(weighted(same.clone()))));
+        let theirs = serde_json::json!({"HostConfig": {"Binds": ["/work/w/1234/ripgrep:/src"], "ExtraHosts": ["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"], "CpuShares": 512}});
+        assert_eq!(translated(&serde_json::to_vec(&theirs)?, &p), None);
         assert_eq!(translated(b"{not json", &p), None);
         Ok(())
+    }
+
+    /// A create's body with the leg's CPU weight (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2).
+    fn weighted(mut body: serde_json::Value) -> serde_json::Value {
+        if let Some(o) = body.get_mut("HostConfig").and_then(serde_json::Value::as_object_mut) {
+            o.insert("CpuShares".to_owned(), serde_json::Value::from(crate::runner::docker::LEG_CPU_SHARES));
+        }
+        body
     }
 
     /// A create's body as a socket whose names are the daemon's passes it on.
@@ -1865,17 +1901,12 @@ mod tests {
         assert_eq!(rewritten(&Gather::NetworkMember(true), &json!({"Container": "db"}), &mut names)?, json!({"Container": format!("db{k}"), "EndpointConfig": {"Aliases": ["db"]}}));
         assert_eq!(rewritten(&Gather::NetworkMember(false), &json!({"Container": "db", "Force": false}), &mut names)?, json!({"Container": format!("db{k}"), "Force": false}));
         assert_eq!(rewrite(&Gather::NetworkMember(true), br#"{"Container":"theirs"}"#, &leg(), &mut names, None, &mut None), None);
-        // A socket whose names are the daemon's: on as it came, unless a bind mount is the host's elsewhere.
+        // A socket whose names are the daemon's: on as it came but for the leg's CPU weight, unless
+        // a bind mount is the host's elsewhere.
+        let daemons = br#"{"HostConfig":{"NetworkMode":"net","Binds":["data:/d"],"ExtraHosts":["host.docker.internal:host-gateway","kiln.localhost:host-gateway"]}}"#;
         assert_eq!(
-            rewrite(
-                &Gather::ContainerCreate(Some("web".to_owned())),
-                br#"{"HostConfig":{"NetworkMode":"net","Binds":["data:/d"],"ExtraHosts":["host.docker.internal:host-gateway","kiln.localhost:host-gateway"]}}"#,
-                &leg(),
-                &mut Names::default(),
-                None,
-                &mut None
-            ),
-            None
+            rewrite(&Gather::ContainerCreate(Some("web".to_owned())), daemons, &leg(), &mut Names::default(), None, &mut None).map(|o| serde_json::from_slice::<serde_json::Value>(&o).ok()),
+            Some(Some(weighted(serde_json::from_slice(daemons)?)))
         );
         Ok(())
     }
@@ -2439,5 +2470,21 @@ mod tests {
         let elsewhere = format!("812 36 0:91 / /run/containerd/io.containerd.runtime.v2.task/moby/{id}/rootfs rw - overlay overlay rw\n");
         assert_eq!(snapshotter_root("/var/lib/docker\toverlayfs", id, &elsewhere), Some(PathBuf::from(format!("/run/containerd/io.containerd.runtime.v2.task/moby/{id}/rootfs"))));
         assert_eq!(snapshotter_root("/var/lib/docker\toverlayfs", "", &mountinfo), None);
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): a container a leg's step makes through its socket keeps to the
+    /// work CPUs beside a server with cores of its own, unless it names CPUs of its own; with none to
+    /// keep to, it goes as it came.
+    #[test]
+    fn g8_s7_a_steps_containers_keep_to_the_work_cpus() {
+        let mut host = serde_json::Map::new();
+        assert!(work_cpuset(&mut host, Some(&[0, 1, 2, 3, 24, 25])));
+        assert_eq!(host.get("CpusetCpus"), Some(&serde_json::Value::from("0-3,24-25")));
+        let mut theirs = serde_json::Map::new();
+        theirs.insert("CpusetCpus".to_owned(), serde_json::Value::from("5"));
+        assert!(!work_cpuset(&mut theirs, Some(&[0, 1])));
+        assert_eq!(theirs.get("CpusetCpus"), Some(&serde_json::Value::from("5")), "its own CPUs win");
+        let mut none = serde_json::Map::new();
+        assert!(!work_cpuset(&mut none, None) && none.is_empty(), "no server's cores to keep off");
     }
 }

@@ -4,6 +4,7 @@
  */
 import type { Res } from "@/lib/data";
 import { apiPath } from "@/lib/peer-base";
+import type { AboutAsk, AgentBrief } from "./harness";
 import { request } from "./client";
 import { signed } from "@/lib/signing";
 
@@ -51,6 +52,17 @@ export interface DiffVersion {
   why?: string | null;
   /** The thread it answers (a suggestion's). */
   thread?: string | null;
+  /** A revision kiln replayed as its trunk moved runs no checks of its own: the version whose checks it shows (W26-R16). */
+  checks_from?: number | null;
+}
+
+/** How fresh a change is on its trunk (W26-R16): its words, Update's state, and where a replay's checks come from. */
+export interface Freshness {
+  /** `replays clean on main@4c1e2a`, `conflicts on main@4c1e2a`, `replaying onto main@4c1e2a`. */
+  words: string;
+  tip: string;
+  update: { can: boolean; why_not: string | null };
+  checks_from: number | null;
 }
 
 export interface DiffRun {
@@ -86,6 +98,8 @@ export interface DiffDetail extends Diff {
   reviewers: Reviewer[];
   runs: DiffRun[];
   commits?: { sha: string; title?: string; subject?: string; author?: string }[];
+  /** How fresh it is on its trunk (W26-R16); null once it's closed. */
+  fresh?: Freshness | null;
 }
 
 export interface ChangedFile {
@@ -133,6 +147,37 @@ export interface ThreadComment {
   deleted?: boolean;
   /** Its suggestions (W26-R10): its body's ```suggestion blocks, then its old `suggestion` field as one more. */
   suggestions?: Suggestion[];
+  /** Who wrote it, in words (W26-R18); a server from before sends `author` alone. */
+  by?: Byline;
+  /** Who signed it, or null while it's unsigned (W27-R04); a server from before sends neither. */
+  signed?: Signed | null;
+}
+
+/** Who wrote a comment, in words (W26-R18): a person by name, an agent by its session's name for the person it acts for, a CI job by its leg. */
+export interface Byline {
+  kind: "person" | "agent" | "job";
+  name: string;
+  /** The person an agent acts for, when kiln knows it. */
+  for?: string;
+}
+
+/** A comment's signature as kiln took it (W27-R04): its signer's identity, in words, and when. */
+export interface Signed {
+  /** The signer's identity (`kiln://<org>/person/kim/agent/<session>/epoch/<n>`). */
+  by: string;
+  who: string;
+  at: number;
+}
+
+/** A comment's author in words: its byline ("Matrix agent for kim"), else its principal's. */
+export function bylineOf(c: Pick<ThreadComment, "author" | "by">): string {
+  if (!c.by) return whoSaid(c.author);
+  return c.by.for ? `${c.by.name} for ${c.by.for}` : c.by.name;
+}
+
+/** What a comment's seal says: who signed it, or that it isn't signed. */
+export function sealOf(c: Pick<ThreadComment, "signed">): string {
+  return c.signed ? `signed by ${c.signed.who}` : "unsigned";
 }
 
 /** A comment's suggestion (W26-R10): the lines it puts where its thread's lines are (none: they go), and which revision applied it. */
@@ -171,6 +216,10 @@ export interface Thread {
   resolved_by?: string | null;
   resolved_at?: number | null;
   resolution?: string | null;
+  /** The version that fixed it (W26-R18): the first that answers it. */
+  fixed_in?: number | null;
+  /** Open, after agents started their fixes in it since a person spoke there: it waits for a person, and says why. */
+  waits?: string | null;
 }
 
 /** The gate (W26-R11) as it stands for you approving: a blocking thread or a conflict holds it, open issues warn, open nits inform. */
@@ -196,6 +245,10 @@ export interface Readiness {
   required: string[];
   strategies: string[];
   default: string | null;
+  /** The land queue's entry that holds it, and where the queue has it (docs/ci.md W26-R19). */
+  queue?: { entry: string; state: string; reason: string | null } | null;
+  /** Asked to land once its gate is clear. */
+  when_ready?: boolean;
 }
 
 export interface InboxThread {
@@ -265,9 +318,31 @@ export interface QueueEntry {
 
 export type ReviewAction = "accept" | "request_changes" | "comment" | "resign";
 
+/** A repository's switch that lets agents fix code from agents' feedback (W26-R18): off until
+ * someone who can land its changes turns it on, who set it and when, and what it does in words. */
+export interface AgentFixes {
+  repo: string;
+  agents_fix: boolean;
+  set_by: string | null;
+  set_at: number | null;
+  says: string;
+  /** The caller may turn it on or off (`diffs.land` on the repository). */
+  may_change: boolean;
+}
+
+/** Who set a repository's agent fixes switch and when, in words: "Turned on by ada, 31 Oct 2026." */
+export function fixesSetBy(v: Pick<AgentFixes, "agents_fix" | "set_by" | "set_at">): string {
+  if (!v.set_by) return "No one has turned it on.";
+  const day = v.set_at == null ? "" : `, ${new Date(v.set_at * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
+  return `Turned ${v.agents_fix ? "on" : "off"} by ${whoSaid(v.set_by)}${day}.`;
+}
+
 const enc = encodeURIComponent;
 
 export const reviewApi = {
+  /** Ask about code no agent made (components/code/about.tsx): a helper kiln starts for the person reads `repo` at `commit` (`ci.repos.about`). */
+  about: (repo: string, commit: string, ask: AboutAsk) =>
+    request<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/repos/${enc(repo)}/about`, { commit, ...ask }),
   inbox: (signal?: AbortSignal) => request<Inbox>("GET", "/api/review/inbox", undefined, { signal }),
   readAll: () => request<{ read: number }>("POST", "/api/review/inbox/read", { all: true }),
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
@@ -309,11 +384,16 @@ export const reviewApi = {
   },
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
-  land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
+  land: (key: string, strategy?: string, whenReady?: boolean) =>
+    request<unknown>("POST", `/api/diffs/${enc(key)}/land`, { ...(strategy ? { strategy } : {}), ...(whenReady ? { when_ready: true } : {}) }),
+  /** A host's changes into its host's own queue, each at the head Review cleared (docs/ci.md W26-R19, W28-R109). */
+  enqueue: (repo: string, changes: { number: number; head: string }[]) => request<{ entry: string; route: string; state: string }>("POST", `/api/repos/${enc(repo)}/queue`, { changes }),
   act: (key: string, action: "ready" | "abandon" | "reclaim" | "commandeer") => request<unknown>("POST", `/api/diffs/${enc(key)}/${action}`, {}),
   stack: (id: string, signal?: AbortSignal) => request<Stack>("GET", `/api/stacks/${enc(id)}`, undefined, { signal }),
   queue: (repo: string, signal?: AbortSignal) => request<{ entries: QueueEntry[] }>("GET", `/api/repos/${enc(repo)}/queue`, undefined, { signal }).then((r) => r.entries),
   dequeue: (entry: string) => request<unknown>("DELETE", `/api/queue/${enc(entry)}`),
+  agentFixes: (repo: string, signal?: AbortSignal) => request<AgentFixes>("GET", `/api/repos/${enc(repo)}/agent-fixes`, undefined, { signal }),
+  setAgentFixes: (repo: string, on: boolean) => request<AgentFixes>("PUT", `/api/repos/${enc(repo)}/agent-fixes`, { agents_fix: on }),
   /** A file's bytes at a version, old or new side (images). */
   blobUrl: (key: string, version: number, path: string, side: "old" | "new") => apiPath(`/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`),
 };
@@ -401,10 +481,15 @@ export const hostPullsApi = {
     request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/comments`, body),
   review: (repo: string, n: number, verdict: "approve" | "request_changes" | "comment", body: string) => request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/reviews`, { verdict, body }),
   merge: (repo: string, n: number, method: string) => request<Acted & { merged: boolean; commit: string | null }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/merge`, { method }),
+  /** How fresh it is on its base (W26-R16); null before kiln has replayed it. */
+  fresh: (repo: string, n: number, signal?: AbortSignal) => request<Freshness | null>("GET", `/api/ci/repos/${enc(repo)}/pulls/${n}/fresh`, undefined, { signal }),
+  /** Update (W26-R16): GitHub's update-branch, GitLab's rebase, else kiln's replay pushed with a lease. */
+  update: (repo: string, n: number) => request<{ change: string; host: HostName; head: string; state: "updated" | "updating" }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/update`, {}),
 };
 
 export const hostPullsRes = (repo: string): Res<HostPull[]> => ({ key: `review/host/${repo}`, fetch: (s) => hostPullsApi.list(repo, s) });
 export const hostPullRes = (repo: string, n: number): Res<HostPullDetail> => ({ key: `review/host/${repo}/${n}`, fetch: (s) => hostPullsApi.get(repo, n, s) });
+export const hostPullFreshRes = (repo: string, n: number): Res<Freshness | null> => ({ key: `review/host/${repo}/${n}/fresh`, fetch: (s) => hostPullsApi.fresh(repo, n, s) });
 
 export const HOST_WORD: Record<HostName, string> = { github: "GitHub", gitlab: "GitLab", bitbucket: "Bitbucket" };
 /** How each host writes a change's number. */
@@ -430,6 +515,7 @@ export const dependenciesRes = (key: string, to: number, from: number | null): R
   key: `review/dependencies/${key}/${from ?? "base"}/${to}`,
   fetch: (s) => reviewApi.dependencies(key, to, from, s),
 });
+export const agentFixesRes = (repo: string): Res<AgentFixes> => ({ key: `review/agent-fixes/${repo}`, fetch: (s) => reviewApi.agentFixes(repo, s) });
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
 /** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */
@@ -485,6 +571,33 @@ export interface Conflict {
   agent: { by: string; take: ConflictTake | null; lines: string[] | null; at: number | null } | null;
   /** The resolution taken: what it took, the lines a text conflict resolves to, by whom and when. */
   resolution: { take: ConflictTake; lines: string[] | null; by: string | null; at: number | null } | null;
+  /** What the conflict ladder offers for it (W26-R17): its latest rung's try. */
+  offered?: LadderTry | null;
+}
+
+/** A rung of the conflict ladder (W26-R17): kiln's structural merge, a remembered resolution, an agent. */
+export type LadderRung = "structural" | "remembered" | "agent";
+
+/** One rung's try at a conflict: at work, kept (with why), or a resolution and its tests (W26-R17). */
+export interface LadderTry {
+  rung: LadderRung;
+  /** Its actor's principal, as kept; the page reads `made_by`. */
+  by: string;
+  /** Who made it, in Ship's shape (ship.rs MadeBy): an agent and the person it acts for, a person, or null for kiln's own. */
+  made_by?: { agent?: string; person?: string } | null;
+  state: "working" | "kept" | "resolved";
+  why: string | null;
+  lines: string[] | null;
+  explanation: string | null;
+  tests: "pending" | "passed" | "failed" | "none_to_run" | null;
+  /** Who signed the revision it was committed as; null until W27-R03 signs it. */
+  signer: string | null;
+}
+
+/** Where a conflicted replay is on the ladder: climbing, waiting, held for a person, offered, gone on, accepted. */
+export interface Ladder {
+  state: "climbing" | "waiting" | "held" | "test_whole" | "offered" | "goes_on" | "accepted" | null;
+  why: string[];
 }
 
 /** A change's latest revision replayed onto where it lands, and its conflicts (W26-R12). */
@@ -508,6 +621,17 @@ export interface Conflicts {
   unresolved: number;
   /** Each conflict resolved: Commit resolution may go. */
   ready: boolean;
+  /** The conflict ladder's state for the replay (W26-R17). */
+  ladder?: Ladder | null;
+}
+
+/** What accepting the ladder's resolutions made: the change's new version (W26-R17). */
+export interface LadderAccepted {
+  diff: string;
+  version: number;
+  why: string;
+  accepted_by: string;
+  replay: string;
 }
 
 /** What Commit resolution made: one revision of whoever committed it, its why `conflict resolved` (`signer` null: unsigned until W27-R03). */
@@ -522,11 +646,17 @@ export interface ConflictsCommitted {
   conflicts: number;
 }
 
+/** Update (W26-R16): a change request's branch moved to its replay, with a lease. */
+export const freshApi = {
+  update: (key: string) => request<{ change: string; version: number; branch: string; head: string }>("POST", `/api/diffs/${enc(key)}/update`, {}),
+};
+
 export const conflictsApi = {
   list: (key: string, signal?: AbortSignal) => request<Conflicts>("GET", `/api/diffs/${enc(key)}/conflicts`, undefined, { signal }),
   resolve: (key: string, id: string, body: { take: ConflictTake; lines?: string[]; text?: string }) => request<Conflicts>("POST", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`, body),
   undo: (key: string, id: string) => request<Conflicts>("DELETE", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`),
   commit: (key: string) => request<ConflictsCommitted>("POST", `/api/diffs/${enc(key)}/conflicts/commit`, {}),
+  accept: (key: string) => request<LadderAccepted>("POST", `/api/diffs/${enc(key)}/conflicts/accept`, {}),
 };
 
 export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });

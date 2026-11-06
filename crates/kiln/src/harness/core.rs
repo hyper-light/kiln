@@ -117,7 +117,7 @@ fn still_open(body: &Body) -> bool {
 pub const MAX_EVENTS: usize = 4_000;
 
 /// A change for the UI (and for the server's mirror of a machine's session).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Update {
@@ -164,6 +164,144 @@ pub enum Update {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gone: Vec<super::model::FileKey>,
     },
+}
+
+/// An update read as serde's derive reads an internally tagged enum (`#[serde(tag = "t")]`: the same updates, the
+/// same refusals), without the buffer the derive reads the whole map into first, the tag being anywhere in it: where
+/// the tag comes first, as every writer of an update puts it (serde's tagged serializer writes it first), the
+/// variant's fields are read from the rest of the map as they come. Goal 9, plan 01a1a87b2cec step 5: in rt7's calm
+/// profile the runners' updates' JSON took 5% of the shards' user time (the net loop's), a third of it the buffer.
+/// A tag elsewhere: the map read whole, as the derive would, and the tag taken out of it.
+impl<'de> Deserialize<'de> for Update {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(UpdateVisitor)
+    }
+}
+
+/// [`Update`]'s variants as its tag names them (`rename_all = "snake_case"`), in its order: an unknown one is
+/// refused as the derive refuses it ("unknown variant `x`, expected one of ...").
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdateKind {
+    Open,
+    Closed,
+    State,
+    Meta,
+    Events,
+    Changes,
+    Stream,
+    Reply,
+    Inbox,
+    Reset,
+    ChangesPatch,
+}
+
+struct UpdateVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UpdateVisitor {
+    type Value = Update;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("internally tagged enum Update")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Update, A::Error> {
+        use serde::de::Error as _;
+        let Some(first) = map.next_key::<String>()? else { return Err(A::Error::missing_field("t")) };
+        if first == "t" {
+            let kind = map.next_value::<UpdateKind>()?;
+            return update_of(kind, serde::de::value::MapAccessDeserializer::new(map));
+        }
+        let mut rest = serde_json::Map::new();
+        rest.insert(first, map.next_value::<serde_json::Value>()?);
+        while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+            rest.insert(key, value);
+        }
+        let kind = rest.remove("t").ok_or_else(|| A::Error::missing_field("t"))?;
+        let kind = UpdateKind::deserialize(kind).map_err(A::Error::custom)?;
+        update_of(kind, serde_json::Value::Object(rest)).map_err(A::Error::custom)
+    }
+}
+
+/// The update of variant `kind`, its fields read from `rest` (the map past its tag). Each variant's fields as
+/// [`Update`] declares them, with the same defaults: kept in step with it (`tests`, each variant read back).
+fn update_of<'de, D: serde::Deserializer<'de>>(kind: UpdateKind, rest: D) -> Result<Update, D::Error> {
+    #[derive(Deserialize)]
+    struct OpenOf {
+        info: Box<super::session::Info>,
+        #[serde(default)]
+        since: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct StateOf {
+        state: Box<State>,
+    }
+    #[derive(Deserialize)]
+    struct MetaOf {
+        meta: Box<Meta>,
+    }
+    #[derive(Deserialize)]
+    struct EventsOf {
+        events: Vec<Event>,
+    }
+    #[derive(Deserialize)]
+    struct ChangesOf {
+        files: Vec<super::model::FileChange>,
+    }
+    #[derive(Deserialize)]
+    struct StreamOf {
+        id: String,
+        text: String,
+    }
+    #[derive(Deserialize)]
+    struct ReplyOf {
+        client: String,
+        value: serde_json::Value,
+    }
+    #[derive(Deserialize)]
+    struct InboxOf {
+        said: Box<super::inbox::Said>,
+    }
+    #[derive(Deserialize)]
+    struct ResetOf {
+        #[serde(default)]
+        from: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct ChangesPatchOf {
+        #[serde(default)]
+        set: Vec<super::model::FileChange>,
+        #[serde(default)]
+        gone: Vec<super::model::FileKey>,
+    }
+    Ok(match kind {
+        UpdateKind::Open => {
+            let OpenOf { info, since } = OpenOf::deserialize(rest)?;
+            Update::Open { info, since }
+        }
+        UpdateKind::Closed => {
+            serde::de::IgnoredAny::deserialize(rest)?;
+            Update::Closed
+        }
+        UpdateKind::State => Update::State { state: StateOf::deserialize(rest)?.state },
+        UpdateKind::Meta => Update::Meta { meta: MetaOf::deserialize(rest)?.meta },
+        UpdateKind::Events => Update::Events { events: EventsOf::deserialize(rest)?.events },
+        UpdateKind::Changes => Update::Changes { files: ChangesOf::deserialize(rest)?.files },
+        UpdateKind::Stream => {
+            let StreamOf { id, text } = StreamOf::deserialize(rest)?;
+            Update::Stream { id, text }
+        }
+        UpdateKind::Reply => {
+            let ReplyOf { client, value } = ReplyOf::deserialize(rest)?;
+            Update::Reply { client, value }
+        }
+        UpdateKind::Inbox => Update::Inbox { said: InboxOf::deserialize(rest)?.said },
+        UpdateKind::Reset => Update::Reset { from: ResetOf::deserialize(rest)?.from },
+        UpdateKind::ChangesPatch => {
+            let ChangesPatchOf { set, gone } = ChangesPatchOf::deserialize(rest)?;
+            Update::ChangesPatch { set, gone }
+        }
+    })
 }
 
 /// How a file was before the agent first changed it.
@@ -1381,6 +1519,105 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an update reads as serde's derive for an internally tagged enum read it (the
+    /// derive kept here for it): every variant as it's written (its tag first), its tag last, from a JSON value, and
+    /// with a field it doesn't know; and the same refusals: an unknown variant (the same words), no tag, a missing field,
+    /// not a map.
+    #[test]
+    fn g9_s5_an_update_reads_as_serdes_tagged_derive_read_it() -> anyhow::Result<()> {
+        use super::super::inbox::{Refusal, Said};
+        use super::super::model::{FileChange, FileKey};
+        use super::super::session::Info;
+        #[derive(Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum Derived {
+            Open {
+                info: Box<Info>,
+                #[serde(default)]
+                since: Option<u64>,
+            },
+            Closed,
+            State { state: Box<State> },
+            Meta { meta: Box<Meta> },
+            Events { events: Vec<Event> },
+            Changes { files: Vec<FileChange> },
+            Stream { id: String, text: String },
+            Reply { client: String, value: serde_json::Value },
+            Inbox { said: Box<Said> },
+            Reset {
+                #[serde(default)]
+                from: Option<u64>,
+            },
+            ChangesPatch {
+                #[serde(default)]
+                set: Vec<FileChange>,
+                #[serde(default)]
+                gone: Vec<FileKey>,
+            },
+        }
+        let derived = |json: &str| -> Result<Update, serde_json::Error> {
+            Ok(match serde_json::from_str::<Derived>(json)? {
+                Derived::Open { info, since } => Update::Open { info, since },
+                Derived::Closed => Update::Closed,
+                Derived::State { state } => Update::State { state },
+                Derived::Meta { meta } => Update::Meta { meta },
+                Derived::Events { events } => Update::Events { events },
+                Derived::Changes { files } => Update::Changes { files },
+                Derived::Stream { id, text } => Update::Stream { id, text },
+                Derived::Reply { client, value } => Update::Reply { client, value },
+                Derived::Inbox { said } => Update::Inbox { said },
+                Derived::Reset { from } => Update::Reset { from },
+                Derived::ChangesPatch { set, gone } => Update::ChangesPatch { set, gone },
+            })
+        };
+        let file = FileChange { path: "src/a.rs".into(), tree: Some("/w".into()), created: true, deleted: false, added: 3, removed: 1, hunks: Vec::new(), truncated: false, at: 9, by: vec!["s1".into()], place: None };
+        let event = Event { id: "e1".into(), seq: 4, at: 7, parent: Some("p".into()), by: None, body: Body::Assistant { text: "the retry loop's deadline".into(), streaming: false } };
+        let all = [
+            Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Info::default() }), since: Some(12) },
+            Update::Open { info: Box::new(Info { id: "s1".into(), ..Info::default() }), since: None },
+            Update::Closed,
+            Update::State { state: Box::new(State { summary: "it reads its deadline".into(), doing: Some("Running cargo test".into()), files_changed: 2, ..State::default() }) },
+            Update::Meta { meta: Box::new(Meta { version: "2.1".into(), ..Meta::default() }) },
+            Update::Events { events: vec![event.clone(), Event { id: "e2".into(), seq: 5, ..event }] },
+            Update::Changes { files: vec![file.clone()] },
+            Update::Stream { id: "e1".into(), text: " and more".into() },
+            Update::Reply { client: "c1".into(), value: serde_json::json!({"items": [1, "a", null], "more": true}) },
+            Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Err(Refusal::Moved { session: "s1".into(), epoch: 2 }) }) },
+            Update::Reset { from: Some(3) },
+            Update::Reset { from: None },
+            Update::ChangesPatch { set: vec![file], gone: vec![FileKey { path: "src/b.rs".into(), tree: None }] },
+            Update::ChangesPatch { set: Vec::new(), gone: Vec::new() },
+        ];
+        for u in all {
+            let written = serde_json::to_string(&u)?;
+            anyhow::ensure!(written.starts_with(r#"{"t":"#), "written with its tag first: {written}");
+            anyhow::ensure!(serde_json::from_str::<Update>(&written)? == u && derived(&written)? == u, "as written: {written}");
+            let value = serde_json::to_value(&u)?;
+            anyhow::ensure!(Update::deserialize(&value)? == u && serde_json::from_value::<Update>(value.clone())? == u, "from a value: {written}");
+            // The tag last, and a field it doesn't know, first.
+            let mut last = serde_json::Map::new();
+            last.insert("later".into(), serde_json::json!({"x": [1]}));
+            for (k, v) in value.as_object().into_iter().flatten().filter(|(k, _)| *k != "t") {
+                last.insert(k.clone(), v.clone());
+            }
+            last.insert("t".into(), value.get("t").cloned().unwrap_or_default());
+            let last = serde_json::to_string(&last)?;
+            anyhow::ensure!(serde_json::from_str::<Update>(&last)? == u && derived(&last)? == u, "its tag last: {last}");
+            // A field it doesn't know, after its tag.
+            let unknown = written.replacen(',', r#","later":{"x":[1]},"#, 1);
+            let unknown = if unknown == written { written.replace('}', r#","later":1}"#) } else { unknown };
+            anyhow::ensure!(serde_json::from_str::<Update>(&unknown)? == u && derived(&unknown)? == u, "a field it doesn't know: {unknown}");
+        }
+        for refused in [r#"{"t":"stated","state":{}}"#, r#"{"state":{}}"#, r#"{}"#, r#"{"t":"state"}"#, r#"{"t":"stream","id":"e1"}"#, r#""state""#, r#"[1]"#, r#"{"t":3}"#, r#"{"state":{},"t":"stated"}"#] {
+            let (mine, theirs) = (serde_json::from_str::<Update>(refused), derived(refused));
+            anyhow::ensure!(mine.is_err() && theirs.is_err(), "{refused}: {mine:?} and {theirs:?}");
+        }
+        let unknown = |r: Result<Update, serde_json::Error>| r.err().map(|e| e.to_string().split(" at line").next().unwrap_or_default().to_owned());
+        let said = unknown(serde_json::from_str::<Update>(r#"{"t":"stated","state":{}}"#));
+        anyhow::ensure!(said.is_some() && said == unknown(derived(r#"{"t":"stated","state":{}}"#)), "an unknown variant in the same words: {said:?}");
+        Ok(())
+    }
 
     /// A subagent that ended is removed with those under it that ended; one still going, under it or
     /// on its own, stays, and so does everything when what's named is still going or isn't there.

@@ -3,8 +3,9 @@
  * runners keep since it ran commands there, what the rules say of each, and its own rules for them.
  */
 import { api } from "@/api/client";
+import type { AgentKeep } from "@/api/types";
 import { formatBytes } from "@/lib/format";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { change, invalidate, useSuspenseResource } from "@/lib/resource";
 import { RulesForm } from "./rules";
 import { CopyList, taking } from "./section";
 
@@ -26,7 +27,11 @@ export function AgentKeep({ id }: { id: string }) {
         label="Its rules for its copies"
         onSave={async (r) => {
           await api.setAgentKeep(id, r);
-          invalidate(`harness/keep/${id}`);
+          // Read again before the save is done: its form starts again from it while it holds its fields (W21-R15).
+          await api.agentKeep(id).then(
+            (k) => change<AgentKeep>(`harness/keep/${id}`, () => k),
+            () => invalidate(`harness/keep/${id}`),
+          );
           invalidate("reach/keep");
         }}
       />

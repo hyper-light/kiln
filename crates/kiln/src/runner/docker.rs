@@ -46,12 +46,36 @@ pub fn find() -> Option<String> {
             None => crate::os::which(bin),
         };
         let Some(full) = found else { continue };
-        let ok = std::process::Command::new(&full).args(["version", "--format", "{{.Server.Version}}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
-        if ok {
+        if answers(&full, FIND_WAIT) {
             return Some(full.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// How long `find` waits for the engine to answer `version`. A daemon that's stuck never does, and
+/// a runner's start (its sweep, before it dials the server) waited on it for good: the runner
+/// never connected (2026-11-02, a Mac whose Docker Desktop hung).
+const FIND_WAIT: Duration = SWEEP;
+
+/// Whether the CLI at `bin` reaches its daemon (`version` succeeds) within `wait`; one still
+/// waiting then is killed.
+fn answers(bin: &Path, wait: Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(bin).args(["version", "--format", "{{.Server.Version}}"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() else {
+        return false;
+    };
+    let until = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// How long a probe of the container engine is waited for: a runner's report of what it can do
@@ -498,7 +522,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
 /// new build removes the user's older ones. `None` for any other image.
 pub async fn runner_image(cli: &Cli, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Option<String>> {
     let Some(dockerfile) = runner_dockerfile(image, user) else { return Ok(None) };
-    let _g = IMAGE_BUILD.lock().await;
+    let _g = IMAGE_BUILD.turn().await;
     let digest = crate::util::sha256_hex(dockerfile.as_bytes());
     let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
     if cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
@@ -539,8 +563,8 @@ async fn forget_older(cli: &Cli, image: &str, owner: &str, keep: &str) {
     }
 }
 
-/// One runner image build at a time on this machine.
-static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One runner image build at a time on this machine, in the order asked for, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static IMAGE_BUILD: crate::turn::Gate = crate::turn::Gate::one();
 
 /// The label on everything a runner starts: its legs' networks and containers, and its pools'
 /// executors. It comes from the runner's work directory, so another runner on the same engine
@@ -1038,6 +1062,25 @@ pub fn proxy_env<'a>(services: impl Iterator<Item = &'a str>) -> Vec<(String, St
     ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].iter().map(|k| ((*k).to_owned(), url.clone())).chain(["NO_PROXY", "no_proxy"].iter().map(|k| ((*k).to_owned(), none.clone()))).collect()
 }
 
+/// What a leg's containers are given of the CPU (docs/priority.md; goal 8, plan 01a1a59c2b29 step
+/// 2): the least weight Docker gives a container, as a leg's group on the host has,
+/// `--cpu-shares 2`, `cpu.weight` 1 on cgroup v2 (runc's and crun's conversion). A leg's own
+/// `options:` come after it, and so win.
+pub const LEG_CPU_SHARES: u32 = 2;
+
+/// `--cpu-shares` for a leg's container ([`LEG_CPU_SHARES`]).
+fn leg_cpu() -> [String; 2] {
+    [s("--cpu-shares"), LEG_CPU_SHARES.to_string()]
+}
+
+/// `--cpuset-cpus` for a leg's container not given its leg's CPUs (its egress relay, a Docker
+/// action's): beside a server with cores of its own, the CPUs kiln's own work keeps to
+/// (docs/priority.md, "Legs and agents keep off the server's cores"; goal 8, plan 01a1a59c2b29 step
+/// 7), as its job container and services keep to its share of them; else nothing.
+fn work_cpuset() -> Vec<String> {
+    crate::os::work_cpus().map(|c| vec![s("--cpuset-cpus"), super::cpus::list(&c)]).unwrap_or_default()
+}
+
 fn s(x: &str) -> String {
     x.to_owned()
 }
@@ -1130,6 +1173,7 @@ impl Containers {
                 if let Some(cpus) = &spec.cpuset {
                     args.extend([s("--cpuset-cpus"), cpus.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1203,6 +1247,7 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1366,8 +1411,11 @@ impl Containers {
             s("-v"), format!("{}:/kiln-egress:ro", e.binary.display()), s("--entrypoint"), s("/kiln-egress"),
             // Nothing it needs but its two ports.
             s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
-            image.to_owned(), s("egress-relay"),
         ]);
+        // The leg's, at a leg's weight, off a server's cores.
+        args.extend(leg_cpu());
+        args.extend(work_cpuset());
+        args.extend([image.to_owned(), s("egress-relay")]);
         let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
         let id = self.cli.run(&args, &env, CALL).await?;
         self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, CALL).await?;
@@ -1479,6 +1527,8 @@ pub fn action_run_args(
     if let Some(e) = entrypoint.filter(|e| !e.is_empty()) {
         a.extend([s("--entrypoint"), e.to_owned()]);
     }
+    a.extend(leg_cpu());
+    a.extend(work_cpuset());
     a.push(image.to_owned());
     a.extend(args.iter().cloned());
     a

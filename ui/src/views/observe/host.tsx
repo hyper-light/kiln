@@ -12,6 +12,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { labelOf, useLabels, useRes, type Res } from "@/lib/data";
 import { formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -19,7 +20,7 @@ import { invalidate } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { coresText, imageOf, nameOf } from "./containers";
 import { Percent, Status } from "./hosts";
-import { QueryChart, RangePicker, compact, useRange, type Range } from "./parts";
+import { HeldFields, QueryChart, RangePicker, compact, useOpening, useRange, type Range } from "./parts";
 
 // The charts' series, named.
 const CPU = ["User", "System", "I/O wait"];
@@ -47,7 +48,8 @@ export default function HostPage() {
 }
 
 function HostView({ name, range, onRange }: { name: string; range: Range; onRange: (r: Range) => void }) {
-  const h = useRes(hostRes(name)).data;
+  const res = useRes(hostRes(name));
+  const h = res.data;
   // Its runner by the name people see (its label, docs/machines.md).
   const labels = useLabels();
   const [muting, setMuting] = React.useState(false);
@@ -55,15 +57,27 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
   const f = h.kiln.figures;
   const last = h.last_reported_time !== null ? `its last sample ${relativeTime(h.last_reported_time)}` : "no sample yet";
   const mute = h.kiln.mute;
-  const unmute = async () => {
+  // Unmuted at once (W21-R15), and muted again if the server refuses; muting it again waits for
+  // the answer, so the two never cross.
+  const [unmute, unmuting] = useAction(async () => {
+    res.change((d) => ({ ...d, is_muted: false, mute_timeout: null, kiln: { ...d.kiln, mute: null } }));
     try {
       await observeApi.unmuteHost(name);
       invalidate(`observe/hosts/${name}`);
       invalidate("observe/hosts");
     } catch (e) {
       toast({ title: "Couldn't unmute it", description: errorMessage(e), tone: "failed" });
+      invalidate(`observe/hosts/${name}`);
     }
-  };
+  });
+  // Muted from its dialog, Mute… waiting for it as for an unmute, also after the dialog's Cancel:
+  // a second change to its mute can't start while one is on its way (W21-R15).
+  const [muteIt, mutingIt] = useAction(async (body: { end?: number; message?: string }, then: () => void) => {
+    await observeApi.muteHost(name, body);
+    invalidate(`observe/hosts/${name}`);
+    invalidate("observe/hosts");
+    then();
+  }, "Couldn't mute it");
   const q = `host:${tagValue(name)}`;
   return (
     <>
@@ -86,11 +100,11 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
             <Link to={`/observe/logs?q=${encodeURIComponent(q)}`}>Its logs</Link>
           </Button>
           {mute ? (
-            <Button variant="secondary" onClick={() => void unmute()}>
+            <Button variant="secondary" onClick={unmute}>
               Unmute
             </Button>
           ) : (
-            <Button variant="secondary" onClick={() => setMuting(true)}>
+            <Button variant="secondary" pending={unmuting || mutingIt} onClick={() => setMuting(true)}>
               Mute…
             </Button>
           )}
@@ -239,7 +253,7 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
         )}
       </Panel>
       {h.meta && <AgentPanel h={h} />}
-      {muting && <MuteDialog name={name} onClose={() => setMuting(false)} />}
+      {muting && <MuteDialog name={name} pending={mutingIt} onMute={muteIt} onClose={() => setMuting(false)} />}
     </>
   );
 }
@@ -292,39 +306,34 @@ const MUTES = [
 ];
 
 /** A host muted: a downtime of every monitor's groups of it, for a while or until unmuted. */
-function MuteDialog({ name, onClose }: { name: string; onClose: () => void }) {
+function MuteDialog({ name, pending, onMute, onClose }: { name: string; pending: boolean; onMute: (body: { end?: number; message?: string }, then: () => void) => void; onClose: () => void }) {
   const [forS, setFor] = React.useState("3600");
   const [message, setMessage] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const save = async () => {
-    setBusy(true);
-    try {
-      await observeApi.muteHost(name, { end: forS ? Math.floor(Date.now() / 1000) + Number(forS) : undefined, message: message.trim() || undefined });
-      invalidate(`observe/hosts/${name}`);
-      invalidate("observe/hosts");
-      onClose();
-    } catch (e) {
-      toast({ title: "Couldn't mute it", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const form = [forS, message];
+  const opening = useOpening(form);
+  const save = () =>
+    onMute({ end: forS ? Math.floor(Date.now() / 1000) + Number(forS) : undefined, message: message.trim() || undefined }, () => {
+      if (opening.still(form)) onClose();
+    });
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={`Mute ${name}`} description="Every monitor's groups of this host say nothing while it is muted: a downtime, as Datadog's mute makes.">
-        <div className="space-y-4">
-          <SelectField label="How long" value={forS} onChange={setFor} options={MUTES} />
-          <div>
-            <label htmlFor="mute-message" className="field-label">
-              Why (optional)
-            </label>
-            <textarea id="mute-message" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Patching the kernel" />
-          </div>
+        <div ref={opening.ref} className="space-y-4">
+          {/* Muted once: muted again, it's refused, so its fields wait for the answer. */}
+          <HeldFields held={pending}>
+            <SelectField label="How long" value={forS} onChange={setFor} options={MUTES} />
+            <div>
+              <label htmlFor="mute-message" className="field-label">
+                Why (optional)
+              </label>
+              <textarea id="mute-message" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Patching the kernel" />
+            </div>
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button disabled={busy} onClick={() => void save()}>
+            <Button pending={pending} onClick={save}>
               Mute
             </Button>
           </div>

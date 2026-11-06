@@ -13,11 +13,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { statsdRes } from "./parts";
+import { HeldFields, statsdRes, useOpening } from "./parts";
 import { ReadBy, ReadByMachines } from "./scrapes";
 
 const SERVER = "server";
@@ -209,7 +210,7 @@ function bodyOf(f: Form): StatsdIn {
 
 function StatsdDialog({ listener, onClose }: { listener: Statsd | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(listener));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(f);
   const set = (patch: Partial<Form>) => setF((old) => ({ ...old, ...patch }));
   const validName = /^[A-Za-z0-9_.-]{1,64}$/.test(f.name);
   const addresses = list(f.listen);
@@ -217,18 +218,11 @@ function StatsdDialog({ listener, onClose }: { listener: Statsd | null; onClose:
   const validAggregates = list(f.aggregates).every((a) => AGGREGATES.includes(a as HistogramAggregate));
   const validPercentiles = list(f.percentiles).every((p) => /^0?\.\d{1,2}$/.test(p) && Number(p) >= 0.01);
   const ok = validName && validListen && validAggregates && validPercentiles;
-  const save = async () => {
-    setBusy(true);
-    try {
-      await observeApi.putStatsd(f.name, bodyOf(f));
-      invalidate("observe/statsd");
-      onClose();
-    } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    await observeApi.putStatsd(f.name, bodyOf(f));
+    invalidate("observe/statsd");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -236,55 +230,58 @@ function StatsdDialog({ listener, onClose }: { listener: Statsd | null; onClose:
         description="Metrics are of the machine that takes them (a host: tag says otherwise), aggregated each ten seconds as Datadog's Agent aggregates them."
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <HeldFields held={saving && !listener}>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Name"
+                value={f.name}
+                readOnly={listener !== null}
+                onChange={(e) => set({ name: e.target.value })}
+                placeholder="dogstatsd"
+                hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
+              />
+              <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
+                <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
+              </React.Suspense>
+            </div>
             <TextField
-              label="Name"
-              value={f.name}
-              readOnly={listener !== null}
-              onChange={(e) => set({ name: e.target.value })}
-              placeholder="dogstatsd"
-              hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
-            />
-            <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
-              <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
-            </React.Suspense>
-          </div>
-          <TextField
-            label="Listen on"
-            value={f.listen}
-            onChange={(e) => set({ listen: e.target.value })}
-            placeholder="udp://127.0.0.1:8125"
-            hint={!validListen ? "udp://host:port or unix:///path, 4 at the most" : "udp://0.0.0.0:8125 takes other machines' too; a Unix socket anyone on the machine may send to."}
-            spellCheck={false}
-          />
-          <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" hint="Given to every metric, event and check." spellCheck={false} />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField
-              label="Histogram aggregates"
-              value={f.aggregates}
-              onChange={(e) => set({ aggregates: e.target.value })}
-              hint={!validAggregates ? "max, median, avg, count, min, sum" : undefined}
+              label="Listen on"
+              value={f.listen}
+              onChange={(e) => set({ listen: e.target.value })}
+              placeholder="udp://127.0.0.1:8125"
+              hint={!validListen ? "udp://host:port or unix:///path, 4 at the most" : "udp://0.0.0.0:8125 takes other machines' too; a Unix socket anyone on the machine may send to."}
               spellCheck={false}
             />
-            <TextField
-              label="Histogram percentiles"
-              value={f.percentiles}
-              onChange={(e) => set({ percentiles: e.target.value })}
-              hint={!validPercentiles ? "0.01 to 0.99, in hundredths" : undefined}
-              spellCheck={false}
-            />
-          </div>
+            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" hint="Given to every metric, event and check." spellCheck={false} />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Histogram aggregates"
+                value={f.aggregates}
+                onChange={(e) => set({ aggregates: e.target.value })}
+                hint={!validAggregates ? "max, median, avg, count, min, sum" : undefined}
+                spellCheck={false}
+              />
+              <TextField
+                label="Histogram percentiles"
+                value={f.percentiles}
+                onChange={(e) => set({ percentiles: e.target.value })}
+                hint={!validPercentiles ? "0.01 to 0.99, in hundredths" : undefined}
+                spellCheck={false}
+              />
+            </div>
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {listener ? "Save" : "Add"}
             </Button>
           </div>

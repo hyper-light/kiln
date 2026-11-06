@@ -57,7 +57,7 @@ impl Leg {
         let arch = match std::env::consts::ARCH { "x86_64" => "amd64", "aarch64" => "arm64", "arm" => "arm", other => other };
         let platform = format!("{os}/{arch}{}", if musl { "/musl" } else { "" });
         let archive = locks.runtime(using, &platform).map_err(anyhow::Error::msg)?.clone();
-        let _guard = NODE_LOCK.lock().await;
+        let _guard = NODE_LOCK.turn().await;
         let cache = self.work_dir.join("_externals/_locked_archives").join(format!("{}.tar.gz", archive.sha256.to_ascii_lowercase()));
         let path = cache.clone();
         let cached = crate::rt::blocking(move || -> std::io::Result<Vec<u8>> {
@@ -147,7 +147,7 @@ mod tests {
             let (bytes, archive) = archive()?;
             let locks = kiln_ci::lock::execution::Locks { runtimes: [("node20".into(), [("linux/amd64".into(), archive.clone())].into())].into(), ..Default::default() };
             let a = AssignmentV2 { job_id: "locked-node".into(), dependency_locks: Some(locks), ..Default::default() };
-            let (tx, _rx) = async_channel::unbounded();
+            let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             let leg = Leg { a, work_dir: root.path().to_owned(), runner_name: "fixture".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let cache = root.path().join("_externals/_locked_archives").join(format!("{}.tar.gz", archive.sha256));
             std::fs::create_dir_all(cache.parent().ok_or_else(|| anyhow::anyhow!("no cache parent"))?)?;

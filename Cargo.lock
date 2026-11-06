@@ -313,6 +313,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-task",
+ "futures-util",
  "log",
  "pin-project-lite",
  "tungstenite",
@@ -342,8 +343,6 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aws-lc-rs"
 version = "1.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -1363,10 +1362,12 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 name = "focal-bus"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crc-fast",
  "focal-memory",
  "focal-platform",
  "focal-seal",
+ "getrandom 0.3.4",
  "hyper-block",
  "hyper-durable",
  "hyper-liveness",
@@ -1835,6 +1836,9 @@ name = "hyper-rt"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "crossbeam-deque",
+ "crossbeam-utils",
+ "hyper-measure",
  "libc",
  "loom",
  "pin-project-lite",
@@ -1887,6 +1891,7 @@ dependencies = [
 name = "hyper-transport"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "crc-fast",
  "hyper-quic",
@@ -2230,6 +2235,7 @@ name = "kiln"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-broadcast",
  "async-channel",
@@ -2241,6 +2247,8 @@ dependencies = [
  "bytes",
  "clap",
  "command-group",
+ "concurrent-queue",
+ "crc32fast",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",
@@ -2264,6 +2272,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-bp",
  "kiln-cd",
  "kiln-ci",
  "kiln-http",
@@ -2271,6 +2280,9 @@ dependencies = [
  "kiln-seams",
  "kiln-search",
  "kiln-sim",
+ "mantle-client",
+ "mantle-protocol",
+ "mantle-s3",
  "memchr",
  "mime_guess",
  "nix 0.31.3",
@@ -2301,6 +2313,8 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "time",
  "toml",
  "toml_edit",
@@ -2315,6 +2329,14 @@ dependencies = [
  "winapi-util",
  "x509-parser",
  "zip",
+]
+
+[[package]]
+name = "kiln-bp"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "serde_json",
 ]
 
 [[package]]
@@ -2388,9 +2410,29 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httparse",
+ "hyper-measure",
+ "hyper-quic",
  "hyper-rt",
  "memchr",
+ "rcgen",
+ "sha2 0.11.1",
  "tracing",
+]
+
+[[package]]
+name = "kiln-lab"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "libc",
+ "polling",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml",
 ]
 
 [[package]]
@@ -2450,6 +2492,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "postcard",
+ "proptest",
  "rayon",
  "regex",
  "serde",
@@ -2610,6 +2653,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mantle-client"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-transport",
+ "mantle-protocol",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-codec"
+version = "0.1.0"
+
+[[package]]
+name = "mantle-crc"
+version = "0.1.0"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-protocol"
+version = "0.1.0"
+dependencies = [
+ "hyper-rt-transport",
+ "hyper-timing",
+ "hyper-transport",
+ "mantle-codec",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-s3"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "mantle-crc",
+ "memchr",
+ "thiserror 2.0.21",
+ "twox-hash",
+ "unicode-general-category",
+ "zeroize",
 ]
 
 [[package]]
@@ -4339,6 +4433,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4856,6 +4970,12 @@ name = "unicase"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

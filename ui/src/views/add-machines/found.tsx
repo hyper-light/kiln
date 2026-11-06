@@ -12,6 +12,7 @@ import type { DiscoveredInstance, DiscoveryInfo, JoinRequest, ScanState } from "
 import { Button } from "@/components/ui/button";
 import { SectionHeading } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { sendingProps, useAction } from "@/lib/action";
 import { errorMessage, useNow } from "@/lib/hooks";
 import type { SuspenseResource } from "@/lib/resource";
 import { Beam } from "@/views/harness/signals";
@@ -24,12 +25,11 @@ type Probe = { address: string; state: "asking" } | { address: string; state: "d
 export function FoundSection({ index, discovery, requests, onRequestsChanged }: { index: string; discovery: SuspenseResource<DiscoveryInfo>; requests: JoinRequest[]; onRequestsChanged: () => void }) {
   const d = discovery.data;
   const [probe, setProbe] = React.useState<Probe | null>(null);
-  const { setData, reload } = discovery;
+  const { setData, change, reload } = discovery;
 
-  const patch = React.useCallback(
-    (id: string, p: Partial<DiscoveredInstance>) => setData((prev) => ({ ...prev, instances: prev.instances.map((i) => (i.id === id ? { ...i, ...p } : i)) })),
-    [setData],
-  );
+  // What a press shows at once, made again over a read of the list already on its way (a scan
+  // reads it again on nearly every event).
+  const patch = React.useCallback((id: string, p: Partial<DiscoveredInstance>) => change((prev) => ({ ...prev, instances: prev.instances.map((i) => (i.id === id ? { ...i, ...p } : i)) })), [change]);
   const changed = React.useCallback(() => {
     reload();
     onRequestsChanged();
@@ -151,12 +151,15 @@ function ScanForm({ d, onStarted }: { d: DiscoveryInfo; onStarted: (s: ScanState
   const value = text ?? (d.subnets ?? []).join(", ");
   const [editing, setEditing] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [starting, setStarting] = React.useState(false);
   const running = Boolean(d.scan?.running);
   const id = React.useId();
   const edit = React.useRef<HTMLButtonElement>(null);
+  const [scan, starting] = useAction(
+    (cidrs: string[]) => discoveryApi.scan(cidrs).then(onStarted),
+    (err) => setError(errorMessage(err)),
+  );
 
-  const submit = async (e: React.FormEvent) => {
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (running || starting) return;
     const cidrs = value.split(/[\s,]+/).filter(Boolean);
@@ -168,19 +171,12 @@ function ScanForm({ d, onStarted }: { d: DiscoveryInfo; onStarted: (s: ScanState
     }
     setError(null);
     setEditing(false);
-    setStarting(true);
-    try {
-      onStarted(await discoveryApi.scan(cidrs));
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setStarting(false);
-    }
+    scan(cidrs);
   };
 
   return (
     <form className="am-scan" onSubmit={submit}>
-      <Button type="submit" variant="secondary" size="xs" disabled={running || starting}>
+      <Button type="submit" variant="secondary" size="xs" pending={starting} disabled={running}>
         <Radar aria-hidden="true" /> {running ? "Scanning…" : "Scan network"}
       </Button>
       {editing ? (
@@ -339,7 +335,7 @@ function ProbeForm({ probe, onProbe }: { probe: Probe | null; onProbe: (p: Probe
           }
         }}
       />
-      <button type="submit" className="am-act" disabled={!address.trim() || asking}>
+      <button type="submit" className="am-act" {...sendingProps(asking)} disabled={!address.trim()}>
         {asking ? "Asking…" : "Probe"} <ArrowRight aria-hidden="true" />
       </button>
       <button type="button" className="am-act" data-tone="quiet" aria-label="Close add by address" onClick={close}>
@@ -469,29 +465,28 @@ function InstanceAction({
 }) {
   useLabels();
   const name = displayName(i);
-  const [busy, setBusy] = React.useState(false);
 
-  const invite = async (yes: boolean) => {
-    setBusy(true);
-    try {
-      if (yes) await discoveryApi.invite(i.id);
-      else await discoveryApi.uninvite(i.id);
-      onPatch(i.id, { invited: yes });
-      onChanged();
-    } catch (e) {
-      toast.error(yes ? `Couldn't invite ${name}` : "Couldn't cancel the invitation", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Invited (or not) at once (W21-R15), and as it was, saying why, if the server says no; while
+  // that's on its way the next press on it waits, so an invitation and its cancelling can't be taken
+  // in the other order.
+  const [invite, inviting] = useAction((yes: boolean) => {
+    onPatch(i.id, { invited: yes });
+    return (yes ? discoveryApi.invite(i.id) : discoveryApi.uninvite(i.id)).then(
+      () => onChanged(),
+      (e: unknown) => {
+        onPatch(i.id, { invited: !yes });
+        toast.error(yes ? `Couldn't invite ${name}` : "Couldn't cancel the invitation", errorMessage(e));
+      },
+    );
+  });
 
   switch (stand) {
     case "asking":
       return request ? <Decide request={request} onDecided={onChanged} /> : <span className="am-quiet">asking…</span>;
     case "fresh":
       return canInvite ? (
-        <button type="button" className="am-act" disabled={busy} onClick={() => void invite(true)} aria-label={`Invite ${name}`} title="It asks to join; you approve it here with its code">
-          <Send aria-hidden="true" /> {busy ? "Inviting…" : "Invite"}
+        <button type="button" className="am-act" {...sendingProps(inviting)} onClick={() => invite(true)} aria-label={`Invite ${name}`} title="It asks to join; you approve it here with its code">
+          <Send aria-hidden="true" /> Invite
         </button>
       ) : (
         <span className="am-quiet">join requests are off</span>
@@ -500,7 +495,7 @@ function InstanceAction({
       return (
         <>
           <span className="am-quiet">Invited · waiting for it to ask</span>
-          <button type="button" className="am-act" data-tone="quiet" disabled={busy} onClick={() => void invite(false)} aria-label={`Cancel the invitation to ${name}`}>
+          <button type="button" className="am-act" data-tone="quiet" {...sendingProps(inviting)} onClick={() => invite(false)} aria-label={`Cancel the invitation to ${name}`}>
             Cancel
           </button>
         </>
@@ -526,9 +521,10 @@ function InstanceAction({
 
 /** The verification code and the decision. The code is the check: approve only when the machine shows the same. */
 function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: () => void }) {
-  const [busy, setBusy] = React.useState<"approve" | "deny" | null>(null);
-  const decide = async (what: "approve" | "deny") => {
-    setBusy(what);
+  // The decision pressed says it's on its way (W21-R15); pressing the other meanwhile does nothing.
+  const [chose, setChose] = React.useState<"approve" | "deny" | null>(null);
+  const [decide, deciding] = useAction(async (what: "approve" | "deny") => {
+    setChose(what);
     try {
       if (what === "approve") {
         const res = await api.approveJoin(r.id);
@@ -542,10 +538,9 @@ function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: ()
       onDecided();
     } catch (e) {
       toast.error(what === "approve" ? "Approval failed" : "Deny failed", errorMessage(e));
-    } finally {
-      setBusy(null);
     }
-  };
+  });
+  const busy = deciding ? chose : null;
   return (
     <>
       {r.code ? (
@@ -557,10 +552,10 @@ function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: ()
       ) : (
         <span className="am-quiet">waiting for it to confirm…</span>
       )}
-      <button type="button" className="am-act" data-tone="ok" disabled={!r.code || busy !== null} onClick={() => void decide("approve")} aria-label={`Approve ${r.name}`}>
+      <button type="button" className="am-act" data-tone="ok" {...sendingProps(busy === "approve")} disabled={!r.code} onClick={() => decide("approve")} aria-label={`Approve ${r.name}`}>
         <Check aria-hidden="true" /> {busy === "approve" ? "Approving…" : "Approve"}
       </button>
-      <button type="button" className="am-act" data-tone="danger" disabled={busy !== null} onClick={() => void decide("deny")} aria-label={`Deny ${r.name}`}>
+      <button type="button" className="am-act" data-tone="danger" {...sendingProps(busy === "deny")} onClick={() => decide("deny")} aria-label={`Deny ${r.name}`}>
         {busy === "deny" ? "Denying…" : "Deny"}
       </button>
     </>

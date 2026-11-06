@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { toast } from "@/components/ui/toast";
+import { useAction, useHold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -35,24 +37,33 @@ export function PasskeysGroup() {
   const res = useRes(passkeysRes);
   const list = res.data;
   const [name, setName] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [removing, setRemoving] = React.useState<string | null>(null);
   const [note, setNote] = React.useState<Note>(null);
-  const act = async (f: () => Promise<unknown>, done: string) => {
-    setBusy(true);
-    setNote(null);
-    try {
-      await f();
-      res.reload();
-      setNote({ text: done });
-      return true;
-    } catch (e) {
-      setNote({ tone: "error", text: e instanceof DOMException && e.name === "NotAllowedError" ? "No passkey was made: it was cancelled, or it timed out." : errorMessage(e) });
-      return false;
-    } finally {
-      setBusy(false);
-    }
+  // Gone at once (W21-R15), and back, saying why, if the server keeps it; said in a toast, as a
+  // passkey being made meanwhile has the line under the form.
+  const remove = (k: Passkey) => {
+    setRemoving(null);
+    res.change((l) => l.filter((x) => x.id !== k.id));
+    signin.removePasskey(k.id).then(
+      () => toast({ title: `Removed ${k.name}`, tone: "info" }),
+      (e: unknown) => {
+        toast.error(`Couldn't remove ${k.name}`, errorMessage(e));
+        res.reload();
+      },
+    );
   };
+  // Its answer empties the name, so the name is held as it is until then (W21-R15).
+  const [make, making] = useAction(
+    async () => {
+      const called = name.trim() || "A passkey";
+      setNote(null);
+      await signin.addPasskey(called);
+      res.reload();
+      setNote({ text: `Made ${called}. Sign in with it from the sign-in page.` });
+      setName("");
+    },
+    (e) => setNote({ tone: "error", text: e instanceof DOMException && e.name === "NotAllowedError" ? "No passkey was made: it was cancelled, or it timed out." : errorMessage(e) }),
+  );
   return (
     <SettingsGroup id="signin.passkeys" title="Passkeys" about={PASSKEYS.about} words={PASSKEYS.words}>
       {list.length === 0 ? (
@@ -68,7 +79,7 @@ export function PasskeysGroup() {
                   {k.backed_up ? " · synced" : ""} · {k.rp_id}
                 </span>
                 <span className="st-item-acts">
-                  <Button size="xs" variant="ghost" disabled={busy} aria-expanded={removing === k.id} onClick={() => setRemoving(removing === k.id ? null : k.id)}>
+                  <Button size="xs" variant="ghost" aria-expanded={removing === k.id} onClick={() => setRemoving(removing === k.id ? null : k.id)}>
                     Remove
                   </Button>
                 </span>
@@ -80,10 +91,10 @@ export function PasskeysGroup() {
                   className="mt-3"
                   actions={
                     <>
-                      <Button size="xs" variant="primary" disabled={busy} onClick={() => void act(() => signin.removePasskey(k.id), `Removed ${k.name}.`).then((ok) => ok && setRemoving(null))}>
+                      <Button size="xs" variant="primary" onClick={() => remove(k)}>
                         Remove {k.name}
                       </Button>
-                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(null)}>
+                      <Button size="xs" variant="ghost" onClick={() => setRemoving(null)}>
                         Keep it
                       </Button>
                     </>
@@ -100,18 +111,17 @@ export function PasskeysGroup() {
         <form
           noValidate
           className="mt-4"
-          onSubmit={async (e) => {
+          onSubmit={(e) => {
             e.preventDefault();
-            const called = name.trim() || "A passkey";
-            if (await act(() => signin.addPasskey(called), `Made ${called}. Sign in with it from the sign-in page.`)) setName("");
+            make();
           }}
         >
           <SettingRow label="A new one" htmlFor="st-passkey-name" help="Name it for the device or password manager that keeps it.">
             <div className="st-control-line">
               <div className="field st-wide">
-                <input id="st-passkey-name" type="text" placeholder="Work laptop" maxLength={80} value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+                <input id="st-passkey-name" type="text" placeholder="Work laptop" maxLength={80} value={name} disabled={making} onChange={(e) => setName(e.target.value)} />
               </div>
-              <Button type="submit" size="xs" variant="secondary" disabled={busy}>
+              <Button type="submit" size="xs" variant="secondary" pending={making}>
                 Make a passkey
               </Button>
             </div>
@@ -142,23 +152,22 @@ export function MyPasswordGroup() {
   const has = res.data.set;
   const [current, setCurrent] = React.useState("");
   const [next, setNext] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<Note>(null);
   const save = async (password: string, done: string) => {
-    setBusy(true);
     setNote(null);
-    try {
-      const r = await signin.setMyPassword(password, current);
-      res.setData(() => r);
-      setCurrent("");
-      setNext("");
-      setNote({ text: done });
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
+    const r = await signin.setMyPassword(password, current);
+    res.setData(() => r);
+    setCurrent("");
+    setNext("");
+    setNote({ text: done });
   };
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  const hold = useHold(failed);
+  const change = () => hold.change("change", () => save(next, has ? "Changed." : "Set: sign in with your name and it."));
+  const remove = () => hold.change("remove", () => save("", "Removed: sign in with links, a host or a passkey."));
+  // One change to the password at a time, and either answer empties the fields: they're held as
+  // they are while it's on its way (W21-R15).
+  const busy = hold.going;
   return (
     <SettingsGroup id="signin.mine" title="Your password" about={PASSWORD.about} words={PASSWORD.words} actions={<span className="st-value">{has ? "Set" : "None"}</span>}>
       <form
@@ -166,7 +175,7 @@ export function MyPasswordGroup() {
         autoComplete="on"
         onSubmit={(e) => {
           e.preventDefault();
-          if (next) void save(next, has ? "Changed." : "Set: sign in with your name and it.");
+          if (next && !hold.held("change")) change();
         }}
       >
         {has && (
@@ -183,11 +192,11 @@ export function MyPasswordGroup() {
         </SettingRow>
         <div className="mt-3 flex justify-end gap-2">
           {has && (
-            <Button type="button" size="xs" variant="ghost" disabled={busy || !current} onClick={() => void save("", "Removed: sign in with links, a host or a passkey.")}>
+            <Button type="button" size="xs" variant="ghost" pending={hold.doing("remove")} disabled={!current || hold.held("remove")} onClick={remove}>
               Remove it
             </Button>
           )}
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || next.length < 8 || (has && !current)}>
+          <Button type="submit" size="xs" variant="secondary" pending={hold.doing("change")} disabled={hold.held("change") || next.length < 8 || (has && !current)}>
             {has ? "Change it" : "Set it"}
           </Button>
         </div>

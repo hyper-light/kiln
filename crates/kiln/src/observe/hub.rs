@@ -15,16 +15,25 @@ use crate::proto::{self, ServerMsg};
 /// Sends what the group says to each machine's replicating runner process, on observe's lane.
 pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let Some(o) = super::api::get() else { return Ok(()) };
-    let out = o.outgoing();
-    while let Ok(m) = out.recv().await {
-        let peer = hub.instances.lock().newest_with(&m.machine, proto::CAP_OBSERVE);
-        let Some(peer) = peer else { continue };
-        let msg = ServerMsg::Observe { json: wire::encode(&m.msg), bytes: m.bytes };
-        if let Ok(b) = proto::encode(&msg) {
-            hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b).await;
-        }
-    }
+    send_each(&hub, &o.outgoing()).await;
     Ok(())
+}
+
+/// What `out` holds, each sent in its turn (goal 9, plan 01a1a87b2cec step 3): its queue and the net thread's take a
+/// message without waiting, so a replica catching up (up to thousands waiting) was sent in one poll; then, taking
+/// turns, each message was still copied as it was encoded (up to half a mebibyte), 0.16 to 0.39 ms on the CPU in a
+/// poll in rt9's rounds. Each message's runner process is found here, its frame made on the compute pool, and the
+/// frames sent in order in turns that end their polls (`crate::net::send_made`).
+async fn send_each(hub: &Hub, out: &async_channel::Receiver<Box<super::owner::Out>>) {
+    let route = |m: Box<super::owner::Out>| hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE).map(|peer| (peer, m));
+    crate::net::send_made(out, route, observe_frame, |peer, b| hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b)).await;
+}
+
+/// A message to a runner's replica as observe's lane carries it: its words beside its bytes. Made on the compute pool
+/// (`send_each`).
+fn observe_frame(m: Box<super::owner::Out>) -> Vec<Vec<u8>> {
+    let super::owner::Out { msg, bytes, .. } = *m;
+    proto::encode(&ServerMsg::Observe { json: wire::encode(&msg), bytes }).ok().into_iter().collect()
 }
 
 /// What a machine's runner said on observe's lane.
@@ -39,7 +48,7 @@ pub fn heard(machine: &str, msg: wire::Msg, bytes: Vec<u8>) {
 pub async fn announced(hub: &Hub, machine: &str) {
     let Some(o) = super::api::get() else { return };
     let (newest, others) = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         let newest = inst.newest_with(machine, proto::CAP_OBSERVE);
         let others: Vec<_> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_OBSERVE != 0)).collect();
         (newest, others)
@@ -56,7 +65,7 @@ pub async fn announced(hub: &Hub, machine: &str) {
 /// A runner process of `machine` went: the group follows the newest that is left, if any.
 pub fn lost(hub: &Hub, machine: &str) {
     if let Some(o) = super::api::get() {
-        o.up(machine, hub.instances.lock().newest_with(machine, proto::CAP_OBSERVE).is_some());
+        o.up(machine, hub.instances.load().newest_with(machine, proto::CAP_OBSERVE).is_some());
     }
 }
 
@@ -82,4 +91,46 @@ pub fn host_sample(machine: &str, s: &HostSample) {
     ];
     let series: Vec<(SeriesKey, Vec<(i64, f64)>)> = points.iter().filter_map(|&(metric, kind, v)| SeriesKey::new(metric, host, kind).ok().map(|k| (k, vec![(ts, v)]))).collect();
     o.write(series);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: observe's sender, with thousands of messages waiting (a replica catching up),
+    /// gives its shard up between them once its turn would pass the quantum, and takes every one: another task on its
+    /// shard that wants it runs while it sends. Its queue and the net thread's take a message without waiting, so it
+    /// took them all in one poll.
+    #[test]
+    fn g9_s3_a_backlog_is_sent_in_turns() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (tx, rx) = async_channel::unbounded();
+            for n in 0..20_000u32 {
+                tx.try_send(Box::new(super::super::owner::Out { machine: "away".into(), msg: wire::Msg::Release, bytes: n.to_be_bytes().to_vec() })).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
+            }
+            drop(tx);
+            let (ran, stop) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+            let other = {
+                let (ran, stop) = (Arc::clone(&ran), Arc::clone(&stop));
+                crate::rt::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        hyper_rt::futures::yield_now().await;
+                    }
+                })
+            };
+            let before = ran.load(Ordering::SeqCst);
+            send_each(&hub, &rx).await;
+            let during = ran.load(Ordering::SeqCst) - before;
+            stop.store(true, Ordering::SeqCst);
+            let _ = other.await;
+            anyhow::ensure!(during > 0, "the other task never ran while the backlog was sent");
+            anyhow::ensure!(rx.is_empty(), "every one taken");
+            Ok(())
+        })
+    }
 }

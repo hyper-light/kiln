@@ -17,6 +17,11 @@ hyper-seal = { path = "../hyper-seal" }
 hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
 
+# loom builds only for the library's own tests under `RUSTFLAGS="--cfg loom"`, for the owner's
+# wake's interleavings (`src/wake.rs`): a test-only dependency, so no consumer resolves it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }

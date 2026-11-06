@@ -139,7 +139,9 @@ pub struct Tasks {
     file: PathBuf,
     dir: PathBuf,
     inner: Mutex<Inner>,
-    changed: event_listener::Event,
+    /// Told as a task changes: a wait for a machine's news looks again (`crate::rt::Changed`, no lock; goal 5, plan
+    /// 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: crate::rt::Changed,
 }
 
 /// What to do: from where, to which machines and folders.
@@ -199,7 +201,7 @@ impl Tasks {
         let bundles = dir.join("bundles");
         let _ = std::fs::remove_dir_all(&bundles);
         let _ = std::fs::create_dir_all(&bundles);
-        let me = Self { file, dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: event_listener::Event::new() };
+        let me = Self { file, dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: crate::rt::Changed::new() };
         // Written again only when the restart failed one under way, or forgot ones kept long
         // enough: unchanged, the file stands.
         if cut || pruned {
@@ -236,7 +238,7 @@ impl Tasks {
     /// What a machine said of its part of a task (or of a batch's bundle).
     pub fn heard(&self, machine: &str, news: TaskNews) {
         self.inner.lock().news.insert((news.task.clone(), machine.to_owned()), (news, Instant::now()));
-        self.changed.notify(usize::MAX);
+        self.changed.notify();
     }
 
     fn news(&self, id: &str, machine: &str) -> Option<(TaskNews, Instant)> {
@@ -282,7 +284,7 @@ impl Tasks {
         };
         if found {
             self.save();
-            self.changed.notify(usize::MAX);
+            self.changed.notify();
             hub.emit(&crate::wire::events::ServerEvent::Places);
         }
     }
@@ -336,7 +338,7 @@ impl Tasks {
             b.hash = Some(hash);
             b.size = size;
         }
-        self.changed.notify(usize::MAX);
+        self.changed.notify();
     }
 
     /// The batch's bundle, its SHA-256 and size, for a machine it goes to.
@@ -893,7 +895,7 @@ async fn wait_news(hub: &Arc<Hub>, id: &str, machine: &str, ids: &[String]) -> R
         } else if start.elapsed() > QUIET {
             return Err(format!("{} never started: is its runner up to date?", hub.shown(machine)));
         }
-        let online = hub.agents.lock().get(machine).is_some_and(|a| a.connected);
+        let online = hub.agents.load().get(machine).is_some_and(|a| a.connected);
         if online {
             away = None;
         } else if away.get_or_insert_with(Instant::now).elapsed() > AWAY {

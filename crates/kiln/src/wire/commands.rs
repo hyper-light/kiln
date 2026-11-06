@@ -147,6 +147,54 @@ struct Peer {
 /// its hello: the clock is for a runner that says nothing, not a short wait.
 pub const COMING_FOR: Duration = Duration::from_secs(60);
 
+/// A call on the commands, run by their [`Owner`].
+type Call = Box<dyn FnOnce(&mut Commands) + Send>;
+
+/// The server's [`Commands`] without a lock (goal 5 of the API runtime program, plan 01a1a59c2aae):
+/// a task of their own owns them and takes every change and question as a message, in the order they
+/// come. A caller waits for its turn, not on a lock, and no shard stalls another holding them.
+pub struct Owner {
+    tx: crate::memory::queue::Sender<Call>,
+}
+
+impl Owner {
+    /// `commands`, owned by a task started for them now.
+    pub fn start(commands: Commands) -> Self {
+        // Unbounded, and bounded by its callers (goal 11, plan 01a1a87b2e56 step 3): every call but
+        // `tell`'s is waited for ([`Owner::ask`]), so those are one for each task waiting on the commands;
+        // `tell`'s are `crate::hub::Hub::command_soon`'s, a command each for a session told at once (an
+        // account's sessions held at its limit, a stale session's snapshot asked), each at most
+        // [`ITEM_MOST`]. What the commands keep unanswered is [`ROOM`] a runner process at the most.
+        // Lock-free (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's
+        // wait took event-listener's `Mutex`, each caller's shard sending (a terminal's keystrokes, every
+        // `command_start`) and the owner's waiting.
+        let (tx, rx) = crate::memory::queue::unbounded::<Call>(&crate::memory::owners::CHANNELS);
+        drop(crate::rt::spawn(async move {
+            let mut commands = commands;
+            while let Ok(call) = rx.recv().await {
+                call(&mut commands);
+            }
+        }));
+        Self { tx }
+    }
+
+    /// `f` run on the commands in its turn, not waited for.
+    pub fn tell(&self, f: impl FnOnce(&mut Commands) + Send + 'static) {
+        // Unbounded: refused only once the owner has stopped (the server's going).
+        let _ = self.tx.try_send(Box::new(f));
+    }
+
+    /// `f` run on the commands in its turn, after what was sent before it; its answer. None once the
+    /// owner has stopped.
+    pub async fn ask<R: Send + 'static>(&self, f: impl FnOnce(&mut Commands) -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = oneshot::channel();
+        self.tell(move |c| {
+            let _ = tx.send(f(c));
+        });
+        rx.await.ok()
+    }
+}
+
 /// Every runner process's command streams, on the server.
 pub struct Commands {
     born: u64,
@@ -489,6 +537,45 @@ mod tests {
 
     fn t(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): the commands' owner takes its calls on a lock-free queue now.
+    /// Calls told from every shard at once (as each terminal's keystrokes and every `command_start` are) are
+    /// each run once, each sender's in the order it told them, and a question asked after them is answered
+    /// once they've all run.
+    #[test]
+    fn g5_the_commands_owner_runs_calls_from_every_shard_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let owner = std::sync::Arc::new(Owner::start(Commands::new(1)));
+            let (ran, log) = crate::memory::queue::unbounded::<(usize, usize)>(&crate::memory::owners::CHANNELS);
+            let (senders, per) = (8usize, 500usize);
+            let mut telling = Vec::new();
+            for s in 0..senders {
+                let (owner, ran) = (std::sync::Arc::clone(&owner), ran.clone());
+                telling.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        let ran = ran.clone();
+                        owner.tell(move |_| {
+                            let _ = ran.try_send((s, n));
+                        });
+                    }
+                }));
+            }
+            drop(ran);
+            for t in telling {
+                t.await.map_err(|_| anyhow::anyhow!("a sender ended before its calls"))?;
+            }
+            let asked = crate::rt::timeout(Duration::from_secs(10), owner.ask(|c| c.waiting())).await.map_err(|_| anyhow::anyhow!("never answered"))?;
+            anyhow::ensure!(asked == Some(0), "{asked:?}");
+            let mut got = vec![Vec::new(); senders];
+            while let Ok((s, n)) = log.try_recv() {
+                got.get_mut(s).ok_or_else(|| anyhow::anyhow!("no sender {s}"))?.push(n);
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     /// The runner's side: takes every command it's sent (refusing those `refuse` picks), its

@@ -147,10 +147,11 @@ takes is checked by the same functions (`check_key`, `check_sha256`, `byte_range
 takes. A put is checked in this order: its key, its size, its checksum, then its condition.
 
 - **Implementations:** kiln's local store (`kiln::blobs::local::LocalBlobs`: kiln's
-  content-addressed store, its data where it was), any S3 (`kiln::blobs::s3::S3Blobs`), then Mantle
-  (CP-T10.2); `kiln_seams::blobs::SimBlobs`: in memory, its presigned URLs signed and timed by its
-  clock, objects to 64 MiB, a million of them, a GiB in all (uploads' parts included), 1000
-  uploads under way.
+  content-addressed store, its data where it was), any S3 (`kiln::blobs::s3::S3Blobs`), and Mantle
+  over its native protocol (`kiln::blobs::mantle::MantleBlobs`, CP-T10.2);
+  `kiln_seams::blobs::SimBlobs`: in memory, its presigned URLs signed and timed by its clock,
+  objects to 64 MiB, a million of them, a GiB in all (uploads' parts included), 1000 uploads under
+  way.
 - **Used by:** kiln's content-addressed store (caches, artifacts, registry blobs, release assets and
   test reports, which CD reads its artifacts from), sync's blobs, recordings, transcripts and
   runner upgrade binaries (docs/blobs.md); Reliquary's bytes (CP-T9.1).

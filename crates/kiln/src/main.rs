@@ -10,6 +10,14 @@ use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
 
+/// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): production's, which the release
+/// build (ci/release/build.sh) takes by default since the lab's A/B picked it over musl's malloc, by resident memory
+/// and latency; its settings, for giving memory back, are `kiln::os::alloc`'s. Elsewhere, and without the feature,
+/// the platform's allocator as before.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Self-hosted GitOps CI/CD for the hyper-light stack")]
 struct Cli {
@@ -382,17 +390,30 @@ struct AgentArgs {
 }
 
 /// The log's lines, as `filter` says; and kiln's own spans that observe keeps (its own filter: what
-/// the log shows does not decide what observe sees).
-fn init_tracing(filter: &str, json: bool) {
+/// the log shows does not decide what observe sees). A server's and a runner's lines (`own_thread`) are
+/// written by a thread of their own (`kiln::log_lines`; goal 9, plan 01a1a87b2cec step 3), so a shard
+/// that logs never waits on stdout's lock or its reader: what's returned keeps that thread going until
+/// it's dropped. A command's lines stay where it writes them, in its output's order.
+fn init_tracing(filter: &str, json: bool, own_thread: bool) -> Option<kiln::log_lines::Writing> {
     use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let registry = tracing_subscriber::registry().with(kiln::observe::spans::layer());
+    if own_thread {
+        let (lines, writing) = kiln::log_lines::start();
+        let _ = if json {
+            registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        } else {
+            registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        };
+        return Some(writing);
+    }
     let _ = if json {
         registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_filter(filter)).try_init()
     } else {
         registry.with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).try_init()
     };
+    None
 }
 
 /// Panics are contained at task boundaries; the hook makes sure each one is logged loudly.
@@ -502,6 +523,8 @@ fn thread_stacks() {
 }
 
 fn main() -> ExitCode {
+    // The allocator's settings, before any other thread starts (goal 11, plan 01a1a87b2e56 step 4).
+    kiln::os::alloc::init();
     thread_stacks();
     // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
     #[cfg(target_os = "linux")]
@@ -578,14 +601,59 @@ fn main() -> ExitCode {
     // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
     // itself, the same way.
     let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
-    init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
+    // Held to the end of `main`: the log's lines written before the process ends.
+    let _log = init_tracing(if quiet { "warn" } else { &cli.log }, cli.json, matches!(cli.cmd, Cmd::Server | Cmd::Up | Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_)));
     install_panic_hook();
+    // Which allocator, and how it gives memory back (`kiln::os::alloc`): a server's and a runner's log say.
+    if matches!(cli.cmd, Cmd::Server | Cmd::Agent(_)) {
+        tracing::info!("{}", kiln::os::alloc::said());
+    }
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
     kiln::rt::configure(match &cli.cmd {
         Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
         Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
+    // The server's place on its machine (docs/priority.md), before the runtime starts: cores of its
+    // own, its shards fixed to them, and the legs and agents its own runner starts kept off them
+    // (worked out from the CPUs this thread starts with, before the shards take theirs); and its
+    // shards' real-time class.
+    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
+    if matches!(cli.cmd, Cmd::Server)
+        && let Ok(cfg) = config::Config::load(&config_path)
+    {
+        if let Some(cores) = &cfg.server.cores {
+            let own = kiln::os::own_cores(cores);
+            if cfg.local_agent.enabled {
+                // Off the shards' cores, where its slice holds the server on its cores (goal 9, plan
+                // 01a1a87b2cec step 4: a system install's partition).
+                let shards = own.as_deref().map(kiln::rt::shard_cores_for).unwrap_or_default();
+                kiln::os::keep_work_off(cores, &shards, "the server's own runner");
+            }
+            match own {
+                Ok(own) => {
+                    tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
+                    kiln::rt::pin(own);
+                    // Whether they're its alone: the partition a system install makes as the server starts.
+                    match kiln::os::cgroup::partition() {
+                        Some((path, state)) if state == "root" || state == "isolated" => tracing::info!(partition = %path, "the server's cores are a cpuset partition's: nothing outside it runs on them"),
+                        Some((path, state)) => tracing::warn!(partition = %path, state = %state, "the server's cores aren't kept from other work: the kernel found its partition invalid"),
+                        None => tracing::info!("the server's cores aren't a partition's: other work may run on them too (a system install makes kiln.slice one)"),
+                    }
+                }
+                Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
+            }
+        }
+        kiln::rt::realtime(cfg.server.realtime);
+        kiln::rt::nudge(cfg.server.nudge);
+    }
+    // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
+    // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").
+    if matches!(cli.cmd, Cmd::Agent(_) | Cmd::Join(_))
+        && let Some(cores) = config::Config::load(&config_path).ok().and_then(|c| c.server.cores)
+    {
+        kiln::os::keep_work_off(&cores, &[], "this runner");
+    }
     match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         // `kiln run`: the command's own exit status, nothing more to say.
@@ -624,6 +692,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
             shutdown_on_signals(shutdown.clone());
+            // Above what runs beside it (docs/priority.md): its own process on Windows.
+            kiln::os::server_first();
             // The agents it starts have their processes held together (`os::contain`).
             kiln::os::contain::hold_agents();
             // Jobs that ended frozen with a runner process before this one go on (W26-R22).

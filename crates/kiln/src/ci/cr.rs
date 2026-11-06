@@ -97,6 +97,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     let base_url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let (repo_id, trunk_s, branch_s, pushed_by, author) = (repo.id.clone(), trunk.to_owned(), branch.to_owned(), by.pushed_by.clone(), by.author.clone());
     let (draft, ready, note, topic) = (options.draft, options.ready, options.message.clone(), options.topic.clone());
+    let (threads, by_agent) = (options.threads.clone(), by.author.1 == "agent");
     let reviewers = options.reviewers.clone();
     let (head_s, base_s, patch_s) = (s.head.clone(), s.base.clone(), s.patch_id.clone());
     let brought: Vec<String> = s.shas.iter().filter(|h| **h != s.head).cloned().collect();
@@ -155,9 +156,11 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
             for (i, sha) in brought.iter().enumerate() {
                 tx.execute("INSERT OR IGNORE INTO diff_version_commits (diff_id, n, sha, position) VALUES (?1, ?2, ?3, ?4)", params![id, n, sha, i64::try_from(i).unwrap_or(i64::MAX)])?;
             }
+            // The threads of its own it answers (`-o answer=`, W26-R18).
+            let (why, thread, note) = diffs::answering(&tx, &id, &threads, by_agent, note)?;
             tx.execute(
-                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![id, n, head_s, base_s, patch_s, summary_c, note, rebase_only, pushed_by, now, by_text],
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why, thread) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![id, n, head_s, base_s, patch_s, summary_c, note, rebase_only, pushed_by, now, by_text, why, thread],
             )?;
             // Reviewers asked for the first time: they hear of it (W19-R06).
             let mut asked = Vec::new();
@@ -202,6 +205,8 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     hub.store.audit(by.pushed_by.clone(), "change_requests.submit".into(), format!("{} CR{number} v{n} {kind} ({branch} into {trunk})", repo.name)).await;
     let _ = id;
     let found = if kind == "new" { "new" } else { "branch" };
+    // The collision radar looks again (W26-R16).
+    super::fresh::changed(hub, repo, trunk);
     Ok(Outcome { name: format!("CR{number}"), number, version: n, kind, title, url: format!("{base_url}/diffs/CR{number}"), change, found, split_from: None, absorbed: Vec::new() })
 }
 

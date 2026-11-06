@@ -9,15 +9,51 @@
 //! the runner says hello with its store's id, the server answers with the number it has, and the
 //! runner sends batches from there, [`WINDOW`] ahead of what the server has acknowledged. A batch
 //! larger than a frame goes in parts.
+//!
+//! Each batch changes hands signed by both sides (docs/ci.md W27-R08), once each end has a
+//! [`Custodian`]: the giver's hand-on of it, by the SHA-256 of its rows, goes with its first part,
+//! and the taker checks what came against it before its store takes any of it: a batch that isn't
+//! what its hand-on says is refused (the giver is told to go on from where the taker stands, and
+//! sends it again), and the taker's receipt of what came records the break.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
+use kiln_ci::identity::statement::Subject;
 use serde::{Deserialize, Serialize};
 
-use super::store::{Changes, Store};
+use super::store::{Change, Changes, Store};
 use super::telemetry::{PeerView, Report, ShipStats, ShipView};
 use crate::proto;
+
+/// Who signs for one end of a feed (docs/ci.md W27-R08; the Transfers plan's step 12): a giver,
+/// its hand-on of each batch it sends; a taker, its receipt of each it takes, or would have.
+pub trait Custodian: Send + Sync {
+    /// Its signed hand-on of `thing` (a batch, by the SHA-256 of its rows) to the feed's taker, as
+    /// JSON; none when it signs none now (no identity yet, or a taker that takes no custody).
+    fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>>;
+
+    /// Its receipt, as the taker of `machine`'s feed, of `thing` (what came, by its SHA-256),
+    /// following `hand_on` (the giver's, as the batch carried it): signed, and kept with it.
+    fn received(&self, machine: &str, hand_on: &str, thing: Subject);
+}
+
+/// Where a feed's end keeps its [`Custodian`]: set once its identity can sign, read per batch, a copy swapped
+/// in whole (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal: an `RwLock` each batch read on its shard).
+type Signs = Arc<crate::rcu::Rcu<Option<Arc<dyn Custodian>>>>;
+
+/// A batch of `store`'s feed, following `from` and reading through `upto`, by the SHA-256 of its
+/// rows as JSON (`sha256`): what a hand-on and its receipt are about.
+pub fn batch_thing(store: &str, from: u64, upto: u64, sha256: &str) -> Subject {
+    Subject { name: format!("conversation store {store} after {from} through {upto}"), digest: std::collections::BTreeMap::from([("sha256".to_owned(), sha256.to_owned())]), ..Subject::default() }
+}
+
+/// The SHA-256 a hand-on (a custody record's bundle, as JSON) says its batch has.
+fn handed(hand_on: &str) -> Option<String> {
+    crate::custody::statement_in(hand_on)?.subject.first()?.digest.get("sha256").cloned()
+}
 
 /// The feed's lane on the runner's link.
 pub const LANE: u32 = proto::LANE_CONVO;
@@ -74,6 +110,10 @@ pub enum Msg {
         zip: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         told: Option<u64>,
+        /// The giver's signed hand-on of the batch, on its first part ([`Custodian`]): a giver from
+        /// before, or one that signs none now, sends none, and a taker from before ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand_on: Option<String>,
     },
     /// Server to runner: it has `store`'s feed through `rev`.
     Ack { store: String, rev: u64 },
@@ -108,36 +148,47 @@ pub fn decode(json: &str) -> Option<Msg> {
 /// Compression quality for a batch on the wire: fast, and most of the gain.
 const ZIP_QUALITY: u32 = 4;
 
+/// brotli's buffer, both ways; and so a unit of a batch's decoding on the compute pool ([`decode_batch`]): one read
+/// of the decompressor's, or hashing as much, a few microseconds, well inside a piece.
+const ZIP_BUFFER: usize = 4096;
+
+/// The brotli window a batch of `len` bytes is zipped with, as bits: the smallest that holds it
+/// (`crate::util::brotli_window`), and at most a batch's own size (`BATCH_BYTES`, 2^21 bytes; a row larger
+/// than a batch goes alone, in a batch of its own past it). The decoder on the other side ([`Decoding`]) grows
+/// its ring buffer to the window as the output passes it: at 22 bits for every batch, a batch just past 2 MiB
+/// took a 4 MiB ring buffer, and one being decoded held 5.2 MB of the server's live memory in the lab's
+/// realistic profile (goal 11, plan 01a1a87b2e56 step 5). A window of the batch's size reaches every match
+/// the batch's own bytes offer but those a large row's spill past it, and any brotli decoder reads it.
+fn zip_window(len: usize) -> u32 {
+    crate::util::brotli_window(len).min(BATCH_BYTES.ilog2())
+}
+
 fn zip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use std::io::Write as _;
     let mut out = Vec::with_capacity(bytes.len() / 4 + 16);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, 4096, ZIP_QUALITY, 22);
+        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, zip_window(bytes.len()));
         w.write_all(bytes)?;
         w.flush()?;
     }
     Ok(out)
 }
 
-fn unzip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    brotli::Decompressor::new(bytes, 4096).take(BATCH_MAX as u64 + 1).read_to_end(&mut out)?;
-    anyhow::ensure!(out.len() <= BATCH_MAX, "a batch too large to take");
-    Ok(out)
-}
-
 /// A batch as the messages it travels in, compressed when the taker takes that (`zipped`), sent
 /// after being told to go on from `told` ([`Msg::Batch`]).
 pub fn parts(store: &str, from: u64, batch: &Changes, zipped: bool, told: Option<u64>) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
-    let json = serde_json::to_vec(batch)?;
+    parts_of(store, from, batch.upto, serde_json::to_vec(batch)?, zipped, told, None)
+}
+
+/// [`parts`] of a batch read through `upto` as `json`, its giver's `hand_on` with its first part.
+fn parts_of(store: &str, from: u64, upto: u64, json: Vec<u8>, zipped: bool, told: Option<u64>, hand_on: Option<String>) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
     let bytes = if zipped { zip(&json)? } else { json };
     let chunks: Vec<&[u8]> = if bytes.is_empty() { vec![&[][..]] } else { bytes.chunks(PART).collect() };
     let n = u32::try_from(chunks.len())?;
     Ok(chunks
         .into_iter()
         .enumerate()
-        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto: batch.upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n, zip: zipped, told }, c.to_vec()))
+        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n, zip: zipped, told, hand_on: hand_on.clone().filter(|_| i == 0) }, c.to_vec()))
         .collect())
 }
 
@@ -155,42 +206,63 @@ pub enum Link {
     Wrote,
 }
 
+/// A feed's parts waiting for its link to take them, at the most: as many as the channel they waited in
+/// held. The feed waits for room past them, so a slow link holds it back.
+const OUT_PARTS: usize = 16;
+
+/// What a feed hears of its link, lock-free (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5: an
+/// async-channel's wait took event-listener's `Mutex`, the runner's link and its store's commits sending on
+/// their shards and the feed waiting on its own). Unbounded, as that channel was: a link's word and a commit's
+/// nudge never wait, and the feed takes each as it comes.
+fn links() -> (crate::memory::queue::Sender<Link>, crate::memory::queue::Receiver<Link>) {
+    crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
+
+/// A feed's parts to send, `(json, bytes)`: [`OUT_PARTS`] of them whatever each carries (a part up to
+/// [`PART`]), lock-free (goal 4, plan 01a1a59c2a9c step 5, as [`links`]).
+fn parts_out() -> (crate::memory::queue::Sender<(String, Vec<u8>)>, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, OUT_PARTS)
+}
+
 /// A runner's feed: tell it of the link with [`Shipper::link`]; what it sends comes out of the
 /// receiver [`Shipper::start`] returns, as `(json, bytes)` for [`proto::AgentMsg::Convo`].
 #[derive(Clone)]
 pub struct Shipper {
-    tx: async_channel::Sender<Link>,
+    tx: crate::memory::queue::Sender<Link>,
     stats: std::sync::Arc<ShipStats>,
+    signs: Signs,
 }
 
 /// Whether the taker has a row already (by its number): it is left out of what goes to it.
 pub type Skip = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 impl Shipper {
-    pub fn start(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start(store: Store) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, false, None)
     }
 
     /// [`Shipper::start`], leaving out the rows `skip` says the taker has (what a mirror sent
     /// back to restore this store from isn't sent to it again, [`Echoes`]).
-    pub fn start_skipping(store: Store, skip: Skip) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start_skipping(store: Store, skip: Skip) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, false, Some(skip))
     }
 
     /// A mirror's copy of the server's store, sent back for the server to restore its own from
     /// ([`Msg::Restore`]): everything the copy holds now, then [`Msg::Restored`], and the feed
     /// ends (what it takes meanwhile, it takes from the server: not sent back).
-    pub fn start_restore(store: Store) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
+    pub fn start_restore(store: Store) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         Self::start_as(store, true, None)
     }
 
-    fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, async_channel::Receiver<(String, Vec<u8>)>) {
-        let (tx, rx) = async_channel::unbounded::<Link>();
-        let (out_tx, out_rx) = async_channel::bounded::<(String, Vec<u8>)>(16);
+    fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
+        let (tx, rx) = links();
+        let (out_tx, out_rx) = parts_out();
         // Each commit, as a nudge in the same queue.
         let watch = store.watch();
         let nudge = tx.clone();
-        crate::rt::spawn(async move {
+        // The feed's two tasks on the next shards round-robin, not the one that starts it: a server
+        // starts every feed on the shard its start-up runs on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(async move {
             while watch.recv().await.is_ok() {
                 if nudge.send(Link::Wrote).await.is_err() {
                     break;
@@ -198,12 +270,18 @@ impl Shipper {
             }
         });
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
-        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone()));
-        (Self { tx, stats }, out_rx)
+        let signs = Signs::default();
+        crate::rt::spawn_spread(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
+        (Self { tx, stats, signs }, out_rx)
     }
 
     pub fn link(&self, l: Link) {
         let _ = self.tx.try_send(l);
+    }
+
+    /// Its batches go signed by `c` from now on ([`Custodian`]).
+    pub fn sign_with(&self, c: Arc<dyn Custodian>) {
+        self.signs.set(Some(c));
     }
 
     /// Where the feed stands, for telemetry.
@@ -230,7 +308,10 @@ struct Shipping {
     heard: Instant,
 }
 
-async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>) {
+/// A test build's `feed_changed` changed a batch of this process's once already.
+static CHANGED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -247,8 +328,13 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
     };
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
-    let hello = |out: &async_channel::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
+    let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
+    // Its turns on its shard: what waits in its queue is taken without waiting (a commit's nudges pile up while its
+    // window is full, 20 a second for as long as its taker is slow), so it's given up between them once its turn would
+    // pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+    let mut turns = crate::rt::Turns::new();
     loop {
+        turns.after().await;
         let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(ev)) => Some(ev),
             Ok(Err(_)) => return,
@@ -338,13 +424,47 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if batch.rows.is_empty() {
                 break;
             }
-            // What the taker has already is left out; the batch still says through where it read.
-            if let Some(skip) = &skip {
-                batch.rows.retain(|c| !skip(c.rev));
+            // Its JSON and the SHA-256 of it made on the compute pool (goal 3, plan 01a1a59c2a8e step 3): a
+            // batch of up to two MiB, written out and hashed on the shard, held it all the while. What the taker
+            // has already is left out there first, the rows let go of there too: a mirror's batch asked of each
+            // of its up to tens of thousands of rows whether it had it, on the shard (goal 9, plan 01a1a87b2cec
+            // step 3). The batch still says through where it read.
+            let (upto, skip) = (batch.upto, skip.clone());
+            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)> {
+                if let Some(skip) = &skip {
+                    batch.rows.retain(|c| !skip(c.rev));
+                }
+                let json = serde_json::to_vec(&batch)?;
+                let digest = crate::util::sha256_hex(&json);
+                Ok((json, digest, batch.rows.len()))
+            })
+            .await;
+            let (mut json, digest, rows) = match encoded {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) | Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
+                    break;
+                }
+            };
+            // Its hand-on, by the SHA-256 of what goes (docs/ci.md W27-R08).
+            let signer = Option::clone(&signs.load());
+            let hand_on = match signer {
+                Some(c) => c.hand_on(batch_thing(&me, from, upto, &digest)).await,
+                None => None,
+            };
+            // A test build's `feed_changed`: the first batch signed for changes on its way, once.
+            if hand_on.is_some()
+                && crate::runner::chaos::get().is_some_and(|c| c.feed_changed)
+                && !CHANGED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                && let Some(b) = json.iter_mut().rev().find(|b| b.is_ascii_alphabetic())
+            {
+                *b ^= 0x20;
             }
-            let msgs = match parts(&me, from, &batch, st.zipped, st.told) {
-                Ok(m) => m,
-                Err(e) => {
+            // Compressed and cut into its parts on the compute pool too.
+            let (store_id, zipped, told) = (me.clone(), st.zipped, st.told);
+            let msgs = match crate::rt::compute(move || parts_of(&store_id, from, upto, json, zipped, told, hand_on)).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) | Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
                     break;
                 }
@@ -358,9 +478,9 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if st.flight.is_empty() {
                 st.heard = Instant::now();
             }
-            st.sent = batch.upto;
-            st.flight.push_back((from, batch.upto));
-            stats.sent(batch.upto, batch.rows.len(), bytes, st.flight.len());
+            st.sent = upto;
+            st.flight.push_back((from, upto));
+            stats.sent(upto, rows, bytes, st.flight.len());
         }
     }
 }
@@ -395,6 +515,8 @@ struct Partial {
     got: u32,
     zip: bool,
     bytes: Vec<u8>,
+    /// Its giver's hand-on, from its first part.
+    hand_on: Option<String>,
 }
 
 /// Where the sessions a feed brings run.
@@ -409,56 +531,105 @@ pub enum Brings {
 /// The taking side: one thread takes what feeds send into a store, in the order each sent it, and
 /// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
-    tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, Msg, Vec<u8>)>,
+    tx: crate::memory::queue::Sender<Heard>,
     restores: std::sync::Arc<Restores>,
+    /// Where each store that feeds it stands ([`Peers`]).
     peers: std::sync::Arc<Peers>,
+    signs: Signs,
 }
 
-/// Where each store that feeds an intake stands, by its name among the store's peers
-/// ([`peer_name`]): for telemetry.
-type Peers = std::sync::Mutex<HashMap<String, PeerView>>;
+/// Where each store that feeds an intake stands, by its name among the store's peers ([`peer_name`]): for
+/// telemetry. Its thread alone writes it, as it takes each message ([`Feed::note`]), and [`Intake::peers`]
+/// reads it, with no lock (goal 5, plan 01a1a59c2aae, its top goal: a `Mutex` the thread took for each message
+/// and a telemetry read took on its shard). Each store's view is a copy of its own, swapped in whole, and the
+/// map of them a copy swapped in whole as a store first feeds it (`crate::rcu`): a message copies its own
+/// store's view, never every store's.
+type Peers = crate::rcu::Rcu<HashMap<String, Arc<crate::rcu::Rcu<PeerView>>>>;
+
+/// A feed's message as its intake's thread takes it: the link it came on, its machine, the message, and
+/// the bytes that came with it (a part of a batch).
+type Heard = (hyper_transport::PeerId, String, Msg, Vec<u8>);
+
+impl crate::memory::queue::Weigh for Heard {
+    /// Its place, its machine's and store's names, a batch's hand-on, and the bytes it carries: a batch's
+    /// part (up to [`PART`]) is all of it but those few names (a report's figures counted by its place).
+    fn weight(&self) -> usize {
+        let hand_on = match &self.2 {
+            Msg::Batch { hand_on, .. } => hand_on.as_ref().map_or(0, String::len),
+            Msg::Stats { .. } => size_of::<Report>(),
+            _ => 0,
+        };
+        size_of::<Heard>().saturating_add(self.1.len()).saturating_add(self.2.store().len()).saturating_add(hand_on).saturating_add(self.3.len())
+    }
+}
+
+/// An intake's answers waiting to go to their runners, at the most: as many as the channel they waited in
+/// held. Its thread waits for room past them.
+const ANSWERS: usize = 1024;
+
+/// An intake's answers to its feeds, [`ANSWERS`] of them, lock-free (`crate::memory::queue`; goal 4, plan
+/// 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex`, the intake's thread sending and
+/// the task that sends them on waiting on its shard).
+fn answers() -> (crate::memory::queue::Sender<Out>, crate::memory::queue::Receiver<Out>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, ANSWERS)
+}
+
+/// The bytes of messages waiting for an intake's thread, at most (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`crate::net::WINDOW`]), what the hub's queue of runner events it's handed
+/// from may hold; a feed sends at most [`WINDOW`] batches of [`BATCH_BYTES`] ahead of the server, so it
+/// holds every feed's window for as many feeds as fit in it. Past it a message is dropped, as it was past
+/// 256 messages of any size (up to 768 MiB of parts): its runner, holding the batch until the server has
+/// it, asks again ([`STALL`]). Nothing a person sent is lost.
+pub const HEARD_BYTES: usize = crate::net::WINDOW as usize;
 
 /// What each mirror sent back to restore a store, by the numbers it was written under there: the
-/// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
+/// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent. Read for each
+/// row a mirror's feed sends and written as a copy sent back is taken, so a copy swapped in whole
+/// (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal: a `Mutex` the feeds' shards and the intake's
+/// thread took).
 #[derive(Default)]
-pub struct Echoes(std::sync::Mutex<HashMap<String, Vec<(u64, u64)>>>);
+pub struct Echoes(crate::rcu::Rcu<HashMap<String, Vec<(u64, u64)>>>);
 
 impl Echoes {
     /// Numbers `first` through `last` were written from `machine`'s copy.
     pub fn add(&self, machine: &str, first: u64, last: u64) {
-        let mut all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ranges = all.entry(machine.to_owned()).or_default();
-        match ranges.last_mut() {
-            Some(r) if r.1 + 1 == first => r.1 = last,
-            _ => ranges.push((first, last)),
-        }
+        self.0.update(|all| {
+            let ranges = all.entry(machine.to_owned()).or_default();
+            match ranges.last_mut() {
+                Some(r) if r.1 + 1 == first => r.1 = last,
+                _ => ranges.push((first, last)),
+            }
+        });
     }
 
     /// Whether number `rev` was written from `machine`'s copy.
     pub fn has(&self, machine: &str, rev: u64) -> bool {
-        let all = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        all.get(machine).is_some_and(|ranges| {
+        self.0.load().get(machine).is_some_and(|ranges| {
             let i = ranges.partition_point(|r| r.1 < rev);
             ranges.get(i).is_some_and(|r| r.0 <= rev)
         })
     }
 }
 
-/// The mirrors' copies an intake takes to restore its store from ([`Intake::accept_restore`]).
-type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
+/// The mirrors' copies an intake takes to restore its store from ([`Intake::accept_restore`]): read for each
+/// batch its thread takes, written as a mirror says it sends one back, so a copy swapped in whole
+/// (`crate::rcu`; goal 5, plan 01a1a59c2aae, its top goal).
+type Restores = crate::rcu::Rcu<std::collections::HashSet<String>>;
 
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
-    pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, Msg, Vec<u8>)>(256);
-        let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
+    pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, crate::memory::queue::Receiver<Out>)> {
+        let (tx, rx) = crate::memory::queue::bounded::<Heard>(&crate::memory::owners::FEED_INTAKE, HEARD_BYTES);
+        let (out_tx, out_rx) = answers();
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
-        let (restoring, seen) = (restores.clone(), peers.clone());
+        let signs = Signs::default();
+        let (restoring, seen, signing) = (restores.clone(), peers.clone(), signs.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
-            while let Ok((peer, machine, msg, data)) = rx.recv() {
-                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen };
+            while let Ok((peer, machine, msg, data)) = rx.recv_blocking() {
+                let signer = Option::clone(&signing.load());
+                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
                 for m in take(&feed, &mut taking, peer, &machine, msg, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
@@ -466,23 +637,30 @@ impl Intake {
                 }
             }
         })?;
-        Ok((Self { tx, restores, peers }, out_rx))
+        Ok((Self { tx, restores, peers, signs }, out_rx))
+    }
+
+    /// The batches it takes are signed for by `c` from now on ([`Custodian`]).
+    pub fn sign_with(&self, c: Arc<dyn Custodian>) {
+        self.signs.set(Some(c));
     }
 
     /// Where each store that feeds this intake stands, since kiln started.
     pub fn peers(&self) -> Vec<PeerView> {
-        self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect()
+        self.peers.load().values().map(|v| PeerView::clone(&v.load())).collect()
     }
 
     /// Take store `store`'s feed as a mirror's copy of this one, sent back to restore it
     /// ([`super::store::Store::take_copy`]): what it brings fills in what this store lacks.
     pub fn accept_restore(&self, store: &str) {
-        self.restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(store.to_owned());
+        self.restores.update(|all| {
+            all.insert(store.to_owned());
+        });
     }
 
     /// What runner process `peer` of `machine` sent on the feed's lane, read where its frame was
-    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind, it's dropped (the
-    /// runner asks again, [`STALL`]).
+    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind (its queue holds
+    /// [`HEARD_BYTES`]), it's dropped (the runner asks again, [`STALL`]).
     pub fn heard(&self, peer: hyper_transport::PeerId, machine: &str, msg: Msg, data: Vec<u8>) {
         let _ = self.tx.try_send((peer, machine.to_owned(), msg, data));
     }
@@ -500,14 +678,20 @@ struct Feed<'a> {
     restores: &'a Restores,
     echoes: Option<&'a Echoes>,
     peers: &'a Peers,
+    /// Who signs for what it takes, once it can.
+    custodian: Option<&'a dyn Custodian>,
 }
 
 impl Feed<'_> {
-    /// Telemetry of store `store` of `machine`.
-    fn note(&self, machine: &str, store: &str, f: impl FnOnce(&mut PeerView)) {
-        let mut all = self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let v = all.entry(peer_name(machine, store)).or_insert_with(|| PeerView { machine: machine.to_owned(), store: store.to_owned(), ..PeerView::default() });
-        f(v);
+    /// Telemetry of store `store` of `machine`: its view, changed by `f` on a copy swapped in ([`Peers`]).
+    fn note(&self, machine: &str, store: &str, mut f: impl FnMut(&mut PeerView)) {
+        let name = peer_name(machine, store);
+        let known = self.peers.load().get(&name).cloned();
+        let view = known.unwrap_or_else(|| {
+            let made = Arc::new(crate::rcu::Rcu::new(PeerView { machine: machine.to_owned(), store: store.to_owned(), ..PeerView::default() }));
+            self.peers.update(|all| Arc::clone(all.entry(name.clone()).or_insert_with(|| Arc::clone(&made))))
+        });
+        view.update(&mut f);
     }
 }
 
@@ -539,7 +723,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             taking.entry((peer, s.clone())).or_default().told = Some(rev);
             vec![Msg::From { store: s, rev, zip: true, kept: true, about: None }]
         }
-        Msg::Batch { store: s, from, upto, part, parts, zip, told } => {
+        Msg::Batch { store: s, from, upto, part, parts, zip, told, hand_on } => {
             let key = (peer, s.clone());
             // Where to go on from, about this batch: to a runner from before (it doesn't say
             // where it was told to go on from), once until a batch of it is taken. It goes on from
@@ -571,7 +755,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 return tell(taking, rev);
             }
             let t = taking.entry(key.clone()).or_default();
-            let p = t.batch.get_or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new() });
+            let p = t.batch.get_or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new(), hand_on });
             p.got += 1;
             p.bytes.extend_from_slice(&data);
             if p.bytes.len() > BATCH_MAX {
@@ -584,10 +768,23 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             }
             let Some(done) = t.batch.take() else { return Vec::new() };
             let wire = done.bytes.len() as u64;
-            let read = if done.zip { unzip(&done.bytes) } else { Ok(done.bytes) };
-            let batch: Changes = match read.and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from)) {
-                Ok(b) => b,
-                Err(e) => {
+            // What came, checked against its giver's hand-on before anything of it is taken
+            // (docs/ci.md W27-R08): a batch that isn't what its giver signed for is refused, and
+            // the receipt of what came records the break. Unzipped, checked and parsed on the
+            // compute pool, this thread waiting for it ([`decode_batch`]).
+            let signer = feed.custodian.zip(done.hand_on.as_deref());
+            let (batch, signed) = match decode_batch(done.bytes, done.zip, signer.map(|(_, h)| handed(h))) {
+                Decoded::Read(batch, sha256) => (batch, signer.zip(sha256).map(|((c, h), sha256)| (c, h.to_owned(), batch_thing(&s, from, upto, &sha256)))),
+                Decoded::NotAsHanded(sha256) => {
+                    tracing::warn!(%machine, store = %s, from, upto, "conversation feed: a batch isn't what its giver's hand-on says: refused");
+                    if let Some((c, h)) = signer {
+                        c.received(machine, h, batch_thing(&s, from, upto, &sha256));
+                    }
+                    feed.note(machine, &s, |v| v.errors += 1);
+                    let rev = stands_now(taking);
+                    return tell(taking, rev);
+                }
+                Decoded::Unreadable(e) => {
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
                     feed.note(machine, &s, |v| v.errors += 1);
                     let rev = stands_now(taking);
@@ -595,7 +792,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 }
             };
             let theirs = (brings == Brings::TheirMachine).then_some(machine);
-            let copy = restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&s);
+            let copy = restores.load().contains(&s);
             let began = Instant::now();
             let took = if copy { store.take_copy(&peer_name(machine, &s), from, batch) } else { store.take(&peer_name(machine, &s), theirs, from, batch) };
             let take_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -625,6 +822,9 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                     });
                     // Taken: whatever comes next that doesn't follow is told where to go on.
                     taking.remove(&key);
+                    if let Some((c, h, got)) = signed {
+                        c.received(machine, &h, got);
+                    }
                     vec![Msg::Ack { store: s, rev: t.rev }]
                 }
                 Err(e) => {
@@ -637,6 +837,217 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
         }
         Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. } => Vec::new(),
     }
+}
+
+// ----------------------------------------------------------------------- a whole batch, decoded
+
+/// What a whole batch's bytes came to ([`decode_batch`]).
+enum Decoded {
+    /// Its rows, with the SHA-256 of their JSON where it was checked.
+    Read(Changes, Option<String>),
+    /// Its JSON isn't what its giver's hand-on says (this is its SHA-256): refused before it's parsed.
+    NotAsHanded(String),
+    /// It couldn't be unzipped or parsed.
+    Unreadable(anyhow::Error),
+}
+
+/// A whole batch's `bytes` (brotli-compressed when `zip`) unzipped, checked and parsed on the compute pool, in
+/// pieces (goal 3, plan 01a1a59c2a8e step 3): unzipped and hashed a buffer at a time and parsed a row at a
+/// time, the piece given up where another job waits for its thread ([`Decoding`]). The intake's thread did
+/// all three at once, a batch of two MiB at a time, at the shards' own priority. `check`, where the batch is
+/// checked against its giver's hand-on: the SHA-256 the hand-on says it has (none where it says none that
+/// can be read); checked before the batch is parsed. The intake's thread waits for it, so the batches it
+/// takes are taken in the order they came.
+fn decode_batch(bytes: Vec<u8>, zip: bool, check: Option<Option<String>>) -> Decoded {
+    crate::rt::compute_pieces_blocking(Decoding::new(bytes, zip, check), |d, turn| d.piece(turn)).unwrap_or_else(Decoded::Unreadable)
+}
+
+/// A whole batch being decoded ([`decode_batch`]): where it stands.
+struct Decoding {
+    /// Its JSON so far: as it came, or as far as it's unzipped.
+    json: Vec<u8>,
+    /// What's left to unzip, when it came compressed.
+    unzip: Option<brotli::Decompressor<std::io::Cursor<Vec<u8>>>>,
+    /// Where it's checked: its SHA-256 so far, how much of `json` that has taken, and what its hand-on says.
+    check: Option<(sha2::Sha256, usize, Option<String>)>,
+    /// Its JSON's SHA-256, once checked.
+    sha256: Option<String>,
+    /// Its rows, as far as they're read.
+    reading: Reading,
+}
+
+impl Decoding {
+    fn new(bytes: Vec<u8>, zip: bool, check: Option<Option<String>>) -> Self {
+        use sha2::Digest as _;
+        let (json, unzip) = if zip { (Vec::new(), Some(brotli::Decompressor::new(std::io::Cursor::new(bytes), ZIP_BUFFER))) } else { (bytes, None) };
+        Self { json, unzip, check: check.map(|says| (sha2::Sha256::new(), 0, says)), sha256: None, reading: Reading::default() }
+    }
+
+    /// A piece: units of the work until it's done, or until its turn says another job waits for the thread.
+    fn piece(&mut self, turn: &crate::rt::Turn<'_>) -> crate::rt::Step<Decoded> {
+        loop {
+            match self.unit() {
+                Ok(Some(done)) => return crate::rt::Step::Done(done),
+                Ok(None) if turn.over() => return crate::rt::Step::More,
+                Ok(None) => {}
+                Err(e) => return crate::rt::Step::Done(Decoded::Unreadable(e)),
+            }
+        }
+    }
+
+    /// One unit, in order: a buffer of what's come and isn't hashed yet, hashed; a buffer unzipped; the check,
+    /// once all of it is in; a step of reading its rows. What it came to, once it's done.
+    fn unit(&mut self) -> anyhow::Result<Option<Decoded>> {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        if let Some((sha256, hashed, _)) = &mut self.check
+            && *hashed < self.json.len()
+        {
+            let to = hashed.saturating_add(ZIP_BUFFER).min(self.json.len());
+            sha256.update(self.json.get(*hashed..to).unwrap_or_default());
+            *hashed = to;
+            return Ok(None);
+        }
+        if let Some(unzip) = &mut self.unzip {
+            let at = self.json.len();
+            self.json.resize(at.saturating_add(ZIP_BUFFER), 0);
+            let (n, ended) = match unzip.read(self.json.get_mut(at..).unwrap_or_default()) {
+                Ok(n) => (n, n == 0),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (0, false),
+                Err(e) => return Err(e.into()),
+            };
+            self.json.truncate(at.saturating_add(n));
+            anyhow::ensure!(self.json.len() <= BATCH_MAX, "a batch too large to take");
+            if ended {
+                self.unzip = None;
+            }
+            return Ok(None);
+        }
+        if let Some((sha256, _, says)) = self.check.take() {
+            let sha256 = hex::encode(sha256.finalize());
+            if says.as_deref() != Some(sha256.as_str()) {
+                return Ok(Some(Decoded::NotAsHanded(sha256)));
+            }
+            self.sha256 = Some(sha256);
+            return Ok(None);
+        }
+        Ok(self.reading.step(&self.json)?.map(|batch| Decoded::Read(batch, self.sha256.take())))
+    }
+}
+
+/// A batch's [`Changes`] read from its JSON a step at a time ([`Decoding`]): a member's name and value, or
+/// one of its rows. Where its JSON isn't as a feed writes it (a member missing or repeated, rows that aren't
+/// an array, anything after the object), it's read whole instead, as it was before, so what's read, or why
+/// it can't be, is serde's own.
+#[derive(Default)]
+struct Reading {
+    /// Where the next thing starts in the JSON.
+    at: usize,
+    within: Within,
+    rows: Option<Vec<Change>>,
+    upto: Option<u64>,
+}
+
+/// Where a [`Reading`] stands in a batch's object.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Within {
+    /// Before the object.
+    #[default]
+    Start,
+    /// Before a member's name.
+    Name,
+    /// Before one of the rows.
+    Row,
+    /// After a member's value: a comma, or the object's end.
+    After,
+}
+
+impl Reading {
+    /// A step: the batch, once it's all read.
+    fn step(&mut self, json: &[u8]) -> anyhow::Result<Option<Changes>> {
+        match self.as_written(json) {
+            Some(read) => Ok(read),
+            None => Ok(Some(serde_json::from_slice(json)?)),
+        }
+    }
+
+    /// A step of a batch as a feed writes it: none where the JSON isn't.
+    fn as_written(&mut self, json: &[u8]) -> Option<Option<Changes>> {
+        self.at = past_space(json, self.at);
+        match self.within {
+            Within::Start => {
+                self.at = past(json, self.at, b'{')?;
+                self.within = Within::Name;
+            }
+            Within::Name => {
+                let name: String = self.value(json)?;
+                self.at = past(json, past_space(json, self.at), b':')?;
+                self.at = past_space(json, self.at);
+                match name.as_str() {
+                    "rows" if self.rows.is_none() => {
+                        self.at = past_space(json, past(json, self.at, b'[')?);
+                        self.rows = Some(Vec::new());
+                        self.within = match past(json, self.at, b']') {
+                            Some(at) => {
+                                self.at = at;
+                                Within::After
+                            }
+                            None => Within::Row,
+                        };
+                    }
+                    "upto" if self.upto.is_none() => {
+                        self.upto = Some(self.value(json)?);
+                        self.within = Within::After;
+                    }
+                    "rows" | "upto" => return None,
+                    _ => {
+                        let _: serde::de::IgnoredAny = self.value(json)?;
+                        self.within = Within::After;
+                    }
+                }
+            }
+            Within::Row => {
+                let row: Change = self.value(json)?;
+                self.rows.as_mut()?.push(row);
+                let at = past_space(json, self.at);
+                match json.get(at) {
+                    Some(b',') => self.at = at + 1,
+                    Some(b']') => {
+                        self.at = at + 1;
+                        self.within = Within::After;
+                    }
+                    _ => return None,
+                }
+            }
+            Within::After => match json.get(self.at) {
+                Some(b',') => {
+                    self.at += 1;
+                    self.within = Within::Name;
+                }
+                Some(b'}') if past_space(json, self.at + 1) == json.len() => return Some(Some(Changes { rows: self.rows.take()?, upto: self.upto.take()? })),
+                _ => return None,
+            },
+        }
+        Some(None)
+    }
+
+    /// The JSON value where the reading stands, as a `T`, and the reading moved past it.
+    fn value<'a, T: serde::Deserialize<'a>>(&mut self, json: &'a [u8]) -> Option<T> {
+        let mut values = serde_json::Deserializer::from_slice(json.get(self.at..)?).into_iter::<T>();
+        let value = values.next()?.ok()?;
+        self.at = self.at.checked_add(values.byte_offset())?;
+        Some(value)
+    }
+}
+
+/// Past the JSON whitespace at `at`.
+fn past_space(json: &[u8], at: usize) -> usize {
+    at + json.get(at..).map_or(0, |rest| rest.iter().take_while(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t')).count())
+}
+
+/// Past `byte`, where it's at `at`.
+fn past(json: &[u8], at: usize, byte: u8) -> Option<usize> {
+    (json.get(at) == Some(&byte)).then_some(at + 1)
 }
 
 #[cfg(test)]
@@ -656,7 +1067,7 @@ mod tests {
     fn took(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
         let peers = Peers::default();
         let Some(msg) = decode(json) else { return Vec::new() };
-        take(&Feed { store, brings, restores, echoes, peers: &peers }, partial, peer, machine, msg, data)
+        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None }, partial, peer, machine, msg, data)
     }
 
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
@@ -774,7 +1185,7 @@ mod tests {
         // A part out of place: the same.
         let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?, true, Some(0))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from: f, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
-        let astray = |told| (Msg::Batch { store: store.clone(), from: f, upto, part: 1, parts: n + 1, zip: true, told }, data.clone());
+        let astray = |told| (Msg::Batch { store: store.clone(), from: f, upto, part: 1, parts: n + 1, zip: true, told, hand_on: None }, data.clone());
         assert_eq!(send(&mut partial, 7, vec![astray(Some(0))]), from(0, 0));
         // A runner from before goes on from every answer, and what it sent before it heard one
         // doesn't follow either: told once, until a batch of it is taken.
@@ -796,8 +1207,8 @@ mod tests {
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: false }, b""), Vec::new());
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: true }, b""), Vec::new());
         // A part out of place, and a batch that can't be read: the same.
-        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false, told: Some(0) }, b"{}"), Vec::new());
-        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false, told: Some(0) }, b"not json"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false, told: Some(0), hand_on: None }, b"{}"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false, told: Some(0), hand_on: None }, b"not json"), Vec::new());
     }
 
     #[test]
@@ -846,7 +1257,9 @@ mod tests {
             server.send("live", &said("l1", 1, "as it is now"));
             server.sync()?;
             let restores = Restores::default();
-            restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(mirror.id().to_owned());
+            restores.update(|all| {
+                all.insert(mirror.id().to_owned());
+            });
             let (ship, out) = Shipper::start_restore(mirror.clone());
             ship.link(Link::Up);
             let mut partial = HashMap::new();
@@ -900,9 +1313,191 @@ mod tests {
         })
     }
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: a feed's queues, lock-free now (`crate::memory::queue`). Its link's
+    /// words, sent from every shard at once, reach it each sender's in order, none refused, lost or doubled
+    /// (unbounded, as before). Its parts to send hold [`OUT_PARTS`] whatever each carries and hold the feed
+    /// back past them, in order. An intake's answers hold [`ANSWERS`], its thread waiting past them.
+    #[test]
+    fn g4_s5_a_feeds_queues_keep_their_order_and_their_bounds() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (tx, rx) = links();
+            let (senders, per) = (8usize, 500u64);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let tx = tx.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move { (0..per).all(|rev| tx.try_send(Link::Heard(Msg::Ack { store: s.to_string(), rev })).is_ok()) }));
+            }
+            drop(tx);
+            for s in sending {
+                anyhow::ensure!(s.await.unwrap_or(false), "a link's word was refused");
+            }
+            let mut got = vec![Vec::new(); senders];
+            while let Ok(l) = rx.try_recv() {
+                let Link::Heard(Msg::Ack { store, rev }) = l else { anyhow::bail!("a word no sender of the test's sent") };
+                got.get_mut(store.parse::<usize>()?).ok_or_else(|| anyhow::anyhow!("no sender {store}"))?.push(rev);
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            // Parts: as many as their places, a whole part or none; the next waits until one is taken.
+            let (out, parts) = parts_out();
+            for n in 0..OUT_PARTS {
+                anyhow::ensure!(out.try_send((n.to_string(), vec![0; if n == 0 { PART } else { 0 }])).is_ok(), "part {n} had no room");
+            }
+            anyhow::ensure!(matches!(out.try_send(("over".into(), Vec::new())), Err(async_channel::TrySendError::Full(_))), "a part past its places");
+            let waiting = crate::rt::spawn_spread_joined({
+                let out = out.clone();
+                async move { out.send(("last".into(), Vec::new())).await.is_ok() }
+            });
+            crate::rt::sleep(Duration::from_millis(50)).await;
+            anyhow::ensure!(parts.len() == OUT_PARTS, "the feed didn't wait for room: {} parts", parts.len());
+            for n in 0..OUT_PARTS {
+                let (json, _) = crate::rt::timeout(Duration::from_secs(5), parts.recv()).await??;
+                anyhow::ensure!(json == n.to_string(), "part {n} came as {json}");
+            }
+            let (json, _) = crate::rt::timeout(Duration::from_secs(5), parts.recv()).await??;
+            anyhow::ensure!(json == "last" && waiting.await.unwrap_or(false), "the waiting part, last: {json}");
+            // Answers: as many as their places; the intake's thread waits past them.
+            let (answer, told) = answers();
+            for n in 0..ANSWERS {
+                anyhow::ensure!(answer.try_send(Out { peer: 7, json: n.to_string() }).is_ok(), "answer {n} had no room");
+            }
+            anyhow::ensure!(matches!(answer.try_send(Out { peer: 7, json: "over".into() }), Err(async_channel::TrySendError::Full(_))), "an answer past its places");
+            let thread = std::thread::spawn(move || answer.send_blocking(Out { peer: 7, json: "last".into() }).is_ok());
+            for n in 0..ANSWERS {
+                let o = crate::rt::timeout(Duration::from_secs(5), told.recv()).await??;
+                anyhow::ensure!(o.json == n.to_string() && o.peer == 7, "answer {n} came as {}", o.json);
+            }
+            let last = crate::rt::timeout(Duration::from_secs(5), told.recv()).await??;
+            anyhow::ensure!(last.json == "last" && thread.join().unwrap_or(false), "the waiting answer, last: {}", last.json);
+            Ok(())
+        })
+    }
+
     /// What the shipper sends next, within `wait` (None: nothing).
-    async fn next_sent(out: &async_channel::Receiver<(String, Vec<u8>)>, wait: Duration) -> Option<Msg> {
+    async fn next_sent(out: &crate::memory::queue::Receiver<(String, Vec<u8>)>, wait: Duration) -> Option<Msg> {
         crate::rt::timeout(wait, out.recv()).await.ok().and_then(Result::ok).and_then(|(json, _)| decode(&json))
+    }
+
+    /// A test's end of a feed: as a giver, a hand-on of each batch saying what the giver's would (its
+    /// digest); as a taker, each receipt noted.
+    #[derive(Default)]
+    struct Sides {
+        received: parking_lot::Mutex<Vec<(String, Subject)>>,
+    }
+
+    impl Custodian for Sides {
+        fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move { Some(bundle_of(&thing)) })
+        }
+
+        fn received(&self, _machine: &str, hand_on: &str, thing: Subject) {
+            self.received.lock().push((hand_on.to_owned(), thing));
+        }
+    }
+
+    /// A hand-on of `thing` as a bundle's JSON, unsigned: what [`handed`] reads of one.
+    fn bundle_of(thing: &Subject) -> String {
+        use base64::Engine as _;
+        use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, Statement, payload};
+        let st = Statement { subject: vec![thing.clone()], ..Statement::new(serde_json::json!({ "v": 1, "kind": "handed-on", "by": "kiln://hyper-light/person/ada/machine/box/instance/i", "to": "kiln://hyper-light/server" })) };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload(&st).unwrap_or_default());
+        serde_json::json!({ "dsseEnvelope": { "payloadType": PAYLOAD_CUSTODY, "payload": encoded, "signatures": [] } }).to_string()
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): a batch comes with its giver's hand-on, by the
+    /// SHA-256 of its rows, and the taker checks what came against it before its store takes any
+    /// of it. One that isn't what its hand-on says is refused (the giver told where to go on from)
+    /// and the receipt of what came records the break; as it was signed for, it's taken and
+    /// received; one with no hand-on (a giver from before) is taken as before, with no receipt.
+    #[test]
+    fn w27_r08_a_feeds_batch_is_taken_only_as_its_giver_signed_for_it() -> anyhow::Result<()> {
+        let (_r, runner) = super::super::store::scratch()?;
+        let (_s, server) = super::super::store::scratch()?;
+        runner.send("a1", &said("m1", 1, "one"));
+        runner.sync()?;
+        let signs = Sides::default();
+        let (restores, peers) = (Restores::default(), Peers::default());
+        let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&signs) };
+        let mut taking = HashMap::new();
+        let hello = take(&feed, &mut taking, 7, "box", Msg::Hello { store: runner.id().to_owned(), restore: false }, Vec::new());
+        let Some(Msg::From { rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
+        let batch = runner.changes_as(rev, BATCH_BYTES, kept)?;
+        let json = serde_json::to_vec(&batch)?;
+        let thing = batch_thing(runner.id(), rev, batch.upto, &crate::util::sha256_hex(&json));
+        let send = |taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, json: Vec<u8>, hand_on: Option<String>| -> anyhow::Result<Vec<Msg>> {
+            let mut answer = Vec::new();
+            for (m, data) in parts_of(runner.id(), rev, batch.upto, json, zip, Some(rev), hand_on)? {
+                answer = take(&feed, taking, 7, "box", m, data);
+            }
+            Ok(answer)
+        };
+        // Changed on its way: refused, nothing of it taken, and the receipt of what came.
+        let mut changed = json.clone();
+        if let Some(b) = changed.iter_mut().rev().find(|b| b.is_ascii_alphabetic()) {
+            *b ^= 0x20;
+        }
+        let answer = send(&mut taking, changed.clone(), Some(bundle_of(&thing)))?;
+        assert!(matches!(answer.first(), Some(Msg::From { rev: r, about: Some(_), .. }) if *r == rev), "refused, told where to go on from: {answer:?}");
+        assert_eq!(server.peer(&peer_name("box", runner.id()))?, rev, "nothing taken");
+        let got = signs.received.lock().pop().map(|(_, t)| t);
+        assert_eq!(got.as_ref().and_then(|t| t.digest.get("sha256")), Some(&crate::util::sha256_hex(&changed)));
+        // As it was signed for: taken, and received.
+        let answer = send(&mut taking, json.clone(), Some(bundle_of(&thing)))?;
+        assert!(matches!(answer.first(), Some(Msg::Ack { rev: r, .. }) if *r == batch.upto), "{answer:?}");
+        assert_eq!(signs.received.lock().pop().map(|(_, t)| t), Some(thing));
+        // A giver from before: taken as before, no receipt.
+        runner.send("a1", &said("m2", 2, "two"));
+        runner.sync()?;
+        let next = runner.changes_as(batch.upto, BATCH_BYTES, kept)?;
+        let mut answer = Vec::new();
+        for (m, data) in parts(runner.id(), batch.upto, &next, zip, Some(batch.upto))? {
+            answer = take(&feed, &mut taking, 7, "box", m, data);
+        }
+        assert!(matches!(answer.first(), Some(Msg::Ack { .. })), "{answer:?}");
+        assert!(signs.received.lock().is_empty());
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): a shipper given a custodian sends each batch with its
+    /// hand-on on its first part, by the SHA-256 of what it sends, which the taker receives.
+    #[test]
+    fn w27_r08_a_shipper_hands_on_each_batch_it_sends() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            for i in 1..=3u64 {
+                runner.send("a1", &said(&format!("m{i}"), i, &"x".repeat(1 << 20)));
+            }
+            runner.sync()?;
+            let (ship, out) = Shipper::start(runner.clone());
+            ship.sign_with(Arc::new(Sides::default()));
+            ship.link(Link::Up);
+            let taker = Sides::default();
+            let (restores, peers) = (Restores::default(), Peers::default());
+            let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&taker) };
+            let mut taking = HashMap::new();
+            let top = runner.top()?;
+            for _ in 0..100 {
+                let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
+                let Some(msg) = decode(&json) else { anyhow::bail!("an unreadable message: {json}") };
+                if let Msg::Batch { part, hand_on, .. } = &msg {
+                    assert_eq!(hand_on.is_some(), *part == 0, "its hand-on with its first part only");
+                }
+                for m in take(&feed, &mut taking, 7, "box", msg, data) {
+                    ship.link(Link::Heard(m));
+                }
+                if server.peer(&peer_name("box", runner.id()))? >= top {
+                    break;
+                }
+            }
+            let received = taker.received.lock().clone();
+            assert!(!received.is_empty(), "each batch received");
+            for (h, t) in &received {
+                assert_eq!(handed(h).as_ref(), t.digest.get("sha256"), "received as handed on");
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -950,6 +1545,40 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal): an intake's telemetry of its feeds is written by its thread
+    /// alone and read with no lock, and is there by the time a message is answered. A copy to restore from is
+    /// taken as said. What a mirror sent back is read, from every shard at once, while it's written, and holds
+    /// every range added.
+    #[test]
+    fn g5_an_intakes_telemetry_and_what_it_reads_per_batch_take_no_lock() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_dir, server) = super::super::store::scratch()?;
+            let (intake, answers) = Intake::start(server, Brings::TheirMachine, None)?;
+            anyhow::ensure!(intake.peers().is_empty(), "telemetry before any feed");
+            intake.heard(7, "box", Msg::Hello { store: "r1".into(), restore: false }, Vec::new());
+            let answer = crate::rt::timeout(Duration::from_secs(5), answers.recv()).await??;
+            anyhow::ensure!(answer.peer == 7 && matches!(decode(&answer.json), Some(Msg::From { .. })), "{answer:?}");
+            let seen = intake.peers();
+            anyhow::ensure!(seen.iter().any(|p| p.machine == "box" && p.store == "r1" && p.hello_at > 0), "its hello isn't in the telemetry: {seen:?}");
+            intake.accept_restore("a-copy");
+            anyhow::ensure!(intake.restores.load().contains("a-copy"), "a copy to restore from, said, isn't taken");
+            let echoes = Arc::new(Echoes::default());
+            let mut reading = Vec::new();
+            for _ in 0..8 {
+                let e = Arc::clone(&echoes);
+                reading.push(crate::rt::spawn_spread_joined(async move { (0..1_000u64).filter(|rev| e.has("m", *rev)).count() }));
+            }
+            for n in 0..100u64 {
+                echoes.add("m", n * 10, n * 10 + 4);
+            }
+            for r in reading {
+                r.await.map_err(|_| anyhow::anyhow!("a reader ended"))?;
+            }
+            anyhow::ensure!((0..100u64).all(|n| echoes.has("m", n * 10) && echoes.has("m", n * 10 + 4) && !echoes.has("m", n * 10 + 5)), "a range added is missing");
+            Ok(())
+        })
+    }
+
     #[test]
     fn what_a_mirror_sent_back_is_known_by_the_numbers_it_was_written_under() {
         let e = Echoes::default();
@@ -989,5 +1618,139 @@ mod tests {
             assert_eq!(ids, vec!["m1".to_owned(), "m3".to_owned()]);
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a mirror has already is left out of a batch on the compute pool, in the
+    /// job that writes its JSON and digest, its rows let go of there, not asked of row by row on the feed's shard; and
+    /// the feed takes its turns between what waits in its queue. What it leaves out, and that its taker still goes
+    /// through it, is `a_shipper_leaves_out_what_the_taker_has_and_still_goes_through_it`'s.
+    #[test]
+    fn g9_s3_a_batch_is_left_out_of_off_the_shard() {
+        let code: String = include_str!("feed.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let ship = code.split("async fn ship(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+        let (on_shard, in_job) = ship.split_once("crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)>").unwrap_or_default();
+        assert!(!on_shard.is_empty() && !on_shard.contains("skip(c.rev)") && in_job.contains("skip(c.rev)"), "{ship}");
+        assert!(on_shard.contains("turns.after().await"), "its turns: {ship}");
+    }
+
+    /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.
+    fn a_batch() -> anyhow::Result<Changes> {
+        let (_r, runner) = super::super::store::scratch()?;
+        runner.send("a1", &Update::State { state: Box::new(State { title: "parser".into(), ..State::default() }) });
+        for i in 1..=300u64 {
+            runner.send("a1", &said(&format!("m{i}"), i, &format!("reply {i} {}", "x".repeat(700))));
+        }
+        runner.put(vec![line("a1", "s-1", 0, &format!("{{\"type\":\"user\",\"blob\":\"{}\"}}", "y".repeat(100_000)))]);
+        runner.sync()?;
+        runner.changes(0, 64 << 20)
+    }
+
+    /// What [`decode_batch`] makes of `json`, sent as it is and compressed: the same both ways.
+    fn decoded(json: &[u8], check: Option<Option<String>>) -> anyhow::Result<Result<(Changes, Option<String>), String>> {
+        let as_is = decode_batch(json.to_vec(), false, check.clone());
+        let zipped = decode_batch(zip(json)?, true, check);
+        let read = |d: Decoded| match d {
+            Decoded::Read(b, sha) => Ok((b, sha)),
+            Decoded::NotAsHanded(sha) => Err(format!("not as handed on: {sha}")),
+            Decoded::Unreadable(e) => Err(format!("unreadable: {e:#}")),
+        };
+        let (as_is, zipped) = (read(as_is), read(zipped));
+        anyhow::ensure!(format!("{as_is:?}") == format!("{zipped:?}"), "as it is {as_is:?}, compressed {zipped:?}");
+        Ok(as_is)
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a whole batch decoded on the compute pool, a row at a time, reads
+    /// as serde read it whole, sent as it is or compressed: as a feed writes it, its members the other way
+    /// round or with one kiln doesn't know, spaced out; and where it can't be read, its error is serde's.
+    #[test]
+    fn g3_s3_a_batch_decoded_in_pieces_reads_as_it_did_whole() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        anyhow::ensure!(batch.rows.len() > 300, "{} rows", batch.rows.len());
+        let json = serde_json::to_vec(&batch)?;
+        anyhow::ensure!(decoded(&json, None)? == Ok((batch.clone(), None)));
+        let rows = serde_json::to_string(&batch.rows)?;
+        for shape in [
+            format!("{{\"upto\":{},\"rows\":{rows}}}", batch.upto),
+            format!(" {{ \"rows\" :\n {rows} ,\t\"later\": [1, {{\"x\": \"]\"}}], \"upto\" : {} }} \n", batch.upto),
+            format!("{{\"rows\":[],\"upto\":{}}}", batch.upto),
+        ] {
+            let whole: Changes = serde_json::from_slice(shape.as_bytes())?;
+            anyhow::ensure!(decoded(shape.as_bytes(), None)? == Ok((whole, None)), "{}", shape.chars().take(80).collect::<String>());
+        }
+        // Not as a feed writes it: read whole, so the outcome is serde's, error and all.
+        for odd in [
+            format!("{{\"rows\":{rows}}}"),
+            format!("{{\"rows\":{rows},\"rows\":[],\"upto\":1}}"),
+            format!("{{\"rows\":{rows},\"upto\":1}} trailing"),
+            "{\"rows\":{},\"upto\":1}".to_owned(),
+            "{\"rows\":[{\"rev\":1}],\"upto\":1}".to_owned(),
+            format!("[{rows},{}]", batch.upto),
+            "{\"rows\":[".to_owned(),
+            String::new(),
+        ] {
+            let whole = serde_json::from_slice::<Changes>(odd.as_bytes()).map(|b| (b, None)).map_err(|e| format!("unreadable: {e}"));
+            anyhow::ensure!(decoded(odd.as_bytes(), None)? == whole, "{}", odd.chars().take(80).collect::<String>());
+        }
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3, and W27-R08: a batch is checked against its giver's hand-on before
+    /// it's parsed, by the SHA-256 of its JSON as it came unzipped: as handed on, read, its digest kept; not,
+    /// refused, with the digest of what came; a hand-on that says nothing readable refuses it too.
+    #[test]
+    fn g3_s3_a_batch_is_checked_against_its_hand_on_before_it_is_parsed() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        let json = serde_json::to_vec(&batch)?;
+        let sha = crate::util::sha256_hex(&json);
+        anyhow::ensure!(decoded(&json, Some(Some(sha.clone())))? == Ok((batch, Some(sha.clone()))));
+        anyhow::ensure!(decoded(&json, Some(Some("0".repeat(64))))? == Err(format!("not as handed on: {sha}")));
+        anyhow::ensure!(decoded(&json, Some(None))? == Err(format!("not as handed on: {sha}")));
+        // Checked before it's parsed: what isn't JSON at all, and isn't as handed on, is refused, not unreadable.
+        let junk = b"not json".to_vec();
+        anyhow::ensure!(decoded(&junk, Some(None))? == Err(format!("not as handed on: {}", crate::util::sha256_hex(&junk))));
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a batch's decoding is many small units, so its piece can end at
+    /// any of them (where another job waits for the pool's thread): a buffer unzipped or hashed at a time,
+    /// a row at a time; none of them larger than a buffer of the JSON or one row.
+    #[test]
+    fn g3_s3_a_batchs_decoding_is_small_units() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        let json = serde_json::to_vec(&batch)?;
+        let mut d = Decoding::new(zip(&json)?, true, Some(Some(crate::util::sha256_hex(&json))));
+        let (mut units, mut biggest) = (0usize, 0usize);
+        let read = loop {
+            let (at, json_before) = (d.reading.at, d.json.len());
+            let done = d.unit()?;
+            units += 1;
+            biggest = biggest.max((d.reading.at - at).max(d.json.len() - json_before));
+            if let Some(done) = done {
+                break done;
+            }
+            anyhow::ensure!(units < 10 * json.len(), "no end");
+        };
+        anyhow::ensure!(matches!(&read, Decoded::Read(b, Some(_)) if *b == batch), "{}", match read { Decoded::Read(..) => "read, but not the batch".to_owned(), Decoded::NotAsHanded(s) => s, Decoded::Unreadable(e) => format!("{e:#}") });
+        // Unzipped and hashed a buffer at a time, then read a row at a time.
+        let longest_row = batch.rows.iter().map(|c| serde_json::to_vec(c).map_or(0, |v| v.len())).max().unwrap_or(0);
+        anyhow::ensure!(units >= 2 * json.len() / ZIP_BUFFER + batch.rows.len(), "{units} units for {} bytes and {} rows", json.len(), batch.rows.len());
+        anyhow::ensure!(biggest <= ZIP_BUFFER.max(longest_row + 2), "a unit of {biggest} bytes");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a batch is zipped in a window no larger than it needs and at most a
+    /// batch's size, past which a decoder's ring buffer doesn't grow, and comes back whole: a small batch, one
+    /// of a batch's size, and one a large row took past it.
+    #[test]
+    fn g11_s5_a_batch_is_zipped_in_a_window_of_its_size() -> anyhow::Result<()> {
+        anyhow::ensure!(zip_window(0) == 10 && zip_window(1000) == 10 && zip_window(20_000) == 15);
+        anyhow::ensure!(zip_window(BATCH_BYTES) == 21 && zip_window(3 * BATCH_BYTES) == 21, "at most a batch's size");
+        for len in [1000, BATCH_BYTES, BATCH_BYTES + BATCH_BYTES / 2] {
+            let json: Vec<u8> = (0u64..).map(|i| format!("{{\"seq\":{i},\"text\":\"a line of the agent's {}\"}},", i % 977)).flat_map(String::into_bytes).take(len).collect();
+            let mut back = Vec::new();
+            brotli::BrotliDecompress(&mut zip(&json)?.as_slice(), &mut back)?;
+            anyhow::ensure!(back == json, "{len} bytes came back as {}", back.len());
+        }
+        Ok(())
     }
 }

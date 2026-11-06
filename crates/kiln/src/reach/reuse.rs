@@ -58,15 +58,22 @@ pub fn unkeyable(req: &RunReq) -> Option<&'static str> {
 /// The digest of the tree at `root` as sync sends it: every entry by path and kind, a file by its
 /// content and whether it's executable, a symlink by its target (`.git` aside).
 pub fn tree(root: &Path) -> anyhow::Result<String> {
-    use sha2::Digest as _;
     let listed = super::sync::scan(root)?;
+    digest_of(&listed.entries, |e| Ok(crate::sync::blobs::hash_file(&listed.source(&e.path))?))
+}
+
+/// [`tree`]'s digest of a tree as sync lists it (`entries`, sorted by path), each file's content by
+/// its SHA-256 as `hash` says: what a sync's custody records name its workspace by (docs/ci.md
+/// W27-R08), the asking side of the bytes it sent, the doing side of the copy it made.
+pub fn digest_of(entries: &[super::wire::Entry], mut hash: impl FnMut(&super::wire::Entry) -> anyhow::Result<String>) -> anyhow::Result<String> {
+    use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(b"kiln/run-tree/v1\0");
     let mut field = |s: &[u8]| {
         h.update((s.len() as u64).to_be_bytes());
         h.update(s);
     };
-    for e in &listed.entries {
+    for e in entries {
         if e.path == ".git" || e.path.starts_with(".git/") {
             continue;
         }
@@ -79,7 +86,7 @@ pub fn tree(root: &Path) -> anyhow::Result<String> {
             }
             EntryKind::File => {
                 field(if e.mode & 0o111 != 0 { b"x" } else { b"f" });
-                field(crate::sync::blobs::hash_file(&listed.source(&e.path))?.as_bytes());
+                field(hash(e)?.as_bytes());
             }
         }
     }
@@ -218,12 +225,12 @@ impl Kept {
 
 /// `kiln run --reuse`, start to end: keyed and looked up first; a hit replayed, a miss run as
 /// [`super::local::run`] runs it and recorded if it succeeds.
-pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     run_with(crate::runner::work::service::ensure().await, handle, me, req, ev, ctl).await;
 }
 
 /// [`run`] against `svc`, this runner's cache service.
-pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me: &str, mut req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me: &str, mut req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     let Some(svc) = svc else {
         let _ = ev.send(Ev::Note("not reused: this runner serves no cache".to_owned())).await;
         return super::local::run(handle, me, req, ev, ctl).await;
@@ -260,7 +267,8 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
     }
     // Where it was keyed for, by name: the run goes there.
     req.target = keyed.runner.name.clone();
-    let (tee, seen) = async_channel::unbounded::<Ev>();
+    // What the run says, seen on its way out: unbounded, as the channel it was (goal 5, plan 01a1a59c2aae).
+    let (tee, seen) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
     let started = Instant::now();
     let running = super::local::run(handle, me, req, tee, ctl);
     let forwarding = async {

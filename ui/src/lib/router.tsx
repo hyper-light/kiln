@@ -84,20 +84,23 @@ export function Navigate({ to, replace }: { to: string; replace?: boolean }) {
   }, [to, replace]);
 }
 
-/** navigate("/runs/1?x=2", { replace }) or navigate(-1). */
-export function useNavigate(): (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => void {
+/**
+ * navigate("/runs/1?x=2", { replace }) or navigate(-1). Settles once the page it goes to is shown:
+ * a press that makes something and then goes to it (`useAction`) says it's on its way until then.
+ */
+export function useNavigate(): (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => Promise<void> {
   const navigate = useTanNavigate();
   const router = useRouter();
   return React.useCallback(
     (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => {
       if (typeof to === "number") {
         router.history.go(to);
-        return;
+        return Promise.resolve();
       }
       const p = split(to);
       // A view transition only while motion plays (kiln's own pause, or the device's reduced motion: motion.tsx).
       const viewTransition = opts?.viewTransition && document.documentElement.dataset.motion !== "paused" ? true : undefined;
-      void navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace, viewTransition } as never);
+      return navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace, viewTransition } as never);
     },
     [navigate, router],
   );

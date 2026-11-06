@@ -9,6 +9,12 @@
 //!   app ──Out──▶ [ net thread: Driver<Endpoint> ⇄ UDP ] ──NetEvent──▶ app
 //! ```
 //!
+//! What comes in waits for the owner in order while the loop goes on taking the owner's sends and
+//! driving its connections (the owner waiting on the loop while the loop waited on the owner was a
+//! deadlock). Past as much as a connection's receive window, the loop holds its peers' lanes
+//! (`Endpoint::hold_lane`): what they send waits in QUIC, whose flow control holds them back, until
+//! the owner has taken all it holds.
+//!
 //! Frames refused with `LaneFull` wait in a bounded per-lane outbox and are sent again once the
 //! lane says it has room (`Event::LaneRoom`), or as the connection drains. A failure or panic inside the loop ends that
 //! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. The
@@ -19,7 +25,7 @@
 //! shed: a control lane whose queue is full means its peer is stuck, and the connection is closed
 //! instead, so the channel's resume repairs what it carried. Other lanes shed their oldest frame.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -29,10 +35,11 @@ use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::{Driver, Io};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, Tls};
 use hyper_transport::{
-    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Fixed, Limits,
-    PeerId, RECEIVE_CHUNK, Refusal, StreamCredit,
+    AdmissionLimits, AskQueue, Authenticated, Classes, Config, Directory, Endpoint, Event, Limits, PeerId,
+    RECEIVE_CHUNK, Refusal, StreamCredit,
 };
 
+use crate::net_budget::Spares;
 use crate::pki::Leaf;
 
 /// The server is always peer 1 from an agent's point of view.
@@ -334,7 +341,7 @@ impl Named for AgentBook {
 }
 
 /// What `ep` measures now: its counts, and each named peer it has a connection to.
-fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Fixed, D>) -> QuicSample {
+fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> QuicSample {
     let st = ep.stats();
     let mut out = QuicSample {
         connections: st.connections as u64,
@@ -360,12 +367,14 @@ pub enum NetEvent {
     Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]> },
     Closed { peer: PeerId, reason: String },
     Unreachable { peer: PeerId, reason: String },
-    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
+    /// `at`: when the network thread took it off the link, so the hub can say how long it waited
+    /// before it was handled (`kiln_route_wait_seconds{class="runner"}`, `crate::route_latency`).
+    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, at: std::time::Instant },
 }
 
 #[derive(Clone)]
 pub struct NetHandle {
-    tx: async_channel::Sender<Out>,
+    tx: crate::memory::queue::Sender<Out>,
 }
 
 impl NetHandle {
@@ -393,11 +402,78 @@ impl NetHandle {
     }
 }
 
+/// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
+/// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
+/// none, and it's dropped), its frames made on the compute pool (`make`), and each handed to `send`. A frame is a copy
+/// of its message's bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes),
+/// which made on a shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe
+/// loops). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard
+/// is given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its
+/// polls ends within the quantum. Returns once `out` is closed and empty.
+pub async fn send_made<M, X, F, S, Fut>(out: &async_channel::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, make: F, mut send: S)
+where
+    X: Send + 'static,
+    F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
+    S: FnMut(PeerId, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let make = Arc::new(make);
+    let mut turns = crate::rt::Turns::new();
+    loop {
+        // One waiting already goes on in this turn; one waited for starts a turn afresh, the wait having given the
+        // shard to its other work (as `rt::Turns::next` takes a queue's).
+        let first = match out.try_recv() {
+            Ok(m) => m,
+            Err(async_channel::TryRecvError::Closed) => return,
+            Err(async_channel::TryRecvError::Empty) => match out.recv().await {
+                Ok(m) => {
+                    turns = crate::rt::Turns::new();
+                    m
+                }
+                Err(_) => return,
+            },
+        };
+        let mut batch = Vec::new();
+        let mut next = Some(first);
+        while let Some(m) = next.take() {
+            batch.extend(route(m));
+            if !turns.over() {
+                next = out.try_recv().ok();
+            }
+        }
+        if !batch.is_empty() {
+            let make = Arc::clone(&make);
+            let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
+            // The wait for the pool ended the poll: the sends start a turn of their own.
+            turns = crate::rt::Turns::new();
+            match made {
+                Ok(made) => {
+                    for (peer, frames) in made {
+                        for frame in frames {
+                            send(peer, frame).await;
+                            turns.end().await;
+                        }
+                    }
+                }
+                // A job that unwound (a bug where they're made): its messages are lost, as a link that drops them
+                // loses them, and their senders' own repair sends what's needed again.
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "messages' frames weren't made: dropped"),
+            }
+        }
+        turns.end().await;
+    }
+}
+
 /// Per-peer, per-lane frames refused with `LaneFull`, bounded.
 const OUTBOX_FRAMES: usize = 8192;
 
+/// A connection's receive window (`Limits::window_ceiling`): the most of one peer's bytes the transport
+/// lets be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it
+/// ([`EVENTS_BYTES`], [`OUT_BYTES`]).
+pub const WINDOW: u64 = 64 << 20;
+
 pub fn limits(server: bool) -> Limits {
-    let window: u64 = 64 << 20;
+    let window: u64 = WINDOW;
     Limits {
         admission: AdmissionLimits {
             pending: if server { 512 } else { 8 },
@@ -426,6 +502,11 @@ pub fn limits(server: bool) -> Limits {
         keep_alive: Some(Duration::from_secs(2)),
         max_responses: 64,
         receive_chunks: usize::try_from(window).unwrap_or(usize::MAX) / RECEIVE_CHUNK + 1,
+        // As every connection asked before the choice was its owner's: decimated, as Google QUIC's
+        // receivers acknowledge (hyper-raft docs/transport.md §4k, §4ak).
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        // No forward erasure correction, as before it was offered (§4an).
+        fec_window: None,
     }
 }
 
@@ -455,44 +536,154 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
+/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
+/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
+/// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
+/// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
+/// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
+/// server's heap (research 01a1a87b2e57, f10) and bounded nothing of the frames they carried.
+pub const EVENTS_BYTES: usize = WINDOW as usize;
+
+/// The bytes of commands (frames to send, mostly) waiting for the net thread, at most (goal 11, plan
+/// 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), the most a peer takes unread, past
+/// which whoever sends waits ([`NetHandle::send`]) or is told it's full ([`NetHandle::try_send`]). Its
+/// 16,384 places took 0.9 MB of an idle server's heap made up front (research 01a1a87b2e57, f10).
+pub const OUT_BYTES: usize = WINDOW as usize;
+
 /// Start a net thread. Returns the command handle and the event stream.
-pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, async_channel::Receiver<NetEvent>)> {
+pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
+    start_bounded(spec, OUT_BYTES, EVENTS_BYTES)
+}
+
+/// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
+/// two windows of frames).
+pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
-    let (tx, rx) = async_channel::bounded::<Out>(16_384);
-    let (etx, erx) = async_channel::bounded::<NetEvent>(16_384);
+    let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
+    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
     std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
     Ok((NetHandle { tx }, erx))
+}
+
+/// An event being handed to the loop's owner: kept across turns of the loop, as a send dropped
+/// before it's done loses what it carried. True once taken; false when the owner is gone.
+type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+
+/// What an event takes of memory: its place and, a frame, its bytes.
+fn weight(ev: &NetEvent) -> usize {
+    std::mem::size_of::<NetEvent>().saturating_add(match ev {
+        NetEvent::Frame { data, .. } => data.len(),
+        NetEvent::Connected { name, .. } => name.as_ref().map_or(0, String::len),
+        NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. } => reason.len(),
+    })
+}
+
+impl crate::memory::queue::Weigh for NetEvent {
+    fn weight(&self) -> usize {
+        weight(self)
+    }
+}
+
+impl crate::memory::queue::Weigh for Out {
+    /// Its place and what it carries: a frame's bytes, the names and keys it says.
+    fn weight(&self) -> usize {
+        std::mem::size_of::<Out>().saturating_add(match self {
+            Out::Frame { data, .. } => data.len(),
+            Out::Revoke { name } | Out::Unrevoke { name } => name.len(),
+            Out::RevokeKeys { keys, why } => keys.iter().map(String::len).sum::<usize>().saturating_add(why.len()),
+            Out::Copy(path) => path.as_os_str().len(),
+            Out::Disconnect { .. } | Out::Connect { .. } | Out::Rebuild | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
+        })
+    }
+}
+
+/// Hands `held` to the owner in order: as many as it has room for, the next one waiting in
+/// `handing` when it has no more. False when the owner is gone.
+fn hand_over(etx: &crate::memory::queue::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+    while handing.is_none() {
+        let Some(ev) = held.pop_front() else { break };
+        *held_bytes = held_bytes.saturating_sub(weight(&ev));
+        match etx.try_send(ev) {
+            Ok(()) => {}
+            Err(async_channel::TrySendError::Full(ev)) => {
+                let etx = etx.clone();
+                *handing = Some(Box::pin(async move { etx.send(ev).await.is_ok() }));
+            }
+            Err(async_channel::TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
+
+/// Holds each of `peers`' lanes (every lane a peer may open), or lets them go
+/// ([`Endpoint::hold_lane`]).
+fn hold_lanes<B, D>(ep: &mut Endpoint<Kiln, B, D>, peers: impl Iterator<Item = PeerId>, lanes: u32, hold: bool)
+where
+    B: hyper_transport::Budget<Class>,
+    D: Directory<Role = Role>,
+{
+    for peer in peers {
+        for lane in 0..lanes {
+            let _ = if hold { ep.hold_lane(peer, lane) } else { ep.release_lane(peer, lane) };
+        }
+    }
 }
 
 /// How one incarnation of the loop ended.
 enum Exit {
     /// The command channel closed: the owner is gone.
     Closed,
-    /// Start over on a fresh endpoint; `redial`: an agent dials its last address at once.
-    Rebuild { redial: bool },
+    /// Start over on a fresh endpoint; `redial`: an agent dials its last address at once. `carry`:
+    /// what the owner hasn't taken yet, for the next incarnation to hand it.
+    Rebuild { redial: bool, carry: Carry },
 }
 
-fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>) {
+/// What one incarnation of the loop hands the next (goal 3, plan 01a1a59c2a8e step 5): the events
+/// the owner had no room for yet, in order, and the one being handed to it. A rebuild used to drop
+/// them, and the dial's deadline waited for room to say it went unanswered: the loop took no command
+/// while it waited (perf/api-pass's deadlock, in its last place).
+#[derive(Default)]
+struct Carry {
+    held: VecDeque<NetEvent>,
+    held_bytes: usize,
+    handing: Option<Handing>,
+}
+
+impl Carry {
+    /// `held` and `handing` as they stand, with `events` (this turn's, not yet held) after them.
+    fn of(mut held: VecDeque<NetEvent>, mut held_bytes: usize, handing: Option<Handing>, events: &mut Vec<NetEvent>) -> Carry {
+        for ev in events.drain(..) {
+            held_bytes = held_bytes.saturating_add(weight(&ev));
+            held.push_back(ev);
+        }
+        Carry { held, held_bytes, handing }
+    }
+}
+
+fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::memory::queue::Sender<NetEvent>) {
     let spec = Arc::new(spec);
     let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
     let mut backoff = Duration::from_millis(200);
+    // What the last incarnation hadn't handed the owner yet: the next hands it first.
+    let mut carry = Carry::default();
     loop {
         let started = Instant::now();
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
         match outcome {
             Ok(Ok(Exit::Closed)) => return,
-            Ok(Ok(Exit::Rebuild { redial })) => {
+            Ok(Ok(Exit::Rebuild { redial, carry: next })) => {
+                carry = next;
                 if !redial {
                     *last_dial.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 }
@@ -523,8 +714,8 @@ enum Dial {
     Connected,
 }
 
-type ServerDriver = Driver<Kiln, Fixed, ServerBook>;
-type AgentDriver = Driver<Kiln, Fixed, AgentBook>;
+type ServerDriver = Driver<Kiln, Spares, ServerBook>;
+type AgentDriver = Driver<Kiln, Spares, AgentBook>;
 
 enum AnyDriver {
     Server(ServerDriver),
@@ -544,7 +735,8 @@ macro_rules! with_driver {
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    let budget = Fixed::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {
@@ -757,9 +949,10 @@ where
 
 async fn run_loop(
     spec: Arc<Spec>,
-    rx: async_channel::Receiver<Out>,
-    etx: async_channel::Sender<NetEvent>,
+    rx: crate::memory::queue::Receiver<Out>,
+    etx: crate::memory::queue::Sender<NetEvent>,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
+    carry: Carry,
 ) -> anyhow::Result<Exit> {
     let mut driver = build(&spec)?;
     if let AnyDriver::Server(d) = &driver {
@@ -782,20 +975,51 @@ async fn run_loop(
     }
     let mut outbox = Outbox::default();
     let mut events: Vec<NetEvent> = Vec::with_capacity(64);
+    // What the owner has no room for yet, in order, and the one being handed to it now. The loop
+    // goes on meanwhile, taking commands (the owner's sends wait for this loop to take them: the
+    // owner waiting on this loop while this loop waited on the owner was a deadlock, and every
+    // connection went quiet as it lasted) and driving its connections, its sends among them. Once
+    // it holds as much for the owner as it lets any one peer have unread (a connection's receive
+    // window, `Limits::window_ceiling`), it holds its peers' lanes: what they send waits in QUIC,
+    // whose flow control holds them back (RFC 9000 §4.1), until the owner has taken all of it.
+    // An incarnation after a rebuild starts with what the last hadn't handed over.
+    let Carry { mut held, mut held_bytes, mut handing } = carry;
+    let (held_most, lanes) = {
+        let l = limits(spec.server);
+        (usize::try_from(l.window_ceiling).unwrap_or(usize::MAX), l.lanes_per_peer)
+    };
+    let mut peers: HashSet<PeerId> = HashSet::new();
+    let mut holding = false;
 
     enum Ev {
         Cmd(Option<Out>),
         Driver(Result<Event<Kiln>, hyper_rt::RtError>),
         Retry,
         DialDeadline,
+        Handed(bool),
     }
 
     loop {
+        if !hand_over(&etx, &mut held, &mut held_bytes, &mut handing) {
+            return Ok(Exit::Closed);
+        }
+        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };
+        if hold != holding {
+            with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), lanes, hold));
+            holding = hold;
+        }
         let pending = !outbox.is_empty();
         let ev = {
             let cmd = rx.recv().fuse();
             // `event()` is cancel-safe: dropping it when another branch wins loses nothing.
             let drv = async { with_driver!(&mut driver, d => d.event().await) }.fuse();
+            let handed = async {
+                match handing.as_mut() {
+                    Some(h) => h.await,
+                    None => futures::future::pending::<bool>().await,
+                }
+            }
+            .fuse();
             let retry = async {
                 if pending {
                     crate::rt::sleep(Duration::from_millis(2)).await;
@@ -815,8 +1039,9 @@ async fn run_loop(
                 }
             }
             .fuse();
-            futures::pin_mut!(cmd, drv, retry, dial_timer);
+            futures::pin_mut!(cmd, drv, retry, dial_timer, handed);
             futures::select_biased! {
+                h = handed => Ev::Handed(h),
                 c = cmd => Ev::Cmd(c.ok()),
                 e = drv => Ev::Driver(e),
                 () = dial_timer => Ev::DialDeadline,
@@ -824,6 +1049,12 @@ async fn run_loop(
             }
         };
         match ev {
+            Ev::Handed(taken) => {
+                handing = None;
+                if !taken {
+                    return Ok(Exit::Closed);
+                }
+            }
             Ev::Cmd(None) => return Ok(Exit::Closed),
             Ev::Cmd(Some(first)) => {
                 let mut cmds = vec![first];
@@ -916,7 +1147,7 @@ async fn run_loop(
                                     Dial::Dialing { addr: pending, .. } if pending == addr => {}
                                     // Dialing elsewhere, or the owner believes the connection is
                                     // gone: a fresh endpoint dials the new address at once.
-                                    Dial::Dialing { .. } | Dial::Connected => return Ok(Exit::Rebuild { redial: true }),
+                                    Dial::Dialing { .. } | Dial::Connected => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                                     Dial::Idle => {
                                         let now = clock!(d);
                                         match d.endpoint().connect(now, SERVER_PEER, addr) {
@@ -927,7 +1158,7 @@ async fn run_loop(
                                 }
                             }
                         }
-                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true }),
+                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                     }
                 }
                 with_driver!(&mut driver, d => {
@@ -955,14 +1186,15 @@ async fn run_loop(
             Ev::DialDeadline => {
                 if let Dial::Dialing { addr, .. } = dial {
                     tracing::warn!(%addr, after = ?spec.dial_deadline, "no answer to the dial; abandoning it");
-                    // Report first, then start over clean: the owner re-dials with its backoff.
-                    let _ = etx
-                        .send(NetEvent::Unreachable {
-                            peer: SERVER_PEER,
-                            reason: format!("no answer from {addr} in {}s", spec.dial_deadline.as_secs()),
-                        })
-                        .await;
-                    return Ok(Exit::Rebuild { redial: false });
+                    // Said after what the owner hasn't taken yet, and carried: the next incarnation
+                    // hands it over as the owner makes room, going on meanwhile (it used to wait here
+                    // for room, taking no command). Then start over clean: the owner re-dials with
+                    // its backoff.
+                    events.push(NetEvent::Unreachable {
+                        peer: SERVER_PEER,
+                        reason: format!("no answer from {addr} in {}s", spec.dial_deadline.as_secs()),
+                    });
+                    return Ok(Exit::Rebuild { redial: false, carry: Carry::of(held, held_bytes, handing, &mut events) });
                 }
             }
             Ev::Retry => {
@@ -976,6 +1208,22 @@ async fn run_loop(
             }
         }
         for ev in events.drain(..) {
+            match &ev {
+                // One that connects while the others' lanes are held is held too.
+                NetEvent::Connected { peer, .. } => {
+                    peers.insert(*peer);
+                    if holding {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, true));
+                    }
+                }
+                NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => {
+                    if holding {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, false));
+                    }
+                    peers.remove(peer);
+                }
+                _ => {}
+            }
             if !spec.server {
                 match &ev {
                     NetEvent::Connected { peer, .. } if *peer == SERVER_PEER => dial = Dial::Connected,
@@ -985,9 +1233,8 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            if etx.send(ev).await.is_err() {
-                return Ok(Exit::Closed);
-            }
+            held_bytes = held_bytes.saturating_add(weight(&ev));
+            held.push_back(ev);
         }
     }
 }
@@ -1025,7 +1272,7 @@ fn on_event<B, D>(
         }
         Event::Frame { peer, lane, kind, frame } => {
             crate::metrics::global().quic_streams.inc();
-            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec() });
+            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec(), at: std::time::Instant::now() });
             ep.release(frame);
         }
         Event::Closed { peer, refusal, .. } => {
@@ -1047,13 +1294,83 @@ fn on_event<B, D>(
         Event::Reply { exchange, .. } | Event::Refused { exchange, .. } => ep.end(exchange),
         // A lane that found a frame too full has room again: the loop flushes the outbox after
         // every event it handles.
-        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
+        // A path's degrading and its progress again (hyper-raft docs/transport.md §4ai): kiln's
+        // links keep their own liveness, as before these were said.
+        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } | Event::Degrading { .. } | Event::Progressing { .. } => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what `send_made` sends is what came, in the order it came and each message's
+    /// frames in theirs, less what had nowhere to go; the frames are made off the shards (on the compute pool); and no
+    /// poll of it runs more sends than its turn has room for, though nothing else asks for its shard: each send here
+    /// takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding the thread only makes
+    /// sends longer, and turns shorter).
+    #[test]
+    fn g9_s3_frames_are_made_off_the_shards_and_sent_in_order_in_turns() -> anyhow::Result<()> {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        crate::rt::block_on(async {
+            const SEND: Duration = Duration::from_micros(20);
+            let send_ns = u64::try_from(SEND.as_nanos()).unwrap_or(u64::MAX);
+            let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
+            anyhow::ensure!(quantum_ns > 0, "a shard has a quantum");
+            // Sends for several turns: two frames a message, a third of the messages with nowhere to go.
+            let n = u32::try_from(quantum_ns.saturating_mul(8) / send_ns).unwrap_or(u32::MAX).max(64);
+            let (tx, rx) = async_channel::unbounded::<u32>();
+            for m in 0..n {
+                tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
+            }
+            drop(tx);
+            let route = |m: u32| (!m.is_multiple_of(3)).then_some((u64::from(m % 5), m));
+            let made_on_a_shard = Arc::new(AtomicBool::new(false));
+            let make = {
+                let on = Arc::clone(&made_on_a_shard);
+                move |m: u32| {
+                    if crate::rt::on_shard() {
+                        on.store(true, Ordering::SeqCst);
+                    }
+                    vec![m.to_be_bytes().to_vec(), vec![0xff]]
+                }
+            };
+            let (sends, most_quantum_ns) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(quantum_ns)));
+            let mut sent: Vec<(PeerId, Vec<u8>)> = Vec::new();
+            let (mut polls, mut most_in_a_poll) = (0u64, 0u64);
+            {
+                let (counted, quantum) = (Arc::clone(&sends), Arc::clone(&most_quantum_ns));
+                let send = |peer: PeerId, frame: Vec<u8>| {
+                    let until = Instant::now() + SEND;
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    // The quantum as the turn reads it (the shard's online estimate may move).
+                    quantum.fetch_max(hyper_rt::futures::step_budget_ns().unwrap_or(0), Ordering::SeqCst);
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    sent.push((peer, frame));
+                    async { true }
+                };
+                let mut work = std::pin::pin!(send_made(&rx, route, make, send));
+                std::future::poll_fn(|cx| {
+                    let before = sends.load(Ordering::SeqCst);
+                    let polled = work.as_mut().poll(cx);
+                    polls += 1;
+                    most_in_a_poll = most_in_a_poll.max(sends.load(Ordering::SeqCst).saturating_sub(before));
+                    polled
+                })
+                .await;
+            }
+            let expected: Vec<(PeerId, Vec<u8>)> = (0..n).filter(|m| !m.is_multiple_of(3)).flat_map(|m| [(u64::from(m % 5), m.to_be_bytes().to_vec()), (u64::from(m % 5), vec![0xff])]).collect();
+            anyhow::ensure!(sent == expected, "sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+            anyhow::ensure!(!made_on_a_shard.load(Ordering::SeqCst), "frames were made on a shard");
+            let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(send_ns).saturating_sub(1).max(1);
+            anyhow::ensure!(most_in_a_poll <= bound, "a poll ran {most_in_a_poll} sends of at least {SEND:?}, past its turn's {bound}");
+            anyhow::ensure!(polls > 1, "{} sends in one poll", sent.len());
+            Ok(())
+        })
+    }
 
     /// A frame garbled for a test can't be read: cut short, given bytes after it, or what follows
     /// its variant index mangled (its index stays).
@@ -1117,7 +1434,7 @@ mod tests {
         assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
-    async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
+    async fn next_event(rx: &crate::memory::queue::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
         crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))?
@@ -1125,7 +1442,7 @@ mod tests {
     }
 
     /// The server's next `Connected`, skipping other events; `None` once `within` passes.
-    async fn connected_within(rx: &async_channel::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
+    async fn connected_within(rx: &crate::memory::queue::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
         let deadline = Instant::now() + within;
         loop {
             match next_event(rx, deadline).await {
@@ -1450,6 +1767,137 @@ mod tests {
             ]
         };
         through_faults("twice-1", &faults(LANE_TERM, 46), &faults(LANE_CONTROL, 54))?.once_in_order()
+    }
+
+    /// A server's owner slow to take what comes in (a hub behind its runners) goes on sending all
+    /// the same: the net thread takes its sends while it holds what the owner hasn't taken, where
+    /// it once waited on the owner to take one while the owner waited on it to take a send, each
+    /// for good (and every connection went quiet as it lasted); then every frame that came in is
+    /// the owner's, once each and each lane's in order.
+    #[test]
+    fn an_owner_slow_to_take_what_comes_in_goes_on_sending_and_misses_none() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("slow-owner")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr }).await;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            loop {
+                if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
+                    break;
+                }
+            }
+            // More than the owner's queue and the thread's command queue hold (16,384 each), over
+            // four lanes (no lane's queue past its bound), the owner taking none of it.
+            const N: u32 = 20_000;
+            const LANES: u32 = 4;
+            let frame = |i: u32| [(i % LANES).to_le_bytes(), i.to_le_bytes()].concat();
+            for i in 0..N {
+                anyhow::ensure!(agent.send(SERVER_PEER, i % LANES, Kind::Control, frame(i)).await, "the agent's thread is gone");
+            }
+            // Taking none still, as many go the other way (spread as well: no lane's queue past
+            // its bound): no send waits for good.
+            let sent = crate::rt::timeout(Duration::from_secs(30), async {
+                for i in 0..N {
+                    srv.send(peer, i % LANES, Kind::Control, frame(i)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(sent.is_ok(), "the server's sends waited for its owner to take what came in");
+            // Then all that came in, once each, each lane's in order.
+            let mut next = [0u32; LANES as usize];
+            let mut taken = 0u32;
+            while taken < N {
+                let ev = next_event(&srv_ev, deadline).await.map_err(|e| anyhow::anyhow!("{taken} of {N} frames came in: {e}"))?;
+                if let NetEvent::Frame { lane, data, .. } = ev {
+                    let at = next.get_mut(lane as usize).ok_or_else(|| anyhow::anyhow!("a frame on lane {lane}"))?;
+                    let i = data.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes).ok_or_else(|| anyhow::anyhow!("a frame of {} bytes", data.len()))?;
+                    anyhow::ensure!(i == *at * LANES + lane, "lane {lane}: {i} where {} was next", *at * LANES + lane);
+                    *at += 1;
+                    taken += 1;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): an agent's dial that goes
+    /// unanswered while its owner has no room for what came in waits on nothing and loses nothing.
+    /// The owner takes none of what the server sends it (more than its queue holds), then asks for a
+    /// dial to an address that never answers: past the dial's deadline the loop still takes commands
+    /// (a sample is answered), and once the owner takes what came in, every frame is there in order,
+    /// then the dial's `Unreachable`. The loop used to wait at the deadline for room to say so, taking
+    /// no command meanwhile, and a rebuild dropped what it held for the owner.
+    #[test]
+    fn g3_s5_a_dial_unanswered_while_the_owner_has_no_room_waits_on_nothing_and_loses_nothing() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            // The owner's queue bounded at a mebibyte (goal 11, plan 01a1a87b2e56 step 3: in bytes, not
+            // events), so what's sent below fills it and leaves the net thread more to hold.
+            const ROOM: usize = 1 << 20;
+            let (agent, agent_ev) = start_bounded(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, OUT_BYTES, ROOM)?;
+            // Full: no room for one more of the frames below (each eight bytes, counted with its place).
+            let one = weight(&NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }).saturating_add(crate::memory::queue::PLACE);
+            let full = |rx: &crate::memory::queue::Receiver<NetEvent>| rx.held().saturating_add(one) > rx.bound();
+            agent.command(Out::Connect { addr }).await;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            loop {
+                if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
+                    break;
+                }
+            }
+            // More than the owner's queue holds (about 10,000 of these), the owner taking none of it, over
+            // four lanes (no lane's queue past its bound).
+            const N: u32 = 17_000;
+            const LANES: u32 = 4;
+            for i in 0..N {
+                srv.send(peer, i % LANES, Kind::Control, [(i % LANES).to_le_bytes(), i.to_le_bytes()].concat()).await;
+            }
+            let filled = Instant::now() + Duration::from_secs(30);
+            while !full(&agent_ev) && Instant::now() < filled {
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::ensure!(full(&agent_ev), "the owner's queue never filled: {} of {} bytes", agent_ev.held(), agent_ev.bound());
+            let queued = u32::try_from(agent_ev.len()).unwrap_or(u32::MAX);
+            // A dial to an address that takes the handshake and never answers, past its deadline.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            agent.command(Out::Connect { addr: silent.local_addr()? }).await;
+            crate::rt::sleep(Duration::from_millis(2500)).await;
+            let asking = agent.clone();
+            let sampled = crate::rt::on_thread("sample", move || asking.sample(Duration::from_secs(10))).await?;
+            anyhow::ensure!(sampled.is_some(), "the net thread took no command past the dial's deadline: it waited for the owner");
+            // Then what came in, each lane's frames in order, and after them the dial's Unreachable.
+            let mut next = [0u32; LANES as usize];
+            loop {
+                match next_event(&agent_ev, deadline).await? {
+                    NetEvent::Frame { lane, data, .. } => {
+                        let at = next.get_mut(lane as usize).ok_or_else(|| anyhow::anyhow!("a frame on lane {lane}"))?;
+                        let i = data.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes).ok_or_else(|| anyhow::anyhow!("a frame of {} bytes", data.len()))?;
+                        anyhow::ensure!(i == *at * LANES + lane, "lane {lane}: {i} where {} was next", *at * LANES + lane);
+                        *at += 1;
+                    }
+                    NetEvent::Unreachable { peer, reason } if peer == SERVER_PEER => {
+                        let taken: u32 = next.iter().sum();
+                        anyhow::ensure!(taken >= queued, "the Unreachable came after {taken} frames, fewer than the owner's queue held ({queued}): {reason}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            drop(silent);
+            Ok(())
+        })
     }
 
     #[test]

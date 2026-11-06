@@ -3,10 +3,12 @@
  * R13), whatever the item's stage. A kiln change's Files draw its threads on their lines, its
  * conflicts where they fall, the kinds row and Approve by the gate's words, and the vorpal search;
  * a host's pull request reads and writes through the forge seam; a commit with no change shows
- * its diff from its parent, no Approve. Data through Suspense, mutations through React Actions.
+ * its diff from its parent, no Approve. Data through Suspense; a mutation shows at once where its
+ * outcome is known, and none runs in a transition (W21-R15).
  */
 import * as React from "react";
 import {
+  agentFixesRes,
   blobTextRes,
   commitBlobTextRes,
   commitFilesRes,
@@ -14,10 +16,15 @@ import {
   conflictsRes,
   diffRes,
   filesRes,
+  fixesSetBy,
+  freshApi,
+  HOST_WORD,
+  hostPullFreshRes,
   hostPullRes,
   hostPullsApi,
   inboxRes,
   pullSearchRes,
+  readinessRes,
   reviewApi,
   searchRes,
   verdictsRes,
@@ -30,12 +37,14 @@ import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, setData } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
+import { Link } from "@/lib/router";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
 import { Conversation, ConvoBox, Description } from "./convo";
 import { FileDiff, makeLinesOf, useThreadMap, WholeFile, type FilesCtx } from "./diffs";
 import { rowsOf } from "./fold";
 import { GateRow, HostGateRow } from "./gate";
+import { FreshRow } from "./fresh";
 import type { DraftPlace, Ops } from "./ops";
 import { applyThreadPatch, pendingComment, pendingThread, type ThreadPatch } from "./ops";
 import { counted, useStable } from "./perf";
@@ -68,9 +77,9 @@ const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
  */
 export function warmReview(item: ShipCommit) {
   const ch = item.change;
-  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name));
-  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)));
-  else warm(inboxRes, commitFilesRes(item.repo, item.sha));
+  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name), agentFixesRes(item.repo));
+  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), hostPullFreshRes(item.repo, pullNumber(ch.name)), agentFixesRes(item.repo));
+  else warm(inboxRes, commitFilesRes(item.repo, item.sha), agentFixesRes(item.repo));
 }
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
@@ -121,14 +130,18 @@ const EMPTY_THREADS: Thread[] = [];
 
 /** Who asking about code goes to (components/code/about.tsx): the agent that made the commit, as
  * Ship's read model says it (`made_by`, ship.rs: one place, which Chain of Ownership fills for every
- * commit in time). Code no agent of kiln's made stays inert, as on the review page: today a person's
- * change, a lone commit and a host's pull request. `name`: how the card names it. */
-function aboutOf(agent: string | null | undefined, name?: string): AboutAgent | null {
-  return agent ? { id: agent, name: name ?? agent, subagents: true, busy: false } : null;
+ * commit in time). Code no agent of kiln's made (a person's change, a lone commit, a host's pull
+ * request) is asked of a helper kiln starts for the person, reading `repo` at `commit`
+ * (`ci.repos.about`). `name`: how the card names the agent. */
+function aboutOf(agent: string | null | undefined, repo: string, commit: string | undefined, name?: string): AboutAgent | null {
+  if (agent) return { id: agent, name: name ?? agent, subagents: true, busy: false };
+  return commit ? { id: "", name: "kiln", subagents: true, busy: false, start: (ask) => reviewApi.about(repo, commit, ask) } : null;
 }
 const noop = () => {};
 
 interface FrameP {
+  /** The item's repository, whose agent fixes the Conversation's head shows. */
+  repo: string;
   sum: string;
   search?: { res: Parameters<typeof SearchBox>[0]["hits"]; q: string; onQ: (q: string) => void };
   onJump?: (j: Jump) => void;
@@ -138,17 +151,46 @@ interface FrameP {
 }
 
 /**
- * The Conversation head's agent fixes switch, where the mockup draws it (Ship's mockups plan, step
- * 13): a repository's setting that lets agents fix code from agents' feedback. Nothing acts on it
- * until Agents in review builds that, so it shows off and can't be turned on yet, and says why.
+ * The Conversation head's agent fixes, where the mockup draws it (Ship's mockups plan, step 13): the
+ * repository's setting that lets agents fix code from agents' feedback (W26-R18), read here and set
+ * in one place, the repository's Review section in Repos (W26 decision 5), which it links to. Its
+ * knob says on or off; its title and name say who set it and when. It loads with the review (Ship's
+ * Dropdown waits for both), and a setting it can't read keeps the same box, saying why.
  */
-function AgentFixes() {
+function AgentFixes({ repo }: { repo: string }) {
   return (
-    <button type="button" className="rv-switch" role="switch" aria-checked={false} disabled title="Agents fix code from agents' feedback · repository setting. Not yet: Agents in review builds it.">
+    <FixesBoundary repo={repo}>
+      <AgentFixesRead repo={repo} />
+    </FixesBoundary>
+  );
+}
+
+function AgentFixesRead({ repo }: { repo: string }) {
+  const v = useRes(agentFixesRes(repo)).data;
+  return <FixesLink repo={repo} on={v.agents_fix} words={`agent fixes: ${v.agents_fix ? "on" : "off"}. ${fixesSetBy(v)} It's set in the repository's Review section in Repos.`} />;
+}
+
+/** The control's one box: a link to the repository's Review section in Repos. */
+function FixesLink({ repo, on, words, unread }: { repo: string; on: boolean; words: string; unread?: boolean }) {
+  return (
+    <Link className="rv-switch" data-on={on ? "" : undefined} data-unread={unread ? "" : undefined} to={`/repos?repo=${encodeURIComponent(repo)}&section=review`} title={words} aria-label={words}>
       <i aria-hidden="true" />
       <span>agent fixes</span>
-    </button>
+    </Link>
   );
+}
+
+/** A setting the server won't give (no such repository here, no `diffs.read` on it). */
+class FixesBoundary extends React.Component<{ repo: string; children: React.ReactNode }, { err: unknown }> {
+  state = { err: null as unknown };
+  static getDerivedStateFromError(err: unknown) {
+    return { err };
+  }
+  render() {
+    if (this.state.err)
+      return <FixesLink repo={this.props.repo} on={false} unread words={`agent fixes: can't be read here: ${errorMessage(this.state.err)}. It's set in the repository's Review section in Repos.`} />;
+    return this.props.children;
+  }
 }
 
 /** The two sections the Dropdown mounts, in their order: Files, then the Conversation. */
@@ -165,7 +207,7 @@ function Frame(p: FrameP) {
       </section>
       <section className="rv-s rv-s-convo" aria-label="Conversation">
         <h3 className="rv-h">Conversation</h3>
-        <AgentFixes />
+        <AgentFixes repo={p.repo} />
         {p.convo}
       </section>
     </>
@@ -184,6 +226,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   const comments = useRes(commentsRes(key)).data;
   const files = useRes(filesRes(key, version)).data;
   const cf = useRes(conflictsRes(key)).data;
+  const ready = useRes(readinessRes(key)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const [whole, setWhole] = React.useState<string | null>(null);
@@ -194,34 +237,36 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   const fileList = useStable(files.files, JSON.stringify(files.files));
   const list = React.useMemo(() => parsePatch(files.patch), [files.patch]);
   const rowsByFile = React.useMemo(() => new Map(list.map((f) => [f.path, rowsOf(f)])), [list]);
-  // Mutations are React Actions with optimistic state: the change shows at once, then the server's
-  // answer is written into the resource (setData) before the refresh it asks for lands.
-  const [shown, patchThreads] = React.useOptimistic(threads, applyThreadPatch);
+  // Mutations show at once: what one changes in place is a patch over kiln's threads while it's on
+  // its way. Answered, the change is written into the resource (change) before the patch comes off,
+  // ahead of the refresh it asks for; refused, the patch comes off and the threads are kiln's again.
+  // Plain state, not useOptimistic, whose transition would hold every other one begun meanwhile
+  // until the server answered (W21-R15).
+  const [patches, setPatches] = React.useState<readonly ThreadPatch[]>([]);
+  const shown = React.useMemo(() => (patches.length ? patches.reduce(applyThreadPatch, threads) : threads), [threads, patches]);
   const map = useThreadMap(shown, version);
   const meta = React.useMemo(() => new Map(fileList.map((f) => [f.path, f])), [fileList]);
   const linesOf = React.useMemo(() => makeLinesOf(rowsByFile), [rowsByFile]);
-  const act = React.useCallback(
-    (f: (patch: (p: ThreadPatch) => void) => Promise<void>) =>
-      new Promise<void>((res, rej) =>
-        React.startTransition(async () => {
-          try {
-            await f(patchThreads);
-            res();
-          } catch (e) {
-            rej(e);
-          }
-        }),
-      ),
-    [patchThreads],
-  );
+  const act = React.useCallback(async (f: (patch: (p: ThreadPatch) => void) => Promise<void>) => {
+    const mine: ThreadPatch[] = [];
+    try {
+      await f((p) => {
+        mine.push(p);
+        setPatches((was) => [...was, p]);
+      });
+    } finally {
+      if (mine.length) setPatches((was) => was.filter((p) => !mine.includes(p)));
+    }
+  }, []);
 
   const fullOps: Ops = React.useMemo(() => {
-    const merge = (p: ThreadPatch) => setData<{ threads: Thread[] }>(`review/comments/${key}`, (s) => ({ ...s, threads: applyThreadPatch(s.threads, p) }));
+    // Written over a load already on its way too, which read the threads before it (lib/resource.ts's change).
+    const merge = (p: ThreadPatch) => change<{ threads: Thread[] }>(`review/comments/${key}`, (s) => ({ ...s, threads: applyThreadPatch(s.threads, p) }));
     return {
       ...ops,
       // What goes out new (a comment, a thread) is written optimistically into the resource at
       // once and swapped for the server's ids when they land, or taken back out when refused;
-      // what changes in place (resolve, kind, edit, delete) goes through useOptimistic's patch.
+      // what changes in place (resolve, kind, edit, delete) is a patch over the threads shown.
       commentAt: (file, line, side, body, kind, start) =>
         act(async () => {
           const t = pendingThread(ops.me, version, { file, side, line, start }, kind, pendingComment(ops.me, body));
@@ -300,17 +345,23 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   }, [ops, act, key, version]);
 
   // Viewed, kept by kiln for the change: the file folds at once, and its files are read again so it
-  // opens folded next time (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2).
+  // opens folded next time (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2). One kiln
+  // refuses says why, and its box goes back (W21-R15).
   const viewed = React.useCallback(
     (file: string, on: boolean) =>
-      void reviewApi.viewed(key, file, on).then(
+      reviewApi.viewed(key, file, on).then(
         () => invalidate(`review/files/${key}/`),
-        (e: unknown) => toast.error("Couldn't mark it viewed", errorMessage(e)),
+        (e: unknown) => {
+          toast.error("Couldn't mark it viewed", errorMessage(e));
+          throw e;
+        },
       ),
     [key],
   );
   const maker = item.made_by?.agent;
-  const about = React.useMemo(() => aboutOf(maker, whoSaid(d.author)), [maker, d.author]);
+  // The commit of the version shown: what a helper kiln starts reads.
+  const commit = d.versions.find((v) => v.n === version)?.commit ?? item.sha;
+  const about = React.useMemo(() => aboutOf(maker, item.repo, commit, whoSaid(d.author)), [maker, item.repo, commit, d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -326,8 +377,20 @@ function KilnFiles({ item }: { item: ShipCommit }) {
 
   return (
     <Frame
+      repo={item.repo}
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />}
+      bar={
+        <>
+          <GateRow
+            gate={comments.gate}
+            conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length, offered: cf.ladder?.state === "offered" }}
+            diffKey={key}
+            superseded={ch.superseded_by}
+            ready={ready}
+          />
+          {d.fresh && <FreshRow fresh={d.fresh} update={() => freshApi.update(key).then((r) => `${r.branch} moved to v${r.version}`)} />}
+        </>
+      }
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
@@ -367,6 +430,7 @@ function HostFiles({ item }: { item: ShipCommit }) {
   const n = pullNumber(ch.name);
   const { me, ops } = useOps(item);
   const pull = useRes(hostPullRes(item.repo, n)).data;
+  const fresh = useRes(hostPullFreshRes(item.repo, n)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const list = React.useMemo(() => pull.files.map((f) => hostFile(f)).filter((f): f is PatchFile => f != null), [pull.files]);
@@ -376,6 +440,8 @@ function HostFiles({ item }: { item: ShipCommit }) {
   const threads = React.useMemo(() => host, [host]);
   const map = useThreadMap(threads, 1);
   const linesOf = React.useMemo(() => makeLinesOf(rowsByFile), [rowsByFile]);
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker, item.repo, pull.sha), [maker, item.repo, pull.sha]);
 
   const fullOps: Ops = React.useMemo(
     () => ({
@@ -414,8 +480,18 @@ function HostFiles({ item }: { item: ShipCommit }) {
 
   return (
     <Frame
+      repo={item.repo}
       sum={`${pull.files.length} file${pull.files.length === 1 ? "" : "s"} · +${adds} −${dels} · ${ch.name}`}
-      bar={<HostGateRow approved={approved} onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})} />}
+      bar={
+        <>
+          <HostGateRow
+            approved={approved}
+            onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})}
+            land={{ state: item.pips.find((p) => p.stage === "land")?.state ?? "none", onLand: () => reviewApi.enqueue(item.repo, [{ number: n, head: pull.sha }]) }}
+          />
+          {fresh && <FreshRow fresh={fresh} update={() => hostPullsApi.update(item.repo, n).then((r) => `${r.state} on ${HOST_WORD[r.host]}`)} />}
+        </>
+      }
       search={{ res: q.trim() ? pullSearchRes(item.repo, n, q) : null, q, onQ: setQ }}
       convo={
         <Conversation
@@ -430,9 +506,11 @@ function HostFiles({ item }: { item: ShipCommit }) {
         </Conversation>
       }
     >
-      {list.map((f) => (
-        <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: pull.files.find((x) => x.path === f.path)?.status }} />
-      ))}
+      <AboutContext.Provider value={about}>
+        {list.map((f) => (
+          <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: pull.files.find((x) => x.path === f.path)?.status }} />
+        ))}
+      </AboutContext.Provider>
     </Frame>
   );
 }
@@ -507,7 +585,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     [ops],
   );
   const maker = item.made_by?.agent;
-  const about = React.useMemo(() => aboutOf(maker), [maker]);
+  const about = React.useMemo(() => aboutOf(maker, item.repo, item.sha), [maker, item.repo, item.sha]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],
@@ -516,6 +594,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
   const dels = list.reduce((a, f) => a + f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.startsWith("-")).length, 0), 0);
   return (
     <Frame
+      repo={item.repo}
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · ${item.short}`}
       convo={
         <ul className="rv-convo">

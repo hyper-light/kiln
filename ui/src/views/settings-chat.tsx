@@ -11,6 +11,7 @@ import { api, type ChatLinks } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingsGroup } from "@/components/ui/settings";
+import { useAction, useActions } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useRes, type Res } from "@/lib/data";
@@ -36,31 +37,24 @@ export function ChatAccountsGroup() {
   const res = useRes(chatLinksRes);
   const { links, chats } = res.data;
   const [code, setCode] = React.useState<{ code: string; expires_at: number } | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
-  const newCode = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
+  const [newCode, making] = useAction(
+    async () => {
+      setProblem(null);
       setCode(await api.chatCode());
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const unlink = async (integration: string, account: string) => {
-    setBusy(true);
-    setProblem(null);
-    try {
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
+  // An Unlink says it's on its way and its row goes with the answer (W21-R15): gone at once, the
+  // next row would slide under a second click and be unlinked too.
+  const [unlink, unlinking] = useActions(
+    async (_key: string, integration: string, account: string) => {
+      setProblem(null);
       await api.unlinkChat(integration, account);
-      res.setData((d) => ({ ...d, links: d.links.filter((l) => !(l.id === integration && l.account === account)) }));
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+      res.change((d) => ({ ...d, links: d.links.filter((l) => !(l.id === integration && l.account === account)) }));
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
   return (
     <SettingsGroup id={ID} title={TITLE} about={ABOUT} words={WORDS}>
       {chats.length === 0 ? (
@@ -78,7 +72,7 @@ export function ChatAccountsGroup() {
                   {l.integration ? ` · ${l.integration}` : ""} · linked {relativeTime(l.created_at)}
                 </span>
                 <span className="st-item-acts">
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void unlink(l.id, l.account)}>
+                  <Button size="xs" variant="ghost" pending={unlinking(`${l.id}/${l.account}`)} onClick={() => unlink(`${l.id}/${l.account}`, l.id, l.account)}>
                     Unlink
                   </Button>
                 </span>
@@ -91,15 +85,14 @@ export function ChatAccountsGroup() {
         (code ? (
           <div className="st-trust mt-3" role="status">
             <p>
-              In {chats.map((c) => c.name).join(", ")}, say to kiln: <code>link {code.code}</code> (Slack: <code>/kiln link {code.code}</code>; Telegram: <code>/link {code.code}</code>; Teams: <code>@kiln link {code.code}</code>).
+              In {chats.map((c) => c.name).join(", ")}, say to kiln: <code>link {code.code}</code> (Slack: <code>/kiln link {code.code}</code>; Telegram: <code>/link {code.code}</code>; Teams:{" "}
+              <code>@kiln link {code.code}</code>).
             </p>
-            <p>
-              It works once, until {new Date(code.expires_at * 1000).toLocaleTimeString()}. Type it yourself: whoever says it acts as you there.
-            </p>
+            <p>It works once, until {new Date(code.expires_at * 1000).toLocaleTimeString()}. Type it yourself: whoever says it acts as you there.</p>
           </div>
         ) : (
           <div className="mt-3 flex justify-end">
-            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void newCode()}>
+            <Button size="xs" variant="secondary" pending={making} onClick={newCode}>
               Link a chat account
             </Button>
           </div>

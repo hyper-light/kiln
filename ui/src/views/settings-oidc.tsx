@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts } from "@/components/ui/misc";
 import { SettingsGroup } from "@/components/ui/settings";
+import { useHold } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -36,21 +37,36 @@ export function OidcGroups() {
   const reach = d.reach;
   const integrations: Integrations = useSuspenseResource("ci/integrations", (s) => api.integrations(s)).data;
   const federated = integrations.integrations.filter((i) => FEDERATING.has(i.kind) || (i.kind === "oci" && typeof i.config.federation === "string"));
-  const [busy, setBusy] = React.useState(false);
   const [said, setSaid] = React.useState<{ tone?: "error"; text: string } | null>(null);
-  const [now, setNow] = React.useState(false);
+  // The rotate confirm, by its opening: a rotation answered after it was closed and opened again
+  // leaves the one open now as it is (W21-R15).
+  const [now, setNow] = React.useState<number | null>(null);
+  const openings = React.useRef(0);
   const act = async (f: () => Promise<string>) => {
-    setBusy(true);
     setSaid(null);
     try {
       setSaid({ text: await f() });
       res.reload();
     } catch (e) {
       setSaid({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
     }
   };
+  // Publishing and rotating both change the keys kiln's issuer publishes: one at a time (W21-R15),
+  // the one pressed saying so and the others waiting, so one message line says how each went.
+  const hold = useHold();
+  const keys = (what: "publish" | "later" | "now") =>
+    hold.change(what, () => {
+      if (what === "publish") return act(async () => `Published to ${(await ci.oidcPublish()).published}.`);
+      const at = now;
+      return act(async () => {
+        if (what === "now") {
+          await ci.oidcRotate(true);
+          return "A new key signs now.";
+        }
+        return `A new key signs from ${new Date((await ci.oidcRotate(false)).sign_from * 1000).toLocaleString()}.`;
+      }).then(() => setNow((n) => (n === at ? null : n)));
+    });
+  const { doing: on, held } = hold;
   return (
     <>
       <SettingsGroup
@@ -60,10 +76,10 @@ export function OidcGroups() {
         words="oidc issuer discovery jwks keys rotate publish subject"
         actions={
           <>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(async () => `Published to ${(await ci.oidcPublish()).published}.`)}>
+            <Button size="xs" variant="ghost" pending={on("publish")} disabled={held("publish")} onClick={() => keys("publish")}>
               Publish
             </Button>
-            <Button size="xs" variant="secondary" disabled={busy} aria-expanded={now} onClick={() => setNow(!now)}>
+            <Button size="xs" variant="secondary" aria-expanded={now !== null} onClick={() => setNow(now === null ? ++openings.current : null)}>
               Rotate
             </Button>
           </>
@@ -102,34 +118,19 @@ export function OidcGroups() {
             AWS and Azure fetch kiln&rsquo;s keys from the issuer: serve it on an address of its own ([ci.oidc] listen) or publish it ([ci.oidc] publish_to), and make that the issuer.
           </p>
         )}
-        {now && (
+        {now !== null && (
           <Confirm
             className="mt-4"
             label="Rotate the signing key"
             actions={
               <>
-                <Button
-                  size="xs"
-                  variant="primary"
-                  disabled={busy}
-                  onClick={() => void act(async () => `A new key signs from ${new Date((await ci.oidcRotate(false)).sign_from * 1000).toLocaleString()}.`).then(() => setNow(false))}
-                >
+                <Button size="xs" variant="primary" pending={on("later")} disabled={held("later")} onClick={() => keys("later")}>
                   In 7 days
                 </Button>
-                <Button
-                  size="xs"
-                  variant="danger"
-                  disabled={busy}
-                  onClick={() =>
-                    void act(async () => {
-                      await ci.oidcRotate(true);
-                      return "A new key signs now.";
-                    }).then(() => setNow(false))
-                  }
-                >
+                <Button size="xs" variant="danger" pending={on("now")} disabled={held("now")} onClick={() => keys("now")}>
                   Now
                 </Button>
-                <Button size="xs" variant="ghost" disabled={busy} onClick={() => setNow(false)}>
+                <Button size="xs" variant="ghost" onClick={() => setNow(null)}>
                   Cancel
                 </Button>
               </>

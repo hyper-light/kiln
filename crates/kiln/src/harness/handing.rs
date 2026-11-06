@@ -62,16 +62,17 @@ impl std::fmt::Display for NotHanded {
 /// The server's word on a hand-over.
 type Word = Result<(), NotHanded>;
 
-/// This runner's link to the server, and the hand-overs under way, each waiting for its word.
+/// This runner's link to the server, and the hand-overs under way, each waiting for its word: on
+/// lock-free queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae), whose waits take no lock.
 struct Relay {
-    up: Mutex<Option<async_channel::Sender<Up>>>,
-    waiting: Mutex<HashMap<String, (async_channel::Sender<Word>, async_channel::Receiver<Word>)>>,
+    up: Mutex<Option<crate::memory::queue::Sender<Up>>>,
+    waiting: Mutex<HashMap<String, (crate::memory::queue::Sender<Word>, crate::memory::queue::Receiver<Word>)>>,
 }
 
 static RELAY: LazyLock<Relay> = LazyLock::new(|| Relay { up: Mutex::new(None), waiting: Mutex::new(HashMap::new()) });
 
 /// This runner's link to the server, set as it starts.
-pub fn install(up: async_channel::Sender<Up>) {
+pub fn install(up: crate::memory::queue::Sender<Up>) {
     // A test holding this process's link keeps it: a runner another test starts here meanwhile (a
     // server's local agent) doesn't take it over.
     #[cfg(test)]
@@ -86,7 +87,7 @@ pub fn install(up: async_channel::Sender<Up>) {
 /// for the same word: one that came since the last try is its answer at once.
 pub async fn send(id: &str, bytes: &[u8]) -> Word {
     let Some(up) = RELAY.up.lock().clone() else { return Err(NotHanded::NotPassed("this runner has no link to the server".to_owned())) };
-    let rx = RELAY.waiting.lock().entry(id.to_owned()).or_insert_with(async_channel::unbounded).1.clone();
+    let rx = RELAY.waiting.lock().entry(id.to_owned()).or_insert_with(|| crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)).1.clone();
     if let Ok(word) = rx.try_recv() {
         return word;
     }
@@ -173,7 +174,7 @@ pub fn hold_link() -> HeldLink {
 
 /// The link of the test holding it ([`hold_link`]).
 #[cfg(test)]
-pub fn set_held_link(up: async_channel::Sender<Up>) {
+pub fn set_held_link(up: crate::memory::queue::Sender<Up>) {
     *RELAY.up.lock() = Some(up);
 }
 
@@ -197,7 +198,7 @@ mod tests {
     fn a_hand_over_goes_in_pieces_and_waits_for_the_servers_word() -> anyhow::Result<()> {
         let _link = hold_link();
         crate::rt::block_on(async {
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             set_held_link(tx);
             let bytes = vec![7u8; PIECE + 10];
             let sending = crate::rt::spawn(async move { send("s1", &bytes).await });

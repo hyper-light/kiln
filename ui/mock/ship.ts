@@ -8,6 +8,7 @@
 import type http from "node:http";
 import type { ShipChange, ShipCommit, ShipDetail, ShipJob, ShipJobDone, ShipMark, ShipPace, ShipPage, ShipPip, ShipScope, ShipVerb } from "../src/api/ship.ts";
 import { STATES } from "../src/components/ui/status-glyph-spec.ts";
+import { ME_URI } from "./agents.ts";
 import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
@@ -128,7 +129,8 @@ function commits(): ShipCommit[] {
       author: "user:lee",
       at: t - 900,
       stand: "waiting",
-      line: "Waiting on review",
+      // How fresh it is, the line's last clause (W26-R16).
+      line: "Waiting on review · replays clean on main@4c1e2a",
       cursor: 10,
       pips: pips("requested", "none", "running"),
       kind: "request",
@@ -281,8 +283,14 @@ const PI = "pi-kitchen";
 /** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
 const piRetried = new Set<string>();
 
-/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): kiln's take for the person. */
-const SIGNED_FOR_YOU = { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): the person's own
+ * hand-on, signed in the browser, which kiln passed on to the agent; else kiln's take for them. */
+const custodyOf = (b: { hand_on?: unknown }) =>
+  b.hand_on ? { hand_on: `sha256:${"5".repeat(64)}`, passed_on: `sha256:${"6".repeat(64)}`, kiln_signed_for_you: false } : { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+
+/** What each browser sent with its hand-offs, by its user agent (`GET /api/mock/ship/hand-offs`):
+ * its own hand-on, signed, or why it couldn't sign one (W27-R08). */
+const sentBy = new Map<string, { hand_on?: unknown; unsigned?: unknown }[]>();
 
 /** The fixed rows each browser handed off (`POST /api/ship/hand-off`), by its user agent as Pi's
  * retry is, so a desktop's and a phone's tests don't see each other's. */
@@ -340,12 +348,49 @@ function inScope(state: string, scope: ShipScope): boolean {
  * agent wrote it, else ci-doctor, the agent the mock's repository has attached. */
 const takerOf = (row: ShipCommit) => (row.author.startsWith("agent:") ? row.author.slice("agent:".length) : "ci-doctor");
 
+/** The rows whose handed-off threads each browser's agent answered in a new version
+ * (`POST /api/mock/ship/fixed?sha=`), by its user agent as `handedBy` is. */
+const fixedBy = new Map<string, Set<string>>();
+
+/** The new version an agent's fix makes of a handed-off change (W26-R18): on top, its checks running. */
+const fixShaOf = (s: string) => `f${s.slice(1)}`;
+function fixOf(row: ShipCommit): ShipCommit {
+  const ch = row.change!;
+  const v = ch.latest + 1;
+  const s = fixShaOf(row.sha);
+  return {
+    ...row,
+    sha: s,
+    short: s.slice(0, 7),
+    at: now(),
+    stand: "checking",
+    line: "Checks running",
+    cursor: row.cursor + 1,
+    pips: pips("requested", "none", "running"),
+    change: { ...ch, revision: v, latest: v, open: { question: 0, nit: 0, issue: 0, blocking: 0 } },
+    actions: [],
+  };
+}
+
 /** A fixed row once this browser handed it off, as the server reads it: a change at work under
- * its agent (no Hand off and Review pair), or a failure on whoever took it (Retry alone). */
+ * its agent (no Hand off and Review pair), its line naming the one thread it has or how many; or a
+ * failure on whoever took it (Retry alone). Once the agent's fix is in, the handed revision is
+ * superseded as any replaced one is, its line saying which version fixed it, folded under that version. */
 function handedRow(row: ShipCommit, ua: string): ShipCommit {
   if (!handedBy.get(ua)?.has(row.sha)) return row;
   const by = takerOf(row);
-  if (row.change) return { ...row, stand: "checking", line: `${by} fixing · kim's thread`, pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "fixing" } : p)), actions: [] };
+  if (row.change && fixedBy.get(ua)?.has(row.sha))
+    return { ...row, stand: "superseded", line: `Fixed in v${row.change.latest + 1}`, pips: pips("none", "none", "superseded"), fold_under: fixShaOf(row.sha), actions: [] };
+  const open = row.change?.open;
+  const threads = open ? open.question + open.nit + open.issue + open.blocking : 0;
+  if (row.change)
+    return {
+      ...row,
+      stand: "checking",
+      line: `${by} fixing · ${threads > 1 ? `${threads} threads` : "kim's thread"}`,
+      pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "fixing" } : p)),
+      actions: [],
+    };
   const why = row.line.split(" · ").slice(1).join(" · ") || "checks failed";
   return { ...row, stand: "failing", line: `${by} fixing · ${why}`, actions: (row.actions ?? []).filter((a) => a.name !== "hand_off") };
 }
@@ -381,6 +426,70 @@ const arrival = (n: number): ShipCommit => ({
   fold_under: null,
   actions: [],
 });
+
+/** An agent's change a test adds on top (`POST /api/mock/ship/arrive?agent=diff|request`), at its
+ * first version, with two open threads: a question of kim's and an issue of an agent's (W26-R18). */
+const agentChange = (kind: ShipChange["kind"]): ShipCommit => {
+  const [name, s, title] = kind === "diff" ? (["D45", sha("d5"), "matrix: cap the expansion"] as const) : (["CR15", sha("c5"), "sched: cap a share"] as const);
+  return {
+    repo: REPO,
+    sha: s,
+    short: s.slice(0, 7),
+    message: title,
+    author: "agent:matrix",
+    branch: "main",
+    at: now(),
+    stand: "needs_you",
+    line: "kim: what caps it? · 2 threads",
+    pips: pips("requested", "none", "passed"),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 200,
+    kind,
+    host: "kiln",
+    change: { name, kind, host: "kiln", title, revision: 1, latest: 1, state: "requested", turn: ["user:ada"], open: { question: 1, nit: 0, issue: 1, blocking: 0 }, superseded_by: null },
+    fold_under: null,
+    actions: [{ name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: s } }],
+  };
+};
+
+/** An agent's draft a test adds on top (`POST /api/mock/ship/arrive?draft=kiln|github`, W26-R18):
+ * a change request on kiln or a pull request on GitHub, not yet asked for review, with Ready. */
+const agentDraft = (host: "kiln" | "github"): ShipCommit => {
+  const [name, s, title] = host === "kiln" ? (["CR16", sha("ad"), "matrix: draft a share"] as const) : (["#22", sha("ae"), "matrix: draft on GitHub"] as const);
+  return {
+    repo: REPO,
+    sha: s,
+    short: s.slice(0, 7),
+    message: title,
+    author: "agent:matrix",
+    branch: "main",
+    at: now(),
+    stand: "waiting",
+    line: "Draft · not asked for review yet",
+    pips: pips("none", "none", "passed"),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 210,
+    kind: "request",
+    host,
+    change: { name, kind: "request", host, title, revision: 1, latest: 1, state: "draft", turn: [], open: { question: 0, nit: 0, issue: 0, blocking: 0 }, superseded_by: null },
+    made_by: { agent: "demo-long", person: "user:sam" },
+    fold_under: null,
+    actions: [{ name: "ready", method: "POST", path: "/api/ship/ready", body: { repo: REPO, sha: s } }],
+  };
+};
+
+/** The drafts each browser marked ready (`POST /api/ship/ready`), by its user agent as `handedBy` is. */
+const readyBy = new Map<string, Set<string>>();
+
+/** A draft once this browser marked it ready, as the server reads it: asked for review, no Ready. */
+const readyRow = (row: ShipCommit, ua: string): ShipCommit =>
+  readyBy.get(ua)?.has(row.sha) && row.change
+    ? { ...row, line: "Waiting on review", pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "requested" } : p)), change: { ...row.change, state: "requested" }, actions: [] }
+    : row;
 
 /**
  * A burst of agents' commits (`POST /api/mock/ship/agents?n=14&over=10`; Agent pace and checks,
@@ -619,6 +728,167 @@ function liveLegs(row: ShipCommit, live: { run: string; job: string }, ctx: Ctx)
   return [...failed, ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({ name: j.name, state: LEG_STATE[j.status] ?? "queued", job: j.job, run: live.run }))];
 }
 
+/**
+ * The server's `ship` frames (W21-R15, crates/kiln/src/ship.rs's `ShipCache::refresh`): with them
+ * on (`MOCK_SHIP_EVENTS=1`, or `POST /api/mock/ship/events?on=1`), a list says whom its rows are for
+ * (`viewer`) and a detail its `dv`, and `shipFrames` says what changed since it last looked: each
+ * repository's rows that read otherwise, those gone, whether its pace line moved. A detail read
+ * from here on is followed (its `dv` goes with its row), as the server follows those read.
+ */
+let live = process.env.MOCK_SHIP_EVENTS === "1";
+export const shipLive = () => live;
+/** What was last said of each commit (`repo/sha`): its row's JSON, and its detail's `dv` and parts once followed. */
+const said = new Map<string, { json: string; dv?: string; parts?: Record<string, string> }>();
+const paced = new Map<string, string>();
+const followed = new Set<string>();
+let primed = false;
+
+/** FNV-1a, 32 bits, in hex: a detail's `dv`. */
+function fnv(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/** What a detail shows beyond its row (ship.rs's `detail_parts`). */
+const PARTS = ["review", "checks", "build", "deployments", "releases", "replant", "jobs"] as const;
+const dvOf = (d: ShipDetail) => fnv(JSON.stringify(PARTS.map((k) => d[k] ?? null)));
+/** Each part of a detail, as JSON (the mock says a part that moved whole, as the server may). */
+const partsOf = (d: ShipDetail): Record<string, string> => Object.fromEntries(PARTS.map((k) => [k, JSON.stringify(d[k] ?? null)]));
+
+export interface ShipFrameOut {
+  type: "ship";
+  repo: string;
+  rows: { row: ShipCommit; dv?: string; base?: string; parts?: Record<string, unknown> }[];
+  gone?: string[];
+  pace?: boolean;
+}
+
+/** What changed of the rows since the last call, as the server's frames say it; nothing the first time. */
+export function shipFrames(ctx: Ctx): ShipFrameOut[] {
+  const rows = all().map((c) => withRan(readyRow(handedRow(c, ""), "")));
+  const frames = new Map<string, ShipFrameOut>();
+  const frame = (repo: string) => frames.get(repo) ?? frames.set(repo, { type: "ship", repo, rows: [] }).get(repo)!;
+  const now = new Set<string>();
+  for (const c of rows) {
+    const k = `${c.repo}/${c.sha}`;
+    if (now.has(k)) continue;
+    now.add(k);
+    const d = followed.has(k) ? detailOf(c.repo, c.sha, "", ctx) : null;
+    const dv = d ? dvOf(d) : undefined;
+    const parts = d ? partsOf(d) : undefined;
+    const json = JSON.stringify(c);
+    const was = said.get(k);
+    said.set(k, { json, dv, parts });
+    if (!primed || (was && was.json === json && (was.dv === undefined || was.dv === dv))) continue;
+    const out: ShipFrameOut["rows"][number] = dv === undefined ? { row: c } : { row: c, dv };
+    // Its parts that moved from the `dv` last said, each whole.
+    if (d && parts && was?.dv !== undefined && was.dv !== dv && was.parts) {
+      const before = was.parts;
+      out.base = was.dv;
+      out.parts = Object.fromEntries(PARTS.filter((p) => before[p] !== parts[p]).map((p) => [p, d[p] ?? null]));
+    }
+    frame(c.repo).rows.push(out);
+  }
+  for (const k of [...said.keys()]) {
+    if (now.has(k)) continue;
+    said.delete(k);
+    const at = k.lastIndexOf("/");
+    const f = frame(k.slice(0, at));
+    if (primed) f.gone = [...(f.gone ?? []), k.slice(at + 1)];
+  }
+  for (const repo of new Set(rows.map((c) => c.repo))) {
+    const mark = JSON.stringify(paceOf(rows.filter((c) => c.repo === repo)));
+    if (primed && paced.get(repo) !== mark) frame(repo).pace = true;
+    paced.set(repo, mark);
+  }
+  primed = true;
+  return [...frames.values()].filter((f) => f.rows.length > 0 || f.gone || f.pace);
+}
+
+/** A commit's detail as `GET /api/ship/commits/:repo/:sha` has it, for browser `ua`; null when there's none. */
+function detailOf(repo: string, sha: string, ua: string, ctx: Ctx): ShipDetail | null {
+  const found = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
+  const row = found ? handedRow(found, ua) : undefined;
+  const live = ctx.liveJob?.();
+  const fixed: ShipDetail | null = row
+    ? {
+        ...row,
+        review: marksOf(row),
+        checks: live
+          ? [
+              {
+                pipeline: "ci",
+                legs:
+                  row.short === "3333333"
+                    ? failingLegs(row, live).map((l) => ({
+                        name: l.name,
+                        state: l.state,
+                        attempts: l.attempts,
+                        note: l.note,
+                        ...(l.log ? { job: l.log, run: l.run } : {}),
+                        ...(l.start != null ? { start: l.start } : {}),
+                        ...(l.end != null ? { end: l.end } : {}),
+                      }))
+                    : [
+                        // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
+                        // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
+                        ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
+                          ? [
+                              {
+                                name: row.line.split(" · ")[0] ?? "checks",
+                                state: "failed",
+                                attempts: 2,
+                                note: row.line.split(" · ").slice(1).join(" · "),
+                                job: live.job,
+                                run: live.run,
+                                start: T0 - 900,
+                                end: T0 - 840,
+                              },
+                            ]
+                          : []),
+                        // Then each job of the live run, as it stands: its own job, its times once it has them.
+                        ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
+                          name: j.name,
+                          state: LEG_STATE[j.status] ?? "queued",
+                          attempts: 1,
+                          note: j.error ?? "",
+                          ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
+                          ...(j.end != null ? { end: j.end } : {}),
+                        })),
+                      ],
+              },
+            ]
+          : [],
+        ...(live ? { jobs: jobsOf(liveLegs(row, live, ctx), actsOf(ua)) } : {}),
+        ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
+        // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
+        runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
+        // A commit in production went through staging, built once: its deploys and the one image they run.
+        ...(row.environments?.some((e) => e.production)
+          ? {
+              build: {
+                platforms: [
+                  { name: "linux/amd64", state: "passed" as const },
+                  // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
+                  { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
+                ],
+                image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
+              },
+              deployments: [
+                { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
+                { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
+              ],
+            }
+          : {}),
+      }
+    : null;
+  return trunk?.detail(sha) ?? fixed;
+}
+
 /** Ship's routes, and the actions its rows name for the trunk's own ids (`ship-run-…`,
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
  * the mock keeps for those paths. True when it answered. */
@@ -633,105 +903,36 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
     const pace = paceOf(all().filter((c) => !repo || c.repo === repo));
+    // An agent's fix of a change this browser handed off (W26-R18): its new version, on top.
+    const rows = [...list.filter((c) => c.change && handedBy.get(ua)?.has(c.sha) && fixedBy.get(ua)?.has(c.sha)).map(fixOf), ...list];
+    const shown = (c: ShipCommit) => withRan(readyRow(handedRow(c, ua), ua));
     // Ship's rows (docs/ci.md W26-R29): each repository's newest commit, the first of its own list.
     if (q.get("by") === "repo") {
       const seen = new Set<string>();
-      const heads = list.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
-      const page: ShipPage = { commits: heads.map((c) => withRan(handedRow(c, ua))), next_cursor: null, pace };
+      const heads = rows.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
+      const page: ShipPage = { commits: heads.map(shown), next_cursor: null, pace, ...(live ? { viewer: [] } : {}) };
       ctx.json(res, 200, page);
       return true;
     }
     // A page: `limit` of them from where the last page's last (`cursor`) left off, as the server pages.
-    const limit = Number(q.get("limit") ?? "") || list.length;
+    const limit = Number(q.get("limit") ?? "") || rows.length;
     const after = q.get("cursor");
-    const from = after === null ? 0 : list.findIndex((c) => String(c.cursor) === after) + 1;
-    const slice = list.slice(from, from + limit);
-    const next = from + limit < list.length ? (slice.at(-1)?.cursor ?? null) : null;
-    const page: ShipPage = { commits: slice.map((c) => withRan(handedRow(c, ua))), next_cursor: next, pace };
+    const from = after === null ? 0 : rows.findIndex((c) => String(c.cursor) === after) + 1;
+    const slice = rows.slice(from, from + limit);
+    const next = from + limit < rows.length ? (slice.at(-1)?.cursor ?? null) : null;
+    const page: ShipPage = { commits: slice.map(shown), next_cursor: next, pace, ...(live ? { viewer: [] } : {}) };
     ctx.json(res, 200, page);
     return true;
   }
   const one = m === "GET" ? p.match(/^\/api\/ship\/commits\/(.+)\/([0-9a-f]{7,40})$/) : null;
   if (one) {
-    const [, repo, sha] = one;
-    const found = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
-    const row = found ? handedRow(found, ua) : undefined;
-    const live = ctx.liveJob?.();
-    const fixed: ShipDetail | null = row
-      ? {
-          ...row,
-          review: marksOf(row),
-          checks: live
-            ? [
-                {
-                  pipeline: "ci",
-                  legs:
-                    row.short === "3333333"
-                      ? failingLegs(row, live).map((l) => ({
-                          name: l.name,
-                          state: l.state,
-                          attempts: l.attempts,
-                          note: l.note,
-                          ...(l.log ? { job: l.log, run: l.run } : {}),
-                          ...(l.start != null ? { start: l.start } : {}),
-                          ...(l.end != null ? { end: l.end } : {}),
-                        }))
-                      : [
-                          // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
-                          // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
-                          ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
-                            ? [
-                                {
-                                  name: row.line.split(" · ")[0] ?? "checks",
-                                  state: "failed",
-                                  attempts: 2,
-                                  note: row.line.split(" · ").slice(1).join(" · "),
-                                  job: live.job,
-                                  run: live.run,
-                                  start: T0 - 900,
-                                  end: T0 - 840,
-                                },
-                              ]
-                            : []),
-                          // Then each job of the live run, as it stands: its own job, its times once it has them.
-                          ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
-                            name: j.name,
-                            state: LEG_STATE[j.status] ?? "queued",
-                            attempts: 1,
-                            note: j.error ?? "",
-                            ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
-                            ...(j.end != null ? { end: j.end } : {}),
-                          })),
-                        ],
-                },
-              ]
-            : [],
-          ...(live ? { jobs: jobsOf(liveLegs(row, live, ctx), actsOf(ua)) } : {}),
-          ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
-          // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
-          runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
-          // A commit in production went through staging, built once: its deploys and the one image they run.
-          ...(row.environments?.some((e) => e.production)
-            ? {
-                build: {
-                  platforms: [
-                    { name: "linux/amd64", state: "passed" as const },
-                    // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
-                    { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
-                  ],
-                  image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
-                },
-                deployments: [
-                  { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
-                  { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
-                ],
-              }
-            : {}),
-        }
-      : null;
-    const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
+    const [, repo = "", sha = ""] = one;
+    const detail = detailOf(repo, sha, ua, ctx);
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
-    else ctx.json(res, 200, detail);
+    else if (live) {
+      followed.add(`${detail.repo}/${detail.sha}`);
+      ctx.json(res, 200, { ...detail, dv: dvOf(detail), viewer: [] });
+    } else ctx.json(res, 200, detail);
     return true;
   }
   // A commit's jobs acted on together (W26-R21, R22), answered as the server answers: each job done, or why not.
@@ -789,10 +990,38 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     ctx.json(res, 200, { bodies: jobActs.get(ua)?.bodies ?? [] });
     return true;
   }
-  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
-  // handed off from a browser, which has no key, kiln signs it for the person (W27-R08).
-  if (p === "/api/ship/hand-off" && m === "POST") {
+  // What a browser signs to hand a row off (W27-R08), as the server says it: the person's hand-on
+  // of what's open to kiln's server, which passes it on to the agent that takes it.
+  if (p === "/api/ship/hand-off/statement" && m === "POST") {
     let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const sha = typeof body.sha === "string" ? body.sha : "";
+    const row = all().find((c) => c.repo === body.repo && c.sha === sha);
+    if (typeof body.repo !== "string" || !sha || (row && (handedBy.get(ua)?.has(sha) || !(row.actions ?? []).some((a) => a.name === "hand_off")))) {
+      ctx.json(res, row ? 409 : 400, { error: row ? `${row.short} has nothing open to hand off` : "`repo` and `sha`: the commit to hand off" });
+      return true;
+    }
+    const what = row?.change ? "threads" : "checks";
+    const at = `${body.repo}@${sha.slice(0, 7)}`;
+    const statement = {
+      v: 1,
+      subject: [{ name: `${at} ${what}`, digest: { "kiln-work-v1": "cd".repeat(32) } }],
+      body: { v: 1, kind: "handed-on", by: ME_URI, to: "kiln://hyper-light/server", why: `handed off: ${what} of ${at}` },
+    };
+    const text = JSON.stringify(statement);
+    const type = "application/vnd.kiln.custody+json";
+    const pae = `DSSEv1 ${type.length} ${type} ${Buffer.byteLength(text)} ${text}`;
+    ctx.json(res, 200, { payload_type: type, statement, payload: Buffer.from(text).toString("base64"), pae: Buffer.from(pae).toString("base64"), required: false });
+    return true;
+  }
+  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
+  // its custody, as the browser sent it: the person's own hand-on, or kiln's take for them (W27-R08).
+  if (p === "/api/ship/hand-off" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown; hand_on?: unknown; unsigned?: unknown } = {};
     try {
       body = JSON.parse((await readBody(req)) || "{}") as typeof body;
     } catch {
@@ -803,10 +1032,13 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       ctx.json(res, 400, { error: "`repo` and `sha`: the commit to hand off" });
       return true;
     }
+    const sent = () => sentBy.set(ua, [...(sentBy.get(ua) ?? []), { hand_on: body.hand_on, unsigned: body.unsigned }]);
     const taken = trunk?.handOff(sha);
     if (taken != null) {
-      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: SIGNED_FOR_YOU });
-      else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
+      if (taken) {
+        sent();
+        ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: custodyOf(body) });
+      } else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
       return true;
     }
     const row = all().find((c) => c.repo === body.repo && c.sha === sha);
@@ -816,12 +1048,55 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       return true;
     }
     handedBy.set(ua, mine.add(sha));
+    sent();
     const to = takerOf(row);
-    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: SIGNED_FOR_YOU });
+    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: custodyOf(body) });
+    return true;
+  }
+  if (p === "/api/mock/ship/hand-offs" && m === "GET") {
+    ctx.json(res, 200, { hand_offs: sentBy.get(ua) ?? [] });
+    return true;
+  }
+  // A row's Ready (W26-R18): an agent's draft marked ready for review, as the server answers.
+  if (p === "/api/ship/ready" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const row = all().find((c) => c.repo === body.repo && c.sha === body.sha);
+    const mine = readyBy.get(ua) ?? new Set<string>();
+    if (!row?.change || mine.has(row.sha) || !(row.actions ?? []).some((a) => a.name === "ready")) {
+      ctx.json(res, row ? 409 : 404, { error: row ? `${row.change?.name ?? row.short} isn't a draft` : "no such commit" });
+      return true;
+    }
+    readyBy.set(ua, mine.add(row.sha));
+    ctx.json(res, 200, { ready: { change: row.change.name } });
+    return true;
+  }
+  if (p === "/api/mock/ship/ready" && m === "POST") {
+    if (q.get("reset")) readyBy.delete(ua);
+    ctx.json(res, 200, { ok: true });
     return true;
   }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {
-    if (q.get("reset")) handedBy.delete(ua);
+    if (q.get("reset")) {
+      handedBy.delete(ua);
+      sentBy.delete(ua);
+      fixedBy.delete(ua);
+    }
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
+  // The author's agent's fix of a handed-off change is in: a new version answering its threads.
+  if (p === "/api/mock/ship/fixed" && m === "POST") {
+    const sha = q.get("sha") ?? "";
+    if (!handedBy.get(ua)?.has(sha)) {
+      ctx.json(res, 409, { error: "not handed off from this browser" });
+      return true;
+    }
+    fixedBy.set(ua, (fixedBy.get(ua) ?? new Set<string>()).add(sha));
     ctx.json(res, 200, { ok: true });
     return true;
   }
@@ -847,12 +1122,24 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     ctx.json(res, 200, { ok: true, states: STATES.length });
     return true;
   }
+  // The server's `ship` frames on or off (W21-R15); either way what was said starts over.
+  if (p === "/api/mock/ship/events" && m === "POST") {
+    live = q.get("on") === "1";
+    said.clear();
+    paced.clear();
+    followed.clear();
+    primed = false;
+    ctx.json(res, 200, { ok: true, live });
+    return true;
+  }
   if (p === "/api/mock/ship/arrive" && m === "POST") {
     if (q.get("clear")) {
       for (const t of burstTimers) clearTimeout(t);
       burstTimers.clear();
       arrived.length = 0;
-    } else arrived.unshift(arrival(arrived.length + 1));
+    } else if (q.get("agent") === "diff" || q.get("agent") === "request") arrived.unshift(agentChange(q.get("agent") as ShipChange["kind"]));
+    else if (q.get("draft") === "kiln" || q.get("draft") === "github") arrived.unshift(agentDraft(q.get("draft") as "kiln" | "github"));
+    else arrived.unshift(arrival(arrived.length + 1));
     ctx.json(res, 200, { ok: true });
     return true;
   }

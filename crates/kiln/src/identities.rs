@@ -106,6 +106,14 @@ pub fn sign_as(pki: &crate::pki::Pki, kind: &str, payload_type: &str, payload: &
     Ok(statement::bundle(payload_type, payload, &signature, &certificate))
 }
 
+/// [`sign_as`] on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the key and its certificate
+/// are read from their files each time ([`sign_own`]), then signed with, which a land's and a revision's VSA did on
+/// the shard of the task that asked.
+pub async fn sign_as_off(pki: &Arc<crate::pki::Pki>, kind: &str, payload_type: &str, payload: Vec<u8>) -> anyhow::Result<serde_json::Value> {
+    let (pki, kind, payload_type) = (Arc::clone(pki), kind.to_owned(), payload_type.to_owned());
+    crate::rt::blocking(move || sign_as(&pki, &kind, &payload_type, &payload)).await?
+}
+
 /// The server's delegation of attempt `attempt` of leg `job` to the identity `uri` it just
 /// certified (`cert_pem`), signed as itself and kept as taken now (W27-R05, R06;
 /// [`kiln_ci::attest::leg::delegation`]): about what kiln handed it (the commit its certificate
@@ -113,13 +121,20 @@ pub fn sign_as(pki: &crate::pki::Pki, kind: &str, payload_type: &str, payload: &
 /// (`signs`, as its runner said). Its digest, for the leg's records to name in `under`.
 async fn delegate_leg(hub: &Hub, job: &str, attempt: u32, uri: &str, cert_pem: &str, facts: &[(u64, String)], signs: bool) -> anyhow::Result<String> {
     use kiln_ci::identity::{chain::fulcio, statement};
-    let commit = facts.iter().find(|(m, _)| *m == fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.as_str());
+    let commit = facts.iter().find(|(m, _)| *m == fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.clone());
     let assignment = crate::ci::signed::handed_digest(&hub.store, job, attempt).await?;
-    let until = crate::pki::cert_info(cert_pem)?.not_after;
     let server = Identity::new(hub.pki.organization(), Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let payload = statement::payload(&kiln_ci::attest::leg::delegation(&server, uri, commit, assignment.as_deref(), until))?;
-    let bundle = sign_as(&hub.pki, "server", statement::PAYLOAD_DELEGATION, &payload)?.to_string();
-    let digest = statement::digest(statement::PAYLOAD_DELEGATION, &payload);
+    // Read, made and signed on the blocking pool: the server's key and certificate are files, read for each
+    // signature, and the certificate's parse and the signature were CPU on the hub's loop, which waits for this
+    // answer (goal 9, plan 01a1a87b2cec step 3).
+    let (pki, uri, cert) = (Arc::clone(&hub.pki), uri.to_owned(), cert_pem.to_owned());
+    let (bundle, digest) = crate::rt::blocking(move || -> anyhow::Result<(String, String)> {
+        let until = crate::pki::cert_info(&cert)?.not_after;
+        let payload = statement::payload(&kiln_ci::attest::leg::delegation(&server, &uri, commit.as_deref(), assignment.as_deref(), until))?;
+        let bundle = sign_as(&pki, "server", statement::PAYLOAD_DELEGATION, &payload)?.to_string();
+        Ok((bundle, statement::digest(statement::PAYLOAD_DELEGATION, &payload)))
+    })
+    .await??;
     let (j, d, at) = (job.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
@@ -740,7 +755,11 @@ pub enum Target {
 
 /// Records a certificate kiln just issued.
 pub async fn record(store: &Store, kind: &str, subject: &str, cert_pem: &str) -> anyhow::Result<()> {
-    let f = crate::pki::fingerprints(cert_pem)?;
+    record_fingerprinted(store, kind, subject, cert_pem, crate::pki::fingerprints(cert_pem)?).await
+}
+
+/// [`record`], `cert_pem` fingerprinted already (`f`, where it was made: [`certify`]).
+async fn record_fingerprinted(store: &Store, kind: &str, subject: &str, cert_pem: &str, f: crate::pki::Fingerprints) -> anyhow::Result<()> {
     let (kind, subject, pem, now) = (kind.to_owned(), subject.to_owned(), cert_pem.to_owned(), crate::util::now_unix());
     store
         .call(move |c| {
@@ -773,10 +792,12 @@ pub async fn enrolled(store: &Store, machine: &str, by: &str) -> anyhow::Result<
         .await
 }
 
-/// Who enrolled `machine`: `admin` for one enrolled before kiln recorded it.
+/// Who enrolled `machine`: `admin` for one enrolled before kiln recorded it. Read on the store's read connections, not
+/// in the writer's turn (goal 9, plan 01a1a87b2cec step 5: train 8's census had it 37 times a second behind the writes,
+/// 4.6 ms each, on every runner's identity and every mirror's hand-on): an enrollment committed before it is read.
 pub async fn enrolled_by(store: &Store, machine: &str) -> anyhow::Result<String> {
     let machine = machine.to_owned();
-    let by: Option<String> = store.call(move |c| Ok(c.query_row("SELECT enrolled_by FROM enrollments WHERE machine = ?1", [machine], |r| r.get(0)).optional()?)).await?;
+    let by: Option<String> = store.read(move |c| Ok(c.query_row("SELECT enrolled_by FROM enrollments WHERE machine = ?1", [machine], |r| r.get(0)).optional()?)).await?;
     Ok(by.unwrap_or_else(|| "admin".to_owned()))
 }
 
@@ -799,6 +820,18 @@ const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// yet waits for the session's Open, [`OPEN_WAIT`] at most, in a task of its own, so this runner's
 /// messages (the Open among them) go on being taken meanwhile; every other ask is answered at once.
 pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: IdentityAsk) {
+    // A test build's `identity_late` (the server's): a leg's identity answered that long late, as a
+    // busy server's is, in a task of its own as below (docs/ci.md W27-R05).
+    if ask.kind == "leg"
+        && let Some(late) = crate::runner::chaos::get().and_then(|c| c.identity_late)
+    {
+        let (hub, machine) = (Arc::clone(hub), machine.to_owned());
+        crate::rt::spawn(async move {
+            crate::rt::sleep(late).await;
+            answer(&hub, peer, &machine, &ask).await;
+        });
+        return;
+    }
     let unopened = |hub: &Hub, ask: &IdentityAsk| ask.kind == "agent" && ask.of.as_deref().is_some_and(|s| hub.harness.info(s).is_none());
     if unopened(hub, &ask) {
         let (hub, machine) = (Arc::clone(hub), machine.to_owned());
@@ -814,14 +847,18 @@ pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: IdentityAs
     answer(hub, peer, machine, &ask).await;
 }
 
-/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked.
-async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
+/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked. A
+/// leg's inputs follow it, handed on signed in a task of their own: the leg's first step waits for
+/// this answer (docs/ci.md W27-R05), not for them.
+async fn answer(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
+    let mut inputs = None;
     match issue(hub, peer, machine, ask).await {
-        Ok((uri, pem, delegation)) => {
+        Ok((uri, pem, delegation, leg)) => {
             given.uri = uri;
             given.cert_pem = Some(pem);
             given.delegation = delegation;
+            inputs = leg;
         }
         Err(e) => {
             tracing::warn!(agent = %machine, kind = %ask.kind, error = %format!("{e:#}"), "no identity issued");
@@ -831,19 +868,36 @@ async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     if let Ok(json) = serde_json::to_string(&given) {
         hub.send_peer(peer, &ServerMsg::Identity { json }).await;
     }
+    // And the leg's inputs handed to the runner process running it, signed (docs/ci.md W27-R08).
+    if let Some(LegInputs { job, attempt, uri, commit }) = inputs {
+        let hub = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            Box::pin(crate::ci::signed::give_inputs(&hub, peer, &job, attempt, &uri, commit.as_deref())).await;
+        });
+    }
+}
+
+/// What kiln hands a leg it certified as `uri` once it has answered its runner process
+/// ([`crate::ci::signed::give_inputs`]): attempt `attempt` of leg `job`, at `commit`.
+struct LegInputs {
+    job: String,
+    attempt: u32,
+    uri: String,
+    commit: Option<String>,
 }
 
 /// Which of `machine`'s runner processes asked, as it said when it joined. One that isn't joined
 /// now (gone while its ask waited for its session to open) is named in no certificate, rather than
 /// certified as a process kiln can't say it is (docs/ci.md W27-R01).
 fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
-    hub.instances.lock().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
+    hub.instances.load().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
 }
 
 /// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
-/// server's delegation of it, by digest ([`delegate_leg`]). A leg's identity comes with its
-/// delegation or not at all, since its records are taken only under it.
-async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>)> {
+/// server's delegation of it, by digest ([`delegate_leg`]), and its inputs to hand on once it's
+/// answered. A leg's identity comes with its delegation or not at all, since its records are taken
+/// only under it.
+async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>, Option<LegInputs>)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
     let instance = asker(hub, peer, machine)?;
     let (identity, lifetime) = match ask.kind.as_str() {
@@ -863,10 +917,17 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let named: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
-    let pem = hub.pki.issue_identity(&ask.csr, &identity, &named, lifetime)?;
+    let (pem, fingerprints) = certify(&hub.pki, &ask.csr, &identity, &facts, lifetime).await?;
     let delegation = match (&identity.actor, ask.of.as_deref()) {
         (Actor::Leg { attempt, .. }, Some(job)) => Some(delegate_leg(hub, job, *attempt, &uri, &pem, &facts, ask.signs).await.map_err(|e| e.context("the server's delegation of the leg wasn't signed"))?),
+        _ => None,
+    };
+    // And the leg's inputs, handed to the runner process running it once it's answered.
+    let inputs = match (&identity.actor, ask.of.as_deref()) {
+        (Actor::Leg { attempt, .. }, Some(job)) => {
+            let commit = facts.iter().find(|(m, _)| *m == kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.clone());
+            Some(LegInputs { job: job.to_owned(), attempt: *attempt, uri: uri.clone(), commit })
+        }
         _ => None,
     };
     let now = crate::util::now_unix();
@@ -885,7 +946,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // None came with it, to an epoch kiln certifies the session at for the first time: its
         // hand-over went unsigned, recorded saying which side is from before signed hand-overs.
         let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
-        let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+        let takes = hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
         let why = if !takes {
             format!("the process it went to, on {}, runs a kiln from before signed hand-overs: it signed no receipt", hub.shown(machine))
         } else if gave.is_empty() {
@@ -911,7 +972,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // kiln's count of them last named (the 14:18 drop: words for the runner a blue/green
         // upgrade took over from, passed on to the new build).
         hub.harness.raise_epoch(session, *epoch);
-        hub.instances.lock().own(crate::instances::Owned::Agent(session.to_owned()), peer);
+        hub.instances.update(|i| i.own(crate::instances::Owned::Agent(session.to_owned()), peer));
         if let Some(h) = held_by {
             hub.harness.held_by(session, &h.instance);
         }
@@ -919,15 +980,30 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // the machine's other processes, as kiln sent them to the one it still counted, which
         // refuse them.
         if crate::runner::chaos::get().is_some_and(|c| c.stale_words) {
-            let others: Vec<crate::instances::PeerId> = hub.instances.lock().of(machine).into_iter().filter(|p| *p != peer).collect();
+            let others: Vec<crate::instances::PeerId> = hub.instances.load().of(machine).into_iter().filter(|p| *p != peer).collect();
             for was in others {
                 stale_words(hub, machine, was, session).await;
             }
         }
     }
-    record(&hub.store, &ask.kind, &uri, &pem).await?;
+    record_fingerprinted(&hub.store, &ask.kind, &uri, &pem, fingerprints).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");
-    Ok((uri, pem, delegation))
+    Ok((uri, pem, delegation, inputs))
+}
+
+/// The certificate for the key of `csr` as `identity`, with `facts` and for `lifetime`, and its fingerprints:
+/// made on the compute pool. The CSR's signature checked and the CA's made, then the certificate read back,
+/// were each runner's Identity's work on the hub's loop, which waits for its answer: every ask held its
+/// shard, 0.2 ms at the median and up to 3 ms with hogs in g9p7's fill (goal 9, plan 01a1a87b2cec step 3).
+async fn certify(pki: &Arc<crate::pki::Pki>, csr: &str, identity: &Identity, facts: &[(u64, String)], lifetime: time::Duration) -> anyhow::Result<(String, crate::pki::Fingerprints)> {
+    let (pki, csr, identity, facts) = (Arc::clone(pki), csr.to_owned(), identity.clone(), facts.to_vec());
+    crate::rt::compute(move || -> anyhow::Result<_> {
+        let named: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
+        let pem = pki.issue_identity(&csr, &identity, &named, lifetime)?;
+        let fingerprints = crate::pki::fingerprints(&pem)?;
+        Ok((pem, fingerprints))
+    })
+    .await?
 }
 
 /// An agent session's identity at `epoch`, for the runner process of `machine` holding it
@@ -1210,15 +1286,59 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
 
 /// Every revocation, for the chain checker.
 pub async fn revocations(store: &Store) -> anyhow::Result<Vec<Revocation>> {
-    store
-        .call(|c| {
-            let mut q = c.prepare("SELECT serial, key_sha256, at, reason, by FROM revocations ORDER BY at, id")?;
-            let rows = q
-                .query_map([], |r| Ok(Revocation { serial: r.get(0)?, key: r.get(1)?, at: r.get(2)?, reason: r.get(3)?, by: r.get(4)? }))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .await
+    store.call(|c| Ok(revocations_on(c)?)).await
+}
+
+/// Every revocation `c` has, in order (when it took effect, then as it was added).
+fn revocations_on(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Revocation>> {
+    let mut q = c.prepare("SELECT serial, key_sha256, at, reason, by FROM revocations ORDER BY at, id")?;
+    q.query_map([], |r| Ok(Revocation { serial: r.get(0)?, key: r.get(1)?, at: r.get(2)?, reason: r.get(3)?, by: r.get(4)? }))?.collect()
+}
+
+/// What tells one set of revocations from another: the newest's id (0 for none). Nothing changes or deletes a
+/// revocation; one is only added ([`revoke`]), under an id past every id before it (the table's `AUTOINCREMENT`,
+/// migration `w27_identities`), so the stamp moves with each one added, and with nothing else.
+pub type Stamp = i64;
+
+/// The revocations' [`Stamp`] as `c` has them now: one lookup of the largest key, the same few pages read however
+/// many there are. Goal 9, plan 01a1a87b2cec step 5: it counted them too, and a count visits every leaf page of the
+/// table, in every custody record's keeping call, in the writer's turn; the newest id alone moves as the count did.
+pub fn revoked_stamp(c: &rusqlite::Connection) -> rusqlite::Result<Stamp> {
+    c.query_row("SELECT COALESCE(MAX(id), 0) FROM revocations", [], |r| r.get(0))
+}
+
+/// Every revocation as one read of them found them, with their [`Stamp`] then (goal 9, plan 01a1a87b2cec step 5):
+/// what a custody record kiln takes is checked against off the store's thread, and kept only while the store's
+/// stamp is still this one (`crate::custody::take`), so no record is kept that a revocation added since its check
+/// would have refused.
+#[derive(Debug)]
+pub struct Revoked {
+    pub stamp: Stamp,
+    pub list: Arc<[Revocation]>,
+}
+
+/// Every revocation and its stamp, read now in one call, and kept beside `store` for [`revoked`].
+pub async fn revoked_now(store: &Store) -> anyhow::Result<Arc<Revoked>> {
+    let read = store.call(|c| Ok(Revoked { list: revocations_on(c)?.into(), stamp: revoked_stamp(c)? })).await?;
+    let read = Arc::new(read);
+    // The list kept before let go of on the blocking pool: a revocation a superseded certificate, it grows for as long as
+    // kiln runs, and it was freed on the shard that read the new one, once a revocation (goal 9, plan 01a1a87b2cec step 3).
+    if let Some(was) = store.keep_revoked(Arc::clone(&read)) {
+        drop(crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || drop(was)).await;
+        }));
+    }
+    Ok(read)
+}
+
+/// The revocations as `store` last read them ([`revoked_now`]), or read now when it hasn't: no call to the store's
+/// thread while they're kept. Their stamp says whether they're still all there are ([`revoked_stamp`]); whoever
+/// keeps what it checked against them looks at it in the same call ([`crate::custody::take`]).
+pub async fn revoked(store: &Store) -> anyhow::Result<Arc<Revoked>> {
+    match store.revoked_kept() {
+        Some(kept) => Ok(kept),
+        None => revoked_now(store).await,
+    }
 }
 
 /// What the TLS directory says as it refuses a revoked key: `revoked at <RFC 3339> (<reason>, by
@@ -1346,6 +1466,55 @@ mod tests {
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;
         pki.sign_csr(&csr, name, 30)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: who enrolled a machine is read on the store's read connections, not in the
+    /// writer's turn: answered while the writer is held by another call, with what the last enrollment committed, and
+    /// `admin` for a machine never enrolled.
+    #[test]
+    fn g9_s5_who_enrolled_a_machine_is_read_beside_the_writer() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::open(&dir.path().join("kiln.db"))?;
+            enrolled(&store, "box", "user:sam").await?;
+            enrolled(&store, "box", "user:ada").await?;
+            let hold = store.call(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok(())
+            });
+            let ask = async {
+                // The writer has taken the held call by now.
+                crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                let began = std::time::Instant::now();
+                let (by, never) = (enrolled_by(&store, "box").await, enrolled_by(&store, "never").await);
+                (by, never, began.elapsed())
+            };
+            let (held, (by, never, took)) = futures::join!(hold, ask);
+            held?;
+            anyhow::ensure!(by? == "ada" && never? == "admin", "the last enrollment's, and admin for none");
+            anyhow::ensure!(took < std::time::Duration::from_secs(1), "read in {took:?}, behind the writer's 2 s call");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the revocations' stamp is the newest's id, no count: it moves with each one
+    /// added and with nothing else (a read, another table's write), and the list read with it carries the same.
+    #[test]
+    fn g9_s5_the_revocations_stamp_moves_with_each_one_added() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let stamp = || store.call(|c| Ok(revoked_stamp(c)?));
+            let none = stamp().await?;
+            anyhow::ensure!(none == 0, "none yet: {none}");
+            revoke(&store, Target::Key("ab".into()), "lost", "ada", 1).await?;
+            let one = stamp().await?;
+            enrolled(&store, "box", "user:ada").await?;
+            anyhow::ensure!(one > none && stamp().await? == one, "moved with the one added ({none} then {one}), not with another table's write");
+            revoke(&store, Target::Key("cd".into()), "lost", "ada", 2).await?;
+            let (two, read) = (stamp().await?, revoked_now(&store).await?);
+            anyhow::ensure!(two > one && read.stamp == two && read.list.len() == 2, "{two} after {one}; the list read with it: {read:?}");
+            Ok(())
+        })
     }
 
     /// W27-R01: a leg's certificate lasts as long as its attempt may (its timeout) and an hour
@@ -1619,6 +1788,58 @@ mod tests {
             let none = check(&results(None)?, &[(&kilns, &by_kiln)])?;
             assert!(leg::under_kilns_delegation(&none, &server).is_err_and(|e| e.contains("acts under no delegation")));
             Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a runner process's identity is certified on the compute pool, its
+    /// certificate fingerprinted there, and recorded with those fingerprints: the certificate is the identity's,
+    /// for the CSR's key, and its row in `identities` says what the certificate says. Its shard is the hub's
+    /// loop's, which waited through the CSR's check and the CA's signature for every ask. And `issue` makes no
+    /// certificate of its own: `certify`'s alone.
+    #[test]
+    fn g9_s3_an_identity_is_certified_off_the_shard_and_recorded_as_made() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+            let identity = Identity::new(pki.organization(), Actor::Runner { enrolled_by: "admin".into(), machine: "box".into(), instance: "main".into() });
+            let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (pem, made) = certify(&pki, &csr, &identity, &[], time::Duration::hours(RUNNER_HOURS)).await?;
+            anyhow::ensure!(made == crate::pki::fingerprints(&pem)?, "its fingerprints are its certificate's");
+            anyhow::ensure!(pki.issued(&crate::pki::der_of(&pem)?), "the CA's");
+            anyhow::ensure!(made.key == crate::pki::fingerprints(&pki.issue_identity(&csr, &identity, &[], time::Duration::hours(1))?)?.key, "for the CSR's key");
+            record_fingerprinted(&store, "runner", &uri, &pem, made.clone()).await?;
+            let row: (String, String, String, i64, i64, String) = store
+                .call(|c| Ok(c.query_row("SELECT serial, subject, key_sha256, not_before, not_after, cert_pem FROM identities WHERE kind = 'runner'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?))
+                .await?;
+            anyhow::ensure!(row == (made.serial, uri, made.key, made.not_before, made.not_after, pem), "{row:?}");
+            let code: String = include_str!("identities.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+            let issue = code.split("async fn issue(").nth(1).and_then(|rest| rest.split("\nasync fn certify(").next()).unwrap_or_default();
+            anyhow::ensure!(!issue.is_empty() && !issue.contains("issue_identity(") && !issue.contains("fingerprints("), "issue makes or reads a certificate on its caller's shard");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the revocations read again after one was added are kept from then on, and the list
+    /// kept before is let go of by the store, off the shard that read the new one: only its other holders keep it.
+    #[test]
+    fn g9_s3_the_revocations_kept_before_are_let_go_of_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let first = revoked_now(&store).await?;
+            revoke(&store, Target::Key("ab".repeat(32)), "a test's", "kiln", 1).await?;
+            let second = revoked_now(&store).await?;
+            anyhow::ensure!(second.list.len() == first.list.len() + 1, "the one added is in the list read again");
+            anyhow::ensure!(store.revoked_kept().is_some_and(|k| Arc::ptr_eq(&k, &second)), "kept from then on");
+            for _ in 0..500 {
+                if Arc::strong_count(&first) == 1 {
+                    return Ok(());
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("the store still holds the list it kept before: {} holders", Arc::strong_count(&first))
         })
     }
 }

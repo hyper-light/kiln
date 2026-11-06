@@ -15,10 +15,11 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { StateBadge, sloRes } from "./parts";
+import { HeldFields, StateBadge, sloRes, useOpening } from "./parts";
 import { Budget, SloBadge, burn, measures, sliText, targetText } from "./slos";
 
 export default function SloPage() {
@@ -69,12 +70,10 @@ function SloView({ id }: { id: string }) {
   const s = res.data;
   const [editing, setEditing] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
-  const [adding, setAdding] = React.useState(false);
   const navigate = useNavigate();
   const st = s.standing;
   const alerts = s.alerts ?? [];
-  const addAlerts = async () => {
-    setAdding(true);
+  const [addAlerts, adding] = useAction(async () => {
     try {
       for (const a of burnAlerts(s)) {
         await observeApi.createMonitor({
@@ -93,9 +92,8 @@ function SloView({ id }: { id: string }) {
       invalidate("observe/monitors");
       const fresh = await observeApi.slo(s.id).catch(() => null);
       if (fresh) res.setData(() => fresh);
-      setAdding(false);
     }
-  };
+  });
   return (
     <>
       <title>{`${s.name} · SLOs · kiln`}</title>
@@ -173,7 +171,7 @@ function SloView({ id }: { id: string }) {
                       .join(", and at ")}
                     .
                   </p>
-                  <Button variant="secondary" disabled={adding} onClick={() => void addAlerts()}>
+                  <Button variant="secondary" pending={adding} onClick={addAlerts}>
                     <BellPlus /> Add burn-rate alerts
                   </Button>
                 </>
@@ -193,7 +191,7 @@ function SloView({ id }: { id: string }) {
           try {
             await observeApi.deleteSlo(s.id);
             invalidate("observe/slos");
-            navigate("/observe/slos");
+            await navigate("/observe/slos");
           } catch (e) {
             toast({ title: "Couldn't delete the SLO", description: errorMessage(e), tone: "failed" });
           }
@@ -269,7 +267,8 @@ function SloForm({ initial, id, onDone }: { initial: SloIn; id?: string; onDone?
   const [warning, setWarning] = React.useState(initial.warning === undefined || initial.warning === null ? "" : String(initial.warning));
   const [timeframe, setTimeframe] = React.useState<SloIn["timeframe"]>(initial.timeframe);
   const [tags, setTags] = React.useState((initial.tags ?? []).join(", "));
-  const [busy, setBusy] = React.useState(false);
+  const form = [name, type, good, total, query, condition, slice, target, warning, timeframe, tags];
+  const opening = useOpening(form);
   const navigate = useNavigate();
   const body = (): SloIn => ({
     name: name.trim(),
@@ -283,6 +282,18 @@ function SloForm({ initial, id, onDone }: { initial: SloIn; id?: string; onDone?
       .map((t) => t.trim())
       .filter(Boolean),
   });
+  const [save, saving] = useAction(async () => {
+    const saved = id ? await observeApi.updateSlo(id, body()) : await observeApi.createSlo(body());
+    invalidate("observe/slos");
+    // Done with only if it's still this form, saying what was saved: changed since, it stays, and the
+    // page behind it shows what was (W21-R15).
+    if (!opening.still(form)) {
+      if (id) invalidate(sloRes(id).key);
+      return;
+    }
+    if (onDone) await onDone(true);
+    else await navigate(`/observe/slos/${encodeURIComponent(saved.id)}`);
+  }, "Couldn't save the SLO");
   const queryField = (fid: string, label: string, value: string, set: (v: string) => void, placeholder: string, hint?: string) => (
     <div>
       <label htmlFor={fid} className="field-label">
@@ -296,82 +307,75 @@ function SloForm({ initial, id, onDone }: { initial: SloIn; id?: string; onDone?
   );
   return (
     <form
+      ref={opening.ref}
       className="max-w-[720px] space-y-5"
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
-        setBusy(true);
-        try {
-          const saved = id ? await observeApi.updateSlo(id, body()) : await observeApi.createSlo(body());
-          invalidate("observe/slos");
-          if (onDone) await onDone(true);
-          else navigate(`/observe/slos/${encodeURIComponent(saved.id)}`);
-        } catch (err) {
-          toast({ title: "Couldn't save the SLO", description: errorMessage(err), tone: "failed" });
-        } finally {
-          setBusy(false);
-        }
+        save();
       }}
     >
-      <TextField label="Name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Checkout availability" required />
-      <Segmented
-        label="Indicator"
-        value={type}
-        onChange={setType}
-        options={[
-          { value: "ratio", label: "Good events over all" },
-          { value: "slices", label: "Time slices" },
-        ]}
-      />
-      {type === "ratio" ? (
-        <>
-          {queryField("slo-good", "Good events", good, setGood, "sum:http.requests{service:checkout,status:2xx}.as_count()", "A metric query of counts.")}
-          {queryField("slo-total", "All events", total, setTotal, "sum:http.requests{service:checkout}.as_count()")}
-        </>
-      ) : (
-        <>
-          {queryField("slo-query", "Query", query, setQuery, "max:http.latency.p99{service:checkout}", "Each slice is good when its value meets the condition.")}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField label="Condition" value={condition} onChange={(e) => setCondition(e.target.value)} placeholder="< 0.3" spellCheck={false} required />
-            <div>
-              <p className="field-label">Slice</p>
-              <Segmented
-                label="Slice"
-                value={slice}
-                onChange={setSlice}
-                options={[
-                  { value: "60", label: "1 min" },
-                  { value: "300", label: "5 min" },
-                ]}
-              />
-            </div>
-          </div>
-        </>
-      )}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <TextField label="Target (%)" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} required />
-        <TextField label="Warning (%, optional)" inputMode="decimal" value={warning} onChange={(e) => setWarning(e.target.value)} placeholder="above the target" />
-      </div>
-      <div>
-        <p className="field-label">Timeframe</p>
+      <HeldFields held={saving && !id} className="space-y-5">
+        <TextField label="Name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Checkout availability" required />
         <Segmented
-          label="Timeframe"
-          value={timeframe}
-          onChange={setTimeframe}
+          label="Indicator"
+          value={type}
+          onChange={setType}
           options={[
-            { value: "7d", label: "7 days" },
-            { value: "30d", label: "30 days" },
-            { value: "90d", label: "90 days" },
+            { value: "ratio", label: "Good events over all" },
+            { value: "slices", label: "Time slices" },
           ]}
         />
-      </div>
-      <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="team:checkout, tier:1" spellCheck={false} />
+        {type === "ratio" ? (
+          <>
+            {queryField("slo-good", "Good events", good, setGood, "sum:http.requests{service:checkout,status:2xx}.as_count()", "A metric query of counts.")}
+            {queryField("slo-total", "All events", total, setTotal, "sum:http.requests{service:checkout}.as_count()")}
+          </>
+        ) : (
+          <>
+            {queryField("slo-query", "Query", query, setQuery, "max:http.latency.p99{service:checkout}", "Each slice is good when its value meets the condition.")}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="Condition" value={condition} onChange={(e) => setCondition(e.target.value)} placeholder="< 0.3" spellCheck={false} required />
+              <div>
+                <p className="field-label">Slice</p>
+                <Segmented
+                  label="Slice"
+                  value={slice}
+                  onChange={setSlice}
+                  options={[
+                    { value: "60", label: "1 min" },
+                    { value: "300", label: "5 min" },
+                  ]}
+                />
+              </div>
+            </div>
+          </>
+        )}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <TextField label="Target (%)" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} required />
+          <TextField label="Warning (%, optional)" inputMode="decimal" value={warning} onChange={(e) => setWarning(e.target.value)} placeholder="above the target" />
+        </div>
+        <div>
+          <p className="field-label">Timeframe</p>
+          <Segmented
+            label="Timeframe"
+            value={timeframe}
+            onChange={setTimeframe}
+            options={[
+              { value: "7d", label: "7 days" },
+              { value: "30d", label: "30 days" },
+              { value: "90d", label: "90 days" },
+            ]}
+          />
+        </div>
+        <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="team:checkout, tier:1" spellCheck={false} />
+      </HeldFields>
       <div className="flex justify-end gap-2">
         {onDone && (
           <Button variant="ghost" onClick={() => void onDone(false)}>
             Cancel
           </Button>
         )}
-        <Button type="submit" disabled={busy || !name.trim()}>
+        <Button type="submit" disabled={!name.trim()} pending={saving}>
           {id ? "Save" : "Make the SLO"}
         </Button>
       </div>

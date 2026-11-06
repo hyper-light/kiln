@@ -142,6 +142,41 @@ async fn step(server: &mut Drv, client: &mut Drv, seen: &mut Seen) {
     }
 }
 
+/// A node's port is its listener's alone: a second driver asked for the port a driver holds is
+/// refused `AddrInUse`, as the plane's socket is (found by mantle: at `628111e` a second node of the
+/// same user bound a running node's named port without error on Linux 6.19 and Darwin 25.4, and the
+/// two split its datagrams; docs/transport.md §4w). Where the platform shares no port (Windows) the
+/// listener is a plain bind, which the OS refuses a held port as well.
+#[test]
+fn a_second_driver_on_a_held_port_is_refused() {
+    let pki = Pki::new();
+    let one = pki.issue(&name(1));
+    let two = pki.issue(&name(2));
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async move {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let first: Drv =
+            Driver::bind(endpoint(&pki, &two, &one.0, CLIENT, true), loopback, IO).unwrap();
+        let held = first.local_addr().unwrap();
+        let second: Result<Drv, _> =
+            Driver::bind(endpoint(&pki, &one, &two.0, SERVER, true), held, IO);
+        let refused = match &second {
+            Err(hyper_rt::RtError::DriverRefused {
+                code: Some(code), ..
+            }) => Some(std::io::Error::from_raw_os_error(*code).kind()),
+            _ => None,
+        };
+        assert_eq!(
+            refused,
+            Some(std::io::ErrorKind::AddrInUse),
+            "a second driver on {held}: {:?}",
+            second.map(|_| ())
+        );
+        drop(first);
+    })
+    .unwrap();
+}
+
 #[test]
 fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection() {
     let pki = Pki::new();

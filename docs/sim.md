@@ -48,7 +48,7 @@ KILN_SIM_SEEDS=2000 KILN_SIM_FROM=100000 taskset -c <cpu> <the binary> --exact <
 ```
 
 The model's test is `sim::sync::tests::sync_converges_and_loses_nothing_under_the_nemesis` or
-`sim::moves::tests::a_moving_session_never_leaves_its_work_behind` (and the transfers model's, `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied`, not measured yet).
+`sim::moves::tests::a_moving_session_never_leaves_its_work_behind` (and the transfers model's, `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied`, and the custody model's, `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken`, neither measured yet).
 
 ## What it is
 
@@ -71,6 +71,7 @@ The model's test is `sim::sync::tests::sync_converges_and_loses_nothing_under_th
 | moves | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived` (the copy it goes to has saved the log through where it left), as `harness::session`'s `files_out` and `files_in` use them | the sync model's | a session leaves no write of its own behind, goes on with each in its folder, and every move finishes |
 | goal driver | the goal driver's own round of the stacks (`Driver::round`, adopting, resuming and stepping them) each tick, as `Driver::drive` runs it, on a simulated clock, through `SimHarness`. Its store is inline, so each call is a wait a crash can come at | the server crashing at waits the seed picks (up to 0.8% of the driver's polls) and between them; machines away; harnesses starting again; usage limits; people clearing goals | one goal under way, in order, ended ones never back; nothing to a paused agent; no goal again within 30 s unless the agent was cut off from it; every stack runs to its end |
 | transfers | agent sessions changing hands (docs/ci.md W27-R08), over statements signed under a test CA: kiln's server's act check (`custody::act_check`: its signer's identity not revoked, then `kiln_ci::identity::custody::acted`'s fence), its check of a hand-on (`custody::hands_on_to`), its signed words (`custody::word_signed`) and the runner's check of one (`runner::custody::addressed`), and the custody chain's hop and walk. The model plays the processes and the server's store around them: a hand-over certifies the new holder and revokes every epoch below, as kiln's server does as it issues an epoch's identity | two or three machines, each with one or two runner processes: sessions moved, resumed from the server's store while their machine is cut off (kiln's take, for the process left behind), taken over by a newer process of their machine (the old one still acting), carried through blue/green upgrades and their rollbacks; the server restarting, its count of which process holds what stale; frames lost, doubled and late, a cut-off machine's kept until its link comes back; copies left behind acting, handing their session on and announcing it, at random | no act a copy left behind signs is ever applied; no hand-over's word is applied by a process it isn't for; one holder per epoch; every transfer carries both its sides' signatures, each session's chain walking back to where it began; once the world calms, every holder runs its session and no copy left behind still runs |
+| custody | things handed on between custodians, directly and through one or two relays (docs/ci.md W27-R08; the Transfers plan's step 15), over statements signed under a test CA: each relay's numbered pass, each taker's check of what came against its giver's hand-on before it uses it, and kiln's custody core as kiln's server walks a chain (`kiln_ci::identity::custody`'s `hop` and `walk`, `statement::gaps`) | records reaching kiln late, twice and out of order, a relay's own sometimes never; things overtaking each other on their way; relays that drop what they carry (silently, or after signing their pass), lose their own record, change a byte (hiding it, or owning it), swap two things they carry, or replay one handed on before | no chain with a break walks as unbroken (one whose taker got other bytes than its giver handed on never does); nothing used differs from what its giver handed on; nothing a relay passed on is unseen (its pass kept, or a gap in its numbers); once calm, every thing handed on is used and walks unbroken |
 
 Not modelled yet, and where they will be:
 
@@ -98,6 +99,11 @@ What the models leave out, so what no seed can find:
   there.
 - **kiln's temporary files** left in a folder (`.kiln-sync-*.tmp`) are left out of the check.
 - **The transfers model's processes** are their copies' keys and whether they run: the host's own take-over (its package, files and harness) isn't run, a take-over there being the epoch up, the receipt signed at it, and a session refused where a copy of it runs already. The server's store doesn't crash there: what kiln certified and revoked is kept whole. Work, changes and reviews changing hands aren't modelled (`crates/kiln/tests/transfers.rs` tests them end to end).
+- **The custody model's paths** are things handed on, directly or through relays: each path's own
+  transport (a leg's checkout, a peer's object, the feed, a sync, a deploy) is tested end to end
+  instead (`crates/kiln/tests/transfers.rs`, `identities.rs`). Who may take custody (delegations)
+  and kiln's takes for a custodian that can't sign aren't modelled. A change a later relay undoes,
+  every record naming the giver's bytes, breaks nothing: what came is what was handed on.
 
 ## The bugs it found
 
@@ -129,3 +135,10 @@ file, and contents nobody wrote spread, a last write is lost, or a copy stays ap
 The seed that finds it must pass without the plant.
 
 The transfers model plants five, each a bug kiln had or could have (W27-AC05): the act check going by machine; a process a newer one superseded passing the server's words on to it, which applies them as its own (the 14:18 drop); a resume from the server's store that doesn't revoke the epoch it leaves; a copy left behind told to let go only once it announces itself (the twin, which ran on for ten minutes); and no check of whom a word is for. `sim::transfers`' `w27_ac05_the_transfers_model_finds_each_planted_bug` runs the CI budget with each, and passes once each is found by a seed that passes without it.
+
+The custody model plants the three the Transfers plan names (W27-R08): a relay that doesn't number
+its records (a pass lost on its way then leaves nothing to show it), a hop that doesn't check the
+digest (a byte changed and hidden reads as unchanged), and a walk that checks only the receipt's own
+hop (a relay that owned its change breaks a hop further back). `sim::custody`'s
+`w27_r08_the_custody_model_finds_each_planted_bug` runs the CI budget with each, and passes once each
+is found by a seed that passes without it.

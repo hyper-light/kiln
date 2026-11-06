@@ -2,12 +2,14 @@
 //! store as its state machine. On the server alone it's a group of one voter, which commits alone;
 //! runners join it as learners, then voters, in the phases after.
 //!
-//! A write runs as it always has, in a transaction of the store's connection, while the rows it
-//! touches are noted ([`super::capture`]). When it's done, its net change is read and committed with
-//! the write's number (`seq`, in [`STATE`]), and then proposed to the group as an entry: the log
-//! takes the change right after, written alongside what other writes sent meanwhile, one flush for
-//! all of them. So a write's caller gets its answer as fast as before the group, and is as durable
-//! (kiln.db commits without waiting for the disk, as it always has).
+//! A write runs in its turn on the store's connection, in a savepoint of its own inside the
+//! transaction of the group of writes committed with it (goal 5, plan 01a1a59c2aae), while the rows
+//! it touches are noted ([`super::capture`]). When it's done, its net change is read and numbered
+//! (`seq`, in [`STATE`]); the group commits with its last write's number, and then each change is
+//! proposed to the group as an entry, in turn: the log takes them right after, written alongside
+//! what other writes sent meanwhile, one flush for all of them. So a write's caller gets its answer
+//! once its group commits, and is as durable as before the group (kiln.db commits without waiting
+//! for the disk, as it always has).
 //!
 //! - **A restart replays** the log's entries kiln.db doesn't hold (a write whose commit the disk
 //!   lost while the log's flush kept it): an entry applies when its `seq` is past kiln.db's, and is
@@ -28,8 +30,15 @@
 //! fresh copy, and the image the group sends it is only where it stands. The server adds each
 //! runner as a learner ([`Group::learners`]), one change at a time, and the group's messages to
 //! and from the runners go through [`Group::outgoing`] and [`Group::step`].
+//!
+//! **Custody (docs/ci.md W27-R08).** Each member keeps a leaf of every entry it applies, the SHA-256
+//! of the entry as it came ([`Leaves`]): the same on the server and on a learner for the same entry,
+//! and different for one changed on its way. A checkpoint of the log is the SHA-256 of a stretch of
+//! them ([`Group::digest`]), which the server hands on and a learner receives
+//! (`crate::custody::cluster`); one that doesn't match has the learner copy the database again
+//! ([`Group::copy_again`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +58,7 @@ use hyper_raft::{Config, Elections, Limits, Stated, Timing};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 use super::capture::{self, Change, Row, TableInfo};
 use crate::sync::group::Conf;
@@ -77,12 +87,31 @@ const SERVER: u64 = 1;
 const BLOCK: usize = 4096;
 /// The most an entry carries of a change; a larger change goes in parts of this.
 pub const LARGEST: usize = 8 << 20;
+/// The entries one append to a learner carries, at the most; an entry larger goes alone, up to [`LARGEST`]
+/// (goal 11, plan 01a1a87b2e56 step 5). It's the append of kiln's other groups (`crate::sync::group::APPEND`,
+/// observe's `APPEND_BYTES`), which a frame of kiln's control lane carries with room to spare. What the server's
+/// handle no longer holds of a learner's next append is read from the log's file, one read of the append's bytes,
+/// and hyper-log keeps the buffers it read into for its next reads (up to two segments, 16 MiB). Train 4's heap
+/// profile held 9.04 MB of them (`Pool::take` under `device::serve`), buffers of reads up to 8 MiB, which in the
+/// lab's fresh rounds only this log's appends of [`LARGEST`] and 64 KiB made. A learner catching up is sent up
+/// to 256 appends ahead of its answers (hyper-raft's `max_inflight_msgs`), 64 MiB of them at this size: past
+/// what a runner's path carries.
+const APPEND: u64 = 256 << 10;
+/// Groups the log holds at most, the cluster's [`GROUP`] among them: one of the facts a log reopens with.
+const GROUPS: usize = 2;
+/// Recent entries the log keeps in memory, shared evenly by its groups: one append a group (goal 11, plan
+/// 01a1a87b2e56 step 5). The replica keeps past it whatever it has yet to apply and whatever a learner in step
+/// has yet to acknowledge (hyper-durable's `Replica::keep`, through `LogStore::keep_after`), so it serves only a
+/// learner out of step, one that dropped and probes or one the apply point has passed: its next append comes
+/// from memory, and one further behind takes an append's entries from the file at a time. It was 8 MiB (4 MiB
+/// for the cluster's group), of which the lab held 2.63 MB (`update_of` under `Driver::drive`).
+const CACHE_BYTES: u64 = GROUPS as u64 * APPEND;
 /// Bytes the log's file may take (it grows as it's used).
 const DISK: u64 = 4 << 30;
 /// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
 const KEEP: u64 = if cfg!(test) { 8 } else { 256 };
 /// Changes waiting for the log, at most: past them a write waits its turn.
-const QUEUED: usize = 1024;
+pub(super) const QUEUED: usize = 1024;
 /// Entries, and log bytes, between compactions.
 const COMPACT_ENTRIES: u64 = if cfg!(test) { 64 } else { 8192 };
 const COMPACT_BYTES: u64 = 128 << 20;
@@ -105,7 +134,9 @@ const TIMING: Timing = Timing { span: Duration::from_millis(500), round: Duratio
 /// A change of learners that hasn't applied in this long is proposed again.
 const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// The group's messages waiting for the links to the runners, at most (past them, they're
-/// dropped: Raft sends what's needed again).
+/// dropped: Raft sends what's needed again). Kept where the group's thread, their one sender, sends
+/// them: their queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5: a bounded one
+/// makes every place as it's made, concurrent-queue writing each one's stamp, 160 KiB of them).
 const OUTGOING: usize = 4096;
 /// How many times a learner tries to fetch a copy of the database before its replica stops.
 const FETCH_TRIES: u32 = 4;
@@ -117,10 +148,112 @@ const STOP_PATIENCE: Duration = Duration::from_secs(30);
 /// How long a learner waits for another process to let its replica go (a machine's older runner
 /// process, told to let its learner go as the newest takes it).
 const ALONE_PATIENCE: Duration = Duration::from_secs(30);
+/// The entries' leaves a member keeps, at most ([`Leaves`]): a checkpoint runs over those since its
+/// period began, a minute's at the least, so more than a busy group writes in several.
+const LEAVES: usize = 1 << 16;
 
 /// Fetches a copy of the server's kiln.db into a file, made now (a learner's way to the database:
 /// the runner's HTTP client to the server).
 pub type Fetch = Arc<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
+
+/// An entry's leaf (docs/ci.md W27-R08): the SHA-256 of its place, its term and what it carries, a
+/// configuration's change by the configuration it leaves. The same wherever the entry is applied,
+/// so a checkpoint over a stretch of leaves holds on a learner only if each entry came as the server
+/// logged it.
+fn leaf(index: u64, term: u64, change: bool, context: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut h = sha2::Sha256::new();
+    h.update(b"kiln-cluster-entry-v1\0");
+    h.update(index.to_le_bytes());
+    h.update(term.to_le_bytes());
+    h.update([u8::from(change)]);
+    for part in [context, data] {
+        h.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        h.update(part);
+    }
+    <[u8; 32]>::try_from(h.finalize().as_slice()).unwrap_or_default()
+}
+
+/// Why a stretch of the log can't be checked against a member's leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Short {
+    /// It starts before what the member holds: its leaves start after this entry (a copy, or a
+    /// start, came after it).
+    Before(u64),
+    /// It ends past what the member applied: its leaves end at this entry.
+    Ahead(u64),
+}
+
+/// The leaves of the entries a member applied, in order: those after `base`, at most `most` (the
+/// oldest let go). A copy taken over an image starts them again at its entry.
+#[derive(Debug)]
+pub struct Leaves {
+    base: u64,
+    list: VecDeque<[u8; 32]>,
+    most: usize,
+}
+
+impl Leaves {
+    fn new(base: u64, most: usize) -> Self {
+        Self { base, list: VecDeque::new(), most: most.max(1) }
+    }
+
+    /// The entry they start after.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The last entry they hold a leaf of.
+    pub fn last(&self) -> u64 {
+        self.base.saturating_add(u64::try_from(self.list.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Entry `index`'s leaf, applied next (one out of turn starts them again before it).
+    fn push(&mut self, index: u64, leaf: [u8; 32]) {
+        if index != self.last().saturating_add(1) {
+            self.restart(index.saturating_sub(1));
+        }
+        self.list.push_back(leaf);
+        while self.list.len() > self.most {
+            self.list.pop_front();
+            self.base = self.base.saturating_add(1);
+        }
+    }
+
+    /// None held: the next leaf is entry `at + 1`'s.
+    fn restart(&mut self, at: u64) {
+        self.base = at;
+        self.list.clear();
+    }
+
+    /// The leaves of entries `from + 1` to `to`, in order, copied ([`digest_of`] makes their checkpoint), or why this
+    /// member can't say them.
+    fn stretch(&self, from: u64, to: u64) -> Result<Vec<[u8; 32]>, Short> {
+        if from < self.base {
+            return Err(Short::Before(self.base));
+        }
+        if to > self.last() {
+            return Err(Short::Ahead(self.last()));
+        }
+        let skip = usize::try_from(from - self.base).unwrap_or(usize::MAX);
+        let take = usize::try_from(to.saturating_sub(from)).unwrap_or(usize::MAX);
+        Ok(self.list.iter().skip(skip).take(take).copied().collect())
+    }
+
+    /// The SHA-256 (hex) of the leaves of entries `from + 1` to `to`, in order: a checkpoint of
+    /// that stretch of the log, or why this member can't say it.
+    pub fn digest(&self, from: u64, to: u64) -> Result<String, Short> {
+        self.stretch(from, to).map(|s| digest_of(&s))
+    }
+}
+
+/// The SHA-256 (hex) of `stretch`'s leaves, in order: a checkpoint of that stretch of the log.
+fn digest_of(stretch: &[[u8; 32]]) -> String {
+    let mut h = sha2::Sha256::new();
+    for l in stretch {
+        h.update(l);
+    }
+    hex::encode(h.finalize())
+}
 
 /// Whether `db` is a copy of kiln.db a learner opens on: it says where it stands, and this build
 /// said so last ([`MARK`]).
@@ -185,23 +318,28 @@ pub fn member_of(machine: &str) -> u64 {
     h.max(SERVER + 1)
 }
 
-/// The log's layout. Every value is fixed: a log reopens with the facts it was made with.
+/// The log's layout. Every value is fixed but its cache: a log reopens with the facts it was made with.
 fn log_config(align: Alignment) -> anyhow::Result<LogConfig> {
-    LogConfig::derive(&Facts {
+    LogConfig::derive(&log_facts(align, CACHE_BYTES)).map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
+}
+
+/// The facts the log is laid out by, its cache `cache` bytes: the rest give its segments and slots, which a log
+/// reopens by.
+fn log_facts(align: Alignment, cache: u64) -> Facts {
+    Facts {
         align,
         sealed: false,
         largest_entry: LARGEST + (64 << 10),
         disk_bytes: DISK,
-        max_groups: 2,
+        max_groups: GROUPS,
         cadence_entries: 4096,
         cadence_bytes: 256 << 20,
         uncommitted_entries: 2048,
         uncommitted_bytes: 64 << 20,
         // Little to gain on one node from keeping recent entries in memory (the server's pod is
         // tight on memory): what replays at a start reads the file.
-        cache_bytes: 8 << 20,
-    })
-    .map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
+        cache_bytes: cache,
+    }
 }
 
 /// An entry: one write's change, or a part of it (a large one).
@@ -246,6 +384,9 @@ enum Request {
     Learners(BTreeSet<u64>),
     /// A member no link reaches now: the group stops sending it entries until it answers again.
     Unreachable(u64),
+    /// A learner's: a copy of the database now, over what it applied (a checkpoint of the log that
+    /// didn't match what it holds).
+    CopyAgain(mpsc::SyncSender<Result<(), String>>),
     Stop,
 }
 
@@ -279,6 +420,8 @@ pub struct Group {
     outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
     /// Why its driver stopped, once it has (it applies nothing from then on).
     stopped: Arc<Mutex<Option<String>>>,
+    /// The leaves of the entries it applied, which checkpoints of the log run over.
+    leaves: Arc<Mutex<Leaves>>,
 }
 
 /// What opening a member of the group found wrong.
@@ -359,17 +502,21 @@ impl Group {
         let learner = fetch.is_some();
         let machine = Machine::open(db, fetch).map_err(failed)?;
         let seq = machine.seq.clone();
+        let leaves = machine.leaves.clone();
         let point = Arc::new(Mutex::new((machine.applied, machine.configuration.clone())));
         let limits = Limits::derive(Stated { message: LARGEST + (64 << 10) + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES, members: 64, memory: 64 << 20, depth: 1 })
             .map_err(|e| failed(anyhow::anyhow!("the cluster group's limits: {e:?}")))?;
         let settings = Settings {
-            core: Config { max_size_per_msg: (LARGEST + (64 << 10)) as u64, check_quorum: true, pre_vote: true, seed: member, ..Config::new(member, limits) },
+            core: Config { max_size_per_msg: APPEND, check_quorum: true, pre_vote: true, seed: member, ..Config::new(member, limits) },
             // Driven by events: what's proposed is written at the first lull, together.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
+            // Today's: a member's heartbeats wait on its flush proof, and a leader applies only
+            // what a majority's disks hold, its own among them (hyper-durable's `Disk`).
+            disk: hyper_durable::Disk::Flushed,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
-        let (out_tx, outgoing) = async_channel::bounded(OUTGOING);
+        let (out_tx, outgoing) = async_channel::unbounded();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
@@ -425,7 +572,7 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped, leaves })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
@@ -496,6 +643,36 @@ impl Group {
     pub fn flush(&self) -> anyhow::Result<()> {
         let (reply, answer) = mpsc::sync_channel(1);
         self.tx.send(Request::Flush(reply)).map_err(|_| anyhow::anyhow!("the cluster group stopped"))?;
+        self.thread.unpark();
+        match answer.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => bail!("{e}"),
+            Err(_) => bail!("the cluster group stopped before it answered"),
+        }
+    }
+
+    /// A checkpoint of the log as this member applied it: the SHA-256 (hex) of the leaves of
+    /// entries `from + 1` to `to` ([`Leaves::digest`]), or why it can't say (docs/ci.md W27-R08).
+    pub fn digest(&self, from: u64, to: u64) -> Result<String, Short> {
+        // Copied under the lock and hashed once it's let go: the group's thread takes it to add each entry's leaf as it
+        // applies, and waits a copy's time at the most, not a hash's (goal 9, plan 01a1a87b2cec step 3: a period's
+        // leaves are up to 2 MiB).
+        let stretch = self.leaves.lock().stretch(from, to)?;
+        Ok(digest_of(&stretch))
+    }
+
+    /// The entry this member's leaves start after: it checks the log's checkpoints from there.
+    pub fn leaves_from(&self) -> u64 {
+        self.leaves.lock().base()
+    }
+
+    /// A learner's: its replica copied again now, over what it applied, once a checkpoint of the
+    /// log didn't match what it holds (docs/ci.md W27-R08): an entry came changed. Waits until the
+    /// copy is in. One that can't be taken stops the group, saying why, and the replica is copied
+    /// again as its learner starts again.
+    pub fn copy_again(&self) -> anyhow::Result<()> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.tx.send(Request::CopyAgain(reply)).map_err(|_| anyhow::anyhow!("the cluster group stopped"))?;
         self.thread.unpark();
         match answer.recv() {
             Ok(Ok(())) => Ok(()),
@@ -672,6 +849,8 @@ impl Driver {
         ready.send(Ok(())).ok();
         let mut stopping: Option<Instant> = None;
         loop {
+            // A copy a learner couldn't take over entries that came changed: its group stops.
+            let mut failed: Option<anyhow::Error> = None;
             while let Ok(req) = self.rx.try_recv() {
                 match req {
                     Request::Append(seq, change) => self.append(seq, change),
@@ -685,6 +864,16 @@ impl Driver {
                     Request::Unreachable(member) => {
                         self.replica.report_unreachable(member).ok();
                     }
+                    Request::CopyAgain(reply) => {
+                        let took = self.replica.machine_mut().copy_again("entries that came changed").map_err(|e| e.0.to_owned());
+                        if let Err(why) = &took {
+                            // What the replica holds isn't what the server logged: it's copied
+                            // again as its learner starts again.
+                            self.replica.machine_mut().unmark();
+                            failed = Some(anyhow::anyhow!("a checkpoint of the log didn't match what this replica holds, and {why}"));
+                        }
+                        reply.send(took).ok();
+                    }
                     Request::Stop if stopping.is_none() => {
                         // What was sent before goes into the log first (the server's; a learner
                         // proposes nothing).
@@ -697,7 +886,7 @@ impl Driver {
                     Request::Stop => {}
                 }
             }
-            if let Err(e) = self.drive() {
+            if let Err(e) = failed.map_or_else(|| self.drive(), Err) {
                 tracing::error!("the cluster group stopped: {e:#}");
                 for (_, reply) in self.pending.drain() {
                     reply.send(Err(format!("the cluster group failed: {e:#}"))).ok();
@@ -909,7 +1098,7 @@ impl Driver {
             for m in out.messages.drain(..) {
                 let (to, snapshot) = (m.to, m.msg_type == MessageType::MsgSnapshot);
                 // A message the links can't take now is dropped: Raft sends what's needed again.
-                let sent = self.outgoing.try_send((to, m.encode_to_vec())).is_ok();
+                let sent = crate::memory::send_within(&self.outgoing, OUTGOING, || (to, m.encode_to_vec()));
                 if snapshot {
                     // The image is only where the group stands (the learner fetches the database).
                     self.replica.report_snapshot(to, sent).ok();
@@ -944,6 +1133,8 @@ struct Machine {
     logged: u64,
     /// A learner's way to a copy of the database; none on the server, which never takes one.
     fetch: Option<Fetch>,
+    /// The leaves of the entries it applied since it opened (or took a copy over an image).
+    leaves: Arc<Mutex<Leaves>>,
 }
 
 /// Where kiln.db stands, as [`STATE`] says: its last entry applied (with its term), its last
@@ -1030,7 +1221,16 @@ impl Machine {
             seq: Arc::new(AtomicU64::new(seq)),
             logged: 0,
             fetch,
+            leaves: Arc::new(Mutex::new(Leaves::new(at.index, LEAVES))),
         })
+    }
+
+    /// Says this replica isn't a copy this build took ([`MARK`] goes): it's copied again as its
+    /// learner starts again. What it holds isn't what the server logged.
+    fn unmark(&self) {
+        if let Err(e) = self.conn.execute_batch(&format!("DELETE FROM {MARK}")) {
+            tracing::error!("a replica that isn't what the server logged couldn't be marked to be copied again: {e:#}");
+        }
     }
 
     /// The log has been replayed: says what kiln.db holds that it doesn't.
@@ -1080,14 +1280,14 @@ impl Machine {
         }
     }
 
-    /// A learner meets writes its log lacks: a copy of the database now, said to stand where this
-    /// one is durable (its log holds everything after that; what it applies of it the copy holds
-    /// already is skipped by its `seq`). Its replica answers nothing meanwhile: its last write stays
-    /// behind the server's.
-    fn copy_again(&mut self) -> Result<(), Fatal> {
+    /// A learner meets writes its log lacks, or entries that came changed (a checkpoint of the log
+    /// that didn't match): a copy of the database now, said to stand where this one is durable (its
+    /// log holds everything after that; what it applies of it the copy holds already is skipped by
+    /// its `seq`). Its replica answers nothing meanwhile: its last write stays behind the server's.
+    fn copy_again(&mut self, over: &str) -> Result<(), Fatal> {
         let (at, configuration) = (self.durable, self.configuration.clone());
         let seq = self.take_a_copy(at, &configuration)?;
-        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db over writes its log lacked");
+        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db over {over}");
         Ok(())
     }
 
@@ -1124,6 +1324,7 @@ impl StateMachine for Machine {
             return Err(Fatal("an entry applied out of order"));
         }
         self.applied = Point { index: entry.index, term: entry.term };
+        self.leaves.lock().push(entry.index, leaf(entry.index, entry.term, false, entry.context, entry.data));
         let id = entry.context.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).unwrap_or(0);
         if entry.data.is_empty() {
             // A barrier, or a new leader's empty entry.
@@ -1142,7 +1343,7 @@ impl StateMachine for Machine {
                 let have = self.seq.load(Ordering::SeqCst);
                 if self.fetch.is_some() && e.part == 0 && e.seq > have.saturating_add(1) {
                     tracing::warn!(index = entry.index, seq = e.seq, have, "the cluster log lacks writes this replica doesn't hold: it takes a copy of kiln.db");
-                    self.copy_again()?;
+                    self.copy_again("writes its log lacked")?;
                 }
                 // kiln.db holds what this node wrote (it committed it first); a write past that is
                 // one the disk lost from kiln.db and the log kept.
@@ -1165,6 +1366,8 @@ impl StateMachine for Machine {
         }
         self.configuration = configuration.clone();
         self.applied = at;
+        let conf = serde_json::to_vec(&Conf::from(configuration)).unwrap_or_default();
+        self.leaves.lock().push(at.index, leaf(at.index, at.term, true, &[], &conf));
         Ok(())
     }
 
@@ -1200,6 +1403,9 @@ impl StateMachine for Machine {
         self.applied = at;
         self.durable = at;
         self.configuration = configuration.clone();
+        // Its leaves start again at the entry the copy stands for, as its checkpoints do (the
+        // server begins its period at the copy).
+        self.leaves.lock().restart(at.index);
         Ok(())
     }
 
@@ -1220,6 +1426,21 @@ impl StateMachine for Machine {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    /// The cluster group's appends are kiln's other groups', and its log keeps one of them a group in memory; nothing
+    /// else of the log's layout moves, so a log made with the 8 MiB cache reopens with this one (goal 11, plan
+    /// 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_cluster_log_keeps_one_append_a_group_and_appends_what_kilns_groups_do() -> anyhow::Result<()> {
+        assert_eq!(APPEND, crate::sync::group::APPEND, "the append kiln's groups send");
+        let align = Alignment::new(BLOCK).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let config = log_config(align)?;
+        assert_eq!(config.max_groups, GROUPS);
+        assert_eq!(config.group_cache, APPEND, "an append a group");
+        let before = LogConfig::derive(&log_facts(align, 8 << 20)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..config }, before, "the cache alone differs");
+        Ok(())
+    }
 
     /// Where kiln.db stands: its last write's number, and the last entry made durable with it.
     fn state(db: &Path) -> anyhow::Result<(i64, i64)> {
@@ -1995,5 +2216,143 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
         Ok(())
+    }
+
+    /// W27-R08 (docs/ci.md, the cluster group's custody): a member's leaves say a stretch of the
+    /// log by the SHA-256 of their leaves, or why not: it starts before them, or runs past them. They
+    /// keep the newest, at most as many as they may; one out of turn (an image taken) starts them
+    /// again; and a stretch's digest changes with any leaf in it, not with one outside it.
+    #[test]
+    fn w27_r08_leaves_say_a_stretch_of_the_log_or_why_not() -> anyhow::Result<()> {
+        let one = |i: u64, b: u8| leaf(i, 1, false, &[], &[b]);
+        let mut l = Leaves::new(10, 4);
+        for i in 11..=13 {
+            l.push(i, one(i, 0));
+        }
+        assert_eq!((l.base(), l.last()), (10, 13));
+        assert_eq!(l.digest(9, 12), Err(Short::Before(10)), "it starts before what's held");
+        assert_eq!(l.digest(10, 14), Err(Short::Ahead(13)), "it runs past what's applied");
+        let all = l.digest(10, 13).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut other = Leaves::new(10, 4);
+        for i in 11..=13 {
+            other.push(i, one(i, u8::from(i == 12)));
+        }
+        assert_ne!(other.digest(10, 13), Ok(all.clone()), "entry 12 came changed");
+        assert_eq!(other.digest(12, 13), l.digest(12, 13), "a stretch past it holds");
+        for i in 14..=15 {
+            l.push(i, one(i, 0));
+        }
+        assert_eq!((l.base(), l.last()), (11, 15), "the newest four");
+        l.push(20, one(20, 0));
+        assert_eq!((l.base(), l.last()), (19, 20), "one out of turn starts them again");
+        assert_ne!(leaf(5, 1, false, &[1], &[]), leaf(5, 1, false, &[], &[1]), "what an entry carries is its context, then its data");
+        Ok(())
+    }
+
+    /// W27-R08 (docs/ci.md, the cluster group's custody): the server and its learner keep the same
+    /// leaves of the same entries, so a checkpoint of the log the server says holds on the learner.
+    /// An entry changed on its way (the message made again whole, past its checksum, as a link that
+    /// changes what it carries would) leaves the learner holding other than the server wrote, and its
+    /// checkpoint doesn't hold; copied again, the learner holds what the server wrote, and the
+    /// checkpoints after it hold. Each stretch is checked once both have applied it, whatever the
+    /// timing: a member says the entry it applied last only once its turn of applying ends, after
+    /// it answered a flush.
+    #[test]
+    fn w27_r08_a_checkpoint_holds_on_a_learner_only_as_the_server_logged_its_entries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let fetch: Fetch = {
+            let server = server.clone();
+            Arc::new(move |dest: &Path| {
+                let (s, d) = (server.clone(), dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        // The links between them, the first entry with a write in it past the learner's copy
+        // changed on its way, and every copy of it sent again (after a refusal). Not one the copy
+        // holds: the leader sends the new learner messages it held for it from before the copy, and
+        // may send it entries the copy holds, which it passes over. The first message with an entry
+        // past the copy is that entry's first sending.
+        let copied = learner.leaves_from();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked = Arc::new(AtomicU64::new(0));
+        let links = {
+            let (server, learner, done, picked) = (server.clone(), learner.clone(), done.clone(), picked.clone());
+            thread::spawn(move || {
+                let Some(g) = server.group() else { return };
+                let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
+                let changes = |e: &hyper_raft::proto::Entry, picked: u64| !e.data.is_empty() && if picked == 0 { e.index > copied } else { e.index == picked };
+                while !done.load(Ordering::SeqCst) {
+                    let mut moved = false;
+                    while let Ok((to, bytes)) = to_learner.try_recv() {
+                        moved = true;
+                        if to != member {
+                            continue;
+                        }
+                        let bytes = match Message::decode(&bytes) {
+                            Ok(mut m) if m.entries.iter().any(|e| changes(e, picked.load(Ordering::SeqCst))) => {
+                                for e in m.entries.iter_mut() {
+                                    if changes(e, picked.load(Ordering::SeqCst))
+                                        && let Some(b) = e.data.last_mut()
+                                    {
+                                        *b ^= 0x01;
+                                        picked.store(e.index, Ordering::SeqCst);
+                                    }
+                                }
+                                m.encode_to_vec()
+                            }
+                            _ => bytes,
+                        };
+                        learner.step(&bytes).ok();
+                    }
+                    while let Ok((_, bytes)) = to_server.try_recv() {
+                        moved = true;
+                        g.step(&bytes).ok();
+                    }
+                    if !moved {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            })
+        };
+        let checked = (|| -> anyhow::Result<()> {
+            set(&server, "after", "2")?;
+            server.flush_group()?;
+            // The stretch from the learner's copy to the entry the link changed, once both applied it.
+            until("the link changing an entry", || Ok(picked.load(Ordering::SeqCst) != 0))?;
+            let changed = picked.load(Ordering::SeqCst);
+            until("the server and the learner applying it", || Ok(g.standing().1 >= changed && learner.standing().1 >= changed))?;
+            anyhow::ensure!(changed > copied, "the link changed entry {changed}, which the learner's copy holds (it holds those to {copied})");
+            let (said, held) = (g.digest(copied, changed), learner.digest(copied, changed));
+            anyhow::ensure!(said.is_ok() && held.is_ok() && said != held, "the changed entry changes the learner's checkpoint: kiln's {said:?}, the learner's {held:?}");
+            anyhow::ensure!(read("after")?.as_deref() != Some("2"), "the learner holds what came, not what the server wrote");
+            // Copied again: what the server wrote; and the stretch after the changed entry, to what
+            // both applied of the writes after the copy, holds.
+            learner.copy_again()?;
+            anyhow::ensure!(read("after")?.as_deref() == Some("2"), "the copy holds what the server wrote");
+            for i in 0..5 {
+                set(&server, &format!("later{i}"), "x")?;
+            }
+            server.flush_group()?;
+            until("the writes after the copy on the learner", || Ok(read("later4")?.as_deref() == Some("x")))?;
+            until("both saying they applied past the changed entry", || Ok(g.standing().1 > changed && learner.standing().1 > changed))?;
+            let applied = g.standing().1.min(learner.standing().1);
+            anyhow::ensure!(g.digest(changed, applied) == learner.digest(changed, applied), "a checkpoint after the changed entry holds");
+            Ok(())
+        })();
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        checked
     }
 }

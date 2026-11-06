@@ -405,15 +405,20 @@ pub struct Host {
     saves: AtomicU64,
     /// Where its looks and record writes are counted for /metrics (kiln's, `metrics::agents()`).
     metrics: &'static crate::metrics::AgentMetrics,
-    changed: event_listener::Event,
+    /// Told after each look and each record written (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top
+    /// goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: crate::rt::Changed,
     /// Its sessions' inboxes (CP-T3.2): none without their records (`KILN_INBOX` off, or they
     /// couldn't be opened), and messages then go on as they come, unchecked.
     inbox: Option<Arc<Inbox>>,
-    /// Each session's lane: what it's told, in order, a command at a time; and what says it's done.
-    lanes: Mutex<HashMap<String, (async_channel::Sender<Lane>, async_channel::Receiver<()>)>>,
+    /// Each session's lane: what it's told, in order, a command at a time; and what says it's done. Each a
+    /// lock-free queue (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
+    /// event-listener's `Mutex`, the runner's loop sending each command on its shard and the lane's task
+    /// waiting on its own.
+    lanes: Mutex<HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>>,
     /// Lanes on their way out, each done once what it holds is done: a session's next lane waits for
     /// its last (a session taken back right after it went: its fence first, then its opening).
-    ending: Mutex<HashMap<String, async_channel::Receiver<()>>>,
+    ending: Mutex<HashMap<String, crate::memory::queue::Receiver<()>>>,
     /// It took its sessions over from the runner process it upgrades (blue/green) and isn't
     /// promoted yet: that one takes them back if it never is, so this one takes no messages till
     /// then (each refused `moved`, and sent again).
@@ -455,29 +460,30 @@ pub const ATTACHMENT_MAX: u64 = 25 << 20;
 pub const PACKAGE_MAX: u64 = 1 << 30;
 
 impl Host {
-    pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
+    pub fn new(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
         Self::with_clock(sink, file, limits, crate::rt::clock())
     }
 
     /// A host whose time is `clock`'s, its sessions' inboxes keeping their records beside its own
     /// record of them.
-    pub fn with_clock(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
+    pub fn with_clock(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
         Self::counting_into(sink, file, limits, clock, crate::metrics::agents())
     }
 
     /// A host whose time is `clock`'s, its looks and record writes counted into `metrics`, its
     /// sessions' inboxes keeping their records beside its own record of them.
-    pub fn counting_into(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    pub fn counting_into(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         let records = file.as_ref().and_then(|f| f.parent()).and_then(open_records);
         Self::build(sink, file, limits, clock, records, metrics)
     }
 
     /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
-    pub fn with_records(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
+    pub fn with_records(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
         Self::build(sink, file, limits, clock, records, crate::metrics::agents())
     }
 
-    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    fn build(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+        let sink: Sink = sink.into();
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -503,7 +509,7 @@ impl Host {
             looks: AtomicU64::new(0),
             saves: AtomicU64::new(0),
             metrics,
-            changed: event_listener::Event::new(),
+            changed: crate::rt::Changed::new(),
             inbox: records.map(|r| Arc::new(Inbox::new(r, inbox::Limits::default()))),
             lanes: Mutex::new(HashMap::new()),
             ending: Mutex::new(HashMap::new()),
@@ -1238,11 +1244,12 @@ impl Host {
 
     /// Opens session `id`'s lane (with `lanes` held), its first word that the session is here at
     /// `epoch` (`back`: taken back). It goes once its last lane is done.
-    fn open_lane(&self, lanes: &mut HashMap<String, (async_channel::Sender<Lane>, async_channel::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
-        let (tx, rx) = async_channel::bounded(LANE);
+    fn open_lane(&self, lanes: &mut HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
+        // At most `LANE` waiting, whatever each carries, as the channel it was held.
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, LANE);
         let _ = tx.try_send(Lane::Open { epoch, back });
         // Dropped as the lane ends: what waits on it goes on.
-        let (done, ended) = async_channel::bounded::<()>(1);
+        let (done, ended) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
         lanes.insert(id.to_owned(), (tx, ended.clone()));
         let before = self.ending.lock().remove(id);
         let (me, id) = (self.me.clone(), id.to_owned());
@@ -1575,7 +1582,7 @@ impl Host {
         }
         // Their lanes end as what they hold is done, and each session's next lane waits for its
         // last: what it was sent before goes first.
-        let lanes: Vec<(String, (async_channel::Sender<Lane>, async_channel::Receiver<()>))> = self.lanes.lock().drain().collect();
+        let lanes: Vec<(String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>))> = self.lanes.lock().drain().collect();
         {
             let mut ending = self.ending.lock();
             for (id, (_, ended)) in lanes {
@@ -1777,7 +1784,7 @@ impl Host {
                 }
                 h.looks.fetch_add(1, Ordering::AcqRel);
                 h.metrics.harness_polls.inc();
-                h.changed.notify(usize::MAX);
+                h.changed.notify();
             }
         });
     }
@@ -1868,7 +1875,7 @@ impl Host {
             }
             Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
         }
-        self.changed.notify(usize::MAX);
+        self.changed.notify();
     }
 }
 
@@ -2277,7 +2284,7 @@ mod tests {
 
     /// A host on a simulated clock of its own, never moved: its watch never looks and its record
     /// is written only when a test says (`save_now`).
-    fn sim(tx: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Host> {
+    fn sim(tx: impl Into<Sink>, file: Option<PathBuf>, limits: Limits) -> Arc<Host> {
         Host::with_clock(tx, file, limits, Arc::new(SimClock::new()))
     }
 
@@ -3016,8 +3023,37 @@ while True:
     }
 
     /// A host whose sessions' inboxes keep their records in the simulator's.
-    fn with_inbox(tx: Sink) -> Arc<Host> {
+    fn with_inbox(tx: impl Into<Sink>) -> Arc<Host> {
         Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())))
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a session's lane is a lock-free queue of
+    /// [`LANE`] places. Messages sent to one session from every shard at once each go down its lane once,
+    /// each sender's in the order sent, its inbox answering each in its turn.
+    #[test]
+    fn g5_a_sessions_lane_takes_what_every_shard_sends_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            host.open(Some("lane".into()), no_harness(dir.path()))?;
+            // Fewer than its places, however slow its lane: none refused full.
+            let (senders, per) = (8usize, 100usize);
+            let mut sending = Vec::new();
+            for t in 0..senders {
+                let host = Arc::clone(&host);
+                sending.push(crate::rt::spawn_spread_joined(async move { (0..per).all(|n| host.command("lane", message(&format!("{t}-{n}"), "x"))) }));
+            }
+            for t in sending {
+                anyhow::ensure!(t.await.unwrap_or(false), "a message was refused");
+            }
+            let said = answers(&rx, senders * per).await?;
+            for t in 0..senders {
+                let theirs: Vec<usize> = said.iter().filter_map(|s| s.message.strip_prefix(&format!("{t}-"))?.parse().ok()).collect();
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     /// CP-T3.2 (seen as a failed test's session, left behind its host, was handed over later with
@@ -3834,7 +3870,7 @@ while True:
                     .collect()
             };
             let prompts = |id: &str| handed(id).len();
-            let (up, pieces) = async_channel::unbounded();
+            let (up, pieces) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             super::super::handing::set_held_link(up);
             let (tx_old, rx_old) = async_channel::unbounded();
             let (tx_new, rx_new) = async_channel::unbounded();

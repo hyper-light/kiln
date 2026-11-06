@@ -16,7 +16,6 @@ use http::StatusCode;
 use kiln_ci::identity::statement;
 use kiln_ci::identity::verdict::{self, Asked, Holds, Kept, Place, Revision};
 use kiln_ci::land::Action;
-use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
@@ -38,21 +37,24 @@ fn bad(why: String) -> Fail {
 
 /// `commit`'s verbatim patch-id: `git patch-id --verbatim` of its diff as `git show` gives it,
 /// context and whitespace as they are. W26-R16's replays make this same comparison for their
-/// `same_patch`; once both are on main, a replay's carrying can read that instead. Remembered.
+/// `same_patch`; once both are on main, a replay's carrying can read that instead. Remembered: read
+/// without a lock by the pages and the land queue that ask (goal 5, plan 01a1a59c2aae step 2), one
+/// worked out swapped in whole with the rest (`crate::rcu`).
 pub async fn verbatim(hub: &Hub, path: &str, commit: &str) -> Option<String> {
-    static KEPT: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static KEPT: OnceLock<crate::rcu::Rcu<HashMap<String, String>>> = OnceLock::new();
     let kept = KEPT.get_or_init(Default::default);
-    if let Some(p) = kept.lock().get(commit) {
+    if let Some(p) = kept.load().get(commit) {
         return Some(p.clone());
     }
     let patch = super::diffs::git_run(hub, &["-C", path, "show", "--no-color", "--format=", commit], &[], Vec::new()).await.ok()?.out;
     let out = super::diffs::git_with_input(hub, &["-C", path, "patch-id", "--verbatim"], patch).await.ok()?;
     let id = String::from_utf8_lossy(&out).split_whitespace().next().map(str::to_owned)?;
-    let mut k = kept.lock();
-    if k.len() >= PATCH_IDS_KEPT {
-        k.clear();
-    }
-    k.insert(commit.to_owned(), id.clone());
+    kept.update(|k| {
+        if k.len() >= PATCH_IDS_KEPT {
+            k.clear();
+        }
+        k.insert(commit.to_owned(), id.clone());
+    });
     Some(id)
 }
 
@@ -229,7 +231,8 @@ pub struct Taken {
 pub async fn take(hub: &Hub, caller: &Caller, asked: &Asked<'_>, bundle: &Value) -> Result<Taken, Fail> {
     let at = crate::util::now_unix();
     let revocations = crate::identities::revocations(&hub.store).await.map_err(fail)?;
-    let c = statement::verify(bundle, &hub.pki.ca_der, &revocations, at).map_err(|e| bad(format!("its signature isn't taken: {e}")))?;
+    // Checked on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+    let c = crate::custody::verify_off(bundle, &hub.pki.ca_der, revocations, at).await.map_err(fail)?.map_err(|e| bad(format!("its signature isn't taken: {e}")))?;
     let body = verdict::read(&c.payload_type, &c.statement).map_err(|e| bad(format!("what's signed isn't a {}: {e}", asked.kind)))?;
     if !crate::identities::is_caller(hub, caller, &c.signer.identity).await {
         return Err((StatusCode::FORBIDDEN, format!("it's signed by {}, and {} gives it: a verdict or comment is signed by whoever gives it", c.custodian, caller.name)));
@@ -363,16 +366,28 @@ pub async fn holding(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<HashMa
     let revocations = crate::identities::revocations(&hub.store).await.map_err(fail)?;
     let latest_patch = verbatim(hub, &path, &latest.commit).await;
     let kept: Vec<Kept> = versions.iter().map(|v| Kept { n: v.n, commit: v.commit.clone(), patch_id: (v.n == latest.n).then(|| latest_patch.clone()).flatten() }).collect();
-    let mut out = HashMap::new();
-    for (review, bundle, at) in rows {
-        let checked = serde_json::from_str::<Value>(&bundle).map_err(|e| e.to_string()).and_then(|b| statement::verify(&b, &hub.pki.ca_der, &revocations, at).map_err(|e| e.to_string()));
-        let holds = match checked.and_then(|c| verdict::read(&c.payload_type, &c.statement)) {
-            Ok(b) => verdict::holds_on(&b.revision, &kept, latest.n),
-            Err(why) => Holds::Not(format!("its signature doesn't verify: {why}")),
-        };
-        out.insert(review, holds);
+    // Each checked on the compute pool, a verdict at a time, in their order, off the shards (goal 9, plan 01a1a87b2cec
+    // step 3): a signature and its certificate chain apiece, one after another on the shard of each page and land that
+    // asked.
+    let (pki, n) = (std::sync::Arc::clone(&hub.pki), latest.n);
+    let held = crate::rt::compute_map(rows, move |(review, bundle, at)| {
+        let holds = holds_now(&bundle, &pki.ca_der, &revocations, at, &kept, n);
+        (review, holds)
+    })
+    .await
+    .map_err(fail)?;
+    Ok(held.into_iter().collect())
+}
+
+/// Where signed verdict `bundle`, which kiln took at `at`, stands on version `latest` of its diff, `kept` its versions
+/// ([`holding`]): checked again as of then against kiln's root `root` and `revocations`, then held to that version. On
+/// the thread it's called on: a compute job's.
+fn holds_now(bundle: &str, root: &[u8], revocations: &[kiln_ci::identity::chain::Revocation], at: i64, kept: &[Kept], latest: u32) -> Holds {
+    let checked = serde_json::from_str::<Value>(bundle).map_err(|e| e.to_string()).and_then(|b| statement::verify(&b, root, revocations, at).map_err(|e| e.to_string()));
+    match checked.and_then(|c| verdict::read(&c.payload_type, &c.statement)) {
+        Ok(b) => verdict::holds_on(&b.revision, kept, latest),
+        Err(why) => Holds::Not(format!("its signature doesn't verify: {why}")),
     }
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -12,10 +12,12 @@ import { attachApi, attachmentsRes, onWords, WAKES_CODE, WAKES_RUNNERS, type Att
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { SelectField, TextField } from "@/components/ui/misc";
-import { labelOf, useLabels, useRes } from "@/lib/data";
+import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
+import { labelOf, upsert, useLabels, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { Link } from "@/lib/router";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import "./attach.css";
 
 const WAKE_WORDS: Record<string, string> = {
@@ -27,6 +29,7 @@ const WAKE_WORDS: Record<string, string> = {
   unroutable: "a job can't run anywhere",
   degraded: "an app it deploys degrades",
   mention: "someone mentions it",
+  review: "someone asks it to review a change",
   schedule: "on a schedule",
   offline: "a runner goes offline",
   upgrade: "an upgrade fails",
@@ -98,12 +101,32 @@ function Watchers({ on, watches }: { on: string; watches: (on: string) => boolea
   useLabels();
   const rows = useRes(attachmentsRes).data.filter((r) => watches(r.attachment.on));
   const [open, setOpen] = React.useState<string | null>(null);
-  const [adding, setAdding] = React.useState(false);
+  // Attach's form by its opening: an attach answered after its form was closed (and one opened
+  // since) closes nothing, and what's chosen there stays (W21-R15).
+  const [adding, setAdding] = React.useState<number | null>(null);
+  const openings = React.useRef(0);
+  const opening = adding;
+  // Paused or resumed at once (W21-R15), and as it was, saying why in its line, if the server says
+  // no; while that's on its way the next press on it waits (its line closed and opened again too).
+  const [refused, setRefused] = React.useState<Record<string, string>>({});
+  const [pause, pausing] = useActions(async (id: string, paused: boolean) => {
+    const set = (to: boolean) => change<AttachmentRow[]>(attachmentsRes.key, (list) => list.map((x) => (x.attachment.id === id ? { ...x, attachment: { ...x.attachment, paused: to } } : x)));
+    setRefused((f) => Object.fromEntries(Object.entries(f).filter(([k]) => k !== id)));
+    set(paused);
+    try {
+      await attachApi.pause({ attachment: id, paused });
+    } catch (e) {
+      set(!paused);
+      setRefused((f) => ({ ...f, [id]: errorMessage(e) }));
+    } finally {
+      invalidate("attachments");
+    }
+  });
   const shown = rows.find((r) => r.attachment.id === open);
   return (
     <>
       <div className="watch-chips">
-        {rows.length === 0 && !adding && <span className="watch-none">No agent watches it.</span>}
+        {rows.length === 0 && adding === null && <span className="watch-none">No agent watches it.</span>}
         {rows.map((r) => {
           const stand = standOf(r);
           const id = r.attachment.id;
@@ -117,7 +140,7 @@ function Watchers({ on, watches }: { on: string; watches: (on: string) => boolea
               aria-expanded={open === id}
               onClick={() => {
                 setOpen(open === id ? null : id);
-                setAdding(false);
+                setAdding(null);
               }}
             >
               <i className="dot" data-status={DOT[stand]} aria-hidden="true" />
@@ -127,13 +150,13 @@ function Watchers({ on, watches }: { on: string; watches: (on: string) => boolea
             </button>
           );
         })}
-        {!adding && (
+        {adding === null && (
           <Button
             size="xs"
             variant="secondary"
             className="watch-add"
             onClick={() => {
-              setAdding(true);
+              setAdding(++openings.current);
               setOpen(null);
             }}
           >
@@ -141,36 +164,42 @@ function Watchers({ on, watches }: { on: string; watches: (on: string) => boolea
           </Button>
         )}
       </div>
-      {shown && <Watcher key={shown.attachment.id} r={shown} onGone={() => setOpen(null)} />}
-      {adding && <QuickAttach on={on} onDone={() => setAdding(false)} />}
+      {shown && (
+        <Watcher
+          key={shown.attachment.id}
+          r={shown}
+          pausing={pausing(shown.attachment.id)}
+          refused={refused[shown.attachment.id]}
+          onPause={() => pause(shown.attachment.id, !shown.attachment.paused)}
+          onGone={() => setOpen(null)}
+        />
+      )}
+      {adding !== null && <QuickAttach key={adding} on={on} onDone={() => setAdding((a) => (a === opening ? null : a))} />}
     </>
   );
 }
 
-/** Pause or resume one, or remove it (asked once more): the buttons, and what went wrong. */
-function WatcherActions({ r, onGone }: { r: AttachmentRow; onGone?: () => void }) {
+/** Pause or resume one (`pausing`: that's on its way; `refused`: why it didn't go), or remove it (asked once more): the buttons. */
+function WatcherActions({ r, pausing, refused, onPause, onGone }: { r: AttachmentRow; pausing: boolean; refused?: string; onPause: () => void; onGone?: () => void }) {
   const a = r.attachment;
-  const [busy, setBusy] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const act = async (f: () => Promise<unknown>, after?: () => void) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await f();
-      invalidate("attachments");
-      after?.();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
+  // Gone at once, and back, saying why, if the server keeps it.
+  const remove = () => {
+    change<AttachmentRow[]>(attachmentsRes.key, (rows) => rows.filter((x) => x.attachment.id !== a.id));
+    onGone?.();
+    attachApi.remove(a.id).then(
+      () => invalidate("attachments"),
+      (e: unknown) => {
+        toast.error(`Couldn't remove ${a.name}`, errorMessage(e));
+        invalidate("attachments");
+      },
+    );
   };
   return (
     <span className="watch-acts">
       {removing ? (
         <>
-          <Button size="xs" variant="danger" disabled={busy} onClick={() => void act(() => attachApi.remove(a.id), onGone)}>
+          <Button size="xs" variant="danger" onClick={remove}>
             Remove {a.name}
           </Button>
           <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
@@ -179,26 +208,26 @@ function WatcherActions({ r, onGone }: { r: AttachmentRow; onGone?: () => void }
         </>
       ) : (
         <>
-          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void act(() => attachApi.pause({ attachment: a.id, paused: !a.paused }))}>
+          <Button size="xs" variant="secondary" pending={pausing} onClick={onPause}>
             {a.paused ? "Resume" : "Pause"}
           </Button>
           {/* One kept in a repository is changed, or removed, there. */}
           {a.source ? (
             <span className="watch-kept">in {a.source.split(":").pop()}</span>
           ) : (
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(true)}>
+            <Button size="xs" variant="ghost" onClick={() => setRemoving(true)}>
               Remove
             </Button>
           )}
         </>
       )}
-      {error && <span className="attach-error">{error}</span>}
+      {refused && <span className="attach-error">{refused}</span>}
     </span>
   );
 }
 
 /** An attached agent's own line: what wakes it, its agent, its latest incident; pause, remove. */
-function Watcher({ r, onGone }: { r: AttachmentRow; onGone: () => void }) {
+function Watcher({ r, pausing, refused, onPause, onGone }: { r: AttachmentRow; pausing: boolean; refused?: string; onPause: () => void; onGone: () => void }) {
   return (
     <div className="watch-detail">
       <p className="watch-what">
@@ -210,7 +239,7 @@ function Watcher({ r, onGone }: { r: AttachmentRow; onGone: () => void }) {
           </>
         )}
       </p>
-      <WatcherActions r={r} onGone={onGone} />
+      <WatcherActions r={r} pausing={pausing} refused={refused} onPause={onPause} onGone={onGone} />
     </div>
   );
 }
@@ -222,24 +251,27 @@ function QuickAttach({ on, onDone }: { on: string; onDone: () => void }) {
   const [name, setName] = React.useState(runners ? "runner-doctor" : "ci-doctor");
   const [harness, setHarness] = React.useState("claude");
   const [wake, setWake] = React.useState<string[]>(runners ? ["offline", "upgrade"] : ["failure"]);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
-      await attachApi.save(defaultsFor({ name, on, harness, wake, playbook: "" }));
+  // Waits for the answer, its button saying so (W21-R15), so a refusal is said here with what was
+  // chosen; attached, it's among the chips as the form closes.
+  const [attach, attaching] = useAction(
+    async () => {
+      setError(null);
+      const made = await attachApi.save(defaultsFor({ name, on, harness, wake, playbook: "" }));
+      change<AttachmentRow[]>(attachmentsRes.key, (rows) => upsert(rows, { attachment: made, open: 0, today: 0, latest: null }, (x) => x.attachment.id, false));
       invalidate("attachments");
       onDone();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (err) => setError(errorMessage(err)),
+  );
   return (
-    <form className="watch-form" onSubmit={(e) => void submit(e)}>
+    <form
+      className="watch-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        attach();
+      }}
+    >
       <TextField label="Name" value={name} onChange={(e) => setName(e.target.value)} required />
       <SelectField label="Agent" value={harness} onChange={setHarness} options={HARNESSES} />
       <div className="watch-wakes">
@@ -253,8 +285,8 @@ function QuickAttach({ on, onDone }: { on: string; onDone: () => void }) {
         />
       </div>
       <div className="watch-form-acts">
-        <Button size="xs" type="submit" disabled={busy || wake.length === 0 || !name.trim()}>
-          {busy ? "Attaching…" : "Attach"}
+        <Button size="xs" type="submit" pending={attaching} disabled={wake.length === 0 || !name.trim()}>
+          {attaching ? "Attaching…" : "Attach"}
         </Button>
         <Button size="xs" type="button" variant="ghost" onClick={onDone}>
           Cancel

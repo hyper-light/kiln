@@ -13,3 +13,10 @@ LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_PREUPDATE_HOOK"
 # handle -> start -> commands -> actions -> queue -> commands overflowed one (frames of 180-764 KiB,
 # 2026-10-27). Reserved, not used: pages are touched as needed. A value already set stays.
 RUST_MIN_STACK = "16777216"
+# aws-lc-sys (crates.io's 0.46.0, under kiln's vendored aws-lc-rs) built as Mantle builds it
+# (vendor/aws-lc-rs/UPSTREAM.md; Ada's word, 2026-11-03): no CPU jitter entropy, which costs a
+# process 17.6 ms before its first random bytes, and AWS-LC from its own source, never a system one
+# found by OPENSSL_DIR or pkg-config. Mantle's third change, a failing hardware RNG read falling
+# back to the operating system's, is AWS-LC's C: carried only once aws-lc-sys is vendored.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
+AWS_LC_SYS_USE_SYSTEM = "0"

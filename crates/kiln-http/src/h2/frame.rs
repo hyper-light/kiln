@@ -62,9 +62,14 @@ pub(crate) fn head(buf: &[u8]) -> Option<Head> {
 }
 
 pub(crate) fn put_head(out: &mut Vec<u8>, len: usize, kind: u8, flags: u8, stream: u32) {
+    out.extend_from_slice(&head_bytes(len, kind, flags, stream));
+}
+
+/// A frame's 9-byte head, to write where its place was kept (a header block's, once its length is known).
+pub(crate) fn head_bytes(len: usize, kind: u8, flags: u8, stream: u32) -> [u8; 9] {
     let l = (len as u32).to_be_bytes();
     let s = stream.to_be_bytes();
-    out.extend_from_slice(&[l[1], l[2], l[3], kind, flags, s[0], s[1], s[2], s[3]]);
+    [l[1], l[2], l[3], kind, flags, s[0], s[1], s[2], s[3]]
 }
 
 pub(crate) fn put_settings(out: &mut Vec<u8>, settings: &[(u16, u32)]) {
@@ -113,5 +118,17 @@ mod tests {
         // The reserved bit is ignored on receipt.
         assert_eq!(head(&[0, 0, 0, 0, 0, 0x80, 0, 0, 1]).map(|h| h.stream), Some(1));
         assert_eq!(head(&[0, 0, 0]), None);
+    }
+
+    /// Goal 9 of kiln's API runtime program, plan 01a1a87b2cec step 5: a head made where its place was kept is the
+    /// head appended, byte for byte, and reads back as it was made.
+    #[test]
+    fn g9_s5_a_head_made_in_place_is_the_head_appended() {
+        let mut out = Vec::new();
+        put_head(&mut out, 0x01_23_45, HEADERS, END_HEADERS, 7);
+        let made = head_bytes(0x01_23_45, HEADERS, END_HEADERS, 7);
+        assert_eq!(out.as_slice(), made.as_slice());
+        assert_eq!(made, [0x01, 0x23, 0x45, HEADERS, END_HEADERS, 0, 0, 0, 7]);
+        assert_eq!(head(&made), Some(Head { len: 0x01_23_45, kind: HEADERS, flags: END_HEADERS, stream: 7 }));
     }
 }

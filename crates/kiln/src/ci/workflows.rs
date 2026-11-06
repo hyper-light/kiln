@@ -750,7 +750,7 @@ pub async fn new_draft(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, body: &V
         // version that could publish a new action. A host assigns its draft's number when it
         // opens it; only kiln's own next diff number can be read without making a draft.
         let machines = {
-            let agents = hub.agents.lock();
+            let agents = hub.agents.load();
             let names = |executor: &str| {
                 let mut names: Vec<String> = agents.values().filter(|a| a.connected && a.facts.as_deref().is_some_and(|f| kiln_ci::sched::routing::has_executor(f, executor))).map(|a| a.name.clone()).collect();
                 names.sort();

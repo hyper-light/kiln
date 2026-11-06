@@ -473,6 +473,9 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
         // The step's agent's own record of it.
         let now = crate::util::now_unix();
         let previous = change::of(hub, &e.agent).await;
+        let review = review.or_else(|| previous.as_ref().and_then(|p| p.review.clone()));
+        // A draft by its diff's state on kiln (W26-R18); a host's as it was.
+        let draft = review.as_deref().map(|s| s == "draft").or_else(|| previous.as_ref().and_then(|p| p.draft));
         let mut record = Record {
             agent: e.agent.clone(),
             repo: st.repo.clone(),
@@ -486,7 +489,8 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
             files: e.files.clone(),
             title: e.title.clone(),
             state: previous.as_ref().map_or_else(|| "open".to_owned(), |p| p.state.clone()),
-            review: review.or_else(|| previous.as_ref().and_then(|p| p.review.clone())),
+            review,
+            draft,
             checks: previous.as_ref().and_then(|p| p.checks.clone()),
             fix_checks: previous.as_ref().is_none_or(|p| p.fix_checks),
             opened_at: previous.as_ref().map_or(now, |p| p.opened_at),
@@ -595,6 +599,13 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
             _ => None,
         })
         .collect();
+    // The threads it answers (W26-R18) ride on the push of the stack's top: kiln marks the version
+    // of the diff each is on. So does `ready`, its draft marked ready.
+    let answers = Want { draft: false, ..want.clone() }.ref_options()?;
+    let refs: Vec<Option<String>> = match (st.provider.as_str(), answers.strip_prefix('%')) {
+        ("kiln", Some(more)) => refs.into_iter().map(|r| r.map(|r| if r.contains('%') { format!("{r},{more}") } else { format!("{r}%{more}") })).collect(),
+        _ => refs,
+    };
     let opener = hub.store.kv_get(crate::mcp::opener_key(&info.id)).await.ok().flatten().unwrap_or_else(|| "owner".to_owned());
     let minted = if st.provider == "kiln" { Some(token(hub, &st, &info.id, &opener).await.map_err(|m| (StatusCode::FORBIDDEN, m))?) } else { None };
     let ask = Ask::Restack(Restack {
@@ -753,7 +764,7 @@ mod end_to_end {
                 let early = crate::ops::call(cx.clone(), "agents.change", json!({"agent": agent})).await.err().map(|(_, m)| m).unwrap_or_default();
                 anyhow::ensure!(early.contains("still going"), "{early}");
                 std::fs::write(work.path().join(file), text)?;
-                anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])), "no agent to set the changes of");
+                anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])).await, "no agent to set the changes of");
                 let a = agent.clone();
                 hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1", rusqlite::params![a])?)).await?;
                 agents::advance(&hub, &run).await?;

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Goal 6's lab (plan 01a1a59c2abe, docs/runtime-lab.md "Goal 6"): the lab's kiln with its server alone in a scope of
+# its own at CPUWeight=1000, as kiln.slice gives the server on bare metal (docs/priority.md); its runners as they
+# come, in the lab's unit. Given to kiln-lab as --kiln, beside the kiln it runs (bin/kiln). The lab starts its
+# server as `kiln --config <file> server`; systemd-run --scope execs it in place, so its pid and process group stay
+# the lab's to stop. Linux with systemd's user manager.
+real=$(dirname "$(readlink -f "$0")")/kiln
+if [ "${3:-}" = server ]; then
+  exec systemd-run --user --scope --quiet --collect -p CPUWeight=1000 -p MemoryMax=8G --unit="kiln-lab-server-$$" "$real" "$@"
+fi
+exec "$real" "$@"

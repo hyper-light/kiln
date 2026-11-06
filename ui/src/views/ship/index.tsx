@@ -17,9 +17,11 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { browserSigns } from "@/lib/signing";
 import { RelTime } from "../shared";
 import { ACTION_WORD, FACET_KEYS, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
@@ -35,6 +37,7 @@ import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
 import { counted } from "./review/perf";
+import { pageOpts, shipCommits } from "./live";
 
 const LIMIT = 100;
 
@@ -70,11 +73,9 @@ function ShipList() {
   const narrow: Narrow = { host: q.host, kind: q.kind };
   const key = `ship/repos/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
-  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
-  const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
-    pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
-  });
+  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant). The
+  // server turns them into `ship` frames of the rows that changed, each taken in place (W21-R15).
+  const page = useSuspenseResource(key, (s) => shipCommits(q, s), pageOpts(q));
   const all = page.data.commits;
   // What each facet reads of a commit; every facet chosen must hold.
   const value: Record<string, (c: (typeof all)[number]) => string> = {
@@ -322,34 +323,31 @@ const Row = React.memo(
   (a, b) => a.item === b.item && a.open === b.open && a.narrow.host === b.narrow.host && a.narrow.kind === b.narrow.kind,
 );
 
-/** The row's paired actions, each through the endpoint it names; Review opens the item at its files. */
+/**
+ * The row's paired actions, each through the endpoint it names; Review opens the item at its files.
+ * One on its way says so, holding neither the other nor another row's (W21-R15).
+ */
 function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () => void; onReview: () => void }) {
-  const [busy, setBusy] = React.useState<string | null>(null);
   const navigate = useNavigate();
-  const act = async (a: ShipAction) => {
-    if (a.name === "review" && commit.change) {
-      onReview();
-      return;
-    }
-    setBusy(a.name);
+  const send = async (a: ShipAction) => {
     try {
-      const answer = await shipApi.act(a);
-      // A hand-off kiln signed for you, this browser having no key (docs/ci.md W27-R08): says so,
-      // and how to sign your own.
+      // A hand-off is signed in this browser, with its own key; one kiln signed for you says why,
+      // and, on a page that isn't secure, how to sign your own (docs/ci.md W27-R08).
+      const { answer, unsigned } = a.name === "hand_off" ? await shipApi.handOff(a) : { answer: await shipApi.act(a), unsigned: undefined };
       const signedForYou = (answer as { custody?: { kiln_signed_for_you?: boolean } } | null)?.custody?.kiln_signed_for_you === true;
+      const how = browserSigns() ? "" : " Over https, this browser signs its own.";
       toast({
         title: `${ACTION_WORD[a.name] ?? a.name}: ${commit.change?.name ?? commit.short}`,
-        description: signedForYou ? "kiln signed the hand-off for you: this browser has no key. `kiln login` gives this device one." : undefined,
+        description: signedForYou ? `kiln signed the hand-off for you: ${unsigned ?? "it didn't take this browser's signature"}.${how}` : undefined,
         tone: "succeeded",
       });
       invalidate("ship/");
       reload();
     } catch (e) {
       toast({ title: `${ACTION_WORD[a.name] ?? a.name} didn't go`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
     }
   };
+  const [act, acting] = useActions((_name: string, a: ShipAction) => (a.name === "review" && commit.change ? onReview() : send(a)));
   const acts = (commit.actions ?? []).slice(0, 2);
   // Always a pair of one width: a slot no action fills keeps its place, unseen.
   const slot = (k: number) => (
@@ -367,8 +365,8 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
           key={a.name}
           size="xs"
           variant={i === 0 ? "primary" : "secondary"}
-          disabled={busy !== null}
-          onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : void act(a))}
+          pending={acting(a.name)}
+          onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : act(a.name, a))}
         >
           {ACTION_WORD[a.name] ?? a.name}
         </Button>

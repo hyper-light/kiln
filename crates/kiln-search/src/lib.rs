@@ -37,10 +37,36 @@ use vorpal_outline::DEFAULT_OUTLINE_RULES;
 use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
 
+pub mod merge;
+
 /// The index's format: an index of another is built again.
 const FORMAT: u32 = 1;
 /// Indexes kept open between searches (their tables read, their trigrams mapped).
 const OPEN_MAX: usize = 8;
+
+/// What the open indexes hold on the heap, every [`VorpalSearch`]'s in the process, and the largest one
+/// opened: [`memory`] (an index's trigrams are mapped from its files, which the host can take back).
+static OPEN_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OPEN_LARGEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What the open indexes hold on the heap now, and their bound (kiln's goal 11, plan 01a1a87b2e56 step 3,
+/// on kiln's `/metrics` as `kiln_memory_bytes{owner="search_indexes"}`): [`OPEN_MAX`] of them, each at most
+/// as large as the largest opened, measured as it opened (its table as read, each file's key, place and
+/// language). Past the count the one searched least recently goes: opened again from its files when
+/// searched. One searched as it goes is let go once that search ends.
+pub fn memory() -> (usize, usize) {
+    let largest = OPEN_LARGEST.load(std::sync::atomic::Ordering::Relaxed);
+    (OPEN_HELD.load(std::sync::atomic::Ordering::Relaxed), largest.saturating_mul(OPEN_MAX))
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        let mut now = OPEN_HELD.load(std::sync::atomic::Ordering::Relaxed);
+        while let Err(seen) = OPEN_HELD.compare_exchange_weak(now, now.saturating_sub(self.bytes), std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            now = seen;
+        }
+    }
+}
 const CONTENTS: &str = "contents.bin";
 const TABLE: &str = "table.bin";
 /// Touched at each search: the order trees are forgotten in, kept across restarts.
@@ -114,6 +140,8 @@ struct Def {
 
 /// An index, open.
 struct Index {
+    /// What it holds on the heap ([`memory`]): its table as read, and each file's key, place and language.
+    bytes: usize,
     table: Table,
     store: Option<TrigramStore>,
     contents: std::fs::File,
@@ -378,6 +406,7 @@ impl Inner {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(unavailable("its table", e)),
         };
+        let table_bytes = table.len();
         let Ok(table) = postcard::from_bytes::<Table>(&table) else { return Ok(None) };
         if table.format != FORMAT {
             return Ok(None);
@@ -389,7 +418,11 @@ impl Inner {
             by_key.entry(FileKey::of(&row.path).0).or_default().push(i);
         }
         let langs = table.rows.iter().map(|r| language_of(&r.path)).collect();
-        let index = Arc::new(Index { table, store, contents, by_key, langs });
+        let each = size_of::<u64>() + size_of::<Vec<usize>>() + size_of::<usize>() + size_of::<Option<SupportLang>>();
+        let bytes = size_of::<Index>().saturating_add(table_bytes).saturating_add(table.rows.len().saturating_mul(each));
+        OPEN_HELD.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        OPEN_LARGEST.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+        let index = Arc::new(Index { bytes, table, store, contents, by_key, langs });
         let mut st = self.state.lock();
         st.open.retain(|(t, _)| t != tree);
         st.open.push((tree.to_owned(), Arc::clone(&index)));
@@ -731,6 +764,10 @@ mod tests {
         let s = VorpalSearch::open(&root, Limits { trees: 2, threads: 1 })?;
         let found = futures::executor::block_on(s.search("t1", Query { mode: Mode::Text, q: "one".into(), lang: None, limit: 10 })).map_err(|e| e.to_string())?;
         assert_eq!(found.hits.first().and_then(|h| h.symbol.clone()), Some(Symbol { name: "one".into(), kind: "function".into() }));
+        // Kiln's goal 11, plan 01a1a87b2e56 step 3: an index searched is open, what it holds counted, and
+        // its bound OPEN_MAX as large as the largest opened (other tests' searches open theirs alongside).
+        let (held, bound) = memory();
+        assert!(held > 0 && bound >= OPEN_MAX, "{held} held, {bound} its bound");
         futures::executor::block_on(s.build("t3", one("three"))).map_err(|e| e.to_string())?;
         assert_eq!(futures::executor::block_on(s.built("t2")).map_err(|e| e.to_string())?, None, "t2 was searched least recently");
         assert!(futures::executor::block_on(s.built("t1")).map_err(|e| e.to_string())?.is_some());

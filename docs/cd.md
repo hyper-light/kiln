@@ -306,6 +306,15 @@ window denies it. The environments page shows every app's revision in each stage
 waiting to move. **Windows** follow Argo CD's sync windows: `allow` / `deny`, cron, duration,
 timezone, which apps, namespaces and clusters, and whether manual syncs may pass.
 
+**Custody to production** (docs/ci.md W27-R08). Each sync to a Kubernetes cluster that succeeds
+leaves signed custody records: CD's hand-on of the manifests it applied (by digest) and the images
+they name by digest, and kiln's receipt for the cluster as its API server answered each apply. kiln
+then follows each image to the pods running it: the cluster's hand-on to each pod's node, the node's
+resolution of an index to its platform's manifest, and each pod's receipt of what its status's image
+ID says it runs. `GET /api/cd/apps/:app/custody` shows them and whether every pod runs what its
+deploy handed on; a pod running anything else is a break, recorded. An environment requiring a
+verified chain (`gates.require_chain`) counts a release healthy only once its pods are verified.
+
 ## Stacks, diffs and pull requests
 
 kiln reviews code as stacks of diffs ([review.md](review.md)) and as GitHub pull requests.
@@ -427,6 +436,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/tree?fresh=` | the app's objects and every live object they own (ReplicaSets, Pods, ControllerRevisions, Jobs, EndpointSlices), joined on owner uids: each node's uid, parents, health, sync, age, ready counts, restarts, images, containers and a few info pairs |
 | GET | `/api/cd/apps/:app/diff` | rendered against live, per resource |
 | GET | `/api/cd/apps/:app/manifests` | what the app renders now, as kiln applies it (another revision's: not yet) |
+| GET | `/api/cd/apps/:app/custody` | custody to production (docs/ci.md W27-R08): the last sync's custody records (CD's hand-on, kiln's receipt for the cluster), each running pod's container (node, platform, reported image ID, what its deploy handed on there, what it runs, its receipt) and the verdict: `verified`, `waiting`, `broken` or `unverifiable`. The pods are looked at now |
 | POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | `rollback` takes `{ to }` (a deployment's id) or `{ revision }` (a commit, a tag, a chart version), and `prune` |
 | GET | `/api/cd/apps/:app/history` | deployments, each with its commit and the tags that name it |
 | GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now; `commits`: its source's newest commits, each with the deployment that ran it and the one whose render it matches (any of them can be gone back to, ci.md W26-R25) |

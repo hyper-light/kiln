@@ -1,0 +1,35 @@
+# The HTTP/3 door's fuzzing, a large budget (goal 4 step 9, plan 01a1a832eb597110a6dcfda227981604;
+# docs/http.md, "HTTP/3"): its four seeded targets (the QPACK decoder, HTTP/3 streams, capsules,
+# whole connections over a lossy, reordering network), from seeds no run before tried
+# (KILN_H3_FUZZ_FROM moves on a million a day), built for release. Every change request already
+# runs each target's own budget inside `cargo test -p kiln-http` (over 10,000 seeds). A failure
+# names its seed: `KILN_H3_FUZZ_SEED=<seed> cargo test -p kiln-http --lib <test> -- --exact`
+# replays it alone.
+#
+# Declared, not on: it runs when asked (manual). To run it nightly, add
+#   schedule: ["41 3 * * *"]
+# under `on:` (opt-in, docs/ci.md §0.3).
+name: h3-fuzz
+on:
+  manual: true
+jobs:
+  nightly:
+    name: HTTP/3 door, fuzz seeds
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    timeout-minutes: 120
+    steps:
+      - name: build (release)
+        run: cargo test --release --locked -p kiln-http --lib --no-run
+      - name: QPACK decoder, 2,000,000 seeds
+        run: KILN_H3_FUZZ_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_H3_FUZZ_SEEDS=2000000 cargo test --release --locked -p kiln-http --lib h3::fuzz::fuzz_qpack_decoder -- --exact --nocapture
+      - name: HTTP/3 streams, 500,000 seeds
+        run: KILN_H3_FUZZ_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_H3_FUZZ_SEEDS=500000 cargo test --release --locked -p kiln-http --lib h3::fuzz::fuzz_http3_streams -- --exact --nocapture
+      - name: capsules, 500,000 seeds
+        run: KILN_H3_FUZZ_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_H3_FUZZ_SEEDS=500000 cargo test --release --locked -p kiln-http --lib h3::fuzz::fuzz_capsules -- --exact --nocapture
+      - name: whole connections, 5,000 seeds
+        run: KILN_H3_FUZZ_FROM=$(( $(date -u +%s) / 86400 * 1000000 )) KILN_H3_FUZZ_SEEDS=5000 cargo test --release --locked -p kiln-http --lib h3::fuzz::fuzz_whole_connections -- --exact --nocapture

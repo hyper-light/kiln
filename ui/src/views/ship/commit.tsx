@@ -13,17 +13,16 @@
  */
 import * as React from "react";
 import { api } from "@/api/client";
-import { shipApi, type ShipDetail } from "@/api/ship";
+import type { ShipDetail, ShipQuery } from "@/api/ship";
 import type { RunnerFinding } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
+import { useAction } from "@/lib/action";
 import { clockTime } from "@/lib/format";
 import { labelOf, updatesRes, useLabels, useRes } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { cardsOf } from "./jobs";
@@ -31,6 +30,10 @@ import { platformsOf } from "@/views/updates/words";
 import { buildWord, environmentsOf, failuresOf, keptBuildsOf, replantGlyph, replantWord, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
 import { horizonOf, LaneBar, reviewGroup, type ShipLaneGroup } from "./review/lanes";
 import "./ship.css";
+import { DETAIL_OPTS, pageOpts, shipCommit, shipCommits } from "./live";
+
+/** The repository's commits a commit page folds by. */
+const LISTED = (repo: string): ShipQuery => ({ repo, limit: 200 });
 
 export default function CommitPage() {
   const { owner = "", name = "", sha = "" } = useParams();
@@ -48,12 +51,9 @@ export default function CommitPage() {
 
 function Commit({ repo, sha }: { repo: string; sha: string }) {
   // Every stage it shows moves on its own event, as Ship's list follows them.
-  const c = useSuspenseResource(`ship/commit/${repo}/${sha}`, (s) => shipApi.commit(repo, sha, s), {
-    pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
-  }).data;
+  const c = useSuspenseResource(`ship/commit/${repo}/${sha}`, (s) => shipCommit(repo, sha, s), DETAIL_OPTS).data;
   // What ships with it is how Ship's list folds it: the repository's commits, read as the list reads them.
-  const listed = useSuspenseResource(`ship/commits/${JSON.stringify({ repo, limit: 200 })}`, (s) => shipApi.commits({ repo, limit: 200 }, s), { pollMs: 15_000, on: ["run", "review"] }).data;
+  const listed = useSuspenseResource(`ship/commits/${JSON.stringify(LISTED(repo))}`, (s) => shipCommits(LISTED(repo), s), pageOpts(LISTED(repo))).data;
   const rides = ridesOf(listed.commits, c.sha);
   const envs = environmentsOf(c);
   const image = c.build?.image.digest ?? null;
@@ -295,32 +295,17 @@ function Runners({ detail }: { detail: ShipDetail }) {
 /** One runner: replanted, replanting, didn't replant (with why), or offline; one that didn't is retried, and either looked at, through System's own actions. Shown by its label (docs/machines.md), asked for by its name. */
 function Runner({ runner }: { runner: { name: string; state: string; why: string } }) {
   const shown = labelOf(runner.name, useLabels());
-  const [busy, setBusy] = React.useState<"retry" | "diagnose" | null>(null);
   const [said, setSaid] = React.useState<string | null>(null);
   const [found, setFound] = React.useState<RunnerFinding[] | null>(null);
-  const retry = async () => {
-    setBusy("retry");
-    try {
-      await api.upgradeRunner(runner.name);
-      setSaid("Its upgrade started again.");
-      invalidate("ship/");
-      invalidate("updates");
-    } catch (e) {
-      toast({ title: `Couldn't retry ${shown}`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
-    }
-  };
-  const diagnose = async () => {
-    setBusy("diagnose");
-    try {
-      setFound((await api.diagnoseRunner(runner.name)).findings);
-    } catch (e) {
-      toast({ title: `Couldn't diagnose ${shown}`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
-    }
-  };
+  const [retry, retrying] = useAction(async () => {
+    await api.upgradeRunner(runner.name);
+    setSaid("Its upgrade started again.");
+    invalidate("ship/");
+    invalidate("updates");
+  }, `Couldn't retry ${shown}`);
+  const [diagnose, diagnosing] = useAction(async () => {
+    setFound((await api.diagnoseRunner(runner.name)).findings);
+  }, `Couldn't diagnose ${shown}`);
   const state = replantGlyph(runner.state);
   return (
     <li data-state={state}>
@@ -331,11 +316,11 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
       {runner.state === "failed" || runner.state === "offline" ? (
         <span className="ship-commit__acts">
           {runner.state === "failed" && (
-            <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void retry()}>
+            <Button size="xs" variant="secondary" pending={retrying} onClick={retry}>
               Retry
             </Button>
           )}
-          <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void diagnose()}>
+          <Button size="xs" variant="secondary" pending={diagnosing} onClick={diagnose}>
             Diagnose
           </Button>
         </span>

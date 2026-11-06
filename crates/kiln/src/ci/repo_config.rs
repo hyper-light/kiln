@@ -13,15 +13,16 @@
 //! the rules it runs under.
 
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use kiln_ci::policy::Policy;
 use kiln_ci::wf::GithubWorkflows;
-use parking_lot::Mutex;
 use serde::Deserialize;
 
 use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -90,7 +91,10 @@ impl RepoConfig {
 /// How long a repository's settings are read again at most.
 const FRESH: Duration = Duration::from_secs(20);
 
-static CACHE: Mutex<Option<HashMap<String, (Instant, RepoConfig)>>> = Mutex::new(None);
+/// Each repository's settings as last read, by its id: read without a lock by every run planned and
+/// every call that asks (goal 5, plan 01a1a59c2aae step 2), one read again swapped in whole with the
+/// others' pointers (`crate::rcu`).
+static CACHE: LazyLock<Rcu<HashMap<String, (Instant, Arc<RepoConfig>)>>> = LazyLock::new(Rcu::default);
 
 /// The first of `names` that trunk (the default branch of the repository kiln hosts, else of its
 /// mirror) has: its name and contents.
@@ -134,10 +138,10 @@ pub async fn lock_policy(hub: &Hub, repo: &Repo) -> Result<kiln_ci::lock::verify
 /// The repository's settings, from its mirror's default branch; none when there is no file or it
 /// can't be read (which is logged).
 pub async fn load(hub: &Hub, repo: &Repo) -> RepoConfig {
-    if let Some((at, c)) = CACHE.lock().get_or_insert_with(HashMap::new).get(&repo.id)
+    if let Some((at, c)) = CACHE.load().get(&repo.id)
         && at.elapsed() < FRESH
     {
-        return c.clone();
+        return RepoConfig::clone(c);
     }
     let mut config = RepoConfig::default();
     if let Some((name, text)) = trunk_file(hub, repo, &[".kiln/config.yaml", ".kiln/config.yml"]).await {
@@ -146,7 +150,10 @@ pub async fn load(hub: &Hub, repo: &Repo) -> RepoConfig {
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's CI settings can't be read; using the server's"),
         }
     }
-    CACHE.lock().get_or_insert_with(HashMap::new).insert(repo.id.clone(), (Instant::now(), config.clone()));
+    let (now, kept) = (Instant::now(), Arc::new(config.clone()));
+    CACHE.update(|m| {
+        m.insert(repo.id.clone(), (now, Arc::clone(&kept)));
+    });
     config
 }
 

@@ -9,6 +9,7 @@ import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, Flag, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import type { RefusedMessages } from "@/api/types";
+import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { newestFirst, refusedCounts, refusedFlag, refusedWhen, whatWhy } from "@/views/refused";
 import { agentLabel, hasOwnName, modelLabel } from "./derive";
@@ -82,6 +83,20 @@ function TurnTook({ ms }: { ms: number }) {
   );
 }
 
+/** How long a setting picked here shows as picked before its agent says it back (most do at once). */
+const SAID_BACK_MS = 3500;
+
+/**
+ * A setting as the head shows it: picked here, at once (W21-R15), until its agent says it back, or
+ * hasn't within a while (then as the agent has it; a command still waiting says so, asked.tsx).
+ */
+function usePicked(said: string): [string, (v: string) => void] {
+  const [picked, setPicked] = React.useState<{ v: string; at: number } | null>(null);
+  const now = useClock(picked ? 1000 : 60_000);
+  if (picked && (picked.v === said || now - picked.at > SAID_BACK_MS)) setPicked(null);
+  return [picked ? picked.v : said, (v) => setPicked({ v, at: Date.now() })];
+}
+
 export function AgentHeader({
   info,
   state,
@@ -148,28 +163,58 @@ export function AgentHeader({
   // While a switch to another harness waits, how it will run there: the permissions and effort it
   // carries over, named by that harness, set once it's there; the old harness's limits aren't its.
   const switching = state?.switching;
+  // Each setting picked shows at once, before its agent says it back.
+  const [mode, pickMode] = usePicked(switching ? (switching.mode ?? "") : (state?.mode ?? info?.mode ?? ""));
+  // A switch waiting shows as that harness's model (its own default, for none).
+  const [model, pickModel] = usePicked(switching ? modelIn(switching.kind, switching.model) : (state?.model ?? info?.model ?? ""));
+  const [effort, pickEffort] = usePicked(switching ? (switching.effort ?? "") : (state?.effort ?? ""));
+  const [speed, pickSpeed] = usePicked(state?.speed ?? "");
   const line: RunSettingsProps = {
     className: "ag-run",
     modes: switching ? (switching.modes ?? []) : (meta?.modes ?? []),
-    mode: switching ? (switching.mode ?? "") : (state?.mode ?? info?.mode ?? ""),
-    onMode: !switching && features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
+    mode,
+    onMode:
+      !switching && features.includes("set_mode")
+        ? (m) => {
+            pickMode(m);
+            send({ type: "set_mode", mode: m });
+          }
+        : undefined,
     modeCanReapply: permissionsLive && running,
     models: meta?.models ?? [],
-    // A switch waiting shows as that harness's model (its own default, for none).
-    model: switching ? modelIn(switching.kind, switching.model) : (state?.model ?? info?.model ?? ""),
+    model,
     onModel:
       features.includes("set_model") || features.includes("switch_harness")
-        ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m })
+        ? (m, kind) => {
+            // One in another harness is a switch, which says itself how it goes (`switching`).
+            if (kind && kind !== info?.kind) {
+              send({ type: "set_model", model: m, kind });
+              return;
+            }
+            pickModel(m);
+            send({ type: "set_model", model: m });
+          }
         : undefined,
     harness: switching?.kind ?? info?.kind,
     modelLabel,
     efforts: switching ? (switching.efforts ?? []) : (meta?.efforts ?? []),
-    effort: switching ? (switching.effort ?? "") : (state?.effort ?? ""),
-    onEffort: !switching && (features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0) ? (e) => send({ type: "set_effort", effort: e }) : undefined,
+    effort,
+    onEffort:
+      !switching && (features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0)
+        ? (e) => {
+            pickEffort(e);
+            send({ type: "set_effort", effort: e });
+          }
+        : undefined,
     // The bolt, where the model goes faster: a speed is its harness's own, so none while a switch waits.
     speeds: switching ? [] : (meta?.speeds ?? []),
-    speed: state?.speed ?? "",
-    onSpeed: features.includes("set_speed") ? (s) => send({ type: "set_speed", speed: s }) : undefined,
+    speed,
+    onSpeed: features.includes("set_speed")
+      ? (v) => {
+          pickSpeed(v);
+          send({ type: "set_speed", speed: v });
+        }
+      : undefined,
     speedBlocked: state?.speed_blocked,
     speedCooldown: state?.speed_cooldown,
     appliesNextTurn: nextTurn,
@@ -198,8 +243,9 @@ export function AgentHeader({
     },
     { on: usage || refusals },
   );
-  // The kind is said beside a label that isn't the kind's own name.
-  const label = info ? agentLabel(info) : "Agent";
+  // The kind is said beside a label that isn't the kind's own name. A name given here shows at once.
+  const own = info && { ...info, name: actions.name };
+  const label = own ? agentLabel(own) : "Agent";
   const named = Boolean(info && label.toLowerCase() !== info.kind_name.trim().toLowerCase());
 
   return (
@@ -220,8 +266,8 @@ export function AgentHeader({
       {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">
         <div className="ag-id">
-          {actions.renaming && info ? (
-            <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
+          {actions.renaming && own ? (
+            <NameField value={hasOwnName(own) ? own.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
           ) : (
             <h1 className="ag-title">
               <button
@@ -229,9 +275,10 @@ export function AgentHeader({
                 className="ag-title-btn"
                 onClick={actions.startRenaming}
                 disabled={!info}
-                aria-label={info && hasOwnName(info) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
+                {...sendingProps(actions.naming)}
+                aria-label={own && hasOwnName(own) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
               >
-                <span className={info && !hasOwnName(info) ? "ag-title-unnamed" : undefined}>{label}</span>
+                <span className={own && !hasOwnName(own) ? "ag-title-unnamed" : undefined}>{label}</span>
               </button>
             </h1>
           )}
@@ -257,7 +304,7 @@ export function AgentHeader({
               <SquareTerminal size={15} aria-hidden="true" />
             </RoundButton>
           )}
-          <RoundButton label={actions.live ? "End the agent" : "Remove the agent"} tone="danger" className="ag-wide" onClick={actions.end}>
+          <RoundButton label={actions.live ? "End the agent" : "Remove the agent"} tone="danger" className="ag-wide" {...sendingProps(actions.removing)} onClick={actions.end}>
             <Power size={15} aria-hidden="true" />
           </RoundButton>
           {actions.menu(

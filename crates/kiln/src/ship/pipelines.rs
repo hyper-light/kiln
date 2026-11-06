@@ -55,7 +55,7 @@ struct Env {
 
 impl Env {
     async fn read(hub: &Hub) -> Env {
-        let has = |e: &str| hub.agents.lock().values().any(|a| a.connected && a.facts.as_deref().is_some_and(|f| kiln_ci::sched::routing::has_executor(f, e)));
+        let has = |e: &str| hub.agents.load().values().any(|a| a.connected && a.facts.as_deref().is_some_and(|f| kiln_ci::sched::routing::has_executor(f, e)));
         let (firecracker, shards) = (has("firecracker"), has("shards"));
         Env {
             rules: crate::ci::routing::sources(hub).await.effective(),
@@ -99,7 +99,15 @@ impl Model {
             return;
         }
         let (me, hub) = (Arc::clone(self), Arc::clone(hub));
-        let mut rx = hub.events.subscribe();
+        let mut rx = match hub.subscribe_events() {
+            Ok(rx) => rx,
+            Err(e) => {
+                // Asked again at the next listen.
+                tracing::warn!(error = %e, "Pipelines can't follow kiln's events now");
+                self.listening.store(false, Ordering::Release);
+                return;
+            }
+        };
         crate::rt::spawn(async move {
             use futures::FutureExt as _;
             // Which repository each run heard of is: a job's frame names only its run.

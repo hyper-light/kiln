@@ -2,7 +2,7 @@ Subject: The shared crates by name, at the copy of hyper-raft beside the bus
 Why: Focal builds its bus against its own snapshots of hyper-raft's crates (vendor/hyper-* in Focal's tree). Quiver takes hyper-raft once, at the revision the bus takes (vendor/hyper-raft), and kiln holds one copy of each hyper-light product: the bus names the shared crates as from crates.io, and the root manifest of whoever builds it (Quiver's, or kiln's) points each name at its one copy with [patch.crates-io].
 
 diff --git a/Cargo.toml b/Cargo.toml
-index ee16a970797537669206569f13ee74a34598a6bb..5e5475eb89b35946531620ad6e24694ed51db546 100644
+index 9045d672f06113f520fa7a405fa882a605e5076e..f8340bead9846a8ad0f242039cdb997f06a772df 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -45,36 +45,36 @@ postcard = { version = "1.1", features = ["alloc", "use-std"] }

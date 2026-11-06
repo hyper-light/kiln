@@ -75,7 +75,13 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::ui::StreamDown>();
     c.visit::<super::ui::StreamUp>();
     c.visit::<super::ui::CdLogDown>();
+    // An agent session's older pages, and what its lean events held back (docs/wire.md, "Windows").
+    c.visit::<super::ui::TimelinePage>();
+    c.visit::<super::ui::HeldBack>();
+    c.visit::<super::ui::HeldLines>();
     c.visit::<super::events::ServerEvent>();
+    c.visit::<super::events::EventsDown>();
+    c.visit::<super::events::EventsUp>();
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();
     c.visit::<crate::workspace::git::Picked>();
@@ -199,6 +205,11 @@ pub fn hand_written(ui_src: &Path, generated: &Path, names: &[String]) -> Vec<St
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            // The browser protocol's codec is made from Rust too (kiln-bp's own types, which share
+            // some names with these: docs/browser-protocol.md).
+            if text.starts_with("// Made from kiln-bp's Rust types") {
+                continue;
+            }
             for (n, line) in text.lines().enumerate() {
                 let l = line.trim_start();
                 let l = l.strip_prefix("export ").unwrap_or(l);

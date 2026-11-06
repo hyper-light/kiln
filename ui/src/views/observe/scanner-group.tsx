@@ -13,11 +13,12 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { scanningGroupRes, standardPatternsRes } from "./parts";
+import { HeldFields, scanningGroupRes, standardPatternsRes, useOpening } from "./parts";
 
 const BLANK: ScanningGroupIn = { name: "", filter: { query: "" }, is_enabled: true, rules: [] };
 const REPLACEMENTS: { value: ScanReplacement; label: string }[] = [
@@ -80,49 +81,45 @@ function Existing({ id }: { id: string }) {
 function Editor({ initial, id }: { initial: ScanningGroupIn; id?: string }) {
   const patterns = useRes(standardPatternsRes).data;
   const [g, setG] = React.useState<ScanningGroupIn>(() => ({ name: initial.name, description: initial.description, filter: initial.filter, is_enabled: initial.is_enabled, rules: initial.rules }));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening();
   const navigate = useNavigate();
-  const save = async () => {
-    setBusy(true);
-    try {
-      const saved = id ? await observeApi.updateScanningGroup(id, g) : await observeApi.createScanningGroup(g);
-      invalidate("observe/scanner/groups");
-      invalidate(`observe/scanner/group/${saved.id}`);
-      toast({ title: id ? "Saved" : "Made", description: `${saved.name}: records taken from now are scanned by it.`, tone: "succeeded" });
-      if (!id) navigate(`/observe/scanner/${encodeURIComponent(saved.id)}`);
-    } catch (e) {
-      toast({ title: "Couldn't save it", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const saved = id ? await observeApi.updateScanningGroup(id, g) : await observeApi.createScanningGroup(g);
+    invalidate("observe/scanner/groups");
+    invalidate(`observe/scanner/group/${saved.id}`);
+    toast({ title: id ? "Saved" : "Made", description: `${saved.name}: records taken from now are scanned by it.`, tone: "succeeded" });
+    if (!id && opening.still()) await navigate(`/observe/scanner/${encodeURIComponent(saved.id)}`);
+  }, "Couldn't save it");
   return (
     <form
+      ref={opening.ref}
       className="space-y-8"
       onSubmit={(e) => {
         e.preventDefault();
-        if (g.name.trim()) void save();
+        if (g.name.trim()) save();
       }}
     >
-      <div className="grid max-w-[860px] grid-cols-1 gap-3 sm:grid-cols-2">
-        <TextField label="Name" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} placeholder="payments" required />
-        <TextField
-          label="Filter"
-          value={g.filter.query}
-          onChange={(e) => setG({ ...g, filter: { query: e.target.value } })}
-          placeholder="service:checkout"
-          hint="A log search: the records it scans. Empty, every record."
-          className="font-mono"
-          spellCheck={false}
-        />
-      </div>
-      <Rules rules={g.rules} patterns={patterns} onChange={(rules) => setG({ ...g, rules })} />
+      <HeldFields held={saving && !id} className="space-y-8">
+        <div className="grid max-w-[860px] grid-cols-1 gap-3 sm:grid-cols-2">
+          <TextField label="Name" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} placeholder="payments" required />
+          <TextField
+            label="Filter"
+            value={g.filter.query}
+            onChange={(e) => setG({ ...g, filter: { query: e.target.value } })}
+            placeholder="service:checkout"
+            hint="A log search: the records it scans. Empty, every record."
+            className="font-mono"
+            spellCheck={false}
+          />
+        </div>
+        <Rules rules={g.rules} patterns={patterns} onChange={(rules) => setG({ ...g, rules })} />
+      </HeldFields>
       <TryIt group={g} />
       <div className="flex justify-end gap-2">
         <Button variant="ghost" asChild>
           <Link to="/observe/scanner">Cancel</Link>
         </Button>
-        <Button type="submit" disabled={busy || !g.name.trim()}>
+        <Button type="submit" disabled={!g.name.trim()} pending={saving}>
           {id ? "Save" : "Make the group"}
         </Button>
       </div>
@@ -377,16 +374,19 @@ function RuleDialog({ rule, patterns, adding, onClose, onSave }: { rule: Scannin
 
 function TryIt({ group }: { group: ScanningGroupIn }) {
   const [message, setMessage] = React.useState("");
-  const [out, setOut] = React.useState<{ r: PipelineResult } | { error: string } | null>(null);
-  const run = async () => {
+  const [result, setResult] = React.useState<{ of: { group: ScanningGroupIn; message: string }; out: { r: PipelineResult } | { error: string } } | null>(null);
+  const [run, running] = useAction(async () => {
+    const of = { group, message };
     try {
       // Its rules on the message: which records its filter picks is another question.
       const [r] = await observeApi.tryScanner({ ...group, name: group.name.trim() || "tried", is_enabled: true, filter: { query: "" } }, [{ message }]);
-      setOut(r ? { r } : { error: "no record came back" });
+      setResult({ of, out: r ? { r } : { error: "no record came back" } });
     } catch (e) {
-      setOut({ error: errorMessage(e) });
+      setResult({ of, out: { error: errorMessage(e) } });
     }
-  };
+  });
+  // Shown only under what it tried: one that comes after an edit was of what was there before (W21-R15).
+  const out = result && result.of.group === group && result.of.message === message ? result.out : null;
   const tags = out && "r" in out ? Object.entries(out.r.attributes) : [];
   return (
     <Panel eyebrow="Try it" title="A message through its rules" description="As they are now, saved or not, whatever the filter picks: nothing is kept, and a hash is the one this kiln makes.">
@@ -399,7 +399,7 @@ function TryIt({ group }: { group: ScanningGroupIn }) {
           className="font-mono"
           spellCheck={false}
         />
-        <Button variant="secondary" disabled={!message.trim()} onClick={() => void run()}>
+        <Button variant="secondary" disabled={!message.trim()} pending={running} onClick={run}>
           Try it
         </Button>
       </div>

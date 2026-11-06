@@ -59,7 +59,7 @@ impl Owned {
     }
 
     /// Messages that create the thing: whoever they are sent to owns it from then on.
-    fn creates(msg: &ServerMsg) -> bool {
+    pub fn creates(msg: &ServerMsg) -> bool {
         matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. } | ServerMsg::HarnessPackage { .. } | ServerMsg::Assign(_) | ServerMsg::AssignV2 { .. })
     }
 }
@@ -136,7 +136,7 @@ pub struct InstanceView {
     pub can_upgrade: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Instances {
     by_peer: HashMap<PeerId, Instance>,
     announced: HashMap<PeerId, InstanceHello>,
@@ -366,16 +366,27 @@ impl Instances {
         self.owner(what).filter(|p| self.by_peer.get(p).is_some_and(|i| i.name == name))
     }
 
+    /// The runner process of machine `name` a message about `what` goes to: the one that holds it,
+    /// else the newest ([`Instances::route`], without making it an owner).
+    pub fn reaches(&self, name: &str, what: &Owned) -> Option<PeerId> {
+        self.owner_on(name, what).or_else(|| self.newest(name))
+    }
+
     pub fn route(&mut self, name: &str, msg: &ServerMsg) -> Option<PeerId> {
-        let what = Owned::of(msg);
-        let held = what.as_ref().filter(|_| !Owned::creates(msg)).and_then(|w| self.owner_on(name, w));
-        let peer = held.or_else(|| self.newest(name))?;
-        if let Some(w) = what
+        let peer = self.routes(name, msg)?;
+        if let Some(w) = Owned::of(msg)
             && Owned::creates(msg)
         {
             self.owners.insert(w, peer);
         }
         Some(peer)
+    }
+
+    /// Where [`Instances::route`] sends `msg`, without making anyone the owner of what it creates:
+    /// all a message that creates nothing needs, read without changing these.
+    pub fn routes(&self, name: &str, msg: &ServerMsg) -> Option<PeerId> {
+        let held = Owned::of(msg).filter(|_| !Owned::creates(msg)).and_then(|w| self.owner_on(name, &w));
+        held.or_else(|| self.newest(name))
     }
 
     pub fn views(&self, name: &str, count: impl Fn(PeerId) -> (usize, usize, usize)) -> Vec<InstanceView> {
@@ -509,6 +520,32 @@ mod tests {
         assert_eq!(m.newest("box"), Some(20));
         assert!(m.crowded().is_empty());
         Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2: where a message goes is read off the processes' copy, without
+    /// changing it (`routes`), the same as `route` sends it; only a message creating what it's about
+    /// makes its process the holder, which `routes` leaves to `route`.
+    #[test]
+    fn g5_routes_reads_where_route_sends_and_makes_no_holder() {
+        let mut m = Instances::default();
+        m.join(10, "box", hello("old"), 1);
+        m.announce(20, ih("0199-new", 100));
+        m.join(20, "box", hello("new"), 2);
+        let open = ServerMsg::TermOpen { session: "t1".into(), cols: 80, rows: 24, command: None };
+        let input = ServerMsg::TermInput { session: "t1".into(), data: vec![] };
+        // Not held yet: both go to the newest, and reading where an open goes makes no holder.
+        assert_eq!(m.routes("box", &open), Some(20));
+        assert_eq!(m.owner(&Owned::Terminal("t1".into())), None);
+        // An older process holds it: what's about it goes there, read or routed alike.
+        m.own(Owned::Terminal("t1".into()), 10);
+        assert_eq!(m.routes("box", &input), Some(10));
+        assert_eq!(m.route("box", &input), Some(10));
+        assert_eq!(m.routes("other", &input), None);
+        // Opened again, it's the newest's from then on: `route` makes it so, `routes` only says where.
+        assert_eq!(m.routes("box", &open), Some(20));
+        assert_eq!(m.owner(&Owned::Terminal("t1".into())), Some(10));
+        assert_eq!(m.route("box", &open), Some(20));
+        assert_eq!(m.owner(&Owned::Terminal("t1".into())), Some(20));
     }
 
     #[test]

@@ -213,8 +213,11 @@ pub fn claim(id: &str) -> bool {
 /// ended. `waiter`, the agent that waits, if one does: the wait ends early once a message from
 /// another agent waits behind its turn ([`mail`]).
 pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: Duration, waiter: Option<&Waiter>) -> Value {
-    // Listening before the first look: a change between the two isn't missed.
-    let mut events = hub.events.subscribe();
+    // Listening before the first look: a change between the two isn't missed. An agent's info changing,
+    // or its end, is on its owner's lane of the sessions' events (`Hub::harness_events`; goal 4, plan
+    // 01a1a59c2a9c step 5), each lane holding its share of what the hub's ring held. None to be had (the
+    // runtime's channels all in use): it looks again at each `RECHECK`.
+    let mut events = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes())).ok();
     let started = Instant::now();
     let timeout = timeout.min(MAX);
     let first: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
@@ -249,6 +252,10 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
             if rest.is_zero() {
                 break;
             }
+            let Some(events) = events.as_mut() else {
+                crate::rt::sleep(rest).await;
+                break;
+            };
             match crate::rt::timeout(rest, events.recv()).await {
                 Ok(Ok(ev)) if ids.iter().map(String::as_str).chain(waiter.map(|w| w.id.as_str())).any(|id| ev.contains(id)) => break,
                 Ok(Ok(_)) => {}
@@ -376,19 +383,19 @@ mod tests {
                 let hub = crate::hub::tests::scratch_hub().await?;
                 let there = crate::harness::registry::Location::Machine("elsewhere".into());
                 for id in ["at-work", "waiter"] {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), status: Status::Running, ..Info::default() }), since: None });
+                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), status: Status::Running, ..Info::default() }), since: None }).await;
                 }
                 let item = |id: String, text: &str| QueueItem { id, text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
                 let queue = |items: Vec<QueueItem>| Update::State { state: Box::new(State { status: Status::Running, queue: items, ..State::default() }) };
                 let ids = ["at-work".to_owned()];
-                hub.harness.ingest(&hub, &there, "waiter", queue(vec![item("m1".into(), "From a person: later.")]));
+                hub.harness.ingest(&hub, &there, "waiter", queue(vec![item("m1".into(), "From a person: later.")])).await;
                 let me = Waiter::of(&hub, "waiter");
                 let t = Instant::now();
                 let quiet = wait(&hub, &ids, Until::Settled, false, Duration::from_millis(600), Some(&me)).await;
                 anyhow::ensure!(quiet.get("timed_out") == Some(&json!(true)) && t.elapsed() >= Duration::from_millis(600), "a person's message waits for the turn: {quiet}");
                 let peer = item(crate::harness::queued::from_agent("01a15c10306176b4a096f6c8d3100c54"), "Which commit has the fix?");
                 // In its queue when it starts waiting: it ends at once.
-                hub.harness.ingest(&hub, &there, "waiter", queue(vec![item("m1".into(), "From a person: later."), peer.clone()]));
+                hub.harness.ingest(&hub, &there, "waiter", queue(vec![item("m1".into(), "From a person: later."), peer.clone()])).await;
                 let t = Instant::now();
                 let early = wait(&hub, &ids, Until::Settled, false, Duration::from_secs(30), Some(&me)).await;
                 anyhow::ensure!(early.get("done") == Some(&json!(false)) && early.get("timed_out") == Some(&json!(false)) && t.elapsed() < Duration::from_secs(5), "{early}");
@@ -397,11 +404,11 @@ mod tests {
                 let other = wait(&hub, &ids, Until::Settled, false, Duration::from_millis(300), None).await;
                 anyhow::ensure!(other.get("timed_out") == Some(&json!(true)), "{other}");
                 // Coming during the wait: woken by it, well before the next look.
-                hub.harness.ingest(&hub, &there, "waiter", queue(vec![]));
+                hub.harness.ingest(&hub, &there, "waiter", queue(vec![])).await;
                 let t = Instant::now();
                 let (woken, ()) = futures::join!(wait(&hub, &ids, Until::Settled, false, Duration::from_secs(30), Some(&me)), async {
                     crate::rt::sleep(Duration::from_millis(200)).await;
-                    hub.harness.ingest(&hub, &there, "waiter", queue(vec![peer.clone()]));
+                    hub.harness.ingest(&hub, &there, "waiter", queue(vec![peer.clone()])).await;
                 });
                 anyhow::ensure!(woken.get("timed_out") == Some(&json!(false)) && t.elapsed() < RECHECK, "{woken} after {:?}", t.elapsed());
                 Ok(())

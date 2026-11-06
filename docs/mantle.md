@@ -373,6 +373,29 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
   `try_update`), which matter to Mantle's own gate.
 - **Changes offered back** as branches are welcome, through Mantle's gates and CI like any change.
 
+As kiln vendored it (2026-11-01, CP-T10.2, on Ada's word: Mantle at the head of its main, kiln's
+one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
+
+- **Mantle** at `17eb8032`, its main's head, at `vendor/mantle`, in `vendor/MANIFEST.toml` with
+  `vendor/mantle/UPSTREAM.md`: its crates, root manifest, `Cargo.lock`, `rust-toolchain.toml`,
+  settings and scripts. Left out: its `vendor/`, `docs/`, drawings and CI (`.github/`, `.kiln/`).
+- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `0856e05`: hyper-raft's main
+  (`22d5037`) merged with Mantle's line (`0a182ae`). Mantle's crates take it by path, the change kiln
+  records to Mantle's manifests (`vendor/patches/mantle/0001-…`), and Mantle's code states the two
+  limits main added as they were before them (`0002-…`). Quiver (`ba41732`) and Focal's bus
+  (`9aded7cd`) build on the same copy.
+- **aws-lc-rs:** 1.18.2, kiln's release, at `vendor/aws-lc-rs`, with Mantle's changes, which apply
+  unchanged on 1.18.2. kiln's root and Mantle's `[patch.crates-io]` both point at it.
+- **aws-lc-sys** stays crates.io's 0.46.0. Of Mantle's four changes to its 0.45.0, 0.46.0 holds the
+  RNDR and RDRAND retries. Mantle's jitter-entropy and system-library defaults are set as Mantle's
+  are, by `AWS_LC_SYS_NO_JITTER_ENTROPY=1` and `AWS_LC_SYS_USE_SYSTEM=0` in kiln's
+  `.cargo/config.toml` (Ada's word, 2026-11-03). Its fallback to the operating system's random
+  bytes, a change to AWS-LC's C, waits until `scripts/vendor.py` takes a crates.io package
+  (`vendor/aws-lc-rs/UPSTREAM.md`).
+- **Toolchain:** kiln builds Mantle's crates on its own (stable 1.99.1). Mantle's gate (`clippy
+  --workspace --all-targets --all-features -- -D warnings`) passes in kiln's copy on it.
+- `python3 scripts/vendor.py check` holds each copy to its upstream and its recorded changes.
+
 ### Order
 
 - R1, R2 and R3 are phase B; R4 is served with phase B. R5's keys are phase B ("the key authority
@@ -392,15 +415,38 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
 
 ### What it means for kiln
 
-- **CP-T10.2** keeps kiln's bytes in mantle-chunk's `Volume` directly, kiln keeping its own map of
-  objects to chunks (as its local store does with today's CAS), until R1's embedded node exists;
-  `Volume`'s API will change under it (STATUS items 4–5), and it's one device, one copy.
-- **Vendoring Mantle** moves kiln to hyper-raft 2b13b15 (Mantle's copy, by `[patch]` in kiln's
-  root) and to Mantle's patched aws-lc-rs, once Ada decides the version.
-- **A node needs a shard of its own** while it runs its engine beside its transport: kiln's
-  latency-sensitive tasks stay off it.
-- **Through S3** (kiln's `s3` store against Mantle's listener, phase B), kiln's SHA-256 etags map
-  as they do against any S3.
+- **CP-T10.2:** kiln's bytes can go to a Mantle cell over Mantle's native protocol:
+  `kiln::blobs::mantle::MantleBlobs`, kiln-seams' `Blobs` on the vendored `mantle-client`, on
+  hyper-rt, opted into with `[blobs] store = "mantle"` (docs/blobs.md, "The Mantle store"). It's a
+  client of a cell kiln doesn't run: no node starts inside kiln (R1), and production's store stays
+  as it is until Ada moves it.
+- **One revision:** Mantle `17eb8032` builds on kiln's hyper-raft `0856e05` and aws-lc-rs 1.18.2
+  (Vendoring, above), so the client links the hyper-rt, transport and TLS kiln already links.
+- **What it keeps where:** a key's object is a pointer, naming its content's SHA-256, its size and
+  its bytes' native ETag, to bytes kept once by their SHA-256; Mantle's preconditions on the
+  pointer make the seam's conditional writes, and uploads in parts are kept in the cell until
+  they complete.
+- **Through S3** (kiln's `s3` store against Mantle's listener): not yet. At `17eb8032` the listener
+  answers CopyObject and UploadPartCopy `501` and keeps no metadata kiln sets, and kiln's S3 store
+  needs both (docs/blobs.md, "The S3 store"). The native store needs neither.
+- **What the client leaves to kiln:** asking again a request whose answer was lost, and telling
+  whether it had been applied. mantle-client's docs say an ask again with its identity is answered
+  from what it made; at 17eb8032 that holds for a native upload's Finish, not for a put, which the
+  Name range judges afresh (it knows a write again by the file its gateway wrote), so kiln reads
+  the key (docs/blobs.md, "Asked again"). Mantle's to say whether a put's identity should hold.
+- **Custody (W27-R08; the Transfers plan's step 12):** puts and whole reads are signed for as every
+  store's are, by SHA-256, and an object changed in the cell is refused and its break recorded.
+- **Shown** (11-03, on adacachy: a cell of three release-built Mantle processes on loopback,
+  `crates/kiln/tests/mantle_blobs.rs`): kiln-seams' Blobs suite, 163 of 163 clauses over native
+  QUIC in 214 s, BLOBS-90's 1001 objects in 58 s; again with each mutation's first answer lost
+  (chaos `mantle_lost`), 163 of 163 in 296 s, BLOBS-90 in 104 s, no upload left open; and the
+  W27-R08 custody test: a put and its read back walk as hand-on and receipt by SHA-256, and bytes
+  changed in the cell are refused and the break recorded.
+- **Not yet:** collecting the bytes no pointer names and the uploads left open; `Full` for a cell
+  out of space (it's `Unavailable`, with Mantle's status). Placement, repair, scrub and moving
+  production's bytes are T10's, and Ada's to decide.
+- **A node needs a shard of its own** while it runs its engine beside its transport, once R1's
+  embedded node exists: kiln's latency-sensitive tasks stay off it.
 
 ### Agreed next
 

@@ -32,6 +32,30 @@ test("Files and the Conversation are the dropdown's first sections after its rep
   await expect(row.locator(".rv-thread .rv-m", { hasText: "can fail on a bad expression" })).toBeVisible();
 });
 
+test("an agent's reply reads as the agent for its person, and each seal says who signed it (W26-R18, W27-R04)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  const thread = row.locator(".rv-thread").first();
+  const agent = thread.locator(".rv-m", { hasText: "keeps the leg's name" });
+  await expect(agent.locator(".rv-by")).toContainText("Review agent");
+  await expect(agent.locator(".rv-for")).toHaveText("for kim");
+  await expect(agent.locator(".rv-seal")).toHaveAttribute("title", "signed by Review agent for kim");
+  await expect(thread.locator(".rv-m", { hasText: "can fail on a bad expression" }).locator(".rv-seal")).toHaveAttribute("title", "signed by kim");
+  const sam = thread.locator(".rv-m", { hasText: "It names the axis already" });
+  await expect(sam.locator(".rv-seal")).toHaveAttribute("title", "unsigned");
+  await expect(sam.locator(".rv-for")).toHaveCount(0);
+  // One shape: the agent's reply's line stands as a person's reply's does.
+  const [a, s] = [await agent.locator(".rv-meta").boundingBox(), await sam.locator(".rv-meta").boundingBox()];
+  expect(a?.height).toBe(s?.height);
+});
+
+test("a thread a version answered says which version fixed it, as a suggestion says it was applied (W26-R18)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  // kim's thread on the whole change, resolved once v2 answered it (the mock's t4).
+  const done = row.locator(".rv-thread[data-done='1']", { hasText: "fixed in v2" });
+  await expect(done).toHaveCount(1);
+  await expect(done.locator(".rv-done")).toHaveText(/^\d+ · resolved.* · fixed in v2$/);
+});
+
 test("nothing in Files or the Conversation scrolls sideways but a comment's code, which keeps each line on one line, at every width (W21-AC01)", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   await expect(row.locator(".md-code-body").first()).toBeVisible();
@@ -86,8 +110,9 @@ test("reply, resolve, change a kind, delete", async ({ page }) => {
 });
 
 test("apply a suggestion makes a revision", async ({ page }) => {
-  // The mock keeps what each project writes, so the suggestion this applies is its own.
-  const tag = test.info().project.name;
+  // The mock keeps what each run writes, so the suggestion this applies is its own: its tag names the project and the run (a --repeat-each pass, a retry).
+  const { project, repeatEachIndex, retry } = test.info();
+  const tag = `${project.name} ${repeatEachIndex}.${retry}`;
   const row = await open(page, "pipeline: dynamic matrices");
   const thread = row.locator(".rv-thread").first();
   await thread.locator(".rv-btn", { hasText: "Reply" }).click();
@@ -123,10 +148,10 @@ test("a conflict resolves where it falls and commits", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   const cf = row.locator(".rv-cf").first();
   await expect(cf).toBeVisible();
-  await cf.locator(".rv-seg button", { hasText: "this" }).click();
+  await cf.getByRole("button", { name: "Take D41" }).click();
   await expect(cf).toHaveAttribute("data-done", "1");
   const second = row.locator(".rv-cf").nth(1);
-  await second.locator(".rv-seg button", { hasText: "main" }).click();
+  await second.getByRole("button", { name: "Take main" }).click();
   const commit = row.locator(".rv-btn", { hasText: "Commit resolution" });
   await expect(commit).toBeEnabled();
   await commit.click();
@@ -147,8 +172,8 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   await expect(text).toContainText("conflict 1/2");
   await expect(text).toContainText("this change");
   await expect(text).toContainText("a person takes it");
-  for (const take of [/^main$/, /^this$/, /^both$/, /^agent's$/]) {
-    await text.locator(".rv-seg button", { hasText: take }).click();
+  for (const take of ["Take main", "Take D41", "Both", "Use the agent's"]) {
+    await text.getByRole("button", { name: take, exact: true }).click();
     await expect(text).toHaveAttribute("data-done", "1");
     await text.getByRole("button", { name: "Undo" }).click();
     await expect(text).not.toHaveAttribute("data-done", "1");
@@ -161,8 +186,8 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   const binary = row.locator(".rv-cf").nth(1);
   await expect(binary).toContainText("binary file changed on both sides");
   await expect(binary).not.toContainText("<<<<<<<");
-  await expect(binary.locator(".rv-seg button", { hasText: /^both$/ })).toHaveCount(0);
-  await binary.locator(".rv-seg button", { hasText: /^this$/ }).click();
+  await expect(binary.getByRole("button", { name: "Both", exact: true })).toHaveCount(0);
+  await binary.getByRole("button", { name: "Take D41" }).click();
   await expect(binary).toHaveAttribute("data-done", "1");
   await expect(row.getByRole("button", { name: /^Approve/ })).toHaveCount(0);
   // The commit makes the revision; the conflicts go and Approve is back in its place.
@@ -170,4 +195,118 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   await expect(commit).toHaveCount(0);
   await expect(row.locator(".rv-cf")).toHaveCount(0);
   await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
+});
+
+test("the conflict ladder: a rung's line at one height, its tested resolution, Use the agent's, then Accept resolutions (W26-R17)", async ({ page }) => {
+  await page.request.post("/api/mock/review", { data: { conflicts: true, ladder: "held", ladder_tests: "pending" } });
+  const row = await open(page, "pipeline: dynamic matrices");
+  const text = row.locator(".rv-cf").first();
+  for (const cf of [text, row.locator(".rv-cf").nth(1)]) if ((await cf.getAttribute("data-done")) === "1") await cf.getByRole("button", { name: "Undo" }).click();
+  // Under test: the line says so, and Use the agent's is drawn but disabled, saying why.
+  const line = text.locator(".rv-rung");
+  await expect(line).toContainText("testing…");
+  const use = text.getByRole("button", { name: "Use the agent's" });
+  await expect(use).toBeVisible();
+  // Disabled, not hidden, until its tests pass; its title says why (the rung line).
+  await expect(use).toBeDisabled();
+  await expect(use).toHaveAttribute("title", /testing…/);
+  const before = await line.boundingBox();
+  const buttonsBefore = await text.locator(".rv-cfb").boundingBox();
+  // Its tests pass: the same line, the same height, now passed; the resolution shows with its explanation.
+  await page.request.post("/api/mock/review", { data: { ladder_tests: "passed", emit: { type: "conflict", diff: "D41" } } });
+  await expect(line).toContainText("✓ its tests passed");
+  expect((await line.boundingBox())?.height).toBe(before?.height);
+  await expect(text.locator('.rv-cfs[data-side="offered"]')).toContainText("14 passed");
+  await expect(use).toBeEnabled();
+  // The binary file's rung kept the markers, and its Use is disabled, saying why.
+  const binary = row.locator(".rv-cf").nth(1);
+  await expect(binary.locator(".rv-rung")).toContainText("kept the markers");
+  await expect(binary.getByRole("button", { name: "Use kiln's" })).toBeDisabled();
+  expect((await text.locator(".rv-cfb").boundingBox())?.height).toBe(buttonsBefore?.height);
+  // Offered: the gate row's Accept resolutions makes the new version, and the conflicts go.
+  await page.request.post("/api/mock/review", { data: { ladder: "offered", emit: { type: "conflict", diff: "D41" } } });
+  const accept = row.getByRole("button", { name: "Accept resolutions" });
+  await expect(accept).toBeVisible();
+  await accept.click();
+  await expect(row.locator(".rv-cf")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
+});
+
+test("Files says how fresh the change is, and Update stays in place, disabled with why, for a diff (W26-R16)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  const fresh = row.locator(".rv-bar[data-fresh]");
+  await expect(fresh.locator(".rv-k[data-k='fresh']")).toHaveText(/^replays clean on main@[0-9a-f]{6}$/);
+  // A replay runs no checks of its own: they're carried, and said to be.
+  await expect(fresh.locator(".rv-k[data-k='checks']")).toHaveText("checks from v1");
+  const update = fresh.getByRole("button", { name: /^Update/ });
+  await expect(update).toBeVisible();
+  await expect(update).toBeDisabled();
+  await expect(update).toHaveAttribute("title", "a diff has no branch: its replay is its latest revision");
+  // It sits on the gate row's line beneath, inside the section: nothing pokes out sideways.
+  const [bar, sec] = await Promise.all([fresh.boundingBox(), row.locator(".rv-s").first().boundingBox()]);
+  expect(bar && sec && bar.x >= sec.x - 1 && bar.x + bar.width <= sec.x + sec.width + 1).toBeTruthy();
+});
+
+test("a change's line ends with how fresh it is, and Ship's rows keep one height (W26-R16)", async ({ page }) => {
+  // Since W26-R29 Ship's rows are repositories: a change's line is on its own page.
+  const list = (await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string; message: string }[] };
+  const c = list.commits.find((x) => x.message === "sched: fair shares");
+  expect(c).toBeTruthy();
+  await page.goto(`/ship/${c?.repo}/${c?.sha}`);
+  await expect(page.getByRole("region", { name: "Commit", exact: true }).locator(".ship-commit__line")).toHaveText(/ · replays clean on main@4c1e2a$/);
+  await page.goto("/ship");
+  await expect(page.locator(".ship-row").first()).toBeVisible();
+  const heights = await page.locator(".ship-row:not(.ship-open) .ship-main").evaluateAll((els) => els.slice(0, 6).map((e) => Math.round(e.getBoundingClientRect().height)));
+  expect(new Set(heights).size).toBe(1);
+});
+
+test("a host's pull request says how fresh it is, and Update goes: it says it's updating on GitHub and no box moves (W26-R16)", async ({ page }, info) => {
+  // Stills for the person, when asked for (E2E_STILLS: a folder): before and after Update.
+  const still = async (what: string) => {
+    if (process.env.E2E_STILLS) await page.screenshot({ path: `${process.env.E2E_STILLS}/w26-r16-${info.project.name}-${what}.png` });
+  };
+  // The mock is shared across projects: a press before this one has finished updating first.
+  await expect.poll(async () => (await (await page.request.get("/api/ci/repos/hyper-light%2Fkiln/pulls/5/fresh")).json())?.update?.can, { timeout: 15_000 }).toBe(true);
+  const row = await open(page, "Faster builds");
+  const fresh = row.locator(".rv-bar[data-fresh]");
+  const words = fresh.locator(".rv-k[data-k='fresh'] b");
+  await expect(words).toHaveText("replays clean on main@4c1e2a");
+  const update = fresh.getByRole("button", { name: /^Update/ });
+  await expect(update).toBeEnabled();
+  // Every box of the open item, frame by frame: left, top, width, height (a text's width may change).
+  const boxes = () =>
+    row.evaluate(
+      (el) =>
+        new Promise<string[][]>((done) => {
+          const frames: string[][] = [];
+          const parts = [...el.querySelectorAll(".rv-bar, .rv-bar button, .rv-k, .rv-s > *")];
+          const one = () => {
+            frames.push(
+              parts.map((p) => {
+                const b = p.getBoundingClientRect();
+                const r = { left: b.left + scrollX, top: b.top + scrollY, width: b.width, height: b.height };
+                const fixed = p.matches(".rv-k[data-k='fresh']")
+                  ? `${Math.round(r.left)},${Math.round(r.top)},-,${Math.round(r.height)}`
+                  : `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`;
+                return fixed;
+              }),
+            );
+            if (frames.length < 20) requestAnimationFrame(one);
+            else done(frames);
+          };
+          requestAnimationFrame(one);
+        }),
+    );
+  // Centred, so the phone's still shows the row clear of the waiting-agent dock at the bottom.
+  await fresh.evaluate((e) => e.scrollIntoView({ block: "center" }));
+  const before = await boxes();
+  await still("1-before-update");
+  await update.click();
+  await expect(words).toHaveText("updating on GitHub");
+  await expect(update).toBeDisabled();
+  await expect(update).toHaveAttribute("title", "updating on GitHub");
+  const after = await boxes();
+  await still("2-updating");
+  const first = before[0];
+  for (const f of [...before, ...after]) expect(f).toEqual(first);
 });

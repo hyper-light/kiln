@@ -496,8 +496,9 @@ impl Server {
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
         let mut env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
         // The copy of its tree over there is this agent's, for the rules that keep copies
-        // (docs/reach.md §5.1).
-        if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
+        // (docs/reach.md §5.1); and the run is the agent's work, at its priority, synced or not
+        // (docs/priority.md).
+        if !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
             env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
         }
         let req = RunReq {
@@ -1857,7 +1858,7 @@ mod tests {
                     let asked: Value = serde_json::from_str(&json).unwrap_or_default();
                     let raw = asked.clone();
                     let answer = match serde_json::from_value::<crate::reach::Question>(asked.clone()) {
-                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw).await) }).unwrap_or_default(),
+                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw, None).await) }).unwrap_or_default(),
                         Err(e) => json!({"error": format!("unknown reach question: {e}")}),
                     };
                     if let Ok(b) = crate::reach::wire::frame(&Ev::Answer(answer.to_string())) {
@@ -1880,8 +1881,8 @@ mod tests {
         use crate::wire::unread::Kept;
         let hub = crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.agents.lock().insert("box".into(), crate::hub::tests::live_runner("box", "linux", "x86_64"));
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             Ok(hub)
         })?;
         let dir = tempfile::tempdir()?;

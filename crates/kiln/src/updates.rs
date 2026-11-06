@@ -435,7 +435,7 @@ pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::loc
 }
 
 /// The binary kept for `target` as a stream, with what kiln knows of it.
-pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, async_channel::Receiver<bytes::Bytes>)> {
+pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, crate::memory::queue::Receiver<bytes::Bytes>)> {
     let b = stored(hub, target)?;
     let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), Some(b.sha256.clone()), 0, b.size.saturating_sub(1));
     Some((b, rx))
@@ -1651,13 +1651,17 @@ pub fn from_words(hub: &Hub, b: &Binary) -> String {
 
 pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
     let mine = own_build();
-    let mut out: Vec<RunnerInfo> = hub
-        .agent_list()
-        .await
-        .into_iter()
-        // Outposts aren't installed, so there's nothing of them to upgrade.
-        .filter(|a| !a.ephemeral && !a.outpost)
-        .map(|a| {
+    // Each runner's record a piece of this turn, which ends its poll once it's over: each finds the runner's processes
+    // by a look through the terminals and the sessions, and every runner's was made in one poll, with the runners' list
+    // before them (the fleet's loop every minute: 0.3 to 0.6 ms on the CPU in each of rt9's rounds; goal 9, plan
+    // 01a1a87b2cec step 3). Begun before the list's reads, the turn is over with the first record made after them.
+    let mut turns = crate::rt::Turns::new();
+    let listed = hub.agent_list().await;
+    let mut out: Vec<RunnerInfo> = Vec::with_capacity(listed.len());
+    // Outposts aren't installed, so there's nothing of them to upgrade.
+    for a in listed.into_iter().filter(|a| !a.ephemeral && !a.outpost) {
+        turns.end().await;
+        out.push({
             let instances = hub.runner_processes(&a.name);
             let newest = instances.iter().find(|i| i.newest);
             let build = newest.and_then(|i| i.build.clone());
@@ -1688,8 +1692,8 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 waits_on: None,
                 checkout: None,
             }
-        })
-        .collect();
+        });
+    }
     out.sort_by(|a, b| b.connected.cmp(&a.connected).then_with(|| a.name.cmp(&b.name)));
     // Against the newest kiln, when there is one: the commit each runs, and how it gets there.
     let newest = hub.updates.fleet.target();
@@ -1864,7 +1868,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     }
     // A runner that upgrades blue/green is through once it says its new build took over.
     let blue_green = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| i.caps & crate::proto::CAP_BLUE_GREEN != 0)
     };
     let held: Vec<String> = if blue_green { hub.harness.list().into_iter().filter(|i| i.target == format!("agent:{machine}")).map(|i| i.id).collect() } else { Vec::new() };
@@ -2722,7 +2726,7 @@ mod tests {
     /// next one can start.
     #[test]
     fn an_upgrade_neither_waits_on_a_full_uplink_nor_outlives_itself() -> anyhow::Result<()> {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
         let up = crate::exec::Uplink(tx);
         let line = |l: &str| AgentMsg::UpgradeLog { job: "j".into(), line: l.into() };
         up.say(line("downloading"));

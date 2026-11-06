@@ -28,7 +28,7 @@ impl PtyIo {
         Handle
     }
 
-    pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
+    pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) {
         let Self { mut reader, mut writer } = self;
         // PTY → channel. Keeps draining after the consumer is gone: an undrained pseudoconsole
         // blocks both the shell and ClosePseudoConsole.
@@ -105,6 +105,6 @@ impl Handle {
 }
 
 /// Never reached on Windows ([`crate::os::reclaim_fd`] yields nothing to adopt).
-pub fn adopt(_fd: (), _pid: u32, _foreign: bool, _out: async_channel::Sender<PtyOut>, _input: async_channel::Receiver<Vec<u8>>) -> Handle {
+pub fn adopt(_fd: (), _pid: u32, _foreign: bool, _out: crate::memory::queue::Sender<PtyOut>, _input: crate::memory::queue::Receiver<Vec<u8>>) -> Handle {
     Handle
 }

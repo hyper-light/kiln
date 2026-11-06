@@ -2,7 +2,9 @@
 //! store, the network and the runners. Each workstream owns its submodules (docs/ci.md §5.2) and
 //! adds one line here and one arm in [`api`].
 
+pub mod about;
 pub mod actions;
+pub mod agent_fixes;
 pub mod api;
 pub mod attach;
 pub mod attest;
@@ -16,6 +18,7 @@ pub mod cli;
 pub mod code;
 pub mod compare;
 pub mod conflicts;
+pub mod fresh;
 pub mod cr;
 pub mod deploy_step;
 pub mod dependency_sources;
@@ -35,6 +38,7 @@ pub mod images;
 pub mod inbox;
 pub mod pools;
 pub mod insights;
+pub mod ladder;
 pub mod land;
 pub mod lands;
 pub mod integrations;

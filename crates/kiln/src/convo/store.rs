@@ -8,8 +8,14 @@
 //! reaches the server's (`super::feed`).
 //!
 //! The engine is behind [`Engine`]: Turso ([`super::turso`]).
+//!
+//! What waits for the writer is bounded in bytes ([`Queue`]; goal 11, plan 01a1a87b2e56 step 3): the bytes
+//! the writer commits in [`COMMIT_MS`] at the rate it has committed, so a row sent is kept within about
+//! that, as this store says of its updates. Past the bound whoever sends rows waits for the writer
+//! ([`Store::room`], [`Store::put_wait`]): nothing is dropped (conversations are durable state: nothing
+//! about a session is said before it's kept, plan 01a17197).
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -19,15 +25,12 @@ use serde::{Deserialize, Serialize};
 use super::rows::{self, EventRow, Row};
 use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkeeping};
 use crate::harness::core::Update;
-use crate::harness::session::Sink;
+use crate::harness::session::{Sink, Taken};
 
 /// How long a row waits for others to share its commit.
 pub const COMMIT_MS: u64 = 50;
 /// Rows that make a commit at once, however soon.
 pub const COMMIT_ROWS: usize = 2048;
-/// Updates waiting for the writer, at most: one that can't keep up (a stuck disk) drops what
-/// comes, saying so, rather than holding sessions back or growing without bound.
-pub const QUEUE: usize = 65_536;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
 /// The most sessions [`Store::ended`] answers a page.
@@ -279,7 +282,8 @@ pub trait Engine: Send + 'static {
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
 
 enum Msg {
-    Rows(Vec<Row>),
+    /// Rows, and the bytes [`Queue`] counts them at.
+    Rows(Vec<Row>, usize),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
     Run(Job),
     /// Commit what was sent before, let go of the file ([`Engine::release`]) and stop.
@@ -293,10 +297,90 @@ fn notify(watchers: &Watchers) {
     watchers.lock().unwrap_or_else(PoisonError::into_inner).retain(|w| !matches!(w.try_send(()), Err(async_channel::TrySendError::Closed(_))));
 }
 
+/// What waits for the writer, in bytes, and the most it may hold (goal 11, plan 01a1a87b2e56 step 3).
+/// Lockless: atomics, and an event the writer tells as it commits.
+#[derive(Default)]
+pub struct Queue {
+    /// Bytes of rows sent and not yet committed (`Row::bytes`).
+    bytes: AtomicUsize,
+    /// Bytes committed, and the microseconds their commits took: the writer's measured rate.
+    written: AtomicU64,
+    took_us: AtomicU64,
+    /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
+    /// was an event-listener `Event`, its list behind a `Mutex`).
+    room: crate::rt::Changed,
+    /// The most any sender may let wait past [`Queue::bound`] before it waits itself ([`Store::room_within`]),
+    /// for what `/metrics` says the queue may hold.
+    within: AtomicUsize,
+}
+
+impl Queue {
+    /// The most that may wait: what the writer commits in [`COMMIT_MS`] (the most a row waits to share a
+    /// commit) at the rate it has committed so far, so what's sent is kept within about that. None measured
+    /// yet: nothing past what's sent while the queue is empty.
+    pub fn bound(&self) -> usize {
+        let (written, took) = (self.written.load(Ordering::Relaxed), self.took_us.load(Ordering::Relaxed));
+        if took == 0 {
+            return 0;
+        }
+        let wait_us = u128::from(COMMIT_MS).saturating_mul(1000);
+        usize::try_from(u128::from(written).saturating_mul(wait_us) / u128::from(took)).unwrap_or(usize::MAX)
+    }
+
+    /// Bytes waiting now.
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Whether more may be sent: the queue is empty, or under its bound.
+    fn has_room(&self) -> bool {
+        self.has_room_within(0)
+    }
+
+    /// Whether more may be sent by one that may let `most` wait: the queue is empty, or under its bound or `most`.
+    fn has_room_within(&self, most: usize) -> bool {
+        let b = self.bytes();
+        b == 0 || b <= self.bound().max(most)
+    }
+
+    fn took(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        crate::memory::CONVO_QUEUE.add(bytes);
+    }
+
+    /// `bytes` counted as waiting for the writer, for a test of what waits on the queue.
+    #[cfg(test)]
+    pub(crate) fn pretend_waiting(&self, bytes: usize) {
+        self.took(bytes);
+    }
+
+    /// `bytes` the writer let go of, for a test of what waits on the queue.
+    #[cfg(test)]
+    pub(crate) fn pretend_written(&self, bytes: usize) {
+        self.let_go(bytes, None);
+    }
+
+    /// `bytes` committed in `took` (or let go of, the writer gone): their room is the senders' again.
+    fn let_go(&self, bytes: usize, took: Option<Duration>) {
+        if let Some(d) = took {
+            self.written.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+            self.took_us.fetch_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+        }
+        let mut now = self.bytes.load(Ordering::Relaxed);
+        while let Err(seen) = self.bytes.compare_exchange_weak(now, now.saturating_sub(bytes), Ordering::Relaxed, Ordering::Relaxed) {
+            now = seen;
+        }
+        crate::memory::CONVO_QUEUE.sub(bytes);
+        crate::memory::CONVO_QUEUE.bound_at(self.bound().max(self.within.load(Ordering::Relaxed)));
+        self.room.notify();
+    }
+}
+
 /// A handle to a machine's store: cheap to clone, usable from any thread.
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::SyncSender<Msg>,
+    tx: mpsc::Sender<Msg>,
+    queue: Arc<Queue>,
     id: Arc<str>,
     meter: Arc<Meter>,
     watchers: Watchers,
@@ -307,14 +391,15 @@ pub struct Store {
 impl Store {
     /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
     pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
+        let (tx, rx) = mpsc::channel::<Msg>();
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
         let hold = Arc::new(AtomicI64::new(i64::MAX));
-        let (w, m, h) = (watchers.clone(), meter.clone(), Arc::clone(&hold));
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h))?;
-        Ok(Self { tx, id, meter, watchers, hold })
+        let queue: Arc<Queue> = Arc::default();
+        let (w, m, h, q) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue));
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?;
+        Ok(Self { tx, queue, id, meter, watchers, hold })
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -336,7 +421,7 @@ impl Store {
     /// Blocking, for `READ_WAIT` at most.
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
-        self.tx.send_wait(Msg::Close(rtx)).map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+        self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
         rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
     }
 
@@ -356,24 +441,77 @@ impl Store {
         self.put(rows::of(session, update, crate::util::now_ms()));
     }
 
-    /// Rows to be committed with the next batch. Never blocks: when the writer can't keep up,
-    /// they're dropped and counted.
+    /// Rows to be committed with the next batch. Never blocks and never drops them: whoever sends
+    /// waits for [`Store::room`] after (a store over its bound holds its senders back, not their rows).
+    /// Lost only when the writer has stopped (counted, said).
     pub fn put(&self, rows: Vec<Row>) {
         if rows.is_empty() {
             return;
         }
-        if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(Msg::Rows(rows)) {
+        let bytes = rows.iter().map(Row::bytes).sum();
+        self.queue.took(bytes);
+        if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
+            self.queue.let_go(bytes, None);
             let n = self.meter.dropped();
             if (n - 1).is_power_of_two() {
-                tracing::warn!(dropped = n, "conversation store: the writer can't keep up; updates were dropped");
+                tracing::warn!(dropped = n, "conversation store: its writer has stopped; updates were dropped");
             }
         }
     }
 
-    /// Rows to be committed with the next batch, waiting up to `READ_WAIT` for room: false when
-    /// they couldn't be handed over (whoever sends them sends them again). Blocking.
+    /// Rows to be committed with the next batch, then waiting, up to `READ_WAIT` (a writer stuck, its
+    /// disk say, holds a sender no longer), while the store is over its bound ([`Queue`]): false when
+    /// they couldn't be handed over (its writer has stopped: whoever sends them sends them again).
+    /// Blocking: for a thread of its own.
     pub fn put_wait(&self, rows: Vec<Row>) -> bool {
-        rows.is_empty() || self.tx.send_wait(Msg::Rows(rows)).is_ok()
+        if rows.is_empty() {
+            return true;
+        }
+        let bytes = rows.iter().map(Row::bytes).sum();
+        self.queue.took(bytes);
+        if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
+            self.queue.let_go(bytes, None);
+            return false;
+        }
+        let until = Instant::now() + READ_WAIT;
+        while !self.queue.has_room() && Instant::now() < until {
+            let listener = self.queue.room.listen();
+            if self.queue.has_room() {
+                break;
+            }
+            let _ = listener.wait_deadline(until);
+        }
+        true
+    }
+
+    /// Waits while more waits for the writer than its bound ([`Queue`]): whoever sent rows waits here
+    /// after, so a burst waits for the writer rather than growing without bound or being dropped. A
+    /// task's wait (the thread goes on with others).
+    pub async fn room(&self) {
+        self.room_within(0).await;
+    }
+
+    /// [`Store::room`] for a sender whose updates' rows may wait as long as `most` bytes of them: what would wait
+    /// for room in its own queues otherwise. Goal 10, plan 01a1a87b2dae step 5: a sessions' owner waited for room
+    /// (the bound, what the writer commits in [`COMMIT_MS`]) between its turns, so a disk that stalled the writer
+    /// stalled every frame and attach of every session it owned (g9p7: an update's wait for its owner 839 ms at
+    /// p99.9 in one round). Its rows now wait here instead, as long as the updates would have waited for it in its
+    /// inbox, and what hands it updates waits past that: none of them dropped, each session's in order (they come
+    /// from its one owner), and as much held as before.
+    pub async fn room_within(&self, most: usize) {
+        self.queue.within.fetch_max(most, Ordering::Relaxed);
+        while !self.queue.has_room_within(most) {
+            let listener = self.queue.room.listen();
+            if self.queue.has_room_within(most) {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    /// What waits for the writer, in bytes, and its bound.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
     }
 
     /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
@@ -382,10 +520,10 @@ impl Store {
         let (rtx, rrx) = mpsc::channel();
         let asked = Instant::now();
         self.tx
-            .send_wait(Msg::Run(Box::new(move |e| {
+            .send(Msg::Run(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
-            .map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -547,38 +685,16 @@ impl Store {
     }
 }
 
-/// Sending that waits for room, up to `READ_WAIT` (a full queue means a writer behind).
-trait SendWait {
-    fn send_wait(&self, m: Msg) -> Result<(), ()>;
-}
-
-impl SendWait for mpsc::SyncSender<Msg> {
-    fn send_wait(&self, mut m: Msg) -> Result<(), ()> {
-        let until = Instant::now() + READ_WAIT;
-        loop {
-            match self.try_send(m) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(()),
-                Err(mpsc::TrySendError::Full(back)) => {
-                    if Instant::now() >= until {
-                        return Err(());
-                    }
-                    m = back;
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    }
-}
-
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
     let mut held = hold.load(Ordering::Acquire);
     let mut pending: Vec<Row> = Vec::new();
+    // The bytes `pending` holds, as the queue counted them.
+    let mut pending_bytes = 0usize;
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
@@ -589,12 +705,16 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     let mut compacting: Option<Instant> = None;
     // When it last looked at its file for its telemetry, and counted its sessions.
     let (mut looked, mut counted): (Option<Instant>, Option<Instant>) = (None, None);
-    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
+    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, pending_bytes: &mut usize| {
         if pending.is_empty() {
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
-        match engine.apply(&rows) {
+        let began = Instant::now();
+        let applied = engine.apply(&rows);
+        // Their room is the senders' again; the time a commit took is the writer's rate (`Queue::bound`).
+        queue.let_go(std::mem::take(pending_bytes), applied.is_ok().then(|| began.elapsed()));
+        match applied {
             Ok(()) => {
                 meter.committed(rows.len());
                 notify(watchers);
@@ -608,22 +728,23 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         let got = rx.recv_timeout(wait);
         let began = Instant::now();
         match got {
-            Ok(Msg::Rows(rows)) => {
+            Ok(Msg::Rows(rows, bytes)) => {
                 pending.extend(rows);
+                pending_bytes += bytes;
                 since.get_or_insert_with(Instant::now);
                 if pending.len() >= COMMIT_ROWS {
-                    commit(&mut engine, &mut pending);
+                    commit(&mut engine, &mut pending, &mut pending_bytes);
                     since = None;
                 }
             }
             Ok(Msg::Run(f)) => {
-                commit(&mut engine, &mut pending);
+                commit(&mut engine, &mut pending, &mut pending_bytes);
                 since = None;
                 f(engine.as_mut());
                 meter.ran();
             }
             Ok(Msg::Close(reply)) => {
-                commit(&mut engine, &mut pending);
+                commit(&mut engine, &mut pending, &mut pending_bytes);
                 // Its files closed before it says so: whoever moves them next finds them let go of.
                 let released = engine.release();
                 drop(engine);
@@ -632,7 +753,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let had = !pending.is_empty();
-                commit(&mut engine, &mut pending);
+                commit(&mut engine, &mut pending, &mut pending_bytes);
                 since = None;
                 if squeezing && !had {
                     match engine.squeeze_some(SQUEEZE_BATCH) {
@@ -689,7 +810,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                commit(&mut engine, &mut pending);
+                commit(&mut engine, &mut pending, &mut pending_bytes);
                 return;
             }
         }
@@ -728,18 +849,26 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
 }
 
 /// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
-/// same room (a full `sink` holds the sessions back, as it always did).
-pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+/// same room (a full `sink` holds the sessions back, as it always did): `room` updates, whatever each
+/// carries, on a lock-free queue (goal 5, plan 01a1a59c2aae: an async-channel's wait took
+/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own). Each goes on
+/// with when it was sent in, its wait here the runner's (goal 10, plan 01a1a87b2dae step 5: `Taken`).
+pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
+    let sink: Sink = sink.into();
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
-            store.send(&id, &u);
-            if sink.send((id, u)).await.is_err() {
+        while let Ok(t) = rx.recv().await {
+            store.send(&t.session, &t.update);
+            // A store over its bound holds what passes back, rather than its rows piling up (goal 11), once they're as
+            // many as this runner's streams keep unanswered for the server (goal 10, plan 01a1a87b2dae step 5: the
+            // disk's stall held the updates, and the frames they make, before the server ever had them).
+            store.room_within(crate::wire::uplink::TOTAL_ROOM).await;
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
     });
-    tx
+    tx.into()
 }
 
 /// Where the store a [`tee_held`] keeps what passes in stands.
@@ -758,7 +887,7 @@ enum Keeping {
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
     /// The tee's way in, held weakly: the tee still ends once its senders have.
-    input: async_channel::WeakSender<(String, Update)>,
+    input: crate::memory::queue::WeakSender<Taken>,
 }
 
 impl Held {
@@ -790,24 +919,38 @@ impl Held {
 
 /// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
 /// the store wait for it in memory; never given, they go.
-pub fn tee_held(sink: Sink, store: Option<Store>, room: usize) -> (Sink, Held) {
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
+    let sink: Sink = sink.into();
+    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s, each with when it was sent in.
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
     let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
-            // Kept before it goes on, under the lock a taker waits on.
-            match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
-                Keeping::Waiting(rows) => rows.extend(rows::of(&id, &u, crate::util::now_ms())),
-                Keeping::Store(st) => st.send(&id, &u),
-                Keeping::Gone => {}
+        while let Ok(t) = rx.recv().await {
+            // Kept before it goes on, under the lock a taker waits on; then, the lock let go, a store over
+            // its bound holds what passes back (goal 11, plan 01a1a87b2e56 step 3).
+            let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+                Keeping::Waiting(rows) => {
+                    rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
+                    None
+                }
+                Keeping::Store(st) => {
+                    st.send(&t.session, &t.update);
+                    Some(st.clone())
+                }
+                Keeping::Gone => None,
+            };
+            // As [`tee`]'s: held back once its rows are as many as this runner's streams keep unanswered.
+            if let Some(st) = kept_in {
+                st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
             }
-            if sink.send((id, u)).await.is_err() {
+            // With when it was sent in, not now: its wait here was the runner's (goal 10, plan 01a1a87b2dae step 5).
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
     });
-    (tx, held)
+    (tx.into(), held)
 }
 
 /// A store on a new database in a temporary folder, for tests.
@@ -821,8 +964,8 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 /// A store whose writer has stopped: everything asked of it fails at once, for tests.
 #[cfg(test)]
 pub fn stopped() -> Store {
-    let (tx, _) = mpsc::sync_channel(1);
-    Store { tx, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+    let (tx, _) = mpsc::channel();
+    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
 }
 
 #[cfg(test)]
@@ -905,6 +1048,25 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 5: a sender that may let `most` bytes of rows wait (a sessions' owners', as many
+    /// as their inboxes hold) goes on while the queue holds no more than that, past the writer's own bound, and past it
+    /// waits until the writer lets them go; `/metrics` is told the queue may hold that much.
+    #[test]
+    fn g10_s5_a_sender_waits_only_past_what_it_may_let_wait() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        let q = store.queue();
+        // Nothing committed yet, so the writer's own bound lets nothing wait.
+        q.pretend_waiting(1_000);
+        anyhow::ensure!(!q.has_room() && q.has_room_within(1_000) && !q.has_room_within(999));
+        anyhow::ensure!(futures::FutureExt::now_or_never(store.room_within(1_000)).is_some(), "within what it may let wait: at once");
+        let mut past = Box::pin(store.room_within(999));
+        anyhow::ensure!(futures::FutureExt::now_or_never(past.as_mut()).is_none(), "past it: it waits");
+        q.pretend_written(1_000);
+        anyhow::ensure!(futures::FutureExt::now_or_never(past.as_mut()).is_some(), "the writer let them go: it goes on");
+        anyhow::ensure!(q.within.load(Ordering::Relaxed) == 1_000, "the most any sender may let wait");
+        Ok(())
+    }
+
     #[test]
     fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -921,6 +1083,92 @@ mod tests {
             st.sync()?;
             let texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
             assert_eq!(texts, vec!["before the store".to_owned(), "after it".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a tee's way in is a lock-free queue of
+    /// `room` updates. Sessions on every shard sending at once, past its room while what's after it takes
+    /// slowly, each have every update passed on once, in the order sent; its way in never holds more than its
+    /// room; and once its senders are gone and it's drained, what's after it sees the end.
+    #[test]
+    fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, 4);
+            let room = 16;
+            let (sink, held) = tee_held(out, None, room);
+            // Looked at weakly: a sender held here would keep the tee from ever ending.
+            let way_in = match &sink {
+                Sink::Stamped(q) => q.downgrade(),
+                Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
+            };
+            let (senders, per) = (8usize, 200u64);
+            let mut sending = Vec::new();
+            for t in 0..senders {
+                let sink = sink.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        if sink.send((format!("s{t}"), said(&format!("m{n}"), n, "x"))).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }));
+            }
+            drop(sink);
+            let (mut got, mut most) = (vec![Vec::<u64>::new(); senders], 0usize);
+            loop {
+                most = most.max(way_in.upgrade().map_or(0, |q| q.len()));
+                let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the tee never ended"))?;
+                let Ok((id, u)) = next else { break };
+                let t: usize = id.trim_start_matches('s').parse()?;
+                let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
+                got.get_mut(t).ok_or_else(|| anyhow::anyhow!("no session {t}"))?.extend(events.iter().map(|e| e.seq));
+                // Slower than its senders now and then, so they wait for room.
+                if got.iter().map(Vec::len).sum::<usize>() % 100 == 0 {
+                    crate::rt::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            for s in sending {
+                anyhow::ensure!(s.await.unwrap_or(false), "a session's update was refused");
+            }
+            for (t, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "session {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
+            anyhow::ensure!(held.drained(), "drained, its senders gone");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's tee passes each update on with when its session sent it in, not
+    /// when the tee got to pass it on: an update that waited in the tee, behind a sink with no room, still says when
+    /// it was taken in, so its frame counts that wait as the runner's. Into a sink that keeps no such time (the
+    /// server's), it passes on as it always did.
+    #[test]
+    fn g10_s5_a_tee_passes_each_update_on_with_when_it_was_taken_in() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, 1);
+            let (sink, _held) = tee_held(out, None, 16);
+            anyhow::ensure!(matches!(sink, Sink::Stamped(_)), "its way in notes when");
+            sink.send(("a1".to_owned(), said("m1", 1, "fills what's after the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let before = Instant::now();
+            sink.send(("a1".to_owned(), said("m2", 2, "waits in the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let sent = Instant::now();
+            // The tee holds the second while what's after it has no room.
+            let waited = Duration::from_millis(30);
+            crate::rt::sleep(waited).await;
+            let first = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            let second = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            anyhow::ensure!(first.session == "a1" && matches!(&second.update, Update::Events { events } if events.first().is_some_and(|e| e.id == "m2")), "in order: {first:?} {second:?}");
+            anyhow::ensure!(before <= second.at && second.at <= sent, "taken in as it was sent, not as the tee passed it on");
+            anyhow::ensure!(second.at.elapsed() >= waited, "its wait in the tee is counted from then");
+            // Into a sink of plain updates, as before.
+            let (plain, got) = async_channel::unbounded();
+            let (sink, _held) = tee_held(plain, None, 16);
+            sink.send(("a2".to_owned(), said("m3", 3, "plain"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let (id, u) = crate::rt::timeout(Duration::from_secs(5), got.recv()).await??;
+            anyhow::ensure!(id == "a2" && u == said("m3", 3, "plain"), "passed on as it came");
             Ok(())
         })
     }
@@ -1059,6 +1307,41 @@ mod tests {
         store.sync()?;
         assert_eq!(store.record("live", "cc", 0, 10)?.len(), 2);
         assert!(store.marks("old")?.is_empty());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a burst several times the queue's bound waits for the writer
+    /// rather than piling up in memory: what waits never goes past the bound by more than the one put that
+    /// found it full, nothing is lost, and every event is kept, in order.
+    #[test]
+    fn g11_s3_a_burst_past_the_bound_waits_for_the_writer_and_loses_nothing() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        // The writer's first commit measures its rate: until then the bound is none past an empty queue.
+        assert!(store.put_wait(rows::of("burst", &said("m0", 0, "the first"), crate::util::now_ms())));
+        let _ = store.kept("burst", 1)?;
+        let first = store.queue().bound();
+        anyhow::ensure!(first > 0, "the writer's rate wasn't measured");
+        let text = "a reply of a few hundred words, ".repeat(40);
+        let one = rows::of("burst", &said("m1", 1, &text), 0).iter().map(Row::bytes).sum::<usize>();
+        // Sent until it's four times the bound as the writer's rate settles (the bound grows with it), within
+        // what a test takes.
+        let (mut sent, mut most, mut bound, mut n) = (0usize, 0usize, first, 0u64);
+        while (sent <= bound.saturating_mul(4) || n < 2_000) && n < 200_000 {
+            n += 1;
+            let i = n;
+            let rows = rows::of("burst", &said(&format!("m{i}"), i, &text), crate::util::now_ms());
+            let bytes: usize = rows.iter().map(Row::bytes).sum();
+            sent += bytes;
+            // What waits as this put goes in: what put_wait left, and this put's rows.
+            most = most.max(store.queue().bytes() + bytes);
+            bound = bound.max(store.queue().bound());
+            assert!(store.put_wait(rows));
+        }
+        assert!(sent > 3 * bound, "the burst ({sent} bytes) wasn't past the bound ({bound} bytes) for long");
+        assert!(most <= bound + one, "{most} bytes waited, past the bound ({bound}) and one put ({one})");
+        let all = store.events("burst", None, usize::try_from(n + 1)?)?;
+        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), (0..=n).collect::<Vec<_>>(), "every event kept, in order");
+        assert_eq!(store.queue().bytes(), 0, "nothing waits once it's all read back");
         Ok(())
     }
 

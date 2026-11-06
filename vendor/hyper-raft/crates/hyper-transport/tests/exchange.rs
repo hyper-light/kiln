@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hyper_transport::{
-    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, Unprompted, probes_within,
+    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, RestartKey, Unprompted,
+    probes_within,
 };
 
 const PERIOD: Duration = Duration::from_secs(2);
@@ -71,6 +72,20 @@ where
     connected_from(pair, limits, budget, source, |_| {})
 }
 
+/// Node 1 and node 2 connected on the network `build` makes of them.
+fn connected_through<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    build: impl FnOnce(Instant, Node<A>, Node<B>) -> Net<Node<A>, Node<B>>,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_with(pair, limits, budget, |_| {}, build)
+}
+
 /// [`connected_on`], node 2 prepared by `prepare` before node 1 dials it.
 fn connected_from<A, B>(
     pair: &Pair,
@@ -78,6 +93,24 @@ fn connected_from<A, B>(
     budget: u64,
     source: hyper_sim::Source,
     prepare: impl FnOnce(&mut Node<B>),
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_with(pair, limits, budget, prepare, |now, a, b| {
+        Net::of(now, a, b, source)
+    })
+}
+
+/// Node 1 and node 2 connected on the network `build` makes, node 2 prepared by `prepare` before
+/// node 1 dials it.
+fn connected_with<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    prepare: impl FnOnce(&mut Node<B>),
+    build: impl FnOnce(Instant, Node<A>, Node<B>) -> Net<Node<A>, Node<B>>,
 ) -> Net<Node<A>, Node<B>>
 where
     A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
@@ -106,7 +139,7 @@ where
     a.set_oracle(true);
     b.set_oracle(true);
     prepare(&mut b);
-    let mut net = Net::of(now, a, b, source);
+    let mut net = build(now, a, b);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
     let (mut one, mut two) = (false, false);
@@ -605,10 +638,73 @@ fn exchanges_past_the_stream_limit_wait_their_turn_and_the_table_is_bounded() {
     assert_eq!(server.answered, 6);
 }
 
+/// A connection whose packets replies answer asks its peer to acknowledge within RFC 9000's
+/// default max_ack_delay (`Acknowledgement::Replies`, docs/transport.md §4ak): from the hundredth
+/// packet on, a reply sent 5 ms after its request carries the request's acknowledgement, where a
+/// peer asked to acknowledge within a quarter of the round trip sent one alone at its 1 ms
+/// granularity, ahead of the reply. Twenty exchanges asked in turn take 40 datagrams of the
+/// asker's and 21 of the server's; decimated, 61 and 41.
+#[test]
+fn a_reply_carries_its_requests_acknowledgement() {
+    let pair = Pair::new();
+    let exchanges = |acknowledgement: hyper_transport::Acknowledgement| -> (u64, u64) {
+        let mut limits = limits();
+        limits.acknowledgement = acknowledgement;
+        let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+        let (mut asker, mut server) = (Asker::new(), Server::new());
+        server.think = Duration::from_millis(5);
+        let mut ask = |net: &mut Net<Node<Mantle>, Node<Mantle>>, seed: u8| {
+            asker
+                .ask(
+                    &mut net.a,
+                    net.now,
+                    2,
+                    (Kind::Get, Class::Request),
+                    seed,
+                    Some(100),
+                    PERIOD,
+                )
+                .unwrap();
+            for _ in 0..TURNS {
+                net.exchange();
+                asker.drive(&mut net.a);
+                server.now = Some(net.now);
+                server.serve(&mut net.b);
+                if asker.finished() {
+                    return;
+                }
+                net.exchange();
+                net.advance_within(Duration::from_millis(1));
+            }
+            panic!("exchange {seed} never answered");
+        };
+        // Past the hundredth packet each way, where either asks its peer how to acknowledge.
+        for seed in 0..60 {
+            ask(&mut net, seed);
+        }
+        let before = net.datagrams;
+        for seed in 60..80 {
+            ask(&mut net, seed);
+        }
+        (net.datagrams[0] - before[0], net.datagrams[1] - before[1])
+    };
+    let (asks, sent) = exchanges(hyper_transport::Acknowledgement::Replies);
+    assert!(
+        asks <= 42 && sent <= 22,
+        "the server sent {sent} datagrams for 20 replies and the asker {asks}"
+    );
+    let (asks, decimated) = exchanges(hyper_transport::Acknowledgement::Decimated);
+    assert!(
+        decimated >= 38,
+        "decimated, the server sent {decimated} datagrams for 20 replies (and the asker {asks})"
+    );
+}
+
 /// A pooled server holds its peer to the pool it sizes (docs/transport.md §4g): of ten exchanges
-/// asked at once on a connection that may hold sixteen, no more than the pool's three are open at
-/// the server at once; the others wait at the asker and go as streams come back, and every one
-/// completes. The asker said it was blocked (STREAMS_BLOCKED) and was granted streams for it.
+/// asked at once on a connection that may hold sixteen, no more than the pool's three and the
+/// stream the connection keeps (§4aj) are open at the server at once; the others wait at the asker
+/// and go as streams come back, and every one completes. The asker said it was blocked
+/// (STREAMS_BLOCKED) and was granted streams for it.
 #[test]
 fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
     let pair = Pair::new();
@@ -653,19 +749,22 @@ fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
             .all(|asked| asked.refused.is_none() && asked.read == 1_000)
     );
     assert_eq!(server.answered, 10);
-    assert!(most <= 3, "{most} exchanges open at once past a pool of 3");
+    assert!(
+        most <= 4,
+        "{most} exchanges open at once past a pool of 3 and the stream kept"
+    );
     let pool = net.b.stats().pool;
     assert!(pool.grants > 0, "{pool:?}");
-    assert!(pool.granted <= 3, "{pool:?}");
+    assert!(pool.granted <= 4, "{pool:?}");
 }
 
 /// A pooled server parks an exchange that waits on its owner's event (a long poll,
 /// `Classes::waits`): parked as its head arrives, it holds a stream of its own and none of the
 /// pool's, so a pool of one serves every request its peer asks while the wait is held, and the
-/// wait's stream goes with its answer (docs/transport.md §4ab). The same wait asked of a server
-/// whose classes park nothing holds the pool's one stream, and the requests behind it wait at
-/// their asker: focal's deliver run of 500 agents, each connection's long poll holding the pool,
-/// committed 10 writes a second of the 350 offered.
+/// wait's stream goes with its answer (docs/transport.md §4ab). The same waits asked of a server
+/// whose classes park nothing hold the connection's streams (the pool's one and the one it keeps,
+/// §4aj), and the requests behind them wait at their asker: focal's deliver run of 500 agents,
+/// each connection's long poll holding the pool, committed 10 writes a second of the 350 offered.
 #[test]
 fn a_parked_wait_holds_none_of_the_pool() {
     let pair = Pair::new();
@@ -714,7 +813,10 @@ fn a_parked_wait_holds_none_of_the_pool() {
     });
     let pool = net.b.stats().pool;
     assert_eq!((pool.parked, pool.parks), (1, 1), "{pool:?}");
-    assert!(pool.granted <= 1, "{pool:?}");
+    assert!(
+        pool.granted <= 2,
+        "the pool's one and the stream kept: {pool:?}"
+    );
     server.hold_replies = false;
     net.until(TURNS, |net| {
         asker.drive(&mut net.a);
@@ -728,11 +830,12 @@ fn a_parked_wait_holds_none_of_the_pool() {
         0,
         "the wait's stream went with it"
     );
-    // Not parked: the wait holds the pool's one stream, and nothing behind it is served.
+    // Not parked: two waits hold the connection's two streams, and nothing behind them is served.
     let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 1);
     let (mut asker, mut server) = (Asker::new(), Server::new());
     server.hold_replies = true;
     ask(&mut net, &mut asker, Kind::Snapshot, 0);
+    ask(&mut net, &mut asker, Kind::Snapshot, 10);
     for seed in 1..6 {
         ask(&mut net, &mut asker, Kind::Get, seed);
     }
@@ -745,7 +848,7 @@ fn a_parked_wait_holds_none_of_the_pool() {
     }
     assert_eq!(
         server.answered, 0,
-        "a request was served past the held wait"
+        "a request was served past the held waits"
     );
     assert_eq!(net.b.stats().pool.parked, 0);
 }
@@ -797,10 +900,97 @@ fn a_pooled_servers_stream_goes_back_with_the_reply() {
     );
 }
 
+/// Peers past their server's pool each keep the stream their reply gives back (docs/transport.md
+/// §4aj, the least credit Breakwater leaves a client): two connections, each asking a request at a
+/// time of a server whose pool holds one stream, never say they are blocked (STREAMS_BLOCKED) nor
+/// wait for a grant (MAX_STREAMS). Twenty exchanges take 40 datagrams of the peers' (a request and
+/// its reply's acknowledgement each) and 21 of the server's (its reply, the stream given back in
+/// it). When a connection gave back its last stream as an exchange ended with the pool overspent,
+/// its next request said it was blocked and waited for its grant: 49 and 29.
+#[test]
+fn peers_past_the_pool_each_keep_the_stream_their_reply_gives_back() {
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    let book = || pair.book(Role::Node, Role::Node);
+    let peer = |port: u16| {
+        let address: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let node = pair.node::<Pooled>(1, Role::Node, book(), pooled, 256 << 20, now);
+        (address, node)
+    };
+    let peers = Several::new(vec![peer(4433), peer(4435)]);
+    let mut server = pair.node::<Pooled>(2, Role::Node, book(), pooled, 256 << 20, now);
+    server.set_stream_pool(1).unwrap();
+    let mut net = Net::new(now, peers, server);
+    let address = net.b_address;
+    for (_, node) in &mut net.a.nodes {
+        node.connect(now, 2, address).unwrap();
+    }
+    let mut askers = [Asker::new(), Asker::new()];
+    let mut server = Server::new();
+    let drive = |askers: &mut [Asker; 2], net: &mut Net<Several<Node<Pooled>>, Node<Pooled>>| {
+        for (asker, (_, node)) in askers.iter_mut().zip(&mut net.a.nodes) {
+            asker.drive(node);
+        }
+    };
+    net.until(TURNS, |net| {
+        drive(&mut askers, net);
+        server.serve(&mut net.b);
+        askers.iter().all(|asker| asker.connected.contains(&2))
+    });
+    assert_eq!(net.b.stats().pool.connections, 2);
+    net.exchange();
+    let before = net.datagrams;
+    // What the pool granted as the peers joined (the first was welcomed to the pool's one past
+    // the stream it keeps): no grant is asked for after it.
+    let granted = net.b.stats().pool.grants;
+    let rounds = 10u8;
+    for round in 0..rounds {
+        // Each asks its next once its last is answered.
+        for (asker, (_, node)) in askers.iter_mut().zip(&mut net.a.nodes) {
+            asker
+                .ask(
+                    node,
+                    net.now,
+                    2,
+                    (Kind::Get, Class::Request),
+                    round,
+                    Some(100),
+                    PERIOD,
+                )
+                .unwrap();
+        }
+        net.until(TURNS, |net| {
+            drive(&mut askers, net);
+            server.serve(&mut net.b);
+            drive(&mut askers, net);
+            askers.iter().all(Asker::finished)
+        });
+    }
+    assert_eq!(server.answered, 2 * u64::from(rounds));
+    assert!(
+        askers
+            .iter()
+            .flat_map(|asker| &asker.asked)
+            .all(|asked| asked.refused.is_none() && asked.reply.is_some())
+    );
+    let exchanges = 2 * u64::from(rounds);
+    let asks = net.datagrams[0] - before[0];
+    let sent = net.datagrams[1] - before[1];
+    assert!(
+        asks <= 2 * exchanges + 2 && sent <= exchanges + 2,
+        "{exchanges} exchanges took {asks} datagrams of the peers' and {sent} of the server's"
+    );
+    let pool = net.b.stats().pool;
+    assert_eq!((pool.grants, pool.wanting), (granted, 0), "{pool:?}");
+}
+
 /// An asker that bounds its queue by its credit (`AskQueue::Credit`) refuses an exchange `Unsent`
 /// at once, nothing sent, when its connection already waits for as many streams as its peer grants
-/// it: asked ten at once of a pooled peer that granted it two, it holds two, queues two, and refuses
-/// the other six at `open`, and the four it took are all answered.
+/// it: asked ten at once of a pooled peer that granted it three (the pool's two and the stream it
+/// keeps), it holds three, queues three, and refuses the other four at `open`, and the six it took
+/// are all answered.
 #[test]
 fn an_asker_bounded_by_its_credit_refuses_past_a_round_of_it() {
     let pair = Pair::new();
@@ -808,7 +998,7 @@ fn an_asker_bounded_by_its_credit_refuses_past_a_round_of_it() {
     pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
     pooled.ask_queue = hyper_transport::AskQueue::Credit;
     let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 2);
-    // The pool's welcome, a grant of both its streams, reaches the asker.
+    // The pool's welcome, a grant of both its streams past the one kept, reaches the asker.
     for _ in 0..64 {
         net.exchange();
         net.advance_within(Duration::from_millis(1));
@@ -830,7 +1020,10 @@ fn an_asker_bounded_by_its_credit_refuses_past_a_round_of_it() {
             Err(other) => panic!("{other:?}"),
         }
     }
-    assert_eq!(refused, 6, "two held and two queued of a credit of two");
+    assert_eq!(
+        refused, 4,
+        "three held and three queued of a credit of three"
+    );
     net.until(TURNS, |net| {
         asker.drive(&mut net.a);
         server.serve(&mut net.b);
@@ -843,7 +1036,7 @@ fn an_asker_bounded_by_its_credit_refuses_past_a_round_of_it() {
             .iter()
             .all(|asked| asked.refused.is_none() && asked.read == 1_000)
     );
-    assert_eq!(server.answered, 4);
+    assert_eq!(server.answered, 6);
 }
 
 /// A pool sized to nothing grants no stream past the handshake's: what the asker sends past it
@@ -938,6 +1131,160 @@ fn a_peer_that_stops_answering_is_given_up_within_its_period() {
     // silence (the flight in the air and the probe timeout's probes) is no progress.
     assert!(took <= PERIOD, "given up after {took:?}");
     assert_eq!(net.a.exchange_tail(2, GRANULARITY), Some(tail * 2));
+}
+
+/// What head-only asks of `seeds` came to, of a server that thinks `think` on each and says it is at
+/// work on those of `vouch` (`Endpoint::working`) until `until` after the asks: the asker's records,
+/// how long after the asks the last ended, and the asker's and the server's counts.
+fn asked_of_a_thinking_server(
+    seeds: &[u8],
+    think: Duration,
+    vouch: &[u8],
+    until: Option<Duration>,
+) -> (
+    Vec<Asked>,
+    Duration,
+    hyper_transport::Stats,
+    hyper_transport::Stats,
+) {
+    asked_of_a_working_server(seeds, None, (think, None), vouch, until)
+}
+
+/// As [`asked_of_a_thinking_server`], each ask with a body of `body` bytes, which the server
+/// answers with one as long, and pausing it as `pause` says (`Server::pause_body`).
+fn asked_of_a_working_server(
+    seeds: &[u8],
+    body: Option<u64>,
+    (think, pause): (Duration, Option<(u64, Duration)>),
+    vouch: &[u8],
+    until: Option<Duration>,
+) -> (
+    Vec<Asked>,
+    Duration,
+    hyper_transport::Stats,
+    hyper_transport::Stats,
+) {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.think = think;
+    server.pause_body = pause;
+    server.vouch_seeds = vouch.iter().map(|&seed| u64::from(seed)).collect();
+    let began = net.now;
+    server.vouch_until = until.map(|until| began + until);
+    for &seed in seeds {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                body,
+                PERIOD,
+            )
+            .unwrap();
+    }
+    for _ in 0..TURNS {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.now = Some(net.now);
+        server.serve(&mut net.b);
+        if asker.finished() {
+            break;
+        }
+        net.exchange();
+        net.advance_within(Duration::from_millis(10));
+    }
+    assert!(asker.finished(), "{:?}", asker.asked);
+    (
+        asker.asked.clone(),
+        net.now - began,
+        net.a.stats(),
+        net.b.stats(),
+    )
+}
+
+/// A server at work past its asker's period says so, and is waited for until it answers; one that
+/// says nothing is given up as before (mantle research/77 D1). Do: ask head-only of a server that
+/// thinks five periods, saying at each turn that it is at work, and again of one that does not.
+/// Expect: answered after the five periods, its notes at most one a beat; and refused `Stalled`
+/// within two periods.
+#[test]
+fn a_server_that_says_it_is_at_work_is_waited_for_past_the_period() {
+    let think = PERIOD * 5;
+    let (asked, took, a, b) = asked_of_a_thinking_server(&[1], think, &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert!(took >= think, "{took:?}");
+    let beat = limits().serve_period / 3;
+    let most = u64::try_from(took.as_nanos() / beat.as_nanos()).unwrap() + 1;
+    assert!(
+        b.notes_made >= 1 && b.notes_made <= most,
+        "{} notes in {took:?}",
+        b.notes_made
+    );
+    assert!(a.notes_heard >= 1);
+    let (asked, took, a, b) = asked_of_a_thinking_server(&[1], think, &[], None);
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took <= PERIOD * 2, "{took:?}");
+    assert_eq!((b.notes_made, a.notes_heard), (0, 0));
+}
+
+/// A server whose notes stop is given up within a period of the last: silence past the bound is
+/// suspicion, and a note keeps an exchange through the window it starts alone (mantle research/77
+/// D1). Do: the server thinks ten periods and says it is at work through the first three. Expect:
+/// refused `Stalled` after the three periods, and before five: the last note comes within a beat
+/// of the third, a third of a period, and the window it starts is the exchange's last. Kept a
+/// window more past the note, as one the peer was just given, it was refused at six.
+#[test]
+fn a_server_whose_notes_stop_is_given_up_within_a_period_of_the_last() {
+    let (asked, took, ..) = asked_of_a_thinking_server(&[1], PERIOD * 10, &[1], Some(PERIOD * 3));
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took >= PERIOD * 3 && took < PERIOD * 5, "{took:?}");
+}
+
+/// A note keeps only the exchanges it names: one beside an exchange vouched for, on the same
+/// connection, is given up as it would be alone, so a late note for an attempt its asker gave up,
+/// on a stream of its own, keeps no other attempt (mantle research/77 D1). Do: ask two of a server
+/// that thinks five periods on both and says it is at work on the first. Expect: the first
+/// answered, the second refused `Stalled`.
+#[test]
+fn a_note_keeps_only_the_exchanges_it_names() {
+    let (asked, ..) = asked_of_a_thinking_server(&[1, 2], PERIOD * 5, &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert_eq!(asked[1].refused, Some((Refusal::Stalled, false)));
+}
+
+/// A body paused between blocks while its server's own work runs is waited for while the server
+/// says so: the case traced most, a get whose next block waits on a chunk from another node
+/// (mantle measurements/2026-10-29). Do: the server answers a 1 MiB ask at once with as much, writes
+/// 256 KiB of it and pauses four periods before the rest, once saying it is at work at each turn
+/// and once not. Expect: read whole after the pause; and refused `Stalled` within it.
+#[test]
+fn a_body_paused_while_its_server_says_it_is_at_work_is_waited_for() {
+    let pause = Some((256 << 10, PERIOD * 4));
+    let (asked, took, ..) =
+        asked_of_a_working_server(&[1], Some(1 << 20), (Duration::ZERO, pause), &[1], None);
+    assert_eq!(asked[0].refused, None, "{:?}", asked[0]);
+    assert_eq!(asked[0].read, 1 << 20);
+    assert!(took >= PERIOD * 4, "{took:?}");
+    let (asked, took, ..) =
+        asked_of_a_working_server(&[1], Some(1 << 20), (Duration::ZERO, pause), &[], None);
+    assert_eq!(asked[0].refused, Some((Refusal::Stalled, false)));
+    assert!(took < PERIOD * 4, "{took:?}");
+}
+
+/// The notes' lane is the endpoint's own: its owner's frame on it, or a hold of it, is refused.
+#[test]
+fn the_notes_lane_is_refused_to_its_owner() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let notes = hyper_transport::NOTES_LANE;
+    assert_eq!(
+        net.a.send_frame(2, notes, Kind::Append, b"x"),
+        Err(Refusal::Lanes)
+    );
+    assert_eq!(net.a.hold_lane(2, notes), Err(Refusal::Lanes));
 }
 
 /// The peer's time to answer begins when it has the request (focal's audit F38), not when this side
@@ -1263,6 +1610,75 @@ fn frames_on_a_lane_arrive_in_order() {
     }
 }
 
+/// Frames on a lane cross a path that loses 3% of its datagrams each way with its connections
+/// coded (`Limits::fec_window`): each arrives once, whole and in its order; what the coding holds
+/// is charged as it is held, and none of it is charged once the connection is gone.
+#[test]
+fn frames_on_a_lane_cross_a_lossy_path_coded_and_the_coding_is_charged() {
+    let pair = Pair::new();
+    let mut coded = limits();
+    coded.lane_window = 64;
+    coded.lanes_per_peer = 1;
+    coded.fec_window = Some(128);
+    // 2,000 frames of a kilobyte, a datagram each with the acknowledgements and the repairs, each
+    // way, twice over for retransmissions and the handshake
+    let mut net = connected_through::<Mantle, Mantle>(&pair, coded, 256 << 20, |now, a, b| {
+        Net::lossy(now, a, b, 30_000, Duration::from_millis(20), 7, 16_000)
+    });
+    let mut server = Server::new();
+    let (mut sent, mut charged) = (0u32, 0u64);
+    for round in 0..250u32 {
+        for index in 0..8u32 {
+            let mut frame = [round.to_be_bytes(), index.to_be_bytes()].concat();
+            frame.resize(1_000, u8::try_from(index).unwrap());
+            // A full lane takes the frame once it says it has room again
+            let mut tries = 0;
+            loop {
+                match net.a.send_frame(2, 0, Kind::Append, &frame) {
+                    Ok(()) => break,
+                    Err(Refusal::LaneFull) if tries < TURNS => {
+                        net.until(TURNS, |net| {
+                            server.serve(&mut net.b);
+                            events(&mut net.a)
+                                .iter()
+                                .any(|event| matches!(event, Event::LaneRoom { .. }))
+                        });
+                        tries += 1;
+                    }
+                    Err(other) => panic!("frame {round}.{index}: {other:?}"),
+                }
+            }
+            sent += 1;
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        charged = charged.max(net.a.stats().fec_charged);
+    }
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        server.frames.len() as u32 == sent
+    });
+    let order: Vec<(u32, u32)> = server
+        .frames
+        .iter()
+        .map(|(peer, lane, frame)| {
+            assert_eq!((*peer, *lane, frame.len()), (1, 0, 1_000));
+            let index = u32::from_be_bytes(frame[4..8].try_into().unwrap());
+            assert!(frame[8..].iter().all(|byte| u32::from(*byte) == index));
+            (u32::from_be_bytes(frame[..4].try_into().unwrap()), index)
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order, sorted, "the lane kept its order");
+    assert_eq!(order.len(), 2_000, "{sent} sent");
+    assert_eq!(net.a.stats().fec_refused, 0);
+    assert!(charged > 0, "the sender never coded on a path losing 3%");
+    net.a.disconnect(net.now, 2);
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    assert_eq!(net.a.stats().fec_charged, 0);
+}
+
 /// A lane frame of a kind that carries its own CRC-32C is checked by it as it arrives
 /// (`Classes::embedded_checksum`): the prefix's checksum covers only the bytes before the frame's
 /// covered span, so each byte is summed once, and a frame whose covered bytes changed after they
@@ -1560,7 +1976,15 @@ struct Slow {
 
 impl Slow {
     fn open(net: &mut Net<Node<Mantle>, Node<Mantle>>, kind: Kind, seed: u8, body: u64) -> Self {
-        let progress = hyper_transport::Progress::new(PERIOD).unwrap();
+        Self::open_waiting(net, (kind, seed, body), PERIOD)
+    }
+    /// An exchange whose asker gives its peer `period` to move it.
+    fn open_waiting(
+        net: &mut Net<Node<Mantle>, Node<Mantle>>,
+        (kind, seed, body): (Kind, u8, u64),
+        period: Duration,
+    ) -> Self {
+        let progress = hyper_transport::Progress::new(period).unwrap();
         let exchange = net
             .a
             .open(net.now, 2, kind, &[seed, 1, 2, 3], Some(body), progress)
@@ -1750,6 +2174,58 @@ fn an_owner_late_to_write_is_not_refused_by_its_own_side() {
         bulk.read(&mut net.a);
     }
     assert_eq!(refused, None, "the server saw {:?}", server.refused);
+    assert_eq!(bulk.read, bulk.body);
+}
+
+/// An owner that reads a body as it arrives, each read wanting more than had come, and then holds
+/// the rest unread for three periods while its peer fills the window, as mantle's node holds a
+/// PutObject's body while the chunks it carries go durable: the window the owner holds is this
+/// side's doing, so its side does not refuse the exchange as stalled (docs/transport.md §4al). The
+/// asker gives it eight periods, as a client waiting for its object does; one whose own period is
+/// shorter than the hold ends the exchange itself, as unread (focal's audit F38).
+#[test]
+fn an_owner_that_reads_then_holds_a_body_is_not_refused_by_its_own_side() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 1 << 30);
+    let mut server = Server::new();
+    let mut piece = vec![0u8; PIECE];
+    let mut bulk = Slow::open_waiting(&mut net, (Kind::Snapshot, 9, 8 << 20), PERIOD * 8);
+    let mut held_at = None;
+    let mut refused = None;
+    let mut turns = 0u64;
+    while !bulk.done {
+        turns += 1;
+        assert!(turns < 1_000_000, "the exchange never ended");
+        bulk.write(&mut net.a, &mut piece);
+        if held_at.is_none() && bulk.written >= 1 << 20 {
+            server.hold_bulk = true;
+            held_at = Some(net.now);
+        }
+        if held_at.is_some_and(|at| net.now - at >= PERIOD * 3) {
+            server.hold_bulk = false;
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            net.advance_within(Duration::from_millis(100));
+        }
+        while let Some(event) = net.a.poll_event() {
+            match event {
+                Event::Reply { .. } => bulk.replied = true,
+                Event::Refused {
+                    refusal, by_peer, ..
+                } => {
+                    refused = Some((refusal, by_peer));
+                    bulk.done = true;
+                }
+                _ => {}
+            }
+        }
+        bulk.read(&mut net.a);
+    }
+    assert!(held_at.is_some(), "the server never held the body");
+    assert_eq!(refused, None, "the server saw {:?}", server.refused);
+    assert!(server.refused.is_empty(), "{:?}", server.refused);
     assert_eq!(bulk.read, bulk.body);
 }
 
@@ -2658,17 +3134,21 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
     let pair = Pair::new();
     let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
     let address = net.b_address;
-    // The path is cut: node 2 hears nothing more, and the connection idles out.
+    // The path is cut: node 2 hears nothing more, node 1's keep-alive goes unacknowledged and its
+    // path is degrading (§4ai), and the connection idles out.
     net.b_dead = true;
     let told = told_until_a_holds(&mut net, 0);
     assert!(
         matches!(
             told[..],
-            [Event::Closed {
-                peer: 2,
-                epoch: 1,
-                refusal: None
-            }]
+            [
+                Event::Degrading { peer: 2, epoch: 1 },
+                Event::Closed {
+                    peer: 2,
+                    epoch: 1,
+                    refusal: None
+                }
+            ]
         ),
         "{told:?}"
     );
@@ -2721,6 +3201,195 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
         ),
         "{told:?}"
     );
+}
+
+/// A dialer is told its peer's path is degrading once nothing it sent has been acknowledged for four
+/// probe timeouts (hyper-quic's `PathDegrading`, quiche's rule; docs/transport.md §4ai), long before
+/// its idle timeout ends the connection, and progressing once the peer answers again; a path event
+/// the owner has not polled is taken away by the connection's close, which says more. Before it, an
+/// owner heard nothing of a peer that went until the idle timeout: focal's bus client kept sending
+/// to a leader killed with kill -9 for two minutes, while the group had elected another in a second
+/// (found by focal).
+#[test]
+fn a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout() {
+    let pair = Pair::new();
+    let limits = limits();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+    let mut server = Server::new();
+    events(&mut net.a);
+    // Node 2 goes, saying nothing, as a killed process does; node 1 sends it a frame.
+    net.b_dead = true;
+    let gone = net.now;
+    net.a.send_frame(2, 0, Kind::Append, b"one").unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(told[..], [Event::Degrading { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    let took = net.now - gone;
+    assert!(
+        took < limits.keep_alive.unwrap(),
+        "told {took:?} after the peer went"
+    );
+    assert_eq!(net.a.stats().connections, 1, "the connection stays open");
+    // Node 2 answers again: node 1 is told its path makes progress, and the frame arrives.
+    net.b_dead = false;
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        told.extend(events(&mut net.a));
+        !told.is_empty() && server.frames.len() == 1
+    });
+    assert!(
+        matches!(told[..], [Event::Progressing { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    // Node 2 goes again, and node 1 polls nothing until the connection idles out: the path event
+    // that waited is taken away by the close.
+    net.b_dead = true;
+    net.a.send_frame(2, 0, Kind::Append, b"two").unwrap();
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Closed {
+                peer: 2,
+                epoch: 1,
+                refusal: None
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// An endpoint restarted at its address with the key it keeps across restarts resets each connection
+/// its last run held as a packet on it arrives (RFC 9000 §10.3), as a restarted host's TCP answers
+/// with an RST: node 1, connected to node 2 and sending it only keep-alives, is told the connection
+/// closed within a keep-alive of node 2's restart, and its next dial connects. Restarted with a key
+/// of its own, as an endpoint without one is at every start, node 2 drops what comes on the old
+/// connection, its ID one the new key does not know, and node 1 is told only as the connection idles
+/// out (docs/transport.md §4ah).
+#[test]
+fn a_restarted_endpoint_resets_what_its_last_run_held() {
+    let pair = Pair::new();
+    let kept = RestartKey::from_secret(&[1; 32]).unwrap();
+    let fresh = RestartKey::from_secret(&[2; 32]).unwrap();
+    let limits = limits();
+    let keep_alive = limits.keep_alive.unwrap();
+    for (restarted_with, reset) in [(&kept, true), (&fresh, false)] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let node_2 = |restart: &RestartKey, now| {
+            pair.restartable::<Mantle>(
+                2,
+                Role::Node,
+                pair.book(Role::Node, Role::Node),
+                limits,
+                256 << 20,
+                now,
+                restart,
+            )
+        };
+        let node_1 = pair.node::<Mantle>(
+            1,
+            Role::Node,
+            pair.book(Role::Node, Role::Node),
+            limits,
+            256 << 20,
+            now,
+        );
+        let mut net = Net::new(now, node_1, node_2(&kept, now));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }
+                )
+            })
+        });
+        // Node 2's run ends with nothing said, as a process's does when it stops, and the next
+        // starts at its address.
+        net.b = node_2(restarted_with, net.now);
+        let restarted = net.now;
+        let mut told = Vec::new();
+        let mut degraded = None;
+        net.until(TURNS, |net| {
+            for event in events(&mut net.a) {
+                if matches!(event, Event::Degrading { .. }) {
+                    degraded = Some(net.now);
+                }
+                told.push(event);
+            }
+            told.iter()
+                .any(|event| matches!(event, Event::Closed { .. }))
+        });
+        let took = net.now - restarted;
+        if reset {
+            assert!(
+                matches!(
+                    told[..],
+                    [Event::Closed {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }]
+                ),
+                "{told:?}"
+            );
+            assert!(took <= keep_alive, "reset {took:?} after the restart");
+        } else {
+            // Its keep-alive unacknowledged, node 1 is told its path is degrading (§4ai) within a
+            // keep-alive and the zero path's four probe timeouts, long before the close.
+            assert!(
+                matches!(
+                    told[..],
+                    [
+                        Event::Degrading { peer: 2, epoch: 1 },
+                        Event::Closed {
+                            peer: 2,
+                            epoch: 1,
+                            ..
+                        }
+                    ]
+                ),
+                "{told:?}"
+            );
+            let degraded = degraded.unwrap() - restarted;
+            assert!(
+                degraded <= keep_alive * 2,
+                "degrading told {degraded:?} after the restart"
+            );
+            assert!(
+                took >= limits.idle_timeout - keep_alive,
+                "closed {took:?} after a restart that could not reset it"
+            );
+        }
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 2,
+                        ..
+                    }
+                )
+            })
+        });
+    }
 }
 
 /// A dial that ends after its peer connected in, and went, while the owner polled nothing is told:

@@ -24,7 +24,6 @@
 //! As each step is met, what its agent changed goes up for review as that step's diff, on the diff
 //! of the step met before it (`super::stack`): the run ends as a stack with one diff per step.
 
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -425,11 +424,13 @@ async fn load_run(hub: &Hub, run: &str) -> R<(Head, Vec<Row>)> {
 }
 
 /// One look at a run at a time (the server's, a start, a retry, a stop …), so a step's agent
-/// starts once and what's changed is changed on the run as it is.
-static LOOKING: LazyLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = LazyLock::new(Default::default);
+/// starts once and what's changed is changed on the run as it is. In the order they came: a gate per
+/// run while anyone looks or waits, gone with its last (`crate::turn::Keyed`, no lock; goal 5, plan
+/// 01a1a59c2aae, its top goal), where a map behind a `Mutex` kept async-lock's mutexes for every run.
+static LOOKING: LazyLock<crate::turn::Keyed<String, crate::turn::Gate>> = LazyLock::new(crate::turn::Keyed::new);
 
-fn looking(run: &str) -> Arc<async_lock::Mutex<()>> {
-    Arc::clone(LOOKING.lock().entry(run.to_owned()).or_default())
+fn looking(run: &str) -> crate::turn::Entry<'static, String, crate::turn::Gate> {
+    LOOKING.of(&run.to_owned())
 }
 
 /// Where a step stands, its agent as it is now.
@@ -588,7 +589,7 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         let paused = crate::goals::get(hub, to).await.is_ok_and(|s| s.state == "paused" && s.reason.is_some());
         mark_started(hub, run, row.idx, to).await?;
         crate::goals::add_at(hub, to, goal, !paused, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
-        hand_step(hub, run, head, row, to).await;
+        hand_step(hub, run, head, row, to, false).await;
         tracing::info!(%run, step = at + 1, agent = %to, "a plan step's goal goes on an agent's goal stack");
         return Ok(());
     }
@@ -628,7 +629,7 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let agent = started.map_err(|(_, m)| Error::Bad(m))?.ok_or_else(|| Error::Bad("the step's agent didn't start".into()))?;
     mark_started(hub, run, row.idx, &agent).await?;
     crate::goals::add_at(hub, &agent, goal, true, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
-    hand_step(hub, run, head, row, &agent).await;
+    hand_step(hub, run, head, row, &agent, true).await;
     tracing::info!(%run, step = at + 1, %agent, "a plan step's agent started");
     Ok(())
 }
@@ -669,8 +670,9 @@ async fn acts_for(hub: &Hub, head: &Head) -> Vec<String> {
 /// Step `row` changes hands, signed (docs/ci.md W27-R08; the Transfers plan's step 6): kiln, the
 /// run's driver, hands it to `agent`, acting for the agent that ran the plan (if one did) and its
 /// person; or, tried again after another agent had it, takes it for that one. `agent` signs its
-/// receipt as it takes the step up, at its first turn (`crate::custody::ask_receipt`).
-async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str) {
+/// receipt as it takes the step up, at its next turn (`crate::custody::ask_receipt`); `first`, an
+/// agent started for the step, whose first turn takes it up (`crate::custody::ask_first_receipt`).
+async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str, first: bool) {
     let n = row.idx + 1;
     let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
         Ok(to) => to,
@@ -686,6 +688,7 @@ async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str) {
     };
     let why = format!("step {n} of plan run {run}: {}", row.title);
     match crate::custody::hand_work(hub, step_work(run, row), &to, &why, giver).await {
+        Ok((_, bundle)) if first => crate::custody::ask_first_receipt(hub, agent, &bundle).await,
         Ok((_, bundle)) => crate::custody::ask_receipt(hub, agent, &bundle).await,
         Err(e) => tracing::warn!(target: "kiln.custody", %run, step = n, %agent, error = %format!("{e:#}"), "a plan step's hand-on wasn't kept"),
     }
@@ -734,7 +737,7 @@ pub async fn step_left(hub: &Hub, session: &str, input: &serde_json::Value) -> O
     let stack = crate::goals::get(hub, session).await.ok()?;
     let goal = match input.get("id").and_then(serde_json::Value::as_str) {
         Some(id) => stack.items.iter().find(|g| g.id == id),
-        None => stack.items.iter().find(|g| g.status == "active"),
+        None => crate::goals::under_way(&stack.items),
     }?;
     let step = goal.step.as_ref()?;
     let run = step.run.as_deref()?;
@@ -815,7 +818,7 @@ fn held_up(rows: &[Row]) -> String {
 /// person retries them, or takes them over).
 pub async fn advance(hub: &Arc<Hub>, run: &str) -> R<()> {
     let lock = looking(run);
-    let _one = lock.lock().await;
+    let _one = lock.turn().await;
     advance_locked(hub, run).await
 }
 
@@ -920,7 +923,7 @@ pub async fn drive(hub: Arc<Hub>) -> anyhow::Result<()> {
 pub async fn stop(hub: &Hub, run: &str, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (head, rows) = load_run(hub, run).await?;
         if head.state == "running" {
             for row in rows.iter().filter(|r| matches!(r.status.as_str(), "started" | "taken")) {
@@ -946,7 +949,7 @@ fn step_row(rows: &[Row], n: usize) -> R<&Row> {
 pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if seen.is_some_and(|t| t != row.tries) {
@@ -990,7 +993,7 @@ pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &
 pub async fn take(hub: &Hub, run: &str, n: usize, by: &str, person: Option<&str>, signs: bool) -> R<serde_json::Value> {
     let custody = {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (_, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if !matches!(row.status.as_str(), "started" | "unmet" | "stopped") {
@@ -1027,12 +1030,46 @@ pub async fn receipt(hub: &Hub, run: &str, n: usize, person: &str, receipt: &ser
     }
 }
 
+/// What person `person` signs, in a browser or anywhere kiln says what to sign, to receive step `n`
+/// they took over (docs/ci.md W27-R08): their receipt of the hand-on waiting for them, from whom it
+/// came, as `kiln plans take` builds it, said as `custody::to_sign` says it.
+pub async fn receipt_statement(hub: &Hub, run: &str, n: usize, person: &str) -> R<serde_json::Value> {
+    use kiln_ci::identity::custody::{Body, Kind, to_value};
+    use kiln_ci::identity::statement::Statement;
+    let (_, rows) = load_run(hub, run).await?;
+    let row = step_row(&rows, n)?;
+    let work = step_work(run, row);
+    let Some((hand_on, bundle)) = crate::custody::waiting_for(&hub.store, person, &work).await? else {
+        return Err(Error::Bad(format!("nothing of step {n} waits for {person}'s receipt: take it over first")));
+    };
+    let from = crate::custody::giver_of(&bundle).unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
+    let body = Body { from: Some(from), why: format!("step {n} of plan run {run}, taken over"), ..Body::new(Kind::Received, person) };
+    let s = Statement { subject: vec![work], follows: vec![hand_on], ..Statement::new(to_value(&body)) };
+    crate::custody::to_sign(&s).map_err(|e| Error::Bad(e.to_string()))
+}
+
+/// Step `n`, taken over by `person` where they couldn't sign (`missing`: why, as their browser says
+/// it): kiln's receipt for them of the hand-on waiting for them, saying their own signature is
+/// missing and why (docs/ci.md W27-R08). Its digest, and the hand-on's.
+pub async fn receipt_for(hub: &Hub, run: &str, n: usize, person: &str, missing: &str) -> R<serde_json::Value> {
+    let (_, rows) = load_run(hub, run).await?;
+    let row = step_row(&rows, n)?;
+    let work = step_work(run, row);
+    let Some((hand_on, bundle)) = crate::custody::waiting_for(&hub.store, person, &work).await? else {
+        return Err(Error::Bad(format!("nothing of step {n} waits for {person}'s receipt: take it over first")));
+    };
+    let from = crate::custody::giver_of(&bundle).unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
+    let why = format!("step {n} of plan run {run}, taken over");
+    let digest = crate::custody::receive_for_because(hub, person, work, &hand_on, &from, &why, missing).await?;
+    Ok(serde_json::json!({ "receipt": digest, "hand_on": hand_on, "kiln_signed_for_you": digest }))
+}
+
 /// A person says step `n` is met (one they took over, or one they judge done): the steps waiting
 /// for it start.
 pub async fn met(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
     {
         let lock = looking(run);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let (head, rows) = load_run(hub, run).await?;
         let row = step_row(&rows, n)?;
         if row.status == "waiting" {
@@ -1158,7 +1195,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 for (name, os) in [("box", "linux"), ("studio", "macos")] {
-                    hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, os, "aarch64"));
+                    hub.put_agent(crate::hub::tests::live_runner(name, os, "aarch64"));
                 }
                 hub.harness.set_kinds("local", offering(&["claude"]));
                 hub.harness.set_kinds("agent:box", offering(&["claude", "devin"]));

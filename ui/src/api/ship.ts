@@ -5,6 +5,7 @@
  * it (`fold_under`). Every field is new on the wire, so each is optional here but the basics.
  */
 import { apiPath } from "@/lib/peer-base";
+import { browserSigns, signed } from "@/lib/signing";
 import { request } from "./client";
 import type { CdPlan } from "./types";
 
@@ -95,6 +96,9 @@ export interface ShipPage {
   next_cursor: number | null;
   /** With a page the server read from memory. */
   pace?: ShipPace;
+  /** Whom its rows were picked for (a `ship` frame's `whose` is held against it); a server that
+   * sends `ship` frames says it (W21-R15, views/ship/live.ts). */
+  viewer?: string[];
 }
 
 /** A build part's state (`Part` in kiln_cd::journey): `none` when nothing built it. */
@@ -130,6 +134,10 @@ export interface ShipDetail extends ShipCommit {
   replant?: { name: string; state: string; why: string }[];
   /** Every job of the commit, either engine's, as the jobs pane acts on them (docs/ci.md W26-R21, R22). */
   jobs?: ShipJob[];
+  /** The version of what it shows beyond its row: a `ship` frame of the same `dv` changes only the row's part (W21-R15). */
+  dv?: string;
+  /** As a page's. */
+  viewer?: string[];
 }
 
 /** What can be done to a commit's jobs together (`POST /api/ship/jobs`). */
@@ -391,6 +399,26 @@ export const shipApi = {
     request<ShipDetail>("GET", apiPath(`/api/ship/commits/${repo.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(sha)}`), undefined, { signal }),
   /** A row's action, through the endpoint it names. */
   act: (a: ShipAction) => request<unknown>(a.method, apiPath(a.path), a.method === "GET" ? undefined : (a.body ?? {})),
+  /**
+   * A row's Hand off, the person's side signed in this browser (docs/ci.md W27-R08): kiln says what
+   * to sign (`…/statement`: their hand-on to kiln's server, which passes it on to the agent that
+   * takes it), and it goes with this browser's own key (lib/signing). Where this browser can't sign,
+   * it says why (`unsigned`), and kiln's take for them gives the same reason.
+   */
+  handOff: async (a: ShipAction): Promise<{ answer: unknown; unsigned?: string }> => {
+    const body = (a.body && typeof a.body === "object" ? a.body : {}) as Record<string, unknown>;
+    let why = "this page isn't secure (https), so this browser has no key";
+    if (browserSigns()) {
+      try {
+        const hand_on = await signed(apiPath(`${a.path}/statement`), body);
+        if (hand_on) return { answer: await request<unknown>("POST", apiPath(a.path), { ...body, hand_on }) };
+        why = "kiln is from before a browser signed its hand-offs";
+      } catch (e) {
+        why = `this browser couldn't sign: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    return { answer: await request<unknown>("POST", apiPath(a.path), { ...body, unsigned: why }), unsigned: why };
+  },
   /** A commit's jobs run again, paused, resumed or cancelled together: those named, or those a word picks. */
   jobs: (body: { repo: string; sha: string; verb: ShipVerb; jobs?: string[]; scope?: ShipScope }) => request<{ verb: ShipVerb; jobs: ShipJobDone[] }>("POST", apiPath("/api/ship/jobs"), body),
   /** Every KilnCD app by project, needs-you first (docs/ci.md W26-R24); `q` finds by project, app, environment, cluster or namespace. */

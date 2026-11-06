@@ -84,6 +84,30 @@ pub fn memory_limit() -> Option<u64> {
     imp::memory_limit()
 }
 
+/// The cpuset partition this process runs in (docs/priority.md, "Cores of its own"; goal 9, plan
+/// 01a1a87b2cec step 4), as the kernel says it: the nearest of its cgroup and those above it whose
+/// `cpuset.cpus.partition` isn't `member`, as its path in the hierarchy (`/kiln.slice`) and its state
+/// (`root`, `isolated`, or either with `invalid (why)`). None where there's none: no partition above
+/// it, cgroup v1, or off Linux. What the server says of the cores of its own a system install made a
+/// partition of as it started (its unit's `ExecStartPre=`, whose failure is no failure of the unit's).
+pub fn partition() -> Option<(String, String)> {
+    imp::partition()
+}
+
+/// [`partition`] for the cgroup `dir`, under the hierarchy's mount `root` (the root cgroup has no
+/// partition flag of its own: it always is one).
+#[cfg(any(target_os = "linux", test))]
+fn nearest_partition(root: &std::path::Path, dir: &std::path::Path) -> Option<(String, String)> {
+    dir.ancestors().take_while(|d| d.starts_with(root) && *d != root).find_map(|d| {
+        let state = std::fs::read_to_string(d.join("cpuset.cpus.partition")).ok()?;
+        let state = state.trim();
+        if state.is_empty() || state == "member" {
+            return None;
+        }
+        Some((format!("/{}", d.strip_prefix(root).ok()?.display()), state.to_owned()))
+    })
+}
+
 /// cgroup v2: the least `memory.max` of `dir` and the cgroups above it, up to `root` (the
 /// hierarchy's mount, a container's own cgroup namespace's root among them).
 #[cfg(any(target_os = "linux", test))]
@@ -105,7 +129,10 @@ mod imp {
     }
 
     pub fn memory() -> Option<super::Memory> {
-        if let Some(dir) = v2_dir().filter(|d| d.join("memory.current").exists()) {
+        // Its own cgroup's, or, where that counts no memory (kiln's processes in their delegated
+        // unit's leaf, docs/priority.md), the nearest above it that does: its unit's.
+        let counted = v2_dir().and_then(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).find(|a| a.join("memory.current").exists()).map(Path::to_path_buf));
+        if let Some(dir) = counted {
             let f = |n: &str| read_to_string(dir.join(n)).ok();
             return super::from_v2(&f("memory.current")?, &f("memory.max").unwrap_or_default(), &f("memory.stat").unwrap_or_default(), &f("memory.events").unwrap_or_default(), f("memory.peak").as_deref());
         }
@@ -115,10 +142,15 @@ mod imp {
     }
 
     pub fn memory_limit() -> Option<u64> {
-        if let Some(dir) = v2_dir().filter(|d| d.join("memory.current").exists()) {
+        // As [`memory`]: a leaf that counts no memory is held by what's above it.
+        if let Some(dir) = v2_dir().filter(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).any(|a| a.join("memory.current").exists())) {
             return super::least_limit(Path::new("/sys/fs/cgroup"), &dir);
         }
         super::limit(&read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?)
+    }
+
+    pub fn partition() -> Option<(String, String)> {
+        super::nearest_partition(Path::new("/sys/fs/cgroup"), &v2_dir()?)
     }
 }
 
@@ -129,6 +161,10 @@ mod imp {
     }
 
     pub fn memory_limit() -> Option<u64> {
+        None
+    }
+
+    pub fn partition() -> Option<(String, String)> {
         None
     }
 }
@@ -183,6 +219,28 @@ mod tests {
         std::fs::create_dir_all(none.join("a"))?;
         std::fs::write(none.join("a/memory.max"), "max\n")?;
         assert_eq!(least_limit(&none, &none.join("a")), None);
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: the partition a server runs in is the nearest cgroup above it that
+    /// isn't a member: a system install's kiln.slice, above its unit and the unit's leaf; one the kernel
+    /// found invalid says why; with none, there's none.
+    #[test]
+    fn g9_s4_the_partition_a_server_runs_in() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let leaf = root.join("kiln.slice/kiln.service/kiln");
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::write(root.join("kiln.slice/kiln.service/cpuset.cpus.partition"), "member\n")?;
+        anyhow::ensure!(nearest_partition(root, &leaf).is_none(), "every cgroup above it a member");
+        std::fs::write(root.join("kiln.slice/cpuset.cpus.partition"), "root\n")?;
+        anyhow::ensure!(nearest_partition(root, &leaf) == Some(("/kiln.slice".to_owned(), "root".to_owned())));
+        std::fs::write(root.join("kiln.slice/cpuset.cpus.partition"), "root invalid (Cpu list in cpuset.cpus not exclusive)\n")?;
+        anyhow::ensure!(nearest_partition(root, &leaf) == Some(("/kiln.slice".to_owned(), "root invalid (Cpu list in cpuset.cpus not exclusive)".to_owned())));
+        // The hierarchy's root has no flag of its own, and a cgroup outside it isn't looked at.
+        std::fs::write(root.join("cpuset.cpus.partition"), "root\n")?;
+        std::fs::write(root.join("kiln.slice/cpuset.cpus.partition"), "member\n")?;
+        anyhow::ensure!(nearest_partition(root, &leaf).is_none());
         Ok(())
     }
 }

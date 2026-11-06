@@ -29,6 +29,10 @@ pub enum Land {
     Testing,
     Landed,
     Ejected { why: String },
+    /// In the queue, waiting on Review (docs/ci.md W26-R19): its gate holds it, or Review did, and why.
+    Held { why: String },
+    /// Back with Review (W28-R107): it conflicts with the trunk, and where.
+    Returned { why: String },
     /// Not in the queue yet: a change under review.
     NotYet,
 }
@@ -214,6 +218,12 @@ pub struct Review {
     pub about: String,
     /// The revision that replaced this commit's (`v6`): the commit then stands superseded.
     pub superseded_by: Option<String>,
+    /// What was handed off at this revision, fixed by a later one (`v6`, W26-R18): replaced, it
+    /// says which version fixed it.
+    pub fixed_in: Option<String>,
+    /// How fresh it is on its trunk (W26-R16), in the replay planner's words (`replays clean on
+    /// main@4c1e2a`): the last clause of its line, after whatever the line needs you for.
+    pub fresh: Option<String>,
 }
 
 /// A commit's records, as the server read them.
@@ -416,6 +426,8 @@ pub fn pips(j: &Journey, now: i64) -> Vec<Pip> {
         Land::Testing => Glyph::Running,
         Land::Landed => Glyph::Passed,
         Land::Ejected { .. } => Glyph::Failed,
+        Land::Held { .. } => Glyph::Queued,
+        Land::Returned { .. } => Glyph::Needs,
         Land::NotYet => Glyph::None,
     };
     let staging = match &j.staging {
@@ -473,7 +485,8 @@ pub fn standing(j: &Journey, now: i64) -> Standing {
 pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
     let pips = pips(j, now);
     let (stand, line) = match &j.review {
-        Some(Review { superseded_by: Some(by), .. }) => (Stand::Superseded, format!("Replaced by {by}")),
+        // Replaced: what replaced it, or which version fixed what was handed off at it (W26-R18).
+        Some(Review { superseded_by: Some(by), fixed_in, .. }) => (Stand::Superseded, fixed_in.as_ref().map_or_else(|| format!("Replaced by {by}"), |v| format!("Fixed in {v}"))),
         Some(r) => ranked(j, r, yours),
         None => stand_and_line(j),
     };
@@ -485,7 +498,7 @@ pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
 /// then the review's stand, then the journey's. A failure of the change's own checks needs whoever
 /// the change is theirs ([`in_turn_of`]); to everyone else it's failing.
 fn ranked(j: &Journey, r: &Review, yours: bool) -> (Stand, String) {
-    let review = if r.state == ReviewState::Approved && j.land == Land::NotYet { Some((Stand::Landing, "Approved · joining the queue".to_string())) } else { review_stand(r, yours) };
+    let review = if r.state == ReviewState::Approved && j.land == Land::NotYet { Some((Stand::Landing, with_fresh("Approved · joining the queue".to_string(), r))) } else { review_stand(r, yours) };
     let journey = match stand_and_line(j) {
         (Stand::NeedsYou, line) if review.is_some() && !yours && own_failure(j) => (Stand::Failing, line),
         x => x,
@@ -543,6 +556,19 @@ fn review_stand(r: &Review, yours: bool) -> Option<(Stand, String)> {
 }
 
 fn review_line(r: &Review) -> String {
+    with_fresh(review_said(r), r)
+}
+
+/// `line`, then how fresh the change is, as its last clause.
+fn with_fresh(line: String, r: &Review) -> String {
+    match r.fresh.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) if line.is_empty() => f.to_string(),
+        Some(f) => format!("{line} · {f}"),
+        None => line,
+    }
+}
+
+fn review_said(r: &Review) -> String {
     let about = r.about.trim();
     let threads = r.open.question + r.open.nit + r.open.issue + r.open.blocking;
     let then = |first: &str, rest: String| match (first.is_empty(), rest.is_empty()) {
@@ -596,6 +622,8 @@ fn stand_and_line(j: &Journey) -> (Stand, String) {
         Land::Queued { ahead } => return (Stand::Landing, format!("Queued · {ahead} ahead")),
         Land::Testing => return (Stand::Landing, "Testing against trunk".to_string()),
         Land::Ejected { why } => return (Stand::Failing, format!("Didn't land · {why}")),
+        Land::Held { why } => return (Stand::Waiting, format!("Held · {why}")),
+        Land::Returned { why } => return (Stand::Waiting, format!("Back with Review · {why}")),
         Land::NotYet => return (Stand::Waiting, "Not landed".to_string()),
         Land::Landed => {}
     }
@@ -705,7 +733,7 @@ mod tests {
     fn under_review(state: ReviewState, turn: &[&str], about: &str) -> Journey {
         let mut j = landed(Author::Person("sam".into()));
         j.land = Land::NotYet;
-        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None });
+        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None, fixed_in: None, fresh: None });
         j
     }
 
@@ -773,6 +801,27 @@ mod tests {
         assert_eq!(pip(&s, Stage::Review), Some(Glyph::Approved));
     }
 
+    /// docs/ci.md W26-R19: the Land stage says where the queue has a change: held by Review's gate
+    /// (waiting, saying why), back with Review on a conflict (needs its author, saying where), in
+    /// line with the entries ahead of it, under test, and landed.
+    #[test]
+    fn w26_r19_the_land_stage_says_where_the_queue_has_it() {
+        let mut j = under_review(ReviewState::Approved, &[], "");
+        let cases = [
+            (Land::Held { why: "D41: kim resolves this blocking comment first".into() }, Glyph::Queued, Stand::Waiting, "Held · D41: kim resolves this blocking comment first"),
+            (Land::Returned { why: "needs rebase: conflicts with the trunk in README.md".into() }, Glyph::Needs, Stand::Waiting, "Back with Review · needs rebase: conflicts with the trunk in README.md"),
+            (Land::Queued { ahead: 1 }, Glyph::Queued, Stand::Landing, "Queued · 1 ahead"),
+            (Land::Testing, Glyph::Running, Stand::Landing, "Testing against trunk"),
+        ];
+        for (land, glyph, stand, line) in cases {
+            j.land = land;
+            let s = standing_as(&j, 0, true);
+            assert_eq!((pip(&s, Stage::Land), s.stand, s.line.as_str()), (Some(glyph), stand, line));
+        }
+        j.land = Land::Landed;
+        assert_eq!(pip(&standing_as(&j, 0, true), Stage::Land), Some(Glyph::Passed));
+    }
+
     #[test]
     fn w26_r02_every_review_state_as_yours_and_as_others() {
         use ReviewState::*;
@@ -815,6 +864,25 @@ mod tests {
     }
 
     #[test]
+    fn w26_r16_how_fresh_a_change_is_ends_its_line() {
+        let mut j = under_review(ReviewState::Requested, &["user:kim"], "kim: empty matrix meant?");
+        if let Some(r) = j.review.as_mut() {
+            r.fresh = Some("replays clean on main@4c1e2a".into());
+        }
+        assert_eq!(standing_as(&j, 0, true).line, "kim: empty matrix meant? · replays clean on main@4c1e2a");
+        // An approved change waiting to land says it too.
+        let mut a = under_review(ReviewState::Approved, &[], "");
+        a.land = Land::NotYet;
+        if let Some(r) = a.review.as_mut() {
+            r.fresh = Some("conflicts on main@4c1e2a".into());
+        }
+        assert_eq!(standing_as(&a, 0, false).line, "Approved · joining the queue · conflicts on main@4c1e2a");
+        // None: the line as it was.
+        let plain = under_review(ReviewState::Requested, &["user:kim"], "kim: empty matrix meant?");
+        assert_eq!(standing_as(&plain, 0, true).line, "kim: empty matrix meant?");
+    }
+
+    #[test]
     fn w26_r02_approved_falls_through_to_the_journey_once_landed() {
         let mut j = landed(Author::Person("user:sam".into()));
         j.review = under_review(ReviewState::Approved, &[], "").review;
@@ -839,6 +907,18 @@ mod tests {
                 assert_eq!((s.stand, s.line.as_str()), (Stand::Superseded, "Replaced by v6"), "{state:?}, yours: {yours}");
             }
         }
+    }
+
+    /// W26-R18: a revision whose threads were handed off to its author's agent, replaced since by
+    /// that agent's fix, says which version fixed it.
+    #[test]
+    fn w26_r18_a_handed_off_revision_says_which_version_fixed_it() {
+        let mut j = under_review(ReviewState::Fixing, &[], "kim's thread");
+        if let Some(r) = j.review.as_mut() {
+            (r.superseded_by, r.fixed_in) = (Some("v6".into()), Some("v6".into()));
+        }
+        let s = standing_as(&j, 0, false);
+        assert_eq!((s.stand, s.line.as_str()), (Stand::Superseded, "Fixed in v6"));
     }
 
     #[test]

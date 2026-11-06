@@ -28,9 +28,12 @@ use crate::hub::Hub;
 pub const MOST_KEPT: u64 = 64 << 20;
 pub const MOST_PER_SESSION: u64 = 512 << 20;
 pub const MOST_ALL: u64 = 4 << 30;
-/// Finished messages waiting for their files to be kept; past that, a message's are read when
-/// someone looks.
-const QUEUE: usize = 4096;
+/// The bytes of finished messages' mentions waiting for their files to be kept (goal 11, plan
+/// 01a1a87b2e56 step 3): as many as the inbox of the session's owner that applied the message holds
+/// ([`crate::net::EVENTS_BYTES`]), the names a job carries being a message's words; past that, a message's
+/// files are read when someone looks, nothing lost. Its 4,096 places, made up front, took 0.4 MB of an idle
+/// server's heap (research 01a1a87b2e57, f10).
+const QUEUE_BYTES: usize = crate::net::EVENTS_BYTES;
 /// How often content no list names is cleared away.
 const SWEEP_EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -67,21 +70,49 @@ pub struct Job {
     pub location: Location,
 }
 
+impl crate::memory::queue::Weigh for Job {
+    /// Its place, its session's id, each path with its place, and its machine's name.
+    fn weight(&self) -> usize {
+        let paths = self.paths.iter().map(|p| size_of::<String>().saturating_add(p.len())).fold(0usize, usize::saturating_add);
+        let machine = match &self.location {
+            Location::Machine(m) => m.len(),
+            Location::Local => 0,
+        };
+        size_of::<Job>().saturating_add(self.session.len()).saturating_add(paths).saturating_add(machine)
+    }
+}
+
 pub struct Keeper {
     dir: PathBuf,
     lists: Mutex<HashMap<String, Vec<Kept>>>,
+    /// Each conversation's frame of what's kept ([`Keeper::frame`]), made from its list when that was as long as
+    /// the number says: a list only grows (`keep`) or goes (`forget`), so its length says which list it was made of.
+    frames: Mutex<HashMap<String, (usize, Arc<str>)>>,
+    /// How many frames it made (each list's once).
+    #[cfg(test)]
+    made: AtomicU64,
     /// Conversations closed since start: nothing more is kept for them.
     gone: Mutex<HashSet<String>>,
-    tx: async_channel::Sender<Job>,
-    rx: async_channel::Receiver<Job>,
+    tx: crate::memory::queue::Sender<Job>,
+    rx: crate::memory::queue::Receiver<Job>,
     /// What the kept content takes, as of the last sweep and since (`u64::MAX` before the first).
     used: AtomicU64,
 }
 
 impl Keeper {
     pub fn new(harness_dir: &Path) -> Self {
-        let (tx, rx) = async_channel::bounded(QUEUE);
-        Self { dir: harness_dir.join("files"), lists: Mutex::default(), gone: Mutex::default(), tx, rx, used: AtomicU64::new(u64::MAX) }
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::KEPT_FILES, QUEUE_BYTES);
+        Self {
+            dir: harness_dir.join("files"),
+            lists: Mutex::default(),
+            frames: Mutex::default(),
+            #[cfg(test)]
+            made: AtomicU64::new(0),
+            gone: Mutex::default(),
+            tx,
+            rx,
+            used: AtomicU64::new(u64::MAX),
+        }
     }
 
     fn list_file(&self, session: &str) -> PathBuf {
@@ -113,10 +144,46 @@ impl Keeper {
         self.list(session).iter().any(|k| k.path == path)
     }
 
-    /// The frame that tells a viewer what's kept (`None`: nothing yet).
+    /// The frame that tells a viewer what's kept (`None`: nothing yet): made once from each list, and given as it
+    /// was made after that. Goal 10, plan 01a1a87b2dae step 5: each viewer's attach and catch-up copied the whole
+    /// list and encoded it on its shard (an entry for each file each finished message mentioned: thousands in a
+    /// long session), and a viewer's socket held its shard 6.3 ms in g9p7's calm lab. [`warm`] makes it off the
+    /// shards first.
     pub fn frame(&self, session: &str) -> Option<String> {
+        let len = self.len_of(session);
+        if len == 0 {
+            return None;
+        }
+        if let Some((n, made)) = self.frames.lock().get(session)
+            && *n == len
+        {
+            return Some(String::from(&**made));
+        }
         let l = self.list(session);
-        (!l.is_empty()).then(|| crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: l }).text())
+        let n = l.len();
+        if n == 0 {
+            return None;
+        }
+        let made: Arc<str> = Arc::from(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: l }).text());
+        #[cfg(test)]
+        self.made.fetch_add(1, Ordering::Relaxed);
+        self.frames.lock().insert(session.to_owned(), (n, Arc::clone(&made)));
+        Some(String::from(&*made))
+    }
+
+    /// How long a conversation's list is, read off its file the first time (as [`Keeper::list`]), and not copied.
+    fn len_of(&self, session: &str) -> usize {
+        if let Some(l) = self.lists.lock().get(session) {
+            return l.len();
+        }
+        self.list(session).len()
+    }
+
+    /// Whether a conversation's list is in memory and its frame made of it as it is now (an empty list has none to
+    /// make): a viewer's [`Keeper::frame`] then reads nothing off disk and encodes nothing.
+    pub fn framed(&self, session: &str) -> bool {
+        let Some(len) = self.lists.lock().get(session).map(Vec::len) else { return false };
+        len == 0 || self.frames.lock().get(session).is_some_and(|(n, _)| *n == len)
     }
 
     pub fn enqueue(&self, job: Job) {
@@ -132,6 +199,7 @@ impl Keeper {
     pub fn forget(&self, session: &str) {
         self.gone.lock().insert(session.to_owned());
         self.lists.lock().remove(session);
+        self.frames.lock().remove(session);
         let _ = std::fs::remove_file(self.list_file(session));
     }
 
@@ -221,6 +289,19 @@ impl Keeper {
     }
 }
 
+/// Session `session`'s list of what's kept read, and its frame made, on the blocking pool, unless they're in memory as
+/// the list is now ([`Keeper::framed`]): a viewer's attach or catch-up then takes the frame as it was made, reading no
+/// file and encoding nothing on its shard (goal 10, plan 01a1a87b2dae step 5; [`Keeper::frame`]).
+pub async fn warm(hub: &Arc<Hub>, session: &str) {
+    if hub.harness.keeper.framed(session) {
+        return;
+    }
+    let (h, s) = (Arc::clone(hub), session.to_owned());
+    if let Err(e) = crate::rt::blocking(move || drop(h.harness.keeper.frame(&s))).await {
+        tracing::debug!(session, error = %format!("{e:#}"), "what's kept of a session wasn't made ahead of its viewer: the viewer makes it");
+    }
+}
+
 /// A conversation's id as a file name: as it is when it's plain, else its hash.
 fn file_name(session: &str) -> String {
     if !session.is_empty() && session.len() <= 128 && session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
@@ -280,7 +361,7 @@ async fn keep(hub: &Arc<Hub>, job: Job) {
         Ok(Ok(())) => {}
         Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "couldn't keep a conversation's list of files"),
     }
-    hub.harness.files_added(&job.session, &added);
+    hub.harness.files_added(&job.session, &added).await;
 }
 
 /// One mention: the file as it is now, copied when it fits. `None` when there's nothing to say
@@ -414,6 +495,39 @@ mod tests {
         assert_eq!(k2.blob("not-a-sha"), None);
         k2.forget("s1");
         assert!(k2.list("s1").is_empty() && !dir.join("files/s1.json").exists());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a conversation's frame of what's kept is made once from each list and given as
+    /// it was made after that; the list grown, it's made again, once; an empty list has none; a list forgotten takes
+    /// its frame with it. `framed` says when a viewer's frame reads no file and encodes nothing.
+    #[test]
+    fn g10_s5_a_lists_frame_is_made_once_for_each_list() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("kiln-kept-frames-{}", std::process::id()));
+        let k = Keeper::new(&dir);
+        let gone = |seq: u64| Kept { path: "crates/kiln/src/harness/registry.rs".into(), seq, meta: None, sha: None, error: Some("it isn't there".into()) };
+        k.save("s", &[gone(1), gone(2)])?;
+        // Read off its file the first time, framed only once it's made.
+        assert!(!k.framed("s"));
+        let first = k.frame("s");
+        assert!(first.as_deref().is_some_and(|f| f.contains("\"t\":\"files\"") && f.matches("registry.rs").count() == 2), "{first:?}");
+        assert!(k.framed("s"));
+        assert_eq!(k.frame("s"), first, "the same frame");
+        assert_eq!(k.made.load(Ordering::Relaxed), 1, "made once");
+        // The list grown (as `keep` grows it): made again, once.
+        k.lists.lock().insert("s".into(), vec![gone(1), gone(2), gone(3)]);
+        assert!(!k.framed("s"));
+        let grown = k.frame("s");
+        assert!(grown.as_deref().is_some_and(|f| f.matches("registry.rs").count() == 3), "{grown:?}");
+        assert_eq!(k.frame("s"), grown);
+        assert_eq!(k.made.load(Ordering::Relaxed), 2, "made once more");
+        // An empty list: framed, with no frame.
+        assert_eq!(k.frame("none"), None);
+        assert!(k.framed("none"));
+        // Forgotten: its frame goes with its list.
+        k.forget("s");
+        assert!(k.frames.lock().get("s").is_none());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

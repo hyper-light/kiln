@@ -8,15 +8,16 @@
  */
 import * as React from "react";
 import { ApiError } from "@/api/client";
-import { peersApi, type Peer, type PeerState } from "@/api/peers";
+import { peersApi, type Openable, type Peer, type PeerState, type Peers } from "@/api/peers";
 import { Button } from "@/components/ui/button";
 import { CopyBlock } from "@/components/ui/copy-block";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Facts, PageIntro, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { openCluster, openRes } from "@/components/shell/clusters";
+import { useAction, useHold, type Hold } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import "./clusters.css";
 
 const peersRes: Res<Awaited<ReturnType<typeof peersApi.list>>> = { key: "peers", fetch: (s) => peersApi.list(s), opts: { on: ["peers"] } };
@@ -117,21 +118,25 @@ function CodeField({ label, value, onChange, placeholder }: { label: string; val
   );
 }
 
-/** Asks before removing a peering. */
-function Removal({ p, question, onDone }: { p: Peer; question: string; onDone: () => void }) {
-  const [busy, setBusy] = React.useState(false);
-  const remove = async () => {
-    setBusy(true);
-    try {
-      await peersApi.remove(p.id);
-      toast({ title: `${p.name} removed`, tone: "info" });
-      changed();
-    } catch (e) {
-      toast.error(`Couldn't remove ${p.name}`, problem(e));
-    } finally {
-      setBusy(false);
-      onDone();
-    }
+/**
+ * Asks before removing a peering: removed, it leaves the list and the header's cluster picker at
+ * once, and is back in both, saying why, if it doesn't go (W21-R15).
+ */
+function Removal({ p, question, onDone, held = false }: { p: Peer; question: string; onDone: () => void; held?: boolean }) {
+  const remove = () => {
+    change<Peers>(peersRes.key, (d) => ({ ...d, peers: d.peers.filter((x) => x.id !== p.id) }));
+    change<Openable>(openRes.key, (d) => ({ ...d, peers: d.peers.filter((x) => x.id !== p.id) }));
+    onDone();
+    peersApi.remove(p.id).then(
+      () => {
+        toast({ title: `${p.name} removed`, tone: "info" });
+        changed();
+      },
+      (e: unknown) => {
+        toast.error(`Couldn't remove ${p.name}`, problem(e));
+        changed();
+      },
+    );
   };
   return (
     <Confirm
@@ -140,7 +145,7 @@ function Removal({ p, question, onDone }: { p: Peer; question: string; onDone: (
       tone="danger"
       actions={
         <>
-          <Button size="xs" variant="danger" disabled={busy} onClick={() => void remove()}>
+          <Button size="xs" variant="danger" disabled={held} onClick={remove}>
             Remove
           </Button>
           <Button size="xs" variant="ghost" onClick={onDone}>
@@ -157,20 +162,23 @@ function Removal({ p, question, onDone }: { p: Peer; question: string; onDone: (
 /** A cluster our people open: open it, or finish peering, or start again. */
 function OutRow({ p }: { p: Peer }) {
   const [removing, setRemoving] = React.useState(false);
-  const [moving, setMoving] = React.useState(false);
+  // Which opening of Change address is shown (0: none): a new address's answer closes only its own (W21-R15).
+  const [moving, setMoving] = React.useState(0);
+  const opens = React.useRef(0);
   const [challenge, setChallenge] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const rechallenge = async () => {
-    setBusy(true);
-    try {
-      setChallenge((await peersApi.rechallenge(p.id)).challenge);
-      changed();
-    } catch (e) {
-      toast.error("Couldn't make a new challenge", problem(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [open, opening] = useAction(() => openCluster(p.id, p.name));
+  // The peering's changes (a new challenge, the response pasted, a new address, its removal) go one
+  // at a time: the one pressed says it's on its way and the others wait (W21-R15).
+  const hold = useHold();
+  const rechallenge = () =>
+    hold.change("challenge", async () => {
+      try {
+        setChallenge((await peersApi.rechallenge(p.id)).challenge);
+        changed();
+      } catch (e) {
+        toast.error("Couldn't make a new challenge", problem(e));
+      }
+    });
   const peered = p.state === "peered";
   return (
     <li className="cl-row">
@@ -181,15 +189,15 @@ function OutRow({ p }: { p: Peer }) {
         </span>
         <span className="flex-1" />
         {peered ? (
-          <Button size="xs" variant="secondary" onClick={() => void openCluster(p.id, p.name)}>
+          <Button size="xs" variant="secondary" pending={opening} onClick={open}>
             Open
           </Button>
         ) : (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void rechallenge()}>
+          <Button size="xs" variant="ghost" pending={hold.doing("challenge")} disabled={hold.held("challenge")} onClick={rechallenge}>
             New challenge
           </Button>
         )}
-        <Button size="xs" variant="ghost" aria-expanded={moving} onClick={() => setMoving(!moving)}>
+        <Button size="xs" variant="ghost" aria-expanded={moving > 0} pending={hold.doing("address")} onClick={() => setMoving(moving ? 0 : ++opens.current)}>
           Change address
         </Button>
         <Button size="xs" variant="ghost" aria-expanded={removing} onClick={() => setRemoving(!removing)}>
@@ -206,39 +214,43 @@ function OutRow({ p }: { p: Peer }) {
           </>
         ) : null}
       </div>
-      {moving && <Readdress p={p} onDone={() => setMoving(false)} />}
-      {removing && <Removal p={p} question={`Stop opening ${p.name} from here? To open it again takes new codes.`} onDone={() => setRemoving(false)} />}
-      {challenge && <Code label="Its new challenge" text={challenge} note={<>Take it to {p.name}: its admin pastes it under Clusters → Let a cluster in, within 30 minutes. The one before no longer works.</>} />}
-      {!peered && <Complete p={p} />}
+      {moving > 0 && <Readdress p={p} hold={hold} onDone={() => setMoving((m) => (m === moving ? 0 : m))} />}
+      {removing && <Removal p={p} question={`Stop opening ${p.name} from here? To open it again takes new codes.`} held={hold.held("remove")} onDone={() => setRemoving(false)} />}
+      {challenge && (
+        <Code label="Its new challenge" text={challenge} note={<>Take it to {p.name}: its admin pastes it under Clusters → Let a cluster in, within 30 minutes. The one before no longer works.</>} />
+      )}
+      {!peered && <Complete p={p} hold={hold} />}
     </li>
   );
 }
 
 /** Where a cluster is reached from here, changed: its key is what's trusted, so no new codes. */
-function Readdress({ p, onDone }: { p: Peer; onDone: () => void }) {
+function Readdress({ p, hold, onDone }: { p: Peer; hold: Hold; onDone: () => void }) {
   const [url, setUrl] = React.useState(p.url);
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setErr(null);
-    try {
-      await peersApi.readdress(p.id, url.trim());
-      toast({ title: `${p.name}'s address changed`, description: "Open it again from the cluster picker.", tone: "info" });
-      changed();
-      onDone();
-    } catch (e2) {
-      setErr(problem(e2));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const submit = () =>
+    hold.change("address", async () => {
+      setErr(null);
+      try {
+        await peersApi.readdress(p.id, url.trim());
+        toast({ title: `${p.name}'s address changed`, description: "Open it again from the cluster picker.", tone: "info" });
+        changed();
+        onDone();
+      } catch (e) {
+        setErr(problem(e));
+      }
+    });
   return (
-    <form className="cl-form grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end" onSubmit={(e) => void submit(e)}>
+    <form
+      className="cl-form grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end"
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
       <TextField label="Its address, as this cluster reaches it" value={url} inputMode="url" onChange={(e) => setUrl(e.target.value)} />
       <div className="flex gap-2">
-        <Button type="submit" size="sm" variant="secondary" disabled={busy || !url.trim() || url.trim() === p.url}>
+        <Button type="submit" size="sm" variant="secondary" disabled={!url.trim() || url.trim() === p.url || hold.held("address")} pending={hold.doing("address")}>
           Save
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onDone}>
@@ -251,29 +263,31 @@ function Readdress({ p, onDone }: { p: Peer; onDone: () => void }) {
 }
 
 /** Paste the other cluster's response: checked against our challenge, it peers them. */
-function Complete({ p }: { p: Peer }) {
+function Complete({ p, hold }: { p: Peer; hold: Hold }) {
   const [text, setText] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setErr(null);
-    try {
-      await peersApi.complete(p.id, text.trim());
-      toast({ title: `Peered with ${p.name}`, description: "Open it from the cluster picker in the header.", tone: "succeeded" });
-      changed();
-    } catch (e2) {
-      setErr(problem(e2));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const submit = () =>
+    hold.change("peer", async () => {
+      setErr(null);
+      try {
+        await peersApi.complete(p.id, text.trim());
+        toast({ title: `Peered with ${p.name}`, description: "Open it from the cluster picker in the header.", tone: "succeeded" });
+        changed();
+      } catch (e) {
+        setErr(problem(e));
+      }
+    });
   return (
-    <form className="cl-form" onSubmit={(e) => void submit(e)}>
+    <form
+      className="cl-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
       <CodeField label={`${p.name}'s response`} value={text} onChange={setText} placeholder="kiln_pr1_…" />
       <div className="cl-actions">
-        <Button type="submit" size="sm" variant="secondary" disabled={busy || !text.trim()}>
+        <Button type="submit" size="sm" variant="secondary" disabled={!text.trim() || hold.held("peer")} pending={hold.doing("peer")}>
           Peer
         </Button>
         {err && <span className="cl-err">{err}</span>}
@@ -286,22 +300,16 @@ function Complete({ p }: { p: Peer }) {
 function Register() {
   const [name, setName] = React.useState("");
   const [url, setUrl] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const [made, setMade] = React.useState<{ peer: Peer; challenge: string } | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setErr(null);
-    try {
+  const [submit, making] = useAction(
+    async () => {
+      setErr(null);
       setMade(await peersApi.register(name.trim(), url.trim()));
       changed();
-    } catch (e2) {
-      setErr(problem(e2));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setErr(problem(e)),
+  );
   return (
     <Panel eyebrow="Peer with a cluster" title="Open another cluster from here" description="Its name, and its address as this cluster reaches it: its front door, or its server's address.">
       {made ? (
@@ -311,8 +319,7 @@ function Register() {
             text={made.challenge}
             note={
               <>
-                Take it to {made.peer.name}: its admin pastes it under Clusters → Let a cluster in, within 30 minutes, and gives you a response to paste under {made.peer.name}{" "}
-                above.
+                Take it to {made.peer.name}: its admin pastes it under Clusters → Let a cluster in, within 30 minutes, and gives you a response to paste under {made.peer.name} above.
               </>
             }
           />
@@ -329,10 +336,16 @@ function Register() {
           </Button>
         </>
       ) : (
-        <form className="grid gap-3 sm:grid-cols-[1fr_1.4fr_auto] sm:items-end" onSubmit={(e) => void submit(e)}>
+        <form
+          className="grid gap-3 sm:grid-cols-[1fr_1.4fr_auto] sm:items-end"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
           <TextField label="Name" value={name} placeholder="work" onChange={(e) => setName(e.target.value)} />
           <TextField label="Its address" value={url} placeholder="https://kiln.work" inputMode="url" onChange={(e) => setUrl(e.target.value)} />
-          <Button type="submit" variant="secondary" disabled={busy || !name.trim() || !url.trim()}>
+          <Button type="submit" variant="secondary" disabled={!name.trim() || !url.trim()} pending={making}>
             Make a challenge
           </Button>
         </form>
@@ -375,29 +388,23 @@ function InRow({ p }: { p: Peer }) {
 function Authorize({ roles }: { roles: string[] }) {
   const [code, setCode] = React.useState("");
   const [role, setRole] = React.useState("developer");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const [made, setMade] = React.useState<{ peer: Peer; response: string } | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setErr(null);
-    try {
+  const [submit, letting] = useAction(
+    async () => {
+      setErr(null);
       setMade(await peersApi.authorize(code.trim(), role));
       changed();
-    } catch (e2) {
-      setErr(problem(e2));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setErr(problem(e)),
+  );
   return (
     <Panel eyebrow="Let a cluster in" title="Let another cluster open this one" description="Paste the challenge its admin made, pick the most its people may do here, and give back the response.">
       {made ? (
         <>
           <p className="cl-ok">
-            {made.peer.name} may open this cluster, its people as {ROLE[made.peer.role] ?? made.peer.role} at most. Its key is <code className="cl-fp">{made.peer.fingerprint}</code>:
-            compare it with what its admin sees.
+            {made.peer.name} may open this cluster, its people as {ROLE[made.peer.role] ?? made.peer.role} at most. Its key is <code className="cl-fp">{made.peer.fingerprint}</code>: compare it with
+            what its admin sees.
           </p>
           <Code label="The response" text={made.response} note={<>Take it back to {made.peer.name}: its admin pastes it under Clusters, at the cluster it made the challenge for.</>} />
           <Button
@@ -412,11 +419,17 @@ function Authorize({ roles }: { roles: string[] }) {
           </Button>
         </>
       ) : (
-        <form className="space-y-3" onSubmit={(e) => void submit(e)}>
+        <form
+          className="space-y-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
           <CodeField label="Its challenge" value={code} onChange={setCode} placeholder="kiln_pc1_…" />
           <div className="grid gap-3 sm:grid-cols-[260px_auto] sm:items-end sm:justify-start">
             <SelectField label="Its people may" value={role} onChange={setRole} options={roles.map((r) => ({ value: r, label: ROLE[r] ?? r }))} />
-            <Button type="submit" variant="secondary" disabled={busy || !code.trim()}>
+            <Button type="submit" variant="secondary" disabled={!code.trim()} pending={letting}>
               Let it in
             </Button>
           </div>

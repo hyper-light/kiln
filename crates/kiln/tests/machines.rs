@@ -20,6 +20,11 @@ use serde_json::{Value, json};
 /// (its machine id made from it), with `more` (`--instance <id>`: a runner process an upgrade
 /// started): its log.
 fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str, more: &[&str]) -> anyhow::Result<(Runner, PathBuf)> {
+    agent_on(dir, port, state, name, name, log, more)
+}
+
+/// [`agent`], on machine `machine` (its machine id made from it): two names of one machine.
+fn agent_on(dir: &Path, port: u16, state: &Path, name: &str, machine: &str, log: &str, more: &[&str]) -> anyhow::Result<(Runner, PathBuf)> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(log);
@@ -27,7 +32,7 @@ fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str, more: &[&st
     let child = common::kiln()
         .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--name", name, "--no-terminal"])
         .args(more)
-        .env("KILN_MACHINE_ID", name)
+        .env("KILN_MACHINE_ID", machine)
         .arg("--work-dir")
         .arg(dir.join(format!("{log}-work")))
         .arg("--state-dir")
@@ -63,17 +68,18 @@ fn until(port: u16, admin: &str, what: &str, log: &Path, holds: impl Fn(&[Value]
     }
 }
 
-/// The machine whose state is `state` enrolls as `name`, sending no machine id, as a kiln from
-/// before did: known by that name.
-fn enrolled_by_name(port: u16, admin: &str, join: &str, state: &Path, name: &str) -> anyhow::Result<()> {
+/// The machine whose state is `state` has a certificate naming it `name`, as a kiln from before
+/// machine ids signed one (it registers no machine without its id now, docs/machines.md): signed
+/// with the server's CA, in its data directory `dir/data`, as that server would have.
+fn enrolled_by_name(dir: &Path, port: u16, admin: &str, state: &Path, name: &str) -> anyhow::Result<()> {
     let (csr, key) = kiln::pki::make_csr(name)?;
-    let ask = json!({ "token": join, "name": name, "csr": csr, "hostname": name });
-    let (st, body) = http(port, "POST", "/api/agents/enroll", admin, Some(&ask))?;
-    anyhow::ensure!(st == 200, "enrolling: {st} {body}");
-    let enrolled: Value = serde_json::from_str(&body)?;
-    anyhow::ensure!(text(&enrolled, "name") == name && enrolled.get("label").is_none(), "known by its name: {enrolled}");
+    let pki = kiln::pki::Pki::open(&dir.join("data/pki"))?;
+    let cert = pki.sign_csr(&csr, name, 365)?;
+    let (st, body) = http(port, "GET", "/api/agents/join", admin, None)?;
+    anyhow::ensure!(st == 200, "the join info: {st} {body}");
+    let info: Value = serde_json::from_str(&body)?;
     std::fs::create_dir_all(state)?;
-    for (file, content) in [("agent.pem", text(&enrolled, "cert_pem")), ("agent.key", key.as_str()), ("ca.pem", text(&enrolled, "ca_pem")), ("quic", text(&enrolled, "quic"))] {
+    for (file, content) in [("agent.pem", cert.as_str()), ("agent.key", key.as_str()), ("ca.pem", pki.ca_pem.as_str()), ("quic", text(&info, "quic"))] {
         std::fs::write(state.join(file), content)?;
     }
     Ok(())
@@ -87,48 +93,43 @@ fn connected(a: &Value) -> bool {
     a.get("connected").and_then(Value::as_bool) == Some(true)
 }
 
+/// docs/machines.md, "One record a machine": a runner whose certificate carries the name a kiln
+/// from before gave it is keyed by its machine id the moment it connects, without a restart, and
+/// shown by that name; started again, its certificate is for the id (a refresh: nothing moves).
 #[test]
-fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_name() -> anyhow::Result<()> {
+fn machines_a_runner_from_before_is_keyed_by_its_machine_id_as_it_connects() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();
     let s = start(dir, &Options::default())?;
-    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let state = dir.join("machine");
+    enrolled_by_name(dir, s.port, &s.admin, &state, "old-box")?;
+    let id = machine("old-box");
 
-    enrolled_by_name(s.port, &s.admin, &join, &state, "old-box")?;
-
-    // It has never connected, so kiln has nothing of it to move yet: it's refused, and goes on by
-    // its name. Kiln keeps what's set for it under that name: its agent limit, a person's grant.
+    // It connects with its certificate from before: known by its id at once, shown by its name.
     let (first, log) = agent(dir, s.port, &state, "old-box", "first.log", &[])?;
-    until(s.port, &s.admin, "old-box connected by its name", &log, |l| l.iter().any(|a| text(a, "name") == "old-box" && connected(a)))?;
-    assert!(std::fs::read_to_string(&log)?.contains("it goes on by its name"), "it said why it wasn't moved");
-    let (st, body) = http(s.port, "PUT", "/api/runners/old-box/agent-limit", &s.admin, Some(&json!({ "max_sessions": 2 })))?;
+    let list = until(s.port, &s.admin, "the runner connected, keyed by its machine id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
+    let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
+    assert_eq!(text(&me, "label"), "old-box", "shown by its name: {me}");
+    assert!(!list.iter().any(|a| text(a, "name") == "old-box"), "nothing is known by its name: {list:?}");
+    // What's set for it, and a person's grant by the name people see, are the id's.
+    let (st, body) = http(s.port, "PUT", &format!("/api/runners/{id}/agent-limit"), &s.admin, Some(&json!({ "max_sessions": 2 })))?;
     anyhow::ensure!(st == 200, "its agent limit: {st} {body}");
     let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "dan", "grants": ["developer", "runners.terminal@runner:old-box"] })))?;
     anyhow::ensure!((200..300).contains(&st), "dan: {st} {body}");
+    let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
+    assert!(body.contains(&format!("runners.terminal@runner:{id}")) && !body.contains("runners.terminal@runner:old-box"), "dan's grant is on the id: {body}");
     stop(first)?;
-    until(s.port, &s.admin, "old-box gone away", &log, |l| l.iter().any(|a| text(a, "name") == "old-box" && !connected(a)))?;
+    until(s.port, &s.admin, "it went away", &log, |l| l.iter().any(|a| text(a, "name") == id && !connected(a)))?;
 
-    // It starts again, and moves to its machine id as it does: known by the id, shown by its name,
-    // what was kept under the name with it.
+    // Started again: its certificate is for its id now, and it's the same record.
     let (_runner, log) = agent(dir, s.port, &state, "old-box", "runner.log", &[])?;
-    let id = machine("old-box");
-    let list = until(s.port, &s.admin, "the runner connected by its machine id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
-    let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
-    assert_eq!(text(&me, "label"), "old-box", "shown by its name: {me}");
-    assert!(!list.iter().any(|a| text(a, "name") == "old-box"), "nothing is known by its name any more: {list:?}");
-    assert!(std::fs::read_to_string(&log)?.contains("this runner is known by its machine id now"), "it said so");
+    until(s.port, &s.admin, "the runner connected by its machine id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
+    assert!(std::fs::read_to_string(&log)?.contains("this runner is known by its machine id now"), "it took its certificate for the id");
+    let leaf = std::fs::read_to_string(state.join("agent.pem"))?;
+    assert_eq!(kiln::pki::leaf_name(&kiln::pki::Leaf { cert_pem: leaf.clone(), key_pem: String::new() }).as_deref(), Some(id.as_str()), "its certificate names its id");
     let (st, body) = http(s.port, "GET", &format!("/api/runners/{id}/agent-limit"), &s.admin, None)?;
     let limit: Value = serde_json::from_str(&body).unwrap_or_default();
-    assert!(st == 200 && limit.get("max_sessions") == Some(&json!(2)), "its agent limit went with it: {st} {body}");
-    let (st, _) = http(s.port, "GET", "/api/runners/old-box/agent-limit", &s.admin, None)?;
-    assert_eq!(st, 404, "nothing is set under its name any more");
-    let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
-    let users: Value = serde_json::from_str(&body)?;
-    let dan = users.get("users").and_then(Value::as_array).into_iter().flatten().find(|u| text(u, "name") == "dan").cloned().unwrap_or_default();
-    let grants: Vec<&str> = dan.get("grants").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-    let on_it = format!("runners.terminal@runner:{id}");
-    assert!(grants.contains(&on_it.as_str()) && !grants.contains(&"runners.terminal@runner:old-box"), "dan's grant went with it: {dan}");
+    assert!(st == 200 && limit.get("max_sessions") == Some(&json!(2)), "its agent limit stayed: {st} {body}");
 
     // Renamed, it's shown by its new name, and that name is its machine's: another machine that
     // asks for it is shown by another.
@@ -139,20 +140,13 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
     let list = until(s.port, &s.admin, "the other machine connected", &other_log, |l| l.iter().any(|a| text(a, "name") == other && connected(a)))?;
     let shown = |k: &str| list.iter().find(|a| text(a, "name") == k).map(|a| text(a, "label").to_owned()).unwrap_or_default();
     assert_eq!((shown(&id), shown(&other)), ("build-box".to_owned(), "build-box-2".to_owned()), "{list:?}");
-    // A grant on it by the name people see is on the runner kiln knows by its id.
-    let (st, body) = http(s.port, "POST", "/api/grants", &s.admin, Some(&json!({ "user": "dan", "grant": "runners.read@runner:build-box" })))?;
-    anyhow::ensure!((200..300).contains(&st), "granting by its name: {st} {body}");
-    let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
-    assert!(body.contains(&format!("runners.read@runner:{id}")) && !body.contains("runners.read@runner:build-box"), "{body}");
 
-    // Forgotten, it stays out (W27-R01): its certificate for the id was recorded as it moved, so
-    // forgetting it revokes its key, its certificate for its old name's with it.
-    let key = kiln::pki::fingerprints(&std::fs::read_to_string(state.join("agent.pem"))?)?.key;
-    let (st, body) = http(s.port, "DELETE", &format!("/api/agents/{id}"), &s.admin, None)?;
-    anyhow::ensure!((200..300).contains(&st), "forgetting it: {st} {body}");
+    // Forgotten, it stays out (W27-R01): its certificates' key is revoked, the one for its old name too.
+    let key = kiln::pki::fingerprints(&leaf)?.key;
+    let (st, body) = http(s.port, "DELETE", "/api/agents/old-box", &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "forgetting it by its old name: {st} {body}");
     let (_, body) = http(s.port, "GET", "/api/identities/revocations", &s.admin, None)?;
-    let (_, issued) = http(s.port, "GET", "/api/identities?kind=machine", &s.admin, None)?;
-    assert!(body.contains(&key), "its key is revoked: {body}\nwhat kiln issued: {issued}");
+    assert!(body.contains(&key), "its key is revoked: {body}");
     std::thread::sleep(Duration::from_secs(6));
     until(s.port, &s.admin, "it stayed forgotten", &log, |l| !l.iter().any(|a| text(a, "name") == id))?;
     Ok(())
@@ -163,18 +157,17 @@ fn a_runner_an_upgrade_started_moves_its_machine_to_its_machine_id_as_it_starts(
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();
     let s = start(dir, &Options::default())?;
-    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let state = dir.join("machine");
-    enrolled_by_name(s.port, &s.admin, &join, &state, "up-box")?;
-    // Its usual runner connects by its name (it had nothing to move), then stops.
-    let (first, log) = agent(dir, s.port, &state, "up-box", "first.log", &[])?;
-    until(s.port, &s.admin, "up-box connected by its name", &log, |l| l.iter().any(|a| text(a, "name") == "up-box" && connected(a)))?;
-    stop(first)?;
-    until(s.port, &s.admin, "up-box gone away", &log, |l| l.iter().any(|a| text(a, "name") == "up-box" && !connected(a)))?;
-    // Its runner now is the runner process an upgrade started (`--instance`): as it starts, the
-    // machine moves to its id, and the process gets its own certificate for it.
-    let (_beside, log) = agent(dir, s.port, &state, "up-box", "beside.log", &["--instance", "u1"])?;
+    enrolled_by_name(dir, s.port, &s.admin, &state, "up-box")?;
     let id = machine("up-box");
+    // Its usual runner connects (keyed by its machine id at once), then stops.
+    let (first, log) = agent(dir, s.port, &state, "up-box", "first.log", &[])?;
+    until(s.port, &s.admin, "up-box connected", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
+    stop(first)?;
+    until(s.port, &s.admin, "up-box gone away", &log, |l| l.iter().any(|a| text(a, "name") == id && !connected(a)))?;
+    // Its runner now is the runner process an upgrade started (`--instance`): as it starts, the
+    // machine's certificate is for its id, and the process gets its own certificate for it.
+    let (_beside, log) = agent(dir, s.port, &state, "up-box", "beside.log", &["--instance", "u1"])?;
     let list = until(s.port, &s.admin, "the runner process connected by the machine's id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
     let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
     assert_eq!(text(&me, "label"), "up-box", "shown by its name: {me}");
@@ -195,5 +188,50 @@ fn the_servers_own_runner_is_known_by_its_machines_id_and_shown_by_its_name() ->
     let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
     assert_eq!(text(&me, "label"), kiln::pki::sanitize_name(&kiln::config::Config::hostname()), "shown by its configured name: {me}");
     assert_eq!(list.len(), 1, "one runner: {list:?}");
+    Ok(())
+}
+
+/// docs/machines.md, "One record a machine": one machine whose runner had certificates for two
+/// names from before (it joined by two host names, as fedora.attlocal.net and
+/// kiln-a094a12d.attlocal.net did) is one record, by its id, whichever connects: the second
+/// connecting is the same record, shown by the first's name, and both names resolve to it.
+#[test]
+fn machines_two_names_of_one_machine_are_one_record_by_its_id() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let s = start(dir, &Options::default())?;
+    let id = machine("one-box");
+    for (name, log) in [("fedora", "fedora.log"), ("kiln-a094", "kiln-a094.log")] {
+        let state = dir.join(name);
+        enrolled_by_name(dir, s.port, &s.admin, &state, name)?;
+        let (r, log) = agent_on(dir, s.port, &state, name, "one-box", log, &[])?;
+        let list = until(s.port, &s.admin, &format!("{name} connected as the machine"), &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
+        assert!(!list.iter().any(|a| ["fedora", "kiln-a094"].contains(&text(a, "name"))), "one record: {list:?}");
+        assert_eq!(list.iter().filter(|a| text(a, "label") == "fedora").count(), 1, "shown by the first's name: {list:?}");
+        stop(r)?;
+        until(s.port, &s.admin, &format!("{name} gone away"), &log, |l| l.iter().any(|a| text(a, "name") == id && !connected(a)))?;
+    }
+    // Forgotten by either name, the machine is.
+    let (st, body) = http(s.port, "DELETE", "/api/agents/kiln-a094", &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "forgetting it: {st} {body}");
+    let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
+    assert!(!body.contains(&id), "forgotten: {body}");
+    Ok(())
+}
+
+/// docs/machines.md, "One record a machine": kiln registers machines by their ids. Enrolling with
+/// the join token, and asking to join, without one are refused, saying how to get one.
+#[test]
+fn machines_registration_without_a_machine_id_is_refused() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let s = start(dir, &Options::default())?;
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    let (csr, _key) = kiln::pki::make_csr("no-id")?;
+    let (st, body) = http(s.port, "POST", "/api/agents/enroll", &s.admin, Some(&json!({ "token": join, "name": "no-id", "csr": csr, "hostname": "no-id" })))?;
+    assert!(st == 400 && body.contains("KILN_MACHINE_ID") && body.contains("systemd-machine-id-setup"), "enrolling without an id: {st} {body}");
+    let id = machine("with-id");
+    let (st, body) = http(s.port, "POST", "/api/agents/enroll", &s.admin, Some(&json!({ "token": join, "name": "with-id", "csr": csr, "hostname": "with-id", "machine_id": id })))?;
+    assert!(st == 200 && body.contains(&id), "with its id it's registered by it: {st} {body}");
     Ok(())
 }

@@ -76,7 +76,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "b9fb7e149057620d03b1d89ee6637fd5f2246fcf"
+commit = "ba41732d1ddb70fa0d86b546b0a88e01afa7bae3"
 path = "vendor/quiver"
 exclude = ["vendor", "bench/records"]
 
@@ -85,7 +85,7 @@ exclude = ["vendor", "bench/records"]
 [projects.focal-bus]
 kind = "git"
 repository = "https://github.com/hyper-light/focal"
-commit = "f8052a5eaf21f81709129583e535331c2e9722f3"
+commit = "9aded7cdf0a596f35039acb9b4e610c52f9d1f0a"
 path = "vendor/focal-bus"
 take = [
   "Cargo.toml",
@@ -98,12 +98,13 @@ take = [
 ]
 own = ["UPSTREAM.md"]
 
-# hyper-raft's shared crates at the revision Focal's bus takes: Quiver's, and kiln's own transport,
-# runtime and replicated stores (sync, CD) too; its recorded change is Quiver's.
+# hyper-raft's shared crates at one revision for Focal's bus, Quiver, Mantle and kiln's own transport,
+# runtime and replicated stores (sync, CD): the merge of hyper-raft's main and Mantle's line
+# (CP-T10.2); its recorded change is Quiver's.
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "25cf88924895ee55976caa061a48789355fb3354"
+commit = "0856e05df3d136f0870a98808113294a73399206"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",
@@ -120,6 +121,7 @@ take = [
   "crates/hyper-rt-transport",
   "crates/hyper-seal",
   "crates/hyper-sim",
+  "crates/hyper-swim",
   "crates/hyper-timing",
   "crates/hyper-tls",
   "crates/hyper-transport",
@@ -164,4 +166,34 @@ take = [
   "grammars/tree-sitter-typescript",
   "grammars/tree-sitter-yaml",
 ]
+own = ["UPSTREAM.md"]
+
+# aws-lc-rs, kiln's (and rustls's, Mantle's) cryptography over AWS-LC, at its release v1.18.2, the
+# version kiln takes from crates.io, with Mantle's change to it (a digest's state read out and
+# resumed, which Mantle's gateway needs) so Mantle builds on kiln's one copy (kiln's CP-T10.2). The
+# crate alone: aws-lc-sys stays crates.io's (0.46.0). Its manifest is made standalone, as crates.io's
+# package states it (vendor/aws-lc-rs/UPSTREAM.md).
+[projects.aws-lc-rs]
+kind = "git"
+repository = "https://github.com/aws/aws-lc-rs"
+commit = "9df497501436596d4da77109217806b3af7f56cb"
+path = "vendor/aws-lc-rs"
+take = ["LICENSE", "aws-lc-rs"]
+# Upstream's checkouts write its NIST vectors with CRLF line ends; kiln's copy holds each file's bytes
+# as upstream's repository does, so a checkout of kiln holds them as scripts/vendor.py checks them.
+exclude = ["aws-lc-rs/third_party/NIST/.gitattributes"]
+own = ["UPSTREAM.md"]
+
+# Mantle, kiln's store of bytes (docs/mantle.md; kiln's CP-T10.2), at the head of its main: its crates,
+# built on kiln's one hyper-raft (vendor/hyper-raft) and aws-lc-rs (vendor/aws-lc-rs), so kiln's copy
+# leaves its own copies of them (its vendor/) out, and its docs and drawings, which are Mantle's and no
+# part of what kiln builds, and its CI (.github, .kiln), which runs in Mantle's repository. Its crates
+# take hyper-raft's by path: the recorded change points those paths at kiln's copy
+# (vendor/mantle/UPSTREAM.md).
+[projects.mantle]
+kind = "git"
+repository = "https://github.com/hyper-light/mantle"
+commit = "17eb8032710b8803d328a6c846a9dc1769660b98"
+path = "vendor/mantle"
+exclude = [".github", ".kiln", "vendor", "docs", "loomdoc.html", "mantle-strata.svg", "mantle-strata-dark.svg", "mantle-strata-light.svg"]
 own = ["UPSTREAM.md"]

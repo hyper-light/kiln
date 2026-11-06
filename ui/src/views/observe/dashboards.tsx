@@ -10,15 +10,20 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { ObserveNav, dashboardsRes } from "./parts";
+import { HeldFields, ObserveNav, dashboardsRes, useOpening } from "./parts";
 
 export default function Dashboards() {
   const navigate = useNavigate();
-  const [busy, setBusy] = React.useState(false);
   const [importing, setImporting] = React.useState(false);
+  const [make, making] = useAction(async () => {
+    const d = await observeApi.createDashboard({ title: "New dashboard", description: "", template_variables: [], widgets: [] });
+    invalidate("observe/dashboards");
+    await navigate(`/observe/dashboards/${encodeURIComponent(d.id)}`);
+  }, "Couldn't make a dashboard");
   return (
     <div className="container-console page">
       <title>Dashboards · Observe · kiln</title>
@@ -32,21 +37,7 @@ export default function Dashboards() {
             <Button variant="secondary" onClick={() => setImporting(true)}>
               <Upload /> Import from Datadog
             </Button>
-            <Button
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  const d = await observeApi.createDashboard({ title: "New dashboard", description: "", template_variables: [], widgets: [] });
-                  invalidate("observe/dashboards");
-                  navigate(`/observe/dashboards/${encodeURIComponent(d.id)}`);
-                } catch (e) {
-                  toast({ title: "Couldn't make a dashboard", description: errorMessage(e), tone: "failed" });
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
+            <Button onClick={make} pending={making}>
               <Plus /> New dashboard
             </Button>
           </div>
@@ -67,19 +58,18 @@ function ImportDialog({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const file = React.useRef<HTMLInputElement>(null);
   const [text, setText] = React.useState("");
+  const opening = useOpening(text);
   const [error, setError] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const submit = async () => {
-    let body: unknown;
-    try {
-      body = JSON.parse(text);
-    } catch (e) {
-      setError(`Not JSON: ${errorMessage(e)}`);
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
+  const [submit, submitting] = useAction(
+    async () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(text);
+      } catch (e) {
+        setError(`Not JSON: ${errorMessage(e)}`);
+        return;
+      }
+      setError(null);
       const { dashboard, report } = await observeApi.importDashboard(body);
       invalidate("observe/dashboards");
       const apart = report.otherwise.length + report.not_drawn.length;
@@ -90,61 +80,69 @@ function ImportDialog({ onClose }: { onClose: () => void }) {
           : `All ${report.widgets} widgets drawn as Datadog draws them.`,
         tone: "succeeded",
       });
-      navigate(`/observe/dashboards/${encodeURIComponent(dashboard.id)}`);
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+      if (opening.still(text)) await navigate(`/observe/dashboards/${encodeURIComponent(dashboard.id)}`);
+    },
+    (e) => setError(errorMessage(e)),
+  );
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title="Import a Datadog dashboard" description="Its JSON, as Datadog exports it (a dashboard's settings, Export dashboard JSON) or as its API gives it.">
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            void submit();
+            submit();
           }}
         >
-          <div>
-            <label htmlFor="datadog-json" className="field-label">
-              Dashboard JSON
-            </label>
-            <div className="field">
-              <textarea id="datadog-json" rows={10} className="font-mono" value={text} onChange={(e) => setText(e.target.value)} placeholder='{ "title": "…", "widgets": [ … ] }' spellCheck={false} />
+          <HeldFields held={submitting}>
+            <div>
+              <label htmlFor="datadog-json" className="field-label">
+                Dashboard JSON
+              </label>
+              <div className="field">
+                <textarea
+                  id="datadog-json"
+                  rows={10}
+                  className="font-mono"
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  placeholder='{ "title": "…", "widgets": [ … ] }'
+                  spellCheck={false}
+                />
+              </div>
+              <p className="field-hint">
+                Or{" "}
+                <button type="button" className="text-link" onClick={() => file.current?.click()}>
+                  choose its file
+                </button>
+                .
+              </p>
             </div>
-            <p className="field-hint">
-              Or{" "}
-              <button type="button" className="text-link" onClick={() => file.current?.click()}>
-                choose its file
-              </button>
-              .
-            </p>
-          </div>
-          <input
-            ref={file}
-            type="file"
-            accept="application/json,.json"
-            className="sr-only"
-            tabIndex={-1}
-            aria-hidden="true"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              e.target.value = "";
-              if (f) void f.text().then(setText);
-            }}
-          />
-          {error && (
-            <p role="alert" className="text-[12.5px] break-words text-[#e2c4c6]">
-              {error}
-            </p>
-          )}
+            <input
+              ref={file}
+              type="file"
+              accept="application/json,.json"
+              className="sr-only"
+              tabIndex={-1}
+              aria-hidden="true"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) void f.text().then(setText);
+              }}
+            />
+            {error && (
+              <p role="alert" className="text-[12.5px] break-words text-[#e2c4c6]">
+                {error}
+              </p>
+            )}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy || !text.trim()}>
+            <Button type="submit" disabled={!text.trim()} pending={submitting}>
               Import
             </Button>
           </div>

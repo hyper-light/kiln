@@ -67,19 +67,45 @@ async fn seen(cx: &Cx, id: &str) -> Result<Info, Fail> {
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
     let (machine, harness, state, parent, run) = (s("machine"), s("harness"), s("state"), s("parent"), s("plan_run"));
-    let agents: Vec<Value> = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list())
-        .await
-        .iter()
+    let keep = |i: &Info| {
         // A card's helper (`super::about`) is the card's: no agent of these.
-        .filter(|i| i.helper.is_none())
-        .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
-        .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
-        .filter(|i| parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p)))
-        .filter(|i| run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r)))
-        .map(wait::brief)
-        .filter(|b| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st)))
-        .collect();
-    Ok(json!({"agents": agents}))
+        i.helper.is_none()
+            && machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local"))
+            && harness.as_deref().is_none_or(|h| i.kind == h)
+            && parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p))
+            && run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r))
+    };
+    // Whoever sees every session reads each info as its owner shares it, none copied (goal 9, plan 01a1a87b2cec step 5);
+    // anyone else, those `lineage::seen` lets them.
+    let infos: Vec<std::sync::Arc<Info>> = if lineage::sees_all(&cx.caller) {
+        cx.hub.harness.list_shared().into_iter().filter(|i| keep(i)).collect()
+    } else {
+        lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await.into_iter().filter(|i| keep(i)).map(std::sync::Arc::new).collect()
+    };
+    let wanted = |b: &Value| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st));
+    let agents = briefs(infos, wait::brief, wanted).await;
+    // `{"agents": [...]}` with the briefs moved in: `json!` would serialize them into a new tree, a copy of every
+    // brief on the shard (goal 10, plan 01a1a87b2dae step 5).
+    let mut out = serde_json::Map::new();
+    out.insert("agents".into(), Value::Array(agents));
+    Ok(Value::Object(out))
+}
+
+/// The briefs `make` makes (`wait::brief`) of `infos` whose brief `wanted` wants, in their order, made on the compute
+/// pool (`crate::rt::compute_map`, an agent a unit, its thread given up between any two where another job waits) and
+/// handed back to the shard in one hop (goal 10, plan 01a1a87b2dae step 5). Made on the request's shard, `agents_list`
+/// held it 1.2 ms a call made at once (g11alloc2's calm rounds), and 0.31 ms a poll at the mean made a brief at a
+/// time with its turn taken after each (rt9's): a turn taken after a brief ends past the quantum where the brief
+/// does. Where the pool can't take them, they're made here.
+async fn briefs(infos: Vec<std::sync::Arc<Info>>, make: fn(&Info) -> Value, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let made = match crate::rt::compute_map(infos.clone(), move |i: std::sync::Arc<Info>| make(&i)).await {
+        Ok(made) => made,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "the agents' briefs weren't made off the shard: made here");
+            infos.iter().map(|i| make(i)).collect()
+        }
+    };
+    made.into_iter().filter(|b| wanted(b)).collect()
 }
 
 /// What a state says that `agents.get` leaves out: catalogs and lists only a console needs.
@@ -188,7 +214,8 @@ async fn about(cx: Cx, v: Value) -> Out {
 
 async fn send(cx: Cx, v: Value) -> Out {
     let id = agent_of(&v)?;
-    let body = text(&v, "text")?;
+    let words = text(&v, "text")?;
+    let body = words.clone();
     let mode: SendMode = match v.get("mode").and_then(Value::as_str).unwrap_or("queue") {
         "queue" => SendMode::Queue,
         "steer" => SendMode::Steer,
@@ -218,7 +245,52 @@ async fn send(cx: Cx, v: Value) -> Out {
         None => made,
     };
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await {
+    // An agent's words, its call relayed signed by its runner and taken: kiln passes them on too,
+    // its record and the ones before it going with them, for the recipient's runner to check end to
+    // end (docs/ci.md W27-R08's relays).
+    let relayed = match cx.caller.agent.as_deref().and_then(|me| cx.hub.relays.carried(me, &words)) {
+        Some(c) => crate::relays::words(&cx.hub, &id, c).await,
+        None => None,
+    };
+    let mut c = Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+    let mut record = None;
+    let sent = match relayed {
+        Some((relayed, seq, digest)) => {
+            record = Some(digest);
+            // A test build's faulty relay (`relay_words`): every second one dropped, swapped for the
+            // one before, or a byte of it changed, after kiln recorded passing it on.
+            use crate::runner::chaos::RelayFault;
+            let relayed = match crate::runner::chaos::get().and_then(|f| f.relay_words).filter(|_| RelayFault::strikes(seq)) {
+                Some(RelayFault::Drop) => return Ok(json!({"sent": true, "message": message})),
+                Some(RelayFault::Alter) => {
+                    if let Command::Send { text, .. } = &mut c {
+                        text.push('!');
+                    }
+                    relayed
+                }
+                Some(RelayFault::Swap) => match cx.hub.relays.swapped(&relayed) {
+                    Some((other, words)) => {
+                        if let Command::Send { text, .. } = &mut c {
+                            *text = words;
+                        }
+                        other
+                    }
+                    None => relayed,
+                },
+                None => relayed,
+            };
+            cx.hub.harness.command_relayed(&cx.hub, &id, c, relayed).await
+        }
+        None => cx.hub.harness.command(&cx.hub, &id, c).await,
+    };
+    // Words kiln recorded passing on that it couldn't deliver: said so at once, not left for a
+    // receipt that won't come.
+    if let Some(record) = record
+        && matches!(sent, Sent::NoSession | Sent::Unreachable | Sent::Rejected { .. } | Sent::Unanswered(_))
+    {
+        crate::relays::undelivered(&cx.hub, &record, &format!("{sent:?}")).await;
+    }
+    match sent {
         Sent::Ok | Sent::Taken => Ok(json!({"sent": true, "message": message})),
         // Its machine is away: it goes once that's back, once.
         Sent::Parked => Ok(json!({"sent": true, "parked": true, "message": message})),
@@ -295,7 +367,7 @@ fn peer_text(sender: Option<(&Info, &str)>, me: &str, text: &str) -> String {
 
 /// The words of a message from another agent: what follows what kiln says of a fellow agent
 /// (`peer_text`), or all of it.
-fn body_of(text: &str) -> &str {
+pub(crate) fn body_of(text: &str) -> &str {
     text.split_once("\n\n").filter(|(said, _)| said.starts_with("Agent ") && said.ends_with(ANSWER_END)).map_or(text, |(_, body)| body)
 }
 
@@ -414,7 +486,10 @@ async fn result(cx: Cx, v: Value) -> Out {
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
-    let record = crate::workspace::change::of(&cx.hub, &id).await;
+    let record = match crate::workspace::change::of(&cx.hub, &id).await {
+        Some(r) => Some(crate::workspace::change::fresh(&cx.hub, r).await),
+        None => None,
+    };
     let files: Vec<Value> = changes
         .as_array()
         .into_iter()
@@ -531,13 +606,16 @@ async fn changes(cx: Cx, v: Value) -> Out {
             if cx.hub.harness.info(&id).is_some() {
                 lineage::may_see(&cx.hub, &cx.caller, &id).await?;
             }
-            crate::workspace::change::of(&cx.hub, &id).await.iter().map(crate::workspace::change::shown).collect()
+            match crate::workspace::change::of(&cx.hub, &id).await {
+                Some(r) => vec![crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await)],
+                None => Vec::new(),
+            }
         }
         None => {
             let mut out = Vec::new();
             for r in crate::workspace::change::all(&cx.hub).await {
                 if cx.hub.harness.info(&r.agent).is_none() || lineage::may_see(&cx.hub, &cx.caller, &r.agent).await.is_ok() {
-                    out.push(crate::workspace::change::shown(&r));
+                    out.push(crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await));
                 }
             }
             out
@@ -706,7 +784,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.change",
-            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default).",
+            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft` (a draft on every host, new versions staying one), `ready` (its draft marked ready for review, with a new version or nothing new), `trunk` (else the repository's default), `answers` (the threads a new version answers, in kiln's own review). Its answer says whether it's a `draft`.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsChange>(),
@@ -966,12 +1044,18 @@ pub mod input {
         pub title: Option<String>,
         /// What it changes and why, for reviewers.
         pub body: Option<String>,
-        /// Not ready for review yet (kiln's own review).
+        /// Opened as a draft, not ready for review yet, on kiln, GitHub, GitLab and Bitbucket alike;
+        /// its new versions stay a draft until `ready`.
         pub draft: Option<bool>,
         /// The branch it goes into.
         pub trunk: Option<String>,
         /// Failing checks go to the agent to fix (the default).
         pub fix_checks: Option<bool>,
+        /// The threads of its change this new version fixes (kiln's own review, by their ids): the
+        /// version is an agent's fix of theirs, and each says which version fixed it.
+        pub threads: Option<Vec<String>>,
+        /// Marks its draft ready for review, with a new version or with nothing new to push.
+        pub ready: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1057,6 +1141,40 @@ pub mod input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 5: `agents.list` makes its agents' briefs on the compute pool, none on the shard
+    /// that asks for them, and has them back in one hop: each made once, the agents it gives, their order and its
+    /// filter on what each brief says as they were made at once.
+    #[test]
+    fn g10_s5_agents_list_makes_its_briefs_off_the_shard() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static ON_SHARD: AtomicUsize = AtomicUsize::new(0);
+        fn counted(i: &Info) -> Value {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            if crate::rt::on_shard() {
+                ON_SHARD.fetch_add(1, Ordering::Relaxed);
+            }
+            wait::brief(i)
+        }
+        let info = |n: usize| Info { id: format!("a{n}"), kind: if n.is_multiple_of(2) { "claude" } else { "codex" }.into(), ..Info::default() };
+        let infos: Vec<Arc<Info>> = (0..5).map(|n| Arc::new(info(n))).collect();
+        let at_once: Vec<Value> = infos.iter().map(|i| wait::brief(i)).collect();
+        let claude: Vec<Value> = at_once.iter().filter(|b| b.get("kind") == Some(&json!("claude"))).cloned().collect();
+        let (all, some, none) = crate::rt::block_on(async move {
+            let all = briefs(infos.clone(), counted, |_: &Value| true).await;
+            let some = briefs(infos.clone(), counted, |b: &Value| b.get("kind") == Some(&json!("claude"))).await;
+            let none = briefs(infos, counted, |_: &Value| false).await;
+            Ok((all, some, none))
+        })?;
+        assert_eq!(all, at_once, "the same briefs, in order");
+        assert_eq!((some.len(), some), (3, claude), "those its filter wants, in order");
+        assert!(none.is_empty(), "none wanted");
+        assert_eq!(MADE.load(Ordering::Relaxed), 15, "each agent's brief made once a call");
+        assert_eq!(ON_SHARD.load(Ordering::Relaxed), 0, "none made on a shard");
+        Ok(())
+    }
 
     #[test]
     fn about_asks_what_was_tapped_in_the_four_parts_the_card_reads() {
@@ -1187,6 +1305,24 @@ mod end_to_end {
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         Ok(hub)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a person who sees every session gets the agents listed from their infos as each
+    /// owner shares them (`Registry::list_shared`, none copied), and what the copied list gave: the same agents, in order.
+    #[test]
+    fn g9_s5_a_list_for_whoever_sees_every_session_is_the_copied_lists() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let (a, b) = (parent(&hub, "default", true).await?, parent(&hub, "default", true).await?);
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let listed = call(person, "agents.list", json!({})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let ids: Vec<String> = listed.get("agents").and_then(Value::as_array).map(|all| all.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect()).unwrap_or_default();
+            let copied: Vec<String> = hub.harness.list().into_iter().filter(|i| i.helper.is_none()).map(|i| i.id).collect();
+            anyhow::ensure!(ids == copied && ids.contains(&a) && ids.contains(&b), "{listed}");
+            let shared: Vec<String> = hub.harness.list_shared().iter().map(|i| i.id.clone()).collect();
+            anyhow::ensure!(shared == hub.harness.list().into_iter().map(|i| i.id).collect::<Vec<_>>(), "the same sessions, in the same order");
+            Ok(())
+        })
     }
 
     #[test]
@@ -1548,11 +1684,11 @@ mod end_to_end {
             let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
             for (n, k) in kids.iter().enumerate() {
                 let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
-                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None });
+                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None }).await;
             }
-            let report = |k: &str, status: Status, said: String, at: i64| {
+            let report = async |k: &str, status: Status, said: String, at: i64| {
                 let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };
-                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) });
+                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) }).await;
             };
             let queue = || hub.harness.queue(&p);
             let news = || queue().into_iter().filter(|q| q.text.contains("which you started")).collect::<Vec<_>>();
@@ -1565,12 +1701,12 @@ mod end_to_end {
             for round in 0..6 {
                 // Each helper goes to work and ends a turn, and stands so a while.
                 for k in &kids {
-                    report(k, Status::Running, String::new(), 0);
+                    report(k, Status::Running, String::new(), 0).await;
                 }
                 now += 1_000;
                 crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
                 for (n, k) in kids.iter().enumerate() {
-                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0));
+                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0)).await;
                 }
                 now += 1_000;
                 crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
@@ -1608,7 +1744,7 @@ mod end_to_end {
             until(|| queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "the fellow agents' messages, waiting").await?;
             // The third helper goes back to work; it waits for it, and the wait returns at once with its mail.
             if let Some(k) = kids.get(2) {
-                report(k, Status::Running, String::new(), 0);
+                report(k, Status::Running, String::new(), 0).await;
             }
             // (A wait that says not to, as a program's in code mode does, hands nothing over.)
             let program = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 1, "hand_over": false})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
@@ -1705,6 +1841,59 @@ mod end_to_end {
             let deep = as_agent(&hub, &kid).await?;
             let Err((_, why)) = call(deep, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE})).await else { anyhow::bail!("too deep") };
             anyhow::ensure!(why.contains("max_depth"), "{why}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `agents.list`, its briefs made in turns of the shard's and a person's infos read
+    /// as their owners share them (goals 10 and 9's), lists what it listed when it did it all in one poll:
+    /// for an agent (its own children and itself, its person's other agents), another agent of the same person,
+    /// and the owner; with no filter, by parent, by state, and by a harness none runs; in the registry's order.
+    #[test]
+    fn g9_s3_agents_list_lists_what_it_listed_for_agents_and_people() -> anyhow::Result<()> {
+        use crate::harness::{lineage, wait};
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let p = parent(&hub, "default", true).await?;
+            let cx = as_agent(&hub, &p).await?;
+            let mut kids = Vec::new();
+            for name in ["a", "b"] {
+                let started = call(cx.clone(), "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "name": name})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                kids.push(started.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or("").to_owned());
+            }
+            // They can't start (their folder isn't there): settled, so their briefs hold still.
+            let waited = call(cx.clone(), "agents.wait", json!({"agents": kids, "timeout_s": 20})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(waited.get("done") == Some(&json!(true)), "{waited}");
+            let other = parent(&hub, "default", true).await?;
+            let stranger = as_agent(&hub, &other).await?;
+            let owner = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            // Who each listed agent is, which holds still while the parents start and stop.
+            let who_is = |v: &Value| -> Vec<(Value, Value, Value)> { v.as_array().map(|a| a.iter().map(|b| (b.get("id").cloned().unwrap_or_default(), b.get("kind").cloned().unwrap_or_default(), b.get("parent").cloned().unwrap_or_default())).collect()).unwrap_or_default() };
+            for (who, caller) in [("the parent", &cx), ("another agent", &stranger), ("the owner", &owner)] {
+                for args in [json!({}), json!({"harness": "codex"}), json!({"parent": p}), json!({"parent": p, "state": "stopped"}), json!({"parent": p, "state": "ended"})] {
+                    let got = call(caller.clone(), "agents.list", args.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned);
+                    let (parent, state, harness) = (s("parent"), s("state"), s("harness"));
+                    // As it listed them: what the caller sees, then the filters, then each one's brief.
+                    let want: Vec<Value> = lineage::seen(&hub, &caller.caller, hub.harness.list())
+                        .await
+                        .iter()
+                        .filter(|i| i.helper.is_none())
+                        .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
+                        .filter(|i| parent.as_deref().is_none_or(|q| i.parent.as_deref() == Some(q)))
+                        .map(wait::brief)
+                        .filter(|b| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st)))
+                        .collect();
+                    let want = Value::Array(want);
+                    // The children have settled: their briefs whole. The parents' may change as they're read.
+                    let same = if parent.is_some() { got.get("agents") == Some(&want) } else { got.get("agents").map(who_is) == Some(who_is(&want)) };
+                    anyhow::ensure!(same, "{who}, {args}: {got} against {want}");
+                }
+            }
+            // And the parent's own children are what it lists by parent.
+            let mine = call(cx, "agents.list", json!({"parent": p})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let ids: Vec<&str> = mine.get("agents").and_then(Value::as_array).map(|a| a.iter().filter_map(|b| b.get("id").and_then(Value::as_str)).collect()).unwrap_or_default();
+            anyhow::ensure!(ids.len() == 2 && kids.iter().all(|k| ids.contains(&k.as_str())), "{mine}");
             Ok(())
         })
     }

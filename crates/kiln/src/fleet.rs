@@ -236,7 +236,11 @@ fn builds_path(hub: &Hub) -> PathBuf {
 }
 
 fn load_builds(hub: &Hub) -> BTreeMap<String, Known> {
-    std::fs::read(builds_path(hub)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    read_builds(&builds_path(hub))
+}
+
+fn read_builds(path: &std::path::Path) -> BTreeMap<String, Known> {
+    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 /// Remember that `build` (a binary for `target`) is `commit`.
@@ -255,18 +259,12 @@ pub fn remember(hub: &Hub, build: &str, target: &str, commit: &str) {
         let Some(oldest) = map.iter().min_by_key(|(_, k)| k.at).map(|(b, _)| b.clone()) else { break };
         map.remove(&oldest);
     }
-    let path = builds_path(hub);
-    let write = || -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.part");
-        std::fs::write(&tmp, serde_json::to_vec(&*map)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        tracing::warn!(error = %format!("{e:#}"), "couldn't remember a build's commit");
+    // Written by the kept files' writer, off the shards, whole (`<file>.part`, then renamed over it), in the order
+    // kept: written here, a runner's facts (on the hub's loop) and the fleet's loop waited on the disk, under this
+    // lock (goal 9, plan 01a1a87b2cec step 3).
+    match serde_json::to_vec(&*map) {
+        Ok(b) => crate::keep::later(builds_path(hub), b),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "couldn't remember a build's commit"),
     }
 }
 
@@ -592,7 +590,7 @@ pub(crate) fn builds_itself(hub: &Hub, r: &RunnerInfo) -> Result<(), String> {
     if let Some(why) = cant_build(hub, &r.name) {
         return Err(why);
     }
-    let missing = hub.agents.lock().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
+    let missing = hub.agents.load().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
     match missing {
         Some(m) if m.is_empty() => Ok(()),
         Some(m) => Err(format!("it has no {} to build kiln with", m.join(" or "))),
@@ -646,7 +644,7 @@ pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder
     }
     let candidates: Vec<Candidate> = hub
         .agents
-        .lock()
+        .load()
         .values()
         .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
         .filter_map(|a| {
@@ -830,6 +828,16 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     // thread (`updates::binaries`, `updates::runners`), where a debug build's gigabyte held the
     // shard, and the HTTP listener on it, back 30 to 60 s.
     let build = crate::rt::blocking(crate::updates::own_build).await?;
+    // The builds kiln knows read on the blocking pool too, before anything asks them on a shard (goal 9, plan
+    // 01a1a87b2cec step 3); one asked first (a runner's facts as it connects) reads them where it is, once.
+    let path = builds_path(&hub);
+    let known = crate::rt::blocking(move || read_builds(&path)).await?;
+    {
+        let mut kept = hub.updates.fleet.builds.lock();
+        if kept.is_none() {
+            *kept = Some(known);
+        }
+    }
     // What this server runs is remembered, so runners on it are known after it is replaced.
     if is_commit(crate::api::COMMIT) {
         remember(&hub, &build, crate::api::TARGET, crate::api::COMMIT);
@@ -868,7 +876,7 @@ async fn tell(hub: &Arc<Hub>, t: &Target) {
         if hub.updates.fleet.told.lock().contains(&key) {
             continue;
         }
-        let Some(peer) = hub.instances.lock().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
+        let Some(peer) = hub.instances.load().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
         let from = r.from.clone().unwrap_or_else(|| format!("no build of it for {} yet", r.target.as_deref().unwrap_or("its platform")));
         let msg = crate::proto::ServerMsg::UpdateAvailable { commit: t.commit.clone(), build: r.target_build.clone().unwrap_or_default(), from };
         hub.command_peers(&r.name, vec![peer], &msg).await.log_when_answered(crate::hub::LOG_WITHIN);
@@ -927,7 +935,7 @@ pub fn building_commit(hub: &Hub, job: &str) -> Option<String> {
 }
 
 /// The source of the commit build job `job` builds: the server's archive of it (tar).
-pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let commit = building_commit(hub, job).ok_or_else(|| anyhow::anyhow!("no such build"))?;
     let repo = release_repo(hub).await.ok_or_else(|| anyhow::anyhow!("kiln doesn't build {}", hub.cfg.updates.release_repo))?;
     crate::gitops::archive(hub, &repo, &commit).await
@@ -1470,6 +1478,7 @@ mod tests {
             instances: Vec::new(),
             transport: None,
             skew: crate::skew::Skew::default(),
+            stale: false,
         }
     }
 
@@ -1480,7 +1489,7 @@ mod tests {
     async fn fleet() -> anyhow::Result<Arc<Hub>> {
         let hub = crate::hub::tests::scratch_hub().await?;
         for a in [live("studio", "macos", "aarch64", &["git", "docker"]), live("macbook", "macos", "aarch64", &["cargo", "node", "git"]), live("linux", "linux", "x86_64", &["cargo", "node", "python3"])] {
-            hub.agents.lock().insert(a.name.clone(), a);
+            hub.put_agent(a);
         }
         Ok(hub)
     }
@@ -1523,13 +1532,13 @@ mod tests {
             assert!(build.ok && build.on.as_deref() == Some("macbook"), "{ways:?}");
             assert_eq!(build.why, "macbook builds e511eabdeab2 for aarch64-apple-darwin from the server's source, and it downloads that build");
             assert!(ways.iter().any(|w| w.way == crate::updates::Way::Download && !w.ok));
-            if let Some(m) = hub.agents.lock().get_mut("macbook") {
-                m.draining = true;
-            }
+            hub.change_agent("macbook", |m| m.draining = true);
             assert_eq!(built_by(&plan(&hub, &studio, &t).await), Some(("linux".to_owned(), false, true)), "no Mac to build it: cross-built");
-            if let Some(f) = hub.agents.lock().get_mut("linux").and_then(|l| l.facts.as_mut()) {
-                f.tools.remove("python3");
-            }
+            hub.change_agent("linux", |l| {
+                if let Some(f) = l.facts.as_mut() {
+                    f.tools.remove("python3");
+                }
+            });
             match plan(&hub, &studio, &t).await {
                 Plan::Wait(why) => assert_eq!(
                     why,
@@ -1537,7 +1546,7 @@ mod tests {
                 ),
                 other => anyhow::bail!("nowhere to build: {other:?}"),
             }
-            hub.agents.lock().insert("box".into(), live("box", "linux", "x86_64", &["git"]));
+            hub.put_agent(live("box", "linux", "x86_64", &["git"]));
             assert!(matches!(plan(&hub, &runner(&hub, "box").await?, &t).await, Plan::Wait(_)), "a Linux build is its machine's own: never made elsewhere");
             Ok(())
         })
@@ -1600,9 +1609,7 @@ mod tests {
     fn a_runner_joining_a_build_downloads_it_once_kept() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = fleet().await?;
-            if let Some(s) = hub.agents.lock().get_mut("studio") {
-                s.terminal = false;
-            }
+            hub.change_agent("studio", |s| s.terminal = false);
             let studio = runner(&hub, "studio").await?;
             let other = crate::updates::new_job("runner", "studio-2", "build", None, None);
             hub.updates.insert(other.clone());
@@ -1623,6 +1630,29 @@ mod tests {
             let j = ended(&hub, &job.id).await?;
             assert_eq!(j.error.as_deref(), Some("the build it waited for ended without a binary of 0123456789ab: kiln did not build"));
             Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a build's commit, remembered (as a runner says its facts, on the hub's loop),
+    /// is known at once and written by the kept files' writer, off the caller's thread, as it was written before: the
+    /// whole map at `binaries/builds.json`.
+    #[test]
+    fn g9_s3_a_builds_commit_is_kept_off_the_callers_thread() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let commit = "0123456789abcdef0123456789abcdef01234567";
+            remember(&hub, "b1", "x86_64-unknown-linux-musl", commit);
+            let path = builds_path(&hub);
+            anyhow::ensure!(crate::keep::kept_through(&path) == Some(false), "through the kept files' writer");
+            let known = hub.updates.fleet.builds.lock().as_ref().and_then(|m| m.get("b1").map(|k| k.commit.clone()));
+            anyhow::ensure!(known.as_deref() == Some(commit), "known at once: {known:?}");
+            for _ in 0..500 {
+                if read_builds(&path).get("b1").is_some_and(|k| k.commit == commit && k.target == "x86_64-unknown-linux-musl") {
+                    return Ok(());
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("{} was never written", path.display())
         })
     }
 }

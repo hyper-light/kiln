@@ -14,6 +14,7 @@ import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/compone
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { useAction, useHold } from "@/lib/action";
 import { labelOf, upsert, useLabels } from "@/lib/data";
 import { placementWords } from "@/api/retry";
 import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortSha, spanSeconds } from "@/lib/format";
@@ -54,6 +55,9 @@ async function readRun(id: string, signal: AbortSignal, attempt?: number): Promi
   }
 }
 
+/** What a run's header does to it. */
+type RunAct = "cancel" | "retry-failed" | "retry-all";
+
 function RunBody({ id }: { id: string }) {
   const { jobId } = useParams();
   const navigate = useNavigate();
@@ -70,11 +74,26 @@ function RunBody({ id }: { id: string }) {
   const ciRes = useSuspenseResource(`ci-run/${id}/${asked ?? ""}`, (s) => ciRun(id, asked, s));
   const ciDetail = ciRes.data;
   const [confirm, setConfirm] = React.useState<null | "cancel" | "retry-all">(null);
-  const [busy, setBusy] = React.useState(false);
+  // One change to the run at a time (W21-R15): the press that sent it says it's on its way (its
+  // opener too, once its confirm is shut), the others are held until it's back, and a confirm closes
+  // once its own has gone.
+  const hold = useHold("Action failed");
+  const act = (key: RunAct, fn: () => Promise<void>, ok: string) =>
+    hold.change(key, async () => {
+      try {
+        await fn();
+        toast({ title: ok, tone: "info" });
+        invalidate(`run/${id}`);
+        invalidate("runs/");
+      } finally {
+        setConfirm((c) => (c === key ? null : c));
+      }
+    });
+  const { doing: going, held } = hold;
   const [firstPick, setFirstPick] = React.useState(() => (res.data ? pickDefaultJob(res.data.jobs)?.id : undefined));
   if (firstPick === undefined && res.data?.jobs.length) setFirstPick(pickDefaultJob(res.data.jobs)?.id);
 
-  useServerEvents((ev) => {
+  useServerEvents(["run", "job"], (ev) => {
     if (ev.type === "run" && ev.run.id === id) res.setData((d) => (d ? { ...d, run: ev.run } : d));
     if (ev.type === "job" && ev.job.run_id === id) res.setData((d) => (d ? { ...d, jobs: upsert(d.jobs, { ...ev.job, spec: d.jobs.find((j) => j.id === ev.job.id)?.spec }, (j) => j.id, false) } : d));
   });
@@ -109,21 +128,6 @@ function RunBody({ id }: { id: string }) {
   const select = (jid: string) => navigate(`/runs/${id}/jobs/${jid}${asked ? `?attempt=${asked}` : ""}`, { replace: true });
   const shownAttempt = asked ?? ciDetail?.run.attempt ?? 1;
   const setAttempt = (n: number) => setSearch(n === ciDetail?.run.attempt ? {} : { attempt: String(n) }, { replace: true });
-
-  const act = async (fn: () => Promise<void>, ok: string) => {
-    setBusy(true);
-    try {
-      await fn();
-      toast({ title: ok, tone: "info" });
-      invalidate(`run/${id}`);
-      invalidate("runs/");
-    } catch (e) {
-      toast.error("Action failed", errorMessage(e));
-    } finally {
-      setBusy(false);
-      setConfirm(null);
-    }
-  };
 
   const failedCount = jobs.filter((j) => j.status === "failed" || j.status === "timed_out" || j.status === "cancelled").length;
   const active = isActive(run.status);
@@ -189,16 +193,33 @@ function RunBody({ id }: { id: string }) {
           <div className="flex flex-col items-start gap-3 md:items-end">
             <div className="flex flex-wrap gap-2">
               {active && (
-                <Button variant="danger" disabled={busy} aria-expanded={confirm === "cancel"} onClick={() => setConfirm(confirm === "cancel" ? null : "cancel")}>
+                <Button
+                  variant="danger"
+                  aria-expanded={confirm === "cancel"}
+                  pending={going("cancel") && confirm !== "cancel"}
+                  disabled={held("cancel")}
+                  onClick={() => setConfirm(confirm === "cancel" ? null : "cancel")}
+                >
                   <Square /> Cancel
                 </Button>
               )}
               {!active && failedCount > 0 && (
-                <Button variant="secondary" disabled={busy} onClick={() => act(() => api.retryRun(run.id, true), "Retrying failed jobs")}>
+                <Button
+                  variant="secondary"
+                  pending={going("retry-failed")}
+                  disabled={held("retry-failed")}
+                  onClick={() => act("retry-failed", () => api.retryRun(run.id, true), "Retrying failed jobs")}
+                >
                   <RotateCcw /> Retry failed
                 </Button>
               )}
-              <Button variant={active ? "ghost" : "primary"} disabled={busy} aria-expanded={confirm === "retry-all"} onClick={() => setConfirm(confirm === "retry-all" ? null : "retry-all")}>
+              <Button
+                variant={active ? "ghost" : "primary"}
+                aria-expanded={confirm === "retry-all"}
+                pending={going("retry-all") && confirm !== "retry-all"}
+                disabled={held("retry-all")}
+                onClick={() => setConfirm(confirm === "retry-all" ? null : "retry-all")}
+              >
                 <RotateCcw /> Retry all
               </Button>
             </div>
@@ -208,7 +229,7 @@ function RunBody({ id }: { id: string }) {
                 tone="danger"
                 actions={
                   <>
-                    <Button size="xs" variant="danger" disabled={busy} onClick={() => act(() => api.cancelRun(run.id), "Run cancelled")}>
+                    <Button size="xs" variant="danger" pending={going("cancel")} disabled={held("cancel")} onClick={() => act("cancel", () => api.cancelRun(run.id), "Run cancelled")}>
                       Cancel run
                     </Button>
                     <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
@@ -226,7 +247,7 @@ function RunBody({ id }: { id: string }) {
                 label={`Retry every job in #${run.number}?`}
                 actions={
                   <>
-                    <Button size="xs" disabled={busy} onClick={() => act(() => api.retryRun(run.id, false), "Run re-queued")}>
+                    <Button size="xs" pending={going("retry-all")} disabled={held("retry-all")} onClick={() => act("retry-all", () => api.retryRun(run.id, false), "Run re-queued")}>
                       Retry all
                     </Button>
                     <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
@@ -609,8 +630,9 @@ function StepRow({
   command?: string;
   now: number;
   /** A kept leg's failed step can run again in place. */
-  onRerun?: () => void;
+  onRerun?: () => Promise<void>;
 }) {
+  const [rerun, rerunning] = useAction(() => onRerun?.());
   const dur = spanSeconds(step.started_at, step.finished_at, now);
   const notStarted = step.status === "pending" || step.status === "queued";
   return (
@@ -628,7 +650,7 @@ function StepRow({
           {onRerun && (
             <div className="flex items-center gap-3 px-5 pb-2">
               <span className="font-mono text-[11px] text-[#7f8a9a]">Kept: fix what failed in the leg&rsquo;s terminal, then</span>
-              <Button size="xs" variant="ghost" onClick={onRerun}>
+              <Button size="xs" variant="ghost" pending={rerunning} onClick={rerun}>
                 Rerun this step in place
               </Button>
             </div>

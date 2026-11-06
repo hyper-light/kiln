@@ -84,13 +84,13 @@ pub enum AgentMsg {
     JobSample { job: String, rss: u64, cpu_seconds: f64 },
     /// The agent could not take the job (e.g. no slot after a race); server requeues it.
     Reject { job: String, reason: String },
-    TermOutput { session: String, data: Vec<u8> },
+    TermOutput { session: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     TermExit { session: String, code: Option<i32>, error: Option<String> },
     /// The terminals still running on this machine (sent on every (re)connect, so a restarted
     /// server learns about sessions that outlived it).
     TermList { sessions: Vec<TermInfo> },
     /// Bytes that bring a fresh terminal to the session's current state (answer to TermAttach).
-    TermReplay { session: String, data: Vec<u8> },
+    TermReplay { session: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// The AI coding sessions running on this machine, as a JSON array of
     /// [`crate::aisessions::AiSession`] (JSON, so either side can add fields). Sent when they
     /// change. Appended last: postcard encodes variants by index.
@@ -133,7 +133,7 @@ pub enum AgentMsg {
     /// Repo sync (`crate::sync`, on [`LANE_SYNC`]): `json` a [`crate::sync::wire::Msg`], `raft` the
     /// bytes of the hyper-raft message it carries (empty when none). Only from runners announcing
     /// [`CAP_SYNC`]. Appended last: postcard encodes variants by index.
-    Sync { json: String, raft: Vec<u8> },
+    Sync { json: String, #[serde(with = "wire_bytes")] raft: Vec<u8> },
     /// This machine's front door (JSON [`crate::frontdoor::Status`]): how its DNS, HTTPS and
     /// `.local` listeners and its certificate are doing, and a CSR when it needs a certificate from
     /// the kiln CA. Sent on every (re)connect and whenever it changes. Appended last: postcard
@@ -153,7 +153,7 @@ pub enum AgentMsg {
     /// to relay. `data` is the link's ciphertext; `open` on a link's first frame; `close` ends the
     /// link (with why). Only from runners announcing [`CAP_REACH`]. Appended last: postcard
     /// encodes variants by index.
-    Reach { to: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
+    Reach { to: String, link: String, open: bool, #[serde(with = "wire_bytes")] data: Vec<u8>, close: Option<String> },
     /// Reach: this runner's identity and whether it takes links (JSON
     /// [`crate::reach::relay::Announce`]). Sent on every (re)connect. Appended last: postcard
     /// encodes variants by index.
@@ -164,7 +164,7 @@ pub enum AgentMsg {
     /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): `json` a
     /// [`crate::convo::feed::Msg`], `data` a batch's bytes (empty for the rest). Only from runners
     /// announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
-    Convo { json: String, data: Vec<u8> },
+    Convo { json: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// Whether this machine takes upgrades from its server (its kiln config's `[updates] accept`):
     /// `false` and the server never upgrades it, whatever its policy there. Sent on every
     /// (re)connect, and when it changes. Appended last: postcard encodes variants by index.
@@ -181,11 +181,11 @@ pub enum AgentMsg {
     /// [`crate::harness::files::Answer`] (the file's size, type and dimensions, or why it can't
     /// be read), `data` the bytes asked for. Only from runners announcing [`CAP_FILES`]. Appended
     /// last: postcard encodes variants by index.
-    HarnessFileData { req: u64, json: String, data: Vec<u8> },
+    HarnessFileData { req: u64, json: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// A chunk of stream `stream` (on [`LANE_STREAM`]): `crate::browser::stream::frame`'s bytes.
     /// Only from runners announcing [`CAP_STREAM`]. Appended last: postcard encodes variants by
     /// index.
-    StreamFrame { stream: String, data: Vec<u8> },
+    StreamFrame { stream: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// What stream `stream` says (JSON: opened, navigated, loaded, focus, dialog, closed, error), on
     /// [`LANE_STREAM`]. Appended last: postcard encodes variants by index.
     StreamEvent { stream: String, json: String },
@@ -193,7 +193,7 @@ pub enum AgentMsg {
     PortOpened { conn: u64, error: Option<String> },
     /// Bytes from connection `conn`'s port: at most `crate::browser::ports::WINDOW` the server
     /// hasn't acknowledged ([`ServerMsg::PortAck`]).
-    PortData { conn: u64, data: Vec<u8> },
+    PortData { conn: u64, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// The runner took `bytes` more of what the server sent connection `conn`.
     PortAck { conn: u64, bytes: u64 },
     /// Connection `conn`'s port ended it (or it failed: `error`).
@@ -220,7 +220,7 @@ pub enum AgentMsg {
     /// `crate::store::learner::Msg`, `raft` the bytes of the hyper-raft message it carries (empty
     /// when none) from this runner's learner. Only from runners announcing [`CAP_CLUSTER`].
     /// Appended last: postcard encodes variants by index.
-    Cluster { json: String, raft: Vec<u8> },
+    Cluster { json: String, #[serde(with = "wire_bytes")] raft: Vec<u8> },
     /// What this runner's QUIC layer let go before it reached the wire since it started, by lane
     /// and reason (`crate::metrics::NetMetrics`): each supersedes the last. Sent with its samples
     /// once it changed, only to a server announcing [`CAP_NET_DROPS`]. Appended last: postcard
@@ -231,7 +231,7 @@ pub enum AgentMsg {
     /// [`ServerMsg::HarnessPackage`] carries them: the server passes them on to the newer process.
     /// On [`LANE_CONVO`]. Only to a server announcing [`CAP_HANDOVER`]. Appended last: postcard
     /// encodes variants by index.
-    HarnessHandOver { session: String, offset: u64, data: Vec<u8>, done: bool },
+    HarnessHandOver { session: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
     /// This runner process took over agent session `session` from an older one of its machine,
     /// or why it couldn't (`error`): the older one lets go of it, or goes on with it. Only to a
     /// server announcing [`CAP_HANDOVER`]. Appended last: postcard encodes variants by index.
@@ -256,7 +256,7 @@ pub enum AgentMsg {
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
     /// encodes variants by index.
-    Observe { json: String, bytes: Vec<u8> },
+    Observe { json: String, #[serde(with = "wire_bytes")] bytes: Vec<u8> },
     /// This machine's headroom (JSON [`crate::headroom::Status`], docs/headroom.md): its targets'
     /// latencies, its window, what waits and what is paced. Sent on every (re)connect and when what
     /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
@@ -290,6 +290,12 @@ pub enum AgentMsg {
     /// (a giver's hand-on, from the package it took). Only to a server announcing [`CAP_CUSTODY`].
     /// Appended last: postcard encodes variants by index.
     Custody { json: String },
+    /// The machine this runner is ([`crate::os::machine_id`]), said before its `Instance` and
+    /// `Hello` on every connection (docs/machines.md, "One record a machine"): a runner whose
+    /// certificate carries a name from before is keyed by this id from its Hello on. A job's pod
+    /// never says it (it's known by its pod). An older server skips it. Appended last: postcard
+    /// encodes variants by index.
+    Machine { id: String },
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -488,6 +494,16 @@ pub const CAP_LEG_SIGNS: u64 = 1 << 45;
 /// (`crate::custody::take`). (Bits 41 to 43 are main's, 44 `CAP_AGENT_GIT`, 45 `CAP_LEG_SIGNS`.)
 pub const CAP_CUSTODY: u64 = 1 << 46;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: relays record what they pass on
+/// (docs/ci.md W27-R08's relays). A runner that says it sends its record of each act of its agents'
+/// it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words
+/// with their records, `relayed`; kiln's records of a reach link's frames) and signs its receipts;
+/// a server that says it checks the runner's records and relays so. Neither sends the other these
+/// without it. (Bits 41 to 46 are main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS` and
+/// `CAP_WORKSPACE_COMPARE`, then W27's `CAP_AGENT_GIT`, `CAP_LEG_SIGNS` and `CAP_CUSTODY`; 53 is
+/// `CAP_FREEZE`.)
+pub const CAP_RELAYS: u64 = 1 << 47;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -632,7 +648,7 @@ pub enum ServerMsg {
     /// Stop accepting jobs and exit once idle (ephemeral agents, upgrades).
     Drain,
     TermOpen { session: String, cols: u16, rows: u16, command: Option<String> },
-    TermInput { session: String, data: Vec<u8> },
+    TermInput { session: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     TermResize { session: String, cols: u16, rows: u16 },
     TermClose { session: String },
     /// Send the session's replay (TermReplay); live output keeps flowing as TermOutput.
@@ -653,7 +669,7 @@ pub enum ServerMsg {
     /// A piece of a file attached to a message for an agent session (frames are bounded, files
     /// are not): written at `offset`; `done` on the last piece. The message refers to it by `file`.
     /// Appended last: postcard encodes variants by index.
-    HarnessFile { session: String, file: String, offset: u64, data: Vec<u8>, done: bool },
+    HarnessFile { session: String, file: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
     /// Sent to a machine's newest runner process: the older one, `instance` ("legacy" for one
     /// that never announced itself), has nothing left to run (no terminals, agent sessions or
     /// jobs) and can be stopped. Appended last: postcard encodes variants by index.
@@ -677,7 +693,7 @@ pub enum ServerMsg {
     HarnessHistory { req: u64, kind: Option<String>, limit: u32 },
     /// Repo sync (`crate::sync`, on [`LANE_SYNC`]): as [`AgentMsg::Sync`]. Only to runners that
     /// announced [`CAP_SYNC`]. Appended last: postcard encodes variants by index.
-    Sync { json: String, raft: Vec<u8> },
+    Sync { json: String, #[serde(with = "wire_bytes")] raft: Vec<u8> },
     /// This machine's front door (JSON [`crate::frontdoor::Push`]): its settings, and a
     /// certificate the kiln CA issued for it or one uploaded for it. Sent when it connects and
     /// whenever that changes; only to runners that announced [`CAP_FRONT_DOOR`]. Appended last:
@@ -703,7 +719,7 @@ pub enum ServerMsg {
     /// Reach (`crate::reach`, on [`LANE_REACH`]): a frame of a link from runner `from` (the name
     /// its certificate carries), as [`AgentMsg::Reach`]. Only to runners announcing [`CAP_REACH`].
     /// Appended last: postcard encodes variants by index.
-    Reach { from: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
+    Reach { from: String, link: String, open: bool, #[serde(with = "wire_bytes")] data: Vec<u8>, close: Option<String> },
     /// Reach: the answer to [`AgentMsg::ReachAsk`] (JSON). Appended last: postcard encodes
     /// variants by index.
     ReachAnswer { req: u64, json: String },
@@ -721,13 +737,13 @@ pub enum ServerMsg {
     /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): as [`AgentMsg::Convo`].
     /// Only to runners announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by
     /// index.
-    Convo { json: String, data: Vec<u8> },
+    Convo { json: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// A piece of a session's package (`crate::harness::moving::Package`, JSON) for it to go on on
     /// this machine, made from the server's conversation store (`crate::convo::resume`): its
     /// machine is gone. Written at `offset`; on the last piece (`done`) the runner takes the
     /// session over. On [`LANE_CONVO`]; only to runners announcing [`CAP_CONVO`]. Appended last:
     /// postcard encodes variants by index.
-    HarnessPackage { session: String, offset: u64, data: Vec<u8>, done: bool },
+    HarnessPackage { session: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
     /// Let go of this session: it went on on another machine since (its copy here is from an
     /// earlier epoch). Its harness stops; it isn't closed. Only to runners announcing
     /// [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
@@ -772,7 +788,7 @@ pub enum ServerMsg {
     /// [`AgentMsg::PortOpened`]. Only to runners announcing [`CAP_PORTS`], on [`LANE_PORTS`].
     PortOpen { conn: u64, session: String, port: u16 },
     /// Bytes for connection `conn`'s port.
-    PortData { conn: u64, session: String, data: Vec<u8> },
+    PortData { conn: u64, session: String, #[serde(with = "wire_bytes")] data: Vec<u8> },
     /// The server took `bytes` more of what connection `conn`'s runner sent: it may send that many
     /// more (`crate::browser::ports::WINDOW`).
     PortAck { conn: u64, session: String, bytes: u64 },
@@ -806,7 +822,7 @@ pub enum ServerMsg {
     /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): as [`AgentMsg::Cluster`], to the
     /// runner's learner. Only to runners announcing [`CAP_CLUSTER`]. Appended last: postcard
     /// encodes variants by index.
-    Cluster { json: String, raft: Vec<u8> },
+    Cluster { json: String, #[serde(with = "wire_bytes")] raft: Vec<u8> },
     /// What the server's copy of each of this runner's agent sessions has: sent before `Welcome`
     /// to a runner that keeps the channel (as many of these as it takes), so a stream it starts
     /// (it started again, or the server lost its streams) sends only what the copy lacks
@@ -832,7 +848,7 @@ pub enum ServerMsg {
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
-    Observe { json: String, bytes: Vec<u8> },
+    Observe { json: String, #[serde(with = "wire_bytes")] bytes: Vec<u8> },
     /// This machine's headroom settings (JSON [`crate::headroom::Push`]): applied at once and kept
     /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
     /// postcard encodes variants by index.
@@ -856,7 +872,7 @@ pub enum ServerMsg {
     /// (`payload` of `payload_type`, an in-toto statement), for the leg to sign as itself when it's
     /// of what the leg reported (docs/ci.md W27-R06); it answers [`AgentMsg::LegSignature`]. Only to
     /// runners announcing [`CAP_LEG_SIGNS`]. Appended last: postcard encodes variants by index.
-    SignAsLeg { job: String, nonce: String, payload_type: String, payload: Vec<u8> },
+    SignAsLeg { job: String, nonce: String, payload_type: String, #[serde(with = "wire_bytes")] payload: Vec<u8> },
     /// Work kiln's server handed one of the runner's agent sessions (docs/ci.md W27-R08; the
     /// Transfers plan's step 6): `{session, hand_on}`, the hand-on (a Sigstore bundle, as JSON) of a
     /// plan's step, a subagent's task or what a person handed off, whose receipt the runner
@@ -914,11 +930,85 @@ pub struct Assignment {
 pub struct LogChunk {
     pub job: String,
     pub idx: u32,
+    #[serde(with = "wire_bytes")]
     pub data: Vec<u8>,
 }
 
+
+/// A `Vec<u8>` field of a message, written and read whole as postcard's bytes (goal 9, plan 01a1a87b2cec
+/// step 3): the same bytes on the wire as the sequence of `u8` serde makes of a `Vec<u8>` without it (a
+/// varint length, then each byte as itself), so a peer of any build reads either (`tests`,
+/// `bytes_fields_keep_the_wire`); and read and written with one copy rather than a call a byte, which held
+/// the shards that read runners' frames and wrote the server's (the lab's calm baseline, research f21).
+pub(crate) mod wire_bytes {
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        d.deserialize_byte_buf(Bytes)
+    }
+
+    /// Bytes as postcard gives them (whole), or a sequence of `u8` as a format that has no bytes gives
+    /// them (JSON's array of numbers).
+    struct Bytes;
+
+    impl<'de> serde::de::Visitor<'de> for Bytes {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bytes")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            // Not sized from the sequence's word of its length: that's the sender's to say.
+            let mut out = Vec::new();
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// `v` as postcard writes it, into one buffer the size it comes to (goal 9, plan 01a1a87b2cec step 5): measured
+/// first (a walk that adds up lengths, a byte string's or a text's at once), then written once. Written into a buffer
+/// that grew as it went, a message was copied again at each doubling: in rt7's calm profile half of what the cluster
+/// loop cost its shard was growing the buffers its learners' entries were encoded into.
 pub fn encode<T: Serialize>(v: &T) -> anyhow::Result<Vec<u8>> {
-    postcard::to_allocvec(v).map_err(|e| anyhow::anyhow!("encode: {e}"))
+    let size = postcard::experimental::serialized_size(v).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    postcard::serialize_with_flavor::<T, Exact, Vec<u8>>(v, Exact(Vec::with_capacity(size))).map_err(|e| anyhow::anyhow!("encode: {e}"))
+}
+
+/// postcard's output as one buffer made the size it will come to ([`encode`]).
+struct Exact(Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Exact {
+    type Output = Vec<u8>;
+
+    fn try_push(&mut self, b: u8) -> postcard::Result<()> {
+        self.0.push(b);
+        Ok(())
+    }
+
+    fn try_extend(&mut self, b: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Vec<u8>> {
+        Ok(self.0)
+    }
 }
 
 /// Why a frame couldn't be read ([`read`]).
@@ -999,6 +1089,101 @@ pub fn read_server(b: &[u8]) -> Result<ServerMsg, Unreadable> {
     read(b, || crate::wire::server_classes().len())
 }
 
+/// A runner's frame, read as [`read_agent`] reads it, taking its bytes (goal 9, plan 01a1a87b2cec step 5). In the two
+/// messages most of what runners send comes in, a channel item (`AgentMsg::Wire(Frame::Item { .. })`) and an agent
+/// session's update (`AgentMsg::Harness { .. }`), the last field runs to the frame's end: it's kept in the frame's own
+/// buffer, moved down over what came before it, where `read_agent` copies it into a buffer of its own. The hub's loop
+/// copied each runner update's text whole twice so, its item's body out of its frame and its JSON out of that body.
+/// Every other frame, and one of those two that isn't read so, is read by `read_agent`, and refused as it refuses it.
+pub fn read_agent_owned(mut b: Vec<u8>) -> Result<AgentMsg, Unreadable> {
+    // A test build's frame made unreadable comes marked: `read` takes the mark off, and says so.
+    #[cfg(any(test, feature = "chaos"))]
+    if b.starts_with(&crate::net::MARK) {
+        return read_agent(&b);
+    }
+    if let Some(item) = item_at(&b) {
+        let (stream, seq, low, at) = (item.stream.to_owned(), item.seq, item.low, item.at);
+        b.drain(..at);
+        return Ok(AgentMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body: b }));
+    }
+    if let Some(update) = harness_at(&b) {
+        let (variant, session, at) = (update.variant, update.session.to_owned(), update.at);
+        b.drain(..at);
+        // Its JSON read as text here, once: what isn't is refused as `read_agent` refuses it.
+        return String::from_utf8(b)
+            .map(|json| AgentMsg::Harness { session, json })
+            .map_err(|_| Unreadable::Malformed { variant: Some(variant), why: unreadable(&postcard::Error::DeserializeBadUtf8) });
+    }
+    read_agent(&b)
+}
+
+/// A channel item's frame as its bytes hold it ([`item_at`]).
+pub(crate) struct ItemAt<'a> {
+    pub stream: &'a str,
+    pub seq: crate::wire::channel::Seq,
+    pub low: crate::wire::channel::Seq,
+    /// The message it carries, as its wire encodes it: the frame's bytes from `at` to its end.
+    pub body: &'a [u8],
+    pub at: usize,
+}
+
+/// `b` as a channel item's frame, `AgentMsg::Wire(Frame::Item { .. })` read whole (nothing left over), each field where it
+/// lies in it, nothing copied; none for any other frame, or one that isn't read so ([`read_agent_owned`]).
+pub(crate) fn item_at(b: &[u8]) -> Option<ItemAt<'_>> {
+    let tags = in_place()?;
+    let ((wire, item), rest) = postcard::take_from_bytes::<(u32, u32)>(b).ok()?;
+    if wire != tags.wire || item != tags.item {
+        return None;
+    }
+    let ((stream, seq, low, body), left) = postcard::take_from_bytes::<(&str, u64, u64, &[u8])>(rest).ok()?;
+    left.is_empty().then_some(ItemAt { stream, seq, low, body, at: b.len().saturating_sub(body.len()) })
+}
+
+/// An agent session's update as its frame's bytes hold it ([`harness_at`]).
+pub(crate) struct HarnessAt<'a> {
+    /// `AgentMsg::Harness`'s index, as the frame says it.
+    pub variant: u64,
+    pub session: &'a str,
+    /// Its JSON, not yet read as text: the frame's bytes from `at` to its end.
+    pub json: &'a [u8],
+    pub at: usize,
+}
+
+/// `b` as an agent session's update, `AgentMsg::Harness { .. }` read whole (nothing left over), each field where it lies in
+/// it, nothing copied and its JSON not yet read as text; none for any other frame, or one that isn't read so
+/// ([`read_agent_owned`]).
+pub(crate) fn harness_at(b: &[u8]) -> Option<HarnessAt<'_>> {
+    let tags = in_place()?;
+    let (variant, rest) = postcard::take_from_bytes::<u32>(b).ok()?;
+    if variant != tags.harness {
+        return None;
+    }
+    let ((session, json), left) = postcard::take_from_bytes::<(&str, &[u8])>(rest).ok()?;
+    left.is_empty().then_some(HarnessAt { variant: u64::from(variant), session, json, at: b.len().saturating_sub(json.len()) })
+}
+
+/// The variants a frame read in place is known by ([`read_agent_owned`]): `AgentMsg::Harness`'s index on the wire,
+/// `AgentMsg::Wire`'s, and `Frame::Item`'s inside a `Wire`.
+struct InPlace {
+    harness: u32,
+    wire: u32,
+    item: u32,
+}
+
+/// [`InPlace`], read once off a message of each kind as postcard writes it (its variant index, a varint), so it's
+/// what the types say; none where one couldn't be written.
+fn in_place() -> Option<&'static InPlace> {
+    static TAGS: std::sync::OnceLock<Option<InPlace>> = std::sync::OnceLock::new();
+    TAGS.get_or_init(|| {
+        let update = encode(&AgentMsg::Harness { session: String::new(), json: String::new() }).ok()?;
+        let item = encode(&AgentMsg::Wire(crate::wire::channel::Frame::Item { stream: String::new(), seq: 0, low: 0, body: Vec::new() })).ok()?;
+        let (harness, _) = postcard::take_from_bytes::<u32>(&update).ok()?;
+        let ((wire, item), _) = postcard::take_from_bytes::<(u32, u32)>(&item).ok()?;
+        Some(InPlace { harness, wire, item })
+    })
+    .as_ref()
+}
+
 /// Why postcard couldn't read a frame, as an `Unread` says it.
 fn unreadable(e: &postcard::Error) -> String {
     match e {
@@ -1027,6 +1212,148 @@ mod tests {
     /// encoded. What the server and a runner read goes through `read` (`read_agent`, `read_server`).
     fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> anyhow::Result<T> {
         postcard::from_bytes(b).map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a message is written once into a buffer the size it comes to, the same bytes
+    /// postcard writes into one that grows: a learner's entry with its raft bytes, an empty one, and a small frame.
+    #[test]
+    fn g9_s5_a_message_is_written_once_into_its_size() -> anyhow::Result<()> {
+        let raft: Vec<u8> = (0..70_000_u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        for m in [ServerMsg::Cluster { json: "{\"t\":\"append\"}".into(), raft }, ServerMsg::Cluster { json: String::new(), raft: Vec::new() }] {
+            let once = encode(&m)?;
+            anyhow::ensure!(once == postcard::to_allocvec(&m)?, "the same bytes");
+            anyhow::ensure!(once.capacity() == once.len(), "{} bytes in a buffer of {}", once.len(), once.capacity());
+        }
+        let caps = AgentMsg::Caps { caps: CAP_WIRE };
+        let small = encode(&caps)?;
+        anyhow::ensure!(small == postcard::to_allocvec(&caps)? && small.capacity() == small.len(), "{small:?}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a channel item's body, written as bytes, is the same on the wire as the
+    /// sequence of `u8` it was, at each length where its varint grows, alone and inside `AgentMsg::Wire` as a
+    /// runner sends it; each shape reads the other's, and their JSON is the same.
+    #[test]
+    fn g9_s5_a_channel_items_body_keeps_the_wire() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Seq};
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        enum Old {
+            Item { stream: String, seq: Seq, low: Seq, body: Vec<u8> },
+        }
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384] {
+            let body: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            let new = Frame::Item { stream: "s:s1#7.0".into(), seq: 9, low: 4, body: body.clone() };
+            let old = Old::Item { stream: "s:s1#7.0".into(), seq: 9, low: 4, body };
+            let (n, o) = (encode(&new)?, encode(&old)?);
+            anyhow::ensure!(n == o, "{len} bytes: {} and {} on the wire", n.len(), o.len());
+            anyhow::ensure!(decode::<Frame>(&o)? == new && decode::<Old>(&n)? == old, "{len} bytes didn't read back");
+            anyhow::ensure!(serde_json::to_string(&new)? == serde_json::to_string(&old)?, "{len} bytes in JSON");
+            match read_agent(&encode(&AgentMsg::Wire(new.clone()))?).map_err(|e| anyhow::anyhow!("{}", e.why("AgentMsg")))? {
+                AgentMsg::Wire(f) => anyhow::ensure!(f == new, "{len} bytes in AgentMsg::Wire"),
+                _ => anyhow::bail!("read back as another message"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a channel item's frame and a session's update, read taking their bytes, are the
+    /// message `read_agent` reads, at each length where a varint grows, the body or the JSON kept in the frame's own
+    /// buffer; every other frame, and what isn't read so (bytes left over, cut short, text that isn't UTF-8, a test
+    /// build's mark), reads or is refused as `read_agent` reads or refuses it.
+    #[test]
+    fn g9_s5_a_frame_read_taking_its_bytes_is_the_message_read_whole() -> anyhow::Result<()> {
+        use crate::wire::channel::Frame;
+        let mut messages = Vec::new();
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384] {
+            let json: String = (0..len).map(|i| char::from(b'a'.saturating_add(u8::try_from(i % 26).unwrap_or(0)))).collect();
+            let body = encode(&AgentMsg::Harness { session: "s1".into(), json: json.clone() })?;
+            messages.push(AgentMsg::Harness { session: format!("s{len}"), json });
+            messages.push(AgentMsg::Wire(Frame::Item { stream: format!("s:s1#{len}"), seq: u64::try_from(len)?.saturating_add(1), low: 3, body }));
+        }
+        for m in &messages {
+            let b = encode(m)?;
+            let whole = read_agent(&b);
+            let mine = b.as_ptr();
+            let read = read_agent_owned(b);
+            anyhow::ensure!(read.as_ref() == Ok(m) && whole.as_ref() == Ok(m), "{m:?} read as {read:?}, whole {whole:?}");
+            let kept = match &read {
+                Ok(AgentMsg::Harness { json, .. }) => json.as_ptr(),
+                Ok(AgentMsg::Wire(Frame::Item { body, .. })) => body.as_ptr(),
+                _ => anyhow::bail!("{m:?}: read as another message"),
+            };
+            anyhow::ensure!(std::ptr::eq(kept, mine), "{m:?}: copied out of its frame's buffer");
+        }
+        // What isn't read so: refused, or read, as `read_agent` does.
+        let update = encode(&AgentMsg::Harness { session: "s1".into(), json: "ab".into() })?;
+        let item = encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq: 1, low: 0, body: update.clone() }))?;
+        let mut odd: Vec<Vec<u8>> = Vec::new();
+        for m in [&update, &item] {
+            odd.push([m.as_slice(), &[0]].concat());
+            odd.push(m.get(..m.len().saturating_sub(1)).unwrap_or_default().to_vec());
+            odd.push([crate::net::MARK.as_slice(), m].concat());
+        }
+        let mut bad_json = update.clone();
+        if let Some(last) = bad_json.last_mut() {
+            *last = 0xff;
+        }
+        let mut bad_session = update.clone();
+        if let Some(s) = bad_session.get_mut(2) {
+            *s = 0xff;
+        }
+        odd.extend([bad_json, bad_session, encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![1, 2] })?, encode(&AgentMsg::Caps { caps: CAP_WIRE })?]);
+        for b in odd {
+            let (whole, read) = (read_agent(&b), read_agent_owned(b.clone()));
+            anyhow::ensure!(read == whole, "{b:?}: read as {read:?}, whole as {whole:?}");
+        }
+        anyhow::ensure!(read_agent_owned(encode(&AgentMsg::Harness { session: "s1".into(), json: "ab".into() })?.into_iter().map(|b| if b == b'b' { 0xff } else { b }).collect()).is_err(), "text that isn't UTF-8 is refused");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a `Vec<u8>` field written as bytes (`wire_bytes`) is the same on the
+    /// wire as one written as a sequence of `u8`, at each length where its varint grows, and each shape reads
+    /// the other's; in JSON both are an array of numbers. So is a message: a frame the old shape of
+    /// `AgentMsg::Convo` wrote reads as the new one.
+    #[test]
+    fn g9_s3_bytes_fields_keep_the_wire() -> anyhow::Result<()> {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Seq {
+            a: String,
+            data: Vec<u8>,
+            b: u64,
+        }
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Whole {
+            a: String,
+            #[serde(with = "super::wire_bytes")]
+            data: Vec<u8>,
+            b: u64,
+        }
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152] {
+            let data: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            let (seq, whole) = (Seq { a: "x".into(), data: data.clone(), b: 7 }, Whole { a: "x".into(), data, b: 7 });
+            let (s, w) = (encode(&seq)?, encode(&whole)?);
+            anyhow::ensure!(s == w, "{len} bytes: {} and {} bytes on the wire", s.len(), w.len());
+            anyhow::ensure!(decode::<Whole>(&s)? == whole && decode::<Seq>(&w)? == seq, "{len} bytes didn't read back");
+            let json = serde_json::to_string(&seq)?;
+            anyhow::ensure!(json == serde_json::to_string(&whole)? && serde_json::from_str::<Whole>(&json)? == whole, "{len} bytes in JSON");
+        }
+        // A whole message: the frame an old peer writes, as postcard writes a variant (its index, then its
+        // fields in order), reads as the new type, and the new type writes the same frame.
+        #[derive(Serialize)]
+        enum Old {
+            Convo { json: String, data: Vec<u8> },
+        }
+        let (json, data) = ("{}".to_owned(), vec![1_u8, 2, 3, 200]);
+        let mut frame = encode(&Old::Convo { json: json.clone(), data: data.clone() })?;
+        // `Old`'s index is 0: the frame takes `AgentMsg::Convo`'s instead, the varint postcard writes.
+        let index = encode(&AgentMsg::Convo { json: json.clone(), data: data.clone() })?;
+        let tail = frame.split_off(1);
+        anyhow::ensure!(index.ends_with(&tail), "the fields differ on the wire");
+        match read_agent(&index).map_err(|e| anyhow::anyhow!("{}", e.why("AgentMsg")))? {
+            AgentMsg::Convo { json: j, data: d } => anyhow::ensure!(j == json && d == data, "read back as {j:?} {d:?}"),
+            _ => anyhow::bail!("read back as another message"),
+        }
+        Ok(())
     }
 
     #[test]
@@ -1343,6 +1670,13 @@ mod tests {
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
     }
 
+    /// W27-R08's relays: their bit is a new one, past custody's (46) and every bit of main's.
+    #[test]
+    fn w27_r08_relays_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_FREEZE;
+        assert!(CAP_RELAYS.is_power_of_two() && CAP_RELAYS == 1 << 47 && CAP_RELAYS & before == 0);
+    }
+
     /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last
     /// before them), and their bit is a new one: past main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS`
     /// and `CAP_WORKSPACE_COMPARE` (41 to 43), `CAP_AGENT_GIT` (44) and `CAP_LEG_SIGNS` (45).
@@ -1381,11 +1715,23 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // and W27 its legs' signing and custody (58 to 60, 65 and 66).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
+        // W27 its legs' signing and custody (58 to 60, 65 and 66), and docs/machines.md `Machine` (61).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (62, 67), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
+        Ok(())
+    }
+
+    /// docs/machines.md, "One record a machine": the machine a runner says it is, before its
+    /// Hello, is appended after every older variant (an older server skips it), and reads back.
+    #[test]
+    fn machines_the_machine_a_runner_says_it_is_is_appended_last() -> anyhow::Result<()> {
+        let said = AgentMsg::Machine { id: "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".into() };
+        let custody = encode(&AgentMsg::Custody { json: String::new() })?;
+        assert_eq!(encode(&said)?.first().copied(), custody.first().map(|i| i + 1), "Machine comes right after Custody");
+        assert_eq!(encode(&said)?.first(), Some(&61));
+        assert_eq!(decode::<AgentMsg>(&encode(&said)?)?, said);
         Ok(())
     }
 

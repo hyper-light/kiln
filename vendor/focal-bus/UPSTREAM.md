@@ -3,8 +3,10 @@
 The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
 
 - **Upstream:** https://github.com/hyper-light/focal, branch `bus-replicated`, commit
-  `f8052a5eaf21f81709129583e535331c2e9722f3` (2026-10-22), MIT (`LICENSE`). The commit was agreed with Focal's agent
-  (docs/design/focal-bus.md, "What Focal's agent said").
+  `9aded7cdf0a596f35039acb9b4e610c52f9d1f0a` (2026-10-28), MIT (`LICENSE`): the branch's head, taken
+  (kiln's CP-T10.2) so the bus builds on hyper-raft's one copy with Mantle's line. Before it, `f8052a5`
+  (2026-10-22), the commit agreed with Focal's agent (docs/design/focal-bus.md, "What Focal's agent
+  said").
 - **What is here:** the bus and the crates of Focal's it builds on, laid out as upstream lays them
   out:
   - `crates/focal-bus`: the event bus (Focal's docs 32 to 34): the batch, a part's log and streams,
@@ -13,8 +15,9 @@ The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
   - `crates/focal-seal` and `crates/focal-platform`: the node log's keys and the files a part's
     image is installed through;
   - `crates/focal-timing`: the bus's tests' waits (a dev-dependency).
-- **What it builds on:** hyper-raft's shared crates at `25cf889` (hyper-raft's `main`), the revision
-  this commit of the bus takes (Focal's `vendor/README.md`), vendored apart at `vendor/hyper-raft`.
+- **What it builds on:** hyper-raft's shared crates at `0856e05` (hyper-raft's `main` merged with
+  Mantle's line), vendored apart at `vendor/hyper-raft`; this commit of the bus takes them at `4d72e19`
+  (Focal's `vendor/README.md`), two commits before `main`'s, and builds on the merge unchanged.
   Focal's own copies of them (its `vendor/hyper-*`) and its other vendored crates (`aws-lc-rs`, `aws-lc-sys`) are not taken:
   the bus names the shared crates as from crates.io, and Quiver's root `Cargo.toml` (kiln's, in kiln)
   points each name at its one copy with `[patch.crates-io]`.

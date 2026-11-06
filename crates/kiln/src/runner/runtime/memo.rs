@@ -639,7 +639,8 @@ impl Leg {
         let req = self.http.put(&self.work_url(&format!("blobs/{digest}"))).bearer(&self.a.runtime.runtime_token).header("content-type", "application/octet-stream").timeout(Duration::from_secs(1800));
         let req = match body {
             Body::Bytes(b) => req.body(b),
-            Body::File(p) => req.body_stream(crate::rt::file_source(p)?),
+            // Read from its start for each send: one the server shed goes again whole (goal 6, plan 01a1a59c2abe step 4).
+            Body::File(p) => req.body_file(p),
         };
         let resp = req.send().await?;
         let status = resp.status();
@@ -905,7 +906,7 @@ mod tests {
             trusted: true,
             ..AssignmentV2::default()
         };
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = l.run().await;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());

@@ -85,6 +85,8 @@ pub fn ops() -> &'static [Op] {
                 run: tree),
             op!("cd.apps.manifests", "The manifests an app renders now, as kiln applies them (Secrets masked).", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsManifests>(), run: manifests),
+            op!("cd.apps.custody", "An app's custody to production (docs/ci.md W27-R08): its last sync's records (CD's hand-on of the manifests it applied and the images they name, by digest, and kiln's receipt for the cluster as its API server answered), each running pod's container (its node, platform, the image its status reports, what its deploy handed on for that platform, what it runs, its receipt) and the verdict: verified, waiting, broken (a pod runs what its deploy didn't hand on) or unverifiable. Each record walks back with `GET /api/custody?digest=`. Looks at the pods now.", ro: true, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsCustody>(), run: custody),
             op!("cd.apps.resource", "One object of an app's tree in depth: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. Secrets are masked.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsResource>(), run: resource),
             op!("cd.apps.resource_events", "An object's Kubernetes events, newest first.", ro: true, destructive: false,
@@ -270,6 +272,13 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct CdAppsManifests {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsCustody {
         /// The app's id, `project/name` (a bare name means the default project).
         pub app: String,
     }
@@ -1052,6 +1061,12 @@ async fn tree(cx: Cx, v: Value) -> Out {
     Ok(t.to_json(&def))
 }
 
+async fn custody(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    exists(&cx.cd, &id)?;
+    super::custody::view(&cx.cd, &id).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))
+}
+
 async fn manifests(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
@@ -1503,7 +1518,7 @@ async fn sync(cx: Cx, v: Value) -> Out {
     agents_may(&cx, &id, "sync")?;
     ready_to_sync(&cx.cd, &id)?;
     let request = sync_request(&v, &cx.actor)?;
-    cx.cd.input(Input::Sync { app: id.as_str().into(), request });
+    cx.cd.input(Input::Sync { app: id.as_str().into(), request }).await;
     audit(&cx, "cd.sync", id.clone()).await;
     Ok(json!({"syncing": id}))
 }
@@ -1517,7 +1532,7 @@ async fn sync_many(cx: Cx, v: Value) -> Out {
     }
     let request = sync_request(&v, &cx.actor)?;
     for id in &ids {
-        cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() });
+        cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() }).await;
     }
     audit(&cx, "cd.sync_many", format!("{} apps", ids.len())).await;
     Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>(), "refused": refused.iter().take(100).collect::<Vec<_>>()}))
@@ -1526,7 +1541,7 @@ async fn sync_many(cx: Cx, v: Value) -> Out {
 async fn refresh(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
-    cx.cd.input(Input::Refresh { app: id.as_str().into(), hard: v.get("hard").and_then(Value::as_bool).unwrap_or(false) });
+    cx.cd.input(Input::Refresh { app: id.as_str().into(), hard: v.get("hard").and_then(Value::as_bool).unwrap_or(false) }).await;
     cx.cd.kick();
     Ok(json!({"refreshing": id}))
 }
@@ -1535,7 +1550,7 @@ async fn refresh_many(cx: Cx, v: Value) -> Out {
     let ids = selected(&cx.cd, &v, 1_000_000);
     let hard = v.get("hard").and_then(Value::as_bool).unwrap_or(false);
     for id in &ids {
-        cx.cd.input(Input::Refresh { app: id.as_str().into(), hard });
+        cx.cd.input(Input::Refresh { app: id.as_str().into(), hard }).await;
     }
     cx.cd.kick();
     Ok(json!({"refreshing": ids.len()}))
@@ -1544,7 +1559,7 @@ async fn refresh_many(cx: Cx, v: Value) -> Out {
 async fn terminate(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
-    cx.cd.input(Input::Terminate { app: id.as_str().into() });
+    cx.cd.input(Input::Terminate { app: id.as_str().into() }).await;
     audit(&cx, "cd.terminate", id.clone()).await;
     Ok(json!({"terminating": id}))
 }
@@ -1634,12 +1649,17 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     // A pin to a commit no deployment ran holds no deployment (`to` 0).
     let pin = state::Pin { to: target.map_or(0, |t| t.id), revision: revision.clone(), commits: commits.clone(), head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
     propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
-    // The held inputs and their sync as one step: nothing syncs the app in between.
+    // The held inputs and their sync as one step: nothing syncs the app in between. Room in the
+    // engine's inbox is waited for first (goal 11, plan 01a1a87b2e56 step 3), so the gate is held
+    // only while they're kept and sent.
     let request = SyncRequest { prune, by: Some(by.to_owned()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
+    let told = cd.reserve_input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request }).await;
     {
         let _gate = cd.inputs_gate.lock();
         cd.keep_inputs(&id, &back);
-        cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
+        if let Some(told) = told {
+            told.send();
+        }
     }
     Ok(match target {
         Some(t) => json!({"rolling_back": id, "to": t.id, "revision": t.revision, "commits": t.commits, "tag": tag}),
@@ -1688,7 +1708,7 @@ async fn set_auto_sync(cx: Cx, v: Value) -> Out {
     agents_may(&cx, &id, "change the auto-sync of")?;
     let value = on.map_or(Value::Null, |on| json!(kiln_cd::autosync::Setting { on, by: Some(cx.actor.clone()), at_ms: super::now_ms(), file: def.sync.auto }));
     propose(&cx.cd, Command::PutSetting(kiln_cd::autosync::app_setting(&id), value)).await?;
-    cx.cd.register(def.clone());
+    cx.cd.register(def.clone()).await;
     audit(&cx, "cd.auto_sync", format!("{id}: {}", on.map_or("cleared", |on| if on { "on" } else { "off" }))).await;
     Ok(cx.cd.auto_sync_json(&id, &def))
 }
@@ -1905,7 +1925,7 @@ async fn delete(cx: Cx, v: Value) -> Out {
         cx.cd.deleting.lock().remove(&id);
         return Err(e);
     }
-    cx.cd.unregister(&id, cascade);
+    cx.cd.unregister(&id, cascade).await;
     cx.cd.deleting.lock().remove(&id);
     audit(&cx, "cd.app.delete", format!("{id} cascade={cascade}")).await;
     Ok(json!({"deleted": id, "cascade": cascade}))

@@ -151,3 +151,6 @@ export async function signed(statement: string, ask: Record<string, unknown>): P
     dsseEnvelope: { payloadType: toSign.payload_type, payload: toSign.payload, signatures: [{ sig: b64(sigDer(raw)) }] },
   };
 }
+
+/** Whether this browser signs as its person: WebCrypto and IndexedDB, which a page that isn't secure (https) lacks. */
+export const browserSigns = () => typeof globalThis.crypto?.subtle !== "undefined" && typeof indexedDB !== "undefined";

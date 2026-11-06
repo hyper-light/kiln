@@ -13,7 +13,7 @@ import { Link, useSearchParams } from "@/lib/router";
 import { AlertTriangle, ArrowUpRight, FolderSync, HardDriveDownload, Play, Plus, RefreshCw, ScanSearch, GitBranch, Trash2 } from "lucide-react";
 import { WatchedBy } from "@/views/attach/here";
 import { api } from "@/api/client";
-import type { PlaceMachine, PlacesView, PlaceTask, SyncView } from "@/api/types";
+import type { PlaceMachine, PlacesView, PlaceTask, Repo, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
@@ -23,6 +23,7 @@ import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/m
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps, useAction, useActions } from "@/lib/action";
 import { byLabel, labelOf, recentRunsRes, reposRes, useLabels, useRecentRuns, useRepos, useRes, warm, type Res } from "@/lib/data";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -36,6 +37,7 @@ import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
 import { RepoKeep } from "../keep/repo";
 import { Providers } from "./providers";
+import { RepoReview } from "./review";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -51,7 +53,8 @@ const CHIPS = 3;
 
 /**
  * The page's toggles, in the URL: which form is open (`?add=1`, `?sync=1`), a kind to show
- * (`?show=built|synced`, until the filter changes) and a repository to open (`?repo=<key>`).
+ * (`?show=built|synced`, until the filter changes), a repository to open (`?repo=<key>`, or its
+ * name) and a section of it to bring into view (`&section=review`, as Ship's agent fixes links).
  */
 function useRepoParams() {
   const [params, setParams] = useSearchParams();
@@ -63,7 +66,7 @@ function useRepoParams() {
     }
     setParams(n, { replace: true });
   };
-  return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), set };
+  return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), section: params.get("section"), set };
 }
 
 /** The Sync section, opened on one repo's activity, brought into view. */
@@ -74,15 +77,11 @@ function showActivity(set: (patch: Record<string, string | null>) => void, repo:
 
 export default function Repos() {
   const { adding, syncing, set } = useRepoParams();
-  const look = async () => {
-    try {
-      const { asked } = await api.placesLook();
-      toast({ title: asked ? `${asked} ${asked === 1 ? "machine looks" : "machines look"} at their repositories again` : "No connected machine can look yet", tone: "info" });
-      window.setTimeout(() => invalidate("places"), 4_000);
-    } catch (err) {
-      toast.error("Looking again failed", errorMessage(err));
-    }
-  };
+  const [look, looking] = useAction(async () => {
+    const { asked } = await api.placesLook();
+    toast({ title: asked ? `${asked} ${asked === 1 ? "machine looks" : "machines look"} at their repositories again` : "No connected machine can look yet", tone: "info" });
+    window.setTimeout(() => invalidate("places"), 4_000);
+  }, "Looking again failed");
   return (
     <div className="container-console page">
       <title>Repositories · kiln</title>
@@ -103,7 +102,7 @@ export default function Repos() {
               <Link to="/review">Review</Link>
             </Button>
             <Tip content="Every machine looks at its repositories again now">
-              <Button size="sm" variant="ghost" onClick={() => void look()}>
+              <Button size="sm" variant="ghost" pending={looking} onClick={look}>
                 <ScanSearch /> Look again
               </Button>
             </Tip>
@@ -118,7 +117,7 @@ export default function Repos() {
 }
 
 function ReposBody() {
-  const { adding, syncing, show, repo, set } = useRepoParams();
+  const { adding, syncing, show, repo, section, set } = useRepoParams();
   warm(reposRes, recentRunsRes(200), syncRes, placesRes);
   const repos = useRepos();
   const lastRuns = useRecentRuns(200).data;
@@ -133,12 +132,10 @@ function ReposBody() {
   };
   const [q, setQ] = React.useState("");
   const [opened, setOpened] = React.useState<Panel | null>(null);
-  const open: Panel | null = opened ?? (repo ? { key: repo, what: "details" } : null);
   const setOpen = (p: Panel | null) => {
     setOpened(p);
-    if (repo) set({ repo: null });
+    if (repo || section) set({ repo: null, section: null });
   };
-  const [polling, setPolling] = React.useState<Set<string>>(new Set());
   const [notice, setNoticeState] = React.useState<Notice>(null);
   // A success says so for a while; a failure stays until the next action.
   const setNotice = (n: Notice) => {
@@ -147,6 +144,9 @@ function ReposBody() {
   };
 
   const entries = React.useMemo(() => entriesOf(places.data, repos.data, sync.data, lastRuns), [places.data, repos.data, sync.data, lastRuns]);
+  // The repository the URL names, by its key or its name (the one kiln builds first).
+  const asked = repo ? (entries.find((e) => e.key === repo) ?? entries.find((e) => e.built?.name === repo) ?? entries.find((e) => e.name === repo))?.key : undefined;
+  const open: Panel | null = opened ?? (repo ? { key: asked ?? repo, what: "details" } : null);
   const machines = React.useMemo(() => new Map(places.data.machines.map((m) => [m.name, m])), [places.data]);
   // Machines are named, and put in order, by the names they're shown by.
   const labels = useLabels();
@@ -160,10 +160,7 @@ function ReposBody() {
   const filtered = isFiltered(q, view.facets);
   const underway = places.data.tasks.filter(isActive);
 
-  const poll = async (e: Entry) => {
-    const r = e.built;
-    if (!r) return;
-    setPolling((p) => new Set(p).add(r.id));
+  const [poll, polling] = useActions(async (_: string, r: Repo) => {
     setNotice(null);
     try {
       await api.pollRepo(r.id);
@@ -171,14 +168,8 @@ function ReposBody() {
       window.setTimeout(() => invalidate("repos"), 1500);
     } catch (err) {
       setNotice({ tone: "fail", text: `Polling ${r.name} failed: ${errorMessage(err)}` });
-    } finally {
-      setPolling((p) => {
-        const n = new Set(p);
-        n.delete(r.id);
-        return n;
-      });
     }
-  };
+  });
 
   const started = (tasks: PlaceTask[], e: Entry) => {
     const first = tasks[0];
@@ -303,9 +294,11 @@ function ReposBody() {
                   entry={e}
                   machines={machines}
                   open={open?.key === e.key ? open.what : null}
-                  polling={e.built ? polling.has(e.built.id) : false}
+                  polling={e.built ? polling(e.built.id) : false}
                   onToggle={(what) => toggle(e.key, what)}
-                  onPoll={() => void poll(e)}
+                  onPoll={() => {
+                    if (e.built) poll(e.built.id, e.built);
+                  }}
                 >
                   {open?.key === e.key && (
                     <Details
@@ -325,6 +318,7 @@ function ReposBody() {
                       }}
                       onChange={changed}
                       onActivity={(id) => showActivity(set, id)}
+                      reveal={!opened ? section : null}
                     />
                   )}
                 </Row>
@@ -505,8 +499,8 @@ function Row({
           <div className="inline-flex items-center gap-0.5">
             {r && (
               <Tip content="Poll now">
-                <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Poll ${r.name} now`} disabled={polling} onClick={onPoll}>
-                  <RefreshCw size={14} className={polling ? "animate-spin motion-reduce:animate-none" : undefined} />
+                <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Poll ${r.name} now`} {...sendingProps(polling)} onClick={onPoll}>
+                  <RefreshCw size={14} />
                 </button>
               </Tip>
             )}
@@ -568,6 +562,7 @@ function Details({
   onDeleted,
   onChange,
   onActivity,
+  reveal,
 }: {
   entry: Entry;
   machines: Map<string, PlaceMachine>;
@@ -581,6 +576,8 @@ function Details({
   onChange: () => void;
   /** Open the Sync section on a synced repo's activity. */
   onActivity: (repo: string) => void;
+  /** The section the URL brings into view (`review`). */
+  reveal?: string | null;
 }) {
   const r = e.built;
   return (
@@ -622,6 +619,12 @@ function Details({
         // What runs its CI (W23-R07), when its host makes a choice possible.
         <Loadable label="what runs its CI" fallback={<></>}>
           <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {r && (
+        // Whether agents fix code from agents' feedback (W26-R18): off until someone who lands turns it on.
+        <Loadable label="its review" fallback={<Hold height={112} />}>
+          <RepoReview repo={r.name} reveal={reveal === "review"} />
         </Loadable>
       )}
       {!e.key.startsWith("here:") && (

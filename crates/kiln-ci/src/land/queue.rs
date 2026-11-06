@@ -514,7 +514,17 @@ pub struct Record {
 pub enum Route {
     Kiln,
     Host { queue: String },
+    /// A repository on a host that has no queue for it (docs/ci.md W26-R19): kiln's queue tests
+    /// its changes in kiln's mirror, and its host merges each at the head tested.
+    HostMerges,
 }
+
+/// [`Route::HostMerges`]'s name, as entries and land records keep it.
+pub const HOST_MERGES: &str = "kiln, merged on its host";
+
+/// What follows a queue's name in a land's `via` when its host merged the change while Review held
+/// its entry (W26-R19).
+pub const HELD_NOTE: &str = ", while Review held it";
 
 impl Route {
     /// The route `abilities(repo).queue` gives: its host queue's name, if it has one.
@@ -525,12 +535,40 @@ impl Route {
         }
     }
 
+    /// The route of a repository on a host (docs/ci.md W26-R19): its host's queue where it has one
+    /// on, else kiln's queue with the host merging what it tested.
+    pub fn of_host(host_queue: Option<&str>) -> Route {
+        host_queue.map_or(Route::HostMerges, |q| Route::Host { queue: q.to_owned() })
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Route::Kiln => "kiln",
             Route::Host { queue } => queue,
+            Route::HostMerges => HOST_MERGES,
         }
     }
+}
+
+/// What a change kiln's queue tested comes to when its host would merge it (docs/ci.md W26-R19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMerge {
+    /// Merge it on its host, at the head tested.
+    Merge,
+    /// Its head moved past the one tested: content Review hasn't cleared, back to Review's gate at
+    /// its new head (W28-R105).
+    Back { why: String },
+}
+
+/// Whether kiln has its host merge a change its queue tested (docs/ci.md W26-R19): only at the head
+/// tested. A head that moved goes back to Review. (Where the trunk is, R102 decides for the whole
+/// batch, as for kiln's own lands: never a build of kiln's own on the trunk's tip.)
+pub fn host_merge(tested_head: &str, head_now: &str) -> HostMerge {
+    let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
+    if head_now != tested_head {
+        return HostMerge::Back { why: format!("its head moved to {} after {} was tested, past what Review cleared", short(head_now), short(tested_head)) };
+    }
+    HostMerge::Merge
 }
 
 /// Where a host's change is, as read back through the seam.

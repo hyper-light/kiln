@@ -1,0 +1,32 @@
+[package]
+name = "kiln-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kiln's load lab: realistic kiln use against any build of kiln, and A/B between two (docs/runtime-lab.md)."
+
+# The lab drives kiln as a person, its agents and its runners do, over HTTP, WebSockets and the
+# runners' own link, so it depends on no build of kiln: any two builds are measured by the same lab.
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
+# `rate`'s generator threads each wait on their connections in a poller of their own: epoll, kqueue or IOCP
+# (src/rate/os.rs). Already in kiln's lock file through turso_core.
+polling = "3.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+# `rate`'s target files (src/rate/target.rs), as kiln reads its kiln.toml.
+toml = "1.1.8"
+
+# `rate`'s OS interface (src/rate/os.rs): Linux's timer slack, the open-files limit, the CPU clocks, the clock's
+# ticks and the page's size, as kiln-rt takes them; macOS's QoS class through libc, as kiln-rt sets it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["param", "process", "thread", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
+[lints]
+workspace = true

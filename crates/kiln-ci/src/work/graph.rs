@@ -1369,7 +1369,11 @@ mod tests {
         assert_eq!(hit(&g, Ecosystem::Cargo, &["docs/ci.md", ".kiln/ci.yaml"]), Vec::<String>::new());
         assert_eq!(hit(&g, Ecosystem::Cargo, &["Cargo.lock"]), crates);
         assert!(hit(&g, Ecosystem::Cargo, &["vendor/turso/core/lib.rs"]).contains(&"kiln".to_owned()));
-        assert!(hit(&g, Ecosystem::Cargo, &["vendor/hyper-raft/crates/hyper-rt/src/lib.rs"]).contains(&"kiln-http".to_owned()));
+        assert!(hit(&g, Ecosystem::Cargo, &["vendor/hyper-raft/crates/hyper-rt-transport/src/lib.rs"]).contains(&"kiln".to_owned()));
+        // hyper-rt is kiln's own runtime, crates/kiln-rt, which the patch gives every crate that names
+        // it; hyper-raft's copy stays upstream's, and nothing kiln builds takes it (crates/kiln-rt/ORIGIN.md).
+        assert!(hit(&g, Ecosystem::Cargo, &["crates/kiln-rt/src/lib.rs"]).contains(&"kiln-http".to_owned()));
+        assert!(!hit(&g, Ecosystem::Cargo, &["vendor/hyper-raft/crates/hyper-rt/src/lib.rs"]).contains(&"kiln-http".to_owned()));
         Ok(())
     }
 }

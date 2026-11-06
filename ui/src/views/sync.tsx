@@ -9,6 +9,7 @@ import type { SyncConflict, SyncCopy, SyncKeep, SyncMode, SyncRepo } from "@/api
 import { Button } from "@/components/ui/button";
 import { Confirm, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
+import { useAction, useActions } from "@/lib/action";
 import { labelOf, useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import "./sync.css";
@@ -53,15 +54,15 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
     { machine: "", path: "" },
   ]);
   const [exclude, setExclude] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const filled = copies.filter((c) => c.machine && c.path.trim());
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
+  // Started, it closes; until it's answered the form stays as typed, to say here what went wrong. Left
+  // with Cancel meanwhile, its answer closes nothing: a form opened since isn't its (W21-R15).
+  const left = React.useRef(false);
+  const [start, starting] = useAction(
+    async () => {
+      setError(null);
       await api.syncCreate({
         name: name.trim(),
         copies: filled.map((c) => ({ machine: c.machine, path: c.path.trim() })),
@@ -71,16 +72,20 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
           .filter(Boolean),
         mode,
       });
-      onDone();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+      if (!left.current) onDone();
+    },
+    (err) => setError(errorMessage(err)),
+  );
 
   return (
-    <form className="sync-form" onSubmit={submit} aria-label="Sync a folder">
+    <form
+      className="sync-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        start();
+      }}
+      aria-label="Sync a folder"
+    >
       <TextField label="Name" value={name} onChange={(e) => setName(e.target.value)} placeholder="kiln" required autoFocus />
       <fieldset className="sync-copies">
         <legend className="field-label">Copies</legend>
@@ -116,10 +121,18 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
       />
       {error && <p className="sync-error">{error}</p>}
       <div className="sync-actions">
-        <Button type="submit" size="sm" disabled={busy || !name.trim() || filled.length === 0}>
-          {busy ? "Starting…" : "Start syncing"}
+        <Button type="submit" size="sm" disabled={!name.trim() || filled.length === 0} pending={starting}>
+          {starting ? "Starting…" : "Start syncing"}
         </Button>
-        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          onClick={() => {
+            left.current = true;
+            onCancel();
+          }}
+        >
           Cancel
         </Button>
       </div>
@@ -186,6 +199,8 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
   const [adding, setAdding] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Copies removed and conflicts resolved, by `copy:member` and `conflict:path`.
+  const [gone, setGone] = React.useState<ReadonlySet<string>>(() => new Set());
   const act = async (f: () => Promise<unknown>) => {
     setError(null);
     try {
@@ -197,6 +212,27 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
       return false;
     }
   };
+  // Its changes: stopping it goes alone; its rows' (a conflict resolved, a copy removed or added) go
+  // side by side, each one at a time. The one pressed says it's on its way, and what contradicts it
+  // waits for it (W21-R15).
+  const [row, rowGoing] = useActions((_: string, f: () => Promise<unknown>) => f());
+  const rowsOut = rowGoing("add") || repo.conflicts.some((c) => rowGoing(`conflict:${c.path}`)) || repo.copies.some((c) => rowGoing(`copy:${c.member}`));
+  const [stop, stopPending] = useAction(() => act(() => api.syncDelete(repo.id)));
+  /** Gone from its list as it's pressed, and back, saying why, if it doesn't go (W21-R15). */
+  const drop = (key: string, f: () => Promise<unknown>) =>
+    row(key, () => {
+      setGone((g) => new Set(g).add(key));
+      return act(f).then(
+        (ok) =>
+          ok ||
+          setGone((g) => {
+            const back = new Set(g);
+            back.delete(key);
+            return back;
+          }),
+      );
+    });
+  const conflicts = repo.conflicts.filter((c) => !gone.has(`conflict:${c.path}`));
 
   return (
     <section className="sync-repo" aria-label={repo.name}>
@@ -211,12 +247,12 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
         </div>
         <div className="sync-actions">
           {!adding && (
-            <Button size="xs" variant="secondary" onClick={() => setAdding(true)}>
+            <Button size="xs" variant="secondary" pending={rowGoing("add")} onClick={() => setAdding(true)}>
               Add a copy
             </Button>
           )}
           {!stopping && (
-            <Button size="xs" variant="ghost" onClick={() => setStopping(true)}>
+            <Button size="xs" variant="ghost" pending={stopPending} onClick={() => setStopping(true)}>
               Stop syncing
             </Button>
           )}
@@ -230,7 +266,7 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => void act(() => api.syncDelete(repo.id))}>
+              <Button size="xs" variant="danger" onClick={stop} pending={stopPending} disabled={rowsOut}>
                 Stop syncing
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setStopping(false)}>
@@ -244,26 +280,32 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
       )}
       {copies && (
         <ul className="sync-copies-list">
-          {repo.copies.map((c) => (
-            <CopyRow key={c.member} copy={c} onRemove={() => act(() => api.syncRemoveCopy(repo.id, c.member))} />
-          ))}
+          {repo.copies
+            .filter((c) => !gone.has(`copy:${c.member}`))
+            .map((c) => (
+              <CopyRow key={c.member} copy={c} held={stopPending} onRemove={() => drop(`copy:${c.member}`, () => api.syncRemoveCopy(repo.id, c.member))} />
+            ))}
         </ul>
       )}
       {adding && (
         <AddCopy
           machines={machines}
-          onAdd={async (copy) => {
-            if (await act(() => api.syncAddCopy(repo.id, copy))) setAdding(false);
-          }}
+          pending={rowGoing("add")}
+          held={stopPending}
+          onAdd={(copy) =>
+            row("add", async () => {
+              if (await act(() => api.syncAddCopy(repo.id, copy))) setAdding(false);
+            })
+          }
           onCancel={() => setAdding(false)}
         />
       )}
-      {repo.conflicts.length > 0 && (
+      {conflicts.length > 0 && (
         <div className="sync-conflicts">
-          <h3 className="field-label">{repo.conflicts.length === 1 ? "1 conflict" : `${repo.conflicts.length} conflicts`}</h3>
+          <h3 className="field-label">{conflicts.length === 1 ? "1 conflict" : `${conflicts.length} conflicts`}</h3>
           <ul>
-            {repo.conflicts.map((c) => (
-              <ConflictRow key={c.path} conflict={c} onResolve={(keep) => act(() => api.syncResolve(repo.id, c.path, keep))} />
+            {conflicts.map((c) => (
+              <ConflictRow key={c.path} conflict={c} held={stopPending} onResolve={(keep) => drop(`conflict:${c.path}`, () => api.syncResolve(repo.id, c.path, keep))} />
             ))}
           </ul>
         </div>
@@ -272,7 +314,7 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
   );
 }
 
-function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<boolean> }) {
+function CopyRow({ copy, held, onRemove }: { copy: SyncCopy; held: boolean; onRemove: () => void }) {
   useLabels();
   const [removing, setRemoving] = React.useState(false);
   const s = copy.status;
@@ -310,7 +352,7 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => void onRemove().then((ok) => ok || setRemoving(false))}>
+              <Button size="xs" variant="danger" disabled={held} onClick={onRemove}>
                 Remove copy
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
@@ -328,22 +370,34 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
   );
 }
 
-function AddCopy({ machines, onAdd, onCancel }: { machines: string[]; onAdd: (copy: { machine: string; path: string }) => Promise<void>; onCancel: () => void }) {
+/** A copy to add: added, it closes; until it's answered what was typed stays, to say here what went wrong (W21-R15). */
+function AddCopy({
+  machines,
+  onAdd,
+  onCancel,
+  pending,
+  held,
+}: {
+  machines: string[];
+  onAdd: (copy: { machine: string; path: string }) => void;
+  onCancel: () => void;
+  pending: boolean;
+  /** The synced repo is being stopped: an add waits for it. */
+  held: boolean;
+}) {
   const [copy, setCopy] = React.useState({ machine: "", path: "" });
-  const [busy, setBusy] = React.useState(false);
   return (
     <form
       className="sync-form sync-add"
       aria-label="Add a copy"
       onSubmit={(e) => {
         e.preventDefault();
-        setBusy(true);
-        void onAdd({ machine: copy.machine, path: copy.path.trim() }).finally(() => setBusy(false));
+        onAdd({ machine: copy.machine, path: copy.path.trim() });
       }}
     >
       <CopyFields machines={machines} value={copy} onChange={setCopy} />
       <div className="sync-actions">
-        <Button type="submit" size="xs" disabled={busy || !copy.machine || !copy.path.trim()}>
+        <Button type="submit" size="xs" disabled={!copy.machine || !copy.path.trim() || held} pending={pending}>
           Add copy
         </Button>
         <Button type="button" size="xs" variant="ghost" onClick={onCancel}>
@@ -360,24 +414,15 @@ const KEEP: { value: SyncKeep; label: string }[] = [
   { value: "both", label: "Keep both" },
 ];
 
-function ConflictRow({ conflict, onResolve }: { conflict: SyncConflict; onResolve: (keep: SyncKeep) => Promise<boolean> }) {
+function ConflictRow({ conflict, held, onResolve }: { conflict: SyncConflict; held: boolean; onResolve: (keep: SyncKeep) => void }) {
   const [keep, setKeep] = React.useState<SyncKeep>("name");
-  const [busy, setBusy] = React.useState(false);
   return (
     <li className="sync-conflict">
       <code className="sync-path">{pathWords(conflict.beside)}</code>
       <code className="sync-path sync-beside">{pathWords(conflict.path)}</code>
       <div className="sync-resolve">
         <SelectField label="Resolve" hideLabel value={keep} onChange={(v) => setKeep(v as SyncKeep)} options={KEEP} />
-        <Button
-          size="xs"
-          variant="secondary"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            void onResolve(keep).finally(() => setBusy(false));
-          }}
-        >
+        <Button size="xs" variant="secondary" disabled={held} onClick={() => onResolve(keep)}>
           Resolve
         </Button>
       </div>

@@ -102,7 +102,7 @@ pub async fn pack_from(hub: &Hub, repo: &str, q: &HashMap<String, String>, mut f
     cmd.args(["-C", &m, "index-pack", "--stdin", "--fix-thin"]);
     let child = crate::proc::spawn_duplex(cmd).map_err(|e| internal(&e))?;
     let (out, err) = (child.stdout.clone(), child.stderr.clone());
-    let drain = |rx: async_channel::Receiver<Vec<u8>>| crate::rt::spawn(async move {
+    let drain = |rx: crate::memory::queue::Receiver<Vec<u8>>| crate::rt::spawn(async move {
         let mut all = Vec::new();
         while let Ok(c) = rx.recv().await {
             if all.len() < 64 << 10 {

@@ -530,7 +530,7 @@ pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
 
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
     hub.store
-        .call(|c| {
+        .read(|c| {
             let mut q = c.prepare(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
             let rows = q.query_map([], row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)

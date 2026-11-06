@@ -109,6 +109,64 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
+    /// The HTTP/3 WebTransport door (goal 4, docs/http.md "HTTP/3"): the UDP address it listens
+    /// on, as `0.0.0.0:7443`. Unset (the default), there is no door and no socket is bound.
+    pub h3_addr: Option<String>,
+    /// The `host:port` pages reach the door at, when it isn't `public_url`'s host at the bound
+    /// port.
+    pub h3_advertise: Option<String>,
+    /// A publicly trusted PEM certificate chain for the door. Unset, the door serves self-signed
+    /// ECDSA P-256 certificates that pages pin by hash, rotated weekly.
+    pub h3_cert: Option<PathBuf>,
+    /// Its PEM private key.
+    pub h3_key: Option<PathBuf>,
+    /// A shard whose queue stands past its calm (most of a tolerance, 1 s, past it while the shard runs
+    /// most of the time), or a pool's line that work keeps standing past it, answers Background requests
+    /// 503 with `Retry-After`, and Normal ones too once it has stood another tolerance; Critical ones
+    /// (health, sign-in, a person's pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln decides
+    /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
+    /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
+    pub shed: bool,
+    /// How the server places its work on its runtime's shards (goal 7 of the API runtime program,
+    /// `crate::placement`): `round-robin` (connections dealt in turn, requests served in their
+    /// connection's task), `steer` (connections and requests to the less delayed of two shards), `steal`
+    /// (requests as tasks an idle shard takes from a busy one) or `both`. `round-robin` by default, as the
+    /// lab's A/B picked it (docs/runtime-lab.md, "Goal 7: placement"); the others stay for later A/B tests.
+    /// `KILN_RT_PLACEMENT` overrides it.
+    pub placement: crate::placement::Placement,
+    /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
+    /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
+    /// these alone (`AllowedCPUs=`, where the service manager has the cpuset controller) and,
+    /// installed system-wide, makes them a cpuset partition that nothing outside the slice runs on
+    /// (given back without them, and by `kiln uninstall`); the server fixes its shards to them, says
+    /// whether they're a partition's (its log, `/healthz/server`); and kiln's own legs and agents keep
+    /// off them, those its own runner starts (off its shards' cores, where the slice holds the runner on
+    /// them) and those of every runner whose config this is (step 7; goal 9, plan 01a1a87b2cec step 4).
+    /// Unset (the default), the server shares every core with what runs beside it, first by its weight.
+    pub cores: Option<String>,
+    /// The server's shards in Linux's round-robin real-time class at its lowest priority
+    /// (docs/priority.md, "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9,
+    /// plan 01a1a87b2cec step 4), where the system grants it (`kiln install` writes the grant,
+    /// `LimitRTPRIO=`): a shard waking takes its CPU at once, whatever runs there, under every kernel
+    /// preemption mode. Refused, the shards run as without it and `/healthz/server` and the log say
+    /// why. Off until declared (docs/ci.md §0.3, "Opt-in automation"): on bare metal, `kiln install`
+    /// declares it in a new server's config wherever the systemd unit it writes grants it, saying why
+    /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
+    pub realtime: bool,
+    /// How the server's shards nudge their CPUs while they wait (docs/priority.md, "A nudge for the
+    /// shards"; goal 8, plan 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3): a nudged shard's waits
+    /// end at least every step quantum less the timers' tick (166.7 µs; goal 9, plan 01a1a87b2cec step 4), so
+    /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within a
+    /// quantum, the timer slack added (266.7 µs), not at the kernel's next tick (up to 1 ms at 1000 Hz).
+    /// `"off"` (or `false`), the default: never; it's off until declared (docs/ci.md §0.3, "Opt-in
+    /// automation"). `"auto"`, the mode a config declares, nudges a shard only while its host holds its
+    /// wakes, as its probe reads each period from the kernel's count of its wait for a CPU (`crate::nudge`),
+    /// so a calm server pays nothing and says when and why a shard nudged; `"on"` (or `true`, as before it
+    /// had a mode) nudges every wait, a wake of each waiting shard every period. Needs no privilege; in the
+    /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge); macOS and
+    /// Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any
+    /// other value on, as it was read before), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+    pub nudge: crate::nudge::Mode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +471,15 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
+            h3_addr: None,
+            h3_advertise: None,
+            h3_cert: None,
+            h3_key: None,
+            shed: false,
+            placement: crate::placement::Placement::default(),
+            cores: None,
+            realtime: false,
+            nudge: crate::nudge::Mode::Off,
         }
     }
 }
@@ -589,8 +656,31 @@ impl Config {
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADDR") {
             cfg.server.webrtc_addr = Some(v).filter(|v| !v.trim().is_empty());
         }
+        if let Ok(v) = std::env::var("KILN_H3_ADDR") {
+            cfg.server.h3_addr = Some(v).filter(|v| !v.trim().is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_H3_ADVERTISE") {
+            cfg.server.h3_advertise = Some(v).filter(|v| !v.trim().is_empty());
+        }
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
             cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
+        }
+        // `[server] shed`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_SHED=1`).
+        if let Ok(v) = std::env::var("KILN_SHED") {
+            cfg.server.shed = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] realtime`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_REALTIME=1`).
+        if let Ok(v) = std::env::var("KILN_RT_REALTIME") {
+            cfg.server.realtime = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`, `=auto`, `=off`).
+        if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
+            cfg.server.nudge = crate::nudge::Mode::from_env(&v);
+        }
+        // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
+        if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {
+            cfg.server.placement = crate::placement::Placement::parse(&v)
+                .ok_or_else(|| anyhow::anyhow!("KILN_RT_PLACEMENT={v}: round-robin, steer, steal or both"))?;
         }
         Ok(cfg)
     }

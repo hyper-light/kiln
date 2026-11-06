@@ -6,4 +6,4 @@
  * (`AgentMsg::Unread`, `ServerMsg::Unread`): new ones are appended last, as postcard encodes
  * variants by index.
  */
-export type Wire = "runner" | "server" | "runner_item" | "server_item" | "runner_payload" | "server_payload" | "relay" | "reach_link" | "session_up" | "session_down" | "terminal_up" | "terminal_down" | "stream_up" | "stream_down" | "events_up" | "events_down" | "log_up" | "log_down" | "tunnel_up" | "tunnel_down" | "mcp_http" | "mcp_reach";
+export type Wire = "runner" | "server" | "runner_item" | "server_item" | "runner_payload" | "server_payload" | "relay" | "reach_link" | "session_up" | "session_down" | "terminal_up" | "terminal_down" | "stream_up" | "stream_down" | "events_up" | "events_down" | "log_up" | "log_down" | "tunnel_up" | "tunnel_down" | "mcp_http" | "mcp_reach" | "bp_up" | "bp_down";

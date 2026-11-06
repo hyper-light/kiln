@@ -377,8 +377,8 @@
 .rv-s[tabindex="-1"]:focus {
   outline: none;
 }
-/* The Conversation's head: its label, and the agent fixes switch on its right (Ship's mockups
-   plan, step 13); everything else under them, full width. */
+/* The Conversation's head: its label, and the repository's agent fixes on its right (Ship's mockups
+   plan, step 13; W26-R18), read here, a link to where it's set; everything else under them, full width. */
 .rv-s-convo {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -400,7 +400,11 @@
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 11px;
   letter-spacing: 0.03em;
+  text-decoration: none;
   cursor: pointer;
+}
+.rv-switch:hover {
+  color: #c9ccd3;
 }
 .rv-switch i {
   position: relative;
@@ -421,14 +425,13 @@
   background: #c9ccd3;
   transition: transform 0.2s;
 }
-.rv-switch[aria-checked="true"] i {
+.rv-switch[data-on] i {
   background: #7fb5a0;
 }
-.rv-switch[aria-checked="true"] i::after {
+.rv-switch[data-on] i::after {
   transform: translateX(12px);
 }
-.rv-switch:disabled {
-  cursor: not-allowed;
+.rv-switch[data-unread] {
   opacity: 0.55;
 }
 .rv-h {
@@ -452,8 +455,10 @@
   letter-spacing: 0;
   color: #e4e5e7;
 }
+/* At a phone's narrowest (320 px) Land goes under Approve rather than past the page's edge. */
 .rv-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -514,6 +519,15 @@
 .rv-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+/* Land beside Approve (docs/ci.md W26-R19): the chips take the room, and Land keeps one width whatever it says,
+   its words from the start so its icon stays put as they change. */
+.rv-bar > .rv-ks {
+  flex: 1;
+}
+.rv-land {
+  min-width: 13em;
+  justify-content: flex-start;
 }
 .rv-btn-go {
   background: rgb(255 255 255 / 9%);
@@ -841,6 +855,14 @@
   align-items: center;
   padding: 8px 8px 8px 16px;
 }
+/* What came of an open thread (W26-R18): fixed in a version, or waiting for a person. */
+.rv-fix {
+  margin-left: auto;
+  font-size: 12px;
+}
+.rv-fix[data-waits] {
+  color: var(--color-warn);
+}
 .rv-done {
   display: inline-flex;
   gap: 6px;
@@ -880,11 +902,19 @@
   align-items: center;
   min-width: 0;
 }
-/* The signature's shield: dim while unsigned (comments are signed from W27-R03). */
+/* An agent's person, after its name: the agent for kim (W26-R18). */
+.rv-for {
+  color: var(--color-secondary);
+}
+/* The signature's shield: whole once signed (W27-R04), dim while unsigned; its title says who
+   signed it. */
 .rv-seal {
   display: inline-flex;
   color: #8fb5a6;
   opacity: 0.55;
+}
+.rv-seal[data-signed] {
+  opacity: 1;
 }
 /* The kind's chip in a comment's line: its icon alone. */
 .rv-k.rv-ki {
@@ -1088,6 +1118,74 @@
 }
 .rv-seg button[data-rec] {
   color: #cdc6ea;
+}
+/* the conflict ladder (W26-R17): its line, one height from the first paint; its resolution; the
+   buttons in a grid of fixed rows */
+.rv-rung {
+  margin: 0;
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  color: #a1a4ad;
+}
+.rv-rung[data-k="working"],
+.rv-rung[data-k="testing"] {
+  color: #cdc6ea;
+}
+.rv-rung[data-k="passed"] {
+  color: #a8c9bc;
+}
+.rv-rung[data-k="failed"] {
+  color: #efb8bf;
+}
+.rv-cfs[data-side="offered"] {
+  box-shadow: inset 0 0 0 1px rgb(205 198 234 / 30%);
+}
+.rv-cfs[data-side="offered"] .rv-cfl {
+  color: #cdc6ea;
+}
+.rv-cfs[data-side="offered"] .rv-cf-says {
+  padding: 6px 10px 8px;
+  overflow-wrap: anywhere;
+}
+.rv-cfb {
+  display: grid;
+  grid-template-columns: repeat(4, max-content) 28px;
+  gap: 4px;
+  align-items: center;
+}
+.rv-cfb .rv-btn {
+  border: 0;
+  border-radius: 99px;
+  background: rgb(255 255 255 / 6%);
+  color: #c9ccd3;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  padding: 5px 11px;
+  white-space: nowrap;
+}
+.rv-cfb .rv-btn:hover:not(:disabled) {
+  background: rgb(255 255 255 / 10%);
+}
+.rv-cfb .rv-btn[data-rec] {
+  color: #cdc6ea;
+}
+.rv-cfb .rv-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+@media (max-width: 560px) {
+  .rv-cfb {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .rv-cfb .rv-btn {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 .rv-cta {
   font-family: var(--mono, ui-monospace, monospace);

@@ -19,6 +19,12 @@ pub fn new_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
 
+/// An id written as [`new_id`] writes them, 32 lowercase hex digits: what a client may make one of
+/// its own as (the agents a page starts, `POST /api/harness/sessions`' `ids`).
+pub fn is_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// An id made from `parts` (a namespace, then what it names), the same every time they're the same
 /// and as unlikely to meet another as a random one (a UUIDv8 of their SHA-256): how a retry finds
 /// the id its first try made, from the key its sender gave (CP-T3.2, an idempotency key).
@@ -114,6 +120,16 @@ pub fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     s.get(..end).unwrap_or_default()
+}
+
+/// The brotli window for `len` bytes, as bits: the smallest that holds them all, between brotli's least (10
+/// bits) and 22 bits (4 MiB). A window past the data finds no match the data's own doesn't, and memory follows
+/// the window on both sides: the encoder's at quality 11 takes eight bytes a place of it (22 bits took 34 MB
+/// for each UI file), and a decoder's ring buffer grows to the window as the output passes it (goal 11, plan
+/// 01a1a87b2e56 steps 3 and 5).
+pub fn brotli_window(len: usize) -> u32 {
+    // A window of `bits` holds (1 << bits) - 16 bytes.
+    (10..22).find(|bits| (1usize << bits).saturating_sub(16) >= len).unwrap_or(22)
 }
 
 /// HMAC-SHA256 of `msg` under `key`, hex encoded.

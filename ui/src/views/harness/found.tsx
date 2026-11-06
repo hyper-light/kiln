@@ -14,7 +14,7 @@ import { harnessApi } from "@/api/harness";
 import type { AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -54,29 +54,28 @@ function abilities(s: AiSession): { take: boolean; fork: boolean; why: string; u
   return { take, fork, why: "", update: false };
 }
 
-/** Take over, confirmed in the row: what happens to it where it runs now, then go. */
+/**
+ * Take over, confirmed in the row: what happens to it where it runs now, then go. Take over says
+ * it's on its way until kiln has it (W21-R15), which can't be called back, so Cancel waits; its
+ * page opens once kiln answers, as a refusal (it runs outside kiln, its runner is too old) is said
+ * here.
+ */
 function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
   useLabels();
   const navigate = useNavigate();
-  const [busy, setBusy] = React.useState(false);
-  const go = async () => {
-    setBusy(true);
-    try {
-      const [a] = await harnessApi.takeover(s.machine, s.pid, { stop: s.takeover === "stop" });
-      if (a) navigate(`/agents/${a.id}`);
-    } catch (e) {
-      toast.error("Couldn't take it over", errorMessage(e));
-      setBusy(false);
-    }
-  };
+  const [go, going] = useAction(async () => {
+    const [a] = await harnessApi.takeover(s.machine, s.pid, { stop: s.takeover === "stop" });
+    if (a) navigate(`/agents/${a.id}`);
+  }, "Couldn't take it over");
   return (
     <div className="ms-confirm" role="group" aria-label="Take over">
       <p>{s.takeover === "stop" ? `Stops it on ${labelOf(s.machine)}` : `Ends its terminal on ${labelOf(s.machine)}`} and continues here as an agent: same folder, conversation and model.</p>
       <span className="ms-confirm-actions">
-        <Button size="xs" disabled={busy} onClick={go}>
+        <Button size="xs" pending={going} onClick={go}>
           Take over
         </Button>
-        <Button size="xs" variant="ghost" disabled={busy} onClick={onCancel}>
+        {/* A take-over on its way can't be called back: Cancel waits for its answer. */}
+        <Button size="xs" variant="ghost" disabled={going} onClick={onCancel}>
           Cancel
         </Button>
       </span>
@@ -153,7 +152,6 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
   const navigate = useNavigate();
   const [reading, setReading] = React.useState(focused);
   const [confirming, setConfirming] = React.useState(false);
-  const [forking, setForking] = React.useState(false);
   // The session a link points at comes into view (again if the link changes to it).
   const reveal = React.useCallback(
     (li: HTMLLIElement | null) => {
@@ -164,17 +162,11 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
   const stand = standOf(s);
   const title = s.title || s.name || toolLabel(s.tool);
   const can = abilities(s);
-  const fork = async () => {
-    setForking(true);
-    try {
-      const [a] = await harnessApi.fork(s.machine, s.pid);
-      if (a) navigate(`/agents/${a.id}`);
-    } catch (e) {
-      toast.error("Couldn't fork it", errorMessage(e));
-    } finally {
-      setForking(false);
-    }
-  };
+  // Fork says it's on its way until kiln has the copy, whose page opens then (W21-R15).
+  const [fork, forking] = useAction(async () => {
+    const [a] = await harnessApi.fork(s.machine, s.pid);
+    if (a) navigate(`/agents/${a.id}`);
+  }, "Couldn't fork it");
   return (
     <li ref={reveal} className="ms-row ms-found-row" data-stand={stand}>
       <span className="ms-mark" title={toolLabel(s.tool)}>
@@ -204,7 +196,7 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
           <Button size="xs" disabled={!can.take || confirming} title={can.take ? undefined : can.why} onClick={() => setConfirming(true)}>
             Take over
           </Button>
-          <Button size="xs" variant="secondary" disabled={!can.fork || forking} title={can.fork ? "Continue a copy here; it keeps running" : can.why} onClick={fork}>
+          <Button size="xs" variant="secondary" disabled={!can.fork} pending={forking} title={can.fork ? "Continue a copy here; it keeps running" : can.why} onClick={fork}>
             Fork
           </Button>
           {s.terminal && (

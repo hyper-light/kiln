@@ -1,14 +1,17 @@
 //! Prometheus metrics with no allocation on the hot path: atomics for counters and gauges, fixed
 //! bucket histograms, and labelled families keyed by a small string set. Host statistics are read
-//! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero.
+//! straight from `/proc` on demand (only when scraped or sampled), so idle cost is ~zero. No lock: a
+//! labelled family's series are an immutable copy swapped in whole as a series is added (`crate::rcu`),
+//! each series' value an atomic (goal 5 of the API runtime program, plan 01a1a59c2aae).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+use crate::rcu::Rcu;
 
 #[derive(Default)]
 pub struct Counter(AtomicU64);
@@ -35,6 +38,10 @@ impl Gauge {
     pub fn add(&self, v: i64) {
         self.0.fetch_add(v, Ordering::Relaxed);
     }
+    /// Raises it to `v` when it's below: the most a figure has been.
+    pub fn raise(&self, v: i64) {
+        self.0.fetch_max(v, Ordering::Relaxed);
+    }
     pub fn get(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -60,6 +67,12 @@ pub const DELIVERY_BUCKETS: &[f64] =
     &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 pub const LATENCY_BUCKETS: &[f64] =
     &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 150.0, 300.0, 600.0];
+/// 50 µs to a minute: [`DELIVERY_BUCKETS`]' steps from where in-process work sits, carried on as
+/// [`LATENCY_BUCKETS`]' are to 60 s, so a stall of seconds (production's live feed showed deliveries
+/// of 2.5 to 5 s) lands in a bucket of its own rather than past the last: how late a shard ran its
+/// ready work, and how long a request waited and took (goal 1, plan 01a1a59c2a68 steps 1 and 2).
+pub const STALL_BUCKETS: &[f64] =
+    &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0];
 
 impl Histogram {
     pub fn new(bounds: &'static [f64]) -> Self {
@@ -71,53 +84,168 @@ impl Histogram {
         }
     }
 
+    /// One observation: its own bucket's count (the first bound at or past it; past the last, `+Inf`'s count alone), the
+    /// count and the sum. Each bucket keeps the observations that fell in it alone, summed up to each bound as they're
+    /// read ([`Histogram::cumulative`], `render`): an observation was added to every bucket at or past it, a locked add
+    /// to each (goal 9, plan 01a1a87b2cec step 5: a shard's probe's delay, 40 of its 44 buckets every 10 ms on every
+    /// shard; each request's latency classes). The bounds go up, as every family's list does and the exposition wants.
     pub fn observe(&self, secs: f64) {
-        for (b, c) in self.bounds.iter().zip(&self.buckets) {
-            if secs <= *b {
-                c.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        self.sum_us.fetch_add((secs.max(0.0) * 1_000_000.0) as u64, Ordering::Relaxed);
+        self.observe_n(secs, 1);
     }
 
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
-        let sep = if labels.is_empty() { "" } else { "," };
-        for (b, c) in self.bounds.iter().zip(&self.buckets) {
-            let _ = writeln!(
-                out,
-                "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {}",
-                c.load(Ordering::Relaxed)
-            );
+    /// `n` observations of `secs` at once, as [`Histogram::observe`] adds one: three adds, however many (goal 9, plan
+    /// 01a1a87b2cec step 5: a batch of a viewer's frames written with one write was three adds a frame).
+    pub fn observe_n(&self, secs: f64, n: u64) {
+        if n == 0 {
+            return;
         }
-        let n = self.count.load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
-        #[allow(clippy::cast_precision_loss)]
-        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        let wrap = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
-        let _ = writeln!(out, "{name}_sum{wrap} {sum}");
-        let _ = writeln!(out, "{name}_count{wrap} {n}");
+        // NaN is at or under no bound: `+Inf`'s alone, as it was.
+        let i = if secs.is_nan() { self.bounds.len() } else { self.bounds.partition_point(|b| *b < secs) };
+        if let Some(c) = self.buckets.get(i) {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+        self.count.fetch_add(n, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        self.sum_us.fetch_add(((secs.max(0.0) * 1_000_000.0) as u64).saturating_mul(n), Ordering::Relaxed);
+    }
+
+    /// Observations so far.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// The observations' sum so far, in microseconds.
+    pub fn sum_us(&self) -> u64 {
+        self.sum_us.load(Ordering::Relaxed)
+    }
+
+    /// Observations so far at or under each bound, in the bounds' order (cumulative, as rendered): each bucket's own
+    /// summed up to it ([`Histogram::observe`]).
+    pub fn cumulative(&self) -> Vec<(f64, u64)> {
+        let mut under = 0_u64;
+        self.bounds
+            .iter()
+            .zip(&self.buckets)
+            .map(|(b, c)| {
+                under = under.saturating_add(c.load(Ordering::Relaxed));
+                (*b, under)
+            })
+            .collect()
+    }
+
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
+        render_histogram(out, name, labels, &self.cumulative(), self.count(), self.sum_us());
+    }
+}
+
+/// A histogram's series in the exposition: `cumulative` (each bound's count at or under it), then `+Inf`'s (`n`, every
+/// observation), the sum (`sum_us`, microseconds, said in seconds) and the count.
+fn render_histogram(out: &mut String, name: &str, labels: &str, cumulative: &[(f64, u64)], n: u64, sum_us: u64) {
+    let sep = if labels.is_empty() { "" } else { "," };
+    for (b, under) in cumulative {
+        let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {under}");
+    }
+    let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
+    #[allow(clippy::cast_precision_loss)]
+    let sum = sum_us as f64 / 1_000_000.0;
+    let wrap = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
+    let _ = writeln!(out, "{name}_sum{wrap} {sum}");
+    let _ = writeln!(out, "{name}_count{wrap} {n}");
+}
+
+/// A histogram the server's shards each observe into a copy of their own, on its own cache line, summed as it's read
+/// (goal 9, plan 01a1a87b2cec step 5): every runner's update, request and batch of a viewer's frames is timed into the
+/// route classes' and the runner legs' histograms (`crate::route_latency`) on whichever shard did the work, so one
+/// histogram's bucket, count and sum lines (and their neighbours', the classes' histograms side by side) went from one
+/// shard's cache to another's at nearly every observation: fifteen locked adds an agent's update, each a line taken
+/// from another core. A thread that isn't a shard (a test's, the compute pool's) observes into a copy the shards
+/// don't. Read and rendered as one histogram ([`Histogram`]'s own form).
+pub struct PerShard {
+    /// One for each of the most shards a server makes ([`crate::os::alloc::SHARDS`]; a shard past them shares by its id
+    /// modulo theirs), then the threads that aren't shards'.
+    copies: Box<[Line]>,
+}
+
+/// A histogram on cache lines of its own (128 bytes, the largest a target of kiln's has, Apple silicon's: as
+/// `crate::shard_health::Shard` and hyper-rt's pulse are).
+#[repr(align(128))]
+struct Line(Histogram);
+
+impl PerShard {
+    pub fn new(bounds: &'static [f64]) -> Self {
+        let shards = usize::try_from(crate::os::alloc::SHARDS).unwrap_or(1).max(1);
+        Self { copies: (0..=shards).map(|_| Line(Histogram::new(bounds))).collect() }
+    }
+
+    /// The copy the calling thread observes into: its shard's, else the last (no shard's).
+    fn mine(&self) -> Option<&Histogram> {
+        let shards = self.copies.len().saturating_sub(1).max(1);
+        let i = hyper_rt::futures::shard_id().map_or(self.copies.len().saturating_sub(1), |s| usize::from(s.0) % shards);
+        self.copies.get(i).map(|l| &l.0)
+    }
+
+    /// One observation, as [`Histogram::observe`], on the calling shard's copy.
+    pub fn observe(&self, secs: f64) {
+        if let Some(h) = self.mine() {
+            h.observe(secs);
+        }
+    }
+
+    /// `n` observations of `secs` at once, as [`Histogram::observe_n`], on the calling shard's copy.
+    pub fn observe_n(&self, secs: f64, n: u64) {
+        if let Some(h) = self.mine() {
+            h.observe_n(secs, n);
+        }
+    }
+
+    /// Observations so far, every copy's.
+    pub fn count(&self) -> u64 {
+        self.copies.iter().map(|l| l.0.count()).fold(0, u64::saturating_add)
+    }
+
+    /// The observations' sum so far, in microseconds, every copy's.
+    pub fn sum_us(&self) -> u64 {
+        self.copies.iter().map(|l| l.0.sum_us()).fold(0, u64::saturating_add)
+    }
+
+    /// Observations so far at or under each bound, every copy's ([`Histogram::cumulative`]).
+    pub fn cumulative(&self) -> Vec<(f64, u64)> {
+        let mut all: Vec<(f64, u64)> = Vec::new();
+        for l in self.copies.iter() {
+            let each = l.0.cumulative();
+            if all.is_empty() {
+                all = each;
+                continue;
+            }
+            for ((_, sum), (_, n)) in all.iter_mut().zip(each) {
+                *sum = sum.saturating_add(n);
+            }
+        }
+        all
+    }
+
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
+        render_histogram(out, name, labels, &self.cumulative(), self.count(), self.sum_us());
     }
 }
 
 /// Each runner's machine id and the name people see, by the name kiln knows it by
 /// (docs/machines.md): every series of a machine carries both, `machine_id` and `machine_name`, so
 /// metrics group by either.
-fn machines() -> &'static RwLock<std::collections::HashMap<String, (String, String)>> {
-    static M: OnceLock<RwLock<std::collections::HashMap<String, (String, String)>>> = OnceLock::new();
+fn machines() -> &'static Rcu<std::collections::HashMap<String, (String, String)>> {
+    static M: OnceLock<Rcu<std::collections::HashMap<String, (String, String)>>> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
 /// Runner `key` is machine `machine_id` (empty when kiln doesn't know it), shown as `name`.
 pub fn set_machine(key: &str, machine_id: &str, name: &str) {
-    machines().write().insert(key.to_owned(), (machine_id.to_owned(), name.to_owned()));
+    machines().update(|m| m.insert(key.to_owned(), (machine_id.to_owned(), name.to_owned())));
 }
 
 /// The labels of runner `key`'s machine, to follow a series' own: its id (empty when kiln doesn't
 /// know it) and the name people see (`key`, when it has no other).
 fn machine_labels(key: &str) -> String {
-    let g = machines().read();
+    let g = machines().load();
     let (id, name) = g.get(key).map_or(("", key), |(i, n)| (i.as_str(), n.as_str()));
     format!(",machine_id=\"{}\",machine_name=\"{}\"", escape(id), escape(name))
 }
@@ -137,18 +265,18 @@ pub struct CounterVec {
     keys: &'static [&'static str],
     /// Which label is a runner's name ([`machine_labels`]).
     machine: Option<usize>,
-    series: RwLock<BTreeMap<Vec<String>, u64>>,
+    series: Rcu<BTreeMap<Vec<String>, Arc<AtomicU64>>>,
 }
 
 impl CounterVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: Rcu::default() }
     }
 
     /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
     /// id and name too.
     pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
-        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: Some(at), series: Rcu::default() }
     }
 
     pub fn inc(&self, values: &[&str]) {
@@ -157,23 +285,23 @@ impl CounterVec {
 
     pub fn add(&self, values: &[&str], n: u64) {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        *self.series.write().entry(key).or_insert(0) += n;
+        series_of(&self.series, key).fetch_add(n, Ordering::Relaxed);
     }
 
     /// One series' count (0 before it's counted).
     pub fn get(&self, values: &[&str]) -> u64 {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        self.series.read().get(&key).copied().unwrap_or(0)
+        self.series.load().get(&key).map_or(0, |n| n.load(Ordering::Relaxed))
     }
 
     /// Every series counted so far: its label values and its count.
     pub fn series(&self) -> Vec<(Vec<String>, u64)> {
-        self.series.read().iter().map(|(k, n)| (k.clone(), *n)).collect()
+        self.series.load().iter().map(|(k, n)| (k.clone(), n.load(Ordering::Relaxed))).collect()
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, n) in self.series.read().iter() {
-            let _ = writeln!(out, "{name}{{{}}} {n}", labels_with_machine(self.keys, vals, self.machine));
+        for (vals, n) in self.series.load().iter() {
+            let _ = writeln!(out, "{name}{{{}}} {}", labels_with_machine(self.keys, vals, self.machine), n.load(Ordering::Relaxed));
         }
     }
 }
@@ -184,36 +312,38 @@ pub struct GaugeVec {
     keys: &'static [&'static str],
     /// Which label is a runner's name ([`machine_labels`]).
     machine: Option<usize>,
-    series: RwLock<BTreeMap<Vec<String>, i64>>,
+    series: Rcu<BTreeMap<Vec<String>, i64>>,
 }
 
 impl GaugeVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: Rcu::default() }
     }
 
     /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
     /// id and name too.
     pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
-        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: Some(at), series: Rcu::default() }
     }
 
     /// Every series, as just measured: label values (in `keys` order) and value.
     pub fn replace(&self, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
-        *self.series.write() = series.into_iter().collect();
+        self.series.set(series.into_iter().collect());
     }
 
     /// The series of one publisher, as just measured: those whose first label is one of `owned`
     /// (what it published before, and now) replaced, another publisher's kept (several sync
     /// servers in one process, as tests have them).
     pub fn replace_owned(&self, owned: &BTreeSet<String>, series: impl IntoIterator<Item = (Vec<String>, i64)>) {
-        let mut g = self.series.write();
-        g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
-        g.extend(series);
+        let series: Vec<(Vec<String>, i64)> = series.into_iter().collect();
+        self.series.update(|g| {
+            g.retain(|k, _| k.first().is_none_or(|first| !owned.contains(first)));
+            g.extend(series.iter().cloned());
+        });
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, v) in self.series.read().iter() {
+        for (vals, v) in self.series.load().iter() {
             let _ = writeln!(out, "{name}{{{}}} {v}", labels_with_machine(self.keys, vals, self.machine));
         }
     }
@@ -223,28 +353,34 @@ impl GaugeVec {
 pub struct HistogramVec {
     keys: &'static [&'static str],
     bounds: &'static [f64],
-    series: RwLock<BTreeMap<Vec<String>, Histogram>>,
+    series: Rcu<BTreeMap<Vec<String>, Arc<Histogram>>>,
 }
 
 impl HistogramVec {
     pub fn new(keys: &'static [&'static str], bounds: &'static [f64]) -> Self {
-        Self { keys, bounds, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, bounds, series: Rcu::default() }
     }
 
     pub fn observe(&self, values: &[&str], secs: f64) {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        if let Some(h) = self.series.read().get(&key) {
-            h.observe(secs);
-            return;
-        }
-        self.series.write().entry(key).or_insert_with(|| Histogram::new(self.bounds)).observe(secs);
+        let found = self.series.load().get(&key).cloned();
+        let h = found.unwrap_or_else(|| self.series.update(|m| Arc::clone(m.entry(key.clone()).or_insert_with(|| Arc::new(Histogram::new(self.bounds))))));
+        h.observe(secs);
     }
 
     fn render(&self, out: &mut String, name: &str) {
-        for (vals, h) in self.series.read().iter() {
+        for (vals, h) in self.series.load().iter() {
             h.render(out, name, &labels(self.keys, vals));
         }
     }
+}
+
+/// Series `key` of a family whose values are atomics: the one there, else one made, swapped in with it.
+fn series_of<V: Default>(series: &Rcu<BTreeMap<Vec<String>, Arc<V>>>, key: Vec<String>) -> Arc<V> {
+    if let Some(v) = series.load().get(&key) {
+        return Arc::clone(v);
+    }
+    series.update(|m| Arc::clone(m.entry(key.clone()).or_default()))
 }
 
 fn escape(v: &str) -> String {
@@ -614,7 +750,7 @@ fn render_agents(m: &AgentMetrics, o: &mut String) {
 /// the server's runner pages.
 pub struct NetMetrics {
     pub frames_dropped: CounterVec,
-    toward: RwLock<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+    toward: Rcu<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
 }
 
 impl NetMetrics {
@@ -625,7 +761,7 @@ impl NetMetrics {
         }
         let lane = crate::proto::lane_name(lane);
         self.frames_dropped.add(&[lane, reason], n);
-        *self.toward.write().entry(peer).or_default().entry((lane, reason)).or_insert(0) += n;
+        self.toward.update(|t| *t.entry(peer).or_default().entry((lane, reason)).or_insert(0) += n);
     }
 
     /// What this process dropped, by lane and reason.
@@ -640,10 +776,16 @@ impl NetMetrics {
             .collect()
     }
 
+    /// The frames dropped toward every runner, as they stand now: a copy swapped in whole at each drop,
+    /// so by its identity a read kept in memory knows they changed (`crate::reads::AgentsKey`).
+    pub fn toward_all(&self) -> std::sync::Arc<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>> {
+        self.toward.get()
+    }
+
     /// What this process dropped of what it had for `peer`, by lane and reason.
     pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
         self.toward
-            .read()
+            .load()
             .get(&peer)
             .map(|m| m.iter().map(|((lane, reason), n)| crate::proto::NetDrop { lane: (*lane).to_owned(), reason: (*reason).to_owned(), frames: *n }).collect())
             .unwrap_or_default()
@@ -687,9 +829,50 @@ fn render_wire(o: &mut String) {
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
 }
 
+/// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan
+/// 01a1a832ebbf7327a203df446e16ecac), by `door` (`server`: the server's own listeners with
+/// `server.https`; `front_door`: a runner's HTTPS) and `kind` (`full`, `full_hello_retry`,
+/// `resumed`): every series there from the start.
+pub struct TlsMetrics {
+    pub handshakes: CounterVec,
+}
+
+/// The doors [`TlsMetrics`] counts.
+pub const TLS_DOORS: [&str; 2] = ["server", "front_door"];
+/// The kinds of handshake it counts (`crate::http::tls::Stream::handshake`).
+pub const TLS_HANDSHAKES: [&str; 3] = ["full", "full_hello_retry", "resumed"];
+
+impl TlsMetrics {
+    /// One handshake completed on `door`, of `kind`.
+    pub fn handshake(&self, door: &'static str, kind: &'static str) {
+        self.handshakes.inc(&[door, kind]);
+    }
+}
+
+pub fn tls() -> &'static TlsMetrics {
+    static M: OnceLock<TlsMetrics> = OnceLock::new();
+    M.get_or_init(|| {
+        let handshakes = CounterVec::new(&["door", "kind"]);
+        for door in TLS_DOORS {
+            for kind in TLS_HANDSHAKES {
+                handshakes.add(&[door, kind], 0);
+            }
+        }
+        TlsMetrics { handshakes }
+    })
+}
+
+fn render_tls(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_tls_handshakes_total TLS handshakes completed on kiln's browser-facing listeners, by door (server, front_door) and kind (full, full_hello_retry, resumed).\n# TYPE kiln_tls_handshakes_total counter"
+    );
+    tls().handshakes.render(o, "kiln_tls_handshakes_total");
+}
+
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default() })
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
@@ -747,16 +930,31 @@ pub fn bus() -> &'static BusMetrics {
 }
 
 /// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
+#[derive(Default)]
 pub struct BusGauges {
     pub topics: Gauge,
     pub viewers: Gauge,
     pub memory_bytes: Gauge,
     pub memory_limit_bytes: Gauge,
+    /// The most bytes one topic's retention has asked the bus to keep since the server started
+    /// (`crate::harness::live`'s feeds raise it as they publish; goal 11, plan 01a1a87b2e56 step 3).
+    pub topic_bytes_peak: Gauge,
+    /// The most the bus can hold with the topics and subscriptions it holds, never past its limit
+    /// (`crate::bus::QuiverBus::bound`; goal 11, plan 01a1a87b2e56 step 3).
+    pub memory_bound_bytes: Gauge,
 }
 
 pub fn bus_gauges() -> &'static BusGauges {
     static M: OnceLock<BusGauges> = OnceLock::new();
-    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default() })
+    M.get_or_init(BusGauges::default)
+}
+
+/// The bus's row of what the server's memory holds, by owner: its bytes, and its bound once the bus has been
+/// observed (its limit is set then; goal 11, plan 01a1a87b2e56 step 3). The bound is the one that binds: the
+/// most its topics and subscriptions can hold, never past its limit.
+fn bus_memory(g: &BusGauges) -> (u64, Option<u64>) {
+    let observed = g.memory_limit_bytes.get() > 0;
+    (u64::try_from(g.memory_bytes.get()).unwrap_or(0), observed.then(|| u64::try_from(g.memory_bound_bytes.get()).unwrap_or(0)))
 }
 
 /// The `kiln_bus_*` families, in the exposition.
@@ -782,6 +980,8 @@ fn render_bus(o: &mut String) {
     let _ = writeln!(o, "kiln_bus_memory_bytes {}", g.memory_bytes.get());
     help(o, "kiln_bus_memory_limit_bytes", "gauge", "Bytes the bus's messages may take ([bus] memory).");
     let _ = writeln!(o, "kiln_bus_memory_limit_bytes {}", g.memory_limit_bytes.get());
+    help(o, "kiln_bus_topic_bytes_peak", "gauge", "The most bytes one topic has asked the bus to keep since the server started: a live feed's newest frames, as many as it keeps, their keys and payloads as [bus] topic_bytes counts them (past topic_bytes the bus keeps fewer).");
+    let _ = writeln!(o, "kiln_bus_topic_bytes_peak {}", g.topic_bytes_peak.get());
 }
 
 /// The `kiln_blobs_*` families, in the exposition.
@@ -881,6 +1081,74 @@ mod tests {
         assert!(out.contains(r#"{repo="hyper-light/kiln",machine="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_id="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_name="adas-macbook-pro-3.local"} 3"#), "{out}");
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: an observation adds to its own bucket alone, and the histogram reads and renders
+    /// as when it added to every bucket at or past it: each bound's count of observations at or under it, on a bound and
+    /// past the last (`+Inf` alone), NaN in none, the count and sum; every bucket list the crate keeps goes up, as
+    /// finding the bucket by a binary search needs.
+    #[test]
+    fn g9_s5_an_observation_adds_to_its_bucket_and_reads_as_before() {
+        let shard = crate::shard_health::DELAY_BUCKETS;
+        for bounds in [DURATION_BUCKETS, QUEUE_BUCKETS, DELIVERY_BUCKETS, LATENCY_BUCKETS, STALL_BUCKETS, shard] {
+            assert!(bounds.windows(2).all(|w| w.first() < w.get(1)), "{bounds:?} go up");
+        }
+        let h = Histogram::new(shard);
+        let seen = [0.0, 0.000005, 0.00001, 0.00012, 0.000125, 0.0002, 0.0009, 0.001, 0.0035, 2.0, 59.9, 60.0, 75.0, f64::NAN, -1.0];
+        for s in seen {
+            h.observe(s);
+        }
+        let want: Vec<(f64, u64)> = shard.iter().map(|b| (*b, seen.iter().filter(|s| **s <= *b).count() as u64)).collect();
+        assert_eq!(h.cumulative(), want);
+        assert_eq!(h.count(), seen.len() as u64);
+        let mut out = String::new();
+        h.render(&mut out, "d", "s=\"0\"");
+        for (b, n) in &want {
+            assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"{b}\"}} {n}")), "{b}: {n} not in\n{out}");
+        }
+        assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"+Inf\"}} {}", seen.len())), "{out}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a histogram each shard observes into a copy of its own reads and renders as one
+    /// histogram of every observation would, wherever each was made (every shard, and a thread that's none's), each copy
+    /// on cache lines of its own; and `n` observations at once read as `n` made one by one.
+    #[test]
+    fn g9_s5_a_histogram_each_shard_keeps_a_copy_of_reads_as_one() -> anyhow::Result<()> {
+        let shard = crate::shard_health::DELAY_BUCKETS;
+        let (spread, one) = (Arc::new(PerShard::new(shard)), Histogram::new(shard));
+        let seen = [0.0, 0.000005, 0.00012, 0.0009, 0.001, 0.0035, 2.0, 75.0, f64::NAN];
+        let shards = crate::rt::shard_count();
+        anyhow::ensure!(shards > 0, "no shards");
+        for i in 0..shards {
+            let s = Arc::clone(&spread);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            anyhow::ensure!(
+                crate::rt::spawn_on(i, async move {
+                    for v in seen {
+                        s.observe(v);
+                    }
+                    s.observe_n(0.0002, 3);
+                    let _ = tx.send(());
+                }),
+                "shard {i} refused"
+            );
+            rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|_| anyhow::anyhow!("shard {i} never ran it"))?;
+            for v in seen {
+                one.observe(v);
+            }
+            for _ in 0..3 {
+                one.observe(0.0002);
+            }
+        }
+        spread.observe(0.5);
+        one.observe(0.5);
+        anyhow::ensure!(spread.count() == one.count() && spread.sum_us() == one.sum_us() && spread.cumulative() == one.cumulative(), "read as one: {} {}", spread.count(), one.count());
+        let (mut a, mut b) = (String::new(), String::new());
+        spread.render(&mut a, "d", "s=\"0\"");
+        one.render(&mut b, "d", "s=\"0\"");
+        anyhow::ensure!(a == b, "rendered as one:\n{a}\nagainst\n{b}");
+        anyhow::ensure!(std::mem::align_of::<Line>() >= 128 && std::mem::size_of::<Line>().is_multiple_of(128), "a copy on lines of its own");
+        Ok(())
+    }
+
     #[test]
     fn a_labelled_histogram_renders_each_series_whole() {
         let h = HistogramVec::new(&["repo"], LATENCY_BUCKETS);
@@ -897,6 +1165,34 @@ mod tests {
         assert!(out.contains("x_seconds_count{repo=\"a\"} 2"), "{out}");
         assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"60\"} 0"), "escaped, and over the top bucket but one: {out}");
         assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"150\"} 1"), "{out}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: the most one topic has asked the bus to keep is a gauge that a
+    /// larger figure raises and a smaller one leaves, on `/metrics` with the bus's families.
+    #[test]
+    fn g11_s3_the_bus_topic_bytes_peak_only_rises_and_renders() {
+        let peak = Gauge::default();
+        peak.raise(5_000);
+        peak.raise(300);
+        assert_eq!(peak.get(), 5_000);
+        let mut o = String::new();
+        render_bus(&mut o);
+        assert!(o.contains("# TYPE kiln_bus_topic_bytes_peak gauge\nkiln_bus_topic_bytes_peak "), "{o}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: the bus's row of the memory by owner gives the bound that binds
+    /// (what its topics can hold, set as the bus is observed), not its limit. Before the bus is observed it
+    /// says no bound. Once observed, a bus holding no topic is bound at 0. Its own gauges, not the process's,
+    /// which other tests' scrapes set.
+    #[test]
+    fn g11_s3_the_bus_memory_row_gives_the_bound_that_binds() {
+        let g = BusGauges::default();
+        g.memory_bytes.set(700);
+        assert_eq!(bus_memory(&g), (700, None), "not observed yet");
+        g.memory_limit_bytes.set(179_306_496);
+        assert_eq!(bus_memory(&g), (700, Some(0)), "observed with nothing to hold");
+        g.memory_bound_bytes.set(6_535_168);
+        assert_eq!(bus_memory(&g), (700, Some(6_535_168)), "a topic's most, under the limit");
     }
 
     /// CP-T3.2: the sends families render before anything was sent, as the sync families do.
@@ -1039,10 +1335,10 @@ pub struct HostSample {
     pub procs: u32,
 }
 
-pub static AGENT_SAMPLES: OnceLock<RwLock<BTreeMap<String, HostSample>>> = OnceLock::new();
+pub static AGENT_SAMPLES: OnceLock<Rcu<BTreeMap<String, HostSample>>> = OnceLock::new();
 
-pub fn agent_samples() -> &'static RwLock<BTreeMap<String, HostSample>> {
-    AGENT_SAMPLES.get_or_init(|| RwLock::new(BTreeMap::new()))
+pub fn agent_samples() -> &'static Rcu<BTreeMap<String, HostSample>> {
+    AGENT_SAMPLES.get_or_init(Rcu::default)
 }
 
 /// The conversation stores' metrics (`crate::convo::board`): name, type and help of each, in the
@@ -1065,10 +1361,10 @@ const CONVO: [(&str, &str, &str); 13] = [
 
 /// Each store's labels (`store`, `role`, `machine`) and its [`CONVO`] values (None: not known).
 type ConvoRow = ([String; 3], [Option<i64>; 13]);
-static CONVO_ROWS: OnceLock<RwLock<Vec<ConvoRow>>> = OnceLock::new();
+static CONVO_ROWS: OnceLock<Rcu<Vec<ConvoRow>>> = OnceLock::new();
 
-fn convo_rows() -> &'static RwLock<Vec<ConvoRow>> {
-    CONVO_ROWS.get_or_init(|| RwLock::new(Vec::new()))
+fn convo_rows() -> &'static Rcu<Vec<ConvoRow>> {
+    CONVO_ROWS.get_or_init(Rcu::default)
 }
 
 /// The conversation stores as the board just sampled them.
@@ -1111,7 +1407,7 @@ pub fn set_convo(status: &crate::convo::board::Status) {
             )
         })
         .collect();
-    *convo_rows().write() = rows;
+    convo_rows().set(rows);
 }
 
 pub fn render() -> String {
@@ -1139,6 +1435,8 @@ pub fn render() -> String {
     scalar!("kiln_ws_clients", "gauge", "Connected UI websocket clients.", m.ws_clients.get());
     scalar!("kiln_supervisor_restarts_total", "counter", "Supervised subsystem restarts.", m.supervisor_restarts.get());
     scalar!("kiln_panics_caught_total", "counter", "Panics contained at task boundaries.", m.panics_caught.get());
+    // Goal 9, plan 01a1a87b2cec step 3: kiln's own log lines let go at their queue's bound (`crate::log_lines`).
+    scalar!("kiln_log_lines_dropped_total", "counter", "kiln's own log lines let go at their writer's queue's bound, each said in the log as the writer next writes.", crate::log_lines::dropped_total());
     scalar!("kiln_quic_streams_total", "counter", "QUIC streams accepted.", m.quic_streams.get());
 
     help(&mut o, "kiln_jobs_finished_total", "counter", "Finished jobs.");
@@ -1182,8 +1480,28 @@ pub fn render() -> String {
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
+    render_tls(&mut o);
+    crate::shard_health::render(&mut o);
+    crate::nudge::render(&mut o);
+    crate::route_latency::render(&mut o);
+    crate::overload::render(&mut o);
+    crate::pool_health::render(&mut o);
+    crate::placement::render(&mut o);
+    // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
+    // count, and the most it can hold with what it holds, never past [bus] memory.
+    let bus = bus_memory(bus_gauges());
+    let segments = u64::try_from(crate::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+    // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
+    let search = kiln_search::memory();
+    let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
+    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is
+    // (`crate::harness::copies::PAGE_BYTES`; goal 11, plan 01a1a87b2e56 step 3).
+    let segments_bound = Some(crate::harness::copies::segments_bound()).filter(|b| *b > 0);
+    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, segments_bound), ("search_indexes", search.0, search.1)]);
+    // What the copies keep on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).
+    crate::harness::spill::render(&mut o);
 
-    let samples = agent_samples().read();
+    let samples = agent_samples().load();
     if !samples.is_empty() {
         for (name, kind, h) in [
             ("kiln_agent_cpu_percent", "gauge", "Agent host CPU utilisation."),
@@ -1217,7 +1535,7 @@ pub fn render() -> String {
             }
         }
     }
-    let convo = convo_rows().read();
+    let convo = convo_rows().load();
     if !convo.is_empty() {
         for (i, (name, kind, h)) in CONVO.iter().enumerate() {
             help(&mut o, name, kind, h);

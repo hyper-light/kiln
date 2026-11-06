@@ -5,10 +5,11 @@
  * sent until you send it. Browsers lend the microphone only to a secure page (https, or localhost).
  */
 import * as React from "react";
-import { LoaderCircle, Mic, Square } from "lucide-react";
+import { Mic, Square } from "lucide-react";
 import { api } from "@/api/client";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps } from "@/lib/action";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -229,6 +230,7 @@ function Microphone({ field, setText, onNote, disabled, className }: MicProps) {
 
   const listening = state === "listening";
   const label = way.kind === "off" ? "Speak (unavailable here)" : listening ? "Stop listening" : state === "transcribing" ? "Turning it into text" : "Speak";
+  // While the recording is turned into text it says so (W21-R15), and a press does nothing.
   return (
     <Tip content={way.kind === "off" ? way.why : listening ? "Stop" : "Speak: the words go in at the cursor"}>
       <button
@@ -238,16 +240,11 @@ function Microphone({ field, setText, onNote, disabled, className }: MicProps) {
         aria-label={label}
         aria-pressed={listening}
         aria-disabled={way.kind === "off" || undefined}
-        disabled={disabled || state === "transcribing"}
+        disabled={disabled}
+        {...sendingProps(state === "transcribing")}
         onClick={click}
       >
-        {state === "transcribing" ? (
-          <LoaderCircle size={15} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
-        ) : listening ? (
-          <Square size={11} fill="currentColor" aria-hidden="true" />
-        ) : (
-          <Mic size={15} aria-hidden="true" />
-        )}
+        {listening ? <Square size={11} fill="currentColor" aria-hidden="true" /> : <Mic size={15} aria-hidden="true" />}
         {listening && <Elapsed since={since} ref={stopOnLeave} />}
       </button>
     </Tip>

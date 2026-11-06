@@ -51,7 +51,6 @@ export interface ChoiceQuestion {
   secret?: boolean;
 }
 
-
 export type ExperimentStrategy = "each" | "all" | "pairs" | "greedy" | "custom";
 
 /** A check (a command, or a CI pipeline) each variant runs, or a metric the checks report. */
@@ -914,18 +913,7 @@ function Ask({
               problemPart={issue?.part}
             />
           ) : q ? (
-            <QuestionStep
-              uid={uid}
-              q={q}
-              d={d}
-              single={n === 1}
-              focused={focused}
-              coarse={coarse}
-              otherRef={setOther}
-              onPick={choose}
-              onFocusRow={setFocused}
-              onChange={patch}
-            />
+            <QuestionStep uid={uid} q={q} d={d} single={n === 1} focused={focused} coarse={coarse} otherRef={setOther} onPick={choose} onFocusRow={setFocused} onChange={patch} />
           ) : (
             <Review
               uid={uid}
@@ -967,7 +955,8 @@ function Ask({
           <Button
             size="sm"
             onClick={() => advance(drafts)}
-            disabled={busy || (trying ? !part && Boolean(problem) : !ready)}
+            disabled={!busy && (trying ? !part && Boolean(problem) : !ready)}
+            pending={busy}
             aria-describedby={trying ? `${uid}-runs` : undefined}
             className="ch-primary"
           >
@@ -1072,7 +1061,7 @@ function QuestionStep({
   const latest = [...d.picked].reverse().find((i) => q.options[i]?.preview);
   const pv = focused !== null && q.options[focused]?.preview ? focused : latest;
   const pvOption = pv === undefined ? undefined : q.options[pv];
-  const first = d.other ? q.options.length : (d.picked.length > 0 ? Math.min(...d.picked) : 0);
+  const first = d.other ? q.options.length : d.picked.length > 0 ? Math.min(...d.picked) : 0;
   const stop = focused ?? first;
   const role = q.multi ? "checkbox" : "radio";
   const kind = free ? "In your words" : q.multi ? "Pick any" : "Pick one";
@@ -1101,15 +1090,7 @@ function QuestionStep({
       data-autofocus={coarse ? undefined : ""}
     />
   ) : (
-    <input
-      ref={otherRef}
-      className="ch-input"
-      value={d.text}
-      onChange={(e) => onChange({ text: e.target.value })}
-      placeholder="Your answer"
-      aria-label="Your answer"
-      enterKeyHint="next"
-    />
+    <input ref={otherRef} className="ch-input" value={d.text} onChange={(e) => onChange({ text: e.target.value })} placeholder="Your answer" aria-label="Your answer" enterKeyHint="next" />
   );
 
   return (

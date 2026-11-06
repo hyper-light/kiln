@@ -85,8 +85,9 @@ hooks.json, so kiln puts one entry, `kiln`, in `~/.gemini/config/hooks.json` as 
 (its answer awaited up to 7 days; past that agy fails the call), `PreInvocation` and `Stop`, each
 `kiln harness-hook --agy <event>` behind a shell guard: the entry stays in the person's hooks.json,
 and once that kiln binary is gone (its version pruned, kiln uninstalled) it answers agy's pass
-itself, as agy fails a call whose hook fails. It hands each to the runner's harness socket (`KILN_HARNESS_SOCK`,
-which agy hands on), with its conversation's tokens so far from its transcript; agy run outside kiln
+itself, as agy fails a call whose hook fails. It hands each to the socket of the runner process
+that started the session (`KILN_RUNNER_SOCK`), else the machine's harness socket (`KILN_HARNESS_SOCK`;
+agy hands both on), with its conversation's tokens so far from its transcript; agy run outside kiln
 gets the answer that changes nothing (`allow`). A subagent's `Stop` ends its task (completed); its
 agent's `manage_subagents` kill, stopped. A subagent's own subagents are named nowhere kiln reads
 (not in the stream, and a hook names only the conversation it's in), so they aren't in the tree;
@@ -289,14 +290,19 @@ server says, and counts every session it has, ended ones included, until it's up
   page's composer, the field and its bar. Under it, More
   options opens to one row each: the machine, the folder, how many, its name, its workspace, where
   its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
-  what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
-  soon as its first snapshot is in (a moment at most), one view transition carrying each part of
-  the composer to its place on the page. That snapshot names its settings as the composer did,
+  what isn't as it starts out). Each opens in place. Start starts it and opens it, waiting for
+  nothing (docs/ci.md W21-R15): the page makes the agent's id and the server starts it under that
+  id (`ids`, below), so its page opens at once, one view transition carrying each part of the
+  composer to its place on the page, listed as starting everywhere agents are. Until its machine
+  has started it the page shows its first message as sent and says it's starting, and its message
+  box takes what's written meanwhile, kept to go once it can; a start that's refused says why
+  there, with Try again (under the same id: nothing starts twice) and Back (its message back in
+  Mission control's box). Its first snapshot names its settings as the composer did,
   before its harness says anything (it may wait for room on its machine, then take seconds to
   start): its permissions, model, effort and speed, by its harness's lists as the machine knows
   them; what the harness says once it runs takes their place, as it does when a switch starts
-  another. Several stay on Mission control: the line under the box
-  says what started, and they come into the list. Files go with the first message, sent once the
+  another. Several stay on Mission control, in the list at once as they start: the line under the
+  box says how they go (Try again if they couldn't), and opens the first. Files go with the first message, sent once the
   agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
   composer in and says where it came from, with Clear for your own defaults.
@@ -322,14 +328,14 @@ server says, and counts every session it has, ended ones included, until it's up
 |---|---|---|
 | GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
-| POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
+| POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
-| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state&window=1&lean=1` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets"); `window=1`, a first load of its newest events alone, `lean=1`, settled tool calls without their bodies (docs/wire.md, "Windows") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | GET / PUT / DELETE | `/api/harness/sessions/:id/keep` | its copies on other runners (each with what the rules say of it) and its own rules for them (docs/reach.md §5.1); DELETE: its repository's and runner's apply |
@@ -340,6 +346,8 @@ server says, and counts every session it has, ended ones included, until it's up
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
 | GET | `/api/harness/sessions/:id/events?before=&limit=` | the session's history from the conversation store, beyond what its timeline holds → `{events}`, oldest first ([conversations.md](conversations.md)) |
+| GET | `/api/harness/sessions/:id/timeline?before=&lean=` | the page of its events just before number `before`, where a window (or the last page) begins → `{events, before?, more}`, oldest first, whole turns where they fit; from the server's copy, then the conversation store ([wire.md](wire.md), "Windows") |
+| GET | `/api/harness/sessions/:id/events/:event?seq=` | one event whole: what a lean one held back, asked for as it's opened ([wire.md](wire.md), "Windows") |
 | GET | `/api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=` | events across every agent's conversation, newest first → `{hits: [{agent, name, machine, event}]}` |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
@@ -561,7 +569,11 @@ agent's approvals, questions or plans.
 
 Mission Control lists every agent kiln runs, in one flat list. The one exception is a card's helper
 (`agents.about`, below): it answers what a person tapped in a conversation, so it's no row, its
-parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. An agent started through kiln's API
+parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. In
+Ship, code no agent made (a person's change, a lone commit, a host's pull request) is asked of a
+helper kiln starts for the person instead (`ci.repos.about`, `POST /api/repos/:repo/about` with the
+`commit` the code is at): it gets the repository at that commit into a folder of its own, reads and
+searches it there and changes nothing, and it's the card's in the same way. An agent started through kiln's API
 is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
 search and bulk actions, with no nesting under the agent that started it. A harness's own
 subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
@@ -634,7 +646,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
-| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
+| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
@@ -811,7 +823,14 @@ kiln shell acts for whoever opened the terminal, audited as `shell:<id>[@<machin
 ### From a kiln shell
 
 Every harness kiln starts has `KILN_HARNESS_SOCK`, so these work in an agent's own commands as
-in a kiln terminal (run by an agent, what they start are its children):
+in a kiln terminal (run by an agent, what they start are its children). It also has
+`KILN_RUNNER_SOCK`, the socket of the runner process that started it, which alone knows it as an
+agent and holds its key. These commands, its hooks and `kiln-git-sign` (its commit signatures and
+its credential for kiln, docs/ci.md W27-R03) ask that one first, then the machine's socket: while
+an upgrade's new build runs beside the old one, the old one serves `KILN_HARNESS_SOCK`, and the
+sessions the new build starts are still known as agents there (what they start are their
+children, their hooks hold them) and sign with their own keys. The runner's own socket answers
+only the processes of its own sessions; anyone else is sent to the machine's.
 
 | Command | |
 |---|---|
@@ -1005,6 +1024,13 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   - A folder whose repository kiln doesn't know: the branch goes to its `origin`.
 - **Each push is a version.** Pushing again (**Push update**, or `agents.change` again)
   makes the commit anew from the agent's files as they are then.
+- **Drafts** (docs/ci.md W26-R18). `draft` opens it a draft wherever it goes: in kiln's own review
+  (the push's `draft` option), as a GitHub pull request (its flag), a GitLab merge request
+  ("Draft: " in its title) or a Bitbucket pull request (its flag). Its new versions stay a draft.
+  `ready` marks it ready for review: with new work, along with the new version; with no edit since
+  its last version, nothing is pushed and the draft is marked ready where it is. On a change that
+  isn't a draft, `ready` says it's ready already. A person marks an agent's draft ready from Ship
+  (**Ready** on its row), as the agent's person or one who can land on the repository.
 - **Where it stands**, in a word above its files: **Pending** (not up for review yet), **Pushed**
   (its branch is pushed, its pull request not opened yet), **Checking**, **Failed** or **Fixing**
   (its checks failed; with **Auto-Fix** on, the agent fixes them), **Changes requested**,
@@ -1017,6 +1043,12 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   only when **Auto-Fix** is on, which it is unless you turn it off when
   opening it), and the land queue taking it out (with the reason). Approvals and landing only
   update where it stands. An agent that has ended is sent nothing.
+- **Agents' feedback** (docs/ci.md W26-R18): another agent's comment on its change reaches it only
+  where the repository lets agents fix code from agents' feedback (the switch in its Review section
+  in Repos, off until turned on), saying why kiln sent it, and at most three times in a thread until
+  a person speaks there. A new version that names the threads it fixes (`threads`) is the agent's
+  fix of them, and each thread says which version fixed it. Ship's **Hand off** sends it every open
+  thread at once, each with its id, place and version.
 - **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)
   go up by themselves, as each step is met: the files the step's agent changed, as one commit on
   the step before's. On a repository kiln hosts that is one diff per step (`D12`), pushed to
@@ -1032,10 +1064,11 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   each step's diff and where it stands.
 
 A `Change` is `{agent, repo?, provider, change?, url, branch, trunk, sha, version, files,
-title, state, review?, checks?, fix_checks, opened_at, updated_at, stack?}`: `provider` is `kiln`,
+title, state, review?, draft?, checks?, fix_checks, opened_at, updated_at, stack?}`: `provider` is `kiln`,
 `github`, `gitlab`, `bitbucket` or `git`; `change` is `CR12`, `D12` or `#34` (none until a pull
-request is opened); `state` is `open`, `landed` or `closed`; `stack` (`{run, step}`) says it is a
-step of a plan run's stack. Mission Control shows each agent's change
+request is opened); `state` is `open`, `landed` or `closed`; `draft` says whether it's a draft,
+read again from kiln's own review or the host's pull request as kiln last read it; `stack`
+(`{run, step}`) says it is a step of a plan run's stack. Mission Control shows each agent's change
 on its row, with **Review** on a finished agent's open one; the Changes tab shows where it
 stands, linked, and pushes new versions. Where kiln has W14's review operations, a comment's
 message tells the agent how to answer in its thread (`ci.diffs.reply` with the thread's id);
@@ -1061,7 +1094,9 @@ environments' too) and on a runner's details (every runner's too), lists them an
   path took longer than the median of its workflow's last green runs on its branch by more than
   `limits.slow_percent`), `unroutable` (a job no runner meets what it asks for, a minute on),
   `degraded` (an app kiln CD deploys to its environment turned degraded), `mention` (`@name` in a
-  comment), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
+  comment), `review` (a push asks it to review a change, `reviewer=agent:<name>`: it reviews
+  read-only, its words signed as itself, and joins the change's turn, a draft's once it's marked
+  ready; docs/ci.md W26-R18), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
   minutes), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine, every half
   hour, found something failing).
 - **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,
@@ -1420,6 +1455,15 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+A message sent while one of its files still uploads waits there too (W21-R15): Send never waits
+for a file, and the box is free at once for what's written next. Its row says each file on its
+way; once they're up it goes, in its turn, carrying each that made it (one that didn't is said in
+a toast, and the message goes without it), and what's queued after it waits behind it. Kept from
+before a reload, its uploads went with that page: it waits for you to send it without each (its ×)
+or remove it. Mission control's Start doesn't wait for files either: the agent starts, and its first
+message waits for them on its page; several agents get theirs once they've started and the files
+are up.
 
 ### A copy left behind
 

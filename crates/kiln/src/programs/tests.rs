@@ -169,10 +169,10 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 }
 
 /// Session `id`'s state changed as its machine would report it (its usage, a pause).
-fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
+async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
     let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
     f(&mut st);
-    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) });
+    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
 
@@ -382,19 +382,20 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
 
         // Above 80% of a weekly window (Sends T3's account): no new goal is put under way, and the
         // track ready for one is held; above 95%, the rule pauses.
-        report(&hub, &sends, |s| s.limits = weekly_at(85.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(85.0)).await?;
         let p = program().await?;
         assert!(matches!(&p.rule, Rule::Hold { .. }) && p.usage.as_ref().is_some_and(|u| (u.pct - 85.0).abs() < 1e-9), "{:?} {:?}", p.rule, p.usage);
         assert_eq!(track(&p, "T4")?.slot, "held");
         let e = run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_3})).await.err();
         assert!(e.as_ref().is_some_and(|(c, m)| *c == http::StatusCode::CONFLICT && m.contains("no new goal starts")), "{e:?}");
-        report(&hub, &sends, |s| s.limits = weekly_at(96.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(96.0)).await?;
         assert!(matches!(&program().await?.rule, Rule::Pause { why } if why.starts_with(PAUSED_FOR_USAGE)));
         // Hex T7 paused at its session limit: T7 says so, with the window and when it starts over.
         let until_ms = crate::util::now_ms() + 3_600_000;
         report(&hub, &hex, |s| {
             s.pause = Some(crate::harness::model::Pause { reason: "limit".into(), window: Some("five_hour".into()), label: Some("Session".into()), until: Some(until_ms), by: "harness".into(), ..Default::default() });
-        })?;
+        })
+        .await?;
         let t7 = track(&program().await?, "T7")?;
         let pause = t7.worker.as_ref().and_then(|w| w.pause.clone()).ok_or_else(|| anyhow::anyhow!("T7's worker isn't paused"))?;
         assert_eq!((t7.slot.as_str(), pause.reason.as_str(), pause.window.as_deref(), pause.until), ("paused", "limit", Some("five_hour"), Some(until_ms)));
@@ -410,7 +411,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         // Under 80% again: a goal of T7's that's met isn't handed over again, and its next is. Said
         // met in the coordinator's stack itself (as an agent's `done` says it), a change of worker
         // isn't refused for it, and the track has none under way.
-        report(&hub, &sends, |s| s.limits = weekly_at(40.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(40.0)).await?;
         let e = run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_2})).await.err();
         assert!(e.as_ref().is_some_and(|(c, m)| *c == http::StatusCode::CONFLICT && m.contains("isn't one still to come")), "{e:?}");
         ok(run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_3})).await)?;
@@ -444,6 +445,31 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         hub.store.call(|c| Ok(c.execute("INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES ('r2', 'm2', 1, 'gone-coordinator', 'goals', 6, 'admin')", [])?)).await?;
         let m2 = get(&hub, "m2").await?.ok_or_else(|| anyhow::anyhow!("no program m2"))?;
         assert_eq!((m2.coordinator.is_none(), m2.coordinator_id.as_deref()), (true, Some("gone-coordinator")));
+        Ok(())
+    })
+}
+
+/// Goal 9, plan 01a1a87b2cec step 3: the programs find their sessions as the registry shares them, none copied:
+/// `list` reads them shared, and `enforce` looks each worker up by its id (`Registry::info_shared`), where it copied
+/// every session's whole info and scanned it for each. A session found so is the one `Registry::info` copies; what
+/// each finds of a program is the other tests'.
+#[test]
+fn g9_s3_programs_find_their_sessions_by_id_none_copied() -> anyhow::Result<()> {
+    use crate::harness::core::Update;
+    use crate::harness::registry::Location;
+    let code = include_str!("mod.rs").lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+    let body = |head: &str| code.split(head).nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default().to_owned();
+    let (listed, enforced) = (body("pub async fn list(hub: &Hub)"), body("async fn enforce_all(hub: &Hub)"));
+    anyhow::ensure!(listed.contains("hub.harness.list_shared()") && !listed.contains("harness.list()"), "list: {listed}");
+    anyhow::ensure!(enforced.contains("hub.harness.info_shared(&agent)") && !enforced.contains("harness.list()") && !enforced.contains(".iter().find("), "enforce: {enforced}");
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let there = Location::Machine("g9s3-box".into());
+        let info = Info { id: "g9s3-w".into(), kind: "claude".into(), name: "Worker".into(), pause_at: Some(80), ..Info::default() };
+        hub.harness.ingest(&hub, &there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
+        let shared = hub.harness.info_shared("g9s3-w").map(|i| Info::clone(&i));
+        anyhow::ensure!(shared.is_some() && shared == hub.harness.info("g9s3-w"), "the same session: {shared:?}");
+        anyhow::ensure!(hub.harness.info_shared("g9s3-gone").is_none(), "none for a session that isn't there");
         Ok(())
     })
 }

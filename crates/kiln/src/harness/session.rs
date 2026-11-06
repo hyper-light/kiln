@@ -542,15 +542,139 @@ impl Info {
     }
 
     /// The parts lists care about changed (activity timestamps aside, the words of what's queued: a
-    /// message edited while it waits changes nothing they show, and what kiln's own were handed).
+    /// message edited while it waits changes nothing they show, and what kiln's own were handed). Field by
+    /// field where each is, neither side copied: both were copied whole for each state a session's owner
+    /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
+    /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
-        strip(self) != strip(o)
+        let Self { id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        !(*id == o.id
+            && *kind == o.kind
+            && *kind_name == o.kind_name
+            && *target == o.target
+            && *name == o.name
+            && *shell == o.shell
+            && *cwd == o.cwd
+            && *tree == o.tree
+            && *created_at == o.created_at
+            && *status == o.status
+            && *title == o.title
+            && *model == o.model
+            && *mode == o.mode
+            && *harness_session == o.harness_session
+            && *approvals == o.approvals
+            && *queued == o.queued
+            && *tasks_running == o.tasks_running
+            && *subagents == o.subagents
+            && *cost_usd == o.cost_usd
+            && *activity == o.activity
+            && *exit == o.exit
+            && *goal == o.goal
+            && *objective == o.objective
+            && *summary == o.summary
+            && *doing == o.doing
+            && *epoch == o.epoch
+            && *todos_done == o.todos_done
+            && *todos_total == o.todos_total
+            && *files_changed == o.files_changed
+            && *lines_added == o.lines_added
+            && *lines_removed == o.lines_removed
+            && *context_pct == o.context_pct
+            && *turn_started == o.turn_started
+            && *limits == o.limits
+            && *account == o.account
+            && *plan == o.plan
+            && *left_behind == o.left_behind
+            && *reach == o.reach
+            && *pause == o.pause
+            && *frozen == o.frozen
+            && *perms == o.perms
+            && *room_wait == o.room_wait
+            && *last_turn == o.last_turn
+            && *keep_off == o.keep_off
+            && *held == o.held
+            && *refused == o.refused
+            && *move_on_limit == o.move_on_limit
+            && *move_plan == o.move_plan
+            && *pause_at == o.pause_at
+            && *max_subagents == o.max_subagents
+            && *parent == o.parent
+            && *plan_run == o.plan_run
+            && *helper == o.helper
+            && *subagent == o.subagent
+            && *variant_of == o.variant_of
+            && *no_bypass == o.no_bypass
+            && *workspace == o.workspace)
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it).
-pub type Sink = async_channel::Sender<(String, Update)>;
+/// Where a session's updates go (the server's registry, or the uplink to it): a queue (`crate::memory::queue`)
+/// bounded in bytes (the server's own sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's,
+/// on their way to its loop, whose uplink bounds them in bytes; goal 5, plan 01a1a59c2aae), or a channel's
+/// sending end (tests'). Either way a sender waits for room: nothing is dropped.
+#[derive(Clone, Debug)]
+pub enum Sink {
+    Bounded(crate::memory::queue::Sender<(String, Update)>),
+    Channel(async_channel::Sender<(String, Update)>),
+    /// A runner's: each update with when it was handed on ([`Taken`]; goal 10, plan 01a1a87b2dae step 5).
+    Stamped(crate::memory::queue::Sender<Taken>),
+}
+
+/// An update of session `session` on a runner's way to the server, with when its session handed it on: when
+/// the runner took it in, which its frame says how long before it was made (`crate::wire::stamp`; goal 10, plan
+/// 01a1a87b2dae step 5). What waits between (a tee's store, the runner's loop) is the runner's.
+#[derive(Debug)]
+pub struct Taken {
+    pub session: String,
+    pub update: Update,
+    pub at: std::time::Instant,
+}
+
+impl Sink {
+    /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
+    /// updates any more. A runner's sink notes when ([`Sink::Stamped`]).
+    pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
+        match self {
+            Sink::Bounded(q) => q.send(update).await,
+            Sink::Channel(c) => c.send(update).await,
+            Sink::Stamped(q) => {
+                let (session, update) = update;
+                q.send(Taken { session, update, at: std::time::Instant::now() }).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
+            }
+        }
+    }
+
+    /// Hands on an update taken in before (a tee passing a runner's updates on): when it was taken in goes with
+    /// it where this sink keeps that ([`Sink::Stamped`]), never noted again here.
+    /// Its error boxed: an update and its stamp are large, and its callers ask only whether it went.
+    pub async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
+        let Taken { session, update, at } = t;
+        let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
+        match self {
+            Sink::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
+            Sink::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
+            Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
+        }
+    }
+}
+
+impl From<crate::memory::queue::Sender<Taken>> for Sink {
+    fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
+        Sink::Stamped(q)
+    }
+}
+
+impl From<crate::memory::queue::Sender<(String, Update)>> for Sink {
+    fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
+        Sink::Bounded(q)
+    }
+}
+
+impl From<async_channel::Sender<(String, Update)>> for Sink {
+    fn from(c: async_channel::Sender<(String, Update)>) -> Self {
+        Sink::Channel(c)
+    }
+}
 
 /// What a session needs from the machine that holds it: where it keeps the files attached to
 /// its messages, how it collects ones that arrived separately (uploaded, or sent in pieces from
@@ -761,7 +885,11 @@ pub struct Session {
     pub created_at: i64,
     pub core: Mutex<Core>,
     info: Mutex<Info>,
-    ctl: async_channel::Sender<Ctl>,
+    /// What it's told (commands, a hook's word, a hand-over's ask), in order: a lock-free queue (goal 5,
+    /// plan 01a1a59c2aae, its top goal), unbounded as the channel it was. An async-channel's wait took
+    /// event-listener's `Mutex`, on each sender's shard (its lane's, a hook's) and on the session's own as
+    /// it waited.
+    ctl: crate::memory::queue::Sender<Ctl>,
     /// The process's pid while it runs.
     pub pid: Mutex<Option<u32>>,
     /// A turn of its is under way: set as one starts, cleared only as one ends (its harness ending
@@ -1022,23 +1150,23 @@ pub fn resolve_cwd(cwd: Option<&str>) -> String {
 }
 
 /// Start a session; its updates go to `sink`, tagged with its id.
-pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
+pub fn start(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
     start_seeded(id, spec, sink, on_change, files, None)
 }
 
 /// Go on with a session this process's previous image handed over ([`Session::hand_over`]): its
 /// timeline and state as they were, and its harness process, still running.
-pub fn start_handed(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_handed(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
     use base64::Engine as _;
     let kind = Kind::get(&h.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", h.kind))?;
     let h = *h;
     let core = Core::thaw(h.core);
     let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
-    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt))
+    begin(id, spec, kind, core, sink.into(), on_change, files, None, Some(adopt))
 }
 
 /// Start a session, seeded with what it had on another machine when it moved here.
-pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -1087,7 +1215,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     }
     core.state.reach.clone_from(&spec.reach);
     named_ahead(&mut core.meta, kind, spec.model.as_deref());
-    begin(id, spec, kind, core, sink, on_change, files, items, None)
+    begin(id, spec, kind, core, sink.into(), on_change, files, items, None)
 }
 
 /// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
@@ -1192,7 +1320,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
-    let (ctl, ctl_rx) = async_channel::unbounded();
+    let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let s = Arc::new(Session {
         id,
         spec: Mutex::new(spec),
@@ -1229,7 +1357,7 @@ const GATHER_MAX: usize = 100_000;
 /// (still in its channel, or carried while its harness was down) join the end of its queue, in the
 /// order they came, to go with it (one for a subagent, its subagent's). Everything else in its
 /// channel is held back, for if it stays.
-fn gather(s: &Session, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>) -> Vec<Ctl> {
+fn gather(s: &Session, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>) -> Vec<Ctl> {
     let mut held = Vec::new();
     let mut waiting = Vec::new();
     {
@@ -1302,7 +1430,7 @@ struct Jobs {
 }
 
 /// Hand out what the core produced: updates to the sink, lines to the process.
-async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Vec<u8>>>) -> Jobs {
+async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Sender<Vec<u8>>>) -> Jobs {
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
@@ -1330,7 +1458,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
 /// closed channel is always ready, so it would be chosen first on every turn of the loop, which
 /// would spin without ever yielding (starving every task on its thread, the one that reaps the
 /// harness among them) and never see the other pipe close or the process exit.
-async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u8>> {
+async fn pipe(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u8>> {
     if open { rx.recv().await.ok() } else { std::future::pending().await }
 }
 
@@ -1652,7 +1780,7 @@ impl Done {
 /// Carry out what the adapter asked for. A branch starts another session; runs, reads and fetches
 /// go off the event loop and come back on `done`. A restart is the caller's: its point (the
 /// harness's own resume point, if any) is returned.
-fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_channel::Sender<Done>) -> Option<Option<String>> {
+fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::memory::queue::Sender<Done>) -> Option<Option<String>> {
     let effects = std::mem::take(&mut s.core.lock().effects);
     let mut restart = None;
     for e in effects {
@@ -2468,7 +2596,8 @@ async fn their_tips(to: &str, there: &str) -> Option<Vec<String>> {
         timeout_ms: Some(30_000),
         ..RunSpec::default()
     };
-    let (tx, rx) = async_channel::unbounded();
+    // What the run says, on a lock-free queue (`reach::node::Says`; goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     reach.run(to, spec, tx).await.ok()?;
     let mut out = Vec::new();
     let until = Instant::now() + Duration::from_secs(40);
@@ -2585,7 +2714,7 @@ enum Arrived {
 /// A session that moved here goes on once its folder has taken its repo's sync log as far as the
 /// machine it left had it: it never starts on files older than the ones it left. Messages sent
 /// meanwhile wait in `carry`; closing it ends the wait.
-async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &async_channel::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
+async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
     let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
     let Some(sync) = crate::sync::runner::global() else {
         note("This machine doesn't sync folders, so its folder here may not have its last changes".into(), Level::Warn);
@@ -3018,13 +3147,15 @@ fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static 
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 #[allow(clippy::too_many_arguments)]
-async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
+async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queue::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;
     s.core.lock().harness = Some(kind.name.to_owned());
-    let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
+    // Its previews' and its effects' results, each back from the task that made it: lock-free queues,
+    // unbounded as the channels they were (goal 5, plan 01a1a59c2aae), each as many as the session asked.
+    let (pv_tx, pv_rx) = crate::memory::queue::unbounded::<(String, Vec<super::model::FileDiff>)>(&crate::memory::owners::CHANNELS);
     let mut changes = futures::stream::FuturesUnordered::new();
-    let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
+    let (fx_tx, fx_rx) = crate::memory::queue::unbounded::<Done>(&crate::memory::owners::CHANNELS);
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
     let handed = adopt.is_some();
@@ -3263,6 +3394,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
                                 }
                             }
+                            // Off the cores of a server beside it, and so is everything it starts
+                            // (docs/priority.md, "Legs and agents keep off the server's cores").
+                            crate::os::onto_work_cpus(&mut p);
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
@@ -4100,8 +4234,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 #[cfg(test)]
 mod tests {
     /// A session that runs nothing, and the receiving end of its channel (what its task would read).
-    fn idle(id: &str) -> (Session, async_channel::Receiver<Ctl>) {
-        let (ctl, rx) = async_channel::unbounded();
+    fn idle(id: &str) -> (Session, crate::memory::queue::Receiver<Ctl>) {
+        let (ctl, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let s = Session {
             id: id.into(),
             spec: Mutex::new(Spec::default()),
@@ -4117,6 +4251,73 @@ mod tests {
             prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: what a session is told goes on a lock-free
+    /// queue. Messages told from every shard at once each reach it once, each sender's in the order sent (a
+    /// move gathers them into its queue so), and once the session is gone, its task sees the end.
+    #[test]
+    fn g5_a_session_takes_what_every_shard_tells_it_once_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (s, rx) = idle("told");
+            let s = Arc::new(s);
+            let (senders, per) = (8usize, 300usize);
+            let mut telling = Vec::new();
+            for t in 0..senders {
+                let s = Arc::clone(&s);
+                telling.push(crate::rt::spawn_spread_joined(async move { (0..per).all(|n| s.command(message(&format!("{t}-{n}"), "x"))) }));
+            }
+            for t in telling {
+                anyhow::ensure!(t.await.unwrap_or(false), "a message was refused");
+            }
+            let held = gather(&s, &rx, &mut Vec::new());
+            anyhow::ensure!(held.is_empty(), "{} held back", held.len());
+            let ids: Vec<String> = s.core.lock().state.queue.iter().map(|q| q.id.clone()).collect();
+            anyhow::ensure!(ids.len() == senders * per, "{} of {}", ids.len(), senders * per);
+            for t in 0..senders {
+                let theirs: Vec<usize> = ids.iter().filter_map(|id| id.strip_prefix(&format!("{t}-"))?.parse().ok()).collect();
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "sender {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            drop(s);
+            anyhow::ensure!(matches!(rx.try_recv(), Err(async_channel::TryRecvError::Closed)), "its end, once the session went");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by
+    /// field without copying either, is what comparing their copies with the activity time, the queue's
+    /// words and what was said cleared said: every field changed alone, and those three changed together.
+    #[test]
+    fn g4_s5_infos_differ_as_their_copies_did() {
+        let was = |a: &Info, b: &Info| {
+            let strip = |i: &Info| Info { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
+            strip(a) != strip(b)
+        };
+        let base = Info { id: "s1".into(), kind: "claude".into(), name: "n".into(), cost_usd: 0.25, ..Info::default() };
+        let changes: Vec<(&str, Info)> = vec![
+            ("id", Info { id: "s2".into(), ..base.clone() }),
+            ("name", Info { name: "m".into(), ..base.clone() }),
+            ("status", Info { status: super::super::model::Status::Running, ..base.clone() }),
+            ("queued", Info { queued: 1, ..base.clone() }),
+            ("cost_usd", Info { cost_usd: 0.5, ..base.clone() }),
+            ("summary", Info { summary: "said".into(), ..base.clone() }),
+            ("doing", Info { doing: Some("reading".into()), ..base.clone() }),
+            ("epoch", Info { epoch: 2, ..base.clone() }),
+            ("context_pct", Info { context_pct: Some(40), ..base.clone() }),
+            ("keep_off", Info { keep_off: true, ..base.clone() }),
+            ("no_bypass", Info { no_bypass: true, ..base.clone() }),
+            ("parent", Info { parent: Some("p".into()), ..base.clone() }),
+            ("last_activity", Info { last_activity: 99, ..base.clone() }),
+            ("queue", Info { queue: vec![super::super::queued::Queued::of("q1", "later")], ..base.clone() }),
+            ("all three", Info { last_activity: 7, queue: vec![super::super::queued::Queued::of("q1", "x")], said: vec![super::super::model::Given::default()], ..base.clone() }),
+        ];
+        assert!(!base.differs(&base.clone()), "the same");
+        for (what, other) in &changes {
+            assert_eq!(base.differs(other), was(&base, other), "{what}");
+            assert_eq!(other.differs(&base), was(other, &base), "{what}, the other way");
+        }
+        assert!(changes.iter().filter(|(w, _)| ["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| !base.differs(o)), "what lists don't show");
+        assert!(changes.iter().filter(|(w, _)| !["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| base.differs(o)), "what they show");
     }
 
     fn message(id: &str, text: &str) -> Command {

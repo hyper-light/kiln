@@ -11,10 +11,11 @@ import { pushApi, pushDevicesRes, pushStateRes, setHears, thisDeviceRes, turnOff
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { sendingProps, useAction } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useRes } from "@/lib/data";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 
 const ID = "device.notifications";
 const TITLE = "Notifications";
@@ -60,35 +61,48 @@ export function NotificationsGroup() {
   const devices = useRes(pushDevicesRes).data;
   const device = useRes(thisDeviceRes).data;
   const mine = device.endpoint ? devices.find((d) => d.endpoint === device.endpoint) : undefined;
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const [tested, setTested] = React.useState<PushTest | null>(null);
   const blocked = blockedWhy(state, device);
-
-  const act = async (what: () => Promise<unknown>) => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      await what();
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
-      invalidate("push");
-    }
+  const failed = (e: unknown) => {
+    setProblem(errorMessage(e));
+    invalidate("push");
   };
-  const toggle = (on: boolean) => act(() => (on ? turnOn(state.public_key ?? "") : turnOff(mine?.id)));
-  const hear = (kind: PushKind, on: boolean) => {
-    const now = new Set(mine?.hears ?? []);
+
+  // This device's notifications are one thing: one change at a time (W21-R15). Off shows at once,
+  // in the list of devices too; on waits for the browser's permission and the server, the box
+  // saying so; and what it hears changes at once, the boxes waiting until that's answered (each
+  // change sends the whole list).
+  const [toggle, toggling] = useAction(async (on: boolean) => {
+    setProblem(null);
+    if (on) {
+      const d = await turnOn(state.public_key ?? "");
+      change<PushDevice[]>(pushDevicesRes.key, (ds) => [...ds.filter((x) => x.id !== d.id), d]);
+      change<ThisDevice>(thisDeviceRes.key, (t) => ({ ...t, permission: "granted", endpoint: d.endpoint }));
+    } else {
+      const id = mine?.id;
+      change<PushDevice[]>(pushDevicesRes.key, (ds) => ds.filter((x) => x.id !== id));
+      change<ThisDevice>(thisDeviceRes.key, (t) => ({ ...t, endpoint: null }));
+      await turnOff(id);
+    }
+    invalidate("push");
+  }, failed);
+  const [hear, hearing] = useAction((kind: PushKind, on: boolean) => {
+    if (!mine) return;
+    const now = new Set(mine.hears);
     if (on) now.add(kind);
     else now.delete(kind);
-    void act(() => setHears(state.kinds.map((k) => k.id).filter((k) => now.has(k))));
-  };
-  const test = () =>
-    act(async () => {
-      setTested(null);
-      setTested(await pushApi.test());
-    });
+    const hears = state.kinds.map((k) => k.id).filter((k) => now.has(k));
+    setProblem(null);
+    change<PushDevice[]>(pushDevicesRes.key, (ds) => ds.map((x) => (x.id === mine.id ? { ...x, hears } : x)));
+    return setHears(hears);
+  }, failed);
+  const [test, testing] = useAction(async () => {
+    setProblem(null);
+    setTested(null);
+    setTested(await pushApi.test());
+    invalidate("push");
+  }, failed);
 
   return (
     <SettingsGroup
@@ -98,7 +112,7 @@ export function NotificationsGroup() {
       words={WORDS}
       actions={
         devices.length > 0 && state.available ? (
-          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void test()}>
+          <Button size="xs" variant="secondary" pending={testing} onClick={test}>
             Send a test
           </Button>
         ) : undefined
@@ -109,11 +123,13 @@ export function NotificationsGroup() {
       ) : (
         <>
           <SettingRow inline htmlFor="st-push" label="Notify this device" help="The browser asks for permission first, on this click.">
-            <input id="st-push" type="checkbox" className="check" checked={Boolean(mine)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} />
+            <span className="inline-flex" {...sendingProps(toggling)}>
+              <input id="st-push" type="checkbox" className="check" checked={Boolean(mine)} disabled={hearing} onChange={(e) => toggle(e.target.checked)} />
+            </span>
           </SettingRow>
           {mine && (
             <SettingRow label="What it hears" help="Each agent can be muted from its ⋯ menu, on every device.">
-              <fieldset className="st-hears" disabled={busy}>
+              <fieldset className="st-hears" disabled={hearing || toggling} {...sendingProps(hearing)}>
                 <legend className="sr-only">What this device hears</legend>
                 {state.kinds.map((k) => (
                   <label key={k.id} title={k.means}>
@@ -169,21 +185,23 @@ function Devices({ devices, state, mine }: { devices: PushDevice[]; state: PushS
 }
 
 function DeviceItem({ d, state, here }: { d: PushDevice; state: PushState; here: boolean }) {
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
-  const remove = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
+  // Its Remove says it's on its way and the row goes with the answer (W21-R15): gone at once, the
+  // next device would slide under a second click and go too.
+  const [remove, removing] = useAction(
+    async () => {
+      setProblem(null);
       if (here) await turnOff(d.id);
       else await pushApi.remove(d.id);
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
+      change<PushDevice[]>(pushDevicesRes.key, (ds) => ds.filter((x) => x.id !== d.id));
+      if (here) change<ThisDevice>(thisDeviceRes.key, (t) => ({ ...t, endpoint: null }));
       invalidate("push");
-    }
-  };
+    },
+    (e) => {
+      setProblem(errorMessage(e));
+      invalidate("push");
+    },
+  );
   const failed = d.last_error && (!d.last_ok_at || (d.last_error_at ?? 0) >= d.last_ok_at);
   return (
     <li>
@@ -194,7 +212,7 @@ function DeviceItem({ d, state, here }: { d: PushDevice; state: PushState; here:
         </span>
         <span className="st-item-meta">Hears {hearsWords(d.hears, state)}</span>
         <span className="st-item-acts">
-          <Button size="xs" variant="ghost-danger" disabled={busy} onClick={() => void remove()} aria-label={`Remove ${d.device}`}>
+          <Button size="xs" variant="ghost-danger" pending={removing} onClick={remove} aria-label={`Remove ${d.device}`}>
             Remove
           </Button>
         </span>

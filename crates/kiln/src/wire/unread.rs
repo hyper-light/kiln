@@ -104,12 +104,16 @@ pub enum Wire {
     /// What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's
     /// operations through reach.
     McpReach,
+    /// The browser protocol (docs/browser-protocol.md): what a page sends up its connection.
+    BpUp,
+    /// The browser protocol: what a page couldn't read of what came down (its `Unread`).
+    BpDown,
 }
 
 /// Every wire kiln reads, in the enum's order: the one inventory. Each is named in [`Wire::name`],
 /// matched without a catch-all arm; docs/wire.md's "What can't be read" has a row for each, and
 /// tests/hostile.rs its cases. A test holds it to the enum: every variant, once, in order.
-pub const WIRES: [Wire; 22] = [
+pub const WIRES: [Wire; 24] = [
     Wire::Runner,
     Wire::Server,
     Wire::RunnerItem,
@@ -132,6 +136,8 @@ pub const WIRES: [Wire; 22] = [
     Wire::TunnelDown,
     Wire::McpHttp,
     Wire::McpReach,
+    Wire::BpUp,
+    Wire::BpDown,
 ];
 
 impl Wire {
@@ -160,6 +166,8 @@ impl Wire {
             Wire::TunnelDown => "tunnel_down",
             Wire::McpHttp => "mcp_http",
             Wire::McpReach => "mcp_reach",
+            Wire::BpUp => "bp_up",
+            Wire::BpDown => "bp_down",
         }
     }
 }
@@ -360,6 +368,7 @@ pub struct Noted {
 }
 
 /// One sender's audit rows for one wire and code, over the minute since the last row.
+#[derive(Clone)]
 struct Window {
     /// When the last row went: none, no row within the minute.
     since: Option<Instant>,
@@ -370,13 +379,16 @@ struct Window {
 }
 
 /// One sender's tells over the current second.
+#[derive(Clone)]
 struct Tells {
     second: Instant,
     told: u32,
     untold: u64,
 }
 
-/// Every wire's refusals, noted.
+/// Every wire's refusals, noted. The hub keeps them as a copy swapped in whole as one is noted (goal 5
+/// of the API runtime program, plan 01a1a59c2aae: `crate::rcu`): a runner's page reads them without a lock.
+#[derive(Clone)]
 pub struct Refusals {
     clock: Arc<dyn Clock>,
     kept: Recent<Page, Kept>,
@@ -595,6 +607,7 @@ fn summary(from: &Sender, wire: Wire, code: Code, n: u64, newest: &Unread) -> Ro
 }
 
 /// A map of at most `most` entries: the least recently touched is let go to make room.
+#[derive(Clone)]
 pub(crate) struct Recent<K, V> {
     most: usize,
     next: u64,

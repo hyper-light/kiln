@@ -193,6 +193,8 @@ const ROWS = 400;
 
 function Waterfall({ t, colors, picked, onPick }: { t: Trace; colors: Map<string, string>; picked: number; onPick: (i: number) => void }) {
   const [all, setAll] = React.useState(false);
+  // The rest drawn while the rows shown stay, the press saying so (W21-R15).
+  const [drawing, start] = React.useTransition();
   const total = Math.max(1, t.duration_ns);
   const rows = all ? t.spans : t.spans.slice(0, ROWS);
   const ticks = [0, 0.25, 0.5, 0.75, 1];
@@ -215,7 +217,7 @@ function Waterfall({ t, colors, picked, onPick }: { t: Trace; colors: Map<string
       </ol>
       {!all && t.spans.length > ROWS && (
         <div className="border-t border-[#1d1f23] px-3 py-2">
-          <Button variant="ghost" size="sm" onClick={() => React.startTransition(() => setAll(true))}>
+          <Button variant="ghost" size="sm" pending={drawing} onClick={() => start(() => setAll(true))}>
             Show all {t.spans.length.toLocaleString()} spans
           </Button>
         </div>

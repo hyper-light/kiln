@@ -21,8 +21,10 @@ const GIT: Duration = Duration::from_secs(10);
 const KEPT: usize = 4096;
 
 /// Distances measured, by repository, checkout and the commit measured against: one checkout's
-/// distance from one commit never changes.
-static MEASURED: LazyLock<parking_lot::Mutex<HashMap<(String, String, String), (u32, u32)>>> = LazyLock::new(Default::default);
+/// distance from one commit never changes. Read without a lock as runners' reports of what they hold
+/// come in (goal 5, plan 01a1a59c2aae step 2), one measured swapped in whole with the rest
+/// (`crate::rcu`).
+static MEASURED: LazyLock<crate::rcu::Rcu<HashMap<(String, String, String), (u32, u32)>>> = LazyLock::new(Default::default);
 
 /// A full commit SHA, as git takes it without reading it for an option: what a runner says it
 /// checked out is nothing else.
@@ -50,18 +52,19 @@ async fn distance(hub: &Hub, repo: &str, base: &str, head: &str) -> Option<(u32,
         return Some((0, 0));
     }
     let at = (repo.to_owned(), base.to_owned(), head.to_owned());
-    if let Some(d) = MEASURED.lock().get(&at) {
+    if let Some(d) = MEASURED.load().get(&at) {
         return Some(*d);
     }
     let range = format!("{base}..{head}");
     let behind = git(hub, repo, &["rev-list", "--count", range.as_str()]).await?.parse::<u32>().ok()?;
     let files = git(hub, repo, &["diff", "--name-only", base, head]).await?.lines().filter(|l| !l.is_empty()).count();
     let d = (behind, u32::try_from(files).unwrap_or(u32::MAX));
-    let mut kept = MEASURED.lock();
-    if kept.len() >= KEPT {
-        kept.clear();
-    }
-    kept.insert(at, d);
+    MEASURED.update(|kept| {
+        if kept.len() >= KEPT {
+            kept.clear();
+        }
+        kept.insert(at.clone(), d);
+    });
     Some(d)
 }
 

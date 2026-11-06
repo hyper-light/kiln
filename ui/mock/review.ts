@@ -489,6 +489,17 @@ interface MockComment {
   created_at: number;
   published: boolean;
   deleted?: boolean;
+  /** Who wrote it, in words, where it's an agent's (W26-R18); a person's is said from `author`. */
+  by?: { kind: "person" | "agent" | "job"; name: string; for?: string };
+  /** Its signature as kiln took it (W27-R04). */
+  signed?: { by: string; who: string; at: number };
+}
+
+/** A comment's author in words, as the server's byline says it (kiln_ci::review::byline). */
+function bylineOf(c: MockComment) {
+  if (c.by) return c.by;
+  if (c.author.startsWith("agent:")) return { kind: "agent" as const, name: `agent ${c.author.slice(6, 14)}` };
+  return { kind: "person" as const, name: c.author.startsWith("user:") ? c.author.slice(5) : c.author };
 }
 interface MockThread {
   id: string;
@@ -504,6 +515,9 @@ interface MockThread {
   kind?: "question" | "nit" | "issue" | "blocking";
   resolved_by?: string | null;
   resolved_at?: number | null;
+  /** The version that fixed it, and whether it waits for a person (W26-R18). */
+  fixed_in?: number | null;
+  waits?: string | null;
   comments: MockComment[];
 }
 
@@ -553,8 +567,19 @@ const threads: MockThread[] = [
         suggestion: null,
         created_at: now() - 3000,
         published: true,
+        signed: { by: "kiln://acme/person/kim", who: "kim", at: now() - 3000 },
       },
       { id: "c2", author: "user:sam", body: "It names the axis already; I'll add the job too.", suggestion: null, created_at: now() - 2400, published: true },
+      {
+        id: "c2a",
+        author: "agent:7c41aa02e9",
+        body: "`legged()` keeps the leg's name, so the job comes with it.",
+        suggestion: null,
+        created_at: now() - 2350,
+        published: true,
+        by: { kind: "agent", name: "Review agent", for: "kim" },
+        signed: { by: "kiln://acme/person/kim/agent/7c41aa02e9/epoch/1", who: "Review agent for kim", at: now() - 2350 },
+      },
       {
         id: "c2b",
         author: "user:kim",
@@ -602,6 +627,7 @@ const threads: MockThread[] = [
     state: "resolved",
     created_by: "user:kim",
     created_at: now() - 90000,
+    fixed_in: 2,
     comments: [{ id: "c5", author: "user:kim", body: "Could this land after D40's outputs? It reads them.", suggestion: null, created_at: now() - 90000, published: true }],
   },
   {
@@ -629,6 +655,8 @@ const threads: MockThread[] = [
 ];
 
 const viewed = new Map<string, Set<string>>();
+/** Diffs asked to land once their gate is clear (docs/ci.md W26-R19). */
+const whenReady = new Set<string>();
 const queue: {
   id: string;
   trunk: string;
@@ -670,6 +698,20 @@ const queue: {
   },
 ];
 
+/** Change requests whose branch Update moved to their replay (W26-R16). */
+const updated = new Set<string>();
+
+/** How fresh a change is on main (W26-R16), as the server says it: D41 a diff kiln replayed (its checks v1's), CR7 a change request whose replay Update can push. */
+function freshOf(d: MockDiff) {
+  const tip = sha("main");
+  const words = `replays clean on main@${tip.slice(0, 6)}`;
+  if (d.kind === "change_request") {
+    const done = updated.has(d.name);
+    return { words, tip, update: { can: !done, why_not: done ? "its branch is at its replay already" : null }, checks_from: d.versions - 1 || null };
+  }
+  return { words, tip, update: { can: false, why_not: "a diff has no branch: its replay is its latest revision" }, checks_from: d.name === "D41" ? 1 : null };
+}
+
 function view(d: MockDiff) {
   const { versions: n, ...rest } = d;
   const vs = Array.from({ length: n }, (_, i) => ({
@@ -685,6 +727,7 @@ function view(d: MockDiff) {
   }));
   return {
     ...rest,
+    fresh: d.state === "landed" || d.state === "abandoned" ? null : freshOf(d),
     versions: vs,
     reviewers:
       d.name === "D41"
@@ -732,11 +775,15 @@ function threadsOf(d: MockDiff) {
       resolved_by: t.resolved_by ?? null,
       resolved_at: t.resolved_at ?? null,
       resolution: null,
+      fixed_in: t.fixed_in ?? null,
+      waits: t.waits ?? null,
       comments: t.comments
         .filter((c) => c.published || c.author === ME)
         .map((c) => ({
           id: c.id,
           author: c.author,
+          by: bylineOf(c),
+          signed: c.signed ?? null,
           body: c.deleted ? "deleted" : c.body,
           suggestion: c.suggestion,
           created_at: c.created_at,
@@ -832,6 +879,8 @@ const hostPullOf = (number: number) => ({
 const hostPulls = [
   hostPullOf(3),
   hostPullOf(4),
+  // Ship's GitHub row (#5): kiln replayed it onto main, and Update pushes it there (W26-R16).
+  { ...hostPullOf(5), host: "github", title: "Faster builds", author: "ada", head: "faster-builds", url: "https://github.com/hyper-light/kiln/pull/5" },
   {
     ...hostPullOf(6),
     title: "ci: a landed change",
@@ -843,6 +892,14 @@ const hostPulls = [
   },
 ];
 
+/** Host pull requests whose Update was pressed, and when: GitHub is updating them for a few seconds (W26-R16). */
+const updatingPulls = new Map<number, number>();
+const UPDATING_MS = 4000;
+const updating = (n: number) => {
+  const at = updatingPulls.get(n);
+  return at != null && Date.now() - at < UPDATING_MS;
+};
+
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
   const [n, what] = rest;
@@ -852,6 +909,17 @@ async function handleHostPulls(req: http.IncomingMessage, res: http.ServerRespon
   const hp = hostPulls.find((x) => x.number === Number(n));
   if (!hp) return (ctx.err(res, 502, `merge request !${n} (404): 404 Not found`), true);
   if (!what && m === "GET") return (ctx.json(res, 200, hp), true);
+  // How fresh it is (W26-R16): GitHub's #5 replays clean on main until Update is pressed.
+  if (what === "fresh" && m === "GET") {
+    if (hp.host !== "github") return (ctx.json(res, 200, null), true);
+    const busy = updating(hp.number);
+    return (ctx.json(res, 200, { words: "replays clean on main@4c1e2a", tip: sha("main"), update: { can: !busy, why_not: busy ? "updating on GitHub" : null }, checks_from: null }), true);
+  }
+  if (what === "update" && m === "POST") {
+    if (updating(hp.number)) return (ctx.err(res, 409, `#${hp.number}'s head moved since its replay: it replays again first`), true);
+    updatingPulls.set(hp.number, Date.now());
+    return (ctx.json(res, 200, { change: `#${hp.number}`, host: hp.host, head: hp.sha, state: "updating" }), true);
+  }
   if (what === "comments" && m === "POST") {
     const body = await ctx.body<{ body: string; path?: string; line?: number; side?: string; reply_to?: string }>(req);
     const c = { id: `n${now()}${Math.random().toString(36).slice(2, 6)}`, author: "ada", body: body.body, at: now() };
@@ -914,6 +982,17 @@ interface MockConflict {
   takes: ("main" | "this" | "both" | "agent" | "edit")[];
   agent: { by: string; take: string | null; lines: string[] | null; at: number | null } | null;
   resolution: { take: string; lines: string[] | null; by: string | null; at: number | null } | null;
+  offered?: {
+    rung: string;
+    by: string;
+    made_by?: { agent?: string; person?: string } | null;
+    state: string;
+    why: string | null;
+    lines: string[] | null;
+    explanation: string | null;
+    tests: string | null;
+    signer: null;
+  } | null;
 }
 
 /**
@@ -929,9 +1008,26 @@ function verdictsOf(d: MockDiff) {
 }
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
-const conflictState = { on: false };
+const conflictState: { on: boolean; ladder: null | "held" | "offered"; tests: "pending" | "passed" | "failed" } = { on: false, ladder: null, tests: "passed" };
+/** Where the queue has a diff when a test says so (`POST /api/mock/review`, `{ queue: { diff, state } }`): it moves on
+ * with no one at the page (docs/ci.md W26-R19). */
+const queueState = new Map<string, string>();
 const takenResolutions = new Map<string, { take: string; lines: string[] | null; by: string; at: number }>();
-function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean } {
+function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean; ladder: { state: string; why: string[] } | null } {
+  // The conflict ladder (W26-R17) when a test turns it on: the agent resolved the text conflict.
+  const offered = conflictState.ladder
+    ? {
+        rung: "agent",
+        by: "agent:port for user:ada",
+        made_by: { agent: "port", person: "user:ada" },
+        state: "resolved",
+        why: null,
+        lines: ["use serde_json::{Value, json}; // keeps main's alias"],
+        explanation: "Main renamed Value to Json; this change only needs both names in scope. Ran cargo test -p kiln-ci plan::matrix: 14 passed.",
+        tests: conflictState.tests,
+        signer: null,
+      }
+    : null;
   const list: MockConflict[] =
     d.name === "D41" && conflictState.on
       ? [
@@ -951,6 +1047,7 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
             takes: ["main", "this", "both", "agent", "edit"],
             agent: { by: "agent:port", take: null, lines: ["use serde_json::{Value, json}; // keeps main's alias"], at: now() - 100 },
             resolution: (takenResolutions.get("cf1") ?? null) as never,
+            offered,
           },
           {
             id: "cf2",
@@ -968,6 +1065,7 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
             takes: ["main", "this"],
             agent: null,
             resolution: (takenResolutions.get("cf2") ?? null) as never,
+            offered: conflictState.ladder ? { rung: "structural", by: "kiln", state: "kept", why: "a binary file", lines: null, explanation: null, tests: null, signer: null } : null,
           },
         ]
       : [];
@@ -992,6 +1090,13 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
     conflicts: list,
     unresolved,
     ready: list.length > 0 && unresolved === 0,
+    ladder:
+      list.length && conflictState.ladder
+        ? {
+            state: conflictState.ladder,
+            why: conflictState.ladder === "offered" ? ["a person confirms it: the repository's automatic resolution is off"] : ["a person takes a side or edits where every rung is spent"],
+          }
+        : null,
   };
 }
 
@@ -1011,6 +1116,11 @@ function textOf(patch: string, path: string): string | null {
 /** A small PNG (32×32, a check of kiln's grey and green), for the image diff. */
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR42mPQ1rPEilac3IMVkaqeYdSCUQuGgAXUMgiX+lELRi0YChaMFhWjFoxaMFofjFowaoG2niUAm6N+TBJRp68AAAAASUVORK5CYII=", "base64");
 
+/** Each repository's agent fixes switch (W26-R18), as `ci/agent_fixes.rs` keeps it: off until set. */
+const agentFixes = new Map<string, { agents_fix: boolean; set_by: string; set_at: number }>();
+const AGENT_FIXES_SAYS =
+  "On: an agent's comment on an agent's change goes to that change's agent, which pushes a fix and answers in the thread. Expect more versions and CI runs. Off: agents' comments wait for a person, who can Hand off.";
+
 export async function handleReview(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
@@ -1024,14 +1134,37 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { id: b, trunk: "main", repo: REPO, diffs: list }), true);
   }
   if (a === "repos" && c === "queue" && m === "GET") return (ctx.json(res, 200, { entries: decodeURIComponent(b ?? "") === REPO ? queue : [] }), true);
+  if (a === "repos" && c === "agent-fixes" && (m === "GET" || m === "PUT")) {
+    const repo = decodeURIComponent(b ?? "");
+    if (m === "PUT") {
+      const body = await ctx.body<{ agents_fix?: unknown }>(req);
+      if (typeof body.agents_fix !== "boolean") return (ctx.err(res, 400, "`agents_fix`: true or false"), true);
+      agentFixes.set(repo, { agents_fix: body.agents_fix, set_by: "admin", set_at: Math.floor(Date.now() / 1000) });
+    }
+    const set = agentFixes.get(repo);
+    return (ctx.json(res, 200, { repo, agents_fix: set?.agents_fix ?? false, set_by: set?.set_by ?? null, set_at: set?.set_at ?? null, says: AGENT_FIXES_SAYS, may_change: true }), true);
+  }
   if (a === "queue" && b && m === "DELETE") {
     const q = queue.find((x) => x.id === b);
     if (q) q.state = "cancelled";
     return (ctx.json(res, 200, { ok: true }), true);
   }
   if (a === "mock" && b === "review" && m === "POST") {
-    const body = await ctx.body<{ conflicts?: boolean; emit?: { type: string; diff?: string } }>(req);
+    const body = await ctx.body<{
+      conflicts?: boolean;
+      queue?: { diff: string; state: string | null };
+      ladder?: null | "held" | "offered";
+      ladder_tests?: "pending" | "passed" | "failed";
+      emit?: { type: string; diff?: string };
+    }>(req);
     if (body.conflicts !== undefined) conflictState.on = body.conflicts;
+    if (body.queue) {
+      if (body.queue.state) queueState.set(body.queue.diff, body.queue.state);
+      else queueState.delete(body.queue.diff);
+      ctx.emit({ type: "diff", diff: body.queue.diff });
+    }
+    if (body.ladder !== undefined) conflictState.ladder = body.ladder;
+    if (body.ladder_tests !== undefined) conflictState.tests = body.ladder_tests;
     if (body.emit) ctx.emit(body.emit);
     return (ctx.json(res, 200, { ok: true }), true);
   }
@@ -1140,6 +1273,12 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { q, hits: hits.slice(0, 50), total: hits.length, truncated: hits.length > 50, index: "ready" }), true);
   }
   if (c === "conflicts" && m === "GET") return (ctx.json(res, 200, conflictsOf(d)), true);
+  if (c === "update" && m === "POST") {
+    if (d.kind !== "change_request" || !d.branch) return (ctx.err(res, 409, `${d.name} is a diff: its replay is its latest revision already, and it has no branch to move`), true);
+    if (updated.has(d.name)) return (ctx.err(res, 409, `${d.branch} is at ${d.name}'s replay already`), true);
+    updated.add(d.name);
+    return (ctx.json(res, 200, { change: d.name, version: d.versions, branch: d.branch, head: sha(`${d.name}v${d.versions}`), by: ME }), true);
+  }
   if (c === "conflicts" && d2 === "commit" && m === "POST") {
     const cf = conflictsOf(d);
     if (cf.unresolved > 0) return (ctx.err(res, 409, "conflicts remain"), true);
@@ -1148,6 +1287,15 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     d.versions += 1;
     ctx.emit({ type: "diff_version", diff: d.name });
     return (ctx.json(res, 200, { diff: d.name, version: d.versions, why: "conflict resolved", commit: sha(`${d.name}v${d.versions}`), by: ME, signer: null, replay: "rp1", conflicts: 0 }), true);
+  }
+  if (c === "conflicts" && d2 === "accept" && m === "POST") {
+    if (conflictState.ladder !== "offered") return (ctx.err(res, 409, `${d.name}: nothing is offered yet`), true);
+    conflictState.on = false;
+    conflictState.ladder = null;
+    takenResolutions.clear();
+    d.versions += 1;
+    ctx.emit({ type: "diff_version", diff: d.name });
+    return (ctx.json(res, 200, { diff: d.name, version: d.versions, why: "conflict resolved", accepted_by: ME, replay: "rp1" }), true);
   }
   if (c === "conflicts" && d2 && e === "resolution") {
     const cf = conflictsOf(d).conflicts.find((x) => x.id === d2);
@@ -1243,11 +1391,29 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
         required: ["ci"],
         strategies: d.stack ? ["stack", "stack-squash"] : ["squash", "merge", "rebase"],
         default: d.stack ? "stack" : "squash",
+        queue: queueState.has(d.name)
+          ? { entry: "q-mock", state: queueState.get(d.name), reason: null }
+          : d.state === "landing"
+            ? { entry: queue.find((q) => q.diffs.includes(d.name))?.id ?? "", state: "queued", reason: null }
+            : null,
+        when_ready: whenReady.has(d.name),
       }),
       true
     );
   }
   if (c === "land" && m === "POST") {
+    // Asked to land once its gate is clear: Review hands it over then (W26-R19).
+    const body = await ctx.body<{ when_ready?: boolean }>(req);
+    if (body.when_ready === false) {
+      const was = whenReady.delete(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: false, was }), true);
+    }
+    if (body.when_ready === true && d.state !== "accepted") {
+      whenReady.add(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: true, entered: false }), true);
+    }
     if (d.state !== "accepted") return (ctx.err(res, 409, `${d.name} needs an accept first`), true);
     d.state = "landing";
     queue.unshift({

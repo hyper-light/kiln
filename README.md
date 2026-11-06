@@ -78,6 +78,16 @@ cluster (one node or more) and OrbStack's share it; any other cluster pulls it f
 machine (asks for sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by
 default, so `runs-on: [baremetal]` jobs work immediately.
 
+On Linux with systemd the server comes first on its machine ([docs/priority.md](docs/priority.md), "What
+kiln install grants"): its `kiln.slice` at CPU and I/O weight 1000, and its shards in Linux's real-time
+class wherever its unit can grant it, written into a new server's config (`[server] realtime`): every
+system install, and a user's whose service manager allows `RLIMIT_RTPRIO` 1. `[server] cores` gives it
+cores of its own, which a system install also makes a cpuset partition nothing else runs on. A user's
+install can't get, without root: a slice ahead of the system's, the real-time class past their service
+manager's limit, `AllowedCPUs=` without the cpuset controller delegated to it, or a partition; `kiln
+install` says, line by line, what it got and what it would take. On macOS and Windows the server keeps
+its own ways (an `Interactive` launchd job; above normal priority), its legs and agents below it.
+
 To add another machine with a join token, such as a benchmark box, copy the command from
 **Agents → Add agent** in the UI:
 

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::directory::{self, RunnerInfo, Want};
 use super::node::Handle;
@@ -167,18 +168,32 @@ pub async fn ranked(handle: &Handle, me: &str, want: Option<&str>) -> anyhow::Re
     let runners: Vec<RunnerInfo> = handle.directory().await?;
     let want = want.map(Want::parse).transpose()?.unwrap_or_default();
     let (ok, passed) = directory::rank(&runners, &want, me);
-    Ok(serde_json::json!({ "me": me, "want": want.describe(), "runners": ok, "passed": passed }))
+    // The name people see of each, passed over too (docs/machines.md: a label, never an id, where there's one).
+    let labels: serde_json::Map<String, serde_json::Value> = runners.iter().filter_map(|r| r.label.clone().map(|l| (r.name.clone(), serde_json::Value::String(l)))).collect();
+    Ok(serde_json::json!({ "me": me, "want": want.describe(), "runners": ok, "passed": passed, "labels": labels }))
 }
 
-/// Copy the tree at `root` to `peer` (as `key`), reporting progress to `ev`. Started over (it then
-/// sends only what still differs) when a link drops in the middle.
-pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &async_channel::Sender<Ev>) -> anyhow::Result<(String, u32, u32, u64)> {
+/// What a sync did: where the copy is over there, what it wrote and removed, and the tree it
+/// handed on, by its digest (docs/ci.md W27-R08).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Synced {
+    pub root: String,
+    pub written: u32,
+    pub removed: u32,
+    pub bytes: u64,
+    pub tree: String,
+}
+
+/// Copy the tree at `root` to `peer` (as `key`), reporting progress to `ev`, handed on by `me`
+/// (`super::custody`). Started over (it then sends only what still differs) when a link drops in
+/// the middle.
+pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Synced> {
     let mut last_err = None;
     for attempt in 0..4 {
         if attempt > 0 {
             crate::rt::sleep(Duration::from_millis(500 * attempt)).await;
         }
-        match sync_once(handle, peer, root, key, ev).await {
+        match sync_once(handle, peer, root, key, me, ev).await {
             Ok(done) => return Ok(done),
             Err(e) if format!("{e:#}").contains("interrupted") => last_err = Some(e),
             Err(e) => return Err(e),
@@ -187,8 +202,30 @@ pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, ev: 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("sync failed")))
 }
 
-async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &async_channel::Sender<Ev>) -> anyhow::Result<(String, u32, u32, u64)> {
-    let (tx, rx) = async_channel::unbounded::<SyncSay>();
+/// The digest of `tree` as this side handed it on: each file sent by the SHA-256 of the bytes it
+/// sent (`sent`), the others by what its kept hashes (`hashes`) say, or hashed now. The hashes are
+/// kept for the next sync.
+fn handed_tree(tree: &sync::Tree, sent: &std::collections::HashMap<String, String>, mut hashes: sync::Hashes) -> anyhow::Result<String> {
+    let digest = super::reuse::digest_of(&tree.entries, |e| match sent.get(&e.path) {
+        Some(sha) => Ok(sha.clone()),
+        None => hashes.hash(&e.path, &tree.source(&e.path)),
+    })?;
+    // What was sent is kept by the stat its file had in the list, if it still has it.
+    for e in tree.entries.iter().filter(|e| e.kind == wire::EntryKind::File) {
+        let source = tree.source(&e.path);
+        if let Some(sha) = sent.get(&e.path)
+            && sync::Stat::of_path(&source).is_some_and(|s| s.size == e.size && s.mtime_ns == e.mtime_ns)
+        {
+            hashes.put(&e.path, &source, sha.clone());
+        }
+    }
+    let listed: std::collections::HashSet<&str> = tree.entries.iter().filter(|e| e.kind == wire::EntryKind::File).map(|e| e.path.as_str()).collect();
+    hashes.save(&listed)?;
+    Ok(digest)
+}
+
+async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Synced> {
+    let (tx, rx) = crate::memory::queue::unbounded::<SyncSay>(&crate::memory::owners::CHANNELS);
     handle.sync(peer, key, tx).await;
     let leave = || handle.leave(peer, None, Some(key.to_owned()));
     let tree = std::sync::Arc::new(
@@ -209,7 +246,7 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
     for (i, c) in chunks.into_iter().enumerate() {
         handle.sync_ask(peer, SyncAsk::Plan { key: key.to_owned(), entries: c, start: i == 0, more: i + 1 < n }).await;
     }
-    let wait = |rx: &async_channel::Receiver<SyncSay>, d: Duration| {
+    let wait = |rx: &crate::memory::queue::Receiver<SyncSay>, d: Duration| {
         let rx = rx.clone();
         async move {
             match crate::rt::timeout(d, rx.recv()).await {
@@ -235,19 +272,32 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
     };
     let mut sent: u64 = 0;
     let mut got: u64 = 0;
+    // What each file sent hashed to, as it went (docs/ci.md W27-R08), and a test build's
+    // `sync_file_changed`: the first piece sent has a byte changed after it was hashed.
+    let mut sent_sha: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut change = crate::runner::chaos::get().is_some_and(|c| c.sync_file_changed);
     for p in paths {
         let mut offset = 0u64;
+        let mut sha = Sha256::new();
         loop {
             let piece = crate::rt::blocking({
                 let src = tree.source(&p);
                 move || sync::read_piece(&src, offset)
             })
             .await;
-            let (data, last) = match piece {
+            let (mut data, last) = match piece {
                 Ok(Ok(x)) => x,
                 // Gone or unreadable since the list was made: sent empty (the next sync fixes it).
                 _ => (Vec::new(), true),
             };
+            sha.update(&data);
+            if change
+                && !p.starts_with(".git/")
+                && let Some(b) = data.first_mut()
+            {
+                *b ^= 0x01;
+                change = false;
+            }
             let len = data.len() as u64;
             handle.sync_ask(peer, SyncAsk::File { key: key.to_owned(), path: p.clone(), offset, data, last }).await;
             sent += len;
@@ -268,14 +318,42 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
                 }
             }
             if last {
+                sent_sha.insert(p.clone(), hex::encode(std::mem::take(&mut sha).finalize()));
                 break;
             }
         }
     }
+    // The tree as handed on, by its digest; its hand-on goes ahead of the commit on a link that
+    // carries it, and to kiln either way (docs/ci.md W27-R08).
+    let hashes_at = handle.hashes_of(key);
+    let digest = {
+        let t = std::sync::Arc::clone(&tree);
+        crate::rt::blocking(move || handed_tree(&t, &sent_sha, sync::Hashes::open(hashes_at))).await??
+    };
+    let version = handle.custody(peer, key).await?.0.unwrap_or(wire::MIN_VERSION);
+    let doer = match me {
+        Some(_) => crate::runner::work::peers::custodian_of(peer).await,
+        None => None,
+    };
+    let carried = version >= wire::CUSTODY;
+    let handed = super::custody::workspace_hand_on(me, doer.as_deref(), key, &digest, (!carried).then_some(peer));
+    if carried {
+        handle.send(peer, Ask::Custody { json: handed.frame.clone() }).await;
+    }
     handle.sync_ask(peer, SyncAsk::Commit { key: key.to_owned() }).await;
     loop {
         match wait(&rx, Duration::from_secs(300)).await {
-            Ok(SyncSay::Done { root, written, removed, bytes, .. }) => return Ok((root, written, removed, bytes)),
+            Ok(SyncSay::Done { root, written, removed, bytes, .. }) => {
+                // Taken over there as handed on, by its receipt, before anything runs in it.
+                if carried {
+                    let receipt = handle.custody(peer, key).await?.1;
+                    if let Err(why) = super::custody::check_receipt(handle.root(), peer, receipt.as_deref(), &handed, &digest) {
+                        super::custody::refused(&format!("{peer}'s copy {key}"), peer, &why);
+                        anyhow::bail!("refused: the copy on {peer} isn't the tree handed on: {why}");
+                    }
+                }
+                return Ok(Synced { root, written, removed, bytes, tree: digest });
+            }
             Ok(SyncSay::Failed { error, .. }) => anyhow::bail!("{error}"),
             Ok(_) => {}
             Err(e) => {
@@ -287,8 +365,10 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
 }
 
 /// Run what `req` says, start to end: pick, sync, run, stream. Control (input, signals) comes on
-/// `ctl`; when it closes before the run ends, the run is stopped (unless `detach`).
-pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
+/// `ctl`; when it closes before the run ends, the run is stopped (unless `detach`). What it says goes on
+/// `ev`. Each a lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae): every piece of a run's
+/// output passes them, a `kiln run`'s and MCP `run`'s.
+pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
     if let Err(e) = run_inner(handle, me, req, &ev, ctl).await {
         let _ = ev.send(Ev::Error(format!("{e:#}"))).await;
     }
@@ -308,7 +388,7 @@ fn spec_of(req: &RunReq) -> RunSpec {
     }
 }
 
-async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
     // An agent session's run on another machine is its act: it goes only once kiln takes it as
     // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
     // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
@@ -339,21 +419,41 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         taken(peer.clone()).await?;
     }
     handle.connect(&peer).await?;
+    // Who hands the workspace and the run on, and receives the output back (docs/ci.md W27-R08):
+    // the agent session asking, when this process holds its key, else this runner process.
+    let signer = super::custody::Signer::asker(req.asker.as_deref());
+    let mut tree = String::new();
     if req.sync {
         let cwd = req.cwd.clone().ok_or_else(|| anyhow::anyhow!("a sync needs the folder to copy"))?;
         let (root, rel) = crate::rt::blocking(move || sync::find_root(Path::new(&cwd))).await?;
         let key = sync::mirror_key(me, &root);
         let t = Instant::now();
-        let (remote_root, sent, removed, bytes) = sync_tree(handle, &peer, &root, &key, ev).await?;
+        let done = sync_tree(handle, &peer, &root, &key, signer.as_ref(), ev).await?;
         let ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let _ = ev.send(Ev::Synced { root: remote_root, sent, removed, bytes, ms }).await;
+        let _ = ev.send(Ev::Synced { root: done.root, sent: done.written, removed: done.removed, bytes: done.bytes, ms }).await;
+        tree = done.tree;
         spec.mirror = Some(key);
         spec.cwd = Some(rel.to_string_lossy().into_owned()).filter(|s| !s.is_empty());
     } else {
         spec.cwd = req.remote_cwd.clone();
     }
-    let (says_tx, says) = async_channel::unbounded::<Say>();
-    let id = handle.run(&peer, spec, says_tx).await?;
+    // The run's hand-on goes ahead of it on a link that carries custody, and to kiln either way.
+    let (id, session) = handle.reserve(&peer).await?;
+    spec.id = id;
+    let version = handle.custody(&peer, "").await?.0.unwrap_or(wire::MIN_VERSION);
+    let carried = version >= wire::CUSTODY;
+    let doer = match &signer {
+        Some(_) => crate::runner::work::peers::custodian_of(&peer).await,
+        None => None,
+    };
+    let run_digest = super::custody::run_digest(&session, &spec, &tree);
+    let handed = super::custody::run_hand_on(signer.as_ref(), doer.as_deref(), &session, &spec, &tree, (!carried).then_some(peer.as_str()));
+    let frames = if carried { vec![handed.frame.clone()] } else { Vec::new() };
+    let (says_tx, says) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
+    let id = handle.run_with(&peer, spec, says_tx, frames).await?;
+    // What came back over the link of its custody: the receipt of the run, the output's hand-on,
+    // and what this side got of the output, by its SHA-256.
+    let (mut receipt, mut out_hand_on, mut out_got) = (None::<String>, None::<String>, String::new());
     // Set once the client went away: by then the run should have ended, else it is killed.
     let mut stop_by: Option<Instant> = None;
     loop {
@@ -379,7 +479,27 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
                 Ok(Say::Output { stream, data, .. }) => {
                     let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await;
                 }
-                Ok(Say::Exit { code, error, lost, .. }) => {
+                Ok(Say::Custody { json }) => {
+                    let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                    if v.get("run").is_some() {
+                        receipt = Some(json);
+                    } else if v.get("output").is_some() {
+                        out_hand_on = Some(json);
+                    } else if let Some(sha) = v.get("sha256").and_then(serde_json::Value::as_str) {
+                        sha.clone_into(&mut out_got);
+                    }
+                }
+                Ok(Say::Exit { code, mut error, lost, .. }) => {
+                    // A run it did, on a link that carries custody: taken as handed on, and its
+                    // output received as it was handed back, or refused, and recorded.
+                    if carried && error.is_none() && handed.hand_on.is_some() {
+                        let checked = super::custody::check_receipt(handle.root(), &peer, receipt.as_deref(), &handed, &run_digest)
+                            .and_then(|()| super::custody::take_output(signer.as_ref(), handle.root(), &peer, id, out_hand_on.as_deref(), &out_got));
+                        if let Err(why) = checked {
+                            super::custody::refused(&format!("run {id}'s output"), &peer, &why);
+                            error = Some(format!("refused: {why}"));
+                        }
+                    }
                     let _ = ev.send(Ev::Exit { code, error, lost }).await;
                     return Ok(());
                 }
@@ -413,9 +533,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
 /// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
-    let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
+    let (tx, rx) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
     let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
     let mut pid = None;
@@ -528,7 +648,8 @@ fn peer_pid(_fd: &std::os::fd::OwnedFd) -> Option<u32> {
 /// One client: its first request decides what the connection is.
 #[cfg(unix)]
 async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>) {
-    let (req_tx, req_rx) = async_channel::unbounded::<Req>();
+    // What its client asks and what it's told, on lock-free queues, unbounded as the channels they were.
+    let (req_tx, req_rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
     // Requests in (the first, then a run's input and signals), until the client closes.
     let reader = std::sync::Arc::clone(&fd);
     crate::rt::spawn(async move {
@@ -552,7 +673,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         }
     });
-    let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
+    let (ev_tx, ev_rx) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
     // Events out, until the request is answered.
     let writer = std::sync::Arc::clone(&fd);
     let out = crate::rt::spawn(async move {

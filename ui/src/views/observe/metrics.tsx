@@ -13,11 +13,11 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SearchField, SelectField, TextField } from "@/components/ui/misc";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { errorMessage, useFieldText } from "@/lib/hooks";
+import { useFieldText } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, drawnColor, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
+import { HeldFields, ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, drawnColor, formatValue, queriesRes, useOpening, useParam, useRange, type Range } from "./parts";
 
 const namesRes: Res<string[]> = { key: "observe/metric-names", fetch: (s) => observeApi.metrics(undefined, s).then((r) => r.metrics), opts: { pollMs: 300_000 } };
 
@@ -249,39 +249,40 @@ function AddForm({ query, onDone }: { query: string; onDone: () => void }) {
   const [target, setTarget] = React.useState(mine[0]?.id ?? NEW);
   const [title, setTitle] = React.useState(query);
   const [name, setName] = React.useState("New dashboard");
-  const [busy, setBusy] = React.useState(false);
+  const form = [target, title, name];
+  const opening = useOpening(form);
   const navigate = useNavigate();
+  const [add, adding] = useAction(async () => {
+    const widget = { id: "", title, kind: "timeseries" as const, queries: [query], search: "", text: "", layout: { x: 0, y: 0, w: 6, h: 4 }, options: null };
+    let id: string;
+    if (target === NEW) {
+      id = (await observeApi.createDashboard({ title: name.trim() || "New dashboard", description: "", template_variables: [], widgets: [widget] })).id;
+    } else {
+      const d = await observeApi.dashboard(target);
+      const below = d.widgets.reduce((m, w) => Math.max(m, w.layout.y + w.layout.h), 0);
+      id = (await observeApi.updateDashboard({ ...d, widgets: [...d.widgets, { ...widget, layout: { ...widget.layout, y: below } }] })).id;
+    }
+    invalidate("observe/dashboard");
+    if (!opening.still(form)) return;
+    await navigate(`/observe/dashboards/${encodeURIComponent(id)}`);
+    onDone();
+  }, "Couldn't add it");
   return (
     <form
+      ref={opening.ref}
       className="space-y-4"
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
-        setBusy(true);
-        try {
-          const widget = { id: "", title, kind: "timeseries" as const, queries: [query], search: "", text: "", layout: { x: 0, y: 0, w: 6, h: 4 }, options: null };
-          let id: string;
-          if (target === NEW) {
-            id = (await observeApi.createDashboard({ title: name.trim() || "New dashboard", description: "", template_variables: [], widgets: [widget] })).id;
-          } else {
-            const d = await observeApi.dashboard(target);
-            const below = d.widgets.reduce((m, w) => Math.max(m, w.layout.y + w.layout.h), 0);
-            id = (await observeApi.updateDashboard({ ...d, widgets: [...d.widgets, { ...widget, layout: { ...widget.layout, y: below } }] })).id;
-          }
-          invalidate("observe/dashboard");
-          onDone();
-          navigate(`/observe/dashboards/${encodeURIComponent(id)}`);
-        } catch (err) {
-          toast({ title: "Couldn't add it", description: errorMessage(err), tone: "failed" });
-        } finally {
-          setBusy(false);
-        }
+        add();
       }}
     >
-      <SelectField label="Dashboard" value={target} onChange={setTarget} options={[...mine.map((d) => ({ value: d.id, label: d.title })), { value: NEW, label: "A new dashboard" }]} />
-      {target === NEW && <TextField label="New dashboard's title" value={name} onChange={(e) => setName(e.target.value)} />}
-      <TextField label="Widget's title" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <HeldFields held={adding}>
+        <SelectField label="Dashboard" value={target} onChange={setTarget} options={[...mine.map((d) => ({ value: d.id, label: d.title })), { value: NEW, label: "A new dashboard" }]} />
+        {target === NEW && <TextField label="New dashboard's title" value={name} onChange={(e) => setName(e.target.value)} />}
+        <TextField label="Widget's title" value={title} onChange={(e) => setTitle(e.target.value)} />
+      </HeldFields>
       <div className="flex justify-end">
-        <Button type="submit" disabled={busy}>
+        <Button type="submit" pending={adding}>
           Add
         </Button>
       </div>

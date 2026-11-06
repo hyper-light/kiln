@@ -169,7 +169,13 @@ async fn lookup(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
     crate::ci::insights::cache_event(hub, claims, &hit.key, "hit", Some(hit.size));
     let id = hit.id;
     hub.store.call(move |c| Ok(c.execute("UPDATE ci_caches SET last_used_at = ?2 WHERE id = ?1", params![id, crate::util::now_unix()])?)).await.map_err(internal)?;
-    Ok(srv::json(StatusCode::OK, &json!({ "id": hit.id, "key": hit.key, "scope": hit.scope, "object": { "digest": obj.digest, "size": obj.size, "chunks": chunks } })))
+    // kiln's hand-on of the cache, by its content's digest, to the runner process running the leg
+    // (docs/ci.md W27-R08), which signs its receipt of it once it has it whole.
+    let hand_on = crate::ci::signed::found_hand_on(hub, &claims.sub, &hit.key, &obj.digest).await.unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.custody", leg = %claims.sub, error = %format!("{e:#}"), "a cache found for a leg went without kiln's hand-on");
+        None
+    });
+    Ok(srv::json(StatusCode::OK, &json!({ "id": hit.id, "key": hit.key, "scope": hit.scope, "object": { "digest": obj.digest, "size": obj.size, "chunks": chunks }, "hand_on": hand_on })))
 }
 
 #[derive(Deserialize)]

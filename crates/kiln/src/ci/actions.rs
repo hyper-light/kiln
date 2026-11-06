@@ -660,8 +660,21 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
             kept.map_err(internal)?
         }
     };
+    // kiln's hand-on of the action to the runner process running the leg, said with it
+    // (docs/ci.md W27-R08): that process checks the tarball against it before using it.
+    let hand_on = super::signed::action_hand_on(hub, &leg.sub, &format!("{owner}/{repo}"), sha, &obj.digest).await.unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.custody", leg = %leg.sub, error = %format!("{e:#}"), "an action served to a leg went without kiln's hand-on");
+        None
+    });
     let rx = super::services::cas::read(hub, &obj, 0, obj.size);
-    Ok(srv::response(StatusCode::OK, "application/gzip", srv::channel_body(rx)))
+    let r = srv::response(StatusCode::OK, "application/gzip", srv::channel_body(rx));
+    Ok(match hand_on {
+        Some(h) => {
+            use base64::Engine as _;
+            srv::with_header(r, http::HeaderName::from_static(super::signed::HAND_ON_HEADER), &base64::engine::general_purpose::STANDARD.encode(h.to_string()))
+        }
+        None => r,
+    })
 }
 
 /// `/api/ci/actions…` (W07-R04, W07-R12), behind the console's auth:

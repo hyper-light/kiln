@@ -13,8 +13,8 @@
 //! the turn ends, once, rather than every settle since. A server that started since finds the news
 //! a server before it left waiting (its id says what it is) and adds to that one.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, LazyLock};
 
 use parking_lot::Mutex;
 
@@ -94,9 +94,52 @@ struct Told {
 }
 
 static TOLD: LazyLock<Mutex<Told>> = LazyLock::new(Default::default);
-/// One sender of news at a time (`tick`, `saw`): what each decides goes to the parent's machine
-/// before the next decides, so two edits of one message can't cross on their way.
-static SENDING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// What goes to each parent, in the order it was decided: `tick` and `saw` queue it here as they
+/// decide it (under `TOLD`'s lock, so nothing decided after it goes before it), and one sender a
+/// parent sends it, each command once the one before it reached the parent's machine or is said
+/// unsent. Two edits of one message can't cross on their way, and nothing that decides waits on a
+/// parent's machine: a command waits up to 30 s for an answer, and one lock held across every
+/// parent's sends in turn once held `agents_wait` and `agents_result` waiting on it.
+static TO_SEND: LazyLock<Mutex<HashMap<String, VecDeque<Command>>>> = LazyLock::new(Default::default);
+
+/// Queues `c` for `parent` (its sender starts when nothing waited for it): true when it starts one,
+/// which [`send_queued`] then is. Taken under `TOLD`'s lock alone (never the other way around).
+fn queue_for(parent: &str, c: Command) -> bool {
+    let mut g = TO_SEND.lock();
+    let q = g.entry(parent.to_owned()).or_default();
+    q.push_back(c);
+    q.len() == 1
+}
+
+/// `parent`'s sender: what's queued for it, in order, each once the one before it went (or is said
+/// unsent, its words to go at the next look). It ends once nothing's left.
+async fn send_queued(hub: Arc<crate::hub::Hub>, parent: String) {
+    loop {
+        // The front stays queued while it goes: what's queued meanwhile waits behind it.
+        let Some(c) = TO_SEND.lock().get(&parent).and_then(|q| q.front().cloned()) else { return };
+        // It went: queued, or taken by its session's inbox (CP-T3.2).
+        if !hub.harness.command(&hub, &parent, c.clone()).await.went() {
+            tracing::info!(agent = %parent, "news of the agents it started didn't reach it");
+            TOLD.lock().unsent(&parent, &c);
+        }
+        let mut g = TO_SEND.lock();
+        let done = g.get_mut(&parent).is_none_or(|q| {
+            q.pop_front();
+            q.is_empty()
+        });
+        if done {
+            g.remove(&parent);
+            return;
+        }
+    }
+}
+
+/// Starts a sender for each of `parents` (those [`queue_for`] said have none).
+fn start_senders(hub: &Arc<crate::hub::Hub>, parents: Vec<String>) {
+    for parent in parents {
+        drop(crate::rt::spawn(send_queued(Arc::clone(hub), parent)));
+    }
+}
 
 fn key_of(info: &Info) -> String {
     format!("{}:{}", stand(info), info.last_turn.as_ref().map_or(0, |t| t.at))
@@ -105,20 +148,20 @@ fn key_of(info: &Info) -> String {
 /// Its parent saw `child` as it stands now (`agents_wait`, `agents_result`): it isn't told of it
 /// again, and its line comes out of the parent's news waiting in its queue (the message with it,
 /// once no line is left).
-pub async fn saw(hub: &crate::hub::Hub, child: &Info) {
-    let _one = SENDING.lock().await;
-    let taken = TOLD.lock().saw(child);
-    if let Some((parent, c)) = taken {
-        let _ = hub.harness.command(hub, &parent, c).await;
-    }
+pub async fn saw(hub: &Arc<crate::hub::Hub>, child: &Info) {
+    // Decided and queued as one: an edit decided later can't go before it.
+    let start = {
+        let mut told = TOLD.lock();
+        told.saw(child).and_then(|(parent, c)| queue_for(&parent, c).then_some(parent))
+    };
+    start_senders(hub, start.into_iter().collect());
 }
 
 /// Tells parents of their children that settled: in the one message of news waiting for each
 /// (`Told::plan`), queued after the parent's turn. `driven`: the agents a goal stack drives now;
 /// `quiet`: those paused for usage (docs/programs.md), which get no new message, since one would
 /// start their turn: their news waits, and goes once they go on.
-pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[String], quiet: &[String]) {
-    let _one = SENDING.lock().await;
+pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[String], quiet: &[String]) {
     // News a server before this one queued, waiting still: this one adds to it.
     for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS))) {
         if TOLD.lock().news.contains_key(&p.id) {
@@ -128,19 +171,36 @@ pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[Strin
             TOLD.lock().found(&p.id, q.id, q.text, now);
         }
     }
-    let plan = TOLD.lock().plan(all, now, driven, quiet);
-    for (parent, c) in plan {
-        if matches!(c, Command::Send { .. })
-            && let Some(p) = all.iter().find(|i| i.id == parent)
-        {
-            super::wait::sent(&p.id, p.last_turn.as_ref().map(|t| t.at));
+    // Decided and queued as one (under `TOLD`'s lock): what `saw` decides after goes after it. Each
+    // parent's goes by its sender, in order; none of it waited for here.
+    let start: Vec<String> = {
+        let mut told = TOLD.lock();
+        let plan = told.plan(all, now, driven, quiet);
+        // Each parent found by its id, not by a scan of every agent for each (goal 9, plan 01a1a87b2cec step 3).
+        let by_id = by_id(all);
+        let mut start = Vec::new();
+        for (parent, c) in plan {
+            if matches!(c, Command::Send { .. })
+                && let Some(p) = by_id.get(parent.as_str())
+            {
+                super::wait::sent(&p.id, p.last_turn.as_ref().map(|t| t.at));
+            }
+            if queue_for(&parent, c) {
+                start.push(parent);
+            }
         }
-        // It went: queued, or taken by its session's inbox (CP-T3.2).
-        if !hub.harness.command(hub, &parent, c.clone()).await.went() {
-            tracing::info!(agent = %parent, "news of the agents it started didn't reach it");
-            TOLD.lock().unsent(&parent, &c);
-        }
+        start
+    };
+    start_senders(hub, start);
+}
+
+/// Each of `all` by its id, the first of any id given twice (as a scan for it finds).
+fn by_id(all: &[Info]) -> HashMap<&str, &Info> {
+    let mut by = HashMap::with_capacity(all.len());
+    for i in all {
+        by.entry(i.id.as_str()).or_insert(i);
     }
+    by
 }
 
 impl Told {
@@ -185,6 +245,8 @@ impl Told {
     /// drives (`driven`: they settle between goals; their parent is told once no stack drives them).
     fn due(&mut self, all: &[Info], now: i64, driven: &[String]) -> HashMap<String, Vec<(String, String)>> {
         let mut by_parent: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        // Those a goal stack drives, looked up in a set, not scanned for each child (goal 9, plan 01a1a87b2cec step 3).
+        let driven: HashSet<&str> = driven.iter().map(String::as_str).collect();
         for c in all {
             let Some(parent) = c.parent.as_deref() else { continue };
             // A card's helper (`super::about`) answers a person: its parent isn't told of it.
@@ -201,7 +263,7 @@ impl Told {
                 e.worked = true;
                 continue;
             }
-            if driven.contains(&c.id) {
+            if driven.contains(c.id.as_str()) {
                 continue;
             }
             if !settled(st) || !e.worked || e.told == key || now - e.since < SETTLE_MS {
@@ -224,11 +286,15 @@ impl Told {
     /// waiting here until it goes on.
     fn plan(&mut self, all: &[Info], now: i64, driven: &[String], quiet: &[String]) -> Vec<(String, Command)> {
         let mut due = self.due(all, now, driven);
-        self.news.retain(|p, _| all.iter().any(|i| i.id == *p));
+        // Each agent found by its id, and those paused for usage looked up in a set: each was a scan of every agent, or
+        // of each of those, for each parent, under `TOLD`'s lock, on the goal driver's shard (goal 9, plan 01a1a87b2cec
+        // step 3).
+        let (by_id, quiet) = (by_id(all), quiet.iter().map(String::as_str).collect::<HashSet<&str>>());
+        self.news.retain(|p, _| by_id.contains_key(p.as_str()));
         let parents: BTreeSet<String> = self.news.keys().chain(due.keys()).cloned().collect();
         let mut out = Vec::new();
         for parent in parents {
-            let Some(info) = all.iter().find(|i| i.id == parent) else { continue };
+            let Some(info) = by_id.get(parent.as_str()).copied() else { continue };
             let n = self.news.entry(parent.clone()).or_default();
             let mut unheard = false;
             if let Some(m) = n.msg.as_mut() {
@@ -284,7 +350,7 @@ impl Told {
                     m.text = text;
                     n.said.clone_from(&n.lines);
                 }
-                None if quiet.contains(&parent) => {}
+                None if quiet.contains(parent.as_str()) => {}
                 None => {
                     let id = super::queued::made(NEWS);
                     out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
@@ -448,6 +514,54 @@ mod tests {
         assert!(told(&mut t, std::slice::from_ref(&between), t0 + 50_000, &driven).is_empty(), "between goals");
         let news = told(&mut t, std::slice::from_ref(&between), t0 + 60_000, &[]);
         assert!(news.first().is_some_and(|(p, t)| p == "p1" && t.contains("Goal 1 met.")), "once left to itself: {news:?}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a fleet's news planned by its agents' ids and sets, not scans of every agent for
+    /// each parent and child: each parent of children that settled gets one message with each one's line, but those a
+    /// goal stack drives and a parent paused for usage, as before, whatever ids `driven` and `quiet` give twice; and
+    /// `plan`, `due` and `tick` (and `elsewhere::tick`) scan none of their lists for each one.
+    #[test]
+    fn g9_s3_a_fleets_news_is_planned_by_id_not_by_scans() -> anyhow::Result<()> {
+        let mut t = Told::default();
+        let (parents, per) = (40, 25);
+        let ps: Vec<Info> = (0..parents).map(|p| coordinator(&format!("g9p{p}"))).collect();
+        let mut kids: Vec<Info> = Vec::new();
+        for p in 0..parents {
+            let ids: Vec<String> = (0..per).map(|k| format!("g9p{p}k{k}")).collect();
+            kids.extend(helpers(&format!("g9p{p}"), &ids.iter().map(String::as_str).collect::<Vec<_>>()));
+        }
+        let all = |kids: &[Info]| ps.iter().cloned().chain(kids.iter().cloned()).collect::<Vec<Info>>();
+        // Each parent's first child driven by a goal stack, the last parent paused for usage; ids given twice.
+        let driven: Vec<String> = (0..parents).flat_map(|p| [format!("g9p{p}k0"), format!("g9p{p}k0")]).collect();
+        let quiet: Vec<String> = vec![format!("g9p{}", parents - 1), format!("g9p{}", parents - 1)];
+        let now = 5_000_000;
+        anyhow::ensure!(t.plan(&all(&kids), now, &driven, &quiet).is_empty(), "seen at work first");
+        for k in &mut kids {
+            k.status = Status::Idle;
+            k.summary = format!("{} done.", k.id);
+            k.last_turn = Some(TurnEnd { at: now + 1, how: "done".into(), ..TurnEnd::default() });
+        }
+        anyhow::ensure!(t.plan(&all(&kids), now + 1, &driven, &quiet).is_empty(), "not before they've stood settled a while");
+        let sent = t.plan(&all(&kids), now + 1 + SETTLE_MS, &driven, &quiet);
+        anyhow::ensure!(sent.len() == parents - 1, "one message for each parent but the one paused: {}", sent.len());
+        for (parent, c) in &sent {
+            let Command::Send { text, .. } = c else { anyhow::bail!("{parent}: {c:?}") };
+            anyhow::ensure!(!text.contains(&format!("{parent}k0 done.")), "{parent}: its driven child isn't told of");
+            anyhow::ensure!(text.contains(&format!("{parent}k1 done.")), "{parent}: its others are: {text}");
+        }
+        anyhow::ensure!(!sent.iter().any(|(p, _)| *p == format!("g9p{}", parents - 1)), "the parent paused for usage gets no message");
+        let code = |src: &str| src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let (told_code, elsewhere_code) = (code(include_str!("told.rs")), code(include_str!("elsewhere.rs")));
+        // A method's body ends at its own indent's closing brace, a free function's at the first column's.
+        let body = |code: &str, head: &str, end: &str| code.split(head).nth(1).and_then(|rest| rest.split(end).next()).unwrap_or_default().to_owned();
+        for (code, head, end) in [(&told_code, "fn plan(&mut self", "\n    }\n"), (&told_code, "fn due(&mut self", "\n    }\n"), (&told_code, "pub async fn tick(", "\n}\n"), (&elsewhere_code, "pub fn tick(", "\n}\n")] {
+            let b = body(code, head, end);
+            anyhow::ensure!(!b.is_empty(), "{head} not found");
+            for scan in ["all.iter().find(", "all.iter().any(", "driven.contains(&", "quiet.contains(&"] {
+                anyhow::ensure!(!b.contains(scan), "{head} scans: {scan}");
+            }
+        }
         Ok(())
     }
 

@@ -173,10 +173,77 @@ async fn opener_of(hub: &Hub, id: &str) -> String {
     hub.store.kv_get(crate::mcp::opener_key(id)).await.ok().flatten().filter(|o| o == "owner" || o.starts_with("user:")).unwrap_or_else(|| "owner".to_owned())
 }
 
+/// A frame [`run`] follows, read: an agent session's info, a session gone, a machine's battery low.
+enum Followed {
+    Harness(Box<crate::harness::session::Info>),
+    Closed(String),
+    BatteryLow { machine: String, text: String },
+}
+
+/// A frame whose kind isn't at its front ([`crate::wire::events::kind_of`]): its kind, read whole.
+#[derive(serde::Deserialize)]
+struct Tagged {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// What [`run`] reads of an agent session's `harness` frame: its info.
+#[derive(serde::Deserialize)]
+struct Heard {
+    info: crate::harness::session::Info,
+}
+
+/// What [`run`] reads of a `harness_closed` frame: the session's id.
+#[derive(serde::Deserialize)]
+struct Closed {
+    id: String,
+}
+
+/// What [`run`] reads of a `machine.battery_low` frame: the machine, and what to say.
+#[derive(serde::Deserialize)]
+struct Low {
+    #[serde(default)]
+    machine: String,
+    #[serde(default)]
+    text: String,
+}
+
+/// What [`run`] follows of the frame `text`, if anything. Its kind is read off its front, what it doesn't
+/// follow passed over unparsed, and the rest parsed once, straight into what it reads of them (goal 4, plan
+/// 01a1a59c2a9c step 5: every change of an agent session's info is a `harness` frame, which was parsed whole,
+/// its info copied out of that and read again).
+fn followed(text: &str) -> Option<Followed> {
+    let kind = match crate::wire::events::kind_of(text) {
+        Some(k) => std::borrow::Cow::Borrowed(k),
+        None => std::borrow::Cow::Owned(serde_json::from_str::<Tagged>(text).ok()?.kind),
+    };
+    match &*kind {
+        "harness" => serde_json::from_str::<Heard>(text).ok().map(|h| Followed::Harness(Box::new(h.info))),
+        "harness_closed" => serde_json::from_str::<Closed>(text).ok().map(|c| Followed::Closed(c.id)),
+        "machine.battery_low" => serde_json::from_str::<Low>(text).ok().map(|l| Followed::BatteryLow { machine: l.machine, text: l.text }),
+        _ => None,
+    }
+}
+
+/// [`followed`], a `harness` frame parsed on the compute pool: its whole info, every subagent, approval and limit of
+/// it, parsed on the listener's shard for every change of every session, held it 1 to 6 ms in g9p7 (goal 9, plan
+/// 01a1a87b2cec step 3). Other frames' kinds are read off their fronts here, and those few parsed here too. Each is
+/// waited for, so the listener still takes them in the order they came.
+async fn follow(text: Arc<str>) -> Option<Followed> {
+    if crate::wire::events::kind_of(&text) == Some("harness") {
+        return crate::rt::compute(move || followed(&text)).await.ok().flatten();
+    }
+    followed(&text)
+}
+
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
 /// server runs, and says what each calls for.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let mut rx = hub.events.subscribe();
+    use futures::FutureExt as _;
+    // The machines' batteries on the hub's events, agent sessions' on their owners' lanes
+    // (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds
+    // as many as the hub's ring held in all: what an agent's notes are made of it misses none it can help.
+    let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
     if hub.cfg.push.enabled {
         let _ = Service::keys(&hub).await;
     }
@@ -191,7 +258,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "what was said of agents couldn't be read: some notes may be said again"),
     }
     loop {
-        let text = match rx.recv().await {
+        let got = futures::select_biased! {
+            m = rx.recv().fuse() => m,
+            m = sessions.recv().fuse() => m,
+        };
+        let text = match got {
             Ok(t) => t,
             Err(async_broadcast::RecvError::Overflowed(n)) => {
                 tracing::warn!(missed = n, "notifications fell behind the agents' changes");
@@ -199,14 +270,10 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
             }
             Err(async_broadcast::RecvError::Closed) => return Ok(()),
         };
-        if !(text.contains("\"type\":\"harness") || text.contains("\"type\":\"machine.battery_low\"")) {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<Value>(&text) else { continue };
-        match ev.get("type").and_then(Value::as_str) {
-            Some("harness") => {
-                let Some(info) = ev.get("info").cloned().and_then(|i| serde_json::from_value::<crate::harness::session::Info>(i).ok()) else { continue };
-                let due = hub.push.watch.lock().heard(info);
+        let Some(what) = follow(text).await else { continue };
+        match what {
+            Followed::Harness(info) => {
+                let due = hub.push.watch.lock().heard(*info);
                 if let Some(d) = due {
                     let h = Arc::clone(&hub);
                     crate::rt::spawn(async move {
@@ -218,20 +285,16 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                     });
                 }
             }
-            Some("harness_closed") => {
-                let Some(id) = ev.get("id").and_then(Value::as_str).map(str::to_owned) else { continue };
+            Followed::Closed(id) => {
                 hub.push.watch.lock().closed(&id);
                 let h = Arc::clone(&hub);
                 crate::rt::spawn(async move {
                     let _ = h.store.call(move |c| store::forget(c, &id)).await;
                 });
             }
-            Some("machine.battery_low") => {
-                let machine = ev.get("machine").and_then(Value::as_str).unwrap_or_default().to_owned();
-                let text = ev.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+            Followed::BatteryLow { machine, text } => {
                 crate::rt::spawn(battery(Arc::clone(&hub), machine, text));
             }
-            _ => {}
         }
     }
 }
@@ -419,6 +482,54 @@ mod tests {
         }
         assert!(said > 0, "approvals were said");
         Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: what the notifications' listener reads of each frame it follows,
+    /// parsed once, is what the frame says, quotes and escapes and all; the kinds it doesn't follow it passes
+    /// over; and a frame whose kind isn't at its front is read whole.
+    #[test]
+    fn g4_s5_push_reads_each_frame_it_follows_once() -> anyhow::Result<()> {
+        use crate::harness::model::{Status, ToolKind};
+        use crate::harness::session::{ApprovalBrief, Info};
+        use crate::wire::events::{ServerEvent, harness_frame};
+        let odd = "a \"quoted\" word, a \\ backslash and \"type\":\"harness_closed\"";
+        let approvals = vec![ApprovalBrief { id: "a1".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: odd.into(), at: 7, agent: None }];
+        let info = Info { id: "s\"1".into(), kind: "claude".into(), status: Status::Waiting, summary: odd.into(), approvals, ..Info::default() };
+        for text in [harness_frame(&serde_json::to_vec(&info)?).to_string(), ServerEvent::Harness { info: Box::new(info.clone()) }.text()] {
+            let Some(Followed::Harness(read)) = followed(&text) else { anyhow::bail!("not read: {text}") };
+            anyhow::ensure!(*read == info, "{text}");
+        }
+        let Some(Followed::Closed(id)) = followed(&ServerEvent::HarnessClosed { id: odd.into() }.text()) else { anyhow::bail!("a session gone, not read") };
+        anyhow::ensure!(id == odd);
+        let battery = crate::os::battery::Battery { percent: 9, ac: false, charging: false, minutes: Some(4) };
+        let Some(Followed::BatteryLow { machine, text }) = followed(&ServerEvent::MachineBatteryLow { machine: "mac".into(), battery, text: odd.into() }.text()) else { anyhow::bail!("a battery low, not read") };
+        anyhow::ensure!(machine == "mac" && text == odd);
+        for text in [ServerEvent::Terminals.text(), ServerEvent::Comment(Box::default()).text(), ServerEvent::AiSessions { machine: "harness".into() }.text()] {
+            anyhow::ensure!(followed(&text).is_none(), "{text}");
+        }
+        let Some(Followed::Closed(id)) = followed(r#"{ "type": "harness_closed", "id": "s1" }"#) else { anyhow::bail!("a frame read whole, not read") };
+        anyhow::ensure!(id == "s1");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the listener reads a `harness` frame's info on the compute pool and the
+    /// rest where it is, each as `followed` reads it: the same info, either way it's sent; a session gone; and
+    /// nothing of a frame it passes over.
+    #[test]
+    fn g9_s3_a_harness_frame_is_read_off_the_shard_as_followed_reads_it() -> anyhow::Result<()> {
+        use crate::harness::session::Info;
+        use crate::wire::events::{ServerEvent, harness_frame};
+        crate::rt::block_on(async {
+            let info = Info { id: "s1".into(), kind: "claude".into(), summary: "a \"quoted\" word".into(), ..Info::default() };
+            for text in [harness_frame(&serde_json::to_vec(&info)?), Arc::from(ServerEvent::Harness { info: Box::new(info.clone()) }.text())] {
+                let Some(Followed::Harness(read)) = follow(Arc::clone(&text)).await else { anyhow::bail!("not read: {text}") };
+                anyhow::ensure!(*read == info, "{text}");
+            }
+            let Some(Followed::Closed(id)) = follow(Arc::from(ServerEvent::HarnessClosed { id: "s1".into() }.text())).await else { anyhow::bail!("a session gone, not read") };
+            anyhow::ensure!(id == "s1");
+            anyhow::ensure!(follow(Arc::from(ServerEvent::Terminals.text())).await.is_none(), "a frame it passes over");
+            Ok(())
+        })
     }
 
     #[test]

@@ -679,6 +679,55 @@ fn the_budget_refuses_what_it_cannot_hold_and_follows_what_is_held() {
     assert_eq!(r.machine().now.entries.len(), 2);
 }
 
+/// A full budget refuses what brings the core something it keeps, and takes what lets it drain
+/// (kiln's CP-T2.2): a proposal and an append with an entry are refused for room, and an
+/// acknowledgement, which carries no entry, snapshot or context and is answered with nothing, is
+/// taken, so a full leader still hears what commits and hands over.
+#[test]
+fn a_full_budget_takes_what_lets_it_drain_and_refuses_what_it_would_keep() {
+    let mut r = sole(2, Bytes::new(1 << 20), |_| {});
+    // Past the room and all the replica holds, which a trim could give back.
+    let room = r.budget_mut().room().unwrap() as u64;
+    let past = room + r.charged() + 1;
+    r.budget_mut().charge(past);
+    assert_eq!(r.budget_mut().room(), Some(0));
+    assert!(matches!(
+        r.propose(Vec::new(), vec![0; 16]),
+        Err(ReplicaError::Budget(_))
+    ));
+    let term = r.term();
+    let append = Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: term + 1,
+        entries: vec![Entry {
+            term: term + 1,
+            index: 99,
+            data: vec![1; 16],
+            ..Entry::default()
+        }],
+        ..Message::default()
+    };
+    assert!(matches!(r.step(append), Err(ReplicaError::Budget(_))));
+    for msg_type in [
+        MessageType::MsgAppendResponse,
+        MessageType::MsgHeartbeatResponse,
+    ] {
+        let outcome = r.step(Message {
+            msg_type,
+            from: 2,
+            to: 1,
+            term,
+            ..Message::default()
+        });
+        assert!(
+            !matches!(outcome, Err(ReplicaError::Budget(_))),
+            "{msg_type:?} refused for room: {outcome:?}"
+        );
+    }
+}
+
 /// A state machine that unwinds on an entry.
 struct Boom(Kv);
 impl StateMachine for Boom {

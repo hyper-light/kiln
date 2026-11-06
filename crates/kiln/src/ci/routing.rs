@@ -12,17 +12,18 @@
 //! neither can reach past its scope; they can only add to what comes before them.
 
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use kiln_ci::sched::routing::{self, Constraint, LegRoute, Rule};
-use parking_lot::Mutex;
 use rusqlite::params;
 use serde_json::{Value, json};
 
 use super::Fail;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 /// Every rule, by where it comes from.
@@ -149,15 +150,18 @@ pub fn parse_file(text: &[u8]) -> Result<Vec<Rule>, String> {
 /// How long a repository's file is read again at most.
 const FRESH: Duration = Duration::from_secs(20);
 
-static CACHE: Mutex<Option<HashMap<String, (Instant, Vec<Rule>)>>> = Mutex::new(None);
+/// Each repository's rules as last read, by its id: read without a lock as legs are routed (goal 5,
+/// plan 01a1a59c2aae step 2), one read again swapped in whole with the others' pointers
+/// (`crate::rcu`).
+static CACHE: LazyLock<Rcu<HashMap<String, (Instant, Arc<Vec<Rule>>)>>> = LazyLock::new(Rcu::default);
 
 /// A repository's rules, from `.kiln/routing.yaml` on its mirror's default branch (limited to
 /// it); none when there is no file or it can't be read (which is logged).
 pub async fn repo_rules(hub: &Hub, repo: &Repo) -> Vec<Rule> {
-    if let Some((at, r)) = CACHE.lock().get_or_insert_with(HashMap::new).get(&repo.id)
+    if let Some((at, r)) = CACHE.load().get(&repo.id)
         && at.elapsed() < FRESH
     {
-        return r.clone();
+        return Vec::clone(r);
     }
     let mut rules = Vec::new();
     if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/routing.yaml", ".kiln/routing.yml"]).await {
@@ -166,7 +170,10 @@ pub async fn repo_rules(hub: &Hub, repo: &Repo) -> Vec<Rule> {
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's routing rules can't be read; it has none"),
         }
     }
-    CACHE.lock().get_or_insert_with(HashMap::new).insert(repo.id.clone(), (Instant::now(), rules.clone()));
+    let (now, kept) = (Instant::now(), Arc::new(rules.clone()));
+    CACHE.update(|m| {
+        m.insert(repo.id.clone(), (now, Arc::clone(&kept)));
+    });
     rules
 }
 

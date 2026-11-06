@@ -16,14 +16,18 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::hub::{Hub, TermOut};
+use crate::rcu::Rcu;
 use crate::proto::{LANE_TERM, ServerMsg};
-use crate::rt::{Broadcast, Shutdown};
+use crate::rt::Shutdown;
 
-/// Raw output kept per session for replay on attach.
+/// Raw output kept per session for replay on attach; and the most of its live frames' bytes kept for
+/// a slow viewer (goal 11, plan 01a1a87b2e56 step 3: `crate::memory::owners::TERMINAL_FEEDS`): one that
+/// falls further behind is repainted from this backlog, which costs it less than catching up would.
 const BACKLOG_BYTES: usize = 256 * 1024;
 /// An exited session stays listed this long, so attached devices can show how it ended.
 const EXITED_LINGER: Duration = Duration::from_secs(60);
-/// Live frames buffered per attached client before a slow one starts losing the oldest.
+/// Live frames buffered per attached client before a slow one starts losing the oldest (or past
+/// [`BACKLOG_BYTES`] of them).
 const FANOUT: usize = 1024;
 
 /// What attached clients receive.
@@ -34,6 +38,18 @@ pub enum Frame {
     /// The session's size changed. Every view draws at exactly this size, so a program's
     /// cursor-addressed redraws line up on every device.
     Size { cols: u16, rows: u16 },
+}
+
+/// A frame's place and its bytes, as its session's ring keeps it for its viewers (goal 11, plan
+/// 01a1a87b2e56 step 3).
+impl crate::memory::queue::Weigh for Frame {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Frame::Data(d) => d.len(),
+            Frame::Exit { error, .. } => error.as_ref().map_or(0, String::capacity),
+            Frame::Size { .. } => 0,
+        })
+    }
 }
 
 /// What attached clients send.
@@ -79,6 +95,7 @@ impl vt100::Callbacks for Titles {
     }
 }
 
+#[derive(Clone)]
 struct Exit {
     code: Option<i32>,
     error: Option<String>,
@@ -90,9 +107,6 @@ struct State {
     /// The backlog has dropped its oldest bytes at least once (replay then starts at a line).
     trimmed: bool,
     screen: vt100::Parser<Titles>,
-    attached: usize,
-    last_activity: Instant,
-    exit: Option<Exit>,
     cols: u16,
     rows: u16,
 }
@@ -102,10 +116,43 @@ pub struct Session {
     pub target: String,
     pub command: Option<String>,
     pub created_at: i64,
+    /// Its screen and backlog: taken by its relay for its output (in order) and by its viewers as they
+    /// attach or resize it, so a replay and the live output meet with no byte twice or lost. What its list
+    /// shows of it, a keystroke and a detach take no lock (goal 5, plan 01a1a59c2aae step 2): the
+    /// figures below are atomics and copies kept beside it.
     state: Mutex<State>,
-    out: Broadcast<Frame>,
-    input: async_channel::Sender<Input>,
+    /// How many are attached.
+    attached: std::sync::atomic::AtomicUsize,
+    /// When it was made; and when it last had output, input or a viewer come or go, in nanoseconds after
+    /// that (monotonic, as the `Instant` it kept before).
+    born: Instant,
+    active: std::sync::atomic::AtomicU64,
+    /// Its size, columns in the high half ([`pack`]).
+    size: std::sync::atomic::AtomicU32,
+    /// The window title its program set, a copy swapped in as it sets another.
+    title: Rcu<String>,
+    /// How it ended, once it has (set under its lock, in order with its output).
+    exit: Rcu<Option<Exit>>,
+    /// It has had output.
+    said: std::sync::atomic::AtomicBool,
+    out: crate::memory::ring::Ring<Frame>,
+    input: crate::memory::queue::Sender<Input>,
     close: Shutdown,
+    /// Output the hub had no room for in this session's relay ([`forward`]): gaps its relay repairs
+    /// from the machine's replay of the session. Only rises.
+    gaps: std::sync::atomic::AtomicU64,
+    /// Rung as `gaps` rises, so a relay with nothing else to do repairs at once.
+    gap: crate::rt::Notify,
+}
+
+/// A size as one word: columns in the high half, rows in the low ([`Session::size`]).
+fn pack(cols: u16, rows: u16) -> u32 {
+    (u32::from(cols) << u16::BITS) | u32::from(rows)
+}
+
+/// [`pack`]'s columns and rows.
+fn unpack(size: u32) -> (u16, u16) {
+    (u16::try_from(size >> u16::BITS).unwrap_or(u16::MAX), u16::try_from(size & u32::from(u16::MAX)).unwrap_or(u16::MAX))
 }
 
 /// What a client gets when it attaches.
@@ -113,7 +160,7 @@ pub struct Attachment {
     /// Bytes that bring a fresh terminal to the session's current state.
     pub replay: Vec<u8>,
     /// Everything after the replay.
-    pub live: async_broadcast::Receiver<Frame>,
+    pub live: crate::memory::ring::Subscription<Frame>,
     /// Set when the session had already ended.
     pub ended: Option<(Option<i32>, Option<String>)>,
 }
@@ -124,12 +171,12 @@ impl Session {
         Self::with_id(id, target, command, cols, rows).0
     }
 
-    fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
+    fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, crate::memory::queue::Receiver<Input>) {
         Self::with_id(crate::util::new_id(), target, command, cols, rows)
     }
 
-    fn with_id(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
-        let (input, input_rx) = async_channel::bounded(1024);
+    fn with_id(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, crate::memory::queue::Receiver<Input>) {
+        let (input, input_rx) = inputs();
         let cols = cols.clamp(2, 1000);
         let rows = rows.clamp(2, 1000);
         let session = Arc::new(Self {
@@ -141,45 +188,80 @@ impl Session {
                 backlog: VecDeque::with_capacity(16 * 1024),
                 trimmed: false,
                 screen: vt100::Parser::new_with_callbacks(rows, cols, 0, Titles::default()),
-                attached: 0,
-                last_activity: Instant::now(),
-                exit: None,
                 cols,
                 rows,
             }),
-            out: Broadcast::new(FANOUT),
+            attached: std::sync::atomic::AtomicUsize::new(0),
+            born: Instant::now(),
+            active: std::sync::atomic::AtomicU64::new(0),
+            size: std::sync::atomic::AtomicU32::new(pack(cols, rows)),
+            title: Rcu::default(),
+            exit: Rcu::default(),
+            said: std::sync::atomic::AtomicBool::new(false),
+            out: crate::memory::ring::Ring::new(&crate::memory::owners::TERMINAL_FEEDS, FANOUT, BACKLOG_BYTES),
             input,
             close: Shutdown::new(),
+            gaps: std::sync::atomic::AtomicU64::new(0),
+            gap: crate::rt::Notify::new(),
         });
         (session, input_rx)
     }
 
+    /// Output its relay had no room for (goal 3, plan 01a1a59c2a8e step 5): a gap the relay repairs.
+    fn lost(&self) {
+        self.gaps.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.gap.notify();
+    }
+
+    /// The gaps in its output so far ([`forward`]).
+    pub fn gaps(&self) -> u64 {
+        self.gaps.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// As the list shows it, read without its lock.
     pub fn info(&self) -> Info {
-        let st = self.state.lock();
+        let (cols, rows) = unpack(self.size.load(std::sync::atomic::Ordering::Acquire));
+        let exit = self.ended();
         Info {
             id: self.id.clone(),
             target: self.target.clone(),
             command: self.command.clone(),
-            title: st.screen.callbacks().title.clone(),
+            title: String::clone(&self.title.load()),
             name: None,
             created_at: self.created_at,
-            attached: st.attached,
-            cols: st.cols,
-            rows: st.rows,
-            idle_seconds: st.last_activity.elapsed().as_secs(),
-            exited: st.exit.is_some(),
-            exit_code: st.exit.as_ref().and_then(|e| e.code),
-            error: st.exit.as_ref().and_then(|e| e.error.clone()),
+            attached: self.attached.load(std::sync::atomic::Ordering::Acquire),
+            cols,
+            rows,
+            idle_seconds: self.idle().as_secs(),
+            exited: exit.is_some(),
+            exit_code: exit.as_ref().and_then(|e| e.code),
+            error: exit.and_then(|e| e.error),
         }
+    }
+
+    /// How it ended, if it has.
+    fn ended(&self) -> Option<Exit> {
+        Option::<Exit>::clone(&self.exit.load())
+    }
+
+    /// How long since it last had output, input or a viewer come or go.
+    fn idle(&self) -> Duration {
+        self.born.elapsed().saturating_sub(Duration::from_nanos(self.active.load(std::sync::atomic::Ordering::Acquire)))
+    }
+
+    /// It's active now.
+    fn touch(&self) {
+        let now = u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.active.fetch_max(now, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Nothing has been output yet.
     pub fn is_empty(&self) -> bool {
-        self.state.lock().backlog.is_empty()
+        !self.said.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn is_exited(&self) -> bool {
-        self.state.lock().exit.is_some()
+        self.exit.load().is_some()
     }
 
     /// Program output: into the emulator and the backlog, then to every attached client, all under
@@ -193,25 +275,34 @@ impl Session {
             st.backlog.drain(..excess);
             st.trimmed = true;
         }
-        st.last_activity = Instant::now();
+        // A title the program set anew goes into the list's copy.
+        let title = &st.screen.callbacks().title;
+        if *title != **self.title.load() {
+            self.title.set(title.clone());
+        }
+        self.touch();
+        if !data.is_empty() {
+            self.said.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.out.send(Frame::Data(Bytes::copy_from_slice(data)));
     }
 
     fn finish(&self, code: Option<i32>, error: Option<String>) {
-        let mut st = self.state.lock();
-        if st.exit.is_some() {
+        // Under its lock: in order with its output, and with a viewer's attach (its end, or its Exit).
+        let _st = self.state.lock();
+        if self.exit.load().is_some() {
             return;
         }
-        st.exit = Some(Exit { code, error: error.clone(), at: Instant::now() });
-        st.last_activity = Instant::now();
+        self.exit.set(Some(Exit { code, error: error.clone(), at: Instant::now() }));
+        self.touch();
         self.out.send(Frame::Exit { code, error });
     }
 
     /// Join the session: the replay that reproduces its current state, then live output.
     pub fn attach(&self) -> Attachment {
-        let mut st = self.state.lock();
-        st.attached = st.attached.saturating_add(1);
-        st.last_activity = Instant::now();
+        let st = self.state.lock();
+        self.attached.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.touch();
         let screen = st.screen.screen();
         let mut replay = b"\x1b[0m".to_vec();
         if screen.alternate_screen() {
@@ -231,37 +322,42 @@ impl Session {
             replay.extend(bytes);
             replay.extend(screen.input_mode_formatted());
         }
-        let ended = st.exit.as_ref().map(|e| (e.code, e.error.clone()));
+        let ended = self.ended().map(|e| (e.code, e.error));
         let live = self.out.subscribe();
         Attachment { replay, live, ended }
     }
 
     pub fn detach(&self) {
-        let mut st = self.state.lock();
-        st.attached = st.attached.saturating_sub(1);
-        st.last_activity = Instant::now();
+        // One fewer, never below none.
+        let mut n = self.attached.load(std::sync::atomic::Ordering::Acquire);
+        while n > 0 {
+            match self.attached.compare_exchange_weak(n, n.saturating_sub(1), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+        self.touch();
     }
 
     /// Keystrokes or a resize from an attached client. A resize that changes the size is announced
-    /// to every attached client (in order with the output, under the same lock).
+    /// to every attached client (in order with the output, under the same lock); keystrokes take none.
     pub fn send(&self, input: Input) {
-        let input = {
-            let mut st = self.state.lock();
-            st.last_activity = Instant::now();
-            match input {
-                Input::Resize { cols, rows } => {
-                    let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
-                    if (cols, rows) == (st.cols, st.rows) {
-                        return;
-                    }
-                    st.cols = cols;
-                    st.rows = rows;
-                    st.screen.screen_mut().set_size(rows, cols);
-                    self.out.send(Frame::Size { cols, rows });
-                    Input::Resize { cols, rows }
+        self.touch();
+        let input = match input {
+            Input::Resize { cols, rows } => {
+                let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
+                let mut st = self.state.lock();
+                if (cols, rows) == (st.cols, st.rows) {
+                    return;
                 }
-                data => data,
+                st.cols = cols;
+                st.rows = rows;
+                st.screen.screen_mut().set_size(rows, cols);
+                self.size.store(pack(cols, rows), std::sync::atomic::Ordering::Release);
+                self.out.send(Frame::Size { cols, rows });
+                Input::Resize { cols, rows }
             }
+            data => data,
         };
         if self.input.try_send(input).is_err() {
             tracing::debug!(session = %self.id, "terminal input dropped (session busy or ended)");
@@ -276,11 +372,13 @@ impl Session {
 
 /// Every terminal session on this server.
 pub struct Sessions {
-    map: Mutex<HashMap<String, Arc<Session>>>,
+    /// Read on every terminal's frame and list without a lock, a copy swapped in whole as one opens
+    /// or goes (goal 5, plan 01a1a59c2aae step 2: `crate::rcu`), as are the two below.
+    map: Rcu<HashMap<String, Arc<Session>>>,
     /// Names people gave sessions, by session id: kept in `names_file`, so they outlive this
     /// server's restarts and a machine's reconnects (its sessions come back under their ids).
-    names: Mutex<HashMap<String, String>>,
-    names_file: Mutex<Option<std::path::PathBuf>>,
+    names: Rcu<HashMap<String, String>>,
+    names_file: Rcu<Option<std::path::PathBuf>>,
 }
 
 /// The longest name a terminal session takes.
@@ -294,18 +392,18 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), names_file: Mutex::new(None) }
+        Self { map: Rcu::default(), names: Rcu::default(), names_file: Rcu::default() }
     }
 
     /// Keeps sessions' names in `file` (read now, written as they change).
     pub fn keep_names_in(&self, file: std::path::PathBuf) {
         if let Ok(raw) = std::fs::read(&file) {
             match serde_json::from_slice::<HashMap<String, String>>(&raw) {
-                Ok(names) => *self.names.lock() = names,
+                Ok(names) => self.names.set(names),
                 Err(e) => tracing::warn!(file = %file.display(), error = %e, "unreadable terminal names; starting without them"),
             }
         }
-        *self.names_file.lock() = Some(file);
+        self.names_file.set(Some(file));
     }
 
     /// Names a session ("" takes its name away, back to its window title). False when there is
@@ -315,36 +413,34 @@ impl Sessions {
             return false;
         }
         let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-        {
-            let mut names = self.names.lock();
+        self.names.update(|names| {
             if name.is_empty() {
                 names.remove(id);
             } else {
-                names.insert(id.to_owned(), name);
+                names.insert(id.to_owned(), name.clone());
             }
-        }
+        });
         self.save_names();
         true
     }
 
+    /// Kept off the calling thread (goal 3, plan 01a1a59c2a8e step 5: `crate::keep`): written here, a
+    /// rename waited on the disk, on the shard of the request that made it.
     fn save_names(&self) {
-        let Some(file) = self.names_file.lock().clone() else { return };
-        let Ok(json) = serde_json::to_vec_pretty(&*self.names.lock()) else { return };
-        let tmp = file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
-            tracing::warn!(file = %file.display(), error = %e, "could not keep terminal names");
-        }
+        let Some(file) = Option::<std::path::PathBuf>::clone(&self.names_file.load()) else { return };
+        let Ok(json) = serde_json::to_vec_pretty(&*self.names.get()) else { return };
+        crate::keep::later(file, json);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.map.lock().get(id).cloned()
+        self.map.load().get(id).cloned()
     }
 
     pub fn list(&self) -> Vec<Info> {
-        let names = self.names.lock().clone();
+        let names = self.names.load();
         let mut v: Vec<Info> = self
             .map
-            .lock()
+            .load()
             .values()
             .map(|s| {
                 let mut i = s.info();
@@ -363,39 +459,36 @@ impl Sessions {
 
     /// Sessions whose shell is still running.
     pub fn live(&self) -> usize {
-        self.map.lock().values().filter(|s| !s.is_exited()).count()
+        self.map.load().values().filter(|s| !s.is_exited()).count()
     }
 
     pub fn remove(&self, id: &str) {
-        self.map.lock().remove(id);
+        self.map.update(|m| m.remove(id));
         self.forget_name(id);
     }
 
     fn forget_name(&self, id: &str) {
-        let had = self.names.lock().remove(id).is_some();
+        let had = self.names.load().contains_key(id) && self.names.update(|m| m.remove(id)).is_some();
         if had {
             self.save_names();
         }
     }
 
-    fn insert(&self, s: &Arc<Session>) {
-        self.map.lock().insert(s.id.clone(), Arc::clone(s));
+    pub(crate) fn insert(&self, s: &Arc<Session>) {
+        self.map.update(|m| m.insert(s.id.clone(), Arc::clone(s)));
     }
 
     /// Close sessions nobody has attached to for `idle`, and forget exited ones nobody watches.
     /// Returns whether anything changed.
     pub fn sweep(&self, idle: Duration) -> bool {
         let mut changed = false;
-        let sessions: Vec<Arc<Session>> = self.map.lock().values().cloned().collect();
+        let sessions: Vec<Arc<Session>> = self.map.load().values().cloned().collect();
         for s in sessions {
-            let (attached, idle_for, exited_for) = {
-                let st = s.state.lock();
-                (st.attached, st.last_activity.elapsed(), st.exit.as_ref().map(|e| e.at.elapsed()))
-            };
+            let (attached, idle_for, exited_for) = (s.attached.load(std::sync::atomic::Ordering::Acquire), s.idle(), s.ended().map(|e| e.at.elapsed()));
             match exited_for {
                 Some(gone) if attached == 0 || gone > EXITED_LINGER * 10 => {
                     if gone > EXITED_LINGER || attached == 0 {
-                        self.map.lock().remove(&s.id);
+                        self.map.update(|m| m.remove(&s.id));
                         self.forget_name(&s.id);
                         changed = true;
                     }
@@ -513,13 +606,85 @@ pub fn adopt_agent(hub: &Arc<Hub>, machine: &str, info: &crate::proto::TermInfo)
     run_agent(hub, machine.to_owned(), session, input, Some(ServerMsg::TermAttach { session: info.session.clone() }));
 }
 
-fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_channel::Receiver<Input>, first: Option<ServerMsg>) {
+/// A terminal's keystrokes and resizes waiting for its relay, at the most: as many as the channel it was held
+/// ([`inputs`]). Past it one is dropped, said in the log, as it always was: a person typing that far ahead of
+/// their machine is told nothing else either way.
+const INPUTS: usize = 1024;
+
+/// A remote terminal's output waiting for its relay, at the most: as many as the channel it was held
+/// ([`relay`]). Past it output is a gap its relay repairs ([`forward`]).
+const RELAY: usize = 4096;
+
+/// A terminal's input queue: [`INPUTS`] of them whatever each carries (a keystroke or a paste), lock-free
+/// (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's
+/// `Mutex`, its viewers' sockets sending on their shards and its relay waiting on its own).
+fn inputs() -> (crate::memory::queue::Sender<Input>, crate::memory::queue::Receiver<Input>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, INPUTS)
+}
+
+/// A remote terminal's relay queue: [`RELAY`] outputs whatever each carries, lock-free, the hub's loop sending
+/// (without waiting, [`forward`]) and the relay taking (goal 4, plan 01a1a59c2a9c step 5, as [`inputs`]).
+fn relay() -> (crate::memory::queue::Sender<TermOut>, crate::memory::queue::Receiver<TermOut>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, RELAY)
+}
+
+/// Hands `out` to a terminal's relay without waiting (goal 3, plan 01a1a59c2a8e step 5): the hub's
+/// loop takes every runner's messages, and it waited for room in one terminal's relay, every runner's
+/// messages behind it. Output with no room is a gap in `session`, which its relay repairs from the
+/// machine's replay of the session (the relay asks for it, and sets aside what comes until it does);
+/// an end (`Exit`, `Gone`) with no room goes on its own once there is, after what came before it, as
+/// its relay's sender is taken from the hub's map with it and nothing follows it.
+pub fn forward(tx: &crate::memory::queue::Sender<TermOut>, session: Option<&Session>, out: TermOut) {
+    match tx.try_send(out) {
+        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
+        Err(async_channel::TrySendError::Full(TermOut::Data(_) | TermOut::Replay(_))) => {
+            if let Some(s) = session {
+                s.lost();
+            }
+        }
+        Err(async_channel::TrySendError::Full(end)) => {
+            let tx = tx.clone();
+            crate::rt::spawn(async move {
+                let _ = tx.send(end).await;
+            });
+        }
+    }
+}
+
+/// A relay's repair of the gaps the hub left in its output ([`forward`]): the gaps it has asked a
+/// replay for, and whether one is on its way (the output before it set aside: the replay holds it).
+#[derive(Debug, Default)]
+struct Repair {
+    seen: u64,
+    waiting: bool,
+}
+
+impl Repair {
+    /// The session's gaps now: whether one is new, to ask the machine for its replay.
+    fn gap(&mut self, gaps: u64) -> bool {
+        if gaps <= self.seen {
+            return false;
+        }
+        self.seen = gaps;
+        self.waiting = true;
+        true
+    }
+}
+
+/// Asks `machine` for `session`'s replay: its picture of the session now, live output after it.
+async fn ask_replay(hub: &Arc<Hub>, machine: &str, session: &str) {
+    if !hub.send_to_agent(machine, LANE_TERM, &ServerMsg::TermAttach { session: session.to_owned() }).await {
+        tracing::debug!(%machine, session, "a terminal's replay couldn't be asked for: its machine is away");
+    }
+}
+
+fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: crate::memory::queue::Receiver<Input>, first: Option<ServerMsg>) {
     hub.terminals.insert(&s);
     let h = Arc::clone(hub);
     crate::rt::spawn(async move {
         let key = format!("{machine}/{}", s.id);
-        let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
-        h.terms.lock().insert(key.clone(), out_tx);
+        let (out_tx, out_rx) = relay();
+        h.terms.update(|m| m.insert(key.clone(), out_tx.clone()));
         // A terminal to open is a live command (`crate::wire::commands`): refused at once while its
         // machine is away, and answered once it opened it. Unanswered, it goes on: its output says.
         let failed = match first {
@@ -533,7 +698,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
             None => None,
         };
         if let Some(why) = failed {
-            h.terms.lock().remove(&key);
+            h.terms.update(|m| m.remove(&key));
             s.finish(None, Some(why));
             h.emit_terminals();
             return;
@@ -542,24 +707,51 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
         enum Ev {
             Out(Option<TermOut>),
             In(Option<Input>),
+            Gap,
             Close,
         }
+        let mut repair = Repair::default();
+        // Its turns on its shard (goal 3, plan 01a1a59c2a8e step 3): a burst of output, up to a full queue of
+        // it through the terminal's emulator, held the shard for as long as it all took; it gives the shard
+        // up by its step quantum now.
+        let mut turns = crate::rt::Turns::new();
         loop {
+            turns.after().await;
             let ev = futures::select_biased! {
                 () = s.close.cancelled().fuse() => Ev::Close,
+                () = s.gap.notified().fuse() => Ev::Gap,
                 o = out_rx.recv().fuse() => Ev::Out(o.ok()),
                 i = input.recv().fuse() => Ev::In(i.ok()),
             };
             match ev {
-                Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
-                Ev::Out(Some(TermOut::Replay(d))) => {
-                    // An adopted session starts from the agent's picture of it. One that has a
-                    // picture already (its machine's output stream started over, docs/wire.md) is
-                    // repainted from the new one.
-                    if !s.is_empty() {
-                        s.output(b"\x1bc");
+                Ev::Gap => {
+                    if repair.gap(s.gaps()) {
+                        ask_replay(&h, &machine, &s.id).await;
                     }
-                    s.output(&d);
+                }
+                Ev::Out(Some(TermOut::Data(d))) => {
+                    if repair.gap(s.gaps()) {
+                        ask_replay(&h, &machine, &s.id).await;
+                    }
+                    if !repair.waiting {
+                        s.output(&d);
+                    }
+                }
+                Ev::Out(Some(TermOut::Replay(d))) => {
+                    if repair.gap(s.gaps()) {
+                        // A gap since this replay came: it's older than what was lost, so another
+                        // is asked for.
+                        ask_replay(&h, &machine, &s.id).await;
+                    } else {
+                        repair.waiting = false;
+                        // An adopted session starts from the agent's picture of it. One that has a
+                        // picture already (its machine's output stream started over, docs/wire.md,
+                        // or a gap the hub left) is repainted from the new one.
+                        if !s.is_empty() {
+                            s.output(b"\x1bc");
+                        }
+                        s.output(&d);
+                    }
                 }
                 Ev::Out(Some(TermOut::Exit { code, error })) => {
                     s.finish(code, error);
@@ -589,7 +781,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                 }
             }
         }
-        h.terms.lock().remove(&key);
+        h.terms.update(|m| m.remove(&key));
         crate::metrics::global().terminal_sessions.add(-1);
         h.emit_terminals();
     });
@@ -610,6 +802,14 @@ mod tests {
         assert!(!reg.rename("nope", "x"), "no such session");
         assert!(reg.rename("t1", "  builds\u{7}  "));
         assert_eq!(reg.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
+        // Kept off the calling thread, soon after (goal 3, plan 01a1a59c2a8e step 5): read once it's written.
+        let settled = |done: &dyn Fn(&str) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !std::fs::read_to_string(&file).is_ok_and(|t| done(&t)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        settled(&|t| t.contains("builds"));
         // Another server reads it back when the session comes back under its id.
         let again = Sessions::new();
         again.keep_names_in(file.clone());
@@ -619,10 +819,12 @@ mod tests {
         assert!(again.rename("t1", ""));
         assert_eq!(again.list().first().and_then(|i| i.name.clone()), None);
         assert!(again.rename("t1", "deploys"));
+        settled(&|t| t.contains("deploys"));
         again.remove("t1");
+        settled(&|t| !t.contains("deploys"));
         let third = Sessions::new();
         third.keep_names_in(file);
-        assert!(third.names.lock().is_empty());
+        assert!(third.names.load().is_empty());
         Ok(())
     }
 
@@ -650,6 +852,18 @@ mod tests {
         assert_eq!(s.info().attached, 1);
     }
 
+    /// Goal 3, plan 01a1a59c2a8e step 5: a relay asks for one replay a gap, sets the output aside until
+    /// it comes, and asks again for a gap after the one it asked for.
+    #[test]
+    fn g3_s5_a_relay_asks_for_a_replay_once_a_gap() {
+        let mut r = Repair::default();
+        assert!(!r.gap(0) && !r.waiting, "no gap, nothing asked");
+        assert!(r.gap(1) && r.waiting, "a gap: a replay asked for, the output set aside");
+        assert!(!r.gap(1), "the same gap: asked once");
+        r.waiting = false;
+        assert!(r.gap(3) && r.waiting, "gaps since: asked again");
+    }
+
     #[test]
     fn backlog_is_bounded_and_replay_starts_at_a_line() {
         let (s, _input) = Session::new("local".into(), None, 80, 24);
@@ -661,6 +875,34 @@ mod tests {
         assert!(a.replay.len() <= BACKLOG_BYTES + 64);
         // After the reset prefix the replay begins with a whole line.
         assert!(a.replay.get(4..).is_some_and(|r| r.starts_with(b"0123")));
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a slow viewer's frames are kept up to the session's backlog in
+    /// bytes (its count of frames too), counted as the terminals' feeds' on `/metrics`; past it the viewer
+    /// is told it fell behind, and goes on from after what it missed (goal 4, plan 01a1a59c2a9c step 5: the
+    /// frames it held from before are let go of, so none older than the gap follows the repaint), and the
+    /// repaint it's sent then holds the session's state.
+    #[test]
+    fn g11_s3_a_slow_viewers_frames_are_kept_up_to_the_backlog_in_bytes() {
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        let mut slow = s.attach();
+        let bound = FANOUT * crate::memory::ring::place::<Frame>() + BACKLOG_BYTES;
+        assert_eq!(s.out.bound(), bound);
+        assert!(crate::memory::owners::TERMINAL_FEEDS.bound().is_some_and(|b| b >= bound));
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..(2 * BACKLOG_BYTES / chunk.len()) {
+            feed(&s, &chunk);
+            assert!(s.out.held() <= bound, "{} past {bound}", s.out.held());
+        }
+        assert!(matches!(slow.live.try_recv(), Err(async_broadcast::TryRecvError::Overflowed(n)) if n > 0), "told it fell behind");
+        let mut kept = 0;
+        while let Ok(Frame::Data(d)) = slow.live.try_recv() {
+            kept += d.len();
+        }
+        assert_eq!(kept, 0, "nothing from before what it missed");
+        feed(&s, b"after");
+        assert!(matches!(slow.live.try_recv(), Ok(Frame::Data(d)) if &d[..] == b"after"), "it goes on from after the gap");
+        assert!(s.attach().replay.len() >= BACKLOG_BYTES - 8192, "the repaint holds the backlog");
     }
 
     #[test]
@@ -683,6 +925,54 @@ mod tests {
             sent.push((cols, rows));
         }
         assert_eq!(sent, vec![(120, 40), (2, 1000)]);
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a terminal's input queue (lock-free now, `inputs`) holds [`INPUTS`]
+    /// keystrokes and pastes whatever each carries, as the channel it was did, in the order they came; one past
+    /// them is dropped, as it was.
+    #[test]
+    fn g4_s5_a_terminals_input_holds_its_places_in_order_whatever_each_carries() {
+        let (s, input) = Session::new("local".into(), None, 80, 24);
+        let paste = |n: usize| n.is_multiple_of(256);
+        for n in 0..INPUTS {
+            s.send(Input::Data(if paste(n) { vec![b'p'; 1 << 20] } else { n.to_string().into_bytes() }));
+        }
+        s.send(Input::Data(b"one past".to_vec()));
+        let mut got = 0;
+        while let Ok(Input::Data(d)) = input.try_recv() {
+            assert!(if paste(got) { d.len() == 1 << 20 } else { d == got.to_string().into_bytes() }, "input {got} out of order");
+            got += 1;
+        }
+        assert_eq!(got, INPUTS, "as many as its places, the one past them dropped");
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a remote terminal's relay (lock-free now, `relay`) holds [`RELAY`]
+    /// outputs whatever each carries, in order; output past them is a gap to repair (goal 3's), and its end
+    /// waits for room on its own, after what came before it.
+    #[test]
+    fn g4_s5_a_terminals_relay_holds_its_places_and_its_end_comes_last() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let s = Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
+            let (tx, rx) = relay();
+            let large = |n: usize| n.is_multiple_of(1024);
+            for n in 0..RELAY {
+                forward(&tx, Some(&s), TermOut::Data(if large(n) { vec![b'x'; 1 << 20] } else { n.to_le_bytes().to_vec() }));
+            }
+            anyhow::ensure!(s.gaps() == 0, "{} gaps within its places", s.gaps());
+            forward(&tx, Some(&s), TermOut::Data(b"past".to_vec()));
+            anyhow::ensure!(s.gaps() == 1, "output past its places is a gap: {}", s.gaps());
+            forward(&tx, None, TermOut::Exit { code: Some(0), error: None });
+            for n in 0..RELAY {
+                match rx.recv().await {
+                    Ok(TermOut::Data(d)) if large(n) => anyhow::ensure!(d.len() == 1 << 20, "output {n}"),
+                    Ok(TermOut::Data(d)) => anyhow::ensure!(d == n.to_le_bytes(), "output {n} out of order"),
+                    other => anyhow::bail!("output {n}: {other:?}"),
+                }
+            }
+            let end = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await;
+            anyhow::ensure!(matches!(end, Ok(Ok(TermOut::Exit { code: Some(0), .. }))), "its end, last: {end:?}");
+            Ok(())
+        })
     }
 
     #[test]

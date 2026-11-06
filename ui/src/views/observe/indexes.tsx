@@ -14,12 +14,13 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { absoluteDate } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { ObserveNav } from "./parts";
+import { HeldFields, ObserveNav, useMoves, useOpening } from "./parts";
 
 export const indexesRes: Res<LogsIndex[]> = { key: "observe/indexes", fetch: (s) => observeApi.indexes(s), opts: { pollMs: 15_000 } };
 
@@ -112,21 +113,32 @@ const excludedSaid = (i: LogsIndex) => {
 };
 
 function List({ onEdit }: { onEdit: (i: LogsIndex) => void }) {
-  const all = useRes(indexesRes).data;
+  const res = useRes(indexesRes);
+  const all = res.data;
   const [removing, setRemoving] = React.useState<LogsIndex | null>(null);
   const act = async (what: string, f: () => Promise<unknown>) => {
     try {
       await f();
       invalidate("observe/indexes");
+      return true;
     } catch (e) {
       toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
+      return false;
     }
   };
+  const moves = useMoves();
+  // Moved at once (W21-R15), and put back if the server refuses.
   const move = (i: number, by: -1 | 1) => {
     const names = all.map((x) => x.name);
     const j = i + by;
-    if (j < 0 || j >= names.length) return;
-    void act("move it", () => observeApi.orderIndexes(swapped(names, i, j)));
+    const name = names[i];
+    if (name === undefined || j < 0 || j >= names.length) return;
+    moves.move(name, by, () => {
+      res.change((l) => swapped(l, i, j));
+      return act("move it", () => observeApi.orderIndexes(swapped(names, i, j))).then((ok) => {
+        if (!ok) invalidate(indexesRes.key);
+      });
+    });
   };
   return (
     <>
@@ -140,10 +152,10 @@ function List({ onEdit }: { onEdit: (i: LogsIndex) => void }) {
               // On a phone they go beside its name, its day and time on a line of their own below.
               const controls = (
                 <>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${x.name} up`} disabled={i === 0} onClick={() => move(i, -1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${x.name} up`} {...moves.props(x.name, -1, i === 0)} onClick={() => move(i, -1)}>
                     <ArrowUp />
                   </Button>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${x.name} down`} disabled={i === all.length - 1} onClick={() => move(i, 1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${x.name} down`} {...moves.props(x.name, 1, i === all.length - 1)} onClick={() => move(i, 1)}>
                     <ArrowDown />
                   </Button>
                   <Button variant="ghost" size="xs" aria-label={`Edit ${x.name}`} onClick={() => onEdit(x)}>
@@ -244,7 +256,7 @@ const percent = (v: string) => v.trim() !== "" && Number.isFinite(Number(v)) && 
 
 function IndexDialog({ index, onClose }: { index: LogsIndex | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(index));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(f);
   const set = (patch: Partial<Form>) => setF((old) => ({ ...old, ...patch }));
   const setEx = (k: number, patch: Partial<Exclusion>) => set({ exclusions: f.exclusions.map((e, i) => (i === k ? { ...e, ...patch } : e)) });
   const tags = f.tags
@@ -267,32 +279,25 @@ function IndexDialog({ index, onClose }: { index: LogsIndex | null; onClose: () 
                 : tags.some((t) => !t.includes(":"))
                   ? "Tags: key:value."
                   : null;
-  const save = async () => {
-    setBusy(true);
-    try {
-      const body: Omit<LogsIndexIn, "name"> = {
-        filter: { query: f.query.trim() || "*" },
-        exclusion_filters: f.exclusions.map((e): ExclusionFilter => ({
-          name: e.name.trim(),
-          is_enabled: e.enabled,
-          filter: { query: e.query.trim() || "*", sample_rate: Number(e.percent) / 100, ...(e.attribute.trim() ? { sample_attribute: e.attribute.trim() } : {}) },
-        })),
-        daily_limit: f.limit.trim() ? Number(f.limit) : null,
-        ...(f.limit.trim() ? { daily_limit_reset: { reset_time: f.hour, reset_utc_offset: f.offset } } : {}),
-        ...(f.limit.trim() && f.warn.trim() ? { daily_limit_warning_threshold_percentage: Number(f.warn) } : {}),
-        num_retention_days: f.retention.trim() ? Number(f.retention) : null,
-        tags,
-      };
-      const saved = index ? await observeApi.updateIndex(index.name, { ...body, disable_daily_limit: !f.limit.trim() }) : await observeApi.createIndex({ name: f.name.trim(), ...body });
-      invalidate("observe/indexes");
-      toast({ title: index ? "Saved" : "Made", description: `${saved.name}: records are routed by it from now on.`, tone: "succeeded" });
-      onClose();
-    } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const body: Omit<LogsIndexIn, "name"> = {
+      filter: { query: f.query.trim() || "*" },
+      exclusion_filters: f.exclusions.map((e): ExclusionFilter => ({
+        name: e.name.trim(),
+        is_enabled: e.enabled,
+        filter: { query: e.query.trim() || "*", sample_rate: Number(e.percent) / 100, ...(e.attribute.trim() ? { sample_attribute: e.attribute.trim() } : {}) },
+      })),
+      daily_limit: f.limit.trim() ? Number(f.limit) : null,
+      ...(f.limit.trim() ? { daily_limit_reset: { reset_time: f.hour, reset_utc_offset: f.offset } } : {}),
+      ...(f.limit.trim() && f.warn.trim() ? { daily_limit_warning_threshold_percentage: Number(f.warn) } : {}),
+      num_retention_days: f.retention.trim() ? Number(f.retention) : null,
+      tags,
+    };
+    const saved = index ? await observeApi.updateIndex(index.name, { ...body, disable_daily_limit: !f.limit.trim() }) : await observeApi.createIndex({ name: f.name.trim(), ...body });
+    invalidate("observe/indexes");
+    toast({ title: index ? "Saved" : "Made", description: `${saved.name}: records are routed by it from now on.`, tone: "succeeded" });
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -300,79 +305,82 @@ function IndexDialog({ index, onClose }: { index: LogsIndex | null; onClose: () 
         description={index ? "Records taken from now are routed by it as changed; those it kept stay." : "It goes last in the order: move it up for the records an index before it takes."}
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!problem) void save();
+            if (!problem) save();
           }}
         >
-          {!index && <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="audit" spellCheck={false} required />}
-          <TextField
-            label="Of the records"
-            value={f.query}
-            onChange={(e) => set({ query: e.target.value })}
-            placeholder="service:payments"
-            className="font-mono"
-            spellCheck={false}
-            hint="A log search; *, every record an index before it did not take."
-          />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField label="Kept for (days)" value={f.retention} onChange={(e) => set({ retention: e.target.value })} placeholder="the store's time" inputMode="numeric" />
-            <TextField label="Daily quota (records)" value={f.limit} onChange={(e) => set({ limit: e.target.value })} placeholder="none" inputMode="numeric" />
-          </div>
-          {f.limit.trim() !== "" && (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <SelectField label="Its day begins" value={f.hour} onChange={(v) => set({ hour: v })} options={HOURS.map((h) => ({ value: h, label: h }))} />
-              <SelectField label="At UTC" value={f.offset} onChange={(v) => set({ offset: v })} options={OFFSETS.map((o) => ({ value: o, label: o }))} />
-              <TextField label="Warn at (%)" value={f.warn} onChange={(e) => set({ warn: e.target.value })} placeholder="no warning" inputMode="decimal" />
+          <HeldFields held={saving && !index}>
+            {!index && <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="audit" spellCheck={false} required />}
+            <TextField
+              label="Of the records"
+              value={f.query}
+              onChange={(e) => set({ query: e.target.value })}
+              placeholder="service:payments"
+              className="font-mono"
+              spellCheck={false}
+              hint="A log search; *, every record an index before it did not take."
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="Kept for (days)" value={f.retention} onChange={(e) => set({ retention: e.target.value })} placeholder="the store's time" inputMode="numeric" />
+              <TextField label="Daily quota (records)" value={f.limit} onChange={(e) => set({ limit: e.target.value })} placeholder="none" inputMode="numeric" />
             </div>
-          )}
-          <fieldset className="space-y-3">
-            <legend className="field-label">Exclusion filters</legend>
-            <p className="field-hint">
-              In order: the first enabled one that matches a record decides alone. A share is decided by each value of an attribute where one is named (a trace&apos;s records together).
-            </p>
-            {f.exclusions.map((e, k) => (
-              <div key={k} className="space-y-2 rounded-[10px] border border-white/10 p-3">
-                <div className="flex items-end gap-2">
-                  <TextField label="Name" value={e.name} onChange={(ev) => setEx(k, { name: ev.target.value })} placeholder="health checks" className="flex-1" />
-                  <Button variant="ghost" size="xs" aria-label={`Move ${e.name || "this filter"} up`} disabled={k === 0} onClick={() => set({ exclusions: swapped(f.exclusions, k, k - 1) })}>
-                    <ArrowUp />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    aria-label={`Move ${e.name || "this filter"} down`}
-                    disabled={k === f.exclusions.length - 1}
-                    onClick={() => set({ exclusions: swapped(f.exclusions, k, k + 1) })}
-                  >
-                    <ArrowDown />
-                  </Button>
-                  <Button variant="ghost-danger" size="xs" aria-label={`Remove ${e.name || "this filter"}`} onClick={() => set({ exclusions: f.exclusions.filter((_, i) => i !== k) })}>
-                    <X />
-                  </Button>
-                </div>
-                <TextField label="Of the records" value={e.query} onChange={(ev) => setEx(k, { query: ev.target.value })} placeholder="status:debug" className="font-mono" spellCheck={false} />
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  <TextField label="Excluded (%)" value={e.percent} onChange={(ev) => setEx(k, { percent: ev.target.value })} inputMode="decimal" />
-                  <TextField label="By (optional)" value={e.attribute} onChange={(ev) => setEx(k, { attribute: ev.target.value })} placeholder="@trace_id" className="font-mono" spellCheck={false} />
-                </div>
-                <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-                  <input type="checkbox" className="check" checked={e.enabled} onChange={(ev) => setEx(k, { enabled: ev.target.checked })} /> On
-                </label>
+            {f.limit.trim() !== "" && (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <SelectField label="Its day begins" value={f.hour} onChange={(v) => set({ hour: v })} options={HOURS.map((h) => ({ value: h, label: h }))} />
+                <SelectField label="At UTC" value={f.offset} onChange={(v) => set({ offset: v })} options={OFFSETS.map((o) => ({ value: o, label: o }))} />
+                <TextField label="Warn at (%)" value={f.warn} onChange={(e) => set({ warn: e.target.value })} placeholder="no warning" inputMode="decimal" />
               </div>
-            ))}
-            <Button variant="ghost" onClick={() => set({ exclusions: [...f.exclusions, { name: "", enabled: true, query: "*", percent: "100", attribute: "" }] })}>
-              <Plus /> Exclusion filter
-            </Button>
-          </fieldset>
-          <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="team:payments, env:prod" spellCheck={false} />
-          {problem && (index || f.name !== "") && <p className="field-hint text-[#f2b8b5]">{problem}</p>}
+            )}
+            <fieldset className="space-y-3">
+              <legend className="field-label">Exclusion filters</legend>
+              <p className="field-hint">
+                In order: the first enabled one that matches a record decides alone. A share is decided by each value of an attribute where one is named (a trace&apos;s records together).
+              </p>
+              {f.exclusions.map((e, k) => (
+                <div key={k} className="space-y-2 rounded-[10px] border border-white/10 p-3">
+                  <div className="flex items-end gap-2">
+                    <TextField label="Name" value={e.name} onChange={(ev) => setEx(k, { name: ev.target.value })} placeholder="health checks" className="flex-1" />
+                    <Button variant="ghost" size="xs" aria-label={`Move ${e.name || "this filter"} up`} disabled={k === 0} onClick={() => set({ exclusions: swapped(f.exclusions, k, k - 1) })}>
+                      <ArrowUp />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      aria-label={`Move ${e.name || "this filter"} down`}
+                      disabled={k === f.exclusions.length - 1}
+                      onClick={() => set({ exclusions: swapped(f.exclusions, k, k + 1) })}
+                    >
+                      <ArrowDown />
+                    </Button>
+                    <Button variant="ghost-danger" size="xs" aria-label={`Remove ${e.name || "this filter"}`} onClick={() => set({ exclusions: f.exclusions.filter((_, i) => i !== k) })}>
+                      <X />
+                    </Button>
+                  </div>
+                  <TextField label="Of the records" value={e.query} onChange={(ev) => setEx(k, { query: ev.target.value })} placeholder="status:debug" className="font-mono" spellCheck={false} />
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <TextField label="Excluded (%)" value={e.percent} onChange={(ev) => setEx(k, { percent: ev.target.value })} inputMode="decimal" />
+                    <TextField label="By (optional)" value={e.attribute} onChange={(ev) => setEx(k, { attribute: ev.target.value })} placeholder="@trace_id" className="font-mono" spellCheck={false} />
+                  </div>
+                  <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+                    <input type="checkbox" className="check" checked={e.enabled} onChange={(ev) => setEx(k, { enabled: ev.target.checked })} /> On
+                  </label>
+                </div>
+              ))}
+              <Button variant="ghost" onClick={() => set({ exclusions: [...f.exclusions, { name: "", enabled: true, query: "*", percent: "100", attribute: "" }] })}>
+                <Plus /> Exclusion filter
+              </Button>
+            </fieldset>
+            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="team:payments, env:prod" spellCheck={false} />
+            {problem && (index || f.name !== "") && <p className="field-hint text-[#f2b8b5]">{problem}</p>}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={problem !== null || busy}>
+            <Button type="submit" disabled={problem !== null} pending={saving}>
               {index ? "Save" : "Make it"}
             </Button>
           </div>

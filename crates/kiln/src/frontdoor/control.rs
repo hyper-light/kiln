@@ -170,7 +170,7 @@ impl FrontDoors {
 /// The process of `machine` that runs its front door (its newest, when that one can), and its
 /// other processes that can run one (they stand by).
 fn peers(hub: &Hub, machine: &str) -> (Option<PeerId>, Vec<PeerId>) {
-    let inst = hub.instances.lock();
+    let inst = hub.instances.load();
     let newest = inst.newest(machine);
     let capable = |p: PeerId| inst.get(p).is_some_and(|i| i.caps & CAP_FRONT_DOOR != 0);
     let others = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && capable(*p)).collect();
@@ -313,17 +313,17 @@ fn date(unix: i64) -> String {
 
 /// A runner the server knows (enrolled, or connected now).
 async fn known(hub: &Hub, name: &str) -> bool {
-    hub.agents.lock().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
+    hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
 /// `GET /api/runners/:name/front-door` (and what the others answer with).
 pub async fn view(hub: &Hub, name: &str) -> serde_json::Value {
     let settings = hub.front_doors.settings(name);
     let (status, status_at) = hub.front_doors.status(name);
-    let connected = hub.agents.lock().get(name).is_some_and(|a| a.connected);
+    let connected = hub.agents.load().get(name).is_some_and(|a| a.connected);
     // Unknown (null: "waiting for the runner") until the runner has said what it can do.
     let caps = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         caps_known(inst.newest(name).and_then(|p| inst.get(p)), crate::util::now_unix())
     };
     let supported = if connected { caps.map(|c| c & CAP_FRONT_DOOR != 0) } else { None };
