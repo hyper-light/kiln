@@ -13,7 +13,7 @@
  */
 import * as React from "react";
 import { api } from "@/api/client";
-import { shipApi, type ShipDetail } from "@/api/ship";
+import type { ShipDetail, ShipQuery } from "@/api/ship";
 import type { RunnerFinding } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -30,6 +30,10 @@ import { platformsOf } from "@/views/updates/words";
 import { buildWord, environmentsOf, failuresOf, keptBuildsOf, replantGlyph, replantWord, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
 import { horizonOf, LaneBar, reviewGroup, type ShipLaneGroup } from "./review/lanes";
 import "./ship.css";
+import { DETAIL_OPTS, pageOpts, shipCommit, shipCommits } from "./live";
+
+/** The repository's commits a commit page folds by. */
+const LISTED = (repo: string): ShipQuery => ({ repo, limit: 200 });
 
 export default function CommitPage() {
   const { owner = "", name = "", sha = "" } = useParams();
@@ -47,12 +51,9 @@ export default function CommitPage() {
 
 function Commit({ repo, sha }: { repo: string; sha: string }) {
   // Every stage it shows moves on its own event, as Ship's list follows them.
-  const c = useSuspenseResource(`ship/commit/${repo}/${sha}`, (s) => shipApi.commit(repo, sha, s), {
-    pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
-  }).data;
+  const c = useSuspenseResource(`ship/commit/${repo}/${sha}`, (s) => shipCommit(repo, sha, s), DETAIL_OPTS).data;
   // What ships with it is how Ship's list folds it: the repository's commits, read as the list reads them.
-  const listed = useSuspenseResource(`ship/commits/${JSON.stringify({ repo, limit: 200 })}`, (s) => shipApi.commits({ repo, limit: 200 }, s), { pollMs: 15_000, on: ["run", "review"] }).data;
+  const listed = useSuspenseResource(`ship/commits/${JSON.stringify(LISTED(repo))}`, (s) => shipCommits(LISTED(repo), s), pageOpts(LISTED(repo))).data;
   const rides = ridesOf(listed.commits, c.sha);
   const envs = environmentsOf(c);
   const image = c.build?.image.digest ?? null;

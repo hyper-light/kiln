@@ -24,6 +24,7 @@ import { Loadable } from "@/components/ui/loading";
 import { ChangeBar } from "./change-bar";
 import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
+import { BodiesContext, Whole } from "./whole";
 import { SubagentOutput } from "./task-output";
 import { SessionChanges, fromServer, inScope, useScope, type OwnSource, type Sub } from "./changes";
 import type { CommitsSource } from "./commits";
@@ -130,7 +131,12 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
                 {c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
               </span>
             </button>
-            {isOpen && <Output text={c.output ?? ""} truncated={c.truncated} error={failed} />}
+            {isOpen && (
+              // Lean, its output comes once it's opened (whole.tsx).
+              <Whole e={c} fallback={<Output text="" truncated={c.truncated} error={failed} />}>
+                {(w) => <Output text={w.output ?? ""} truncated={w.truncated} error={failed} />}
+              </Whole>
+            )}
           </li>
         );
       })}
@@ -372,97 +378,99 @@ export function Inspector({
     { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
-    <div className={cn("hx-inspector", className)}>
-      <div className="hx-inspector-head" hidden={hideTabs}>
-        <div className="hx-tabs" role="tablist">
-          {tabs.map((t) => (
-            <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
-              {t.label}
-              {t.count && <span className="hx-tab-count">{t.count}</span>}
-              {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
-            </button>
-          ))}
+    <BodiesContext.Provider value={store}>
+      <div className={cn("hx-inspector", className)}>
+        <div className="hx-inspector-head" hidden={hideTabs}>
+          <div className="hx-tabs" role="tablist">
+            {tabs.map((t) => (
+              <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
+                {t.label}
+                {t.count && <span className="hx-tab-count">{t.count}</span>}
+                {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
+              </button>
+            ))}
+          </div>
+          {actions}
         </div>
-        {actions}
-      </div>
-      <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} started={started} />}
-        {tab === "plan" && (
-          <div className="in-secs">
-            <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
-              {/* A plan waiting on you (review.tsx): read and answered here, first. */}
-              {agentId && <ReviewHere agent={agentId} store={store} send={send} />}
-              {/* The plan under way as it moves, then every plan kept, to find and recall (browser.tsx). */}
-              <PlansSection
-                session={agentId}
-                active={
-                  <>
-                    {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
-                    {todos.length > 0 && (
-                      <div className="hx-stack">
-                        <TodoSteps todos={todos} />
-                        <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
-                      </div>
-                    )}
-                    {/* The plan it proposed (plan mode), in its words, kept by kiln; while it waits on you, the review above is it. */}
-                    {reviewing === "proposed" && send ? (
-                      <p className="in-none">Its plan waits on your review, above.</p>
-                    ) : agentId ? (
-                      <Loadable label="its plan" fallback={null}>
-                        <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
-                      </Loadable>
-                    ) : (
-                      proposed && (
+        <div className="hx-inspector-body">
+          {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} started={started} />}
+          {tab === "plan" && (
+            <div className="in-secs">
+              <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
+                {/* A plan waiting on you (review.tsx): read and answered here, first. */}
+                {agentId && <ReviewHere agent={agentId} store={store} send={send} />}
+                {/* The plan under way as it moves, then every plan kept, to find and recall (browser.tsx). */}
+                <PlansSection
+                  session={agentId}
+                  active={
+                    <>
+                      {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                      {todos.length > 0 && (
                         <div className="hx-stack">
-                          <Prose text={proposed} className="hx-plan-text" />
-                          <SavePlan body={proposed} />
+                          <TodoSteps todos={todos} />
+                          <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
                         </div>
-                      )
-                    )}
-                    {todos.length === 0 && !proposed && (
-                      <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>
-                    )}
-                  </>
-                }
-              />
-              {/* What agents found out, graded by kiln (research.tsx): to search, a card each, in brief until opened. */}
-              {agentId && <ResearchSection agent={agentId} />}
-              {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
-            </PlanSourceContext.Provider>
-          </div>
-        )}
-        {tab === "tools" && (
-          <div className="in-secs">
-            {/* What it has going: shells and monitors it left running, subagents; what it works with; then
+                      )}
+                      {/* The plan it proposed (plan mode), in its words, kept by kiln; while it waits on you, the review above is it. */}
+                      {reviewing === "proposed" && send ? (
+                        <p className="in-none">Its plan waits on your review, above.</p>
+                      ) : agentId ? (
+                        <Loadable label="its plan" fallback={null}>
+                          <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
+                        </Loadable>
+                      ) : (
+                        proposed && (
+                          <div className="hx-stack">
+                            <Prose text={proposed} className="hx-plan-text" />
+                            <SavePlan body={proposed} />
+                          </div>
+                        )
+                      )}
+                      {todos.length === 0 && !proposed && (
+                        <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>
+                      )}
+                    </>
+                  }
+                />
+                {/* What agents found out, graded by kiln (research.tsx): to search, a card each, in brief until opened. */}
+                {agentId && <ResearchSection agent={agentId} />}
+                {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
+              </PlanSourceContext.Provider>
+            </div>
+          )}
+          {tab === "tools" && (
+            <div className="in-secs">
+              {/* What it has going: shells and monitors it left running, subagents; what it works with; then
                 every command it ran, last, since that list only grows. */}
-            {agentId && send && <Background state={state} agent={agentId} send={send} />}
-            {agentId && (
-              <Fold id="live-pages" title="Live pages">
-                <LivePages session={agentId} />
-              </Fold>
-            )}
-            {subagents > 0 && (
-              <ToolSection id="subagents" title="Subagents" count={subagents}>
-                <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} kiln={kiln} />
+              {agentId && send && <Background state={state} agent={agentId} send={send} />}
+              {agentId && (
+                <Fold id="live-pages" title="Live pages">
+                  <LivePages session={agentId} />
+                </Fold>
+              )}
+              {subagents > 0 && (
+                <ToolSection id="subagents" title="Subagents" count={subagents}>
+                  <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} kiln={kiln} />
+                </ToolSection>
+              )}
+              <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>
+                <McpPanel state={state} store={store} />
               </ToolSection>
-            )}
-            <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>
-              <McpPanel state={state} store={store} />
-            </ToolSection>
-            <ToolSection id="skills" title="Skills" count={state?.skills?.length}>
-              <SkillsPanel state={state} store={store} />
-            </ToolSection>
-            <Fold id="usage" title="Usage and status">
-              <Status state={state} />
-            </Fold>
-            {runs.length > 0 && (
-              <Fold id="commands" title="Commands it ran" count={runs.length}>
-                <Runs runs={runs} />
+              <ToolSection id="skills" title="Skills" count={state?.skills?.length}>
+                <SkillsPanel state={state} store={store} />
+              </ToolSection>
+              <Fold id="usage" title="Usage and status">
+                <Status state={state} />
               </Fold>
-            )}
-          </div>
-        )}
+              {runs.length > 0 && (
+                <Fold id="commands" title="Commands it ran" count={runs.length}>
+                  <Runs runs={runs} />
+                </Fold>
+              )}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </BodiesContext.Provider>
   );
 }

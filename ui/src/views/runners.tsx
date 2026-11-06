@@ -502,8 +502,8 @@ function DrainCheck({ agent, pending, onChange }: { agent: Agent; pending: boole
 /** A runner's last hour of samples (5 s apart), growing as samples arrive. */
 function useAgentHistory(name: string) {
   const res = useSuspenseResource(`metrics/history/${name}`, (s) => api.metricsHistory(name, s).then((h) => h[name] ?? []));
-  useServerEvents((ev) => {
-    if (ev.type === "sample" && ev.agent === name) res.setData((l) => [...l, ev.sample].slice(-720));
+  useServerEvents(["sample"], (ev) => {
+    if (ev.agent === name) res.setData((l) => [...l, ev.sample].slice(-720));
   });
   return res.data;
 }

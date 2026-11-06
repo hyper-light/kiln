@@ -728,6 +728,167 @@ function liveLegs(row: ShipCommit, live: { run: string; job: string }, ctx: Ctx)
   return [...failed, ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({ name: j.name, state: LEG_STATE[j.status] ?? "queued", job: j.job, run: live.run }))];
 }
 
+/**
+ * The server's `ship` frames (W21-R15, crates/kiln/src/ship.rs's `ShipCache::refresh`): with them
+ * on (`MOCK_SHIP_EVENTS=1`, or `POST /api/mock/ship/events?on=1`), a list says whom its rows are for
+ * (`viewer`) and a detail its `dv`, and `shipFrames` says what changed since it last looked: each
+ * repository's rows that read otherwise, those gone, whether its pace line moved. A detail read
+ * from here on is followed (its `dv` goes with its row), as the server follows those read.
+ */
+let live = process.env.MOCK_SHIP_EVENTS === "1";
+export const shipLive = () => live;
+/** What was last said of each commit (`repo/sha`): its row's JSON, and its detail's `dv` and parts once followed. */
+const said = new Map<string, { json: string; dv?: string; parts?: Record<string, string> }>();
+const paced = new Map<string, string>();
+const followed = new Set<string>();
+let primed = false;
+
+/** FNV-1a, 32 bits, in hex: a detail's `dv`. */
+function fnv(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/** What a detail shows beyond its row (ship.rs's `detail_parts`). */
+const PARTS = ["review", "checks", "build", "deployments", "releases", "replant", "jobs"] as const;
+const dvOf = (d: ShipDetail) => fnv(JSON.stringify(PARTS.map((k) => d[k] ?? null)));
+/** Each part of a detail, as JSON (the mock says a part that moved whole, as the server may). */
+const partsOf = (d: ShipDetail): Record<string, string> => Object.fromEntries(PARTS.map((k) => [k, JSON.stringify(d[k] ?? null)]));
+
+export interface ShipFrameOut {
+  type: "ship";
+  repo: string;
+  rows: { row: ShipCommit; dv?: string; base?: string; parts?: Record<string, unknown> }[];
+  gone?: string[];
+  pace?: boolean;
+}
+
+/** What changed of the rows since the last call, as the server's frames say it; nothing the first time. */
+export function shipFrames(ctx: Ctx): ShipFrameOut[] {
+  const rows = all().map((c) => withRan(readyRow(handedRow(c, ""), "")));
+  const frames = new Map<string, ShipFrameOut>();
+  const frame = (repo: string) => frames.get(repo) ?? frames.set(repo, { type: "ship", repo, rows: [] }).get(repo)!;
+  const now = new Set<string>();
+  for (const c of rows) {
+    const k = `${c.repo}/${c.sha}`;
+    if (now.has(k)) continue;
+    now.add(k);
+    const d = followed.has(k) ? detailOf(c.repo, c.sha, "", ctx) : null;
+    const dv = d ? dvOf(d) : undefined;
+    const parts = d ? partsOf(d) : undefined;
+    const json = JSON.stringify(c);
+    const was = said.get(k);
+    said.set(k, { json, dv, parts });
+    if (!primed || (was && was.json === json && (was.dv === undefined || was.dv === dv))) continue;
+    const out: ShipFrameOut["rows"][number] = dv === undefined ? { row: c } : { row: c, dv };
+    // Its parts that moved from the `dv` last said, each whole.
+    if (d && parts && was?.dv !== undefined && was.dv !== dv && was.parts) {
+      const before = was.parts;
+      out.base = was.dv;
+      out.parts = Object.fromEntries(PARTS.filter((p) => before[p] !== parts[p]).map((p) => [p, d[p] ?? null]));
+    }
+    frame(c.repo).rows.push(out);
+  }
+  for (const k of [...said.keys()]) {
+    if (now.has(k)) continue;
+    said.delete(k);
+    const at = k.lastIndexOf("/");
+    const f = frame(k.slice(0, at));
+    if (primed) f.gone = [...(f.gone ?? []), k.slice(at + 1)];
+  }
+  for (const repo of new Set(rows.map((c) => c.repo))) {
+    const mark = JSON.stringify(paceOf(rows.filter((c) => c.repo === repo)));
+    if (primed && paced.get(repo) !== mark) frame(repo).pace = true;
+    paced.set(repo, mark);
+  }
+  primed = true;
+  return [...frames.values()].filter((f) => f.rows.length > 0 || f.gone || f.pace);
+}
+
+/** A commit's detail as `GET /api/ship/commits/:repo/:sha` has it, for browser `ua`; null when there's none. */
+function detailOf(repo: string, sha: string, ua: string, ctx: Ctx): ShipDetail | null {
+  const found = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
+  const row = found ? handedRow(found, ua) : undefined;
+  const live = ctx.liveJob?.();
+  const fixed: ShipDetail | null = row
+    ? {
+        ...row,
+        review: marksOf(row),
+        checks: live
+          ? [
+              {
+                pipeline: "ci",
+                legs:
+                  row.short === "3333333"
+                    ? failingLegs(row, live).map((l) => ({
+                        name: l.name,
+                        state: l.state,
+                        attempts: l.attempts,
+                        note: l.note,
+                        ...(l.log ? { job: l.log, run: l.run } : {}),
+                        ...(l.start != null ? { start: l.start } : {}),
+                        ...(l.end != null ? { end: l.end } : {}),
+                      }))
+                    : [
+                        // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
+                        // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
+                        ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
+                          ? [
+                              {
+                                name: row.line.split(" · ")[0] ?? "checks",
+                                state: "failed",
+                                attempts: 2,
+                                note: row.line.split(" · ").slice(1).join(" · "),
+                                job: live.job,
+                                run: live.run,
+                                start: T0 - 900,
+                                end: T0 - 840,
+                              },
+                            ]
+                          : []),
+                        // Then each job of the live run, as it stands: its own job, its times once it has them.
+                        ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
+                          name: j.name,
+                          state: LEG_STATE[j.status] ?? "queued",
+                          attempts: 1,
+                          note: j.error ?? "",
+                          ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
+                          ...(j.end != null ? { end: j.end } : {}),
+                        })),
+                      ],
+              },
+            ]
+          : [],
+        ...(live ? { jobs: jobsOf(liveLegs(row, live, ctx), actsOf(ua)) } : {}),
+        ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
+        // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
+        runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
+        // A commit in production went through staging, built once: its deploys and the one image they run.
+        ...(row.environments?.some((e) => e.production)
+          ? {
+              build: {
+                platforms: [
+                  { name: "linux/amd64", state: "passed" as const },
+                  // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
+                  { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
+                ],
+                image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
+              },
+              deployments: [
+                { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
+                { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
+              ],
+            }
+          : {}),
+      }
+    : null;
+  return trunk?.detail(sha) ?? fixed;
+}
+
 /** Ship's routes, and the actions its rows name for the trunk's own ids (`ship-run-…`,
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
  * the mock keeps for those paths. True when it answered. */
@@ -749,7 +910,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     if (q.get("by") === "repo") {
       const seen = new Set<string>();
       const heads = rows.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
-      const page: ShipPage = { commits: heads.map(shown), next_cursor: null, pace };
+      const page: ShipPage = { commits: heads.map(shown), next_cursor: null, pace, ...(live ? { viewer: [] } : {}) };
       ctx.json(res, 200, page);
       return true;
     }
@@ -759,91 +920,19 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const from = after === null ? 0 : rows.findIndex((c) => String(c.cursor) === after) + 1;
     const slice = rows.slice(from, from + limit);
     const next = from + limit < rows.length ? (slice.at(-1)?.cursor ?? null) : null;
-    const page: ShipPage = { commits: slice.map(shown), next_cursor: next, pace };
+    const page: ShipPage = { commits: slice.map(shown), next_cursor: next, pace, ...(live ? { viewer: [] } : {}) };
     ctx.json(res, 200, page);
     return true;
   }
   const one = m === "GET" ? p.match(/^\/api\/ship\/commits\/(.+)\/([0-9a-f]{7,40})$/) : null;
   if (one) {
-    const [, repo, sha] = one;
-    const found = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
-    const row = found ? handedRow(found, ua) : undefined;
-    const live = ctx.liveJob?.();
-    const fixed: ShipDetail | null = row
-      ? {
-          ...row,
-          review: marksOf(row),
-          checks: live
-            ? [
-                {
-                  pipeline: "ci",
-                  legs:
-                    row.short === "3333333"
-                      ? failingLegs(row, live).map((l) => ({
-                          name: l.name,
-                          state: l.state,
-                          attempts: l.attempts,
-                          note: l.note,
-                          ...(l.log ? { job: l.log, run: l.run } : {}),
-                          ...(l.start != null ? { start: l.start } : {}),
-                          ...(l.end != null ? { end: l.end } : {}),
-                        }))
-                      : [
-                          // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
-                          // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
-                          ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
-                            ? [
-                                {
-                                  name: row.line.split(" · ")[0] ?? "checks",
-                                  state: "failed",
-                                  attempts: 2,
-                                  note: row.line.split(" · ").slice(1).join(" · "),
-                                  job: live.job,
-                                  run: live.run,
-                                  start: T0 - 900,
-                                  end: T0 - 840,
-                                },
-                              ]
-                            : []),
-                          // Then each job of the live run, as it stands: its own job, its times once it has them.
-                          ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
-                            name: j.name,
-                            state: LEG_STATE[j.status] ?? "queued",
-                            attempts: 1,
-                            note: j.error ?? "",
-                            ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
-                            ...(j.end != null ? { end: j.end } : {}),
-                          })),
-                        ],
-                },
-              ]
-            : [],
-          ...(live ? { jobs: jobsOf(liveLegs(row, live, ctx), actsOf(ua)) } : {}),
-          ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
-          // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
-          runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
-          // A commit in production went through staging, built once: its deploys and the one image they run.
-          ...(row.environments?.some((e) => e.production)
-            ? {
-                build: {
-                  platforms: [
-                    { name: "linux/amd64", state: "passed" as const },
-                    // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
-                    { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
-                  ],
-                  image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
-                },
-                deployments: [
-                  { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
-                  { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
-                ],
-              }
-            : {}),
-        }
-      : null;
-    const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
+    const [, repo = "", sha = ""] = one;
+    const detail = detailOf(repo, sha, ua, ctx);
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
-    else ctx.json(res, 200, detail);
+    else if (live) {
+      followed.add(`${detail.repo}/${detail.sha}`);
+      ctx.json(res, 200, { ...detail, dv: dvOf(detail), viewer: [] });
+    } else ctx.json(res, 200, detail);
     return true;
   }
   // A commit's jobs acted on together (W26-R21, R22), answered as the server answers: each job done, or why not.
@@ -1031,6 +1120,16 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
   if (p === "/api/mock/ship/glyphs" && m === "POST") {
     arrived.unshift(...sampler());
     ctx.json(res, 200, { ok: true, states: STATES.length });
+    return true;
+  }
+  // The server's `ship` frames on or off (W21-R15); either way what was said starts over.
+  if (p === "/api/mock/ship/events" && m === "POST") {
+    live = q.get("on") === "1";
+    said.clear();
+    paced.clear();
+    followed.clear();
+    primed = false;
+    ctx.json(res, 200, { ok: true, live });
     return true;
   }
   if (p === "/api/mock/ship/arrive" && m === "POST") {

@@ -295,7 +295,7 @@ pub fn rtprio_limits(limits: &str) -> Option<(u64, u64)> {
 /// first instruction, and so everything it starts: those of the CPUs it would start on that are work
 /// CPUs (a leg's share stays its share), else the work CPUs (started from a thread fixed to a shard's
 /// core). Nothing where nothing is kept off. Linux only: macOS has no CPU affinity for a process (its
-/// legs and agents run under background policy, which keeps them off the performance cores), and on
+/// legs and agents run below normal, on every core), and on
 /// Windows a server has no cores of its own to keep anything off.
 pub fn onto_work_cpus(cmd: &mut std::process::Command) {
     #[cfg(target_os = "linux")]

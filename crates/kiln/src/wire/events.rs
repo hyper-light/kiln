@@ -6,9 +6,46 @@
 //!
 //! The socket's frames are also what kiln's own listeners read (attachments, notifications,
 //! webhooks' subscribers), as the JSON they serialize to.
+//!
+//! A page that asks for it (`?batch=1`, or `?after=` to resume) gets them numbered and gathered
+//! ([`EventsDown`], [`feed`]), and says which types it wants ([`EventsUp`], `?topics=`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod feed;
+
+/// What goes down the events socket to a page that asked for batches (`?batch=1`, or `?after=`),
+/// besides `refused`: the events of a window, each a [`ServerEvent`], and where the feed is.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsDown {
+    /// The events since the last batch: only the newest of each thing they carry whole, none that
+    /// says again what this socket was last sent, `resync` first when some were missed. `at`
+    /// (`<epoch>.<seq>`) is where the feed is: a page that reconnects with `?after=<at>` is sent
+    /// what it missed. Every socket's first frame is one, its events perhaps none.
+    Batch { at: String, events: Vec<ServerEvent> },
+}
+
+/// What a page sends up the events socket, besides `unread`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsUp {
+    /// The event types it wants from now on (the tags of [`ServerEvent`]; `resync` it always
+    /// gets), all of them when `topics` is left out. `since` (a batch's `at`): of the types new
+    /// to it, it's sent what came after that too, so what it loaded just before it asked misses
+    /// nothing.
+    Topics {
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        topics: Option<Vec<String>>,
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        since: Option<String>,
+    },
+}
 
 /// A frame of the events socket.
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +164,11 @@ pub enum ServerEvent {
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),
+    /// Ship's rows of a repository that changed, as `GET /api/ship/commits` renders them
+    /// (`crate::ship`, W21-R15): a page takes each in place instead of loading its list again. After
+    /// every tagged frame before it (serde reads the untagged ones below last); a page from before
+    /// it doesn't apply it.
+    Ship(Box<ShipRows>),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -267,6 +309,80 @@ pub struct ConflictChange {
     pub take: Option<String>,
     pub by: Option<String>,
     pub agent: Option<bool>,
+}
+
+/// What changed of a repository's Ship rows in one refresh of Ship's read model (`crate::ship`,
+/// W21-R15): each row once, however many times its records changed meanwhile; a row that renders
+/// as it did isn't sent.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipRows {
+    /// The repository, by name (what an events socket's narrowing reads).
+    pub repo: String,
+    pub rows: Vec<ShipRow>,
+    /// Its commits memory no longer holds: gone from the store, or older than it keeps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
+    pub gone: Vec<String>,
+    /// What the list's pace line counts of the repository changed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub pace: bool,
+    /// More changed than its rows say (the repository went, or was renamed): load it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub whole: bool,
+}
+
+/// A Ship row as the list renders it: for everyone (`row`), and for those whose turn it is
+/// (`yours`, `whose`: a viewer holding any of `whose` sees `yours`).
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipRow {
+    pub row: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub yours: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
+    pub whose: Vec<String>,
+    /// The version of what its commit's detail shows beyond the row (`dv` of
+    /// `GET /api/ship/commits/:repo/:sha`), when someone read that detail: a detail of another `dv`,
+    /// or none here, is loaded again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub dv: Option<String>,
+    /// The `dv` that `parts` and `items` go over: a detail of this `dv` with them laid over it is
+    /// the detail of `dv`. None when the detail's parts didn't move, or can't be said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub base: Option<String>,
+    /// The detail's parts that changed since `base`, each whole (`checks`, `build` ...).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, Value>>", optional))]
+    pub parts: std::collections::BTreeMap<String, Value>,
+    /// The detail's lists that changed since `base` entry by entry (`jobs`, `checks` ...): each its
+    /// new length and the entries that changed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, ShipItems>>", optional))]
+    pub items: std::collections::BTreeMap<String, ShipItems>,
+}
+
+/// A list of a Ship detail's, changed entry by entry: its new length, and each entry that isn't
+/// what it was at its place (W21-R15).
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipItems {
+    pub len: usize,
+    pub at: Vec<ShipItem>,
+}
+
+/// An entry of a [`ShipItems`]: its place and what's there now.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipItem {
+    pub i: usize,
+    pub v: Value,
 }
 
 /// A review of a diff.
@@ -848,6 +964,29 @@ mod tests {
                 verdict: verdict.clone(),
             })),
             json!({ "type": "ci_verdict", "repo": "acme/app", "workflow": ".kiln/ci.yaml", "branch": "main", "sha": "abc", "kind": "covered", "why": "covered by def's pass", "verdict": verdict }),
+        )?;
+        // W21-R15's `ship`: what it leaves out when empty isn't sent; what it has is.
+        same(
+            ServerEvent::Ship(Box::new(ShipRows { repo: "acme/app".into(), rows: vec![ShipRow { row: json!({ "sha": "abc", "v": "1" }), ..ShipRow::default() }], ..ShipRows::default() })),
+            json!({ "type": "ship", "repo": "acme/app", "rows": [{ "row": { "sha": "abc", "v": "1" } }] }),
+        )?;
+        same(
+            ServerEvent::Ship(Box::new(ShipRows {
+                repo: "acme/app".into(),
+                rows: vec![ShipRow {
+                    row: json!({ "sha": "abc" }),
+                    yours: Some(json!({ "sha": "abc", "stand": "needs_you" })),
+                    whose: vec!["user:ada".into()],
+                    dv: Some("d2".into()),
+                    base: Some("d1".into()),
+                    parts: [("build".to_owned(), json!({ "image": null }))].into(),
+                    items: [("jobs".to_owned(), ShipItems { len: 2, at: vec![ShipItem { i: 1, v: json!({ "id": "j2" }) }] })].into(),
+                }],
+                gone: vec!["def".into()],
+                pace: true,
+                whole: true,
+            })),
+            json!({ "type": "ship", "repo": "acme/app", "rows": [{ "row": { "sha": "abc" }, "yours": { "sha": "abc", "stand": "needs_you" }, "whose": ["user:ada"], "dv": "d2", "base": "d1", "parts": { "build": { "image": null } }, "items": { "jobs": { "len": 2, "at": [{ "i": 1, "v": { "id": "j2" } }] } } }], "gone": ["def"], "pace": true, "whole": true }),
         )?;
         Ok(())
     }
