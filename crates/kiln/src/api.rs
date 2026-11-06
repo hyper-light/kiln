@@ -5733,24 +5733,88 @@ fn pre_named(made: crate::reads::Made) -> Response {
     r
 }
 
+/// How long a join of the sessions' list takes, as the joins so far took ([`harness_sessions`]; goal 10, plan
+/// 01a1a87b2dae step 5): RFC 6298's estimator of a round trip (§2), learned the same way from each join's time, a smoothed
+/// mean and a mean deviation in nanoseconds (gains 1/8 and 1/4), and the bound it puts on the next, the mean and four
+/// deviations (its retransmission timeout's K). No lock: two joins learned at once may lose one's sample, as an
+/// estimate of a mean can.
+#[derive(Debug, Default)]
+struct Joins {
+    /// The smoothed mean, ns: 0 before the first join (none takes nothing).
+    mean_ns: std::sync::atomic::AtomicU64,
+    /// The mean deviation, ns.
+    dev_ns: std::sync::atomic::AtomicU64,
+}
+
+impl Joins {
+    /// A join took `took`: the first sets the mean to it and the deviation to half of it (RFC 6298 §2.2), each after
+    /// moves them by their gains (§2.3).
+    fn took(&self, took: Duration) {
+        let ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if mean == 0 {
+            self.dev_ns.store(ns / 2, std::sync::atomic::Ordering::Relaxed);
+            self.mean_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let dev = self.dev_ns.load(std::sync::atomic::Ordering::Relaxed);
+        self.dev_ns.store((dev - dev / 4).saturating_add(mean.abs_diff(ns) / 4), std::sync::atomic::Ordering::Relaxed);
+        self.mean_ns.store((mean - mean / 8).saturating_add(ns / 8).max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What the next join is bounded by: the mean and four deviations (RFC 6298 §2.3's K); none before the first join.
+    fn bound_ns(&self) -> Option<u64> {
+        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
+        (mean > 0).then(|| mean.saturating_add(self.dev_ns.load(std::sync::atomic::Ordering::Relaxed).saturating_mul(4)))
+    }
+
+    /// Whether the next join is to be made on the request's shard: the joins so far bound it within the shard's step
+    /// quantum (`quantum_ns`, goal 9's: no poll past it). Not before a join was learned, nor off a shard.
+    fn here(&self, quantum_ns: Option<u64>) -> bool {
+        self.bound_ns().zip(quantum_ns).is_some_and(|(bound, quantum)| bound <= quantum)
+    }
+}
+
+/// The sessions' list's joins so far, wherever they were made.
+static JOINS: Joins = Joins { mean_ns: std::sync::atomic::AtomicU64::new(0), dev_ns: std::sync::atomic::AtomicU64::new(0) };
+
+/// The sessions' list as [`crate::harness::registry::Registry::list_tagged`] finds it or joins it, and how long its join
+/// took where it joined it (`None` where it found it as it was).
+fn list_timed(hub: &Hub) -> ((bytes::Bytes, Option<http::HeaderValue>), Option<Duration>) {
+    let (began, joins) = (Instant::now(), hub.harness.list_joins());
+    let listed = hub.harness.list_tagged();
+    (listed, (hub.harness.list_joins() != joins).then(|| began.elapsed()))
+}
+
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
 /// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
 /// sees by lineage, found as it reads.
 async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
     if crate::harness::lineage::sees_all(caller) {
         // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
-        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). Found, or joined again, on the
-        // compute pool, not on the request's shard (step 3): a join reads every session's view, copies each one's info
-        // into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work change it between nearly
-        // any two reads) and digests the infos that changed. Where its job is lost (it panicked), here.
-        let h = Arc::clone(hub);
-        let (json, etag) = match crate::rt::compute(move || h.harness.list_tagged()).await {
-            Ok(listed) => listed,
-            Err(e) => {
-                tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
-                hub.harness.list_tagged()
+        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). A join reads every session's
+        // view, copies each one's info into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work
+        // change it between nearly any two reads) and digests the infos that changed. It's made here, on the request's
+        // shard, where the joins so far bound it within the shard's quantum (`Joins`; goal 9 step 3's bound on a poll),
+        // else on the compute pool (goal 10, plan 01a1a87b2dae step 5): there each read waited on two wakes across
+        // threads, a worker's and its own shard's, and on the pool's queue behind snapshots' and pages' compression
+        // (g9p16: its jobs' wait for a thread 6.9 ms at p99 calm, 25 ms with hogs, where the API's reads were to be
+        // under a millisecond at p99.9). Where the pool's job is lost (it panicked), here.
+        let ((json, etag), joined) = if JOINS.here(hyper_rt::futures::step_budget_ns()) {
+            list_timed(hub)
+        } else {
+            let h = Arc::clone(hub);
+            match crate::rt::compute(move || list_timed(&h)).await {
+                Ok(listed) => listed,
+                Err(e) => {
+                    tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
+                    list_timed(hub)
+                }
             }
         };
+        if let Some(took) = joined {
+            JOINS.took(took);
+        }
         let mut r = pre_encoded(json);
         if let Some(etag) = etag {
             r.headers_mut().insert(header::ETAG, etag);
@@ -8858,6 +8922,36 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the sessions' list's joins are learned as RFC 6298 learns a round trip: the
+    /// first sets the mean to its time and the deviation to half of it, each after moves the mean by an eighth of its
+    /// difference and the deviation by a quarter of its distance; the next join is bounded by the mean and four
+    /// deviations, and made on the request's shard only once one was learned, and only while that bound fits the shard's
+    /// quantum (never off a shard).
+    #[test]
+    fn g10_s5_the_sessions_lists_joins_are_learned_and_made_where_they_fit() {
+        let us = Duration::from_micros;
+        let j = Joins::default();
+        assert_eq!(j.bound_ns(), None);
+        assert!(!j.here(Some(266_667)), "none learned: to the compute pool, which learns it");
+        j.took(us(40));
+        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (40_000, 20_000), "R, and R/2");
+        assert_eq!(j.bound_ns(), Some(120_000), "R + 4 R/2");
+        assert!(j.here(Some(266_667)) && !j.here(Some(100_000)) && !j.here(None), "within the quantum: here; past it, or off a shard: not");
+        j.took(us(120));
+        // RTTVAR = 3/4 · 20 + 1/4 · |40 − 120| = 35 µs; SRTT = 7/8 · 40 + 1/8 · 120 = 50 µs.
+        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (50_000, 35_000));
+        assert_eq!(j.bound_ns(), Some(190_000));
+        // A list grown past the quantum's join goes off the shard, and comes back once its joins are short again.
+        for _ in 0..8 {
+            j.took(us(900));
+        }
+        assert!(!j.here(Some(266_667)), "{:?}", j.bound_ns());
+        for _ in 0..64 {
+            j.took(us(30));
+        }
+        assert!(j.here(Some(266_667)), "{:?}", j.bound_ns());
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: [`waited`] says whether what it awaited made its task wait (a poll of it was

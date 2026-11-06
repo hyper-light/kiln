@@ -2372,6 +2372,12 @@ impl Registry {
         self.sessions.owner_of(id)
     }
 
+    /// How many times the sessions' list was joined ([`Registry::list_tagged`]), so a read can tell its own join's time
+    /// from a find (goal 10, plan 01a1a87b2dae step 5).
+    pub fn list_joins(&self) -> u64 {
+        self.sessions.list_joins()
+    }
+
     /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
     /// ([`super::copies::View::info_json`]). None when there's no such session.
     pub fn info_json(&self, id: &str) -> Option<bytes::Bytes> {
