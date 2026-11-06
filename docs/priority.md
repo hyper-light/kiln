@@ -123,7 +123,8 @@ probes off, is no reading, never a breach.
   its probe runs, its lateness in the total; the hold itself is the answer only when no probe ran
   at all since the last look. In the lab such holds reached 10 to 38 ms calm, the server's own
   work, which slowing kiln's can't shorten.
-- **Its tolerance:** the shards' own clock, their probes' period (10 ms, `KILN_SHARD_PROBE_MS`):
+- **Its tolerance:** the shards' own clock, their probes' period (17.07 ms, `KILN_SHARD_PROBE_MS`; 10 ms before goal
+  9 step 5 derived it from hyper-rt's watchdog's limit, docs/runtime-lab.md):
   ready work a whole period late on average is a server behind its own work. A server probed at
   another period is measured against its own.
 - **Its window:** trouble is caught within the platform's time (1 s), as every other target's is, so
@@ -420,7 +421,7 @@ default; `"auto"` is the mode a config declares, and `"on"` (or `true`, as it wa
   2.19 ms, the same within noise), at a busy share 27% higher. So `on` isn't the bare-metal default: it needs no
   grant, but it doesn't make the bar, it costs what goal 9 step 5 cuts, and production's kernel preempts fully,
   where it would only cost.
-- **`auto`: only while the host holds the shard's wakes.** Once a period of its health probe (10 ms), on its own
+- **`auto`: only while the host holds the shard's wakes.** Once a period of its health probe (17.07 ms), on its own
   thread, each shard reads the kernel's count of how long its thread waited, runnable, for a CPU (Linux's run
   delay, `/proc/thread-self/schedstat`, a file kept open: one read), and its parks by what ended them. The
   period's wait, less what a calm CPU makes a wake by the shard's own timer wait (0.7 µs, wake-2's most with no

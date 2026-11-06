@@ -4,7 +4,8 @@
 //! A probe pinned to each shard ([`crate::rt::spawn_on`]) sleeps a period on the shard's timers and
 //! notes, as it wakes, how late it ran: work that was ready waited that long behind whatever held the
 //! shard (Node's `monitorEventLoopDelay` measures its loop the same way, sampling every 10 ms by
-//! default: research 01a1a59c2a6a, f8). Each wake it also copies, on the shard itself, what hyper-rt
+//! default: research 01a1a59c2a6a, f8; this probe's period, [`PERIOD`], is derived from what it must see,
+//! goal 9, plan 01a1a87b2cec step 5). Each wake it also copies, on the shard itself, what hyper-rt
 //! counts there (`hyper_rt::futures::shard_counters`: polls, polls that held the shard past twice its
 //! step quantum and who held them) and the CPU time of the shard's thread, into atomics of its own.
 //! `/metrics` reads only those atomics, from whatever thread serves it: reading never touches a shard,
@@ -54,17 +55,53 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::Histogram;
 
-/// How often each probe wakes, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): Node's default
-/// sampling of its loop's delay (research 01a1a59c2a6a, f8).
-pub const PERIOD: Duration = Duration::from_millis(10);
+/// How often each probe wakes, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): the longest period that still sees
+/// what the probe must (goal 9, plan 01a1a87b2cec step 5: each wake a park and a turn of the shard's loop, CPU in its
+/// busy share; 10 ms, Node's default sampling and goal 1's first pick, was about 0.001 of each shard's):
+/// - **Every hold hyper-rt's watchdog reports** ([`watchdog_limit`], `hyper_rt::watch`): it reports a poll held past
+///   its limit, a step's worth of polls each a quantum ([`crate::rt::STEP_BATCH`] × [`crate::rt::STEP_BUDGET_NS`],
+///   17.07 ms), looking every half of it. A probe due at most that long after the last is due inside every such hold,
+///   so the delay ([`DELAY_BUCKETS`]) shows each, and a hold under way shows in `kiln_shard_stalled_seconds` and in
+///   placement's overdue ([`delay_now`]) within the limit, before the watchdog's report of it.
+/// - **The lab's tail of the shards' delay** (goal 9's bar, its p99.9 over a round): kiln-lab rests a p99.9 on ten
+///   samples past it or more (`kiln-lab`'s `TAIL_REQUESTS`), so a round's window of the realistic profile (60 s, its
+///   four shards) holds 10,000 probes or more at a period up to 24 ms ([`TAIL_PROBES`], [`lab_period_bound`]).
+///
+/// The watchdog's is the shorter: the period is its limit. What reads each period stays within it too: overload's
+/// tolerance (1 s) spans 58 periods; headroom's tolerance for the server's delay is a period (`crate::headroom`); the
+/// nudge reads its shard's run wait once a period (`crate::nudge`).
+pub const PERIOD: Duration = watchdog_limit();
+
+/// hyper-rt's watchdog's limit for kiln's shards: a step's worth of polls, [`crate::rt::STEP_BATCH`], each a quantum,
+/// [`crate::rt::STEP_BUDGET_NS`] (`hyper_rt::watch`'s `limit_ns`).
+pub const fn watchdog_limit() -> Duration {
+    Duration::from_nanos(crate::rt::STEP_BUDGET_NS.saturating_mul(crate::rt::STEP_BATCH as u64))
+}
+
+/// The probes kiln-lab's p99.9 of the shards' delay rests on, ten past it or more (`kiln-lab`'s `TAIL_REQUESTS`: the
+/// fewest samples a p99.9 of its rests on).
+pub const TAIL_PROBES: u64 = 10_000;
+
+/// The longest period whose probes give kiln-lab's p99.9 of the shards' delay [`TAIL_PROBES`] in a window of `window`
+/// over `shards` shards.
+pub const fn lab_period_bound(window: Duration, shards: u64) -> Duration {
+    let window_ns = window.as_nanos();
+    Duration::from_nanos((window_ns.saturating_mul(shards as u128) / TAIL_PROBES as u128) as u64)
+}
+
+/// The oldest the copies of a shard's parks, wakes and calls may be ([`COUNTS_EVERY`]): kiln-lab reads them as
+/// differences across its window (`window_s`: 60 s, 10 s at the shortest), so a copy this old moves a window's count by
+/// 2 × 0.1 s / 10 s = 2% at the most, 0.3% over the default (goal 9, plan 01a1a87b2cec step 5).
+pub const COUNTS_AGE: Duration = Duration::from_millis(100);
 
 /// Every how many of its wakes a probe copies what its shard's parks, wakes and calls cost it ([`Wakes`], [`Calls`],
-/// [`ParkTimes`]: 34 counts) to `/metrics`, its first wake among them (goal 9, plan 01a1a87b2cec step 5): every 10th,
-/// so those families move every 100 ms at [`PERIOD`]. The lab reads them as differences across its window (kiln-lab's
-/// `window_s`: 60 s, 10 s at the shortest), so a copy up to 100 ms old moves a window's count by 2 × 0.1 s / 10 s = 2%
-/// at the most, 0.3% over the default. The delay, how late, the most late, the last wake, the CPU time and the tasks
-/// stay each wake's own: goal 9's step 1 reads those at every wake.
-pub const COUNTS_EVERY: u64 = 10;
+/// [`ParkTimes`]: 34 counts) to `/metrics`, its first wake among them (goal 9, plan 01a1a87b2cec step 5): as many whole
+/// periods as [`COUNTS_AGE`] holds (5 of 17.07 ms, every 85 ms). The delay, how late, the most late, the last wake, the
+/// CPU time and the tasks stay each wake's own: goal 9's step 1 reads those at every wake.
+pub const COUNTS_EVERY: u64 = {
+    let every = COUNTS_AGE.as_nanos() / PERIOD.as_nanos();
+    if every == 0 { 1 } else { every as u64 }
+};
 
 /// How late a probe ran, in seconds (goal 9, plan 01a1a87b2cec step 1): a shard's ready work is to run within
 /// a millisecond at p99.9 (Ada, 2026-11-05), so the buckets resolve that millisecond: 25 µs apart to 250 µs,
@@ -1004,6 +1041,27 @@ mod tests {
         ] {
             assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the probes' period is the longest that sees what they must: hyper-rt's
+    /// watchdog's limit as the shards' runtime is configured with it (a probe is due inside every hold it reports), and
+    /// within the lab's tail of the shards' delay (kiln-lab's realistic profile, a 60 s window across the lab's four
+    /// shards, `crate::os::alloc::SHARDS`: ten probes past its p99.9 or more); the copies of a shard's counts as many
+    /// whole periods apart as their age allows; overload's tolerance many periods long.
+    #[test]
+    fn g9_s5_the_probes_period_sees_every_hold_the_watchdog_reports_and_the_labs_tail() -> anyhow::Result<()> {
+        let c = crate::rt::runtime_config(4, 64);
+        let limit = Duration::from_nanos(c.step_budget_ns.saturating_mul(u64::try_from(c.batch)?));
+        anyhow::ensure!(PERIOD == limit && PERIOD == watchdog_limit(), "the watchdog's limit: {PERIOD:?} against {limit:?}");
+        let lab = lab_period_bound(Duration::from_secs(60), u64::from(crate::os::alloc::SHARDS));
+        anyhow::ensure!(PERIOD <= lab && lab == Duration::from_millis(24), "within the lab's tail: {PERIOD:?}, its bound {lab:?}");
+        let probes = Duration::from_secs(60).as_nanos() * u128::from(crate::os::alloc::SHARDS) / PERIOD.as_nanos();
+        anyhow::ensure!(probes >= u128::from(TAIL_PROBES), "{probes} probes a round");
+        let every = u32::try_from(COUNTS_EVERY)?;
+        anyhow::ensure!(PERIOD * every <= COUNTS_AGE && PERIOD * (every + 1) > COUNTS_AGE, "copies {every} periods apart");
+        let tolerance = Duration::from_millis(u64::from(crate::headroom::settings::PLATFORM_TOLERANCE_MS));
+        anyhow::ensure!(tolerance.as_nanos() / PERIOD.as_nanos() == 58, "overload's tolerance: {} periods", tolerance.as_nanos() / PERIOD.as_nanos());
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5, the probe's own cost cut with its samples as step 1 has them: a probe on a
