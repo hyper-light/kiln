@@ -2773,8 +2773,8 @@ impl Registry {
             self.asked.forget(id);
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
-        } else if changed && let Some(m) = s.get(id) {
-            hub.emit_harness(id, m.info_encoded());
+        } else if changed && let Some(m) = s.get_mut(id) {
+            m.harness_at = hub.emit_harness(id, m.info_encoded(), m.harness_at);
         }
         if let Some(c) = thaw {
             s.want_thaw(id, c);
@@ -4729,6 +4729,28 @@ mod tests {
             let (_, meta_made, _) = held().await;
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: each change of a session's info lets go of its last `harness` frame in the
+    /// events socket's feed (`crate::wire::events::feed::Feed::push_over`): its copy keeps the newest frame's number,
+    /// and a page reading the feed from before them all is sent the newest alone.
+    #[test]
+    fn g11_s5_a_sessions_info_frame_lets_go_of_its_last_in_the_feed() -> anyhow::Result<()> {
+        use crate::harness::model::State;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let from = hub.feed.head();
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let at = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.harness_at)).await.flatten().unwrap_or_default() };
+            let mut ats = vec![at().await];
+            for summary in ["one", "two", "three"] {
+                hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State { summary: summary.into(), ..State::default() }) }).await;
+                ats.push(at().await);
+            }
+            anyhow::ensure!(ats.windows(2).all(|w| w.first() < w.get(1)) && ats.first().is_some_and(|a| *a > from), "the copy keeps each frame's number: {ats:?} after {from}");
+            let crate::wire::events::feed::Since::Frames(frames) = hub.feed.since(from) else { anyhow::bail!("a gap in the feed") };
+            let infos: Vec<u64> = frames.iter().filter(|f| f.text.starts_with(r#"{"type":"harness","info":{"id":"s""#)).map(|f| f.seq).collect();
+            anyhow::ensure!(infos.len() == 1 && infos.first() == ats.last(), "the session's info frames a page reads: {infos:?}, its newest {:?}", ats.last());
             Ok(())
         })
     }

@@ -1066,11 +1066,14 @@ impl Hub {
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
     /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5), on the session's
     /// lane of [`Hub::harness_events`] (goal 4, plan 01a1a59c2a9c step 5). Made always: the feed keeps it for
-    /// the pages that resume (W21-R15).
-    pub fn emit_harness(&self, id: &str, info_json: &[u8]) {
+    /// the pages that resume (W21-R15). `was`: the feed's number of the session's last such frame (0: none),
+    /// which this one says again whole, so the feed lets go of it (goal 11, plan 01a1a87b2e56 step 5:
+    /// `crate::wire::events::feed::Feed::push_over`). This one's number, for the next.
+    pub fn emit_harness(&self, id: &str, info_json: &[u8], was: u64) -> u64 {
         let frame = crate::wire::events::harness_frame(info_json);
-        self.feed.push(Arc::clone(&frame));
+        let seq = self.feed.push_over(Arc::clone(&frame), was);
         self.emit_session(id, frame);
+        seq
     }
 
     /// Session `id`'s event `text`, if anyone reads them, on the session's lane: its owner shard's (goal 4,
@@ -4622,7 +4625,7 @@ pub(crate) mod tests {
             for id in ids {
                 let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() };
                 hub.emit(&ServerEvent::Harness { info: Box::new(info.clone()) });
-                hub.emit_harness(id, &serde_json::to_vec(&info)?);
+                hub.emit_harness(id, &serde_json::to_vec(&info)?, 0);
                 hub.emit(&ServerEvent::HarnessClosed { id: id.into() });
             }
             hub.emit(&ServerEvent::Updates);
