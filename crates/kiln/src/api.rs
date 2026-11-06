@@ -7766,10 +7766,13 @@ mod tests {
             let (held, holding) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
             let (free, freed) = std::sync::mpsc::channel::<()>();
             let busy = hub.store.clone();
+            // Held until the test lets it go, or a hang's bound: a loaded machine's test may take what time it takes
+            // to get there, and a hold that ended first let every row through ("their rows didn't wait for room").
+            let hang = Duration::from_secs(300);
             let hold = crate::rt::spawn(async move {
                 busy.call(move |_| {
                     let _ = held.send_blocking(());
-                    let _ = freed.recv_timeout(Duration::from_secs(30));
+                    let _ = freed.recv_timeout(hang);
                     Ok(())
                 })
                 .await
@@ -7789,14 +7792,23 @@ mod tests {
                     anyhow::Ok(())
                 }
             });
+            // The room filled (however long a loaded machine takes to get there), then a moment more for any row past
+            // it to show: none goes.
+            let filled = Instant::now() + hang;
+            while went.load(Ordering::Acquire) < AUDITS_WAITING && Instant::now() < filled {
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
             crate::rt::sleep(Duration::from_millis(300)).await;
             let gone = went.load(Ordering::Acquire);
+            anyhow::ensure!(gone >= AUDITS_WAITING, "only {gone} commands went with the store held: their room never filled");
             anyhow::ensure!(gone <= AUDITS_WAITING + 1, "{gone} commands went with the store held: their rows didn't wait for room");
             let _ = free.send(());
             commands.await.map_err(|_| anyhow::anyhow!("the commands never went"))??;
             let mut q = HashMap::new();
             q.insert("limit".to_owned(), "1000".to_owned());
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // Every row, however long a loaded machine's store takes to write them (10 s ran out at 33 of 264): the
+            // wait ends once they're all there, or once no more came for a hang's bound.
+            let (mut seen, mut deadline) = (0, Instant::now() + hang);
             let written = loop {
                 let all = crate::audit::list(&hub.store, &q).await?;
                 let mut written: Vec<String> = all
@@ -7810,6 +7822,9 @@ mod tests {
                 written.reverse();
                 if written.len() >= rows || Instant::now() > deadline {
                     break written;
+                }
+                if written.len() > seen {
+                    (seen, deadline) = (written.len(), Instant::now() + hang);
                 }
                 crate::rt::sleep(Duration::from_millis(50)).await;
             };
