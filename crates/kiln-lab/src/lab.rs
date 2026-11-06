@@ -1770,6 +1770,45 @@ mod tests {
         assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
     }
 
+    /// The lab writes no number that isn't finite (main's ask, 2026-11-06). In g9p35's round 5 a bus delivery took longer
+    /// than `kiln_bus_delivery_seconds`'s last bound, so `bus.delivery_top_ms`, the histogram's top, was `+Inf`, which
+    /// serde_json writes as null, and kiln-lab's report and table then refused the run (`invalid type: null, expected
+    /// f64`). Now such a number is absent (the quantiles, finite, stay), and a run.json written before, its null in it,
+    /// reads back without it.
+    #[test]
+    fn a_number_past_a_histograms_last_bound_is_absent_and_an_old_null_reads_back() {
+        let scrape = |a: u32, b: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_bus_delivery_seconds_bucket{{le=\"0.001\"}} {a}\nkiln_bus_delivery_seconds_bucket{{le=\"1\"}} {b}\nkiln_bus_delivery_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(5, 9, 10), 60.0);
+        assert!(n.values().all(|v| v.is_finite()), "{n:?}");
+        assert_eq!(n.get("bus.delivery_top_ms"), None, "past the last bound: {n:?}");
+        assert_eq!(n.get("bus.delivery_p99_ms"), Some(&1000.0), "{n:?}");
+        let round = Round {
+            build: "b".to_owned(),
+            index: 5,
+            hogs: 0,
+            machine: Machine::default(),
+            fill_s: 1.0,
+            shards: 4,
+            numbers: BTreeMap::from([("server.rss_mb".to_owned(), 296.0)]),
+            seen: BTreeMap::new(),
+            held: Vec::new(),
+            fill_held: Vec::new(),
+            quantum_us: None,
+            locks: BTreeMap::new(),
+        };
+        let mut written = serde_json::to_value(&round).unwrap_or_default();
+        if let Some(numbers) = written.get_mut("numbers").and_then(Value::as_object_mut) {
+            numbers.insert("bus.delivery_top_ms".to_owned(), Value::Null);
+        }
+        let back = serde_json::from_value::<Round>(written).map_err(|e| e.to_string());
+        assert_eq!(back.as_ref().map(|r| r.numbers.clone()), Ok(BTreeMap::from([("server.rss_mb".to_owned(), 296.0)])), "an old null reads back as no number");
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
     /// the server's histogram of it between the window's two scrapes.
     #[test]
