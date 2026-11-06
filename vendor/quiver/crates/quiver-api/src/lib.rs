@@ -61,6 +61,16 @@ impl Class {
         Self::Windowed,
     ];
 
+    /// The largest payload a message of the class takes: [`PAYLOAD_MAX`], less what Focal's batch
+    /// frames it in for the classes Focal's replicated part keeps ([`BATCH_FRAMING_MAX`]).
+    #[must_use]
+    pub const fn payload_max(self) -> usize {
+        match self {
+            Self::Ephemeral | Self::Windowed => PAYLOAD_MAX,
+            Self::Replicated | Self::Persisted => PAYLOAD_MAX.saturating_sub(BATCH_FRAMING_MAX),
+        }
+    }
+
     /// Its name, as docs and refusals say it.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -89,6 +99,11 @@ pub const NAME_MAX: usize = 128;
 pub const KEY_MAX: usize = 1024;
 /// Largest payload: nats-server's `MAX_PAYLOAD_SIZE`, Focal's largest batch (Focal's doc 32, §4.3).
 pub const PAYLOAD_MAX: usize = 1 << 20;
+/// The most bytes beside its payload a message takes in the Focal batch the replicated and
+/// persisted classes replicate it as, whose largest is [`PAYLOAD_MAX`] (Focal's `BATCH_BOUND`): the
+/// batch's header (56), its record's head (20 at most), Quiver's key framing (2 for the longest key)
+/// and the longest key. `quiver`'s tests hold it to Focal's constants.
+pub const BATCH_FRAMING_MAX: usize = 56 + 20 + 2 + KEY_MAX;
 /// Most messages one read returns.
 pub const READ_MAX: usize = 1000;
 /// Most messages a topic may keep.
@@ -203,6 +218,9 @@ pub enum Refusal {
     Unsupported(Class),
     /// The implementation is closed, or can't be reached: why.
     Unavailable(String),
+    /// The topic's group has no leader a request could reach, a quorum of its nodes not up (why):
+    /// what was refused was never sent, so nothing of it is kept.
+    NoQuorum(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -221,6 +239,7 @@ impl std::fmt::Display for Refusal {
             ),
             Self::Unsupported(class) => write!(f, "the {} class isn't served here", class.name()),
             Self::Unavailable(why) => write!(f, "unavailable: {why}"),
+            Self::NoQuorum(why) => write!(f, "no quorum: {why}"),
         }
     }
 }
@@ -329,7 +348,8 @@ pub fn check_topic(topic: &Topic) -> Result<(), Refusal> {
 }
 
 /// The bytes a message counts against its topic's retention: its key's and its payload's. Refuses
-/// a key over [`KEY_MAX`], a payload over [`PAYLOAD_MAX`], and a message the topic can't keep.
+/// a key over [`KEY_MAX`], a payload over its class's [`Class::payload_max`], and a message the
+/// topic can't keep.
 pub fn check_message(topic: &Topic, key: Option<&[u8]>, payload: &[u8]) -> Result<u64, Refusal> {
     let size = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     let key_len = key.map_or(0, <[u8]>::len);
@@ -340,11 +360,12 @@ pub fn check_message(topic: &Topic, key: Option<&[u8]>, payload: &[u8]) -> Resul
             limit: size(KEY_MAX),
         });
     }
-    if payload.len() > PAYLOAD_MAX {
+    let payload_max = topic.class.payload_max();
+    if payload.len() > payload_max {
         return Err(Refusal::TooLarge {
             what: "a payload",
             size: size(payload.len()),
-            limit: size(PAYLOAD_MAX),
+            limit: size(payload_max),
         });
     }
     let bytes = size(key_len).saturating_add(size(payload.len()));
