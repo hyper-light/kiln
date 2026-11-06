@@ -1125,6 +1125,19 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             n.insert(format!("server.memory.{owner}_mb"), b / 1e6);
         }
     }
+    // What the allocator holds by kind, and its slack (`active` less `allocated`: room left in its pages and slabs),
+    // where the build says them (`kiln_memory_allocator_bytes`, jemalloc's statistics; goal 11, plan 01a1a87b2e56
+    // step 5): each arm of the A/B of jemalloc's settings moves one of them, and what A holds of each says which arms
+    // can move anonymous memory beyond noise (docs/runtime-lab.md).
+    let allocator = |kind: &str| after.get("kiln_memory_allocator_bytes", &[("kind", kind)]);
+    for kind in after.values_of("kiln_memory_allocator_bytes", "kind") {
+        if let Some(b) = allocator(&kind) {
+            n.insert(format!("server.allocator.{kind}_mb"), b / 1e6);
+        }
+    }
+    if let (Some(active), Some(allocated)) = (allocator("active"), allocator("allocated")) {
+        n.insert("server.allocator.slack_mb".into(), (active - allocated) / 1e6);
+    }
     let shards = server_numbers(&mut n, "", before, after, secs);
     per_request_wakes(&mut n, before, after, requests);
     per_request_pools(&mut n, before, after, requests);
@@ -1511,6 +1524,32 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a round reports what the allocator holds at the window's end, by kind and its
+    /// slack (`active` less `allocated`), in MB, so the A/B of jemalloc's settings compares each; a build whose
+    /// allocator says nothing (glibc's malloc, musl's) reports none of them.
+    #[test]
+    fn g11_s5_a_round_reports_what_the_allocator_holds_by_kind() {
+        let scrape = |says: bool| {
+            let mut t = String::from("process_resident_memory_bytes 300000000\n");
+            if says {
+                for (kind, bytes) in [("allocated", 90_000_000), ("thread_caches", 6_000_000), ("active", 100_000_000), ("dirty", 20_000_000), ("muzzy", 0)] {
+                    t.push_str(&format!("kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(true), &scrape(true), 60.0);
+        let at = |k: &str| n.get(k).copied();
+        assert_eq!(
+            [at("server.allocator.allocated_mb"), at("server.allocator.thread_caches_mb"), at("server.allocator.active_mb"), at("server.allocator.dirty_mb"), at("server.allocator.muzzy_mb")],
+            [Some(90.0), Some(6.0), Some(100.0), Some(20.0), Some(0.0)]
+        );
+        assert_eq!(at("server.allocator.slack_mb"), Some(10.0));
+        assert_eq!(crate::lab::better("server.allocator.dirty_mb"), crate::stats::Better::Lower, "less held is better");
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(false), &scrape(false), 60.0);
+        assert!(n.contains_key("server.rss_mb") && !n.keys().any(|k| k.starts_with("server.allocator.")), "{:?}", n.keys().collect::<Vec<_>>());
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a round reports the runner's hold of its updates beside the server's time

@@ -1741,7 +1741,8 @@ a job frees is idle until the next job of its kind. It saves about four fifths o
 share one arena's locks among the jobs running at once (up to 54): watch the store's and the snapshots' jobs
 (API writes, attach, `blocking.<share>.little_p99`). Unset, as by default, nothing changes.
 
-**The A/B to run**, one build (this branch's musl-jemalloc release build), A without a variant and B with
+**The A/B to run** (replaced by "The A/B of jemalloc's settings: the lab plan" at the end of this goal's section,
+whose values are derived), one build (this branch's musl-jemalloc release build), A without a variant and B with
 one, 8 rounds calm, the winners again with hogs:
 1. Any A/B of this build reads `kiln_memory_allocator_bytes` at the window's end: the split above, which says
    which of these can matter.
@@ -1857,7 +1858,7 @@ connection, the bus 12.2 MB at its busiest second of a 171 MiB bound reckoned fo
 topic 3.7 MB at the most of 5 MiB). `custody_receipts` reached 4.6 MB (a hogs round) of 64 MiB. What's resident and
 unbounded in bytes was the feed (cut above) and the copies' metas, bounded by `MAX_EVENTS` a copy.
 
-**The A/B for jemalloc's share, in order** (part 4's arms below replace this order: their values are derived; the build: rt-next with this step's branches merged, its static
+**The A/B for jemalloc's share, in order** ("The A/B of jemalloc's settings: the lab plan" below replaces this order: its values are derived; the build: rt-next with this step's branches merged, its static
 musl build with jemalloc; A without a variant, B with it; 8 rounds calm, a winner again with hogs):
 1. Any A/B first reads `kiln_memory_allocator_bytes{kind}` at the window's end, A's rounds: live =
    `allocated` - `thread_caches`; `thread_caches`; slack = `active` - `allocated`; `dirty`; `metadata`; not
@@ -2111,7 +2112,7 @@ LD_LIBRARY_PATH=$PERF_LIBS $PERF record -e cycles:u -j any,u -o $L/smoke.data --
      -maxdepth 1 -type f -regextype posix-extended -regex '.*/kiln-[0-9a-f]+' -delete`), since cargo doesn't know an
      order changed.
 
-### The vendored projects' memory as kiln sets it, and the A/B of jemalloc's settings (step 5, part 4)
+### The vendored projects' memory as kiln sets it (step 5, part 4)
 
 **What sizes each.** The vendored projects' sites below held about 31 MB of train 4's heap profile (the realistic
 profile, calm), and turso's arenas about 8 MB outside jemalloc. What kiln sets of each, and what it can change:
@@ -2187,51 +2188,91 @@ copy is Kiln DB's to change. Each with its derivation and what it would save in 
    2 MB of 6); without, only the pages its page cache and WAL writes use. Up to the 8 MB, less what those use.
 4. hyper-transport: a lane's queue made as it fills (`VecDeque::new`), not at its window: 48 KiB a lane opened.
 
-**The A/B of jemalloc's settings.** Each arm is one environment variable on the build the lab measures, read as
-the server starts, against step 4's settings as compiled in (`os::alloc::JEMALLOC_CONF`), so it needs no rebuild:
-jemalloc's settings as `_RJEM_MALLOC_CONF` (this build's jemalloc is prefixed: it never reads `MALLOC_CONF`, and the
-server's log says so where it's set), and the blocking pool's arena as `KILN_ALLOC_POOL_DECAY_MS`. The arms are
-`os::alloc::ARMS`, whose tests hold each value to its derivation and this table to them:
+**The A/B of jemalloc's settings**, for what jemalloc keeps of all this, is the next section's lab plan.
 
-| Arm | B's environment | Derived from | Moves | Expect |
-| --- | --- | --- | --- | --- |
-| `subsecond-decay` | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500` | twice the realistic profile's slowest sub-second client (MCP calls 250 ms apart; reads 50, pages 100, a turn's events 25): what that work frees waits for its next call, and what attaches and turns free (2.5 to 3 s apart, step 4's basis) goes | `dirty` | about nine tenths of `dirty` off; an attach's snapshot and a turn's packed chunks fault their pages in anew |
-| `pool-subsecond-decay` | `--env-b KILN_ALLOC_POOL_DECAY_MS=500` | the same decay for the blocking pool's arena alone; the shards' arenas keep 5 s, and the pools' workers go cold after it as before | the pool's share of `dirty` | in `subsecond-decay`'s place if that one is worse beyond noise |
-| `slab-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:14336` | jemalloc's largest size cut from a slab with 4 KiB pages (`SC_SMALL_MAXCLASS`): past it each allocation is a run of whole pages, and a thread's cache keeps whole pages a slot (20 of each of 16 to 32 KiB: 2.4 MB a thread that used them) | `thread_caches` | what `thread_caches` holds of 16 to 32 KiB |
-| `page-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:4096` | a page, TUNING.md's memory-first pick: only after `slab-caches`, where `thread_caches` still holds 2 MB or more | `thread_caches` | what it holds of 5 to 14 KiB (20 of each: 1.3 MB a thread) |
-| `one-arena` (a reading) | `--env-b _RJEM_MALLOC_CONF=narenas:1` | the floor of `narenas`: step 4's 5 are the shards and one more | `active - allocated`, and `dirty` kept apart by arena | up to four fifths of the slack; its cost is the shards' waits on one another's arenas |
-| `no-decay` (a reading) | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:0` | the floor of the decay: every free purged at once, on the thread that frees | `dirty` | the floor of `dirty`, and what purging costs a shard's slow polls |
-| `inline-purge` (a reading) | `--env-b _RJEM_MALLOC_CONF=background_thread:false` | step 4's basis for its background threads: without them an arena purges only as it's used | `dirty` (up) | what the background threads purge that the arenas' own ticks don't |
+### The A/B of jemalloc's settings: the lab plan (step 5)
 
-`muzzy_decay_ms` has no arm: 0 by what resident memory counts, which a page given back lazily (`MADV_FREE`) stays in
-until the kernel takes it. A pool's worker goes cold after the decay jemalloc took (`os::alloc::cold_after`), at
-least the 100 ms its background threads sleep at the least, so a decay's arm moves the pools' cold-after with it.
+It decides, for each of the five settings that decide what jemalloc keeps, whether step 4's value stays or another
+goes in its place: `dirty_decay_ms`, `muzzy_decay_ms`, `narenas` and `background_thread` as step 4 compiled them in
+(`os::alloc::JEMALLOC_CONF`: `background_thread:true,narenas:5,dirty_decay_ms:5000,muzzy_decay_ms:0,thp:never`), and
+`tcache_max`, which step 4 left at jemalloc's 32768. Each arm is one environment variable the server reads as it
+starts, so A and B are one binary, A as compiled and B with the arm, and nothing is rebuilt. jemalloc's settings go
+as `_RJEM_MALLOC_CONF` (this build's jemalloc is prefixed and never reads `MALLOC_CONF`; the server's log says so
+where it's set), the blocking pool's arena as `KILN_ALLOC_POOL_DECAY_MS`. The arms are `os::alloc::ARMS`, whose tests
+hold each value to its derivation and this section to them.
 
-How to run them (the build: production's static musl build with jemalloc; 8 rounds, calm, production's layout):
+**What each round measures**, at the window's end:
+- anonymous memory (`server.rss_anon_mb`): the part of the bar's `server.rss_mb` the settings can move;
+- what jemalloc holds (`server.allocator.<kind>_mb`, from `kiln_memory_allocator_bytes{kind}`): `allocated`,
+  `thread_caches`, `active`, `dirty`, `muzzy`, `metadata`, `resident`, and `slack`, `active` less `allocated` (the
+  room left in its pages and slabs). kiln-lab records them from this branch's tree on; an older kiln-lab doesn't;
+- every latency number kiln-lab compares, the server's CPU a request (what purges and pages faulted in anew cost),
+  and the shards' slow polls.
+
+| Setting, step 4's | Arm | B's environment | Derived from | Moves: expect | Watch |
+| --- | --- | --- | --- | --- | --- |
+| `dirty_decay_ms`, 5000 | `subsecond-decay` | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500` | twice the realistic profile's slowest sub-second client, its MCP calls 250 ms apart (readers ask every 50 ms, pages load every 100, a turn's events come 25 ms apart). jemalloc keeps about what was freed in the last half of its decay (its curve's mean is a half), here 250 ms of frees, which each such client's next call reuses; what attaches (one every 2.5 s: 8 viewers, 20 s each) and turns (each working session's every 3 s: 40 events 25 ms apart, then 2 s) free goes | `dirty`: about nine tenths of it off, as what's kept at an even rate of frees is in proportion to the decay | attach p50 and p99 (a snapshot's pages faulted in anew), API writes' p50, CPU a request; and slow polls, as the background threads purge up to ten times as often (each sleeps the decay's length while its arenas hold at most 1,024 dirty pages, 100 ms at the least) and each purge's `madvise` reaches the CPUs the server's threads run on |
+| | `pool-subsecond-decay` | `--env-b KILN_ALLOC_POOL_DECAY_MS=500` | the same decay for the blocking pool's arena alone: the shards' arenas keep 5 s, and the pools' workers go cold after 5 s as before | the pool's share of `dirty`: in `subsecond-decay`'s place where that one is worse beyond noise | `blocking.<share>.little_p99`, API writes, attach: the store's and the snapshots' jobs share one arena's locks |
+| | `no-decay` (a reading) | `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:0` | the decay's floor: every free purged at once, on the thread that frees (`arena_handle_deferred_work`), a shard among them | `dirty`: its floor | slow polls, frames' p99.9 |
+| `muzzy_decay_ms`, 0 | `lazy-free` (a reading) | `--env-b _RJEM_MALLOC_CONF=muzzy_decay_ms:5000` | the muzzy decay TUNING.md pairs with the dirty decay kiln keeps: its memory-first example sets both to 5 s, its CPU-first one both to 30 s, and step 4 took the dirty decay alone. What the dirty decay purges then goes with `MADV_FREE` first, stays `muzzy` up to 5 s more, then goes with `MADV_DONTNEED` | `muzzy`, up, and anonymous memory about as much: a page given back lazily stays resident until the kernel wants memory, which on the lab's machine it doesn't; what it saves is a page reused before the kernel takes it, which isn't faulted in again | attach p50 and CPU a request, better if anything |
+| `narenas`, 5 | `one-arena` (a reading) | `--env-b _RJEM_MALLOC_CONF=narenas:1` | the floor, every thread in one arena. jemalloc gives a thread the arena with the fewest threads as it first allocates (`arena_choose_hard`), so each of step 4's 5 serves about a fifth of the server's 88 threads, shards and pools' workers alike, its slabs and dirty pages its own | `slack`, and `dirty` kept apart by arena: up to four fifths of each | bus delivery p99, runners' messages p99 (glibc's 2 arenas doubled the first), slow polls: every cache refill and flush, and every allocation past `tcache_max`, takes the one arena's locks |
+| | `bisect-arenas` | `--env-b _RJEM_MALLOC_CONF=narenas:3` | midway between the floor and step 4's, (1 + 5) / 2: only where `one-arena` took anonymous memory off beyond noise and a latency number was worse beyond it | `slack`: about half what `one-arena` took | as `one-arena` |
+| `tcache_max`, 32768 (jemalloc's) | `slab-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:14336` | jemalloc's largest size cut from a slab with 4 KiB pages (`SC_SMALL_MAXCLASS`): past it each allocation is a run of whole pages, and a thread's cache keeps 20 of each size up to 32 KiB, 2.4 MB a thread that used the five from 16 to 32 KiB | `thread_caches`: what they held of 16 to 32 KiB | API reads' p99.9, websocket frames' p99: an allocation of 16 to 32 KiB (a growing buffer's steps among them) takes its arena's lock |
+| | `page-caches` | `--env-b _RJEM_MALLOC_CONF=tcache_max:4096` | a page, TUNING.md's memory-first pick: after `slab-caches`, only where `thread_caches` still held more than the noise | `thread_caches`: what they held of 5 to 14 KiB, 20 of each of its 7 sizes, 1.3 MB a thread | as `slab-caches`, and an allocation of those sizes takes its bin's lock |
+| `background_thread`, true | `inline-purge` (a reading) | `--env-b _RJEM_MALLOC_CONF=background_thread:false` | its other value, step 4's basis for the threads: without them an arena purges only as it's used, on the thread whose allocation moves its decay on (`PAC_PURGE_ON_EPOCH_ADVANCE`), and an idle arena not at all | `dirty`, up: what idle arenas keep; and jemalloc's 4 threads gone | slow polls, frames' p99.9: purges inline on the shards |
+
+**The order**, each A/B 8 rounds calm in production's layout, A and B interleaved (about 25 minutes):
+1. The first A/B is `subsecond-decay`'s. Its A rounds give the medians of `server.allocator.<kind>_mb`, and its report
+   anonymous memory's noise: the `server.rss_anon_mb` row's ± share of A's median, in MB. An arm takes off no more
+   than the kind that bounds it held in A's rounds, so one whose kind held less than that noise can't show beyond it,
+   and isn't run: `dirty` bounds the decays' arms, `inline-purge`'s and `lazy-free`'s (what leaves `dirty` is what
+   goes muzzy); `thread_caches` the caches'; `slack` the arenas'.
+2. Each B's server log says what jemalloc took: `jemalloc 5.3 allocates (<settings>: kiln's <step 4's>, then
+   _RJEM_MALLOC_CONF's <the arm>)`; for `tcache_max`, `past kiln's settings, tcache_max:<the arm> (jemalloc's
+   32768)`; for the pool's arena, `the blocking pool's workers allocate in an arena of their own (<index>), its dirty
+   pages kept 500 ms`. A round whose log doesn't say it measured nothing.
+3. The candidates. One is kept where anonymous memory falls beyond noise and no latency number is worse beyond noise,
+   and from then on rides on both sides of every candidate's A/B (`--env-a` and `--env-b`, settings joined by commas):
+   `subsecond-decay`, or `pool-subsecond-decay` in its place where it's worse; then `slab-caches`; then `page-caches`,
+   where `thread_caches` still held more than the noise.
+4. The readings, once each, against step 4's as compiled in (no `--env-a`): `one-arena`, `no-decay`, `inline-purge`,
+   `lazy-free`. They say what step 4's values cost and keep. One that takes anonymous memory off beyond noise with no
+   latency number worse beyond noise is a candidate after all, its value the reading's. Where `one-arena` takes it off
+   but a latency number is worse beyond noise, `bisect-arenas` runs next, as a candidate. `lazy-free` can't take
+   memory off in the lab: it goes in only where anonymous memory holds within noise and a latency number is better
+   beyond noise.
+5. The picks together, 8 rounds with hogs (`--hogs 1x`), against step 4's: held there, they go into
+   `os::alloc::JEMALLOC_CONF` (`tcache_max` too, where it's picked), whose test holds the string to what the lab ran.
+   With none picked, step 4's stand, and this section gets each arm's numbers.
+
+How to run them (the build: production's static musl build with jemalloc, of a tree with this branch; kiln-lab of
+the same tree):
 
 ```sh
+# the candidates (3), in order
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b subsecond-decay --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500 --server-cpus 16-31 --layout production --rounds 8
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b pool-subsecond-decay --env-b KILN_ALLOC_POOL_DECAY_MS=500 --server-cpus 16-31 --layout production --rounds 8
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b slab-caches --env-b _RJEM_MALLOC_CONF=tcache_max:14336 --server-cpus 16-31 --layout production --rounds 8
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b page-caches --env-b _RJEM_MALLOC_CONF=tcache_max:4096 --server-cpus 16-31 --layout production --rounds 8
+# a kept candidate on both sides: slab-caches once subsecond-decay is kept
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a subsecond-decay --label-b slab-caches --env-a _RJEM_MALLOC_CONF=dirty_decay_ms:500 --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500,tcache_max:14336 --server-cpus 16-31 --layout production --rounds 8
+# the readings (4), against step 4's; bisect-arenas only on one-arena's result, any picks so far on both sides as above
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b one-arena --env-b _RJEM_MALLOC_CONF=narenas:1 --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b bisect-arenas --env-b _RJEM_MALLOC_CONF=narenas:3 --server-cpus 16-31 --layout production --rounds 8
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b no-decay --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:0 --server-cpus 16-31 --layout production --rounds 8
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b inline-purge --env-b _RJEM_MALLOC_CONF=background_thread:false --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b lazy-free --env-b _RJEM_MALLOC_CONF=muzzy_decay_ms:5000 --server-cpus 16-31 --layout production --rounds 8
+# the picks with hogs (5), for example subsecond-decay and slab-caches
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a step4 --label-b picks --env-b _RJEM_MALLOC_CONF=dirty_decay_ms:500,tcache_max:14336 --server-cpus 16-31 --layout production --rounds 8 --hogs 1x
 ```
 
-In order:
-1. From the first A/B's A rounds, `kiln_memory_allocator_bytes{kind}` at the window's end: `dirty`,
-   `thread_caches`, and `active` less `allocated`. An arm whose part held under 2 MB is skipped.
-2. Each B's server log says what jemalloc took: `jemalloc 5.3 allocates (<settings>: kiln's <step 4's>, then
-   _RJEM_MALLOC_CONF's <the arm>)`, or for `tcache_max` `past kiln's settings, tcache_max:<the arm> (jemalloc's
-   32768)`. A round whose log doesn't say it measured nothing.
-3. A candidate is kept where anonymous memory falls beyond noise and no latency number is worse beyond noise:
-   `subsecond-decay` (or `pool-subsecond-decay` in its place), then `slab-caches` against it, the pick so far on
-   both sides (`--env-a` and `--env-b` both carry it, settings joined by commas), then `page-caches` if it's due.
-4. The readings once each: they say what step 4's settings cost and keep. One that saves beyond noise with no latency
-   number worse beyond noise is a candidate after all, its value the reading's.
-5. The picks together, 8 rounds with hogs (`--hogs 1x`); held there, they go into `os::alloc::JEMALLOC_CONF`,
-   whose test holds the string to what the lab ran.
+At most ten A/Bs (four candidates, five readings, the picks with hogs), about four hours; the noise rule (1) and the
+conditions (3, 4) leave out what can't show. What they can give the bar: at most what `dirty`, `thread_caches` and
+`slack` hold, est. 30 to 50 MB (part 3, "What 113 MB takes"), against the 96 to 101 MB of anonymous memory the bar
+leaves; the rest is the live heap's. Production's host differs from the lab's machine in two ways the plan accounts
+for: it gives every anonymous mapping huge pages, which step 4's `thp:never` keeps off jemalloc's mappings, so a
+purge there gives back what it gives back in the lab; and its memory is tight, so the kernel takes `MADV_FREE`'d
+pages there sooner than in the lab, and `lazy-free` costs it less than the lab measures.
 
 ### Kiln's own holders, the next cuts (step 5, part 5)
 
@@ -2244,7 +2285,7 @@ there is what it saves of its class: both figures are given where they differ (j
 | Cut | Est. MB, lab (production) | Basis |
 | --- | --- | --- |
 | A copy's meta is 72 bytes, not 88: it keeps no offset (where an event's text begins among its chunk's texts is reckoned from the lengths before it, at most 70: `Chunk::off`, `Chunk::span`), and says whether its event has a number in its length's top bit (no text is 2^63 bytes), where an `Option<u64>` took 16 | 1.4 jemalloc, 0.75 glibc (2.4) | A compact or spilled chunk keeps its 70 metas in one allocation: 6,160 bytes at 88, jemalloc's 7,168-byte class (and at 96 the same: part 4's digest cut saved nothing there on jemalloc), 5,040 at 72, its 5,120-byte class: 2 KiB a chunk. glibc: 16 bytes a meta |
-| The newest compact chunk keeps of its texts only those its copy's newest page's reads reached back to (`Chunk::page_texts`), not the whole chunk's | 0.6 (0.1 to 0.2) | A page of 50 with k events in the open chunk takes the compact chunk's last 50 - k; a page that reaches less far takes a slice of what's kept, one that reaches further inflates it again and keeps from there. Simulated over the lab's turns (40 events 25 ms apart, then 1.5 to 2.5 s) and reads (12 a second over 32 sessions): 15.8 events kept on average, where the whole chunk's were kept for 36.2, of 70, for each of the 8 copies at work. The UI's pages of 100 reach further |
+| The newest compact chunk keeps of its texts only those its copy's newest page's reads reached back to (`Chunk::page_texts`), not the whole chunk's; and the texts a compaction makes for a read copy's next compact chunk (goal 10's `Chunk::warm`) begin where the reads reached in the chunk before it (`Chunk::page_reach`) | 0.6 (0.1 to 0.2) | A page of 50 with k events in the open chunk takes the compact chunk's last 50 - k; a page that reaches less far takes a slice of what's kept, one that reaches further inflates it again (off the shard: goal 10's `Unread::Unkept`) and keeps from there. Simulated over the lab's turns (40 events 25 ms apart, then 1.5 to 2.5 s) and reads (12 a second over 32 sessions), before `warm`: 15.8 events kept on average, where the whole chunk's were kept for 36.2, of 70, for each of the 8 copies at work. With `warm`, each read copy keeps texts from compaction on: about 49 of 70 (the first read after a compaction, with a few events in the open chunk, reaches back about 49), where the whole chunk's 70 were kept. The UI's pages of 100 reach further |
 | observe's queue to its peers (16,384 places) and kiln.db's group's to the runners (4,096) make their places as they fill: unbounded, each bound kept by its one sender (`memory::send_within`) | 0.4 (0.4, and as much in each runner process) | A bounded async-channel makes every place as it's made (concurrent-queue writes each one's stamp): 16 bytes each of the first (boxes), 40 of the second, resident however few wait |
 
 What each risks, for the lab to say: a read of the newest page that inflates the compact chunk copies the part it
