@@ -97,13 +97,18 @@ pub(crate) struct Sleep {
     deadline: Instant,
     native: Option<hyper_rt::futures::Sleep>,
     bridged: Option<Bridge<Result<(), RtError>>>,
+    /// Where it was asked for: what a park its timer ends is counted against (`hyper_rt::timer_sites`; kiln's goal 9,
+    /// plan 01a1a87b2cec step 5).
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Sleep {
+    #[track_caller]
     pub(crate) fn until(deadline: Instant) -> Sleep {
-        Sleep { deadline, native: None, bridged: None }
+        Sleep { deadline, native: None, bridged: None, site: std::panic::Location::caller() }
     }
 
+    #[track_caller]
     pub(crate) fn after(d: Duration) -> Sleep {
         let now = Instant::now();
         Sleep::until(now.checked_add(d).unwrap_or(now))
@@ -120,10 +125,11 @@ impl Sleep {
             self.bridged = None;
             return Poll::Ready(());
         }
+        let site = self.site;
         if is_native(cx) {
             self.bridged = None;
             let remaining = self.remaining_ns();
-            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep(remaining));
+            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep_from(remaining, site));
             return match Pin::new(sleep).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(_) => Poll::Ready(()),
@@ -132,7 +138,7 @@ impl Sleep {
         self.native = None;
         if self.bridged.is_none() {
             let remaining = self.remaining_ns();
-            match Bridge::spawn(hyper_rt::futures::sleep(remaining), cx.waker()) {
+            match Bridge::spawn(hyper_rt::futures::sleep_from(remaining, site), cx.waker()) {
                 Ok(bridge) => self.bridged = Some(bridge),
                 Err(_) => return Poll::Ready(()),
             }

@@ -143,6 +143,8 @@ pub(crate) struct TimerCell {
     pub(crate) deadline_ns: Cell<u64>,
     pub(crate) word: Cell<u64>,
     pub(crate) dirty: Cell<bool>,
+    /// Where its sleep was asked for, as it was armed: what a park it ends is counted against (`crate::timer_sites`).
+    pub(crate) site: Cell<Option<&'static std::panic::Location<'static>>>,
 }
 
 /// A readiness registration a task asked for, or the withdrawal of one whose wait dropped.
@@ -959,7 +961,14 @@ impl ShardContext {
 
     /// Takes a timer slot for `word` at `deadline_ns`; the loop arms it before the shard next waits. `None`
     /// when every timer is taken (the sleep then waits for one to free, [`Self::wait_for_timer`]).
+    #[track_caller]
     pub fn arm_timer(&self, deadline_ns: u64, word: u64) -> Option<TimerId> {
+        self.arm_timer_from(deadline_ns, word, std::panic::Location::caller())
+    }
+
+    /// [`ShardContext::arm_timer`] for a sleep asked for at `site`, which a park the timer ends is counted against
+    /// (`crate::timer_sites`; kiln's goal 9, plan 01a1a87b2cec step 5).
+    pub fn arm_timer_from(&self, deadline_ns: u64, word: u64, site: &'static std::panic::Location<'static>) -> Option<TimerId> {
         if self.driver_lost() {
             return None;
         }
@@ -968,6 +977,7 @@ impl ShardContext {
         cell.phase.set(TimerPhase::Claimed);
         cell.deadline_ns.set(deadline_ns);
         cell.word.set(word);
+        cell.site.set(Some(site));
         self.timer_dirty(slot, cell);
         Some(TimerId {
             slot,
@@ -1558,6 +1568,7 @@ impl ShardContext {
             deadline_ns: Cell::new(0),
             word: Cell::new(0),
             dirty: Cell::new(false),
+            site: Cell::new(None),
         })?;
         u32::try_from(made).ok()
     }

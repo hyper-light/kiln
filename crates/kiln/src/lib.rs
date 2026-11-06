@@ -68,6 +68,7 @@ pub mod programs;
 pub mod proc;
 pub mod proto;
 pub mod peers;
+pub mod compute_sites;
 pub mod pool_health;
 pub mod push;
 pub mod rcu;
