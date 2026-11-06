@@ -1698,9 +1698,11 @@ mod tests {
         Ok(())
     }
 
-    /// Waits up to 30 s for `ok`.
+    /// Waits for `ok`, looking every 10 ms, up to a hang's bound: never a pace. A loaded machine's disk takes its
+    /// time over the log's flushes, a learner's copy and its writes (30 s ran out under load waiting for a
+    /// learner's writes and for its copy, which a calm machine takes in well under a second).
     fn until(what: &str, mut ok: impl FnMut() -> anyhow::Result<bool>) -> anyhow::Result<()> {
-        let end = Instant::now() + Duration::from_secs(30);
+        let end = Instant::now() + Duration::from_secs(300);
         while !ok()? {
             if Instant::now() >= end {
                 bail!("timed out waiting for {what}");
