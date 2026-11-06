@@ -135,6 +135,13 @@ impl Drop for Placed {
 }
 
 impl Spilled {
+    /// What its segment holds inflated, in bytes: its chunk's texts joined, as `super::copies::Chunk::texts_len` reckons them
+    /// from the chunk's metas (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A5: a snapshot's weight, read on its
+    /// viewer's shard).
+    pub fn texts_len(&self) -> u64 {
+        self.0.len
+    }
+
     /// Its bytes on disk.
     pub fn bytes(&self) -> usize {
         self.0.bytes

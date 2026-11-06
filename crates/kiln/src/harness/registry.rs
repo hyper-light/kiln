@@ -1025,18 +1025,21 @@ impl Snapshot {
     /// About the bytes it takes made, `packed` as one message or as frames: what it takes of the room of
     /// snapshots in flight before it's made ([`snapshot_room`]; [`InFlight::made`] counts it as it was made).
     /// Packed, each chunk's segment as it's kept (in memory or spilled) and a quarter of the texts of one
-    /// that isn't packed (deflate's ratio on them), beside the other frames whole.
+    /// that isn't packed (deflate's ratio on them), beside the other frames whole; as frames, its texts.
+    ///
+    /// Reckoned on its viewer's shard, as its attach's first poll (`api::send_snapshot`): a chunk's texts are read from
+    /// its metas only where it has no segment to say them (the newest, and any the packer hasn't come to: a chunk or two),
+    /// so it's a few steps a chunk (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A5). Each chunk's texts were
+    /// added up from its metas, a meta for each of a long session's events (polls of 0.65 to 2.4 ms on the shard in g9p16
+    /// with hogs, goal 9, plan 01a1a87b2cec step 3), and then on the blocking pool, a round trip for every attach.
     pub fn weight(&self, packed: bool) -> usize {
         let p = &self.parts;
         let frames = p.meta_bytes.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
-        let events = p.events.chunks().iter().map(|c| {
-            let texts = c.texts_len();
-            match (packed, c.packed(), c.spilled_bytes()) {
-                (false, _, _) => texts,
-                (true, Some(s), _) => s.deflated.len(),
-                (true, None, Some(n)) => n,
-                (true, None, None) => texts / 4,
-            }
+        let events = p.events.chunks().iter().map(|c| match (packed, c.packed(), c.spilled_bytes()) {
+            (true, Some(s), _) => s.deflated.len(),
+            (true, None, Some(n)) => n,
+            (true, None, None) => c.texts_len() / 4,
+            (false, _, _) => c.segment_texts_len().unwrap_or_else(|| c.texts_len()),
         });
         events.fold(frames, usize::saturating_add)
     }
@@ -1311,6 +1314,25 @@ impl Packing {
 /// `]`, and a `,` between each two (`write::sent_events`).
 fn events_room(texts: usize, n: usize) -> usize {
     write::envelope("events", Some("events"), None) + "[]".len() + texts + n.saturating_sub(1) * ",".len()
+}
+
+/// A long session's whole snapshot, for `crate::api`'s tests of how one is sent (goal 11, plan 01a1a87b2e56 step 5, the
+/// memory audit's rows A5, A6 and C12): `events` replies of text deflate shortens by about half (hex digits of numbers
+/// hashed apart), about 1 KiB each, its sealed chunks packed and kept compact, its newest open.
+#[cfg(test)]
+pub(crate) fn long_snapshot(events: u64) -> Snapshot {
+    let mut m = super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+    for q in 1..=events {
+        m.rev = q;
+        let text: String = (0..64u64).map(|k| format!("{:016x}", (q * 64 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15))).collect();
+        m.upsert(Arc::new(Entry::new(serde_json::json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": text}))));
+    }
+    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+        let _ = c.pack();
+    }
+    m.events.compact(None);
+    m.publish();
+    Snapshot { parts: m.view().parts(), files: None, store: None }
 }
 
 /// The epoch to send a message once more for, when its session's inbox refused it as sent for an
@@ -6397,6 +6419,44 @@ mod tests {
         let s = Snapshot { parts: m.view().parts(), files: None, store: None };
         anyhow::ensure!(s.weight(false) == texts, "as frames, its texts: {} of {texts}", s.weight(false));
         anyhow::ensure!(s.weight(true) >= segments && s.weight(true) < texts, "packed, its segments: {} of {segments}", s.weight(true));
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A5: a snapshot's weight, reckoned on its viewer's shard, reads
+    /// the metas of a chunk only where it has no segment to say its texts (the newest, one the packer hasn't come to), packed or
+    /// as frames, its chunks' segments kept in memory or spilled; every chunk's were read. As frames it's still its texts.
+    #[test]
+    fn g11_s5_a5_a_snapshots_weight_reads_the_metas_of_chunks_without_a_segment_alone() -> anyhow::Result<()> {
+        let from_metas = || super::super::copies::TEXTS_FROM_METAS.with(std::cell::Cell::get);
+        let tmp = tempfile::tempdir()?;
+        let mut m = super::super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+        for q in 1..=500u64 {
+            m.rev = q;
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": format!("line {q}: {}", "of what was said ".repeat(usize::try_from(q % 7)?))}))));
+        }
+        // Its sealed chunks packed but the newest of them (the packer's yet to come to it), kept compact, the oldest spilled.
+        let parts = m.view().parts();
+        let sealed: Vec<Arc<super::super::copies::Chunk>> = parts.events.chunks().iter().filter(|c| c.is_full()).cloned().collect();
+        for c in sealed.iter().take(sealed.len().saturating_sub(1)) {
+            c.pack()?;
+        }
+        let mut events = parts.events.clone();
+        events.compact(None);
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
+        let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
+        anyhow::ensure!(events.spilled_where(&chunks, spilled) > 0, "some spilled");
+        let without = events.chunks().iter().filter(|c| c.packed().is_none() && !c.is_spilled()).count();
+        anyhow::ensure!(without == 2, "the newest and one not packed: {without}");
+        let texts: usize = events.chunks().iter().map(|c| c.texts_len()).sum();
+        let s = Snapshot { parts: Parts { events, ..m.view().parts() }, files: None, store: None };
+        for packed in [true, false] {
+            let was = from_metas();
+            let weight = s.weight(packed);
+            anyhow::ensure!(from_metas() - was == without as u64, "packed {packed}: {} chunks' metas read, of {without} without a segment", from_metas() - was);
+            anyhow::ensure!(packed || weight == texts, "as frames, its texts: {weight} of {texts}");
+        }
         Ok(())
     }
 

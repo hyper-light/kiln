@@ -370,6 +370,13 @@ pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static WARMED_ON_SHARD: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Chunks whose texts' length was added up from their metas on this thread ([`Chunk::texts_len`]): goal 11, plan
+    /// 01a1a87b2e56 step 5's test of a snapshot's weight (the memory audit's row A5).
+    pub(crate) static TEXTS_FROM_METAS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What the reads of its copy's newest page kept of a compact chunk's texts joined ([`Chunk::page_texts`]):
 /// those from byte `from` of them on, the furthest back a read reached (goal 11, plan 01a1a87b2e56 step 5).
 struct PageTexts {
@@ -476,6 +483,8 @@ impl Chunk {
 
     /// Its texts joined, in bytes: each one's, and a `,` between each two.
     pub fn texts_len(&self) -> usize {
+        #[cfg(test)]
+        TEXTS_FROM_METAS.with(|n| n.set(n.get() + 1));
         self.meta.iter().map(Meta::text_len).sum::<usize>() + self.meta.len().saturating_sub(1)
     }
 
@@ -683,6 +692,18 @@ impl Chunk {
     /// Its segment's bytes on disk, once spilled.
     pub fn spilled_bytes(&self) -> Option<usize> {
         self.spilled.as_ref().map(super::spill::Spilled::bytes)
+    }
+
+    /// Its texts joined, in bytes, where its segment says them without its metas being read (goal 11, plan 01a1a87b2e56
+    /// step 5, the memory audit's row A5): what [`Chunk::texts_len`] reckons, as the segment it keeps in memory or the one
+    /// it spilled holds them inflated. None for one with no segment (the newest, one the packer hasn't come to, one changed).
+    pub fn segment_texts_len(&self) -> Option<usize> {
+        let len = match (self.packed.get(), &self.spilled) {
+            (Some(s), _) => s.len,
+            (None, Some(s)) => s.texts_len(),
+            (None, None) => return None,
+        };
+        Some(usize::try_from(len).unwrap_or(usize::MAX))
     }
 
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in

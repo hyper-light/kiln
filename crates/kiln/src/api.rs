@@ -6807,14 +6807,28 @@ async fn let_go<T: Send + 'static>(held: T) {
     let _ = crate::rt::blocking(move || drop(held)).await;
 }
 
+/// What sending a viewer its snapshot took ([`send_snapshot`]), for the tests that count it (goal 11, plan 01a1a87b2e56
+/// step 5, the memory audit's rows A5 and A6): the blocking pool's jobs it asked for, and a packed one's pieces.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Sent {
+    jobs: usize,
+    pieces: usize,
+}
+
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
 /// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
 /// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
-/// plan 01a1a59c2a9c step 5).
-async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
+/// plan 01a1a59c2a9c step 5). Its socket `tx` is any sink of messages (a test's counts what it's sent).
+async fn send_snapshot<S>(tx: &mut S, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<Sent>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt as _;
+    let mut sent = Sent::default();
     // Room in the snapshots in flight first (`crate::harness::registry::snapshot_room`; goal 11, plan
     // 01a1a87b2e56 step 3): past it this attach waits its turn, until one in flight is written out. Made, it's
     // counted as it is, until handed to the socket: a packed one until its last piece goes (its pieces share
@@ -6826,26 +6840,29 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // then (`crate::rt::Turns::end`, a yield that always yields): a turn given up only where the shard is wanted
     // (`crate::rt::consume_budget`) goes on past the quantum where it isn't, and the snapshot's longest polls were
     // 2.4 to 3.5 ms on the CPU in rt9's calm rounds (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum).
-    // Its weight is reckoned on the blocking pool too, where its pieces are made: a whole snapshot's adds up every
-    // chunk's events' lengths, a meta each (20,000 for the two longest sessions of kiln-lab's realistic profile, among
-    // the eight at work that its viewers open three times in four), read on the viewer's shard in the snapshot's first
-    // poll (step 3: `viewer snapshot` polls of 0.65 to 2.4 ms on the CPU in every round of g9p16's with hogs, train 16).
-    let (snapshot, weight) = crate::rt::blocking(move || {
-        let weight = snapshot.weight(packed);
-        (snapshot, weight)
-    })
-    .await?;
+    // Its weight reckoned here, on the viewer's shard, as the snapshot's first poll: each chunk's segment as it's kept, and
+    // only a chunk without one (the newest, any the packer hasn't come to) has its texts added up from its metas, so it's a
+    // few steps a chunk (`crate::harness::registry::Snapshot::weight`; goal 11, plan 01a1a87b2e56 step 5, the memory audit's
+    // row A5). Every chunk's metas were added up, a meta for each of a long session's events (20,000 for the two longest of
+    // kiln-lab's realistic profile), on the shard (goal 9, plan 01a1a87b2cec step 3: `viewer snapshot` polls of 0.65 to
+    // 2.4 ms on the CPU in g9p16 with hogs), and then on the blocking pool: a round trip before every attach's first piece.
+    let weight = snapshot.weight(packed);
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
     if packed {
         // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
         // it's held (so its last frame is known final), then written; what's in flight is those two, not the
         // whole message, and a place of the blocking pool is held for each piece's making, not for the
         // viewer's reading.
+        sent.jobs += 1;
         let (mut packing, mut now) = next_piece(snapshot.packing(&synced())).await?;
         let mut first = true;
         while let Some(piece) = now {
+            sent.pieces += 1;
             let (rest, following) = match packing.take() {
-                Some(p) => next_piece(p).await?,
+                Some(p) => {
+                    sent.jobs += 1;
+                    next_piece(p).await?
+                }
                 None => (None, None),
             };
             packing = rest;
@@ -6865,8 +6882,9 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
             first = false;
             now = following;
         }
-        return Ok(());
+        return Ok(sent);
     }
+    sent.jobs += 1;
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
     held.made(frames.iter().map(String::capacity).fold(0usize, usize::saturating_add));
     let mut turns = crate::rt::Turns::new();
@@ -6877,7 +6895,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         turns.end().await;
     }
     tx.send(ws::text(synced())).await?;
-    Ok(())
+    Ok(sent)
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
@@ -8127,6 +8145,37 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The one binary message `sent` makes, its frames joined: the first binary, every other a continuation, the last alone
+    /// final (RFC 6455 5.4).
+    fn joined(sent: &[ws::Message]) -> anyhow::Result<Vec<u8>> {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        let mut out = Vec::new();
+        for (i, m) in sent.iter().enumerate() {
+            let ws::Message::Frame(f) = m else { anyhow::bail!("message {i} isn't a frame: {m:?}") };
+            let op = if i == 0 { OpCode::Data(Data::Binary) } else { OpCode::Data(Data::Continue) };
+            anyhow::ensure!(f.header().opcode == op && f.header().is_final == (i + 1 == sent.len()), "frame {i} of {}: {:?}", sent.len(), f.header());
+            out.extend_from_slice(f.payload());
+        }
+        Ok(out)
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A5: a packed snapshot's weight is reckoned on its viewer's
+    /// shard, so its sending asks the blocking pool for nothing before its first piece: its pieces' jobs and the one that
+    /// finds the last made out, no other, where it asked for one more first, to weigh it. Sent, it's the message made at once.
+    #[test]
+    fn g11_s5_a5_a_snapshots_weight_asks_the_pool_for_nothing() -> anyhow::Result<()> {
+        // Made here, off the shards, where no packer runs beside them: the same twice.
+        let (snapshot, whole) = (crate::harness::registry::long_snapshot(800), crate::harness::registry::long_snapshot(800).packed(&synced())?);
+        crate::rt::block_on(async move {
+            let mut wire = Written::default();
+            let sent = send_snapshot(&mut wire, snapshot, true).await?;
+            anyhow::ensure!(sent.pieces >= 3, "pieces: {sent:?}");
+            anyhow::ensure!(sent.jobs == sent.pieces + 1, "its pieces' jobs and the last's, no other: {sent:?}");
+            anyhow::ensure!(joined(&wire.sent)? == whole, "the message made at once");
+            Ok(())
+        })
     }
 
     /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the
