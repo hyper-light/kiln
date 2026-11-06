@@ -87,6 +87,25 @@ const SERVER: u64 = 1;
 const BLOCK: usize = 4096;
 /// The most an entry carries of a change; a larger change goes in parts of this.
 pub const LARGEST: usize = 8 << 20;
+/// The entries one append to a learner carries, at the most; an entry larger goes alone, up to [`LARGEST`]
+/// (goal 11, plan 01a1a87b2e56 step 5). It's the append of kiln's other groups (`crate::sync::group::APPEND`,
+/// observe's `APPEND_BYTES`), which a frame of kiln's control lane carries with room to spare. What the server's
+/// handle no longer holds of a learner's next append is read from the log's file, one read of the append's bytes,
+/// and hyper-log keeps the buffers it read into for its next reads (up to two segments, 16 MiB). Train 4's heap
+/// profile held 9.04 MB of them (`Pool::take` under `device::serve`), buffers of reads up to 8 MiB, which in the
+/// lab's fresh rounds only this log's appends of [`LARGEST`] and 64 KiB made. A learner catching up is sent up
+/// to 256 appends ahead of its answers (hyper-raft's `max_inflight_msgs`), 64 MiB of them at this size: past
+/// what a runner's path carries.
+const APPEND: u64 = 256 << 10;
+/// Groups the log holds at most, the cluster's [`GROUP`] among them: one of the facts a log reopens with.
+const GROUPS: usize = 2;
+/// Recent entries the log keeps in memory, shared evenly by its groups: one append a group (goal 11, plan
+/// 01a1a87b2e56 step 5). The replica keeps past it whatever it has yet to apply and whatever a learner in step
+/// has yet to acknowledge (hyper-durable's `Replica::keep`, through `LogStore::keep_after`), so it serves only a
+/// learner out of step, one that dropped and probes or one the apply point has passed: its next append comes
+/// from memory, and one further behind takes an append's entries from the file at a time. It was 8 MiB (4 MiB
+/// for the cluster's group), of which the lab held 2.63 MB (`update_of` under `Driver::drive`).
+const CACHE_BYTES: u64 = GROUPS as u64 * APPEND;
 /// Bytes the log's file may take (it grows as it's used).
 const DISK: u64 = 4 << 30;
 /// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
@@ -297,23 +316,28 @@ pub fn member_of(machine: &str) -> u64 {
     h.max(SERVER + 1)
 }
 
-/// The log's layout. Every value is fixed: a log reopens with the facts it was made with.
+/// The log's layout. Every value is fixed but its cache: a log reopens with the facts it was made with.
 fn log_config(align: Alignment) -> anyhow::Result<LogConfig> {
-    LogConfig::derive(&Facts {
+    LogConfig::derive(&log_facts(align, CACHE_BYTES)).map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
+}
+
+/// The facts the log is laid out by, its cache `cache` bytes: the rest give its segments and slots, which a log
+/// reopens by.
+fn log_facts(align: Alignment, cache: u64) -> Facts {
+    Facts {
         align,
         sealed: false,
         largest_entry: LARGEST + (64 << 10),
         disk_bytes: DISK,
-        max_groups: 2,
+        max_groups: GROUPS,
         cadence_entries: 4096,
         cadence_bytes: 256 << 20,
         uncommitted_entries: 2048,
         uncommitted_bytes: 64 << 20,
         // Little to gain on one node from keeping recent entries in memory (the server's pod is
         // tight on memory): what replays at a start reads the file.
-        cache_bytes: 8 << 20,
-    })
-    .map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
+        cache_bytes: cache,
+    }
 }
 
 /// An entry: one write's change, or a part of it (a large one).
@@ -481,7 +505,7 @@ impl Group {
         let limits = Limits::derive(Stated { message: LARGEST + (64 << 10) + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES, members: 64, memory: 64 << 20, depth: 1 })
             .map_err(|e| failed(anyhow::anyhow!("the cluster group's limits: {e:?}")))?;
         let settings = Settings {
-            core: Config { max_size_per_msg: (LARGEST + (64 << 10)) as u64, check_quorum: true, pre_vote: true, seed: member, ..Config::new(member, limits) },
+            core: Config { max_size_per_msg: APPEND, check_quorum: true, pre_vote: true, seed: member, ..Config::new(member, limits) },
             // Driven by events: what's proposed is written at the first lull, together.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
@@ -1400,6 +1424,21 @@ impl StateMachine for Machine {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    /// The cluster group's appends are kiln's other groups', and its log keeps one of them a group in memory; nothing
+    /// else of the log's layout moves, so a log made with the 8 MiB cache reopens with this one (goal 11, plan
+    /// 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_cluster_log_keeps_one_append_a_group_and_appends_what_kilns_groups_do() -> anyhow::Result<()> {
+        assert_eq!(APPEND, crate::sync::group::APPEND, "the append kiln's groups send");
+        let align = Alignment::new(BLOCK).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let config = log_config(align)?;
+        assert_eq!(config.max_groups, GROUPS);
+        assert_eq!(config.group_cache, APPEND, "an append a group");
+        let before = LogConfig::derive(&log_facts(align, 8 << 20)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..config }, before, "the cache alone differs");
+        Ok(())
+    }
 
     /// Where kiln.db stands: its last write's number, and the last entry made durable with it.
     fn state(db: &Path) -> anyhow::Result<(i64, i64)> {
