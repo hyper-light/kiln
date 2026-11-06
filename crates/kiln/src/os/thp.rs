@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(choose(None, false), Choice::Off);
         assert_eq!(choose(Some("0"), false), Choice::Off);
         assert_eq!(choose(Some(""), false), Choice::Off);
-        assert_eq!(choose(Some("yes"), false), Choice::Off, "only 1 keeps them, as KILN_KEEP_PAGES");
+        assert_eq!(choose(Some("yes"), false), Choice::Off, "only 1 keeps them");
         assert_eq!(choose(Some("1"), false), Choice::KeptAsAsked);
         assert_eq!(choose(Some(" 1\n"), true), Choice::KeptAsAsked, "the environment's word first");
         assert_eq!(choose(None, true), Choice::KeptForItsRunner);

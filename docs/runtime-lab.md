@@ -322,7 +322,7 @@ folder `<round>.hook`, kept when the round's kiln is removed): `scripts/shard_la
 record the server over the window.
 
 `--bus-memory <bytes>` writes `[bus] memory` into the kiln.toml each round's server starts with
-(kiln's default otherwise, 171 MiB), so a run measures the bus past its default (goal 11 below).
+(kiln's default otherwise, 256 MiB), so a run measures the bus past its default (goal 11 below).
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
 files below: they hold the baseline's numbers and machine, which another machine (or this one under
@@ -1792,7 +1792,7 @@ past the count).
 | `cd_inputs` | what the deployments engine is told and hasn't taken: clusters' lists, watch events and apply answers, renders, people's and the source poll's word, each object as serde_json keeps it | 256 MiB | one answer of a cluster's API server as kiln reads it at the most (`cd::kube::BODY_LIMIT`), which most of its inputs are | the sender waits as a task: a watch stops reading its stream (the API server holds what follows), a render or answer waits to be handed in, a request waits its turn; the poll's and a rollback's inputs wait for room before the gate that keeps them in order, so none is past it |
 | `cd_actions` | what the deployments engine asked for and its dispatcher hasn't taken: applies (each its object), deletes, renders, watches, statuses, records | 256 MiB | as much as its inputs, which what it asks for is made of (an apply's object is a render's) | the engine's thread waits (its own, not the runtime's), and its inputs behind it |
 | `log_lines` | kiln's log lines waiting for the thread that writes them (`log_lines`; goal 9 step 3: a server's and a runner's) | 10,000 lines and 64 MiB | journald's burst (`RateLimitBurst`, journald.conf(5): past it journald drops a service's lines itself), and the bytes observe keeps waiting of a source's log (`WAITING_LOG_BYTES`) | let go, counted (`kiln_log_lines_dropped_total`), and said as the thread next writes: a shard that logs never waits for the log's reader |
-| `bus` | the bus's retained messages (`kiln_bus_memory_bytes`), each topic's as its retention asks (`kiln_bus_topic_bytes_peak`, the largest since start) | what its topics and subscriptions can hold (`QuiverBus::bound`: about 6.6 MB a feed), at most `[bus] memory`, 171 MiB; a topic `[bus] topic_bytes`, 5 MiB | the bus lab (below): its most for each topic held, 1,327,754 B, for production's 134 sessions every one watched; its largest topic, 3,672,418 B; each with room for one more of the largest message | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
+| `bus` | the bus's retained messages (`kiln_bus_memory_bytes`), each topic's as its retention asks (`kiln_bus_topic_bytes_peak`, the largest since start) | what its topics and subscriptions can hold (`QuiverBus::bound`: about 18.1 MB a feed), at most `[bus] memory`, 256 MiB; a topic `[bus] topic_bytes`, 16 MiB | Quiver's own defaults as CP-T2.1 set them (goal 11's audit, row C10, put them back from the bus lab's 171 and 5 MiB, below): ceilings, which cost nothing at rest | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
 | `session_segments` | sealed chunks' segments kept in memory: each copy's among its newest 100 events (`copies::EVENTS_PAGE`, the events API's page without a `limit`), and those on their way to its spill | `copies::PAGE_BYTES` for each copy: 2 x 70 x 647 B, 90,580 B (~91 KB) | two chunks (`CHUNK`, 70 events) at the most hold the newest page beside the open chunk; 647 B an event packed (research f20) | the rest are spilled to the copy's spill file (`harness::spill`, below): a snapshot reads them back on the blocking pool, the events API a spilled range from the store; past the bytes, the newest page's chunks spill too |
 | (on disk) `kiln_session_spill_bytes` | the copies' spilled segments: `live` (still referred to) and `file` (the spill files whole) | `file` at most `live` and as much again | a copy starts a new file once its file's dead bytes (chunks let go of) pass its live ones; a file goes once no chunk refers to it | a write the disk refuses leaves the chunks in memory (`kiln_session_spill_failures_total{op="write"}`); one that doesn't read back as written is refused (`op="read"`), a snapshot then reading those events from the conversation store |
 
@@ -1848,7 +1848,9 @@ No round refused a frame or sent a lag notice.
   hogs round 2.
 - The largest topic asked for 3,672,418 B.
 
-**What it gives** (`crate::bus`, derived there from these figures):
+**What it gave** (goal 11 step 3; goal 11's audit, row C10, put back Quiver's own defaults as CP-T2.1 set them, 16 MiB
+and 256 MiB: ceilings, which cost nothing at rest since Quiver's budget is a counter, and which a lower one could only
+cost room Quiver would use; the bus lab's figures stand as what the realistic profile needs):
 - `[bus] topic_bytes` is 5 MiB. That's the largest topic, with room for one more of the largest message a
   topic takes (1 MiB of payload), never below that message (Quiver refuses a message larger than
   `topic_bytes`), and rounded up to a MiB.
@@ -2026,12 +2028,34 @@ owner counted (`sqlite` counts page caches): 604 KB for its 202 tables and 283 i
 opened (SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), and its statements. The store kept
 every connection a burst of reads ever opened, up to the `store` share's 24 places, and took them in turn
 (a queue), so none went idle. Now a read takes the lowest place's connection and gives it back to the lowest
-place free, and once each 5 s (`os::alloc::COLD_AFTER`) a read giving one back closes the highest place's
-connection that no read took in that long: what stays open is the reads' recent peak. It saves about 0.75 MB
-for each connection past that peak; how many there were is `kiln_memory_bound_bytes{owner="sqlite"}` over a
-connection's bound (4.6 MB, `store::cache_bound`). A read past the peak opens a connection and parses the
-schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the blocking pool): watch store-backed
-numbers' p99 (pages, MCP, fill).
+place free, so the `n`-th read at once uses place `n - 1`. A read past the open connections opens one and parses
+the schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the read's job), so which connections
+close is learned from the reads themselves (goal 11's audit, row B17; the first cut closed any idle 5 s, and every
+burst after a 5 s quiet reopened): each level of reads at once learns the longest it was quiet before reads came
+back to it, and keeps its connection while its quiet is within that. The floor kept is every level up to the
+highest still expected back; above it a read giving its connection back closes the highest place's, one a read,
+never place 0's, on a job of its own so no read's answer waits for the close. A level that never came back is kept
+as long as any level was away and came back, so a burst that doesn't recur gives its connections back. A level
+back after a longer quiet than it ever had costs that read an open, once. It saves about 0.75 MB for each
+connection past the floor; how many there are is `kiln_memory_bound_bytes{owner="sqlite"}` over a connection's
+bound (4.6 MB, `store::cache_bound`). Watch store-backed numbers' p99 (pages, MCP, fill) after quiets.
+
+**The transport's spares** (`net_budget::Spares`): hyper-transport's `Fixed(1 GiB, 256)` kept every buffer given
+back, each as large as the largest frame it carried, 8.3 to 8.8 MB in the lab. The first cut bound them at the
+Interactive class's largest frame (1 MiB), so every Bulk frame larger than that (a feed's parts, up to 3 MiB;
+transfers; CI logs) was allocated on the net thread, and faulted in there once jemalloc's decay had given its pages
+back, with every runner's frames queued behind it (goal 11's audit, row B22). Now the spares keep as many buffers,
+and as many bytes, as the frames have had out at once at the most, learned as frames come: a frame of a size seen
+before finds its buffer kept (`net_budget`'s `g11_b22_*` count the frames allocated: none after the first of each
+size), and the spares hold no more than the busiest moment's frames did. observe's `kiln.quic.frames_allocated`
+counts the frames a node's spares didn't hold, since its endpoint was made.
+
+**observe's grok rules** (`observe::pipeline::grok::Kept`) are compiled as each pipeline is made, and kept. Compiled
+when a record first reached them (goal 11 step 3, for the 4 MB kiln's own six rules took of an idle heap), the
+first record of each pipeline compiled its rules on the thread that took it, an HTTP intake's shard among them, a
+few milliseconds a pipeline, and every pipeline's rules were compiled twice (once to check them as it was made).
+Now the check's compile is what's kept (goal 11's audit, row B23): no record compiles anything
+(`g11_b23_no_record_compiles_grok_rules_on_the_shard_that_takes_it` counts the compiles on the shard), at the 4 MB.
 
 ### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
 
@@ -2199,6 +2223,15 @@ that the page cache holds (fault-around), the server reads its whole binary into
 the code it runs lies spread over about half of its `.text`'s 64 KiB windows. So these pages fall only as far as
 what runs is laid out together: est. 12 to 17 MB with BOLT's layout (g11s5-layout's estimate from g9p7's profile:
 its hot functions, 2.4 MB of code, lie on 558 windows of rt7fp's layout and would fit in 38).
+
+**The drops are off by default** (goal 11's audit, row B14): `crate::resident` drops nothing unless
+`KILN_KEEP_PAGES=0`. A dropped page faults back on whichever thread next runs or reads it, a shard's among them:
+a minor fault while the page cache holds the file, a read from the disk once the host has reclaimed it (production's
+host is short of memory, and its file system stalls). `resident`'s
+`g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not` measures it on a shard
+(`getrusage(RUSAGE_THREAD)`): re-reading data kept, no fault; re-reading it dropped, a fault for each window. The
+20 MB the drops took (125 to 105 MB) were pages the page cache holds anyway; the code's layout, below, is how the
+binary's pages fall without a fault. `KILN_KEEP_PAGES=0` drops them, for the memory A/B.
 
 **The binary's sections**, rt9 (the lab's glibc build, `dfb491ef3dc`; its symbols from rt9fp, the same tree with
 frame pointers), and what reads each:
