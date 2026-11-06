@@ -294,9 +294,8 @@ taskset -c 16-31 target/release/kiln-lab run --kiln target/release/kiln --label 
 # two builds, interleaved: is B better than A beyond noise?
 taskset -c 16-31 target/release/kiln-lab ab --a main/kiln --b branch/kiln --label-a main --label-b branch --rounds 8
 
-# one build, two settings of its server: its shards, or its blocking pool's places (dns,store,fs)
+# one build, two settings of its server: its shards
 kiln-lab ab --a kiln --b kiln --label-a 2-shards --label-b 4-shards --env-a KILN_RT_SHARDS=2 --env-b KILN_RT_SHARDS=4
-kiln-lab ab --a kiln --b kiln --label-a fs-8 --label-b fs-26 --env-a KILN_RT_BLOCKING=4,2,8 --env-b KILN_RT_BLOCKING=4,2,26 --hogs 1x
 
 # a second run against a first; a run's report again; runs side by side
 kiln-lab compare first/run.json second/run.json
@@ -512,10 +511,10 @@ machine's load averages were 25 to 33 before each window. So these numbers are t
 comparable with the baseline's table above. A: goal 1's baseline build (main at `2a2d93f6df5` with goal
 1's metrics; goal 2's kiln-rt is hyper-rt copied, two calls renamed, so this is main before goal 3). B:
 main at `01aba3ff882` with this change (`g3b-9d599a5892`), its server's blocking pool at the sizes
-derived below (`KILN_RT_BLOCKING=4,2,26`, its defaults since). The `realistic` profile, eight rounds of
-each, interleaved, calm and with 16 CPU hogs; the server sized itself to 4 shards and a compute pool of
-12 threads (16 CPUs less the shards). The rounds: `docs/runtime-lab/2026-11-04/goal3-ab-calm.json` and
-`goal3-ab-hogs-1x.json`.
+derived below (`KILN_RT_BLOCKING=4,2,26`, its defaults since; that switch is gone, its A/B done). The
+`realistic` profile, eight rounds of each, interleaved, calm and with 16 CPU hogs; the server sized itself to
+4 shards and a compute pool of 12 threads (16 CPUs less the shards). The rounds:
+`docs/runtime-lab/2026-11-04/goal3-ab-calm.json` and `goal3-ab-hogs-1x.json`.
 
 Calm, 4 of 58 numbers differ beyond noise:
 

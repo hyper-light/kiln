@@ -123,19 +123,8 @@ impl Profile {
         if let Some(n) = std::env::var("KILN_RT_TASKS").ok().and_then(|v| v.parse::<usize>().ok()) {
             self.tasks_per_shard = n.clamp(256, 1 << 20);
         }
-        // The blocking pool's places, `dns,store,fs` (the lab's A/B of share sizes on one build).
-        if let Some(pool) = std::env::var("KILN_RT_BLOCKING").ok().as_deref().and_then(places) {
-            self.pool = pool;
-        }
         self
     }
-}
-
-/// `dns,store,fs` as three counts of places, each at least one.
-fn places(v: &str) -> Option<(usize, usize, usize)> {
-    let mut it = v.split(',').map(|n| n.trim().parse::<usize>().ok().filter(|n| *n > 0));
-    let pool = (it.next()??, it.next()??, it.next()??);
-    it.next().is_none().then_some(pool)
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
@@ -3517,17 +3506,6 @@ mod tests {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let _ = (here, there);
         Ok(())
-    }
-
-    /// Goal 3, plan 01a1a59c2a8e step 4: the blocking pool's places from `KILN_RT_BLOCKING`, `dns,store,fs`
-    /// (the lab's A/B of share sizes on one build): three counts of at least one, or nothing taken.
-    #[test]
-    fn g3_s4_the_blocking_pools_places_from_the_environment() {
-        assert_eq!(places("4,2,8"), Some((4, 2, 8)));
-        assert_eq!(places(" 1, 3 ,12"), Some((1, 3, 12)));
-        for refused in ["", "4,2", "4,2,8,1", "0,2,8", "a,2,8", "4,,8", "-1,2,8"] {
-            assert_eq!(places(refused), None, "{refused:?}");
-        }
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share
