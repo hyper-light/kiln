@@ -57,8 +57,10 @@ pub struct Given {
     pub secrets: Arc<std::collections::BTreeMap<String, String>>,
     /// Variables over the server's (`--var`), in `vars`.
     pub vars: Arc<std::collections::BTreeMap<String, String>>,
-    /// Told the run's id once it's created.
-    pub reply: Option<async_channel::Sender<String>>,
+    /// Told the run's id once it's created: a queue of one answer (`crate::memory::queue::answer`), lock-free
+    /// (goal 5, plan 01a1a59c2aae, its top goal), as every answer of the dispatcher's below is: an async-channel's
+    /// wait took event-listener's `Mutex`, on the asker's shard and the dispatcher's.
+    pub reply: Option<crate::memory::queue::Sender<String>>,
     /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
     pub culprit: Option<Try>,
 }
@@ -145,19 +147,19 @@ pub enum Msg {
         reply: hyper_rt::sync::OneshotSender<Vec<(String, Result<(), String>)>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
-    Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    Explain { leg: String, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
-    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+    Preview { start: Box<Start>, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
     /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
     /// fail.
     Reviewed { run: String },
     /// Where a leg routed so would go now, and why each runner can or can't take it.
-    ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
+    ExplainRoute { route: Box<LegRoute>, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// A maintainer decided an outside contributor's run (W18-R06): approved, it starts; rejected,
     /// it is cancelled. `false` when the run waits for no approval.
-    ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
+    ApproveRun { run: String, by: String, approve: bool, reply: crate::memory::queue::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not. `placed`: where a
     /// person's retry asked legs to run, by key (W05-R28).
     Rerun {
@@ -170,14 +172,14 @@ pub enum Msg {
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
         by: String,
-        reply: async_channel::Sender<Result<u32, String>>,
+        reply: crate::memory::queue::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
     Executor { agent: String, said: crate::runner::pool::Said },
     /// The stored pools changed: read them again.
     PoolsChanged,
     /// The pools and their executors now.
-    Pools { reply: async_channel::Sender<serde_json::Value> },
+    Pools { reply: crate::memory::queue::Sender<serde_json::Value> },
     /// What a runner holds warm (W24-R18): its lanes' workspaces and how long their legs took
     /// there, as it last said.
     WorkState { agent: String, state: Box<kiln_ci::work::slots::WorkState> },

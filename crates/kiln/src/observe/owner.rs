@@ -93,7 +93,9 @@ const PROFILE_BYTES: u64 = 64 << 20;
 const PROFILE_ROOM: usize = 64;
 /// The node's messages to its peers' replicas waiting for the net, at the most (past them a message is dropped: the
 /// group sends what's needed again): the 16,384 its bounded queue held, kept by its one sender now (`Owner::send`)
-/// so the queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5).
+/// so the queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5). Its queue is `crate::memory::queue`'s,
+/// lock-free (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's send on observe's thread and its receipt on
+/// the shard that sends it on (the server's `observe::hub::send_loop`, a runner's loop) took event-listener's `Mutex`.
 const OUT_PLACES: usize = 16_384;
 
 /// What this node is in the group.
@@ -326,7 +328,7 @@ pub struct Observe {
     /// Whether the open replica has applied what its log held as it opened.
     replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
-    out: async_channel::Receiver<Box<Out>>,
+    out: crate::memory::queue::Receiver<Box<Out>>,
     snaps: PathBuf,
     key: Option<String>,
     feed: Arc<Feed>,
@@ -348,7 +350,7 @@ impl Observe {
         // was made (goal 11, plan 01a1a87b2e56 step 3). Its places are made as it fills, its bound kept where its one
         // sender sends ([`OUT_PLACES`], `Owner::send`): a bounded queue makes every place as it's made (concurrent-queue
         // writes each one's stamp), 256 KiB of them in every process though it's all but empty (step 5).
-        let (out_tx, out_rx) = async_channel::unbounded();
+        let (out_tx, out_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let store = Arc::new(Mutex::new(None));
         // Its role said from the start: a status asked before the group opens says what it is.
         let role = if matches!(settings.role, Role::Server { .. }) { "server" } else { "runner" };
@@ -378,7 +380,7 @@ impl Observe {
     }
 
     /// What to send, as it comes.
-    pub fn outgoing(&self) -> async_channel::Receiver<Box<Out>> {
+    pub fn outgoing(&self) -> crate::memory::queue::Receiver<Box<Out>> {
         self.out.clone()
     }
 
@@ -881,7 +883,7 @@ struct Owner {
     /// they were last counted.
     dir_bytes: u64,
     sized: Option<Instant>,
-    out: async_channel::Sender<Box<Out>>,
+    out: crate::memory::queue::Sender<Box<Out>>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
     input: Sender<Input>,
@@ -952,7 +954,7 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: async_channel::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: crate::memory::queue::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {

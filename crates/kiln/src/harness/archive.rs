@@ -438,9 +438,11 @@ async fn write_piece(hub: &Hub, session: &str, source: &str, m: Making) -> anyho
     Ok(())
 }
 
-/// A source's archived lines, in order, as JSON lines: each piece read and unpacked in turn.
-pub fn lines(hub: &Arc<Hub>, pieces: Vec<Piece>) -> async_channel::Receiver<bytes::Bytes> {
-    let (tx, rx) = async_channel::bounded(4);
+/// A source's archived lines, in order, as JSON lines: each piece read and unpacked in turn, four at most waiting
+/// for the response to take them, in a queue that takes no lock (`crate::memory::queue`; goal 5, plan 01a1a59c2aae,
+/// its top goal: as an async-channel's, each piece took event-listener's `Mutex`).
+pub fn lines(hub: &Arc<Hub>, pieces: Vec<Piece>) -> crate::memory::queue::Receiver<bytes::Bytes> {
+    let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
     let hub = Arc::clone(hub);
     crate::rt::spawn(async move {
         for p in pieces {

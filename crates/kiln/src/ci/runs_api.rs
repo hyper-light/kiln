@@ -570,7 +570,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
     // any start from kept folders or restore a cache.
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
     let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
@@ -795,7 +795,7 @@ pub async fn routing(hub: &Hub, id: &str) -> Result<Response, Fail> {
     if !hub.ci.enabled() {
         return Err(missing("the CI engine is off"));
     }
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Explain { leg: id.to_owned(), reply: tx });
     let v = crate::rt::timeout(std::time::Duration::from_secs(5), rx.recv()).await.map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned()))?.map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned()))?;
     Ok(srv::json(StatusCode::OK, &v))

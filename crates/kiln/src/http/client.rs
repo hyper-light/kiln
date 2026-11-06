@@ -140,14 +140,18 @@ impl Client {
 enum Payload {
     None,
     Bytes(Bytes),
-    Stream(async_channel::Receiver<Bytes>),
+    Stream(Chunks),
     /// A stream made anew for each send ([`RequestBuilder::body_reopen`]).
     Reopen(Reopen),
 }
 
+/// A request's body as it streams: its chunks as they come, from whatever makes them (a lock-free queue of kiln's,
+/// `crate::memory::queue`, a file read ahead, `crate::rt::file_source`; or a channel).
+pub type Chunks = std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send + Sync>>;
+
 /// What makes a request's streamed body anew for each send (a file read again from its start): a request a kiln
 /// server shed is sent again whole (goal 6, plan 01a1a59c2abe step 4).
-pub type Reopen = std::sync::Arc<dyn Fn() -> anyhow::Result<async_channel::Receiver<Bytes>> + Send + Sync>;
+pub type Reopen = std::sync::Arc<dyn Fn() -> anyhow::Result<Chunks> + Send + Sync>;
 
 pub struct RequestBuilder<'c> {
     client: &'c Client,
@@ -186,17 +190,17 @@ impl RequestBuilder<'_> {
         self
     }
 
-    /// Stream the request body from a channel (sent chunked); the body ends when the sender drops. A request a
-    /// kiln server sheds can't be sent again with it ([`Self::body_reopen`] can).
-    pub fn body_stream(mut self, rx: async_channel::Receiver<Bytes>) -> Self {
-        self.body = Payload::Stream(rx);
+    /// Stream the request body from a stream of chunks (sent chunked): a queue's or a channel's, ending when its
+    /// senders drop. A request a kiln server sheds can't be sent again with it ([`Self::body_reopen`] can).
+    pub fn body_stream(mut self, rx: impl futures::Stream<Item = Bytes> + Send + Sync + 'static) -> Self {
+        self.body = Payload::Stream(Box::pin(rx));
         self
     }
 
     /// Stream the request body (sent chunked) from what `open` makes, made anew for each send: a request a kiln
     /// server shed is sent again after its `Retry-After` with its body whole (goal 6, plan 01a1a59c2abe step 4).
-    pub fn body_reopen(mut self, open: impl Fn() -> anyhow::Result<async_channel::Receiver<Bytes>> + Send + Sync + 'static) -> Self {
-        self.body = Payload::Reopen(std::sync::Arc::new(open));
+    pub fn body_reopen<S: futures::Stream<Item = Bytes> + Send + Sync + 'static>(mut self, open: impl Fn() -> anyhow::Result<S> + Send + Sync + 'static) -> Self {
+        self.body = Payload::Reopen(std::sync::Arc::new(move || open().map(|s| -> Chunks { Box::pin(s) })));
         self
     }
 

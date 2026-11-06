@@ -52,6 +52,29 @@ fn bp_g3_s2_the_owner_starts_subscriptions_from_their_cursors() -> anyhow::Resul
     Ok(())
 }
 
+/// Goal 5 of the API runtime program (plan 01a1a59c2aae, its top goal): the owner's events and asks and a socket's
+/// starts go through lock-free queues (`crate::memory::queue`, where async-channels took event-listener's `Mutex`
+/// on both shards): an event the hub emits on another shard is made the topics' change, broadcast once, and a
+/// start asked after it is answered from it, on the socket's own queue.
+#[test]
+fn g5_the_owners_events_asks_and_starts_go_through_lock_free_queues() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let owner = super::owner::Handle::start(77);
+        let mut changes = owner.changes();
+        let emitter = owner.clone();
+        crate::rt::spawn_spread_joined(async move { emitter.event(&ServerEvent::Queue(Queue::Counts { queued: 3, running: 1 })) }).await.map_err(|_| anyhow::anyhow!("the emitting task didn't run"))?;
+        let changed = crate::rt::timeout(std::time::Duration::from_secs(10), changes.recv()).await??;
+        let queue = Topic { kind: crate::bp::kind::QUEUE, key: String::new() };
+        anyhow::ensure!(changed.topic == queue, "the change is the queue's: {:?}", changed.topic);
+        let (reply, started) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
+        anyhow::ensure!(owner.ask(super::owner::Ask::Start { sub: 1, topic: queue.clone(), cursor: None, reply }), "the owner took no ask");
+        let s = crate::rt::timeout(std::time::Duration::from_secs(10), started.recv()).await??;
+        anyhow::ensure!(s.sub == 1 && s.topic == queue, "another start: {s:?}");
+        anyhow::ensure!(matches!(s.start, Start::Snapshot { ref items, .. } if items.len() == 1), "the start isn't the change's snapshot: {:?}", s.start);
+        Ok(())
+    })
+}
+
 /// bp-g3 step 3: a socket's numbers read as JSON without a lock.
 #[test]
 fn bp_g3_s3_a_sockets_numbers_read_whole() {

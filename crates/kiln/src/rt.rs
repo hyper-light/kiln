@@ -2196,10 +2196,11 @@ impl<T: Clone> futures::Stream for Subscription<T> {
 
 // --------------------------------------------------------------------------------------- files
 
-/// The next value of an async-channel receiver, after a charge of the task's turn on its shard
-/// (`hyper_rt::coop`, kiln's goal 6): a loop that drains a channel that is always full yields at its
-/// share, as one over hyper-rt's own channels does.
-pub async fn recv<T>(rx: &async_channel::Receiver<T>) -> Result<T, async_channel::RecvError> {
+/// The next value of a queue's receiver (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top
+/// goal; it was an async-channel's, whose waits took event-listener's `Mutex`), after a charge of the task's turn on
+/// its shard (`hyper_rt::coop`, kiln's goal 6): a loop that drains a queue that is always full yields at its share,
+/// as one over hyper-rt's own channels does.
+pub async fn recv<T>(rx: &crate::memory::queue::Receiver<T>) -> Result<T, async_channel::RecvError> {
     hyper_rt::coop::consume_budget().await;
     rx.recv().await
 }
@@ -2211,11 +2212,13 @@ const SINK_BATCH: usize = 1 << 20;
 
 /// Stream a file in chunks. Opening happens now (so a missing file is an error here); each chunk is
 /// read on the blocking pool, and no thread waits while the consumer is slow. The stream ends at
-/// end of file (or a read error, which is logged).
-pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+/// end of file (or a read error, which is logged). Its chunks wait in a queue of four
+/// (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top goal), as in the
+/// async-channel it was, whose every chunk took event-listener's `Mutex` (a download's, an artifact's).
+pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     let path = path.into();
     let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 4);
     spawn(async move {
         let mut offset = 0u64;
         loop {
@@ -2253,17 +2256,19 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Re
 
 /// Write a stream of chunks to a new file. Send chunks into the returned sender, drop it, then
 /// await the future for the byte count. Writing runs concurrently (bounded), so the sender sees
-/// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write.
+/// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write. Its chunks
+/// wait in a queue of sixteen (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top
+/// goal), as in the async-channel it was, whose every chunk took event-listener's `Mutex` (an upload's).
 pub fn file_sink(
     path: impl Into<PathBuf>,
     max: u64,
-) -> anyhow::Result<(async_channel::Sender<Bytes>, impl Future<Output = anyhow::Result<u64>> + Send + 'static)> {
+) -> anyhow::Result<(crate::memory::queue::Sender<Bytes>, impl Future<Output = anyhow::Result<u64>> + Send + 'static)> {
     let path = path.into();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
     let writer = spawn(async move {
         let mut total = 0u64;
         // Each receive a charge of the task's turn (`hyper_rt::coop`).
@@ -2338,7 +2343,7 @@ pub const SIGTERM: i32 = 15;
 /// SIGINT / SIGTERM / SIGHUP as a stream. The subscription lives as long as this value (dropping
 /// the last one restores the default action, i.e. the next SIGTERM kills the process).
 pub struct Signals {
-    rx: async_channel::Receiver<i32>,
+    rx: crate::memory::queue::Receiver<i32>,
 }
 
 impl Signals {
@@ -2348,8 +2353,8 @@ impl Signals {
         anyhow::ensure!(!wanted.is_empty(), "no supported signal requested");
         rt()?;
         let stream = hyper_rt::signal::subscribe(&wanted).map_err(|e| anyhow::anyhow!("subscribe to signals: {e}"))?;
-        let (tx, rx) = async_channel::unbounded();
-        // The stream is awaited at a task's top level (its own waker); consumers read the channel,
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        // The stream is awaited at a task's top level (its own waker); consumers read the queue,
         // which works under any waker.
         spawn(async move {
             let mut failures = 0u32;
@@ -2790,13 +2795,13 @@ mod tests {
         })
     }
 
-    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining an
-    /// async-channel that always holds its next item (`recv`) yields at its share, and a timer due on its shard
-    /// fires while it loops, where a loop on async-channel's own receive would hold the shard until it ended.
+    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining a
+    /// queue that always holds its next item (`recv`) yields at its share, and a timer due on its shard fires while
+    /// it loops, where a loop on the queue's own receive would hold the shard until it ended.
     #[test]
     fn g6_s1_a_loop_on_kiln_s_charged_receive_lets_its_shard_s_timer_fire() -> anyhow::Result<()> {
         block_on(async {
-            let (tx, rx) = async_channel::unbounded::<u64>();
+            let (tx, rx) = crate::memory::queue::unbounded::<u64>(&crate::memory::owners::CHANNELS);
             let fired = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&fired);
             // Spawned from a task: on this shard.

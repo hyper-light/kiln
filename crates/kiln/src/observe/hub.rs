@@ -24,7 +24,7 @@ pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 /// turns, each message was still copied as it was encoded (up to half a mebibyte), 0.16 to 0.39 ms on the CPU in a
 /// poll in rt9's rounds. Each message's runner process is found here, its frame made on the compute pool, and the
 /// frames sent in order in turns that end their polls (`crate::net::send_made`).
-async fn send_each(hub: &Hub, out: &async_channel::Receiver<Box<super::owner::Out>>) {
+async fn send_each(hub: &Hub, out: &crate::memory::queue::Receiver<Box<super::owner::Out>>) {
     let route = |m: Box<super::owner::Out>| hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE).map(|peer| (peer, m));
     crate::net::send_made(out, route, observe_frame, |peer, b| hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b)).await;
 }
@@ -108,7 +108,7 @@ mod tests {
     fn g9_s3_a_backlog_is_sent_in_turns() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let (tx, rx) = async_channel::unbounded();
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
             for n in 0..20_000u32 {
                 tx.try_send(Box::new(super::super::owner::Out { machine: "away".into(), msg: wire::Msg::Release, bytes: n.to_be_bytes().to_vec() })).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
             }

@@ -318,7 +318,7 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor:
             skipped.push(json!({ "workflow": l.path, "why": format!("it doesn't run on this {event_name}: {why}") }));
             continue;
         }
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx), culprit: ask.culprit };
         super::events::start_given(hub, &repo, &event, &loaded, (&message, &author), typed, given).await.map_err(|e| internal(&e))?;
         match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
@@ -478,7 +478,7 @@ async fn run_once(
     event.trusted = trusted;
     event.actor = actor.clone();
     event.source = kiln_ci::trigger::Source::Api;
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let given = Given { reply: Some(tx), ..Given::default() };
     super::events::start_given(hub, repo, &event, &l, (message, &who), typed, given).await.map_err(|e| internal(&e))?;
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {

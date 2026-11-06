@@ -124,18 +124,276 @@ hot = [
 ]
 
 # What waits on event-listener (goal 5 of the API runtime program, plan 01a1a59c2aae, its top goal): its list of
-# listeners sits behind a std Mutex every wait, every wait given up and every wake with a listener takes, and the
-# census of train 8's tree found it the one lock the shards still shared (1.8 ms a second waited with hogs, 2.4 ms
-# at the longest; docs/runtime-lab.md). async-lock's locks, semaphores and cells wait on it, and so do the Events
-# kiln held itself. None is named in these folders' code, outside a test build's: `crate::turn` (a gate, a baton, a
-# read-write, keyed, once) and `crate::rt::Changed` wait with no lock. One that must stay goes under `[[waiting]]`
-# (at, name, why), as `allowed` does for the hot path's locks.
-# Async-channels still on the shards wait on it too: the census counts them (scripts/locks/deps.toml).
+# listeners sits behind a std Mutex every wait, every wait given up and every wake takes, and the census of train 8's
+# tree found it the one lock the shards still shared (1.8 ms a second waited with hogs, 2.4 ms at the longest;
+# docs/runtime-lab.md). async-lock's locks, semaphores and cells wait on it, and so do the Events kiln held itself:
+# none is named in these folders' code, outside a test build's; `crate::turn` (a gate, a baton, a read-write, keyed,
+# once) and `crate::rt::Changed` wait with no lock. Nor is an async-channel, whose every send takes that Mutex twice
+# and every receive once (main's census16: 2,537 takes a second calm, held when asked 5.75 times a second, waited
+# 0.84 ms a second with hogs, 4 ms at the longest): `crate::memory::queue` queues with no lock
+# (`memory::queue::answer` for one answer). Nor is a WebSocket split by async-tungstenite (its two halves share a
+# std Mutex), but where both halves are the socket's one task's. One that must stay goes under `[[waiting]]` (at,
+# name, why), as `allowed` does for the hot path's locks: a file's async-channels as one entry named
+# `async_channel`, its splits as one named `split` (`scripts/locks.py`'s `wait_names`). A module only a test build
+# compiles (a file of its own declared under `#[cfg(test)]`) isn't read.
 waits = [
   "crates/kiln/src",
   "crates/kiln-http/src",
   "crates/kiln-rt/src",
 ]
+
+# The async-channels that stay, none on the server's request, websocket or runner paths (goal 5, plan 01a1a59c2aae,
+# its top goal: census16's 2,537 event-listener takes a second were those paths' channels, moved to
+# `crate::memory::queue` and `crate::rt::Notify`: the cluster group's and observe's messages to the runners, sync's,
+# the conversation store's word to its feeds, kept files, a leg's end to the log index, the browser protocol's
+# topics and sockets, CI's dispatcher's answers, file and archive streams, git's facade, REAPI's reads, Mantle's
+# requests, the HTTP tunnel's relay). The runner process's own first.
+
+[[waiting]]
+at = "crates/kiln/src/agent.rs"
+name = "async_channel"
+why = "the runner process's loop: `recv_opt`, its wait on a chaos delay line's frames (crate::runner::chaos, a test's fault on a runner), none on the server"
+
+[[waiting]]
+at = "crates/kiln/src/runner/chaos.rs"
+name = "async_channel"
+why = "a runner's chaos delay line (a slow network a test asks for): its frames' queue, on the runner, none on the server"
+
+[[waiting]]
+at = "crates/kiln/src/runner/egress.rs"
+name = "async_channel"
+why = "a runner's egress proxy for its microVMs' jobs: the hosts it refused, said to the runner's loop, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/runner/firecracker.rs"
+name = "async_channel"
+why = "a runner's microVMs (Firecracker): what each guest says and is told over its vsock, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/runner/guest.rs"
+name = "async_channel"
+why = "inside a microVM's guest: the hosts its egress refused, to its agent"
+
+[[waiting]]
+at = "crates/kiln/src/runner/runtime.rs"
+name = "async_channel"
+why = "a runner's deployments in microVMs: what a deploy says as it goes, and the guest's egress refusals, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/runner/work/service.rs"
+name = "async_channel"
+why = "a runner's cache service (docs/ci.md W24-R08): its uploads waiting for their uploader, and an object's bytes to the leg asking, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/browser/cdp.rs"
+name = "async_channel"
+why = "the preview browser's DevTools connection, on a runner: what goes to Chrome and the events its listeners asked for"
+
+[[waiting]]
+at = "crates/kiln/src/browser/driven.rs"
+name = "async_channel"
+why = "a browser driven over WebDriver BiDi, on a runner: what goes to it, its pages' events and what they said"
+
+[[waiting]]
+at = "crates/kiln/src/browser/page.rs"
+name = "async_channel"
+why = "a preview page's DevTools events, on a runner"
+
+[[waiting]]
+at = "crates/kiln/src/browser/preview.rs"
+name = "async_channel"
+why = "a preview's page events, served on a runner"
+
+[[waiting]]
+at = "crates/kiln/src/browser/stream.rs"
+name = "async_channel"
+why = "a browser stream's events and chunks out of its browser, on the runner that runs it; the server's viewers read it through crate::harness::streams' lock-free queues"
+
+[[waiting]]
+at = "crates/kiln/src/frontdoor/dns.rs"
+name = "async_channel"
+why = "a runner's front door's DNS: forwarded answers back to its UDP socket's task, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/frontdoor/replica.rs"
+name = "async_channel"
+why = "a runner's front door answering from its replica (docs/p2p.md, P2): its kept connections to the server, on the runner; the server's API takes none"
+
+[[waiting]]
+at = "crates/kiln/src/frontdoor/runner.rs"
+name = "async_channel"
+why = "a runner's front door's settings and commands, to its one task, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/store/learner.rs"
+name = "async_channel"
+why = "a runner's learner of the cluster group (docs/p2p.md, P2): what it tells the server, the server's word on where kiln.db stands and the checkpoints to check, on the runner; the server's side of the group (crate::store::group's messages, Hub::cluster_loop) is crate::memory::queue's"
+
+[[waiting]]
+at = "crates/kiln/src/sync/repos.rs"
+name = "async_channel"
+why = "a runner's repo sync: its scans and jobs, what it tells the server and a bundle's bytes to upload, on the runner"
+
+[[waiting]]
+at = "crates/kiln/src/sync/runner.rs"
+name = "async_channel"
+why = "a runner's side of sync: its transfers, what it tells the server and its repos' jobs, on the runner; the server's (crate::sync::server's messages, Hub::sync_loop) are crate::memory::queue's"
+
+[[waiting]]
+at = "crates/kiln/src/harness/session.rs"
+name = "async_channel"
+why = "Sink::Channel, tests' sink of a session's updates; the server's own sessions' and the runners' go through crate::memory::queue (Sink::Bounded, Sink::Stamped)"
+
+# kiln as a client, and its command line: none of the server's paths.
+
+[[waiting]]
+at = "crates/kiln/src/ci/integrations/aws.rs"
+name = "async_channel"
+why = "an upload to AWS through kiln's HTTP client, its body as it's read: kiln calling out"
+
+[[waiting]]
+at = "crates/kiln/src/ci/integrations/azure.rs"
+name = "async_channel"
+why = "an upload to Azure through kiln's HTTP client, its body as it's read: kiln calling out"
+
+[[waiting]]
+at = "crates/kiln/src/ci/integrations/gcp.rs"
+name = "async_channel"
+why = "an upload to Google Cloud through kiln's HTTP client, its body as it's read: kiln calling out"
+
+[[waiting]]
+at = "crates/kiln/src/ci/cli.rs"
+name = "async_channel"
+why = "the kiln command line: an upload's body and a terminal's keystrokes, on a person's machine"
+
+[[waiting]]
+at = "crates/kiln/src/ci/local.rs"
+name = "async_channel"
+why = "the kiln command line's local runs: a pack's bytes to send, on a person's machine"
+
+[[waiting]]
+at = "crates/kiln/src/mcp/mod.rs"
+name = "async_channel"
+why = "`kiln mcp`, MCP over stdio for a local client: its stdin's lines, read on a thread of their own, in that process; the server's /api/mcp takes none"
+
+# The server's, off its request, websocket and runner paths: CD's engine, observe's archives, sync's collection,
+# the LAN's discovery.
+
+[[waiting]]
+at = "crates/kiln/src/cd/artifacts.rs"
+name = "async_channel"
+why = "an artifact's bytes as CD deploys them to a cloud (crate::cd::targets, through kiln's HTTP client): a deploy's, not a request's"
+
+[[waiting]]
+at = "crates/kiln/src/blobs/io.rs"
+name = "async_channel"
+why = "read_channel, a blob's bytes for CD's artifacts (crate::cd::artifacts) as they go to a cloud; the API's reads take read_stream's crate::memory::queue"
+
+[[waiting]]
+at = "crates/kiln/src/ci/services/cas.rs"
+name = "async_channel"
+why = "read_channel, an artifact's bytes for CD's deploys (crate::cd::artifacts); the API's and registries' reads take read's crate::memory::queue"
+
+[[waiting]]
+at = "crates/kiln/src/cd/rollouts.rs"
+name = "async_channel"
+why = "a progressive rollout's driver's inbox: its own measurements and a person's word on it (promote, abort), one rollout's"
+
+[[waiting]]
+at = "crates/kiln/src/cd/guard.rs"
+name = "async_channel"
+why = "the guard of a deploy of kiln itself (`kiln cd guard`, a Job of its own running the image before, never the server): its checks, measured as they come due, to its watch"
+
+[[waiting]]
+at = "crates/kiln/src/cd/mod.rs"
+name = "async_channel"
+why = "CD's store's changes, from the thread that hears them to the registry's task, as deployments move"
+
+[[waiting]]
+at = "crates/kiln/src/observe/archives.rs"
+name = "async_channel"
+why = "logs archived to an object store, a file's parts and an object's bytes as they're written or read: an archive's own work, in the background"
+
+[[waiting]]
+at = "crates/kiln/src/observe/rehydrate.rs"
+name = "async_channel"
+why = "a rehydration from an archive (one at a time, as a person asks, in the background): an object's bytes to its reader on the blocking pool"
+
+[[waiting]]
+at = "crates/kiln/src/observe/notify.rs"
+name = "async_channel"
+why = "monitors' notifications to their integrations, as they fire: none on a request's, a websocket's or a runner's path"
+
+[[waiting]]
+at = "crates/kiln/src/sync/contents.rs"
+name = "async_channel"
+why = "sync's contents let go, deleted from the blob store one at a time: its collection, in the background"
+
+[[waiting]]
+at = "crates/kiln/src/discovery/native.rs"
+name = "async_channel"
+why = "the LAN's discovery (mDNS): what the platform's browser reports, to its task"
+
+# A WebSocket's two halves, split by async-tungstenite, share a std Mutex. Each socket the server serves is one task's,
+# spawned where its upgrade's handler ran, whose halves never leave it (one select over the reader and the rest, the
+# sender used between): that Mutex is that task's alone, on one shard, never two at once, and the census never found
+# it held (census16: 540.7 taken a second, held when asked none, calm and with hogs). A half sent to another task or
+# a split elsewhere fails the check until it's listed here, saying the same.
+
+[[waiting]]
+at = "crates/kiln/src/api.rs"
+name = "split"
+why = "each socket's task holds both halves (a job's logs, the events socket, a terminal, a stream's viewer, an agent session's viewer): one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/http/ws.rs"
+name = "split"
+why = "Sender, the type of a server socket's sending half, which its socket's task alone holds"
+
+[[waiting]]
+at = "crates/kiln/src/live/conn.rs"
+name = "split"
+why = "the browser protocol's socket: its task holds both halves (the sender moved into its one send under way and back): one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/observe/api.rs"
+name = "split"
+why = "a log tail's socket: its task holds both halves: one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/cd/api.rs"
+name = "split"
+why = "a deployment's logs socket that ends at once: its task sends one error and closes"
+
+[[waiting]]
+at = "crates/kiln/src/cd/logs.rs"
+name = "split"
+why = "a deployment's logs socket: its task holds both halves: one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/cd/live.rs"
+name = "split"
+why = "a deployment's live logs socket: its task holds both halves: one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/tunnel.rs"
+name = "split"
+why = "an HTTP tunnel's WebSocket, the server's end and a runner's: its relay's one task selects over both halves: one task, one shard"
+
+[[waiting]]
+at = "crates/kiln/src/browser/cdp.rs"
+name = "split"
+why = "the preview browser's DevTools socket, on a runner: kiln as a client"
+
+[[waiting]]
+at = "crates/kiln/src/browser/driven.rs"
+name = "split"
+why = "a WebDriver BiDi socket, on a runner: kiln as a client"
+
+[[waiting]]
+at = "crates/kiln/src/ci/cli.rs"
+name = "split"
+why = "the kiln command line's terminal socket, on a person's machine: kiln as a client"
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.
 

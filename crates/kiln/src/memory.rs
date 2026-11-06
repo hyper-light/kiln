@@ -193,8 +193,10 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
 /// it makes its places as it fills, kept by its one sender (goal 11, plan 01a1a87b2e56 step 5). A bounded
 /// async-channel makes every place as it's made (concurrent-queue writes each one's stamp), all of them resident
 /// however few wait. Past `most`, nothing is made and false is said, as a full queue's `try_send` refused; a sender
-/// beside the one may take it past `most` by what it sends meanwhile.
-pub fn send_within<T>(tx: &async_channel::Sender<T>, most: usize, make: impl FnOnce() -> T) -> bool {
+/// beside the one may take it past `most` by what it sends meanwhile. The queue is [`queue`]'s, lock-free (goal 5,
+/// plan 01a1a59c2aae, its top goal): it was an async-channel, whose every send and receive took event-listener's
+/// `Mutex` on the sender's thread and the taker's shard (the cluster group's and observe's messages to the runners).
+pub fn send_within<T>(tx: &queue::Sender<T>, most: usize, make: impl FnOnce() -> T) -> bool {
     tx.len() < most && tx.try_send(make()).is_ok()
 }
 
@@ -256,7 +258,7 @@ mod tests {
     /// next without making it, and takes one again once one is taken.
     #[test]
     fn g11_s5_heap_a_queue_its_sender_bounds_holds_its_most_and_makes_nothing_past_it() {
-        let (tx, rx) = async_channel::unbounded::<u32>();
+        let (tx, rx) = queue::unbounded::<u32>(&owners::CHANNELS);
         for i in 0..3 {
             assert!(send_within(&tx, 3, || i), "{i} of 3");
         }

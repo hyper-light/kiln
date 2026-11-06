@@ -31,9 +31,12 @@
       the modules scripts/locks/hot.toml names, outside a test build's code, but those it lists with
       why each is off the hot path. Nor does kiln's code wait on event-listener (goal 5's census: its
       list's Mutex, the one lock the shards still shared): no async-lock and no event-listener named in
-      the folders hot.toml's `waits` names, outside a test build's code, but those it lists under
-      `waiting` with why; `crate::turn` and `crate::rt::Changed` wait with no lock. Fails on any other,
-      and on a listed one that's gone.
+      the folders hot.toml's `waits` names, outside a test build's code, nor an async-channel (each send
+      and receive takes that Mutex; its error types alone are no channel), nor a WebSocket split by
+      async-tungstenite (its halves share a Mutex), but those it lists under `waiting` with why (a
+      file's channels as one entry, `async_channel`, its splits as one, `split`); `crate::turn`,
+      `crate::rt::Changed` and `crate::memory::queue` wait with no lock. Fails on any other, and on a
+      listed one that's gone.
 
 Exit status: 0 done, 1 failed (the message says why), 2 usage.
 """
@@ -41,6 +44,7 @@ Exit status: 0 done, 1 failed (the message says why), 2 usage.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -904,6 +908,18 @@ LOCK_WORD = re.compile(r"\b(Mutex|RwLock|Condvar|ReentrantMutex|FairMutex)\b")
 # What waits on event-listener's list, behind its std Mutex (goal 5, plan 01a1a59c2aae, its top goal): async-lock's
 # locks, semaphores and cells, and event-listener's Events, named by their crates' paths.
 WAIT_WORD = re.compile(r"\b(async_lock|event_listener)::")
+# async-channel's channels (goal 5, its top goal; what main's census16 found left of event-listener's 2,537 takes a
+# second): each send takes event-listener's Mutex twice (5.4.2's notify takes it whether or not anyone waits), each
+# receive once, and a wait again to list itself, to be polled and to go, on the sender's shard and the taker's.
+# Named anywhere but its error types (which `crate::memory::queue` returns too), a file's channels are one `waiting`
+# entry of its, `async_channel`.
+CHANNEL_WORD = re.compile(r"\basync_channel\b(?!\s*::\s*(?:Try)?(?:Recv|Send)Error\b)")
+CHANNEL_ERRORS = frozenset({"RecvError", "SendError", "TryRecvError", "TrySendError"})
+# async-tungstenite's split of a WebSocket (goal 5, its top goal): its two halves share one std Mutex, which every
+# frame sent, flushed or read takes. It stays where both halves are the socket's one task's (one shard's, never
+# two at once): a socket split (`socket.split()`, `ws.split()`) or a half named (`WebSocketSender`,
+# `WebSocketReceiver`), a file's splits are one `waiting` entry of its, `split`, saying so.
+SPLIT_WORD = re.compile(r"\b(?:socket|ws)\s*\.\s*split\s*\(\s*\)|\bWebSocket(?:Sender|Receiver)\b")
 
 
 def blank(text: str) -> str:
@@ -1025,12 +1041,70 @@ def name_of(line: str) -> str:
     return s
 
 
+def cfg_test(attrs: str) -> bool:
+    """Whether attributes `attrs` (comments and strings blanked) hold an item to a test build: `#[cfg(test)]`, or
+    `#[cfg(all(.., test, ..))]`; never `not(test)` or `any(test, ..)`, which other builds may compile."""
+    for m in re.finditer(r"#\[\s*cfg\s*\((.*?)\)\s*\]", attrs, re.S):
+        e = re.sub(r"\s+", "", m.group(1))
+        if e == "test":
+            return True
+        if e.startswith("all(") and e.endswith(")"):
+            depth, part, parts = 0, "", []
+            for c in e[4:-1] + ",":
+                if c == "," and depth == 0:
+                    parts.append(part)
+                    part = ""
+                    continue
+                depth += {"(": 1, ")": -1}.get(c, 0)
+                part += c
+            if "test" in parts:
+                return True
+    return False
+
+
+def module_parent(f: Path) -> tuple[Path, str] | None:
+    """The file that declares `f`'s module (`mod <name>;`), and the name: `a/b.rs`'s and `a/b/mod.rs`'s is `a.rs`'s
+    or `a/mod.rs`'s, at a crate's root its `lib.rs`'s or `main.rs`'s."""
+    name, here = (f.parent.name, f.parent.parent) if f.name == "mod.rs" else (f.stem, f.parent)
+    if f.name in ("lib.rs", "main.rs") and f.parent.name == "src":
+        return None
+    for parent in (here.with_name(here.name + ".rs"), here / "mod.rs", here / "lib.rs", here / "main.rs"):
+        if parent.is_file() and parent != f:
+            return parent, name
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def blanked(f: Path) -> str:
+    """[`blank`] of the file at `f`, read once a run: a module's parent is read for each of its children."""
+    return blank(f.read_text())
+
+
+def test_only(f: Path, seen: dict[Path, bool] | None = None) -> bool:
+    """Whether only a test build compiles `f`: its module is declared under a test's cfg, or one it's in is."""
+    seen = {} if seen is None else seen
+    if f in seen:
+        return seen[f]
+    seen[f] = False
+    decl = module_parent(f)
+    if decl is None:
+        return False
+    parent, name = decl
+    code = blanked(parent)
+    m = re.search(r"((?:#\[[^\]]*\]\s*)*)(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+" + re.escape(name) + r"\s*;", code)
+    only = bool(m and cfg_test(m.group(1))) or test_only(parent, seen)
+    seen[f] = only
+    return only
+
+
 def hot_files(root: Path, spec: dict, key: str = "hot") -> list[Path]:
+    """The files `spec`'s `key` names, and those in the folders it names, but those only a test build compiles
+    ([`test_only`]: a test module of a file of its own)."""
     files: list[Path] = []
     for p in spec.get(key, []):
         at = root / p
         if at.is_dir():
-            files.extend(sorted(at.rglob("*.rs")))
+            files.extend(f for f in sorted(at.rglob("*.rs")) if not test_only(f))
         elif at.is_file():
             files.append(at)
         else:
@@ -1069,6 +1143,67 @@ def scan(root: Path, files: list[Path], word: re.Pattern[str], entries: dict[tup
     return found, sorted(f"{at} {name}" for (at, name) in entries if (at, name) not in seen)
 
 
+def channel_errors_only(code: str) -> set[int]:
+    """The lines of `code` (comments and strings blanked) whose `use` declarations import nothing of async-channel's
+    but its error types: no channel there."""
+    lines: set[int] = set()
+
+    def leaves(t: UseTree, prefix: list[str], out: list[list[str]]) -> None:
+        path = prefix + [s for s in t.path if s]
+        if t.kind == "group":
+            for c in t.children:
+                leaves(c, path, out)
+        else:
+            out.append(path + (["*"] if t.kind == "glob" else []))
+
+    for start, end in use_declarations(code):
+        t = parse_use(code[start:end])
+        if t is None:
+            continue
+        paths: list[list[str]] = []
+        leaves(t, [], paths)
+        channel = [p for p in paths if p and p[0] == "async_channel"]
+        if channel and all(len(p) == 2 and p[1] in CHANNEL_ERRORS for p in channel):
+            lines.update(range(code.count("\n", 0, start) + 1, code.count("\n", 0, end) + 2))
+    return lines
+
+
+def wait_names(code: str) -> dict[int, list[str]]:
+    """What waits on event-listener's list on each line of `code` (comments, strings and a test build's code
+    blanked), by the name its `waiting` entry has: async-lock's and event-listener's, by what the line declares
+    (`name_of`); an async-channel, `async_channel`; async-tungstenite's split of a WebSocket, `split`."""
+    errors_only = channel_errors_only(code)
+    out: dict[int, list[str]] = {}
+    for i, line in enumerate(code.split("\n"), 1):
+        names = []
+        if WAIT_WORD.search(line):
+            names.append(name_of(line))
+        if CHANNEL_WORD.search(line) and i not in errors_only:
+            names.append("async_channel")
+        if SPLIT_WORD.search(line):
+            names.append("split")
+        if names:
+            out[i] = names
+    return out
+
+
+def scan_waits(root: Path, files: list[Path], entries: dict[tuple[str, str], str]) -> tuple[list[str], list[str]]:
+    """[`scan`] of what waits on event-listener's list ([`wait_names`]): the lines `entries` doesn't list, and the
+    entries no line names any more."""
+    seen: set[tuple[str, str]] = set()
+    found = []
+    for f in files:
+        rel = f.relative_to(root).as_posix()
+        source = f.read_text().split("\n")
+        for i, names in wait_names(outside_tests(blanked(f))).items():
+            for name in names:
+                if (rel, name) in entries:
+                    seen.add((rel, name))
+                    continue
+                found.append(f"{rel}:{i}: {name}: {source[i - 1].strip()}")
+    return found, sorted(f"{at} {name}" for (at, name) in entries if (at, name) not in seen)
+
+
 def check(root: Path) -> int:
     import tomllib
 
@@ -1078,7 +1213,7 @@ def check(root: Path) -> int:
     allowed, todo = listed(spec, "allowed")
     found, stale = scan(root, hot_files(root, spec), LOCK_WORD, allowed)
     waiting, waits_todo = listed(spec, "waiting")
-    waits_found, waits_stale = scan(root, hot_files(root, spec, "waits"), WAIT_WORD, waiting)
+    waits_found, waits_stale = scan_waits(root, hot_files(root, spec, "waits"), waiting)
     if found:
         print("A lock on the API's hot path (goal 5, plan 01a1a59c2aae): make it an owner with messages, an immutable copy swapped in whole (crate::rcu), or a copy per shard; or, if it's off the hot path, list it in " + HOT + " with why.\n")
         print("\n".join(found))
@@ -1086,7 +1221,7 @@ def check(root: Path) -> int:
         print(f"\n{HOT} lists locks that aren't there any more: take them out.\n")
         print("\n".join(stale))
     if waits_found:
-        print("\nA wait on event-listener's list, behind its Mutex (goal 5, plan 01a1a59c2aae, its top goal: the one lock the shards still shared): wait with crate::turn (a gate, a baton, a read-write, keyed, once) or crate::rt::Changed instead; or, if no shard takes it, or one task alone, list it in " + HOT + "'s `waiting` with why.\n")
+        print("\nA wait on event-listener's list, behind its Mutex (goal 5, plan 01a1a59c2aae, its top goal: the one lock the shards still shared): wait with crate::turn (a gate, a baton, a read-write, keyed, once) or crate::rt::Changed instead, queue with crate::memory::queue (memory::queue::answer for a reply) instead of an async-channel, and keep a WebSocket's two halves in its one task; or, if no shard takes it, or one task alone, list it in " + HOT + "'s `waiting` with why (a file's async-channels as `async_channel`, its splits as `split`).\n")
         print("\n".join(waits_found))
     if waits_stale:
         print(f"\n{HOT}'s `waiting` lists waits that aren't there any more: take them out.\n")
