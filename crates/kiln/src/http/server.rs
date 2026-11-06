@@ -290,21 +290,38 @@ pub fn channel_body(rx: impl futures::Stream<Item = Bytes> + Send + Sync + 'stat
 /// plan 01a1a87b2dae step 5: a session's events page, slices of what its copy keeps).
 pub fn pieces(parts: Vec<Bytes>) -> Body {
     let left = parts.iter().map(|p| u64::try_from(p.len()).unwrap_or(u64::MAX)).fold(0u64, u64::saturating_add);
-    BodyExt::boxed(Pieces { parts: parts.into(), left })
+    BodyExt::boxed(Pieces { parts: parts.into(), left, turns: crate::rt::Turns::new(), afresh: true })
 }
 
-/// [`pieces`]' body: the parts still to go, and their bytes.
+/// [`pieces`]' body: the parts still to go, and their bytes; and its connection's turn on its shard as they go (goal 9,
+/// plan 01a1a87b2cec step 3): a part a piece of the turn, with what its connection does with it (kiln-http copies a
+/// small one into its buffer, and writes what it gathered at 64 KiB), the turn ended once the next would pass the
+/// shard's quantum (`crate::rt::Turns`), its connection's poll with it, what it gathered so far written as it ends, the
+/// rest in the polls after. A session's events page, fifty of its events (about 150 KB in kiln-lab's realistic
+/// profile), went in one poll, copied and written on the request's shard. Its first part goes whatever its turn, so
+/// what takes it whole where it's whole (`crate::http::compress::finish`) does as before.
 struct Pieces {
     parts: std::collections::VecDeque<Bytes>,
     left: u64,
+    turns: crate::rt::Turns,
+    /// Its next part begins a turn afresh: its first, and the first after it ended its connection's poll.
+    afresh: bool,
 }
 
 impl http_body::Body for Pieces {
     type Data = Bytes;
     type Error = std::io::Error;
 
-    fn poll_frame(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let this = self.get_mut();
+        if std::mem::take(&mut this.afresh) {
+            this.turns = crate::rt::Turns::new();
+        } else if !this.parts.is_empty() && this.turns.over() {
+            // Woken at once: it goes on at its connection's next poll, once the shard has served what waits.
+            this.afresh = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         while let Some(part) = this.parts.pop_front() {
             if !part.is_empty() {
                 this.left = this.left.saturating_sub(u64::try_from(part.len()).unwrap_or(u64::MAX));
@@ -558,6 +575,50 @@ mod tests {
         assert_eq!(frames.concat(), [b"[".as_slice(), big.as_ref(), b"]"].concat());
         assert!(body.is_end_stream());
         Ok(())
+    }
+
+    /// How often a waker was woken.
+    struct Woken(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a body of pieces goes in its connection's turns on the shard: its first part at
+    /// once (its turn begins there), and polled once its turn is past the quantum, it ends its connection's poll
+    /// (pending, woken at once to go on at the next), its next part beginning a turn afresh; every part goes whole and
+    /// in order.
+    #[test]
+    fn g9_s3_a_body_of_pieces_goes_a_turn_at_a_time() -> anyhow::Result<()> {
+        use http_body::Body as _;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let parts: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![b'a' + i; 64])).collect();
+            let mut body = pieces(parts.clone());
+            let woken = Arc::new(Woken(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(Arc::clone(&woken));
+            let mut cx = Context::from_waker(&waker);
+            // Its first part whatever came before it; then its connection takes the quantum with it.
+            std::thread::sleep(std::time::Duration::from_nanos(quantum));
+            let Poll::Ready(Some(first)) = Pin::new(&mut body).poll_frame(&mut cx) else { anyhow::bail!("its first part didn't go at once") };
+            let mut frames = vec![first?.into_data().map_err(|_| anyhow::anyhow!("a frame that isn't data"))?];
+            std::thread::sleep(std::time::Duration::from_nanos(quantum));
+            anyhow::ensure!(Pin::new(&mut body).poll_frame(&mut cx).is_pending(), "a spent turn's poll went on");
+            anyhow::ensure!(woken.0.load(std::sync::atomic::Ordering::Relaxed) == 1, "not woken to go on");
+            loop {
+                match Pin::new(&mut body).poll_frame(&mut cx) {
+                    Poll::Ready(Some(frame)) => frames.push(frame?.into_data().map_err(|_| anyhow::anyhow!("a frame that isn't data"))?),
+                    Poll::Ready(None) => break,
+                    // A busy host's debug build may take a quantum between two parts: its next poll goes on.
+                    Poll::Pending => {}
+                }
+            }
+            anyhow::ensure!(frames == parts, "every part, whole and in order");
+            anyhow::ensure!(body.is_end_stream(), "its end said");
+            Ok(())
+        })
     }
 
     /// Says what it was asked, as the handler saw it.
