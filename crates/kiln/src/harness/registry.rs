@@ -68,8 +68,8 @@ impl Location {
 /// what's read of it without the JSON: an event's id, number and kind and whether it's on its session's
 /// main thread, a file's path and tree. Its JSON's tree isn't kept: a long session's copy kept every
 /// event's beside its text, 8,260 bytes for each event it kept where its JSON is about 3,500 (goal 11, plan
-/// 01a1a87b2e56 step 2; `tests/session_resident.rs`). One that text is streamed into is held as its tree
-/// while that goes on, and written out again when next asked for.
+/// 01a1a87b2e56 step 2; `tests/session_resident.rs`). One that text is streamed into takes each piece into
+/// its JSON where it is ([`Streaming`]).
 pub struct Entry {
     body: Body,
     head: Head,
@@ -80,18 +80,108 @@ pub struct Entry {
     lean: std::sync::OnceLock<Option<Box<str>>>,
 }
 
-/// An entry's JSON: as written out, or its tree while text is streamed into it.
+/// An entry's JSON: as written out, or as text streamed into it grows it.
 #[derive(Clone)]
 enum Body {
     Text(Box<str>),
-    Changing(Box<Changing>),
+    Streaming(Box<Streaming>),
 }
 
-/// An entry text is being streamed into: its tree, and its JSON once asked for again.
+/// An entry text is being streamed into (goal 9, plan 01a1a87b2cec step 3): its JSON, its top-level `text` string's closing
+/// quote at byte `end`. Each piece goes in there, escaped as serde_json escapes a string's characters, each on its own (so a
+/// piece's escaping is its share of the whole text's), and the JSON stays what writing out its tree with the text grown
+/// writes, byte for byte: what its digest and every frame take. Its tree was held instead, copied whole and written out whole
+/// again at each piece: O(the message so far) on its owner's shard at every delta, past the step's quantum for a message past
+/// ~200 KB (a long extended thinking).
 #[derive(Clone)]
-struct Changing {
-    value: Value,
-    text: std::sync::OnceLock<Box<str>>,
+struct Streaming {
+    json: String,
+    end: usize,
+}
+
+/// `more` as serde_json escapes it inside a string (without its quotes): what it adds to a [`Streaming`] entry's JSON.
+fn escaped(more: &str) -> Option<String> {
+    let quoted = serde_json::to_string(more).ok()?;
+    quoted.get(1..quoted.len().checked_sub(1)?).map(str::to_owned)
+}
+
+/// Past the JSON string that begins at byte `at` of `b` (its opening quote): its closing quote's byte.
+fn string_end(b: &[u8], at: usize) -> Option<usize> {
+    let mut i = at.checked_add(1)?;
+    loop {
+        match *b.get(i)? {
+            b'\\' => i = i.checked_add(2)?,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+}
+
+/// Past the JSON value that begins at byte `at` of `b`: the byte after it. Strings and nested objects and arrays read
+/// through, their strings' brackets and quotes passed over.
+fn value_end(b: &[u8], at: usize) -> Option<usize> {
+    match *b.get(at)? {
+        b'"' => string_end(b, at).map(|e| e + 1),
+        b'{' | b'[' => {
+            let (mut depth, mut i) = (0usize, at);
+            loop {
+                match *b.get(i)? {
+                    b'"' => i = string_end(b, i)?,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        _ => {
+            let mut i = at;
+            while b.get(i).is_some_and(|c| !matches!(c, b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')) {
+                i += 1;
+            }
+            (i > at).then_some(i)
+        }
+    }
+}
+
+/// Where the top-level `text` string of `json` ends (its closing quote's byte), where `json` is an object as serde_json writes
+/// one: no space between its tokens, its keys as they are (none escaped), its text given once, nothing after it. None else (a
+/// JSON another wrote, or one with no text string), and the entry's JSON is written out from its tree first, as before
+/// (`Entry::streaming_at`): so a piece put in where this says is what writing out its tree with the text grown writes.
+fn text_end(json: &str) -> Option<usize> {
+    let b = json.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let (mut i, mut found) = (1, None);
+    loop {
+        if b.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_end = string_end(b, i)?;
+        let key = b.get(i + 1..key_end)?;
+        if key.contains(&b'\\') || b.get(key_end + 1) != Some(&b':') {
+            return None;
+        }
+        let at = key_end + 2;
+        let end = value_end(b, at)?;
+        if key == b"text" {
+            if b.get(at) != Some(&b'"') || found.is_some() {
+                return None;
+            }
+            found = Some(end - 1);
+        }
+        match b.get(end)? {
+            b',' => i = end + 1,
+            b'}' if end + 1 == b.len() => return found,
+            _ => return None,
+        }
+    }
 }
 
 /// What's read of an entry without its JSON.
@@ -348,7 +438,7 @@ impl Entry {
         let lean = self.lean.get().and_then(Option::as_ref).map_or(0, |t| t.len());
         match &self.body {
             Body::Text(t) => t.len() + lean,
-            Body::Changing(_) => lean,
+            Body::Streaming(s) => s.json.len() + lean,
         }
     }
 
@@ -356,7 +446,7 @@ impl Entry {
     pub fn text(&self) -> &str {
         match &self.body {
             Body::Text(t) => t,
-            Body::Changing(c) => c.text.get_or_init(|| serde_json::to_string(&c.value).unwrap_or_default().into_boxed_str()),
+            Body::Streaming(s) => &s.json,
         }
     }
 
@@ -419,34 +509,72 @@ impl Entry {
     /// Its JSON's tree, read again from its text: for what reads more of it than the above (an agent's
     /// conclusion, a changeset as JSON).
     pub fn value(&self) -> Value {
-        match &self.body {
-            Body::Text(t) => serde_json::from_str(t).unwrap_or(Value::Null),
-            Body::Changing(c) => c.value.clone(),
-        }
+        serde_json::from_str(self.text()).unwrap_or(Value::Null)
     }
 
-    /// `more` added to its `text`, as a runner streams it: its tree held while that goes on, its JSON and
-    /// digest written again when next asked for. False when it has no text to add to.
+    /// `more` added to its `text`, as a runner streams it, in its JSON where it is ([`Streaming`]; goal 9, plan 01a1a87b2cec
+    /// step 3): its digest made again when next asked for. False when it has no text to add to.
     pub(super) fn append_text(&mut self, more: &str) -> bool {
-        // Its lean form, if made, says what it was.
-        if let Some(Some(l)) = self.lean.take() {
-            crate::memory::SESSION_ENTRIES.sub(l.len());
-        }
-        if let Body::Text(t) = &self.body {
-            let Ok(value) = serde_json::from_str::<Value>(t) else { return false };
-            if !value.get("text").is_some_and(Value::is_string) {
-                return false;
+        let Some(add) = escaped(more) else { return false };
+        let was = self.counted();
+        match &mut self.body {
+            Body::Streaming(s) if s.json.is_char_boundary(s.end) => {
+                s.json.insert_str(s.end, &add);
+                s.end += add.len();
             }
-            crate::memory::SESSION_ENTRIES.sub(t.len());
-            self.body = Body::Changing(Box::new(Changing { value, text: std::sync::OnceLock::new() }));
+            Body::Streaming(_) => return false,
+            Body::Text(t) => {
+                let Some(made) = Self::streaming_at(t).and_then(|(json, end)| grown(&json, end, &add)) else { return false };
+                self.body = Body::Streaming(Box::new(made));
+            }
         }
-        let Body::Changing(c) = &mut self.body else { return false };
-        let Some(Value::String(s)) = c.value.get_mut("text") else { return false };
-        s.push_str(more);
-        c.text = std::sync::OnceLock::new();
+        // Its lean form, if made, says what it was.
+        drop(self.lean.take());
         self.sum = std::sync::OnceLock::new();
+        let now = self.counted();
+        crate::memory::SESSION_ENTRIES.add(now);
+        crate::memory::SESSION_ENTRIES.sub(was);
         true
     }
+
+    /// It with `more` added to its `text` ([`Entry::append_text`]), made anew where a view shares it: its JSON copied once,
+    /// the piece in it (goal 9, plan 01a1a87b2cec step 3: the tree was copied whole and written out whole again). None when
+    /// it has no text to add to.
+    pub(super) fn appended(&self, more: &str) -> Option<Entry> {
+        let add = escaped(more)?;
+        let made = match &self.body {
+            Body::Text(t) => Self::streaming_at(t).and_then(|(json, end)| grown(&json, end, &add))?,
+            Body::Streaming(s) => grown(&s.json, s.end, &add)?,
+        };
+        let entry = Entry { head: self.head.clone(), body: Body::Streaming(Box::new(made)), sum: std::sync::OnceLock::new(), lean: std::sync::OnceLock::new() };
+        crate::memory::SESSION_ENTRIES.add(entry.counted());
+        Some(entry)
+    }
+
+    /// JSON `json` as a [`Streaming`] entry takes a piece: as it is, where its text's end is found in it; else as its tree
+    /// writes it (what holding the tree wrote: its keys and text as serde_json writes them), found there. None without a
+    /// top-level text string.
+    fn streaming_at(json: &str) -> Option<(std::borrow::Cow<'_, str>, usize)> {
+        if let Some(end) = text_end(json) {
+            return Some((std::borrow::Cow::Borrowed(json), end));
+        }
+        let value = serde_json::from_str::<Value>(json).ok()?;
+        if !value.get("text").is_some_and(Value::is_string) {
+            return None;
+        }
+        let written = serde_json::to_string(&value).ok()?;
+        let end = text_end(&written)?;
+        Some((std::borrow::Cow::Owned(written), end))
+    }
+}
+
+/// `json` with `add` (escaped already) put in at byte `end` (its text's closing quote), copied once into room for both.
+fn grown(json: &str, end: usize, add: &str) -> Option<Streaming> {
+    let mut made = String::with_capacity(json.len().checked_add(add.len())?);
+    made.push_str(json.get(..end)?);
+    made.push_str(add);
+    made.push_str(json.get(end..)?);
+    Some(Streaming { json: made, end: end.checked_add(add.len())? })
 }
 
 impl Clone for Entry {
@@ -1294,7 +1422,7 @@ pub(super) fn merge_changes(files: &mut Vec<Arc<Entry>>, set: Vec<Value>, gone: 
 }
 
 /// [`merge_changes`] of files written out already (`set`, each its entry: where a session's owner wrote them off its shard,
-/// `super::copies::Shard::want_changes`; goal 9, plan 01a1a87b2cec step 3), each keyed by its entry's path and tree as
+/// `super::copies::Shard::want_off`; goal 9, plan 01a1a87b2cec step 3), each keyed by its entry's path and tree as
 /// [`file_ref`] keys its JSON.
 pub(super) fn merge_change_entries(files: &mut Vec<Arc<Entry>>, set: Vec<Arc<Entry>>, gone: &[Value]) {
     if !gone.is_empty() {
@@ -2439,22 +2567,32 @@ impl Registry {
         // A changeset's patch is stored as the whole changeset it makes, once taken in (below); an
         // update's events as they're taken, each written out once for the copy and its row (below).
         let store = self.convo.as_ref().filter(|_| !shipped);
-        // A changeset long to write out (each file a JSON tree, then that written out, and the store's row of it: a runner's
-        // up to 512 KiB of hunks, milliseconds on the shard): written out off the shard first, nothing of it taken yet, then
-        // taken as written there; one its owner tried is taken either way (goal 9, plan 01a1a87b2cec step 3:
-        // `super::copies::Shard::want_changes`).
-        let tried_changes = s.take_changes_written(id);
-        if tried_changes.is_none() && s.get(id).is_some() && super::copies::long_changes(&u) {
-            s.want_changes(id, store.is_some());
+        // A changeset, a state or a meta long to write out (a changeset's files each a JSON tree, then that written out: a
+        // runner's up to 512 KiB of hunks; a state compared with its last and written field by field, a meta made a value; and
+        // the store's row of each: milliseconds on the shard for a large one): written out off the shard first, nothing of it
+        // taken yet, then taken as written there; one its owner tried is taken either way (goal 9, plan 01a1a87b2cec step 3:
+        // `super::copies::Shard::want_off`).
+        let tried = s.take_off_written(id);
+        if tried.is_none() && s.get(id).is_some_and(|m| super::copies::long_off(m, &u)) {
+            s.want_off(id, store.is_some());
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
         }
-        let mut written_changes = tried_changes.and_then(|w| w.made);
+        let (mut written_off, took_off) = match tried {
+            Some(w) => {
+                let took = w.made.is_some().then_some(w.took);
+                (w.made, took)
+            }
+            None => (None, None),
+        };
+        // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below).
+        let row_began = std::time::Instant::now();
         if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
-            match written_changes.as_mut() {
-                Some(made) => store.put(std::mem::take(&mut made.rows)),
+            match written_off.as_mut() {
+                Some(made) => store.put(made.take_rows()),
                 None => store.send(id, &u),
             }
         }
+        let row_took = row_began.elapsed();
         // The event of this update its owner wrote out off the shard, or tried, for that event as it's taken (below; goal 9,
         // plan 01a1a87b2cec step 3).
         let mut written = s.take_written(id);
@@ -2619,9 +2757,25 @@ impl Registry {
                 // The same state as the copy's was made of, the copy's still that one: not made again; another is
                 // written once and kept by its fields, its keys the last one's (goal 9, plan 01a1a87b2cec step 5: a
                 // whole state made into a value tree was 0.45% of the process in rt7's calm profile, its patch's field
-                // compares 0.19%, the last tree let go 0.25%).
-                if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
-                    m.state = Arc::new(StateDoc::made(&**state, &m.state));
+                // compares 0.19%, the last tree let go 0.25%). As its owner wrote it out off the shard, or here, timed, so a
+                // session's long states go off it (step 3).
+                match written_off.take() {
+                    Some(super::copies::OffMade::State { doc, .. }) => {
+                        if let Some(doc) = doc {
+                            m.state = Arc::new(doc);
+                            m.long_to_free = true;
+                        }
+                        if let Some(took) = took_off {
+                            m.said_took(&u, took);
+                        }
+                    }
+                    _ => {
+                        let began = std::time::Instant::now();
+                        if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
+                            m.state = Arc::new(StateDoc::made(&**state, &m.state));
+                        }
+                        m.said_took(&u, row_took.saturating_add(began.elapsed()));
+                    }
                 }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
@@ -2665,32 +2819,57 @@ impl Registry {
             }
             Update::Meta { meta } => {
                 // The same meta as the copy's was made of, the copy's still that value: the same again, not made
-                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5).
-                if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
-                    meta_same = true;
-                } else {
-                    let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
-                    if *m.meta == meta {
-                        meta_same = true;
-                    } else {
-                        m.meta = Arc::new(meta);
+                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5). As its owner wrote it out off the shard, or
+                // here, timed, so a session's long metas go off it (step 3).
+                match written_off.take() {
+                    Some(super::copies::OffMade::Meta { value, .. }) => {
+                        match value {
+                            Some(v) => {
+                                m.meta = Arc::new(v);
+                                m.long_to_free = true;
+                            }
+                            None => meta_same = true,
+                        }
+                        if let Some(took) = took_off {
+                            m.said_took(&u, took);
+                        }
+                    }
+                    _ => {
+                        let began = std::time::Instant::now();
+                        if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
+                            meta_same = true;
+                        } else {
+                            let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
+                            if *m.meta == meta {
+                                meta_same = true;
+                            } else {
+                                m.meta = Arc::new(meta);
+                            }
+                        }
+                        m.said_took(&u, row_took.saturating_add(began.elapsed()));
                     }
                 }
             }
             // As its owner wrote it out off the shard, or here, timed, so what's long to write is learned (goal 9, plan
             // 01a1a87b2cec step 3).
-            Update::Changes { files } => match written_changes.take() {
-                Some(made) => m.take_change_entries(made.set, Vec::new(), true),
-                None => {
+            Update::Changes { files } => match written_off.take() {
+                Some(super::copies::OffMade::Changes { set, .. }) => {
+                    m.take_change_entries(set, Vec::new(), true);
+                    m.long_to_free = true;
+                }
+                _ => {
                     let began = std::time::Instant::now();
                     m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true);
                     super::copies::wrote_changes(&u, began.elapsed());
                 }
             },
             Update::ChangesPatch { set, gone } => {
-                match written_changes.take() {
-                    Some(made) => m.take_change_entries(made.set, made.gone, false),
-                    None => {
+                match written_off.take() {
+                    Some(super::copies::OffMade::Changes { set: made, gone: made_gone, .. }) => {
+                        m.take_change_entries(made, made_gone, false);
+                        m.long_to_free = true;
+                    }
+                    _ => {
                         let began = std::time::Instant::now();
                         m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
                         super::copies::wrote_changes(&u, began.elapsed());
@@ -2792,6 +2971,10 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
+        } else if !resync && !meta_same && m.said(&u).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS) && matches!(u, Update::Meta { .. }) {
+            // A meta that changed, its session's metas long to write out: its frame, the whole value written out, off the shard
+            // too (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
+            m.commit_meta_off()
         } else {
             m.commit(|m| match &u {
                 _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
@@ -5504,6 +5687,33 @@ mod tests {
             // Its row is the one the event written out again makes.
             assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: each piece streamed into an event goes into its JSON where its text ends, and the
+    /// JSON is what writing out its tree with the text grown writes, byte for byte, whatever the pieces hold (quotes,
+    /// backslashes, control characters, other scripts, a separator JSON lets be), taken where it is or made anew; one whose
+    /// JSON serde_json didn't write (spaces, an escaped key) as its tree writes it; one with no text string takes none.
+    #[test]
+    fn g9_s3_text_streamed_into_an_event_goes_into_its_json_where_it_is() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        let e = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "Hel".into(), streaming: true } };
+        let pieces = ["lo", ", \"world\"", " \\ back\\", "\n\ttab\u{1}\u{1f}\u{7f}", "é 漢字 🙂 \u{2028}", "", "end"];
+        let mut tree = serde_json::to_value(&e)?;
+        let (mut own, mut shared) = (Entry::of_event(&e, None), Arc::new(Entry::of_event(&e, None)));
+        for piece in pieces {
+            if let Some(Value::String(t)) = tree.get_mut("text") {
+                t.push_str(piece);
+            }
+            let want = serde_json::to_string(&tree)?;
+            anyhow::ensure!(own.append_text(piece) && own.text() == want, "taken where it is: {} against {want}", own.text());
+            shared = Arc::new(shared.appended(piece).ok_or_else(|| anyhow::anyhow!("made anew"))?);
+            anyhow::ensure!(shared.text() == want && own.value() == tree, "made anew: {}", shared.text());
+            anyhow::ensure!((own.id(), own.seq(), own.kind()) == (Some("e1"), Some(1), Some("assistant")), "its head as it was");
+        }
+        let mut odd = Entry::from_text(&format!(r#"{{ "id" : "x", "te{}u0078t" : "a" , "seq":2}}"#, '\\'));
+        anyhow::ensure!(odd.append_text("b") && odd.text() == r#"{"id":"x","text":"ab","seq":2}"#, "as its tree writes it: {}", odd.text());
+        anyhow::ensure!(Entry::from_text(r#"{"id":"y","text":5}"#).appended("z").is_none() && !Entry::from_text(r#"{"id":"y","seq":3}"#).append_text("z"), "none to grow");
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: an entry's head read from its text alone ([`Head::of_text`], no tree made) is

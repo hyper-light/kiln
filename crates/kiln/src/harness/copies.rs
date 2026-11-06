@@ -1830,6 +1830,13 @@ pub struct Mirror {
     spilling: bool,
     /// Its last spill was refused (said once, until one is written again).
     spill_refused: bool,
+    /// What writing out its last states and metas took, nanoseconds, smoothed ([`Mirror::said`]): what its next of each is
+    /// expected to take, so a long one is written out off its owner's shard ([`long_off`]; goal 9, plan 01a1a87b2cec step 3).
+    state_ns: u64,
+    meta_ns: u64,
+    /// Its view holds what's long to free, replaced since it went out (a long state's, meta's or changeset's last): the next
+    /// publish lets go of it off the shard, as one holding chunks taken out ([`Mirror::publish`]; step 3).
+    pub(super) long_to_free: bool,
 }
 
 impl Drop for Mirror {
@@ -1977,6 +1984,33 @@ impl Mirror {
             spill_file: None,
             spilling: false,
             spill_refused: false,
+            state_ns: 0,
+            meta_ns: 0,
+            long_to_free: false,
+        }
+    }
+
+    /// What writing out its next update of `u`'s kind is expected to take, nanoseconds: its last states' or metas' as they took
+    /// ([`Mirror::said_took`]); none for another kind (goal 9, plan 01a1a87b2cec step 3). A state is compared with its last,
+    /// written field by field and written again for its row; a meta made a value and compared: O(its size), and a session's
+    /// states keep about the size they had.
+    pub(super) fn said(&self, u: &Update) -> Option<u64> {
+        match u {
+            Update::State { .. } => Some(self.state_ns),
+            Update::Meta { .. } => Some(self.meta_ns),
+            _ => None,
+        }
+    }
+
+    /// Writing out its update of `u`'s kind (a state, a meta) took `took`, on its owner's shard or off it: learned as
+    /// [`WRITES`] learns a sample, its weight 1/8, the first taken as it is.
+    pub(super) fn said_took(&mut self, u: &Update, took: Duration) {
+        let ns = nanos(took);
+        let smooth = |avg: u64| if avg == 0 { ns } else { avg - avg / 8 + ns / 8 };
+        match u {
+            Update::State { .. } => self.state_ns = smooth(self.state_ns),
+            Update::Meta { .. } => self.meta_ns = smooth(self.meta_ns),
+            _ => {}
         }
     }
 
@@ -2048,7 +2082,8 @@ impl Mirror {
     /// that changed).
     ///
     /// Where its events took chunks out since the last view ([`Events::took_out`]: a cut's thousand events, a compacted
-    /// chunk's, a copy started over), that view is the last to hold them, and is let go of off the shard ([`let_go`]):
+    /// chunk's, a copy started over), or a long state, meta or changeset replaced the last ([`Mirror::long_to_free`]), that
+    /// view is the last to hold them, and is let go of off the shard ([`let_go`]):
     /// each event's entry and texts were freed one by one on the owner's shard as it went, in its commit (goal 9, plan
     /// 01a1a87b2cec step 3). A reader still holding it lets go of it where it reads.
     pub fn publish(&mut self) {
@@ -2057,7 +2092,7 @@ impl Mirror {
             self.info_json = (Arc::clone(&self.info), json);
             self.encodings.info += 1;
         }
-        let took_out = std::mem::take(&mut self.events.took_out);
+        let took_out = std::mem::take(&mut self.events.took_out) | std::mem::take(&mut self.long_to_free);
         let view = Arc::new(self.view());
         if took_out {
             let_go(self.slot.view.swap(view));
@@ -2134,10 +2169,23 @@ impl Mirror {
             return None;
         }
         if off {
-            return Some(Later { generation, rev: self.rev, entries: entries.to_vec() });
+            return Some(Later { generation, rev: self.rev, entries: entries.to_vec(), meta: None });
         }
         self.feed.send_payload(generation, events_frame(self.rev, entries));
         None
+    }
+
+    /// [`Mirror::commit`] of a meta that changed, its session's metas long to write out ([`Mirror::said`]: a value of hundreds of
+    /// KB written whole into its frame): its frame handed back for its owner to write off the shard and send before it takes
+    /// anything else ([`Later`], [`Shard::want_frame`]; goal 9, plan 01a1a87b2cec step 3), as a large tool output's is.
+    pub(super) fn commit_meta_off(&mut self) -> Option<Later> {
+        self.publish();
+        let Some(generation) = self.feed.watched() else {
+            self.sent = super::state_doc::none();
+            self.changes_sent = None;
+            return None;
+        };
+        Some(Later { generation, rev: self.rev, entries: Vec::new(), meta: Some((Arc::clone(&self.meta), self.meta_bytes)) })
     }
 
     /// The state as a frame for its viewers: whole for those that take it so (or when there's
@@ -2230,10 +2278,8 @@ impl Mirror {
                 p
             }
             Update::Meta { .. } => {
-                let mut p = Payload::new(self.rev, self.meta_bytes);
-                let start = p.text().len();
-                let _ = write::value(p.text(), "meta", "meta", &self.meta, rev);
-                self.meta_bytes = p.text().len() - start;
+                let (p, took) = meta_frame(self.rev, &self.meta, self.meta_bytes);
+                self.meta_bytes = took;
                 self.encodings.meta += 1;
                 p
             }
@@ -2266,7 +2312,7 @@ impl Mirror {
     }
 
     /// [`Mirror::take_changes`] of files written out already (`set`, each its entry: off its owner's shard,
-    /// [`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
+    /// [`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
     pub(super) fn take_change_entries(&mut self, set: Vec<Arc<Entry>>, gone: Vec<Value>, whole: bool) {
         let mut files: Vec<Arc<Entry>> = match self.changes.take() {
             // Its own, or (shared with its views) a list of the same files.
@@ -2416,13 +2462,25 @@ impl Mirror {
         false
     }
 
-    /// Text streamed into event `id`, at the copy's revision. An event a view still holds is copied
-    /// first (that one alone), so the view keeps what it took.
+    /// Text streamed into event `id`, at the copy's revision. An event a view still holds is made anew with it
+    /// (that one alone, its JSON copied once: `Entry::appended`), so the view keeps what it took; one of the copy's
+    /// own takes it where it is (goal 9, plan 01a1a87b2cec step 3: copied, then its tree written out whole again, at
+    /// each piece).
     pub fn append(&mut self, id: &str, text: &str) {
         let rev = self.rev;
         if let Some(i) = self.index.get(&self.events, id) {
             self.events.change(i, |ev| {
-                if Arc::make_mut(&mut ev.entry).append_text(text) {
+                let grown = match Arc::get_mut(&mut ev.entry) {
+                    Some(own) => own.append_text(text),
+                    None => match ev.entry.appended(text) {
+                        Some(made) => {
+                            ev.entry = Arc::new(made);
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                if grown {
                     ev.at = rev;
                 }
             });
@@ -2483,15 +2541,15 @@ pub struct Shard {
     /// Frames written so ([`Shard::framed_off`]), counted for the tests that read it.
     #[cfg(test)]
     framed_off: u64,
-    /// A session's changeset update long to write out ([`long_changes`]), the first of what's left of its messages: written
-    /// out off the shard before it's taken ([`Shard::want_changes`]; goal 9, plan 01a1a87b2cec step 3).
-    changes_writing: Option<ChangesWriting>,
-    /// What was made of the changeset update last written out so, or tried, for that update's next take alone
-    /// ([`Shard::take_changes_written`]).
-    changes_written: Option<ChangesWritten>,
-    /// Changeset updates written out so ([`Shard::changes_off`]), counted for the tests that read it.
+    /// A session's changeset, state or meta long to write out ([`long_off`]), the first of what's left of its messages: written
+    /// out off the shard before it's taken ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+    off_writing: Option<OffWriting>,
+    /// What was made of the update last written out so, or tried, for that update's next take alone
+    /// ([`Shard::take_off_written`]).
+    off_written: Option<OffWritten>,
+    /// Updates written out so ([`Shard::updates_off`]), counted for the tests that read it.
     #[cfg(test)]
-    changes_off: u64,
+    updates_off: u64,
     /// How long each of its turns that took something held the shard ([`Turn::held`]), for the tests that read an owner's
     /// turns.
     #[cfg(test)]
@@ -2610,7 +2668,7 @@ fn changes_bytes(u: &Update) -> u64 {
 
 /// Whether `u` is a changeset, or a changeset's patch, expected to hold its owner's shard past a slow poll to write out
 /// (`hyper_rt::slow::SLOW_POLL_NS`, as [`long_to_write`] judges an event): it's written on the compute pool instead
-/// ([`Shard::want_changes`]). None is until one was written: the first is written where it is, and learned.
+/// ([`Shard::want_off`]). None is until one was written: the first is written where it is, and learned.
 pub(super) fn long_changes(u: &Update) -> bool {
     matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && CHANGES.expected(changes_bytes(u)) > hyper_rt::slow::SLOW_POLL_NS
 }
@@ -2620,41 +2678,83 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
     CHANGES.learn(changes_bytes(u), nanos(took));
 }
 
-/// What its owner needs to write session `session`'s changeset update out off the shard ([`Shard::want_changes`]): whether its
-/// row for the conversation store is kept.
-struct ChangesWriting {
+/// Whether `u`, an update of the session whose copy is `m`, is expected to hold its owner's shard past a slow poll to write
+/// out: a changeset by its bytes ([`long_changes`]), a state or a meta by what the session's last took ([`Mirror::said`]). It's
+/// written out on the compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+pub(super) fn long_off(m: &Mirror, u: &Update) -> bool {
+    long_changes(u) || m.said(u).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS)
+}
+
+/// What its owner needs to write session `session`'s update out off the shard ([`Shard::want_off`]): whether its row for the
+/// conversation store is kept.
+struct OffWriting {
     session: String,
     keep: bool,
 }
 
-/// A session's changeset update written out off its owner's shard ([`Shard::want_changes`]), or tried, for its next take alone
-/// (`Registry::apply`).
-pub(super) struct ChangesWritten {
+/// A session's update written out off its owner's shard ([`Shard::want_off`]), or tried, for its next take alone
+/// (`Registry::apply`), with how long that took.
+pub(super) struct OffWritten {
     session: String,
     /// None where it couldn't be written there: it's written where it is, as before, so an update always goes on.
-    pub(super) made: Option<ChangesMade>,
+    pub(super) made: Option<OffMade>,
+    pub(super) took: Duration,
 }
 
-/// A changeset update written out as `Registry::apply` writes it: its files as the copy keeps them (each its entry,
-/// [`Mirror::take_change_entries`]), the keys of those gone, and its row for the conversation store where one is kept.
-pub(super) struct ChangesMade {
-    pub(super) set: Vec<Arc<Entry>>,
-    pub(super) gone: Vec<Value>,
-    pub(super) rows: Vec<crate::convo::rows::Row>,
+/// An update written out as `Registry::apply` writes it, and its row for the conversation store where one is kept.
+pub(super) enum OffMade {
+    /// A changeset's files as the copy keeps them (each its entry, [`Mirror::take_change_entries`]), the keys of those gone.
+    Changes { set: Vec<Arc<Entry>>, gone: Vec<Value>, rows: Vec<crate::convo::rows::Row> },
+    /// A state as the copy keeps it, field by field; none where it's the one the copy's was made of (kept as it is).
+    State { doc: Option<StateDoc>, rows: Vec<crate::convo::rows::Row> },
+    /// A meta as a value; none where it's the copy's (the same again: nothing to keep, encode or send).
+    Meta { value: Option<Value>, rows: Vec<crate::convo::rows::Row> },
 }
 
-/// Changeset update `u` of session `session` written out ([`ChangesMade`]), its row made when `keep`; and how long its files
-/// took, as [`CHANGES`] learns it.
-fn changes_made_of(session: &str, u: &Update, keep: bool) -> (ChangesMade, Duration) {
+impl OffMade {
+    /// Its row for the conversation store, taken.
+    pub(super) fn take_rows(&mut self) -> Vec<crate::convo::rows::Row> {
+        match self {
+            OffMade::Changes { rows, .. } | OffMade::State { rows, .. } | OffMade::Meta { rows, .. } => std::mem::take(rows),
+        }
+    }
+}
+
+/// What of its copy an update written out off the shard is compared with ([`update_off`]): a state's or a meta's last, as made
+/// and what it was made of (taken out of the copy, and let go of off the shard with what replaces it).
+enum Prior {
+    None,
+    State(Arc<StateDoc>, Option<(Box<super::model::State>, Arc<StateDoc>)>),
+    Meta(Arc<Value>, Option<(Box<super::model::Meta>, Arc<Value>)>),
+}
+
+/// Update `u` of session `session` written out as `Registry::apply` writes it ([`OffMade`]), against what of its copy `prior`
+/// holds, its row made when `keep`. A state the same as the one the copy's was made of is kept as it is; one else is made field
+/// by field, sharing the last one's keys; a meta the same as the copy's (as given, or as a value) is nothing new.
+fn made_off(session: &str, u: &Update, prior: Prior, keep: bool) -> OffMade {
     let rows = if keep { crate::convo::rows::of(session, u, crate::util::now_ms()) } else { Vec::new() };
-    let began = Instant::now();
     let values = |files: &[super::model::FileChange]| files.iter().filter_map(|f| serde_json::to_value(f).ok()).map(|v| Arc::new(Entry::new(v))).collect::<Vec<_>>();
-    let (set, gone) = match u {
-        Update::Changes { files } => (values(files), Vec::new()),
-        Update::ChangesPatch { set, gone } => (values(set), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect()),
-        _ => (Vec::new(), Vec::new()),
-    };
-    (ChangesMade { set, gone, rows }, began.elapsed())
+    match (u, prior) {
+        (Update::Changes { files }, _) => OffMade::Changes { set: values(files), gone: Vec::new(), rows },
+        (Update::ChangesPatch { set, gone }, _) => OffMade::Changes { set: values(set), gone: gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), rows },
+        (Update::State { state }, Prior::State(doc, was)) => {
+            let same = was.as_ref().is_some_and(|(w, made)| **w == **state && Arc::ptr_eq(made, &doc));
+            OffMade::State { doc: (!same).then(|| StateDoc::made(&**state, &doc)), rows }
+        }
+        (Update::Meta { meta }, Prior::Meta(value, was)) => {
+            let same = was.as_ref().is_some_and(|(w, made)| **w == **meta && Arc::ptr_eq(made, &value));
+            let value = if same {
+                None
+            } else {
+                let made = serde_json::to_value(meta).unwrap_or(Value::Null);
+                (*value != made).then_some(made)
+            };
+            OffMade::Meta { value, rows }
+        }
+        (Update::State { state }, _) => OffMade::State { doc: Some(StateDoc::made(&**state, &super::state_doc::none())), rows },
+        (Update::Meta { meta }, _) => OffMade::Meta { value: Some(serde_json::to_value(meta).unwrap_or(Value::Null)), rows },
+        _ => OffMade::Changes { set: Vec::new(), gone: Vec::new(), rows },
+    }
 }
 
 /// A frame of events `entries`, the copy's revision `rev`: `{"t":"events","events":[…],"rev":…}`, each event's text as it
@@ -2677,6 +2777,19 @@ pub(super) struct Later {
     /// The copy's revision then, and the events it took.
     rev: u64,
     entries: Vec<Arc<Entry>>,
+    /// Or the meta it took, a long one ([`Mirror::commit_meta_off`]), with the room its last frame took.
+    meta: Option<(Arc<Value>, usize)>,
+}
+
+/// A frame of meta `meta`, the copy's revision `rev`, in `room` bytes (its last one's): `{"t":"meta","meta":…,"rev":…}`, and the
+/// bytes it took (the next one's room).
+fn meta_frame(rev: u64, meta: &Value, room: usize) -> (Payload, usize) {
+    let mut p = Payload::new(rev, room);
+    let start = p.text().len();
+    let _ = write::value(p.text(), "meta", "meta", meta, Some(rev));
+    let took = p.text().len() - start;
+    p.done();
+    (p, took)
 }
 
 impl Shard {
@@ -2764,24 +2877,24 @@ impl Shard {
         self.framed_off
     }
 
-    /// Session `id`'s changeset update is long to write out ([`long_changes`]: its files' JSON, a runner's up to 512 KiB of
-    /// hunks), and none of it was taken yet (`Registry::apply`): its owner writes it out on the compute pool before it takes
-    /// it ([`own`]), where each file was made a JSON tree and that written out on this shard (goal 9, plan 01a1a87b2cec step
-    /// 3). `keep`: its row for the conversation store is kept.
-    pub(super) fn want_changes(&mut self, id: &str, keep: bool) {
-        self.changes_writing = Some(ChangesWriting { session: id.to_owned(), keep });
+    /// Session `id`'s update is long to write out ([`long_off`]: a changeset's files' JSON, a runner's up to 512 KiB of hunks;
+    /// a state written field by field and compared with its last, a meta made a value), and none of it was taken yet
+    /// (`Registry::apply`): its owner writes it out on the compute pool before it takes it ([`own`]), where it was written on
+    /// this shard (goal 9, plan 01a1a87b2cec step 3). `keep`: its row for the conversation store is kept.
+    pub(super) fn want_off(&mut self, id: &str, keep: bool) {
+        self.off_writing = Some(OffWriting { session: id.to_owned(), keep });
     }
 
-    /// What was made of session `id`'s changeset update written out off the shard ([`Shard::want_changes`]), or tried, for that
-    /// update as it comes back to it: its owner's next take alone has it.
-    pub(super) fn take_changes_written(&mut self, id: &str) -> Option<ChangesWritten> {
-        self.changes_written.take().filter(|w| w.session == id)
+    /// What was made of session `id`'s update written out off the shard ([`Shard::want_off`]), or tried, for that update as it
+    /// comes back to it: its owner's next take alone has it.
+    pub(super) fn take_off_written(&mut self, id: &str) -> Option<OffWritten> {
+        self.off_written.take().filter(|w| w.session == id)
     }
 
-    /// How many changeset updates this owner wrote out off its shard ([`Shard::want_changes`]).
+    /// How many updates this owner wrote out off its shard ([`Shard::want_off`]).
     #[cfg(test)]
-    pub(super) fn changes_off(&self) -> u64 {
-        self.changes_off
+    pub(super) fn updates_off(&self) -> u64 {
+        self.updates_off
     }
 
     /// A turn ended, as what followed gave the shard up: one that took something held it `held` ([`Turn::held`]), kept for the
@@ -3169,10 +3282,10 @@ impl Copies {
                 frame: None,
                 #[cfg(test)]
                 framed_off: 0,
-                changes_writing: None,
-                changes_written: None,
+                off_writing: None,
+                off_written: None,
                 #[cfg(test)]
-                changes_off: 0,
+                updates_off: 0,
                 #[cfg(test)]
                 turns: Vec::new(),
             };
@@ -3541,7 +3654,7 @@ impl Costs {
         let left = shard.take(msg, hub, &over);
         // What was written out off the shard for this take alone: one it didn't take (its update gone meanwhile) isn't kept.
         shard.written = None;
-        shard.changes_written = None;
+        shard.off_written = None;
         let end = Instant::now();
         self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
         if let Some(at) = ran_out.get() {
@@ -3617,50 +3730,58 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
     gave_up
 }
 
-/// The changeset update `writing` names, the first of what's left of its session's messages (`rest`), written out on the compute
-/// pool while the shard does its other work (goal 9, plan 01a1a87b2cec step 3): taken out of its message, not copied, and what
-/// was made of it kept for its next take ([`Shard::take_changes_written`]). Written, the update is let go of there, its files
-/// freed off the shard; one that couldn't be written goes back in its place, marked so, and is written where it is. Whether
-/// the shard was given up.
-async fn changes_off(shard: &mut Shard, writing: ChangesWriting, rest: &mut Option<Msg>) -> bool {
+/// The update `writing` names, the first of what's left of its session's messages (`rest`): a changeset, a state or a meta long
+/// to write out ([`long_off`]), written out on the compute pool while the shard does its other work (goal 9, plan 01a1a87b2cec
+/// step 3). It's taken out of its message, not copied, with what of the copy's it's compared with (a state's or a meta's last,
+/// taken out of the copy and let go of there with what replaces it), and what was made of it kept for its next take
+/// ([`Shard::take_off_written`]). A changeset written is let go of there, its files freed off the shard; a state or a meta goes
+/// back in its place (the copy keeps it); one that couldn't be written goes back marked so, and is written where it is.
+/// Whether the shard was given up.
+async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Msg>) -> bool {
     let Some(Msg::Update(i)) = rest.as_mut() else { return false };
-    // The update taken out, an empty one of its kind in its place till it's back.
-    let u = match &mut i.u {
-        Update::Changes { files } => Update::Changes { files: std::mem::take(files) },
-        Update::ChangesPatch { set, gone } => Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) },
+    let OffWriting { session, keep } = writing;
+    let Some(m) = shard.mirrors.get_mut(&session) else { return false };
+    // The update taken out, an empty one of its kind in its place till it's back; and what it's compared with.
+    let (u, prior) = match &mut i.u {
+        Update::Changes { files } => (Update::Changes { files: std::mem::take(files) }, Prior::None),
+        Update::ChangesPatch { set, gone } => (Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) }, Prior::None),
+        Update::State { state } => (Update::State { state: std::mem::take(state) }, Prior::State(Arc::clone(&m.state), m.state_of.take())),
+        Update::Meta { meta } => (Update::Meta { meta: std::mem::take(meta) }, Prior::Meta(Arc::clone(&m.meta), m.meta_of.take())),
         _ => return false,
     };
-    let ChangesWriting { session, keep } = writing;
     let of = session.clone();
     let (written, gave_up) = waited(crate::rt::compute(move || {
+        let began = Instant::now();
+        let bytes = changes_bytes(&u);
         // Caught here, so the update comes back whatever.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| changes_made_of(&of, &u, keep))) {
-            Ok((made, took)) => {
-                let bytes = changes_bytes(&u);
-                (Some(made), None, bytes, took)
-            }
-            Err(_) => (None, Some(u), 0, Duration::ZERO),
-        }
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_off(&of, &u, prior, keep))).ok();
+        let took = began.elapsed();
+        // A changeset written is let go of here; the rest go back.
+        let let_go = made.is_some() && matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. });
+        let back = (!let_go).then_some(u);
+        (made, back, bytes, took)
     }))
     .await;
     match written {
         Ok((made, back, bytes, took)) => {
             if made.is_some() {
-                CHANGES.learn(bytes, nanos(took));
+                if back.is_none() {
+                    CHANGES.learn(bytes, nanos(took));
+                }
                 #[cfg(test)]
                 {
-                    shard.changes_off = shard.changes_off.saturating_add(1);
+                    shard.updates_off = shard.updates_off.saturating_add(1);
                 }
             }
             if let Some(u) = back {
                 i.u = u;
             }
-            shard.changes_written = Some(ChangesWritten { session, made });
+            shard.off_written = Some(OffWritten { session, made, took });
         }
         Err(err) => {
-            // The pool dropped the job unrun (the process is going), the update with it: the copy keeps the changeset it had,
-            // and its runner sends it again as it changes.
-            tracing::error!(session = %session, error = %format!("{err:#}"), "a session's changeset was lost being written out off its owner's shard");
+            // The pool dropped the job unrun (the process is going), the update with it: the copy keeps what it had, and its
+            // runner says it again as it changes.
+            tracing::error!(session = %session, error = %format!("{err:#}"), "a session's update was lost being written out off its owner's shard");
             *rest = None;
         }
     }
@@ -3673,22 +3794,34 @@ async fn changes_off(shard: &mut Shard, writing: ChangesWriting, rest: &mut Opti
 /// those viewers back to the copy instead (the feed's resync marker), which has its events: none goes on without them.
 /// Whether the shard was given up.
 async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
-    let Later { generation, rev, entries } = later;
-    let (made, gave_up) = waited(crate::rt::compute(move || events_frame(rev, &entries))).await;
-    let p = match made {
-        Ok(p) => {
+    let Later { generation, rev, entries, meta } = later;
+    let (made, gave_up) = waited(crate::rt::compute(move || match meta {
+        Some((value, room)) => {
+            let (p, took) = meta_frame(rev, &value, room);
+            (p, Some(took))
+        }
+        None => (events_frame(rev, &entries), None),
+    }))
+    .await;
+    let (p, meta_bytes) = match made {
+        Ok(made) => {
             #[cfg(test)]
             {
                 shard.framed_off = shard.framed_off.saturating_add(1);
             }
-            p
+            made
         }
         Err(e) => {
             tracing::warn!(session = %id, error = %format!("{e:#}"), "a session's frame couldn't be written off its owner's shard: its viewers start over from its copy");
-            payload_of(super::live::RESYNC, 0)
+            (payload_of(super::live::RESYNC, 0), None)
         }
     };
     if let Some(m) = shard.get_mut(id) {
+        // A meta's, as `Mirror::frame_of` keeps them: the room its next takes, and that it was encoded.
+        if let Some(took) = meta_bytes {
+            m.meta_bytes = took;
+            m.encodings.meta += 1;
+        }
         m.feed.send_payload(generation, p);
     }
     gave_up
@@ -3829,11 +3962,11 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
                 (turn, fresh) = (Turn::new(), true);
             }
         }
-        // A changeset long to write out (its files' JSON, and its row for the store): written on the compute pool, the shard
+        // A changeset, a state or a meta long to write out (and its row for the store): written on the compute pool, the shard
         // given up meanwhile, before its update is taken (goal 9, plan 01a1a87b2cec step 3).
-        if let Some(writing) = shard.changes_writing.take() {
+        if let Some(writing) = shard.off_writing.take() {
             let held = turn.held();
-            if changes_off(&mut shard, writing, &mut rest).await {
+            if update_off(&mut shard, writing, &mut rest).await {
                 shard.turned(held, fresh);
                 (turn, fresh) = (Turn::new(), true);
             }
@@ -5932,14 +6065,14 @@ mod tests {
             for u in updates.by_ref().take(2) {
                 anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
             }
-            let was = copies.on(&id, |s| s.changes_off()).await.unwrap_or_default();
+            let was = copies.on(&id, |s| s.updates_off()).await.unwrap_or_default();
             let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
             anyhow::ensure!(long_changes(&large), "a changeset of 40,000 lines expected to take past a slow poll to write out");
             for u in updates {
                 anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
             }
             let i = id.clone();
-            let now = copies.on(&id, move |s| (s.changes_off(), s.get(&i).map(texts))).await;
+            let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(texts))).await;
             let Some((off, Some(got))) = now else { anyhow::bail!("no copy") };
             anyhow::ensure!(off == was + 1, "written out off its owner's shard once: {was} then {off}");
             let paths: Vec<Option<String>> = got.iter().map(|t| serde_json::from_str::<Value>(t).ok().and_then(|v| v.get("path").and_then(Value::as_str).map(str::to_owned))).collect();
@@ -5994,6 +6127,63 @@ mod tests {
             held.sort();
             let median = held.get(held.len() / 2).copied().unwrap_or_default();
             anyhow::ensure!(held.len() >= 2 && median <= quantum, "{} turns said ended over the sweep, {median:?} at the median, the quantum {quantum:?}", held.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a session whose states (or metas) take long to write out, as its last did on its owner's
+    /// shard, has its next written out off the shard, as the owner counts it, and taken as one written on the shard is: the
+    /// copy's state, its info and its meta as the updates say, the same state again kept as it is (its doc the one it was).
+    #[test]
+    fn g9_s3_a_long_state_or_meta_is_written_off_its_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "said".to_owned();
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                })
+                .await;
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            let (big, bigger) = ("s".repeat(512 << 10), "t".repeat(512 << 10));
+            let state = |summary: &str| Box::new(State { summary: summary.to_owned(), ..State::default() });
+            let off = || async { copies.on(&id, |s| s.updates_off()).await.unwrap_or_default() };
+            // The first, written on the shard, teaches what its states take; the next goes off it, and the same again too.
+            anyhow::ensure!(send(Update::State { state: state(&big) }).await, "sent");
+            let was = off().await;
+            anyhow::ensure!(send(Update::State { state: state(&bigger) }).await, "sent");
+            let i = id.clone();
+            let first = copies.on(&id, move |s| s.get(&i).map(|m| Arc::as_ptr(&m.state) as usize)).await.flatten();
+            anyhow::ensure!(send(Update::State { state: state(&bigger) }).await, "sent");
+            let after_states = off().await;
+            anyhow::ensure!(after_states == was + 2, "two states written out off its owner's shard: {was} then {after_states}");
+            let i = id.clone();
+            let now = copies.on(&id, move |s| s.get(&i).map(|m| (Arc::as_ptr(&m.state) as usize, m.state.to_value(), m.info.summary.len(), m.state_of.as_ref().is_some_and(|(_, made)| Arc::ptr_eq(made, &m.state))))).await.flatten();
+            let Some((doc, value, summary, kept)) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(value == serde_json::to_value(State { summary: bigger.clone(), ..State::default() })?, "the state as made on the shard");
+            anyhow::ensure!(Some(doc) == first && kept && summary < bigger.len(), "the same again kept as it is ({doc:#x}, {first:?}), its info's summary clipped: {summary}");
+            // Metas the same way: one of many agents, as a long meta has many commands, agents and skills, each a value. A viewer
+            // watches: a long one's frame (the whole value written out) goes off the shard too.
+            let slot = copies.slot(&id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let viewer = slot.tap().join(super::super::registry::Patches::default());
+            anyhow::ensure!(viewer.position().is_some(), "its feed");
+            let framed = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
+            let meta = |tag: &str| Meta { agents: (0..20_000).map(|k| format!("{tag}-{k}")).collect(), ..Meta::default() };
+            anyhow::ensure!(send(Update::Meta { meta: Box::new(meta("first")) }).await, "sent");
+            let was = off().await;
+            anyhow::ensure!(send(Update::Meta { meta: Box::new(meta("next")) }).await, "sent");
+            let i = id.clone();
+            let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(|m| (*m.meta).clone()))).await;
+            let Some((off_now, Some(made))) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(off_now == was + 1, "a meta written out off its owner's shard: {was} then {off_now}");
+            anyhow::ensure!(made == serde_json::to_value(meta("next"))?, "the meta as made on the shard");
+            let framed_now = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
+            anyhow::ensure!(framed_now == framed + 2, "each long meta's frame written off its owner's shard: {framed} then {framed_now}");
+            drop(viewer);
             Ok(())
         })
     }
