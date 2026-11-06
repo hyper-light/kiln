@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
@@ -135,6 +135,39 @@ fn recorded(state: &std::path::Path, id: &str) -> anyhow::Result<()> {
     }
 }
 
+/// The first attach to session `id` after its server started again, read on until the session's lines `0..want` have
+/// come on it (in its snapshot, then as its runner sends them again) or `within` is up: its first frame, and the lines
+/// that came. One the server answers `closed` ends there.
+fn first_attach(s: &common::Server, id: &str, want: usize, within: Duration) -> anyhow::Result<(Value, BTreeSet<usize>)> {
+    let mut ws = agents::socket(s.port, &s.admin, &format!("/api/harness/sessions/{id}/ws"))?;
+    let deadline = Instant::now() + within;
+    let (mut first, mut got): (Option<Value>, BTreeSet<usize>) = (None, BTreeSet::new());
+    while !(0..want).all(|n| got.contains(&n)) && Instant::now() < deadline {
+        let (op, payload) = agents::frame(&mut ws)?;
+        if op != 1 {
+            continue;
+        }
+        let f: Value = serde_json::from_slice(&payload)?;
+        got.extend(agents::lines(&agents::events(std::slice::from_ref(&f))));
+        // Closed: nothing more comes (the server ends the socket).
+        let closed = t(&f) == "closed";
+        first.get_or_insert(f);
+        if closed {
+            break;
+        }
+    }
+    Ok((first.unwrap_or_default(), got))
+}
+
+/// That the first attach after a restart got session `id` (`first_attach`): it opened it, and brought every line of the
+/// `had` its copy had before the restart.
+fn got_the_session(id: &str, had: usize, (first, got): &(Value, BTreeSet<usize>)) -> anyhow::Result<()> {
+    anyhow::ensure!(t(first) == "open" && first.pointer("/info/id").and_then(Value::as_str) == Some(id), "the first attach after the restart didn't open session {id}: {first}");
+    let missing: Vec<usize> = (0..had).filter(|n| !got.contains(n)).collect();
+    anyhow::ensure!(missing.is_empty(), "the first attach after the restart never brought lines {missing:?} of the {had} session {id}'s copy had");
+    Ok(())
+}
+
 #[test]
 fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Result<()> {
     const LINES: u64 = 150;
@@ -223,16 +256,19 @@ fn a_server_that_starts_again_has_its_runners_send_only_what_its_copies_lack() -
     let id = agents::open_session(s.port, &s.admin, "steady-runner", &work, Duration::from_secs(60))?;
 
     // Killed mid-turn, as a crash would; the turn goes on on its runner meanwhile.
-    mid_turn(&s, &id, LINES)?;
+    let had = mid_turn(&s, &id, LINES)?;
     let runner_log = || std::fs::read_to_string(&log).unwrap_or_default();
     let server_log = || std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
     let connections = |text: &str| text.matches("connected to server").count();
     let (upto, seen, server_upto) = (runner_log().len(), connections(&runner_log()), server_log().len());
     s.restart()?;
 
-    // Started again, it has the session's copy at once, rebuilt from its store.
-    let (rebuilt, _) = agents::attach(s.port, &s.admin, &id, "")?;
-    anyhow::ensure!(!agents::lines(&agents::events(&rebuilt)).is_empty(), "the copy wasn't rebuilt from the store: {:?}", rebuilt.first());
+    // Started again, it has the session's copy at once, rebuilt from its store: the first attach opens it, and brings
+    // the lines the copy had, those of its store in its snapshot and the rest as its runner sends them again. The store
+    // may have fewer than the copy had: a runner's feed sends its next batch once kiln.db has kept its last one's
+    // receipt (consts-audit R4), and on a loaded machine the restart came four seconds into the session with none of
+    // its lines stored (1 run in 9 alone, 2026-11-06).
+    got_the_session(&id, had, &first_attach(&s, &id, had, Duration::from_secs(120))?)?;
     // Its runner comes back, and the turn ends with every line in the copy once, in order.
     let deadline = Instant::now() + Duration::from_secs(120);
     while connections(&runner_log()) == seen {
@@ -268,4 +304,50 @@ fn a_server_that_starts_again_has_its_runners_send_only_what_its_copies_lack() -
     let went_on = after.lines().filter(|l| l.contains("an agent session's copy goes on from its machine") && l.contains(&id)).count();
     assert_eq!((fresh, went_on), (0, 1), "after the restart the copy started over {fresh} times and went on {went_on} times");
     Ok(())
+}
+
+/// docs/wire.md, "Restarts": a session a restarted server's store has none of has no copy until its runner is back and
+/// sends it whole, and its first attach waits for that rather than being told the session is closed (which ended the
+/// attach, its reader at EOF: "failed to fill whole buffer"). Do: a server that keeps no conversations
+/// (`KILN_CONVERSATIONS=off`), so its store survives nothing; a session mid-turn; the server killed and started again,
+/// and the session attached to at once. Expect: that first attach opens the session and brings every line its copy
+/// had before the restart.
+#[test]
+fn a_session_a_restarted_servers_store_has_none_of_comes_to_its_first_attach_with_its_runner() -> anyhow::Result<()> {
+    const LINES: u64 = 200;
+    let dir = tempfile::tempdir()?;
+    let mut s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("KILN_CONVERSATIONS", "off")])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let (_runner, log) = agents::runner(dir.path(), s.port, "storeless-runner", None, Talk { lines: LINES as usize, every_ms: 50 })?;
+    agents::connected(s.port, &s.admin, "storeless-runner", &log, Duration::from_secs(120))?;
+    let id = agents::open_session(s.port, &s.admin, "storeless-runner", &work, Duration::from_secs(60))?;
+    let had = mid_turn(&s, &id, LINES)?;
+    s.restart()?;
+    got_the_session(&id, had, &first_attach(&s, &id, had, Duration::from_secs(120))?)
+}
+
+/// docs/wire.md, "Restarts", with the runner's feed to the server's store held (`receipts_unkept`: no batch's receipt
+/// kept, so no Ack said, so the feed sends nothing after its first batch): one session's Open reached the store, none of
+/// its lines; a second session, opened after, reached it not at all. Do: both mid-turn; the server killed and started
+/// again, still keeping no receipts, and each session attached to at once. Expect: each first attach opens its session
+/// and brings every line its copy had; the second's was told it was closed, its copy none of the store's.
+#[cfg(feature = "chaos")]
+#[test]
+fn a_server_restarted_while_its_runners_feed_is_held_gives_each_sessions_first_attach_the_session() -> anyhow::Result<()> {
+    const LINES: u64 = 300;
+    let dir = tempfile::tempdir()?;
+    let mut s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("KILN_CHAOS", "receipts_unkept")])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let (_runner, log) = agents::runner(dir.path(), s.port, "held-runner", None, Talk { lines: LINES as usize, every_ms: 50 })?;
+    agents::connected(s.port, &s.admin, "held-runner", &log, Duration::from_secs(120))?;
+    let first = agents::open_session(s.port, &s.admin, "held-runner", &work, Duration::from_secs(60))?;
+    mid_turn(&s, &first, LINES)?;
+    let second = agents::open_session(s.port, &s.admin, "held-runner", &work, Duration::from_secs(60))?;
+    let had_second = mid_turn(&s, &second, LINES)?;
+    let had_first = agents::lines(&agents::events(&agents::attach(s.port, &s.admin, &first, "")?.0)).len();
+    s.restart()?;
+    got_the_session(&second, had_second, &first_attach(&s, &second, had_second, Duration::from_secs(120))?)?;
+    got_the_session(&first, had_first, &first_attach(&s, &first, had_first, Duration::from_secs(120))?)
 }
