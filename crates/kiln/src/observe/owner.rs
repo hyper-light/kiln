@@ -91,6 +91,10 @@ const SNAPSHOT_FILE_MAX: u64 = 1 << 40;
 /// frames waiting on the lane past which none is taken: profiles yield to the group's own messages.
 const PROFILE_BYTES: u64 = 64 << 20;
 const PROFILE_ROOM: usize = 64;
+/// The node's messages to its peers' replicas waiting for the net, at the most (past them a message is dropped: the
+/// group sends what's needed again): the 16,384 its bounded queue held, kept by its one sender now (`Owner::send`)
+/// so the queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5).
+const OUT_PLACES: usize = 16_384;
 
 /// What this node is in the group.
 pub enum Role {
@@ -340,9 +344,11 @@ impl Observe {
         // The node's receivers begin now (`super::otlp::keys`).
         let _ = super::otlp::keys();
         let (tx, rx) = std::sync::mpsc::channel();
-        // Each message boxed: the queue makes all its places as it's made, and a message in place took 320
-        // bytes, 5.2 MB for the queue's 16,384 though it's all but empty (goal 11, plan 01a1a87b2e56 step 3).
-        let (out_tx, out_rx) = async_channel::bounded(16_384);
+        // Each message boxed: a message in place took 320 bytes, 5.2 MB for the queue's 16,384 places made as it
+        // was made (goal 11, plan 01a1a87b2e56 step 3). Its places are made as it fills, its bound kept where its one
+        // sender sends ([`OUT_PLACES`], `Owner::send`): a bounded queue makes every place as it's made (concurrent-queue
+        // writes each one's stamp), 256 KiB of them in every process though it's all but empty (step 5).
+        let (out_tx, out_rx) = async_channel::unbounded();
         let store = Arc::new(Mutex::new(None));
         // Its role said from the start: a status asked before the group opens says what it is.
         let role = if matches!(settings.role, Role::Server { .. }) { "server" } else { "runner" };
@@ -1676,8 +1682,10 @@ impl Owner {
 
     // ------------------------------------------------------------------------------ both
 
+    /// A message to `machine`'s replica: past [`OUT_PLACES`] waiting, dropped, as the bounded queue it waited in
+    /// refused it (the group sends what's needed again).
     fn send(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
-        let _ = self.out.try_send(Box::new(Out { machine: machine.to_owned(), msg, bytes }));
+        crate::memory::send_within(&self.out, OUT_PLACES, || Box::new(Out { machine: machine.to_owned(), msg, bytes }));
     }
 
     /// A profiler's upload sent on to the server (kept here, on the server): one the server is not

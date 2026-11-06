@@ -189,6 +189,15 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
     }
 }
 
+/// What `make` makes, sent into `tx` unless `most` wait in it already: the bound of a queue made unbounded so that
+/// it makes its places as it fills, kept by its one sender (goal 11, plan 01a1a87b2e56 step 5). A bounded
+/// async-channel makes every place as it's made (concurrent-queue writes each one's stamp), all of them resident
+/// however few wait. Past `most`, nothing is made and false is said, as a full queue's `try_send` refused; a sender
+/// beside the one may take it past `most` by what it sends meanwhile.
+pub fn send_within<T>(tx: &async_channel::Sender<T>, most: usize, make: impl FnOnce() -> T) -> bool {
+    tx.len() < most && tx.try_send(make()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +250,31 @@ mod tests {
         assert!(!o.contains("kiln_memory_bound_bytes{owner=\"test_open\"}"), "{o}");
         assert!(o.contains("kiln_memory_bytes{owner=\"ui_assets\"}"), "{o}");
         assert!(o.contains("kiln_memory_bytes{owner=\"snapshots\"}"), "{o}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a queue whose sender keeps its bound holds its most, refuses the
+    /// next without making it, and takes one again once one is taken.
+    #[test]
+    fn g11_s5_heap_a_queue_its_sender_bounds_holds_its_most_and_makes_nothing_past_it() {
+        let (tx, rx) = async_channel::unbounded::<u32>();
+        for i in 0..3 {
+            assert!(send_within(&tx, 3, || i), "{i} of 3");
+        }
+        let mut made = false;
+        assert!(
+            !send_within(&tx, 3, || {
+                made = true;
+                9
+            }),
+            "past its most: refused"
+        );
+        assert!(!made, "and nothing made");
+        assert_eq!(rx.try_recv().ok(), Some(0));
+        assert!(send_within(&tx, 3, || 3), "room again once one's taken");
+        assert_eq!((rx.len(), rx.try_recv().ok()), (3, Some(1)));
+        while rx.try_recv().is_ok() {}
+        drop(rx);
+        assert!(!send_within(&tx, 3, || 4), "with room but none to take it: refused");
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: what's held shows while it's held, goes as it's let go, and what's
