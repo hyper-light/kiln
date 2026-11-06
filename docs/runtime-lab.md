@@ -3151,6 +3151,39 @@ About 2.5 minutes a round, 64 rounds: two hours and three quarters. What to read
   A/B": the probe's own wake is prompt already); the real-time class's A/B ("The A/B to run", above) is the one that
   can, where Ada has given the room.
 
+### The A/B of the spin before the park against step 5's bar (goal 9 step 5)
+
+The sized spin (`spin-<cfg>`: `KILN_RT_SPIN=1`, each shard spinning before each park as long as its own last window of
+gaps makes cheapest in CPU, up to 16 µs; "The shard's own wake path", above) against none (the default, off), calm and
+beside the hogs, in production's layout: what it does to step 5's bar (the shards' busy share calm at most 0.011, with
+hogs at most 0.0056) and to the CPU a request costs, and what it buys or costs the delay and the tails. Eight rounds
+each, interleaved, `kiln` and `kiln-lab` built from one tree with the quiet probe in it (so both sides sample the
+shards' delay the same way: "The shard-delay instrument", above), with `scripts/shard_lab/driver.sh` on fedora (the
+coordinator's):
+
+```sh
+systemd-run --user --unit=g9s5-spin --collect -E HOME=$HOME -E PATH=$PATH -E XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+  env ROUNDS=8 N=16 LAB_CPUS=0-15 SERVER_CPUS=16-31 SHARDS=4 \
+  CONFIGS="calm spin-calm hogs spin-hogs" \
+  COMPARE="calm:spin-calm hogs:spin-hogs" \
+  bash <worktree>/scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab-pending/g9s5-spin
+```
+
+About 2.5 minutes a round, 32 rounds: an hour and twenty minutes. What to read in `report.md`, each pair by
+`kiln-lab compare`:
+
+- **The shards' delay at p99.9**: `shards.delay_p999_us` and `shards.worst_delay_p999_us`, and apart by where the
+  samples came from, `shards.by_work.delay_p999_us` and `shards.by_probe.delay_p999_us`.
+- **The tails**: `shards.delay_max_us`, and each class's `p999_ms` and `max_ms` (`page`, `api_read`, `api_write`,
+  `websocket`, `attach`).
+- **The busy share**: `shards.busy_share` and `shards.worst_busy_share`, against the bar.
+- **The CPU a request costs**: `server.cpu_ms_per_request`, and the shards' own a request: `shards.parks_per_request`,
+  `shards.wakeups_kick_per_request`, `shards.kicks_saved_per_request`, `shards.spins_per_request`,
+  `shards.spin_hits_per_request` and `shards.spin_seconds_per_request`.
+
+It becomes a default candidate only where it lowers the busy share or the CPU a request beyond noise with no delay or
+tail number worse beyond noise, calm and with hogs; else it stays a setting, off until declared (docs/ci.md §0.3).
+
 ### The A/B to run: the nudge on its own (goal 6 step 3 and goal 8 step 7)
 
 `scripts/shard_lab/driver.sh` (goal 9's lab) runs a configuration with `[server] nudge` set by a prefix,
