@@ -308,6 +308,9 @@ pub struct QuicSample {
     pub frames_dropped: u64,
     /// Endpoint responses dropped at their bound, since then.
     pub responses_dropped: u64,
+    /// Frames whose buffer no spare held, allocated or grown on the net thread, since then (goal 11's audit,
+    /// row B22: `crate::net_budget::Spares::fresh`).
+    pub frames_allocated: u64,
     /// Each peer with a connection: its name, its path now and what its connection counted.
     pub peers: Vec<PeerSample>,
 }
@@ -349,6 +352,7 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> 
         streams_refused: st.streams_refused,
         frames_dropped: st.frames_dropped,
         responses_dropped: st.responses_dropped,
+        frames_allocated: ep.budget().fresh(),
         peers: Vec::new(),
     };
     ep.directory().each(&mut |peer, name| {

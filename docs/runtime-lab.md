@@ -2047,7 +2047,8 @@ transfers; CI logs) was allocated on the net thread, and faulted in there once j
 back, with every runner's frames queued behind it (goal 11's audit, row B22). Now the spares keep as many buffers,
 and as many bytes, as the frames have had out at once at the most, learned as frames come: a frame of a size seen
 before finds its buffer kept (`net_budget`'s `g11_b22_*` count the frames allocated: none after the first of each
-size), and the spares hold no more than the busiest moment's frames did.
+size), and the spares hold no more than the busiest moment's frames did. observe's `kiln.quic.frames_allocated`
+counts the frames a node's spares didn't hold, since its endpoint was made.
 
 **observe's grok rules** (`observe::pipeline::grok::Kept`) are compiled as each pipeline is made, and kept. Compiled
 when a record first reached them (goal 11 step 3, for the 4 MB kiln's own six rules took of an idle heap), the
