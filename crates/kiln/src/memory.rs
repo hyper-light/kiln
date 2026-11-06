@@ -155,7 +155,7 @@ fn render_allocator(o: &mut String, stats: Option<crate::os::alloc::Stats>) {
     };
     let _ = writeln!(
         o,
-        "# HELP kiln_memory_allocator_bytes What the allocator (jemalloc) holds, by kind: allocated (the program's allocations, thread_caches included), thread_caches (freed, kept for each thread's next), active (pages holding allocations, never-written ones included), dirty (freed pages not yet given back), muzzy (given back lazily), metadata (its own), resident (active, dirty and metadata pages), mapped and retained (address space).\n# TYPE kiln_memory_allocator_bytes gauge"
+        "# HELP kiln_memory_allocator_bytes What the allocator (jemalloc) holds, by kind: allocated (the program's allocations, thread_caches included), thread_caches (freed, kept for each thread's next), active (pages holding allocations, never-written ones included), dirty (freed pages not yet given back), muzzy (given back lazily), metadata (its own), resident (active, dirty and metadata pages), mapped and retained (address space); of active less allocated, slab_room (small sizes' free regions in their slabs) and large_pad (a page a large allocation, laid out cache-obliviously).\n# TYPE kiln_memory_allocator_bytes gauge"
     );
     for (kind, bytes) in stats.kinds() {
         let _ = writeln!(o, "kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}");
@@ -217,11 +217,11 @@ mod tests {
         let mut o = String::new();
         render_allocator(&mut o, None);
         assert_eq!(o, "");
-        let stats = crate::os::alloc::Stats { allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900 };
+        let stats = crate::os::alloc::Stats { allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900, slab_room: 12, large_pad: 4 };
         render_allocator(&mut o, Some(stats));
         assert!(o.starts_with("# HELP kiln_memory_allocator_bytes "), "{o}");
         assert!(o.contains("# TYPE kiln_memory_allocator_bytes gauge\n"), "{o}");
-        for line in ["allocated\"} 100\n", "thread_caches\"} 10\n", "active\"} 120\n", "dirty\"} 30\n", "muzzy\"} 0\n", "metadata\"} 5\n", "resident\"} 155\n", "mapped\"} 130\n", "retained\"} 900\n"] {
+        for line in ["allocated\"} 100\n", "thread_caches\"} 10\n", "active\"} 120\n", "dirty\"} 30\n", "muzzy\"} 0\n", "metadata\"} 5\n", "resident\"} 155\n", "mapped\"} 130\n", "retained\"} 900\n", "slab_room\"} 12\n", "large_pad\"} 4\n"] {
             assert!(o.contains(&format!("kiln_memory_allocator_bytes{{kind=\"{line}")), "{line} in {o}");
         }
         let mut whole = String::new();
