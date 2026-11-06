@@ -6313,30 +6313,37 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     Ok(resp)
 }
 
-/// The most bytes of a packed snapshot one WebSocket frame carries: the socket's writer copies a frame
-/// into its buffer whole before it writes any of it, on the shard that serves the socket, and a long
-/// session's snapshot is megabytes; as much as the writer gathers before it writes (tungstenite's
-/// `write_buffer_size`, by default) goes at a time, and the shard serves its other sockets between
-/// (goal 10, plan 01a1a87b2dae step 3).
+/// The most bytes of a packed snapshot the blocking pool packs at a time (a piece, `Packing::next_piece`), each
+/// piece's making a job of its own: what a frame carried, as much as tungstenite's writer gathered before it
+/// wrote (its default `write_buffer_size`; goal 10, plan 01a1a87b2dae step 3), kept as the pool's unit so a
+/// snapshot takes as many of its jobs as it did. Its frames are [`SNAPSHOT_FRAME`]s.
 const SNAPSHOT_PIECE: usize = 128 * 1024;
 
-/// `bytes` as one binary message in frames of at most [`SNAPSHOT_PIECE`] bytes (RFC 6455 5.4's
+/// The most bytes of a packed snapshot one WebSocket frame carries: what its socket writes at a time
+/// ([`ws::SOCKET_WRITE`]). The socket's writer copies a frame into its buffer whole before it writes any of it,
+/// on the shard that serves the socket, and a long session's snapshot is megabytes: a frame at a time goes, and
+/// the shard serves its other sockets between. The writer's buffer keeps the most it ever held while the socket
+/// is open, so a frame of a whole piece (128 KiB) kept 131 KiB for every viewer after its snapshot (goal 11,
+/// plan 01a1a87b2e56 step 5).
+const SNAPSHOT_FRAME: usize = ws::SOCKET_WRITE;
+
+/// `bytes` as one binary message in frames of at most [`SNAPSHOT_FRAME`] bytes (RFC 6455 5.4's
 /// fragments, which every client joins into the one message they are).
 #[cfg(test)]
 fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
     pieces_of(bytes, true, true)
 }
 
-/// `bytes`, a piece of one binary message, in frames of at most [`SNAPSHOT_PIECE`] bytes: the message's
+/// `bytes`, a piece of one binary message, in frames of at most [`SNAPSHOT_FRAME`] bytes: the message's
 /// first frame (when `first`) binary and the rest continuations, its last (when `last`) final (RFC 6455
 /// 5.4), so the pieces of a message packed as it goes out make one message (goal 11, plan 01a1a87b2e56 step 5).
 fn pieces_of(bytes: Vec<u8>, first: bool, last: bool) -> impl Iterator<Item = ws::Message> {
     use tungstenite::protocol::frame::Frame;
     use tungstenite::protocol::frame::coding::{Data, OpCode};
     let bytes = bytes::Bytes::from(bytes);
-    let n = bytes.len().div_ceil(SNAPSHOT_PIECE).max(1);
+    let n = bytes.len().div_ceil(SNAPSHOT_FRAME).max(1);
     (0..n).map(move |i| {
-        let piece = bytes.slice((i * SNAPSHOT_PIECE).min(bytes.len())..((i + 1) * SNAPSHOT_PIECE).min(bytes.len()));
+        let piece = bytes.slice((i * SNAPSHOT_FRAME).min(bytes.len())..((i + 1) * SNAPSHOT_FRAME).min(bytes.len()));
         let op = if i == 0 && first { Data::Binary } else { Data::Continue };
         ws::Message::Frame(Frame::message(piece, OpCode::Data(op), last && i + 1 == n))
     })
@@ -7435,16 +7442,18 @@ mod tests {
     }
 
     /// Goal 10, plan 01a1a87b2dae step 3: a packed snapshot goes in frames of at most
-    /// [`SNAPSHOT_PIECE`] bytes (the first binary, the rest continuations, the last final), which a
-    /// client joins into the one message they are, whatever its length.
+    /// [`SNAPSHOT_FRAME`] bytes (the first binary, the rest continuations, the last final), which a
+    /// client joins into the one message they are, whatever its length (goal 11, plan 01a1a87b2e56 step 5:
+    /// a frame what its socket writes at a time, a piece's several).
     #[test]
     fn g10_s3_a_packed_snapshot_goes_in_pieces_a_client_joins() -> anyhow::Result<()> {
         use std::io::Cursor;
         use tungstenite::protocol::{Role, WebSocket};
-        for len in [0, 1, SNAPSHOT_PIECE - 1, SNAPSHOT_PIECE, SNAPSHOT_PIECE + 1, 3 * SNAPSHOT_PIECE + 17] {
+        for len in [0, 1, SNAPSHOT_FRAME - 1, SNAPSHOT_FRAME, SNAPSHOT_FRAME + 1, SNAPSHOT_PIECE, SNAPSHOT_PIECE + 1, 3 * SNAPSHOT_PIECE + 17] {
             let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
             let sent: Vec<ws::Message> = pieces(bytes.clone()).collect();
-            assert_eq!(sent.len(), len.div_ceil(SNAPSHOT_PIECE).max(1), "{len} bytes' frames");
+            assert_eq!(sent.len(), len.div_ceil(SNAPSHOT_FRAME).max(1), "{len} bytes' frames");
+            assert!(sent.iter().all(|m| matches!(m, ws::Message::Frame(f) if f.payload().len() <= SNAPSHOT_FRAME)), "{len} bytes: a frame past {SNAPSHOT_FRAME}");
             let mut server = WebSocket::from_raw_socket(Cursor::new(Vec::new()), Role::Server, None);
             for m in sent {
                 server.send(m)?;
