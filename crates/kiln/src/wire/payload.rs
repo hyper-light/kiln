@@ -545,9 +545,10 @@ pub enum Frame {
 /// each frame's bytes and of how long its read took where it ran, nanoseconds (the weight of a new
 /// sample 1/8, as RFC 6298 smooths a round trip), and of how far each read on the shard fell from what
 /// was expected of it (the weight 1/4, as RFC 6298 smooths a round trip's variation). One writer, the
-/// hub's loop (its loops: a benign race between them, each a load and a store).
+/// hub's loop (its loops: a benign race between them, each a load and a store). Making frames of
+/// messages learns its cost by their bytes so too (`crate::net::MADE`; consts-audit R2).
 #[derive(Default)]
-struct Expect {
+pub(crate) struct Expect {
     bytes: std::sync::atomic::AtomicU64,
     ns: std::sync::atomic::AtomicU64,
     dev: std::sync::atomic::AtomicU64,
@@ -555,7 +556,7 @@ struct Expect {
 
 impl Expect {
     /// An [`Expect`] with nothing learned.
-    const fn nothing_yet() -> Self {
+    pub(crate) const fn nothing_yet() -> Self {
         Self { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0), dev: std::sync::atomic::AtomicU64::new(0) }
     }
 
@@ -582,18 +583,18 @@ impl Expect {
     /// to 0.73 ms on the CPU in train 16's lab, g9p16). A read kept on the shard gives the shard up first where its bound
     /// won't fit what's left of the turn (`crate::rt::Turns`). Consts-audit B1: it was on the shard while its bound was
     /// within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs), whatever the pool's round trip was.
-    fn on_shard(&self, len: u64) -> Option<u64> {
+    pub(crate) fn on_shard(&self, len: u64) -> Option<u64> {
         self.on_shard_against(len, crate::rt::trip_from_here())
     }
 
     /// [`Expect::on_shard`] against a round trip to the compute pool of `trip_ns` (none: not learned).
-    fn on_shard_against(&self, len: u64, trip_ns: Option<u64>) -> Option<u64> {
+    pub(crate) fn on_shard_against(&self, len: u64, trip_ns: Option<u64>) -> Option<u64> {
         let expected = self.expected(len);
         self.bound(len).filter(|_| crate::rt::here_against(expected, trip_ns)).map(|_| expected)
     }
 
     /// A frame of `len` bytes took `took` nanoseconds to read, on the shard (`on_shard`) or off it.
-    fn learn(&self, len: u64, took: u64, on_shard: bool) {
+    pub(crate) fn learn(&self, len: u64, took: u64, on_shard: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         // How far a read on the shard fell from what was expected of it, before what it teaches is taken in, as RFC 6298
         // (§2.3) takes a round trip's variation before its mean: x ← x + (|sample − expected| − x)/4. Only reads on the

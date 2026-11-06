@@ -402,21 +402,16 @@ impl NetHandle {
     }
 }
 
-/// What making a message's frames took at the slowest seen ([`send_made`]): half a mebibyte's in 1.4 ms on the CPU,
-/// in a poll (rt9's lab, the server's cluster and observe loops on their shards). Bytes, then nanoseconds.
-const MADE_SLOWEST: (u64, u64) = (512 * 1024, 1_400_000);
+/// What making messages' frames takes, by the bytes it copies ([`send_made`]): learned from this process's own makes, on
+/// its shards and on the compute pool, as a runner frame's read is (`crate::wire::payload::Expect`, RFC 6298's estimator;
+/// goal 9, plan 01a1a87b2cec step 5). Consts-audit R2: it was rt9's slowest seen, half a mebibyte in 1.4 ms, fixed in
+/// code, and a batch was made where it was up to what that made within a slow poll (100 µs): 37,449 bytes. Making a frame
+/// copies a message's bytes as postcard writes them, alike for the cluster group's and observe's: one for both.
+pub(crate) static MADE: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
 
-/// The most bytes of messages [`send_made`] makes into frames where it is, on its shard, not on the compute pool: what
-/// making at the slowest seen ([`MADE_SLOWEST`]) does within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs), 37,449
-/// bytes. A batch of more goes to the pool as before (goal 9, plan 01a1a87b2cec step 5: every batch did, though most are
-/// one write's few short messages to the cluster group's learners, a few hundred bytes each, whose hand-off, a wake of a
-/// pool's thread, the shard's park while it waits and its wake when the job is done, cost the shard several times what
-/// copying them does, once for every write kiln.db takes).
-pub const MADE_HERE_MOST: usize = (hyper_rt::slow::SLOW_POLL_NS as u128 * MADE_SLOWEST.0 as u128 / MADE_SLOWEST.1 as u128) as usize;
-
-/// What making the frames of `bytes` of messages is expected to take at the slowest seen ([`MADE_SLOWEST`]), nanoseconds.
-fn made_ns(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(MADE_SLOWEST.1) / MADE_SLOWEST.0
+/// Whole nanoseconds since `t`.
+fn nanos_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
@@ -424,13 +419,15 @@ fn made_ns(bytes: usize) -> u64 {
 /// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
 /// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
 /// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
-/// messages is made on the compute pool, unless what `weigh` says they copy is within [`MADE_HERE_MOST`], when it's
-/// made where it is, its turn ended first if that wouldn't fit it (`rt::Turns::before`; goal 9, plan 01a1a87b2cec step
-/// 5). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard is
-/// given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends
-/// within the quantum. Returns once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no
-/// lock (goal 5, plan 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
-pub async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, make: F, mut send: S)
+/// messages is made where it is where that's expected to cost no more than handing it to the compute pool and back, by
+/// what `weigh` says its messages copy at the rate `costs` learned (`crate::wire::payload::Expect::on_shard`,
+/// `crate::rt::here`), its turn ended first if that wouldn't fit it (`rt::Turns::before`), else on the compute pool;
+/// either way what it took teaches `costs` (goal 9, plan 01a1a87b2cec step 5; consts-audit R2). The messages waiting
+/// behind one are taken with it while the loop's turn lasts, and between sends the shard is given up once the turn is
+/// over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends within the quantum. Returns
+/// once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no lock (goal 5, plan
+/// 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
+pub(crate) async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, costs: &crate::wire::payload::Expect, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -467,15 +464,33 @@ where
             }
         }
         if !batch.is_empty() {
-            let made = if bytes <= MADE_HERE_MOST {
-                turns.before(made_ns(bytes)).await;
-                Ok(batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>())
-            } else {
-                let make = Arc::clone(&make);
-                let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
-                // The wait for the pool ended the poll: the sends start a turn of their own.
-                turns = crate::rt::Turns::new();
-                made
+            let len = u64::try_from(bytes).unwrap_or(u64::MAX);
+            let made = match costs.on_shard(len) {
+                // No dearer here than the pool's round trip: made where it is, its turn ended first where it won't fit.
+                Some(expected) => {
+                    turns.before(expected).await;
+                    let began = Instant::now();
+                    let made = batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>();
+                    costs.learn(len, nanos_since(began), true);
+                    Ok(made)
+                }
+                None => {
+                    let make = Arc::clone(&make);
+                    // Each message's making timed where it's made, on the pool's thread: the batch's, summed, teaches the
+                    // rate as one made here does, its waits for the pool left out.
+                    let made = crate::rt::compute_map(batch, move |(peer, x)| {
+                        let began = Instant::now();
+                        let frames = (*make)(x);
+                        (peer, frames, nanos_since(began))
+                    })
+                    .await;
+                    // The wait for the pool ended the poll: the sends start a turn of their own.
+                    turns = crate::rt::Turns::new();
+                    made.map(|made| {
+                        costs.learn(len, made.iter().map(|(_, _, ns)| *ns).fold(0, u64::saturating_add), false);
+                        made.into_iter().map(|(peer, frames, _)| (peer, frames)).collect::<Vec<_>>()
+                    })
+                }
             };
             match made {
                 Ok(made) => {
@@ -1413,8 +1428,11 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                // Each message weighed past what's made where it is ([`MADE_HERE_MOST`]): every batch goes to the pool.
-                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| MADE_HERE_MOST + 1, make, send));
+                // Making taught dearer than any round trip to the pool (a byte's in all the time there is): every batch goes
+                // there, each teaching its eighth, which leaves it dearer still (consts-audit R2).
+                let dear = crate::wire::payload::Expect::nothing_yet();
+                dear.learn(1, u64::MAX, false);
+                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| 1, &dear, make, send));
                 std::future::poll_fn(|cx| {
                     let before = sends.load(Ordering::SeqCst);
                     let polled = work.as_mut().poll(cx);
@@ -1434,27 +1452,36 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a batch of short messages, whose making copies no more than [`MADE_HERE_MOST`],
-    /// is made where it is, on its shard, with no hand-off to the compute pool and back; a batch past it still goes to the
-    /// pool. Either way what's sent is what came, in the order it came, each message's frames in theirs.
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R2: a batch is made where it's cheaper, by what making frames is learned
+    /// to take in this process (it was rt9's slowest seen, fixed in code), against the compute pool's round trip as the process
+    /// learned it. Do: hand a job to the pool from the shard, so the round trip is learned; then send 16 messages of 512
+    /// bytes each three times: with nothing learned of making them, with making learned fast (a mebibyte in a microsecond),
+    /// and learned slow (a byte in a millisecond). Expect: with nothing learned, the first goes to the pool and teaches what
+    /// making takes; learned fast, every one is made on the shard, no hand-off; learned slow, every one goes to the pool;
+    /// each time, what's sent is what came, in the order it came, each message's frames in theirs.
     #[test]
-    fn g9_s5_a_batch_of_short_messages_is_made_where_it_is() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    fn g9_s5_r2_a_batch_is_made_where_its_cheaper_by_what_making_is_learned_to_take() -> anyhow::Result<()> {
+        use crate::wire::payload::Expect;
         crate::rt::block_on(async {
             const MESSAGES: u32 = 16;
-            // A cluster write's few hundred bytes a learner; and one message past the bound, alone or not.
-            for (each, here) in [(512usize, true), (MADE_HERE_MOST + 1, false)] {
+            const EACH: usize = 512;
+            crate::rt::compute(|| ()).await?;
+            anyhow::ensure!(crate::rt::POOL_TRIP.mean().is_some(), "the pool's round trip learned");
+            let (fresh, fast, slow) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
+            fast.learn(1 << 20, 1_000, true);
+            slow.learn(1, 1_000_000, false);
+            for (costs, learned) in [(&fresh, "nothing learned"), (&fast, "learned fast"), (&slow, "learned slow")] {
                 let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
                 for m in 0..MESSAGES {
                     tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
                 }
                 drop(tx);
-                let (on_shard, off_shard) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                // Where each message was made, in the order made.
+                let made_on = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let make = {
-                    let (on, off) = (Arc::clone(&on_shard), Arc::clone(&off_shard));
+                    let made_on = Arc::clone(&made_on);
                     move |m: u32| {
-                        let made_on = if crate::rt::on_shard() { &on } else { &off };
-                        made_on.fetch_add(1, Ordering::SeqCst);
+                        made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(crate::rt::on_shard());
                         vec![m.to_be_bytes().to_vec(), vec![0xff]]
                     }
                 };
@@ -1463,19 +1490,18 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), move |_: &u32| each, make, send).await;
+                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), |_: &u32| EACH, costs, make, send).await;
                 let expected: Vec<(PeerId, Vec<u8>)> = (0..MESSAGES).flat_map(|m| [(u64::from(m % 3), m.to_be_bytes().to_vec()), (u64::from(m % 3), vec![0xff])]).collect();
-                anyhow::ensure!(sent == expected, "{each} bytes a message: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
-                let (on, off) = (on_shard.load(Ordering::SeqCst), off_shard.load(Ordering::SeqCst));
-                let all = u64::from(MESSAGES);
-                if here {
-                    anyhow::ensure!((on, off) == (all, 0), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch is made where it is");
-                } else {
-                    anyhow::ensure!((on, off) == (0, all), "{each} bytes a message: {on} made on the shard, {off} off it, where every batch goes to the pool");
+                anyhow::ensure!(sent == expected, "{learned}: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+                let made_on = made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let here = made_on.iter().filter(|on| **on).count();
+                match learned {
+                    "learned fast" => anyhow::ensure!(here == made_on.len(), "{learned}: {here} of {} made on the shard, where each is cheaper there", made_on.len()),
+                    "learned slow" => anyhow::ensure!(here == 0, "{learned}: {here} of {} made on the shard, where each is cheaper on the pool", made_on.len()),
+                    _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
                 }
             }
-            anyhow::ensure!(MADE_HERE_MOST == 37_449, "half a mebibyte in 1.4 ms, within 100 µs: {MADE_HERE_MOST}");
-            anyhow::ensure!(made_ns(MADE_HERE_MOST) <= hyper_rt::slow::SLOW_POLL_NS, "the most made here is made within a slow poll at the slowest seen");
+            anyhow::ensure!(fresh.on_shard_against(1, Some(u64::MAX)).is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }
