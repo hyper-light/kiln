@@ -610,9 +610,11 @@ async fn wake_every(me: &Shard, i: usize, period: Duration, wakes: u64) {
 /// OS's clock for the thread ([`thread_cpu_ns`]: `clock_gettime`, a call at every wake of every shard, 155 ns on the
 /// lab's machine by hyper-rt's `task_clock` notes). Chosen at the probe's first reading and kept: the two count from
 /// different starts (the task clock from its opening, as the shard's thread began), so the busy counter never mixes
-/// them. Both run while the thread runs, in its system calls too (`tests`), so the busy share means what it meant.
+/// them. Both run while the thread runs, in its system calls too (`tests`), so the busy share means what it meant. Also how
+/// long a piece of work held whatever thread ran it on the CPU, two readings of one clock (`crate::api`'s sessions' list
+/// joins: goal 10, plan 01a1a87b2dae step 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CpuClock {
+pub(crate) enum CpuClock {
     Unchosen,
     Task,
     Os,
@@ -621,7 +623,7 @@ enum CpuClock {
 impl CpuClock {
     /// The shard thread's CPU time now, nanoseconds, by the clock chosen (at the first reading: the task clock where the
     /// shard has one). None where neither keeps it, or where the task clock's page stopped offering it.
-    fn read(&mut self) -> Option<u64> {
+    pub(crate) fn read(&mut self) -> Option<u64> {
         match self {
             CpuClock::Task => hyper_rt::futures::thread_run_ns(),
             CpuClock::Os => thread_cpu_ns(),
