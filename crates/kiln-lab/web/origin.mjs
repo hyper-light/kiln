@@ -131,10 +131,10 @@ const ctl = createServer((req, res) => {
   });
 });
 
-for (const [srv, path] of [
+for (const [srv, path] of /** @type {[import("node:http").Server, string][]} */ ([
   [pub, publicSock],
   [ctl, controlSock],
-]) {
+])) {
   if (existsSync(path)) unlinkSync(path);
   srv.keepAliveTimeout = 600_000;
   srv.requestTimeout = 0;

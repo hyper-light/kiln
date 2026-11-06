@@ -19,12 +19,12 @@ const server = createServer({ cert: readFileSync(cert), key: readFileSync(key) }
   res.writeHead(200, { "access-control-allow-origin": "*", "cross-origin-resource-policy": "cross-origin", "content-type": "text/plain" });
   res.end(String(nowUs()));
 });
-server.on("upgrade", (req, sock) => {
+server.on("upgrade", (req, /** @type {import("node:net").Socket} */ sock) => {
   const accept = createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   sock.setNoDelay(true);
   sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
   let buf = Buffer.alloc(0);
-  sock.on("data", (d) => {
+  sock.on("data", (/** @type {Buffer} */ d) => {
     buf = Buffer.concat([buf, d]);
     while (buf.length >= 2) {
       const op = buf[0] & 0x0f;

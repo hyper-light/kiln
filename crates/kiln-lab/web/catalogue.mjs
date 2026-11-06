@@ -4,7 +4,7 @@
 // 01a1a832e9cc step 3.
 //   node catalogue.mjs build RECORDINGS_DIR CATALOGUE.json PAYLOADS_DIR
 //   node catalogue.mjs compare RECORDINGS_A RECORDINGS_B   (event bodies, stamps taken out)
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, statSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
