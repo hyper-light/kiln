@@ -3322,30 +3322,43 @@ mod tests {
         Ok(())
     }
 
-    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
-    /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
-    /// it works, as it would not under futures' `buffered`.
+    /// Until `begun` reaches `n`: how an item waits for the others begun beside it. Run one at a time, the items
+    /// would wait for ever; at once, they go on together, however slowly a loaded machine runs them.
+    async fn all_begun(begun: &AtomicUsize, n: usize) {
+        while begun.load(Ordering::SeqCst) < n {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (the first four wait for
+    /// each other, which one at a time they never could: a wait on that, not on how fast a loaded machine sleeps),
+    /// and polls them under the task's own waker: a hyper-rt connect inside it works, as it would not under
+    /// futures' `buffered`.
     #[test]
     fn each_runs_n_at_once_in_order_under_the_task_s_own_waker() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
-            let t = Instant::now();
-            let out = each(0..12u64, 4, |i| {
-                let (running, most) = (running.clone(), most.clone());
+            let begun = Arc::new(AtomicUsize::new(0));
+            let items = each(0..12u64, 4, |i| {
+                let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                 async move {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     most.fetch_max(now, Ordering::SeqCst);
+                    begun.fetch_add(1, Ordering::SeqCst);
+                    if i < 4 {
+                        all_begun(&begun, 4).await;
+                    }
                     // Later items finish first: the order kept is the items', not the finishing.
                     sleep(Duration::from_millis(50 - (i % 4) * 10)).await;
                     running.fetch_sub(1, Ordering::SeqCst);
                     i * 10
                 }
-            })
-            .await;
+            });
+            // The bound only ends a hang (the first four begun one at a time), never a slow run.
+            let out = timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first four never ran at once"))?;
             assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
             assert_eq!(most.load(Ordering::SeqCst), 4);
-            assert!(t.elapsed() < Duration::from_millis(400), "three rounds of 50 ms, not twelve: {:?}", t.elapsed());
             assert!(each(Vec::<u8>::new(), 3, |x| async move { x }).await.is_empty());
             // A connect under `each`: refused by the port, not by the runtime.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3362,25 +3375,30 @@ mod tests {
 
     /// Outputs handed over in the items' order as they become ready, not all at the end; an item
     /// begun only once a place is free and what came before was handed over (so it sees what the
-    /// handing changed); `n` at once at the most, ready-and-waiting ones counted; a connect works.
+    /// handing changed); `n` at once at the most, ready-and-waiting ones counted, and at once (the
+    /// first three wait for each other, [`all_begun`]); a connect works.
     #[test]
     fn each_in_order_hands_each_over_in_turn_and_begins_the_next_after() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
+            let begun = Arc::new(AtomicUsize::new(0));
             let handed = Mutex::new(Vec::<u64>::new());
             // What each item saw handed over when it was begun.
             let seen = Mutex::new(Vec::<(u64, usize)>::new());
-            let t = Instant::now();
-            each_in_order(
+            let items = each_in_order(
                 0..12u64,
                 3,
                 |i| {
-                    let (running, most) = (running.clone(), most.clone());
+                    let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                     seen.lock().unwrap_or_else(PoisonError::into_inner).push((i, handed.lock().unwrap_or_else(PoisonError::into_inner).len()));
                     async move {
                         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
+                        begun.fetch_add(1, Ordering::SeqCst);
+                        if i < 3 {
+                            all_begun(&begun, 3).await;
+                        }
                         // Later items finish first: the order handed over is the items'.
                         sleep(Duration::from_millis(40 - (i % 3) * 10)).await;
                         running.fetch_sub(1, Ordering::SeqCst);
@@ -3388,15 +3406,15 @@ mod tests {
                     }
                 },
                 |r| handed.lock().unwrap_or_else(PoisonError::into_inner).push(r),
-            )
-            .await;
+            );
+            // The bound only ends a hang (the first three begun one at a time), never a slow run.
+            timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first three never ran at once"))?;
             assert_eq!(*handed.lock().unwrap_or_else(PoisonError::into_inner), (0..12).map(|i| i * 10).collect::<Vec<_>>());
-            assert!(most.load(Ordering::SeqCst) <= 3);
+            assert_eq!(most.load(Ordering::SeqCst), 3);
             // Three places: item i is begun only once i - 2 were handed over.
             for (i, before) in seen.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(*before as u64 + 2 >= *i, "item {i} begun with {before} handed over");
             }
-            assert!(t.elapsed() < Duration::from_millis(600), "about four rounds of 40 ms: {:?}", t.elapsed());
             let none = Mutex::new(0);
             each_in_order(Vec::<u8>::new(), 3, |x| async move { x }, |_| *none.lock().unwrap_or_else(PoisonError::into_inner) += 1).await;
             assert_eq!(*none.lock().unwrap_or_else(PoisonError::into_inner), 0);

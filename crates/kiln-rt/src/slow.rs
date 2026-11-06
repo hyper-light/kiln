@@ -189,6 +189,65 @@ impl SlowTable {
     }
 }
 
+/// The spawn sites whose polls ran past the step quantum, as a shard learned them (kiln's goal 9, plan 01a1a87b2cec step
+/// 3): where a poll's time on the CPU costs a call to read (macOS, `crate::shard_loop::THREAD_CPU_FOR_SLOW_POLLS`), the
+/// shard reads it only for tasks spawned at one of these, from the poll after their site's first past the quantum, so a
+/// site whose polls never ran past it costs none. The shard's own, one writer and no reader: open addressing over twice
+/// [`ENTRIES`] places, taken as the first site is learned, and no more sites than [`ENTRIES`] (the slow table's bound).
+#[derive(Debug, Default)]
+pub(crate) struct CpuSites {
+    places: Box<[Option<&'static Location<'static>>]>,
+    learned: usize,
+}
+
+impl CpuSites {
+    /// Whether `site` was learned.
+    pub(crate) fn has(&self, site: &'static Location<'static>) -> bool {
+        self.place_of(site)
+            .and_then(|place| self.places.get(place))
+            .is_some_and(Option::is_some)
+    }
+
+    /// Learns `site`: whether it is new and there was room for it.
+    pub(crate) fn learn(&mut self, site: &'static Location<'static>) -> bool {
+        if self.learned >= ENTRIES {
+            return false;
+        }
+        if self.places.is_empty() {
+            self.places = (0..ENTRIES.saturating_mul(2)).map(|_| None).collect();
+        }
+        let Some(place) = self.place_of(site).and_then(|place| self.places.get_mut(place)) else {
+            return false;
+        };
+        if place.is_some() {
+            return false;
+        }
+        *place = Some(site);
+        self.learned = self.learned.saturating_add(1);
+        true
+    }
+
+    /// The place `site` holds, else the free place it would take: probed from where its line and column hash to (as
+    /// the slow table's keys are). Never more than half the places are taken, so a probe always ends.
+    fn place_of(&self, site: &'static Location<'static>) -> Option<usize> {
+        let n = self.places.len();
+        let start = Key { site: Some(site), label: None }.start(n);
+        (0..n)
+            .filter_map(|i| start.wrapping_add(i).checked_rem(n))
+            .find(|&place| {
+                self.places
+                    .get(place)
+                    .is_some_and(|known| known.is_none_or(|known| same_site(known, site)))
+            })
+    }
+}
+
+/// Whether two spawn sites are one: the same file, line and column (one call site's `Location` may be two statics, one
+/// per instance of a generic caller).
+pub(crate) fn same_site(a: &Location<'_>, b: &Location<'_>) -> bool {
+    std::ptr::eq(a, b) || (a.line() == b.line() && a.column() == b.column() && a.file() == b.file())
+}
+
 /// What held a shard: a spawn site and a label, with the polls past [`SLOW_POLL_NS`] they held it and for
 /// how long. Counts are since the shard started.
 #[derive(Clone, Copy, Debug)]
@@ -211,7 +270,8 @@ pub struct SlowPoll {
     /// Their holds added up, nanoseconds.
     pub host_ns: u64,
     /// Of them, the polls whose shard's thread said its run time (`crate::task_clock`: Linux, where a self-monitoring
-    /// perf event could be opened; kiln's goal 9, plan 01a1a87b2cec step 3).
+    /// perf event could be opened, every one; macOS, its thread CPU clock, those of a site after its first poll past the
+    /// quantum, [`CpuSites`]; kiln's goal 9, plan 01a1a87b2cec step 3).
     pub cpu_polls: u64,
     /// Their holds added up, nanoseconds.
     pub cpu_held_ns: u64,
@@ -301,5 +361,221 @@ mod tests {
         let p = read[0];
         assert_eq!((p.polls, p.total_ns), (4, 3_200_000));
         assert_eq!((p.cpu_polls, p.cpu_held_ns, p.cpu_ns, p.longest_cpu_ns), (3, 2_700_000, 830_000, 400_000));
+    }
+
+    /// One shard on this thread, its quantum `quantum_ns` (its step budget: it tracks no wake).
+    fn one_shard(quantum_ns: u64) -> crate::runtime::LocalRuntime {
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 8,
+            timers_per_shard: 8,
+            interests_per_shard: 8,
+            ring_entries: 16,
+            step_budget_ns: quantum_ns,
+            timer_tick_ns: 100_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        };
+        crate::runtime::LocalRuntime::new(&config).unwrap()
+    }
+
+    /// Spins `spin_ns` on the CPU, by the thread's own clock where it has one (a loaded machine that preempts the spin
+    /// stretches its wall time, not its time on the CPU), else by the wall clock; read between runs of plain arithmetic, so
+    /// the spin's time is the task's own, not the clock's calls (Linux's task clock counts user time alone).
+    fn spin_on_the_cpu(spin_ns: u64) {
+        let began = std::time::Instant::now();
+        let cpu_from = crate::attribution::thread_cpu_now();
+        let mut spins = 0u64;
+        loop {
+            for _ in 0..u16::MAX {
+                spins = std::hint::black_box(spins.wrapping_add(1));
+            }
+            let ran = match cpu_from {
+                Some(from) => crate::attribution::thread_cpu_now().map_or(0, |now| now.saturating_sub(from)),
+                None => u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            };
+            if ran >= spin_ns {
+                break;
+            }
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (lab-main, 2026-11-06): a shard's polls that run past the threshold on the CPU say
+    /// their time there wherever the shard's thread has a CPU clock: Linux's task clock where its perf event opens, and
+    /// macOS's thread CPU clock, which no task clock replaces there. The Mac lab's step 3 table (g9p31-mac) had every listed
+    /// path's on-CPU column empty: the shard took a slow poll's CPU from the task clock alone, which opens on Linux only.
+    /// The root spins twice, each far past the quantum, and at least its second spin is read where a clock is (on macOS a
+    /// reading is a call, so a site's polls are read there from the one after its first past the quantum). With no clock
+    /// (Windows, a Linux whose perf event is refused) the polls count in their holds alone.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s3_a_shards_slow_poll_says_its_time_on_the_cpu_where_its_thread_has_a_cpu_clock() {
+        let clock = crate::task_clock::TaskClock::open().is_some()
+            || (cfg!(target_os = "macos") && crate::attribution::thread_cpu_now().is_some());
+        let mut rt = one_shard(1_000_000);
+        let shard = rt.shard_id();
+        // Each spin 200 times the threshold, 20 times the quantum.
+        let spin_ns = SLOW_POLL_NS.saturating_mul(200);
+        rt.block_on(async move {
+            spin_on_the_cpu(spin_ns);
+            crate::futures::yield_now().await;
+            spin_on_the_cpu(spin_ns);
+        })
+        .unwrap();
+        let polls = crate::registry::holder_of(shard.0).map(slow_polls).unwrap_or_default();
+        let spun = polls.iter().find(|p| p.longest_ns >= spin_ns).copied();
+        assert!(spun.is_some(), "no poll of {spin_ns} ns among the shard's slow polls: {polls:?}");
+        let Some(spun) = spun else { return };
+        assert_eq!(spun.polls, 2, "the root's two spins: {spun:?}");
+        if !clock {
+            assert_eq!(spun.cpu_polls, 0, "no CPU clock on this thread, yet a time on the CPU: {spun:?}");
+            return;
+        }
+        assert!(spun.cpu_polls >= 1, "the spins' polls said no time on the CPU: {spun:?}");
+        // At least half the spin: the shard's clock (Linux's task clock, user time alone) and the spin's (the thread's
+        // CPU clock, the kernel's time in its calls too) are two clocks of one thread.
+        assert!(spun.longest_cpu_ns >= spin_ns / 2 && spun.longest_cpu_ns <= spun.longest_ns, "spun {spin_ns} ns on the CPU: {spun:?}");
+    }
+
+    /// Spawns `future` on the current shard from the caller's site, and says that site: the slow table's key for its polls.
+    #[track_caller]
+    fn spawn_here(future: impl std::future::Future<Output = ()> + 'static) -> (crate::shard::TaskId, &'static Location<'static>) {
+        (crate::futures::spawn(future).unwrap(), Location::caller())
+    }
+
+    /// Where the shard reads its thread's CPU clock for slow polls (macOS) and the thread has one.
+    fn thread_clock_read() -> bool {
+        crate::shard_loop::THREAD_CPU_FOR_SLOW_POLLS
+            && crate::task_clock::TaskClock::open().is_none()
+            && crate::attribution::thread_cpu_now().is_some()
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (main's ask, 2026-11-06): a site is learned once; one never learned isn't had.
+    #[test]
+    fn g9_s3_cpu_sites_learn_a_site_once() {
+        let mut sites = CpuSites::default();
+        let (a, b) = (Location::caller(), Location::caller());
+        assert!(!sites.has(a), "an empty set has no site");
+        assert!(sites.learn(a));
+        assert!(!sites.learn(a), "learned twice");
+        assert!(sites.has(a) && !sites.has(b));
+        assert!(sites.learn(b) && sites.has(b) && sites.has(a));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (main's ask, 2026-11-06): where a slow poll's time on the CPU costs a call to read
+    /// (macOS: a Mach trap, 107 to 129 ns on Apple silicon), the polls of a site that never ran past the quantum read
+    /// nothing. A task's thousand quick polls run beside a site the shard learned (three spins, the first teaching it), and
+    /// the thread's clock is read four times, counted: the learned site's other two spins, at each one's start and end.
+    /// Linux is as before: its task clock (a page, no call) reads every slow poll, and the thread's clock is never read.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s3_a_site_never_past_the_quantum_reads_no_cpu_clock() {
+        // A quantum of 5 ms, which a quick poll passes only where the host holds its thread that long.
+        let quantum_ns = 5_000_000;
+        let mut rt = one_shard(quantum_ns);
+        let shard = rt.shard_id();
+        let spin_ns = SLOW_POLL_NS.saturating_mul(200);
+        crate::shard_loop::CPU_READS.with(|reads| reads.set(0));
+        let slow_site = rt
+            .block_on(async move {
+                let (slow, site) = spawn_here(async move {
+                    spin_on_the_cpu(spin_ns);
+                    crate::futures::yield_now().await;
+                    spin_on_the_cpu(spin_ns);
+                    crate::futures::yield_now().await;
+                    spin_on_the_cpu(spin_ns);
+                });
+                let (quick, _) = spawn_here(async {
+                    for _ in 0..1000 {
+                        crate::futures::yield_now().await;
+                    }
+                });
+                crate::futures::join(slow).await.unwrap();
+                crate::futures::join(quick).await.unwrap();
+                site
+            })
+            .unwrap();
+        let reads = crate::shard_loop::CPU_READS.with(std::cell::Cell::get);
+        let polls = crate::registry::holder_of(shard.0).map(slow_polls).unwrap_or_default();
+        // The slow task's entry, by its site: a loaded host may hold a quick poll as long as a spin.
+        let spun = polls.iter().find(|p| p.site == Some(slow_site)).copied().unwrap();
+        assert_eq!(spun.polls, 3, "the slow task's three spins: {polls:?}");
+        if crate::task_clock::TaskClock::open().is_some() {
+            assert_eq!((reads, spun.cpu_polls), (0, 3), "Linux reads every slow poll on its task clock: {spun:?}");
+            return;
+        }
+        if !thread_clock_read() {
+            assert_eq!((reads, spun.cpu_polls), (0, 0), "no clock, yet a reading: {spun:?}");
+            return;
+        }
+        assert_eq!(spun.cpu_polls, 2, "the first spin teaches the shard the site, the next two are read: {spun:?}");
+        // A loaded host that held a quick poll (or the root's) past the quantum teaches the shard that site too: its
+        // later polls are read, and the slow table shows it. Otherwise the reads are the slow site's alone.
+        let others_past = polls.iter().any(|p| p.longest_ns > quantum_ns && p.site != spun.site);
+        if others_past {
+            assert!(reads >= 4, "{reads} reads: {polls:?}");
+        } else {
+            assert_eq!(reads, 4, "a site never past the quantum read the thread's clock: {polls:?}");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (main's ask, 2026-11-06): once a poll of a site ran past the quantum, the polls of
+    /// every task spawned there say their time on the CPU from the next on: a task live then (installed: its first poll
+    /// yielded) and one installed after. Of three tasks from one site that spin, the first spin goes unread where a
+    /// reading costs a call (macOS) and the other two are read. Linux, its task clock reading every poll, is as before:
+    /// all three, the site's first among them.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s3_a_site_past_the_quantum_once_has_its_tasks_next_polls_on_the_cpu() {
+        let mut rt = one_shard(1_000_000);
+        let shard = rt.shard_id();
+        let spin_ns = SLOW_POLL_NS.saturating_mul(200);
+        let spawned_at = rt
+            .block_on(async move {
+                let mut tasks = Vec::new();
+                let mut spawned_at = None;
+                for turn in 0..3u8 {
+                    // One site, this call: the first task yields before it spins, so it is installed when the second's
+                    // spin teaches the shard the site; the third is installed after.
+                    let (task, site) = spawn_here(async move {
+                        if turn == 0 {
+                            crate::futures::yield_now().await;
+                        }
+                        spin_on_the_cpu(spin_ns);
+                    });
+                    tasks.push(task);
+                    spawned_at = Some(site);
+                }
+                for task in tasks {
+                    crate::futures::join(task).await.unwrap();
+                }
+                spawned_at
+            })
+            .unwrap();
+        let polls = crate::registry::holder_of(shard.0).map(slow_polls).unwrap_or_default();
+        // The three tasks' entry, by their site: a loaded host may hold the root's quick polls as long as a spin.
+        let site = polls.iter().find(|p| p.site.is_some() && p.site == spawned_at).copied().unwrap();
+        // The three spins, and the first task's quick poll where a loaded host held it past the threshold.
+        assert!(site.polls >= 3, "the three tasks' spins: {polls:?}");
+        let quick_held = site.polls > 3;
+        if crate::task_clock::TaskClock::open().is_some() {
+            assert_eq!(site.cpu_polls, site.polls, "Linux reads every slow poll on its task clock: {site:?}");
+        } else if thread_clock_read() {
+            // The site's first poll past the quantum teaches the shard and its tasks' next are read: two of the spins, or
+            // all three where the host held the quick poll past the quantum.
+            if quick_held {
+                assert!(site.cpu_polls >= 2, "{site:?}");
+            } else {
+                assert_eq!(site.cpu_polls, 2, "the site's first spin teaches the shard, its tasks' next two are read: {site:?}");
+            }
+            assert!(site.longest_cpu_ns >= spin_ns / 2 && site.longest_cpu_ns <= site.longest_ns, "{site:?}");
+        } else {
+            assert_eq!(site.cpu_polls, 0, "no clock, yet a reading: {site:?}");
+        }
     }
 }
