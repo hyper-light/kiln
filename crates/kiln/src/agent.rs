@@ -417,6 +417,21 @@ enum Ev {
     Delayed(crate::runner::chaos::Due),
 }
 
+/// What event `ev` is, for the legs of what the runner's loop takes (`crate::route_latency::InKind`; runner-fan): one of
+/// the server's frames by what it is (`crate::wire::fan::peek_server`), the link coming or going, a session's update on its
+/// way up, what the runner says of its own, or the rest.
+fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
+    use crate::route_latency::InKind;
+    match ev {
+        Ev::Net(Some(NetEvent::Frame { kind, lane, data, .. })) => crate::wire::fan::peek_server(*kind, *lane, data).1,
+        Ev::Forwarded(data) => crate::wire::fan::peek_server(Kind::Control, LANE_CONTROL, data).1,
+        Ev::Net(_) => InKind::Link,
+        Ev::Harness(..) => InKind::Update,
+        Ev::Up(_) => InKind::Own,
+        _ => InKind::Rest,
+    }
+}
+
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
 /// Windows, which has no blue/green upgrades).
 enum Bg {
@@ -1908,13 +1923,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Events taken off their channels ahead of their turn: each goes before anything else but
     // what the network says (a job's end waits behind what its job sent before it, `Ev::Done`).
     let mut taken: VecDeque<Ev> = VecDeque::new();
+    // The legs of what this loop takes (`crate::route_latency::InLeg`; runner-fan): the event it holds now, since when and
+    // what it is; and the answers to the server's commands on their way to the net thread through `own`, each with when it
+    // was made and what it answered, in the order they went there.
+    let mut holding: Option<(Instant, crate::route_latency::InKind)> = None;
+    let mut answers_at: VecDeque<(Instant, crate::route_latency::InKind)> = VecDeque::new();
 
     'events: loop {
+        // The event this loop held last is done with: its hold, what the events behind it waited for.
+        let last = holding.take();
+        if let Some((since, kind)) = last {
+            crate::route_latency::observe_in(crate::route_latency::InLeg::Held, kind, since.elapsed());
+        }
         if let Some((stream, seq, refusal)) = answer_after.take() {
             let a = match refusal {
                 Some((code, why)) => wire_in.refused(&stream, seq, code, why),
                 None => wire_in.took(&stream, seq),
             };
+            answers_at.push_back((Instant::now(), last.map_or(crate::route_latency::InKind::Command, |(_, k)| k)));
             own.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
         }
         if let Some(until) = lingering
@@ -1983,6 +2009,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             },
             () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
         };
+        // What this loop holds from now (runner-fan): a server's frame by what it is, its wait since it came off the link.
+        holding = Some((Instant::now(), in_kind(&ev)));
+        if let Ev::Net(Some(NetEvent::Frame { at, .. })) = &ev
+            && let Some((_, kind)) = holding
+        {
+            crate::route_latency::observe_in(crate::route_latency::InLeg::Wait, kind, at.elapsed());
+        }
         match ev {
             Ev::Shutdown => {
                 if lingering.is_some() {
@@ -2936,6 +2969,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
                                 Arrival::Answered(None) => continue 'events,
                             };
+                            // An answer, timed to the net thread as one made at the next turn's top is (runner-fan).
+                            if matches!(answer, crate::wire::channel::Frame::Ack(_)) {
+                                answers_at.push_back((Instant::now(), holding.map_or(crate::route_latency::InKind::Command, |(_, k)| k)));
+                            }
                             own.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
                             continue 'events;
                         }
@@ -4414,6 +4451,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
+                // An answer to one of the server's commands: when it was made, and what it answered (runner-fan).
+                let answer = if matches!(&up, Up::Term(AgentMsg::Wire(crate::wire::channel::Frame::Ack(_)))) { answers_at.pop_front() } else { None };
                 let Ok(data) = data else { continue };
                 if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
                     events.push(data.clone());
@@ -4428,6 +4467,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         None => {
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
+                    }
+                    if let Some((made, answered)) = answer {
+                        crate::route_latency::observe_in(crate::route_latency::InLeg::Answer, answered, made.elapsed());
                     }
                 } else if again {
                     // Sent from `unreceived` and `journal` once connected again.

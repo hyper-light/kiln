@@ -441,7 +441,9 @@ enum Lane {
     /// ([`Inbox::bring`]), and its inbox opened; `back`: taken back by this host at the epoch it left
     /// at (its inbox's fence lifted).
     Open { epoch: u64, back: bool },
-    Cmd { c: Box<Command>, epoch: Option<u64> },
+    /// A command or a message for it, sent for `epoch`; `at`: when it was handed to the lane, for its wait there
+    /// (`crate::route_latency::InLeg::ToSession`; runner-fan).
+    Cmd { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant },
     /// A message for it, sent for `epoch`, that this machine couldn't read, its id `message` read:
     /// its inbox says what became of it ([`unread_message`]); `why`, as it's said.
     Unread { message: String, epoch: Option<u64>, why: String },
@@ -1226,7 +1228,7 @@ impl Host {
     /// there's no session `id` here, or its lane holds its most (a message is answered `Full`).
     pub fn command_at(&self, id: &str, c: Command, epoch: Option<u64>) -> bool {
         let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
-        match lane.try_send(Lane::Cmd { c: Box::new(c), epoch }) {
+        match lane.try_send(Lane::Cmd { c: Box::new(c), epoch, at: std::time::Instant::now() }) {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Cmd { c, .. })) => {
                 if let Some((message, _)) = message_of(&c) {
@@ -1317,7 +1319,11 @@ impl Host {
     /// One thing down session `id`'s lane.
     async fn step(&self, id: &str, item: Lane) {
         match item {
-            Lane::Cmd { c, epoch } => self.take(id, *c, epoch).await,
+            Lane::Cmd { c, epoch, at } => {
+                // Its wait in the lane, behind what the session was told before it (runner-fan).
+                crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                self.take(id, *c, epoch).await
+            }
             Lane::Unread { message, epoch, why } => self.unread(id, message, epoch, &why).await,
             Lane::Mark(done) => {
                 let _ = done.send(());

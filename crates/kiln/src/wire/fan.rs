@@ -298,6 +298,164 @@ pub fn peek(kind: crate::net::Kind, lane: u32, data: &[u8]) -> Head<'_> {
     tags.head(tag)
 }
 
+/// Which end's frames a fan reads, to hand each to the loop that takes it: the server's of its runners' (`AgentMsg`,
+/// [`Runners`]), a runner's of its server's (`ServerMsg`, [`Server`]; runner-fan).
+pub trait Heads: Send + 'static {
+    /// What frame `data`, of `kind` on `lane`, is, read off its head, none of it copied.
+    fn head<'a>(&self, kind: crate::net::Kind, lane: u32, data: &'a [u8]) -> Head<'a>;
+}
+
+/// The server's fan: its runners' frames ([`peek`]).
+pub struct Runners;
+
+impl Heads for Runners {
+    fn head<'a>(&self, kind: crate::net::Kind, lane: u32, data: &'a [u8]) -> Head<'a> {
+        peek(kind, lane, data)
+    }
+}
+
+/// A runner's fan: its server's frames ([`peek_server`]).
+pub struct Server;
+
+impl Heads for Server {
+    fn head<'a>(&self, kind: crate::net::Kind, lane: u32, data: &'a [u8]) -> Head<'a> {
+        peek_server(kind, lane, data).0
+    }
+}
+
+/// `ServerMsg`'s variants for one agent session that its session loop on a runner takes, the session's id their first
+/// field: a message for it, which its inbox takes once (not a command: the server sends it as it is, `HarnessSend`).
+const SERVER_SESSION: &[&str] = &["HarnessSend"];
+
+/// Its variants for one agent session whose id follows a question's `req` (a varint): what it ran, a page it serves, a
+/// look at its folder. Asked of the session, answered by its runner on its own.
+const SERVER_SESSION_ASKS: &[&str] = &["HarnessTaskOutput", "Preview", "Workspace"];
+
+/// Its variants that are commands for one agent session, as a channel item's body carries them: on the session's own
+/// command streams (`crate::wire::commands::session_of`), its session loop takes them; on the runner process's own (a
+/// server from before those), the control loop does, and they're barriers there, ordered both ways against what the
+/// session loops take.
+const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "HarnessClose", "HarnessFile", "HarnessPackage", "HarnessRelease", "StreamOpen", "StreamControl", "StreamInput", "StreamClose"];
+
+/// Its variants that what a session loop takes is judged by, ordered both ways against it: the handshake and what it
+/// says the server takes (a session's custody, its relays, its unread words), what the server kept of its sessions, a
+/// session's identity at an epoch and the work kiln handed it, how many sessions the machine runs at once.
+const SERVER_BARRIERS: &[&str] = &["Welcome", "Refused", "Caps", "Kept", "Identity", "Custody", "AgentLimit"];
+
+/// Its variants of a protocol of their own the link carries.
+const SERVER_CARRIED: &[&str] = &["Sync", "Observe", "Cluster", "Convo", "Reach", "ReachRefused", "PortData", "PortAck", "PortClose"];
+
+/// What a runner's fan reads its server's frames by ([`peek_server`]), made once from the types themselves.
+struct ServerTags {
+    /// `ServerMsg::Wire`'s tag, and the channel's frames' within it.
+    wire: u64,
+    item: u64,
+    have: u64,
+    ack: u64,
+    want: u64,
+    /// Each `ServerMsg` tag's place, by tag; a tag past them (a newer server's) is a barrier.
+    of: Vec<ServerTag>,
+}
+
+/// Where a `ServerMsg` of one variant goes on a runner, and what it is for the runner's legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerTag {
+    /// For one agent session, its id the first field.
+    Session,
+    /// For one agent session, its id after a question's `req`.
+    SessionAsk,
+    /// A command for one agent session (a channel item's body).
+    SessionCommand,
+    /// What a session loop's frames are judged by.
+    Barrier,
+    /// The rest, by kind.
+    Plain(crate::route_latency::InKind),
+}
+
+impl ServerTags {
+    fn of(&self, tag: u64) -> ServerTag {
+        usize::try_from(tag).ok().and_then(|t| self.of.get(t)).copied().unwrap_or(ServerTag::Barrier)
+    }
+}
+
+/// [`ServerTags`], made at first use.
+fn server_tags() -> &'static ServerTags {
+    static TAGS: OnceLock<ServerTags> = OnceLock::new();
+    TAGS.get_or_init(|| {
+        use crate::route_latency::InKind;
+        let server = variants_of::<crate::proto::ServerMsg>();
+        let frames = variants_of::<super::channel::Frame>();
+        let tag = |names: &[&str], name: &str| names.iter().position(|n| *n == name).and_then(|i| u64::try_from(i).ok()).unwrap_or(u64::MAX);
+        let of = server
+            .iter()
+            .map(|name| {
+                if SERVER_SESSION.contains(name) {
+                    ServerTag::Session
+                } else if SERVER_SESSION_ASKS.contains(name) {
+                    ServerTag::SessionAsk
+                } else if SERVER_SESSION_COMMANDS.contains(name) {
+                    ServerTag::SessionCommand
+                } else if SERVER_BARRIERS.contains(name) {
+                    ServerTag::Barrier
+                } else if SERVER_CARRIED.contains(name) {
+                    ServerTag::Plain(InKind::Carried)
+                } else {
+                    ServerTag::Plain(InKind::Other)
+                }
+            })
+            .collect();
+        ServerTags { wire: tag(server, "Wire"), item: tag(frames, "Item"), have: tag(frames, "Have"), ack: tag(frames, "Ack"), want: tag(frames, "Want"), of }
+    })
+}
+
+/// What a server's frame `data`, of `kind` on `lane`, is on its runner, read off its head, none of it copied: where it goes
+/// ([`Head`]), and what it is for the runner's legs (`crate::route_latency::InKind`). A message for one agent session, or
+/// its question about one, goes to that session's loop ([`Head::Session`]), as does a command on the session's own command
+/// stream (`crate::wire::commands::session_of`); a session's command on the runner process's own streams, and what a
+/// session loop's frames are judged by (the handshake, the server's caps, a session's identity, custody, the agent limit,
+/// what the server has of the runner's streams), are barriers; the rest is plain. One whose head can't be read so is a
+/// barrier: refused where it's read, in its order.
+pub fn peek_server(kind: crate::net::Kind, lane: u32, data: &[u8]) -> (Head<'_>, crate::route_latency::InKind) {
+    use crate::route_latency::InKind;
+    // Bulk frames are no messages to route by: in the order they came, on the control loop.
+    if crate::hub::Hub::job_log(kind, lane) {
+        return (Head::Plain, InKind::Carried);
+    }
+    let tags = server_tags();
+    let Some((tag, rest)) = varint(data) else { return (Head::Barrier, InKind::Other) };
+    if tag == tags.wire {
+        let Some((frame, rest)) = varint(rest) else { return (Head::Barrier, InKind::Other) };
+        if frame == tags.ack || frame == tags.want {
+            return (Head::Plain, InKind::Answers);
+        }
+        if frame == tags.have {
+            return (Head::Barrier, InKind::Answers);
+        }
+        if frame != tags.item {
+            return (Head::Barrier, InKind::Other);
+        }
+        let Some((stream, rest)) = text(rest) else { return (Head::Barrier, InKind::Command) };
+        if let Some(session) = super::commands::session_of(stream) {
+            return (Head::Session(session), InKind::Session);
+        }
+        // The item's body, after its `seq` and `low`: the command it carries, its tag first.
+        let inner = varint(rest).and_then(|(_, r)| varint(r)).and_then(|(_, r)| varint(r)).and_then(|(_, body)| varint(body)).map(|(t, _)| tags.of(t));
+        return match inner {
+            Some(ServerTag::SessionCommand | ServerTag::Session | ServerTag::SessionAsk) => (Head::Barrier, InKind::Session),
+            Some(ServerTag::Plain(_)) => (Head::Plain, InKind::Command),
+            Some(ServerTag::Barrier) | None => (Head::Barrier, InKind::Command),
+        };
+    }
+    match tags.of(tag) {
+        ServerTag::Session => text(rest).map_or((Head::Barrier, InKind::Session), |(id, _)| (Head::Session(id), InKind::Session)),
+        ServerTag::SessionAsk => varint(rest).and_then(|(_, r)| text(r)).map_or((Head::Barrier, InKind::Session), |(id, _)| (Head::Session(id), InKind::Session)),
+        // Sent as it is (a server's to a runner from before the channel): in its order, both ways.
+        ServerTag::SessionCommand => (Head::Barrier, InKind::Session),
+        ServerTag::Barrier => (Head::Barrier, InKind::Other),
+        ServerTag::Plain(kind) => (Head::Plain, kind),
+    }
+}
+
 /// What an event of a runner's waits for, and what of its runner's later ones wait for it ([`Order`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Waits {
@@ -485,34 +643,42 @@ pub struct Loops {
 }
 
 /// The net thread's end: what it hands over goes to the loop that takes it, numbered ([`Order`]).
-pub struct Fan {
+pub struct Fan<H: Heads = Runners> {
     loops: Vec<crate::memory::queue::Sender<Routed>>,
-    /// Shards that own sessions' copies: a session's updates go to its owner's session loop.
+    /// Shards whose session loops take sessions' frames: a session's go to its owner's session loop.
     shards: usize,
     marks: Arc<Marks>,
     order: Order,
+    /// What the frames it hands over are read by: the server's runners' frames, or a runner's server's.
+    heads: H,
 }
 
-impl Fan {
-    /// A fan to the control loop and a session loop for each of `shards` shards (as many as own sessions'
-    /// copies: [`shards`]), their queues together holding `bound` bytes at most, counted as the net thread's
-    /// events' (`crate::memory::owners::NET_EVENTS`): what one loop's queue held before, so the loops' queues
-    /// and the net thread hold no more of what runners sent than they did (`crate::net::EVENTS_BYTES`). With
-    /// the loops' ends.
+impl Fan<Runners> {
+    /// The server's fan: its runners' frames ([`Fan::with`]).
     pub fn new(shards: usize, bound: usize) -> (Fan, Loops) {
+        Fan::with(Runners, shards, bound)
+    }
+}
+
+impl<H: Heads> Fan<H> {
+    /// A fan of frames read by `heads` to the control loop and a session loop for each of `shards` shards (as many as own
+    /// sessions: [`shards`]), their queues together holding `bound` bytes at most, counted as the net thread's events'
+    /// (`crate::memory::owners::NET_EVENTS`): what one loop's queue held before, so the loops' queues and the net thread
+    /// hold no more of what the link sent than they did (`crate::net::EVENTS_BYTES`). With the loops' ends.
+    pub fn with(heads: H, shards: usize, bound: usize) -> (Fan<H>, Loops) {
         let shards = shards.max(1);
         let loops = session_loop(shards);
         let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::NET_EVENTS, bound));
         let (senders, queues): (Vec<_>, Vec<_>) = (0..loops).map(|_| crate::memory::queue::bounded_in::<Routed>(&room)).unzip();
         let marks = Arc::new(Marks::new(loops));
-        (Fan { loops: senders, shards, marks: Arc::clone(&marks), order: Order::new(loops) }, Loops { queues, marks })
+        (Fan { loops: senders, shards, marks: Arc::clone(&marks), order: Order::new(loops), heads }, Loops { queues, marks })
     }
 
     /// Where `ev` goes, and what it waits for.
     fn route(&self, ev: &NetEvent) -> (PeerId, usize, Waits) {
         match ev {
             NetEvent::Connected { peer, .. } | NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => (*peer, CONTROL, Waits::Barrier),
-            NetEvent::Frame { peer, kind, lane, data, .. } => match peek(*kind, *lane, data) {
+            NetEvent::Frame { peer, kind, lane, data, .. } => match self.heads.head(*kind, *lane, data) {
                 Head::Session(id) => (*peer, session_loop(crate::harness::copies::owner_of(id, self.shards)), Waits::Update),
                 Head::Barrier => (*peer, CONTROL, Waits::Barrier),
                 Head::Reader => (*peer, CONTROL, Waits::Reader),
@@ -522,7 +688,7 @@ impl Fan {
     }
 }
 
-impl crate::net::Hand for Fan {
+impl<H: Heads> crate::net::Hand for Fan<H> {
     fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>> {
         let (peer, to, waits) = self.route(&ev);
         let (n, after) = self.order.number(peer, to, waits, &self.marks);
@@ -638,6 +804,66 @@ mod tests {
         assert_eq!(peek(Kind::Control, 0, &data), Head::Session("sess-2"), "an item with bytes past its end");
         assert_eq!(peek(Kind::Control, 0, &[]), Head::Barrier);
         assert_eq!(peek(Kind::Control, 0, &[0x7f]), Head::Barrier, "a tag past this build's");
+        Ok(())
+    }
+
+    /// runner-fan: the lists a runner's fan reads its server's frames by name `ServerMsg`'s variants as they are, each in one
+    /// list at most, and the tags they're read by are the ones postcard writes.
+    #[test]
+    fn runner_fan_the_servers_messages_are_named_once_and_read_by_their_wire_tags() -> anyhow::Result<()> {
+        use crate::proto::ServerMsg;
+        let server = variants_of::<ServerMsg>();
+        anyhow::ensure!(server.len() == crate::wire::server_classes().len(), "{} variants read off ServerMsg, {} in its classes", server.len(), crate::wire::server_classes().len());
+        let lists = [SERVER_SESSION, SERVER_SESSION_ASKS, SERVER_SESSION_COMMANDS, SERVER_BARRIERS, SERVER_CARRIED];
+        for name in server {
+            let n = lists.iter().filter(|l| l.contains(name)).count();
+            anyhow::ensure!(n <= 1, "ServerMsg::{name} is in {n} of a runner fan's lists");
+        }
+        for list in lists {
+            for name in list {
+                anyhow::ensure!(server.contains(name), "a runner's fan names ServerMsg::{name}, which isn't one");
+            }
+        }
+        let head = |m: &ServerMsg| -> anyhow::Result<u64> { varint(&crate::proto::encode(m)?).map(|(t, _)| t).ok_or_else(|| anyhow::anyhow!("no tag")) };
+        let tags = server_tags();
+        anyhow::ensure!(head(&ServerMsg::Wire(Frame::Have(Vec::new())))? == tags.wire);
+        for (m, want) in [(ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() }, ServerTag::Session), (ServerMsg::Caps { caps: 0 }, ServerTag::Barrier), (ServerMsg::Drain, ServerTag::Plain(crate::route_latency::InKind::Other))] {
+            anyhow::ensure!(tags.of(head(&m)?) == want, "{}: {:?}", crate::wire::server_name(&m), tags.of(head(&m)?));
+        }
+        Ok(())
+    }
+
+    /// runner-fan: a server's frame's head says on its runner where it goes and what it is: a message to an agent session,
+    /// or a question about one, to its session's loop; a command on a session's own command stream too; a session's command
+    /// on the runner process's own streams, and what a session loop's frames are judged by, are barriers; the rest is plain.
+    #[test]
+    fn runner_fan_a_servers_frames_head_says_where_it_goes_on_its_runner() -> anyhow::Result<()> {
+        use crate::proto::ServerMsg;
+        use crate::route_latency::InKind;
+        let of = |m: &ServerMsg| -> anyhow::Result<String> {
+            let data = crate::proto::encode(m)?;
+            let (head, kind) = peek_server(Kind::Control, crate::proto::LANE_TERM, &data);
+            Ok(format!("{head:?} {}", kind.name()))
+        };
+        let item = |stream: &str, inner: &ServerMsg| -> anyhow::Result<ServerMsg> { Ok(ServerMsg::Wire(Frame::Item { stream: stream.into(), seq: 3, low: 2, body: crate::proto::encode(inner)? })) };
+        let cmd = ServerMsg::HarnessCmd { session: "sess-1".into(), json: "{\"type\":\"interrupt\"}".into() };
+        anyhow::ensure!(of(&ServerMsg::HarnessSend { session: "sess-1".into(), epoch: 2, json: "{}".into() })? == "Session(\"sess-1\") session", "a message to a session");
+        anyhow::ensure!(of(&ServerMsg::Workspace { req: 300, session: "sess-2".into(), json: "{}".into() })? == "Session(\"sess-2\") session", "a question about one");
+        anyhow::ensure!(of(&item("l:7.1/sess-3", &cmd)?)? == "Session(\"sess-3\") session", "a command on a session's own stream goes by the stream");
+        anyhow::ensure!(of(&item("l:7.1", &cmd)?)? == "Barrier session", "a session's command on the process's own stream");
+        anyhow::ensure!(of(&item("p:7.1", &ServerMsg::Cancel { job: "j".into(), reason: "r".into() })?)? == "Plain command", "another command");
+        anyhow::ensure!(of(&ServerMsg::Wire(Frame::Ack(crate::wire::channel::Has { stream: "s:x#b.0".into(), upto: 4, nacks: Vec::new() })))? == "Plain answers");
+        anyhow::ensure!(of(&ServerMsg::Wire(Frame::Have(Vec::new())))? == "Barrier answers", "what the server has, as a link comes up");
+        anyhow::ensure!(of(&ServerMsg::Caps { caps: 1 })? == "Barrier other");
+        anyhow::ensure!(of(&ServerMsg::Cluster { json: "{}".into(), raft: vec![1, 2] })? == "Plain carried");
+        anyhow::ensure!(of(&ServerMsg::Drain)? == "Plain other");
+        // Cut short, empty, or a newer server's message: a barrier.
+        let data = crate::proto::encode(&ServerMsg::HarnessSend { session: "sess-1".into(), epoch: 2, json: "{}".into() })?;
+        anyhow::ensure!(peek_server(Kind::Control, 0, data.get(..3).unwrap_or_default()).0 == Head::Barrier);
+        anyhow::ensure!(peek_server(Kind::Control, 0, &[]).0 == Head::Barrier);
+        anyhow::ensure!(peek_server(Kind::Control, 0, &[0x7f]).0 == Head::Barrier);
+        let kept: InKind = peek_server(Kind::Control, 0, &[0x7f]).1;
+        anyhow::ensure!(kept == InKind::Other);
         Ok(())
     }
 

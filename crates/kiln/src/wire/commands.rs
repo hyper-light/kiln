@@ -462,6 +462,15 @@ pub fn prefix_of(stream: &str) -> Option<&'static str> {
     }
 }
 
+/// The agent session a command stream is of: `p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>` are a session's
+/// own (to a runner announcing `CAP_SESSION_STREAMS`; runner-fan), which its session loop on the runner takes. None for a
+/// runner process's own streams (`p:<born>.<gen>`), or a name that isn't a command stream's.
+pub fn session_of(stream: &str) -> Option<&str> {
+    prefix_of(stream)?;
+    let (_, after) = stream.split_once(':')?;
+    after.split_once('/').map(|(_, session)| session).filter(|s| !s.is_empty())
+}
+
 /// A command stream's kind, its server's incarnation and its generation, from its name.
 fn named(stream: &str) -> Option<(&'static str, u64, u64)> {
     let prefix = prefix_of(stream)?;
@@ -950,5 +959,17 @@ mod tests {
         let mut late = c.push(2, Kind::Parked, b"close".to_vec(), base);
         let _ = c.poll(base + PARK_FOR);
         assert!(matches!(answer(&mut late), Some(Answer::Unreachable { .. })));
+    }
+
+    /// runner-fan: a session's own command streams name it after their generation, whatever its id holds; a runner
+    /// process's own streams, and streams that aren't command streams, name none.
+    #[test]
+    fn runner_fan_a_sessions_own_command_streams_name_it() {
+        assert_eq!(session_of("p:1700.3/01a1aa52"), Some("01a1aa52"));
+        assert_eq!(session_of("l:1700.1/a/b#c"), Some("a/b#c"), "everything after the generation's '/'");
+        assert_eq!(session_of("p:1700.3"), None, "the process's own");
+        assert_eq!(session_of("l:1700.3/"), None, "no session");
+        assert_eq!(session_of("s:sess-1#b1.0"), None, "a runner's stream of a session's updates");
+        assert_eq!(session_of("t:term#b1.0"), None);
     }
 }
