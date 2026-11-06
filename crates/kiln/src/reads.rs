@@ -140,7 +140,8 @@ impl<T: Send + Sync + 'static> Kept<T> {
 /// being a change, and the few values it says), taken again at each read, cheaply, so it answers only
 /// while it says what a read made now would. Its maker ([`Views::start`]) makes it again as soon as
 /// something it's made of changes, off the request path; a read that comes between the change and
-/// that making makes it itself (counted: [`trace`]), once, for the reads after it.
+/// that making has it made, once, for the reads after it: where it's cheap, on its own shard ([`Ahead::answer`],
+/// counted: [`trace`]), else on the compute pool ([`Ahead::held`], then [`Ahead::keep`]).
 pub struct Ahead<K> {
     now: arc_swap::ArcSwapOption<(K, bytes::Bytes)>,
     /// It's been read: its maker keeps it made.
@@ -169,6 +170,16 @@ impl<K: PartialEq> Ahead<K> {
     /// Whether it holds what's made of `key`.
     pub fn holds(&self, key: &K) -> bool {
         matches!(&*self.now.load(), Some(now) if now.0 == *key)
+    }
+
+    /// What it holds, when it's made of `key`: making nothing (goal 10, plan 01a1a87b2dae step 5: a read that
+    /// finds it behind has it made off its shard). Counted as read, so its maker keeps it made.
+    pub fn held(&self, key: &K) -> Option<bytes::Bytes> {
+        self.asked.store(true, Ordering::Relaxed);
+        match &*self.now.load() {
+            Some(now) if now.0 == *key => Some(now.1.clone()),
+            _ => None,
+        }
     }
 
     /// Whether it's been read (its maker keeps only those made).

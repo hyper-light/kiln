@@ -372,16 +372,21 @@ pub struct Chunk {
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
     /// packed chunk (`crate::memory::SESSION_ENTRIES`).
     ///
-    /// Its cell is made by the first read that keeps them, and a chunk no read paged has none (goal 9, plan
-    /// 01a1a87b2cec step 5): arc-swap pays every thread's debt slots, a locked compare-and-swap each, whenever
-    /// one of its cells is swapped or let go of, an empty one too (`Debt::pay_all`, no fast path for nothing
-    /// held). Every chunk dropped did that three times (its unpack's swap, its drop's, the cell's own), and
-    /// every event taken in at a copy's newest chunk drops one (the copy of it the view shared): rt7's calm
-    /// profile had it at 0.08% of the process, 0.5% of the shards' time, beside the copy's view's own store.
+    /// Its cell is made by the first read that keeps them, or the compaction that makes them for a copy being
+    /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap
+    /// pays every thread's debt slots, a locked compare-and-swap each, whenever one of its cells is swapped or
+    /// let go of, an empty one too (`Debt::pay_all`, no fast path for nothing held). Every chunk dropped did
+    /// that three times (its unpack's swap, its drop's, the cell's own), and every event taken in at a copy's
+    /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
+    /// process, 0.5% of the shards' time, beside the copy's view's own store.
     texts: OnceLock<ArcSwapOption<Bytes>>,
     /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
     /// alone, as chunks are compacted ([`Events::compact`]).
     paged: AtomicBool,
+    /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
+    /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
+    /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
+    page_read: AtomicBool,
 }
 
 impl Clone for Chunk {
@@ -396,7 +401,7 @@ impl Clone for Chunk {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
         let spilled = self.spilled.clone().filter(|_| self.is_compact());
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false) }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 }
 
@@ -418,7 +423,7 @@ impl Chunk {
                 m
             })
             .collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false) }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
     }
 
     pub fn len(&self) -> usize {
@@ -494,23 +499,53 @@ impl Chunk {
         }
         let made = Bytes::from(self.joined()?.into_owned());
         if self.is_compact() && self.paged.load(Ordering::SeqCst) {
-            let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
-            if was.is_none() {
-                crate::memory::SESSION_ENTRIES.add(made.len());
-                // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
-                // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
-                // with Acquire alone, where the swaps of a cell always there were all SeqCst).
-                std::sync::atomic::fence(Ordering::SeqCst);
-                if !self.paged.load(Ordering::SeqCst) {
-                    self.unpage();
-                }
-            }
+            self.keep_texts(&made);
         }
         Ok(made)
     }
 
+    /// `made`, its texts, kept for the reads of its copy's newest page unless it keeps some already (the first kept
+    /// stays), its cell made if it's the first to.
+    fn keep_texts(&self, made: &Bytes) {
+        let was = self.texts.get_or_init(ArcSwapOption::empty).compare_and_swap(&None::<Arc<Bytes>>, Some(Arc::new(made.clone())));
+        if was.is_none() {
+            crate::memory::SESSION_ENTRIES.add(made.len());
+            // The cell made and the texts kept, then `paged` read; `unpage` writes `paged` and then looks for the
+            // cell: a fence on each side, so one of the two sees the other's (the cell is a `OnceLock`'s, read
+            // with Acquire alone, where the swaps of a cell always there were all SeqCst).
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !self.paged.load(Ordering::SeqCst) {
+                self.unpage();
+            }
+        }
+    }
+
+    /// The texts a read of its copy's newest page kept ([`Chunk::page_texts`]), if any: what a read on a shard takes
+    /// without inflating anything (goal 10, plan 01a1a87b2dae step 5).
+    fn page_texts_kept(&self) -> Option<Bytes> {
+        self.texts.get().and_then(ArcSwapOption::load_full).map(|kept| Bytes::clone(&kept))
+    }
+
+    /// Its texts as a read of its copy's newest page keeps them ([`Chunk::page_texts`]), made now of `was`'s events
+    /// (itself before it was compacted, its events still in memory: their texts copied, nothing inflated), where it's
+    /// its copy's newest compact chunk and keeps none yet (goal 10, plan 01a1a87b2dae step 5). Its owner asks for it
+    /// where its copy's newest page was read since the last compaction ([`Events::compact`]), so the read after this
+    /// one finds them made: the first read after each compaction inflated the chunk's whole segment, a few hundred
+    /// microseconds of a read the lab times. A copy no one reads keeps nothing more, and its chunks no cell.
+    fn warm(&self, was: &Chunk) {
+        if !self.is_compact() || was.is_compact() || !self.paged.load(Ordering::SeqCst) || self.page_kept().is_some() {
+            return;
+        }
+        let Ok(joined) = was.joined() else { return };
+        let made = Bytes::from(joined.into_owned());
+        // Where its metas say its texts end: else they aren't this chunk's (one changed since it was packed).
+        if self.meta.last().map_or(0, |m| m.off + m.len) == made.len() {
+            self.keep_texts(&made);
+        }
+    }
+
     /// Lets go of the texts a page's read kept ([`Chunk::page_texts`]); with no cell made for them, nothing to
-    /// swap. Its caller unset `paged` first, or found it unset: the fence pairs with `page_texts`' own.
+    /// swap. Its caller unset `paged` first, or found it unset: the fence pairs with `keep_texts`' own.
     fn unpage(&self) {
         std::sync::atomic::fence(Ordering::SeqCst);
         if let Some(kept) = self.texts.get().and_then(|cell| cell.swap(None)) {
@@ -534,7 +569,7 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false) })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
     }
 
     /// Whether its segment is on disk (`super::spill`), not in memory.
@@ -550,7 +585,7 @@ impl Chunk {
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
     /// memory (one changed since is kept as it is).
     fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
-        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false) })
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -656,6 +691,17 @@ impl Chunk {
         self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
         self.evs.push(ev);
     }
+}
+
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
+    Cannot,
+    /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
+    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
+    Unkept,
 }
 
 /// A copy's events in order, in chunks ([`Chunk`]) of [`CHUNK`]: the first may hold fewer, once its
@@ -861,29 +907,40 @@ impl Events {
     /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
     /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
     /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. None as `texts_into` says none.
-    pub fn pieces_into(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>) -> Option<()> {
+    /// events' texts written out once. [`Unread::Cannot`] where `texts_into` says none.
+    ///
+    /// A compact chunk's segment is inflated only where `inflate` says so (step 5): a read on a shard takes the
+    /// texts its copy's reads kept, and has the others made off the shard ([`Unread::Unkept`]). An inflate is a
+    /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
+    /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
+    /// 3.6 ms on the CPU, past the shards' quantum.
+    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
         let mut i = range.start;
         while i < range.end {
-            let (c, k) = self.place(i)?;
-            let chunk = self.chunk(c)?;
-            let n = chunk.len().checked_sub(k)?.min(range.end - i);
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
+            let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
             if n == 0 || chunk.is_spilled() {
-                return None;
+                return Err(Unread::Cannot);
             }
             if i > range.start {
                 out.push(Bytes::from_static(b","));
             }
             if chunk.is_compact() {
-                let (first, last) = (chunk.meta.get(k)?, chunk.meta.get(k + n - 1)?);
-                let (from, to) = (first.off, last.off.checked_add(last.len)?);
-                let texts = chunk.page_texts().ok()?;
+                let (first, last) = (chunk.meta.get(k).ok_or(Unread::Cannot)?, chunk.meta.get(k + n - 1).ok_or(Unread::Cannot)?);
+                let (from, to) = (first.off, last.off.checked_add(last.len).ok_or(Unread::Cannot)?);
+                let texts = match chunk.page_texts_kept() {
+                    Some(kept) => kept,
+                    None if inflate => chunk.page_texts().map_err(|_| Unread::Cannot)?,
+                    None => return Err(Unread::Unkept),
+                };
                 if from > to || to > texts.len() {
-                    return None;
+                    return Err(Unread::Cannot);
                 }
+                chunk.page_read.store(true, Ordering::Relaxed);
                 out.push(texts.slice(from..to));
             } else {
-                let evs = chunk.evs.get(k..k + n)?;
+                let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
                 let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
@@ -895,7 +952,7 @@ impl Events {
             }
             i += n;
         }
-        Some(())
+        Ok(())
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -1150,15 +1207,26 @@ impl Events {
         if ready.is_empty() {
             return;
         }
+        // Whether a read of its newest page took the texts of its newest compact chunk until now: then the one this
+        // makes its newest compact chunk has its texts made now, of its events as they were (`Chunk::warm`).
+        let read = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).is_some_and(|c| c.page_read.load(Ordering::Relaxed));
         let chunks = Arc::make_mut(&mut self.older);
+        // The newest of those compacted here (they're in order), as it was.
+        let mut newest: Option<(usize, Arc<Chunk>)> = None;
         for i in ready {
             if let Some(slot) = chunks.get_mut(i)
                 && let Some(c) = slot.compacted()
             {
-                *slot = Arc::new(c);
+                newest = Some((i, std::mem::replace(slot, Arc::new(c))));
             }
         }
         self.page_newest();
+        if read
+            && let Some((i, was)) = newest
+            && let Some(now) = self.older.get(i)
+        {
+            now.warm(&was);
+        }
     }
 
     /// Its newest compact chunk in memory is the one whose texts a read of its newest page keeps
@@ -1608,24 +1676,37 @@ impl View {
     /// 10, plan 01a1a87b2dae step 5: the lab's events reads, at p99 1.1 to 2.0 ms on rt5 calm, inflated a
     /// whole chunk's segment each, on the request's shard).
     pub fn events_page(&self, before: Option<u64>, limit: usize) -> Option<Vec<Bytes>> {
+        self.events_page_with(before, limit, true).ok()
+    }
+
+    /// [`View::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
+    /// (goal 10, plan 01a1a87b2dae step 5). [`Unread::Unkept`]: a compact chunk's texts the page needs aren't kept,
+    /// and [`View::events_page`] makes them, off the shard (the reads after take them as kept); [`Unread::Cannot`]
+    /// where `events_page` says none.
+    pub fn events_page_kept(&self, before: Option<u64>, limit: usize) -> Result<Vec<Bytes>, Unread> {
+        self.events_page_with(before, limit, false)
+    }
+
+    /// [`View::events_page`], a compact chunk's segment inflated where `inflate` says so.
+    fn events_page_with(&self, before: Option<u64>, limit: usize, inflate: bool) -> Result<Vec<Bytes>, Unread> {
         let end = match before {
             Some(b) => self.events.partition_point(|m| m.seq.is_some_and(|s| s < b)),
             None => self.events.len(),
         };
         let start = end.saturating_sub(limit);
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq != Some(1)) {
-            return None;
+            return Err(Unread::Cannot);
         }
         for i in start..end {
-            let m = self.events.meta(i)?;
+            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
             if m.seq.is_none() || m.id().is_empty() {
-                return None;
+                return Err(Unread::Cannot);
             }
         }
         let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_into(start..end, &mut parts)?;
+        self.events.pieces_with(start..end, &mut parts, inflate)?;
         parts.push(Bytes::from_static(b"]}"));
-        Some(parts)
+        Ok(parts)
     }
 }
 
@@ -3703,6 +3784,101 @@ mod tests {
         let now = m.view();
         let newest = now.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page now"))?;
         anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 2).is_some(), "the newest compact chunk's kept now");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a page read on a shard (`View::events_page_kept`) inflates nothing. One
+    /// that needs a compact chunk's texts not kept yet says so (`Unread::Unkept`), and the read that makes them (off
+    /// the shard: `View::events_page`) keeps the newest compact chunk's, so the shard's read after it answers the same
+    /// bytes from them; a page of the open chunk alone needs none; one that reaches an older compact chunk, whose
+    /// texts no read keeps, says so each time; and one the copy can't say is `Unread::Cannot`, as before.
+    #[test]
+    fn g10_s5_a_page_read_on_a_shard_inflates_nothing() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Two sealed chunks, compact, and the newest open with nine: the newest fifty reach into the second.
+        let n = u64::try_from(CHUNK * 2 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = |limit: usize| format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(limit)..).unwrap_or_default().join(","));
+        let view = m.view();
+        let was = inflated();
+        anyhow::ensure!(view.events_page_kept(None, 50) == Err(Unread::Unkept), "its compact chunk's texts aren't kept yet");
+        anyhow::ensure!(view.events_page_kept(None, 9).map(|p| p.concat()) == Ok(page(9).into_bytes()), "the open chunk's alone: nothing to inflate");
+        anyhow::ensure!(inflated() == was, "the shard's reads inflated nothing");
+        // Made off the shard: inflated once, the newest compact chunk's texts kept.
+        let made = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page made"))?;
+        anyhow::ensure!(inflated() == was + 1, "made once");
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the kept page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was + 1, "the shard's read after it inflates nothing");
+        anyhow::ensure!(kept.concat() == made.concat() && made.concat() == page(50).into_bytes(), "the same bytes, the events' texts joined");
+        // Past the open chunk and the newest compact one, into the older: kept by no read, so made off the shard each time.
+        let long = CHUNK + 9 + 5;
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 2, "still not kept: an older chunk's never are");
+        // An event with no number: the copy can't say the page (the store answers it), kept or not.
+        m.rev = n + 1;
+        m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
+        m.publish();
+        anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Cannot), "the store's to answer");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a copy whose newest page was read since its last compaction has the texts of
+    /// the chunk its next compaction makes the newest compact one made then, of its events in memory (nothing
+    /// inflated), so the read after that compaction inflates nothing anywhere and says the same bytes; one not read
+    /// since keeps nothing more.
+    #[test]
+    fn g10_s5_a_read_copys_next_compact_chunk_is_warmed() -> anyhow::Result<()> {
+        let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let push = |m: &mut Mirror, seqs: std::ops::RangeInclusive<u64>| -> anyhow::Result<()> {
+            for q in seqs {
+                m.rev = q;
+                m.upsert(entry(&format!("e{q}"), q));
+            }
+            for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            m.events.compact(None);
+            m.publish();
+            Ok(())
+        };
+        let page = |m: &Mirror| -> String {
+            let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+            format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","))
+        };
+        let kept = |m: &Mirror, i: usize| m.view().events.chunks().get(i).and_then(|c| c.page_kept());
+        let chunk = u64::try_from(CHUNK)?;
+        // Two sealed chunks, compact, the newest open with nine; its newest page read (made off the shard).
+        let mut n = 2 * chunk + 9;
+        push(&mut m, 1..=n)?;
+        anyhow::ensure!(m.view().events_page(None, 50).is_some(), "the newest page read");
+        // A chunk more compacted: the copy's page was read, so the new newest compact chunk's texts are made now.
+        push(&mut m, n + 1..=n + chunk)?;
+        n += chunk;
+        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_none(), "the newest compact chunk's texts made, the older's let go of");
+        // Another, with no read since: nothing made.
+        push(&mut m, n + 1..=n + chunk)?;
+        n += chunk;
+        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 2).is_none(), "no read since: nothing kept");
+        anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Unkept), "a read on a shard has them made off it");
+        anyhow::ensure!(m.view().events_page(None, 50).is_some(), "made, and read");
+        // Read since: the next compaction makes its texts, and the read after it inflates nothing.
+        push(&mut m, n + 1..=n + chunk)?;
+        let was = inflated();
+        let read = m.view().events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the warmed page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was, "nothing inflated: made of its events at the compaction");
+        anyhow::ensure!(read.concat() == page(&m).into_bytes(), "the same bytes as its events' texts joined");
         Ok(())
     }
 

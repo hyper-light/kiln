@@ -2192,6 +2192,18 @@ impl Registry {
         self.sessions.with(id, |v| v.events_page(before, limit)).flatten()
     }
 
+    /// [`Registry::events_page`] of what's in memory as it is, inflating nothing: what a read on a shard answers with
+    /// ([`super::copies::View::events_page_kept`]; goal 10, plan 01a1a87b2dae step 5). No such session: `Cannot`.
+    pub fn events_page_kept(&self, id: &str, before: Option<u64>, limit: usize) -> Result<Vec<bytes::Bytes>, super::copies::Unread> {
+        self.sessions.with(id, |v| v.events_page_kept(before, limit)).unwrap_or(Err(super::copies::Unread::Cannot))
+    }
+
+    /// Session `id`'s newest view, held: for what's read of it off the shards (a page whose compact chunk's texts
+    /// are made there: goal 10, plan 01a1a87b2dae step 5).
+    pub fn view_held(&self, id: &str) -> Option<Arc<super::copies::View>> {
+        self.sessions.view(id)
+    }
+
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
         #[cfg(not(test))]
         super::acp::warm_models();
