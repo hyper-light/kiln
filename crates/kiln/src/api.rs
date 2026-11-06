@@ -6786,19 +6786,92 @@ fn pieces_of(bytes: Vec<u8>, first: bool, last: bool) -> impl Iterator<Item = ws
     })
 }
 
+/// A piece of a packed snapshot as it's made ([`next_piece`]): what's left of it to make, none once its last piece is made
+/// (known with that piece, so no job is asked for after it: the memory audit's row A6), and the piece.
+type Made<P> = (Option<P>, Option<Vec<u8>>);
+
 /// A snapshot's next piece as it's packed going out ([`crate::harness::registry::Packing`]), made on the
 /// blocking pool: a place held for the piece, not for the viewer's reading (goal 11, plan 01a1a87b2e56 step 5).
-/// Once it's all out (or its making failed), the snapshot is let go of there too, not on the viewer's shard: it
+/// Once its last piece is made (or its making failed), the snapshot is let go of there too, not on the viewer's shard: it
 /// may be the last to hold what its copy has since let go of (the chunks, meta and state it was taken with),
 /// and a long session's are thousands of allocations to free (goal 10, plan 01a1a87b2dae step 5).
-async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<(Option<crate::harness::registry::Packing>, Option<Vec<u8>>)> {
+async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<Made<crate::harness::registry::Packing>> {
     let (packing, piece) = crate::rt::blocking(move || {
         let piece = packing.next_piece(SNAPSHOT_PIECE);
-        let rest = matches!(piece, Ok(Some(_))).then_some(packing);
-        (rest, piece)
+        let more = matches!(piece, Ok(Some(_))) && !packing.done();
+        (more.then_some(packing), piece)
     })
     .await?;
     Ok((packing, piece?))
+}
+
+/// Writes a packed snapshot to `tx` piece by piece as its pieces are made, `now` the first made and `make` making each
+/// next (on the blocking pool: [`next_piece`]), each piece's frames one message's ([`pieces_of`]); what it asks of the pool
+/// and sends counted in `sent`, what's in flight in `held`.
+///
+/// The next piece's making is asked for once this one is in hand, before its frames are written, and waited for once they
+/// are (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A6): each was made, and waited for, before the one before
+/// it was written, so a snapshot's round trips to the pool went one after another with its writes, 24 for a 3 MB one.
+/// Self-clocked: the next is asked for as the last is made, whatever the pool's pace and the socket's, so one piece is made
+/// while one is written; what's in flight is those two, and a viewer that reads slowly holds the making of none past them.
+async fn send_pieces<S, P, F, Fut>(tx: &mut S, held: &mut crate::harness::registry::InFlight, now: Made<P>, mut make: F, sent: &mut Sent) -> anyhow::Result<()>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Send + 'static,
+    F: FnMut(P) -> Fut,
+    Fut: Future<Output = anyhow::Result<Made<P>>>,
+{
+    use futures::FutureExt as _;
+    use futures::SinkExt as _;
+    let (mut rest, mut piece) = now;
+    let mut first = true;
+    // A turn from here: the first piece came in a poll of its own, made on the blocking pool; and afresh after each wait.
+    let mut turns = crate::rt::Turns::new();
+    while let Some(bytes) = piece.take() {
+        sent.pieces += 1;
+        let last = rest.is_none();
+        // The next piece's making asked for now: its first poll sends its job to the pool.
+        let next = rest.take().map(|p| {
+            sent.jobs += 1;
+            make(p)
+        });
+        let mut next = std::pin::pin!(futures::future::OptionFuture::from(next));
+        let mut made = next.as_mut().now_or_never();
+        // This piece, and the next as it's made while this one's written, about this one's size.
+        let n = bytes.capacity();
+        held.made(if last { n } else { n.saturating_add(n) });
+        let mut wrote = Ok(());
+        for frame in pieces_of(bytes, first, last) {
+            if let Err(e) = tx.send(frame).await {
+                wrote = Err(e);
+                break;
+            }
+            turns.end().await;
+        }
+        first = false;
+        let made = match made.take().or_else(|| next.as_mut().now_or_never()) {
+            Some(m) => m,
+            None => {
+                let m = next.as_mut().await;
+                // Its wait gave the shard to its other work: a turn afresh.
+                turns = crate::rt::Turns::new();
+                m
+            }
+        };
+        if let Err(e) = wrote {
+            // Its viewer gone before its last piece: what's left of it, made meanwhile, let go of on the blocking pool, as one
+            // all out is (`next_piece`), not on the viewer's shard (goal 9, plan 01a1a87b2cec step 3).
+            if let Some(Ok((left, _))) = made {
+                let_go(left).await;
+            }
+            return Err(e.into());
+        }
+        if let Some(m) = made {
+            (rest, piece) = m?;
+        }
+    }
+    Ok(())
 }
 
 /// `held` let go of on the blocking pool, not on the shard that awaits this: what's left of a snapshot may be the last
@@ -6849,39 +6922,12 @@ where
     let weight = snapshot.weight(packed);
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
     if packed {
-        // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
-        // it's held (so its last frame is known final), then written; what's in flight is those two, not the
-        // whole message, and a place of the blocking pool is held for each piece's making, not for the
-        // viewer's reading.
+        // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5), a piece made while the one before it is written
+        // ([`send_pieces`]; the memory audit's row A6): what's in flight is those two, not the whole message, and a place of
+        // the blocking pool is held for each piece's making, not for the viewer's reading.
         sent.jobs += 1;
-        let (mut packing, mut now) = next_piece(snapshot.packing(&synced())).await?;
-        let mut first = true;
-        while let Some(piece) = now {
-            sent.pieces += 1;
-            let (rest, following) = match packing.take() {
-                Some(p) => {
-                    sent.jobs += 1;
-                    next_piece(p).await?
-                }
-                None => (None, None),
-            };
-            packing = rest;
-            held.made(piece.capacity().saturating_add(following.as_ref().map_or(0, Vec::capacity)));
-            let last = following.is_none();
-            // A turn from here: the piece came in a poll of its own, made on the blocking pool.
-            let mut turns = crate::rt::Turns::new();
-            for frame in pieces_of(piece, first, last) {
-                if let Err(e) = tx.send(frame).await {
-                    // Its viewer gone before its last piece: what's left of it let go of on the blocking pool, as one
-                    // all out is (`next_piece`), not on the viewer's shard (goal 9, plan 01a1a87b2cec step 3).
-                    let_go(packing).await;
-                    return Err(e.into());
-                }
-                turns.end().await;
-            }
-            first = false;
-            now = following;
-        }
+        let first = next_piece(snapshot.packing(&synced())).await?;
+        send_pieces(tx, &mut held, first, next_piece, &mut sent).await?;
         return Ok(sent);
     }
     sent.jobs += 1;
@@ -8157,9 +8203,10 @@ mod tests {
         Ok(out)
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A5: a packed snapshot's weight is reckoned on its viewer's
-    /// shard, so its sending asks the blocking pool for nothing before its first piece: its pieces' jobs and the one that
-    /// finds the last made out, no other, where it asked for one more first, to weigh it. Sent, it's the message made at once.
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's rows A5 and A6: a packed snapshot's weight is reckoned on its
+    /// viewer's shard, so its sending asks the blocking pool for nothing before its first piece, where it asked for one more
+    /// first, to weigh it; and its last piece is known last as it's made, so no job is asked for after it to find it all out.
+    /// Its pieces' jobs alone. Sent, it's the message made at once.
     #[test]
     fn g11_s5_a5_a_snapshots_weight_asks_the_pool_for_nothing() -> anyhow::Result<()> {
         // Made here, off the shards, where no packer runs beside them: the same twice.
@@ -8168,10 +8215,88 @@ mod tests {
             let mut wire = Written::default();
             let sent = send_snapshot(&mut wire, snapshot, true).await?;
             anyhow::ensure!(sent.pieces >= 3, "pieces: {sent:?}");
-            anyhow::ensure!(sent.jobs == sent.pieces + 1, "its pieces' jobs and the last's, no other: {sent:?}");
+            anyhow::ensure!(sent.jobs == sent.pieces, "its pieces' jobs alone: {sent:?}");
             anyhow::ensure!(joined(&wire.sent)? == whole, "the message made at once");
             Ok(())
         })
+    }
+
+    /// Pieces of `sizes` bytes, each its own bytes, as a fake packing makes them: piece `k` of them, and the place of the one
+    /// after it (none for the last).
+    fn fake_pieces(sizes: &[usize]) -> Vec<Vec<u8>> {
+        sizes.iter().enumerate().map(|(k, n)| (0..*n).map(|i| u8::try_from((i + k) % 251).unwrap_or(0)).collect()).collect()
+    }
+
+    /// A socket that counts the frames sent it and wakes whoever waits on them: what a piece being made below waits for.
+    #[derive(Default)]
+    struct Watched {
+        written: Written,
+        seen: Arc<(std::sync::atomic::AtomicUsize, futures::task::AtomicWaker)>,
+    }
+
+    impl futures::Sink<ws::Message> for Watched {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            this.written.sent.push(item);
+            this.seen.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            this.seen.1.wake();
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            futures::Sink::poll_flush(std::pin::Pin::new(&mut self.get_mut().written), cx)
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A6: a packed snapshot's next piece is made while this one is
+    /// written. Here each next piece's making waits until a frame of the one before it is written, as a pool slower than the
+    /// socket would have it: made, and waited for, before this one's frames went (each piece after the last's writing), the
+    /// first piece's frames never go. Its pieces' jobs alone, none after the last to find it all out, and the message the
+    /// pieces make, whole.
+    #[test]
+    fn g11_s5_a6_a_snapshots_next_piece_is_made_while_this_one_is_written() -> anyhow::Result<()> {
+        let sizes = [SNAPSHOT_PIECE + 5, SNAPSHOT_PIECE, 3 * SNAPSHOT_FRAME + 1, 7];
+        let pieces = Arc::new(fake_pieces(&sizes));
+        let n = pieces.len();
+        let (done, came) = std::sync::mpsc::channel();
+        let made = Arc::clone(&pieces);
+        std::thread::spawn(move || {
+            let run = async move {
+                let mut wire = Watched::default();
+                let seen = Arc::clone(&wire.seen);
+                // Piece `k` made once a frame of piece `k - 1` is written: the frames before it, and one.
+                let frames_before = |k: usize| made.iter().take(k).map(|p| p.len().div_ceil(SNAPSHOT_FRAME).max(1)).sum::<usize>();
+                let make = |k: usize| {
+                    let (seen, piece, wait_for) = (Arc::clone(&seen), made.get(k).cloned(), frames_before(k.saturating_sub(1)) + 1);
+                    async move {
+                        std::future::poll_fn(|cx| {
+                            seen.1.register(cx.waker());
+                            if seen.0.load(std::sync::atomic::Ordering::SeqCst) >= wait_for { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+                        })
+                        .await;
+                        Ok(((k + 1 < n).then_some(k + 1), piece))
+                    }
+                };
+                let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), 0).await;
+                let mut sent = Sent::default();
+                let first = (Some(1), made.first().cloned());
+                send_pieces(&mut wire, &mut held, first, make, &mut sent).await.map(|()| (sent, wire.written.sent))
+            };
+            let _ = done.send(futures::executor::block_on(run));
+        });
+        let (sent, frames) = match came.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r?,
+            Err(_) => anyhow::bail!("the next piece waited for this one's frames: they went one after another"),
+        };
+        anyhow::ensure!(sent == Sent { jobs: n - 1, pieces: n }, "its pieces' jobs alone: {sent:?}");
+        anyhow::ensure!(joined(&frames)? == pieces.concat(), "the message its pieces make");
+        Ok(())
     }
 
     /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the

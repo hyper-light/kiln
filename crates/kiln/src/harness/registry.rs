@@ -1308,6 +1308,12 @@ impl Packing {
         }
         Ok(Some(gz.take()))
     }
+
+    /// Whether its message is all made: its last piece was (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A6: a
+    /// piece known last as it's made, no job is asked for after it to find it all out).
+    pub fn done(&self) -> bool {
+        self.gz.is_none()
+    }
 }
 
 /// The bytes an `events` frame of `n` events takes whose texts as sent are `texts` bytes in all: its envelope, the `[` and
