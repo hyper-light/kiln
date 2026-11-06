@@ -127,13 +127,6 @@ pub struct Server {
     /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
     /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
     pub shed: bool,
-    /// How the server places its work on its runtime's shards (goal 7 of the API runtime program,
-    /// `crate::placement`): `round-robin` (connections dealt in turn, requests served in their
-    /// connection's task), `steer` (connections and requests to the less delayed of two shards), `steal`
-    /// (requests as tasks an idle shard takes from a busy one) or `both`. `round-robin` by default, as the
-    /// lab's A/B picked it (docs/runtime-lab.md, "Goal 7: placement"); the others stay for later A/B tests.
-    /// `KILN_RT_PLACEMENT` overrides it.
-    pub placement: crate::placement::Placement,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
     /// these alone (`AllowedCPUs=`, where the service manager has the cpuset controller) and,
@@ -161,14 +154,14 @@ pub struct Server {
     /// end at least every step quantum less the timers' tick (166.7 µs; goal 9, plan 01a1a87b2cec step 4), so
     /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within a
     /// quantum, the timer slack added (266.7 µs), not at the kernel's next tick (up to 1 ms at 1000 Hz).
-    /// `"off"` (or `false`), the default: never; it's off until declared (docs/ci.md §0.3, "Opt-in
-    /// automation"). `"auto"`, the mode a config declares, nudges a shard only while its host holds its
-    /// wakes, as its probe reads each period from the kernel's count of its wait for a CPU (`crate::nudge`),
-    /// so a calm server pays nothing and says when and why a shard nudged; `"on"` (or `true`, as before it
-    /// had a mode) nudges every wait, a wake of each waiting shard every period. Needs no privilege; in the
-    /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge); macOS and
-    /// Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any
-    /// other value on, as it was read before), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+    /// `"off"`, the default: never; it's off until declared (docs/ci.md §0.3, "Opt-in automation").
+    /// `"auto"`, the mode a config declares, nudges a shard only while its host holds its wakes, as its
+    /// probe reads each period from the kernel's count of its wait for a CPU (`crate::nudge`), so a calm
+    /// server pays nothing and says when and why a shard nudged; `"on"` nudges every wait, a wake of each
+    /// waiting shard every period. Needs no privilege; in the real-time class's place where that's refused or
+    /// not asked for (a shard in it needs no nudge); macOS and Windows refuse it, having no lazy preemption.
+    /// `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`, or a flag's word: `1`, `0`), and `KILN_RT_NUDGE_US`
+    /// sets its period for a lab's A/B.
     pub nudge: crate::nudge::Mode,
     /// The browser protocol over one WebSocket (`GET /api/live`, `crate::live`; goal 3 of the browser
     /// protocol program, docs/browser-protocol.md): served beside today's sockets when true. Off until
@@ -490,7 +483,6 @@ impl Default for Server {
             h3_cert: None,
             h3_key: None,
             shed: false,
-            placement: crate::placement::Placement::default(),
             cores: None,
             realtime: false,
             nudge: crate::nudge::Mode::Off,
@@ -691,7 +683,7 @@ impl Config {
         }
         // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`, `=auto`, `=off`).
         if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
-            cfg.server.nudge = crate::nudge::Mode::from_env(&v);
+            cfg.server.nudge = crate::nudge::Mode::from_env(&v).ok_or_else(|| anyhow::anyhow!("KILN_RT_NUDGE={v}: auto, on or off"))?;
         }
         // `[server] live` and `browser_congestion`, as a lab's server takes its settings.
         if let Ok(v) = std::env::var("KILN_LIVE") {
@@ -699,11 +691,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_BROWSER_CONGESTION") {
             cfg.server.browser_congestion = Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        }
-        // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
-        if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {
-            cfg.server.placement = crate::placement::Placement::parse(&v)
-                .ok_or_else(|| anyhow::anyhow!("KILN_RT_PLACEMENT={v}: round-robin, steer, steal or both"))?;
         }
         Ok(cfg)
     }

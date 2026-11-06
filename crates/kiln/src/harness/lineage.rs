@@ -1097,7 +1097,7 @@ mod tests {
             // a and its child c are u1's; b is the owner's; zz is no session at all.
             for (id, parent) in [("a", None), ("c", Some("a")), ("b", None)] {
                 let info = Info { id: id.into(), kind: "claude".into(), parent: parent.map(str::to_owned), ..Info::default() };
-                hub.harness.ingest(&hub, &there, id, super::super::core::Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, super::super::core::Update::Open { info: Box::new(info), since: None }).await;
             }
             for (id, whose) in [("a", "user:u1"), ("c", "user:u1"), ("b", "owner")] {
                 hub.store.kv_set(crate::mcp::opener_key(id), whose.into()).await?;

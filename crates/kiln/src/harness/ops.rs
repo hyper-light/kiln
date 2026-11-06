@@ -1684,11 +1684,11 @@ mod end_to_end {
             let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
             for (n, k) in kids.iter().enumerate() {
                 let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
-                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, k, Update::Open { info: Box::new(info), since: None }).await;
             }
             let report = async |k: &str, status: Status, said: String, at: i64| {
                 let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };
-                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) }).await;
+                hub.harness.ingest(&there, k, Update::State { state: Box::new(state) }).await;
             };
             let queue = || hub.harness.queue(&p);
             let news = || queue().into_iter().filter(|q| q.text.contains("which you started")).collect::<Vec<_>>();

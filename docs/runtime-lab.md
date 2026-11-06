@@ -14,7 +14,7 @@ benchmarking under realistic usage decide). Goal 1 of the API runtime program bu
 A probe pinned to each of hyper-rt's shards (`crate::rt::spawn_on`) sleeps a period on the shard (a quiet
 sleep from goal 9 step 5 on: below) and notes, as it runs, how late ready work ran: work that was ready on
 that shard waited that long. Node measures its loop the same way (`monitorEventLoopDelay`, sampling every 10 ms by default:
-research f8). The period (`shard_health::PERIOD`, 17.07 ms; `KILN_SHARD_PROBE_MS`, `0`: no probes) is the longest
+research f8). The period (`shard_health::PERIOD`, 17.07 ms) is the longest
 that still sees what the probe must (goal 9, plan 01a1a87b2cec step 5): hyper-rt's watchdog's limit, a step's
 worth of polls each a quantum (64 × 266.7 µs), so a probe is due inside every hold the watchdog reports; and within
 the lab's tail, ten probes or more past a round's p99.9 of the shards' delay (60 s × 4 shards at up to 24 ms). 10 ms
@@ -294,9 +294,8 @@ taskset -c 16-31 target/release/kiln-lab run --kiln target/release/kiln --label 
 # two builds, interleaved: is B better than A beyond noise?
 taskset -c 16-31 target/release/kiln-lab ab --a main/kiln --b branch/kiln --label-a main --label-b branch --rounds 8
 
-# one build, two settings of its server: its shards, or its blocking pool's places (dns,store,fs)
+# one build, two settings of its server: its shards
 kiln-lab ab --a kiln --b kiln --label-a 2-shards --label-b 4-shards --env-a KILN_RT_SHARDS=2 --env-b KILN_RT_SHARDS=4
-kiln-lab ab --a kiln --b kiln --label-a fs-8 --label-b fs-26 --env-a KILN_RT_BLOCKING=4,2,8 --env-b KILN_RT_BLOCKING=4,2,26 --hogs 1x
 
 # a second run against a first; a run's report again; runs side by side
 kiln-lab compare first/run.json second/run.json
@@ -512,10 +511,10 @@ machine's load averages were 25 to 33 before each window. So these numbers are t
 comparable with the baseline's table above. A: goal 1's baseline build (main at `2a2d93f6df5` with goal
 1's metrics; goal 2's kiln-rt is hyper-rt copied, two calls renamed, so this is main before goal 3). B:
 main at `01aba3ff882` with this change (`g3b-9d599a5892`), its server's blocking pool at the sizes
-derived below (`KILN_RT_BLOCKING=4,2,26`, its defaults since). The `realistic` profile, eight rounds of
-each, interleaved, calm and with 16 CPU hogs; the server sized itself to 4 shards and a compute pool of
-12 threads (16 CPUs less the shards). The rounds: `docs/runtime-lab/2026-11-04/goal3-ab-calm.json` and
-`goal3-ab-hogs-1x.json`.
+derived below (`KILN_RT_BLOCKING=4,2,26`, its defaults since; that switch is gone, its A/B done). The
+`realistic` profile, eight rounds of each, interleaved, calm and with 16 CPU hogs; the server sized itself to
+4 shards and a compute pool of 12 threads (16 CPUs less the shards). The rounds:
+`docs/runtime-lab/2026-11-04/goal3-ab-calm.json` and `goal3-ab-hogs-1x.json`.
 
 Calm, 4 of 58 numbers differ beyond noise:
 
@@ -1146,8 +1145,11 @@ busy share of the A/B against census16's tree no worse.
 
 Goal 7 of the API runtime program (plan `01a1a59c2aea73e487fb6fcfe90c5fcc`, research
 `01a1a59c2aeb70e9824606865d6762ca`) built three more ways for the server to place its work on kiln-rt's
-shards beside today's. `[server] placement` picks one, and `KILN_RT_PLACEMENT` overrides it, so each runs
-from the setting alone, with no rebuild (`crate::placement`):
+shards beside today's. `[server] placement` picked one, and `KILN_RT_PLACEMENT` overrode it, so each ran
+from the setting alone, with no rebuild (`crate::placement`). Its A/B (below) kept `round-robin`, and on
+2026-11-06 the other three went with the setting, kiln-rt's movable tasks and `scripts/placement_lab` (the
+legacy audit: no switch kept for what an A/B decided against). What follows is the record; the code and the
+scripts are at `f2524b34921`.
 
 | placement | a new connection | a request on a connection | a held shard's queued work |
 | --- | --- | --- | --- |
@@ -1201,7 +1203,8 @@ layout, without losing throughput or CPU per request beyond noise:
 
 ### Running it
 
-On a Linux machine with systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
+As it was run (the scripts are at `f2524b34921`, the last tree with the placements). On a Linux machine with
+systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
 
 ```sh
 mkdir -p ~/.cache/g7-lab/bin && cp scripts/placement_lab/*.sh scripts/placement_lab/merge.py ~/.cache/g7-lab/
@@ -1265,8 +1268,8 @@ per request differs beyond noise.
 
 **By the rule, `round-robin` stays the default.** No placement's people's p99 is better beyond noise: `page`
 p99 and `api_write` p99 went -19.7% and +4.2% under `steer`, -22.3% and +5.6% under `steal`, -33.7% and
-+6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stay behind the setting for
-later A/B tests.
++6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stayed behind the setting
+until 2026-11-06, when they were taken out (above).
 
 **The shared layout and calm, partial** (22:10 to 23:50 UTC; the same build, CPUs and profile). In `shared`
 the server, its runners, the lab and 16 of kiln-lab's own hogs share the lab's cgroup at one weight; in `calm`
@@ -1324,8 +1327,8 @@ What it says:
 - **What placing costs is a sub-millisecond hop** before each handler, the one difference beyond noise; it
   bought nothing measurable here.
 - **Production's load may differ.** These rounds, as goal 8's, ran with the machine shared with other agents'
-  builds; a quieter machine narrows the noise, and the setting lets the A/B be run again on one build
-  (`scripts/placement_lab/driver.sh`).
+  builds; a quieter machine narrows the noise. The setting that let the A/B run again on one build
+  (`scripts/placement_lab/driver.sh`) is gone with the placements it chose between (2026-11-06).
 - **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
   queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
   shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.
@@ -2755,8 +2758,8 @@ server, and a server whose runners are machines of their own); the server's own 
 the machine gives. Its own helpers (git, a render) inherit it. The log says which (`transparent huge pages are off
 for the server's process`, or why they stay). macOS and Windows give no transparent huge pages to turn off.
 
-**The A/B** (one build; `KILN_KEEP_THP=1` keeps them as the machine gives them), 8 rounds calm, production's layout,
-then the same with `--hogs 1x`:
+**The A/B** (one build; `KILN_KEEP_THP=1` kept them as the machine gives them on train 17's build), 8 rounds calm,
+production's layout, then the same with `--hogs 1x`:
 
 ```sh
 taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a thp --label-b no-thp --env-a KILN_KEEP_THP=1 --server-cpus 16-31 --layout production --rounds 8
@@ -2769,6 +2772,13 @@ move: turso's reads and writes run on its own threads and the blocking pool, and
 TLB reach alone. A round's server (`/proc/<pid>/smaps_rollup`) says `AnonHugePages: 0 kB` on B. On production's host
 the saving is larger and the lab can't show it: there, `AnonHugePages` in the server's `smaps_rollup` before and
 after the deploy says it (its kernel makes no huge pages of files: no `READ_ONLY_THP_FOR_FS`, `FileHugePages` 0).
+
+**What it found** (thp17, fedora 2026-11-06 10:59 to 11:43 UTC, train 17's `7faf7aa3163`, the jemalloc build, 8 rounds
+a side interleaved, calm then with 16 hogs; lab-main's report): every round of B said `transparent huge pages are off for
+the server's process`, and its `smaps_rollup` said `AnonHugePages: 0 kB`; A's held 0 to 6 MiB of them (4 MiB the median
+with hogs), all of it turso's advised arenas (`kinds.txt`'s `thp-advised`). B held 3.0 MB (calm) and 3.6 MB (hogs) less
+anonymous memory, within its noise, and no number of kiln-lab's was worse beyond noise, latency included. So huge pages
+stay off, and the switch the A/B ran on (`KILN_KEEP_THP`) is gone from the server.
 
 ### What's resident now, by kind, and what 113 MB takes (step 5, part 6)
 
@@ -2854,7 +2864,8 @@ a build without that layout is the next A/B, two builds, its latency the questio
 **The lab, in order** (each an A/B on one build, 8 rounds calm then 8 with hogs, with `KILN_LAB_HOOK` set to
 `bolt-hook.sh` and `sections.py` and `kinds.py` beside it, so each round writes `kinds.txt`):
 1. Huge pages (above): `--env-a KILN_KEEP_THP=1`. Its proof is `kinds.txt`'s `thp-advised` row, `huge_kb` 4096 on A
-   and 0 on B: 2 to 4 MB is well inside `rss_anon_mb`'s range from round to round (21 MB in g9p16).
+   and 0 on B: 2 to 4 MB is well inside `rss_anon_mb`'s range from round to round (21 MB in g9p16). Done: thp17
+   (above), and the switch is gone.
 2. The arms ("The A/B of jemalloc's settings: the lab plan"): each kind they move held more than that noise in g9p16,
    so all three candidates run, `subsecond-decay` first, then `slab-caches` and `page-caches`, then the readings; the
    arenas' arms where `slab_room` holds more than the noise, a build without the cache-oblivious layout where

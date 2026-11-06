@@ -3787,6 +3787,12 @@ impl Shard {
                     rest = h.runner_update(self, *r, over).map(|i| Msg::Update(Box::new(i)));
                 }
             }
+            Msg::Take(t) => {
+                if let Some(h) = hub {
+                    let Take { from, id, u, shipped } = *t;
+                    rest = h.harness.take_from(self, h, &from, &id, u, shipped, over).map(|i| Msg::Update(Box::new(i)));
+                }
+            }
         }));
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
@@ -3809,7 +3815,8 @@ impl Shard {
     }
 }
 
-/// An update of a session from the machine it runs on, for its owner (`Registry::ingest_from`).
+/// An update of a session from the machine it runs on, as its owner prepared it (`Registry::take_from`'s `prepare`): what
+/// `Registry::apply` takes, and what's left of it when its owner's turn ran out.
 pub struct Ingest {
     pub from: Location,
     pub id: String,
@@ -3844,6 +3851,19 @@ pub struct RunnerUpdate {
     pub taken: Option<std::time::Duration>,
 }
 
+/// An agent session's update as it came from where the session runs, a machine or the server itself
+/// (`super::registry::Location`), for the shard that owns the session's copy to prepare and take there, in the order it
+/// came (`Registry::take_from`): as a runner's is ([`RunnerUpdate`], judged first), not prepared where it came and handed
+/// over prepared, as the server's own sessions' were until 2026-11-06 (the legacy audit: one path for every session's
+/// updates, its copy's owner's).
+pub struct Take {
+    pub from: super::registry::Location,
+    pub id: String,
+    pub u: Update,
+    /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`).
+    pub shipped: bool,
+}
+
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 
 /// A sweep of an owner's copies ([`Copies::on_each_session`]): each session `pick` picks taken by `step` in turn, then `step`
@@ -3871,7 +3891,10 @@ pub struct Work {
 
 /// What an owner takes from its inbox.
 pub enum Msg {
+    /// What's left of an update its owner's turn ran out in, prepared already, to take first at its next.
     Update(Box<Ingest>),
+    /// An update from where a session runs, to prepare and take ([`Take`]).
+    Take(Box<Take>),
     /// Work on its copies (people's commands, a machine lost, a session opened or closed…).
     Run(Job),
     /// An update from a session's runner, to judge and take ([`RunnerUpdate`]).
@@ -3892,6 +3915,7 @@ impl crate::memory::queue::Weigh for Msg {
             Msg::Work(work) => size_of::<Work>().saturating_add(size_of_val(&*work.job)),
             Msg::Each(each) => size_of::<Each>().saturating_add(size_of_val(&*each.pick)).saturating_add(size_of_val(&*each.step)).saturating_add(each.left.as_ref().map_or(0, |l| l.iter().map(|id| size_of::<String>().saturating_add(id.len())).fold(0, usize::saturating_add))),
             Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
+            Msg::Take(t) => size_of::<Take>().saturating_add(t.id.len()).saturating_add(crate::memory::queue::Weigh::weight(&t.u)),
         })
     }
 }
@@ -4259,6 +4283,7 @@ fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     match msg {
         Msg::Update(i) => crate::wire::update_label(&i.u),
         Msg::Runner(r) => crate::wire::update_label(&r.update),
+        Msg::Take(t) => crate::wire::update_label(&t.u),
         Msg::Run(_) => &WORK,
         Msg::Work(work) => work.label,
         Msg::Each(each) => each.label,
@@ -4387,6 +4412,7 @@ impl Costs {
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
+            Msg::Take(t) => &t.u,
             Msg::Run(_) | Msg::Work(_) | Msg::Each(_) => return start,
         };
         match u {
@@ -4599,7 +4625,7 @@ async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
 /// one), then each message while it's expected to end within the quantum ([`Costs`]), an update's events while the next and
 /// what ends the update are. What's left of a message its turn ran out in (an update's events), or one it had no room for,
 /// goes first at its next turn, before anything newer. A turn spent with more to take gives the shard up whether or not
-/// another task wants it: one that went on while none did (`crate::rt::Turns::after`, `maybe_yield`) ran on in the same poll,
+/// another task wants it: one that went on while none did (`maybe_yield`) ran on in the same poll,
 /// which the shards' table counted whole (the lab's g9p9 fill: this owner's polls past 100 µs, 0.7 to 1.6 ms on average by
 /// round, the longest 7 to 53 ms on the CPU, each labeled by a message of its last turn alone).
 ///
