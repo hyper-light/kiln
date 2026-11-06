@@ -933,11 +933,21 @@ pub struct Stats {
     pub mapped: u64,
     /// Address space it keeps for reuse, given back to the OS (`stats.retained`): never resident.
     pub retained: u64,
+    /// Of `active` less `allocated` (its slack), the room left in small allocations' slabs: each small size's slabs'
+    /// regions no allocation holds (`stats.arenas.<all>.bins.<j>.curslabs` times `arenas.bin.<j>.nregs`, less
+    /// `curregs`, at `arenas.bin.<j>.size`), written before, so resident (goal 11, plan 01a1a87b2e56 step 5: in
+    /// g11mem16 the slack was 28.8 MB, and the arms that move it differ by where it is). What fewer arenas can take.
+    pub slab_room: u64,
+    /// Of the slack, the page each large allocation takes past its size class where jemalloc lays large ones out
+    /// cache-obliviously (`opt.cache_oblivious`, on unless built without: its manual, "one extra page per large
+    /// allocation"): the large extents held (`stats.arenas.<all>.large.nmalloc` less `ndalloc`, threads' caches'
+    /// among them) times a page; resident where the allocation is written to its end. Arenas don't move it.
+    pub large_pad: u64,
 }
 
 impl Stats {
     /// Each kind with its name on `/metrics`, in the exposition's order.
-    pub fn kinds(&self) -> [(&'static str, u64); 9] {
+    pub fn kinds(&self) -> [(&'static str, u64); 11] {
         [
             ("allocated", self.allocated),
             ("thread_caches", self.thread_caches),
@@ -948,6 +958,8 @@ impl Stats {
             ("resident", self.resident),
             ("mapped", self.mapped),
             ("retained", self.retained),
+            ("slab_room", self.slab_room),
+            ("large_pad", self.large_pad),
         ]
     }
 }
@@ -977,7 +989,38 @@ pub fn stats() -> Option<Stats> {
         resident: bytes(c"stats.resident")?,
         mapped: bytes(c"stats.mapped")?,
         retained: bytes(c"stats.retained")?,
+        // Where jemalloc doesn't say these (a build without its statistics' bins), 0: the kinds above still stand.
+        slab_room: slab_room().unwrap_or(0),
+        large_pad: large_pad(page).unwrap_or(0),
     })
+}
+
+/// [`Stats::slab_room`]: each small size's free regions in its slabs, over every arena.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn slab_room() -> Option<u64> {
+    let named = |name: String| std::ffi::CString::new(name).ok();
+    let mut room = 0_u64;
+    for bin in 0..jemalloc_opt(c"arenas.nbins", 0_u32)? {
+        let size = jemalloc_opt(&named(format!("arenas.bin.{bin}.size"))?, 0_usize)?;
+        let nregs = jemalloc_opt(&named(format!("arenas.bin.{bin}.nregs"))?, 0_u32)?;
+        let slabs = jemalloc_opt(&named(format!("stats.arenas.{ARENAS_ALL}.bins.{bin}.curslabs"))?, 0_usize)?;
+        let regs = jemalloc_opt(&named(format!("stats.arenas.{ARENAS_ALL}.bins.{bin}.curregs"))?, 0_usize)?;
+        let free = slabs.checked_mul(usize::try_from(nregs).ok()?)?.saturating_sub(regs);
+        room = room.saturating_add(u64::try_from(free.checked_mul(size)?).ok()?);
+    }
+    Some(room)
+}
+
+/// [`Stats::large_pad`]: a page for each large extent held, where jemalloc pads them (`opt.cache_oblivious`).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn large_pad(page: u64) -> Option<u64> {
+    if !jemalloc_opt(c"opt.cache_oblivious", false)? {
+        return Some(0);
+    }
+    let all = |what: &str| std::ffi::CString::new(format!("stats.arenas.{ARENAS_ALL}.large.{what}")).ok();
+    let made = jemalloc_opt(&all("nmalloc")?, 0_u64)?;
+    let gone = jemalloc_opt(&all("ndalloc")?, 0_u64)?;
+    made.saturating_sub(gone).checked_mul(page)
 }
 
 #[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
@@ -1240,10 +1283,10 @@ mod tests {
     /// The allocator's kinds on /metrics, in their order, each its field (goal 11, plan 01a1a87b2e56 step 5).
     #[test]
     fn g11_s5_the_allocators_kinds_are_its_fields() {
-        let stats = Stats { allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9 };
+        let stats = Stats { allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9, slab_room: 10, large_pad: 11 };
         let kinds = stats.kinds();
-        assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained"]);
-        assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained", "slab_room", "large_pad"]);
+        assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     /// Where jemalloc doesn't allocate there are no allocator statistics to say.
@@ -1287,6 +1330,65 @@ mod tests {
         unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
         let after = stats().unwrap_or_default();
         assert!(after.allocated.saturating_add(block_bytes / 2) <= held.allocated, "{held:?} then {after:?}");
+    }
+
+    /// The slack's two causes are said apart (goal 11, plan 01a1a87b2e56 step 5): small blocks freed back to their
+    /// slabs leave room in them (`slab_room`), and each large block held takes a page past its size where jemalloc
+    /// lays large ones out cache-obliviously (`large_pad`). On a thread of its own, whose cache it flushes so what it
+    /// frees goes back to the slabs at once; the blocks are asked of jemalloc directly (the test binary's allocator
+    /// is the system's), at sizes no other test asks of it.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g11_s5_the_slack_is_said_as_slabs_room_and_large_pads() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        const SMALL: usize = 448;
+        const SMALLS: usize = 8192;
+        const LARGE: usize = 80 << 10;
+        const LARGES: usize = 64;
+        let page = jemalloc_opt(c"arenas.page", 0_usize).and_then(|p| u64::try_from(p).ok()).unwrap_or(4096);
+        let padded = jemalloc_opt(c"opt.cache_oblivious", false).ok_or_else(|| anyhow::anyhow!("opt.cache_oblivious"))?;
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            let (small, large) = (Layout::from_size_align(SMALL, 8)?, Layout::from_size_align(LARGE, 8)?);
+            let before = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            // SAFETY: layouts of non-zero size; each block is freed once below with its layout, or at the end.
+            let smalls: Vec<*mut u8> = (0..SMALLS).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(small) }).collect();
+            // SAFETY: as above.
+            let larges: Vec<*mut u8> = (0..LARGES).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(large) }).collect();
+            anyhow::ensure!(smalls.iter().chain(&larges).all(|p| !p.is_null()), "jemalloc gave every block");
+            for p in smalls.iter().skip(1).step_by(2) {
+                // SAFETY: one of `smalls`, freed once (every other one).
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, small) };
+            }
+            give_back_thread_cache();
+            let held = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            let room = u64::try_from(SMALLS / 2 * SMALL)?;
+            // Half of each slab the blocks took is free now; other tests' threads ask jemalloc for other sizes alone.
+            anyhow::ensure!(held.slab_room >= before.slab_room.saturating_add(room / 2), "room {room} freed in slabs: {before:?} then {held:?}");
+            let pads = u64::try_from(LARGES)?.saturating_mul(page);
+            if padded {
+                anyhow::ensure!(held.large_pad >= before.large_pad.saturating_add(pads / 2), "{LARGES} large blocks held: {before:?} then {held:?}");
+            } else {
+                anyhow::ensure!(held.large_pad == 0, "no pad without cache-oblivious layout: {held:?}");
+            }
+            anyhow::ensure!(held.active.saturating_sub(held.allocated) >= held.slab_room, "the room is slack's: {held:?}");
+            for p in smalls.iter().step_by(2) {
+                // SAFETY: the rest of `smalls`, each freed once.
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, small) };
+            }
+            for p in &larges {
+                // SAFETY: each of `larges`, freed once.
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, large) };
+            }
+            give_back_thread_cache();
+            let after = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            if padded {
+                anyhow::ensure!(after.large_pad.saturating_add(pads / 2) <= held.large_pad, "the pads go with the blocks: {held:?} then {after:?}");
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?
     }
 
     /// A pool's worker goes cold after jemalloc's dirty decay (goal 11, plan 01a1a87b2e56 step 5).

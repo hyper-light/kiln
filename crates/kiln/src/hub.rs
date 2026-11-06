@@ -571,8 +571,14 @@ pub struct Hub {
     pub terminals: crate::termsess::Sessions,
     /// Every kiln-native agent session, local and on machines.
     pub harness: crate::harness::registry::Registry,
-    /// What the server has of each runner's channel streams (docs/wire.md).
+    /// What the server has of each runner's channel streams (docs/wire.md): the control loop's, which takes
+    /// terminals' streams, and the keep flags. A session's streams are its owner's shard's session loop's
+    /// ([`Hub::session_wire`]).
     pub wire: crate::wire::link::Links,
+    /// What the server has of runners' agent sessions' channel streams, a `Links` for each shard's session loop
+    /// (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): a session's streams are taken by the loop on its
+    /// owner's shard, with these receivers of its own, whose lock that loop alone takes ([`Hub::links_of`]).
+    session_wire: Box<[crate::wire::link::Links]>,
     /// Commands to each runner process on the channel, until it answers them (docs/wire.md,
     /// "Commands").
     pub cmds: crate::wire::commands::Owner,
@@ -774,6 +780,7 @@ impl Hub {
             terminals: crate::termsess::Sessions::new(),
             harness,
             wire: crate::wire::link::Links::new(),
+            session_wire: (0..crate::wire::fan::shards()).map(|_| crate::wire::link::Links::new()).collect(),
             // Named for this server process (53 bits, as JSON carries a number exactly), so a runner
             // never mistakes another's commands for these.
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
@@ -906,9 +913,10 @@ impl Hub {
         let whole_json = crate::store::learner::encode(&crate::store::learner::Msg::Raft { id: 0, part: 0, parts: 0 });
         // Each message's learner found here, its frames (a copy of up to half a mebibyte each, a learner's catch-up
         // many) made on the compute pool and sent in order, in turns (goal 9, plan 01a1a87b2cec step 3: made here
-        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds).
+        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds); a write's few short messages
+        // made here, by their bytes (`crate::net::send_made`, step 5).
         let route = |(member, bytes): (u64, Vec<u8>)| match self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER)) {
-            Some(peer) => Some((peer, self.cluster.frames(member, bytes))),
+            Some(peer) => Some((peer, (bytes.len(), self.cluster.frames(member, bytes)))),
             None => {
                 if let Some(g) = self.store.group() {
                     g.unreachable(member);
@@ -916,8 +924,8 @@ impl Hub {
                 None
             }
         };
-        let make = move |frames: crate::store::learner::Frames| crate::store::learner::encoded(frames, &whole_json);
-        crate::net::send_made(&out, route, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
+        let make = move |(_, frames): (usize, crate::store::learner::Frames)| crate::store::learner::encoded(frames, &whole_json);
+        crate::net::send_made(&out, route, |(bytes, _)| *bytes, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
         Ok(())
     }
 
@@ -1782,7 +1790,7 @@ impl Hub {
                 said = Instant::now();
                 let runners: Vec<(String, PeerId)> = self.agents.load().values().filter(|a| a.connected && self.wire.keeps(&a.name)).filter_map(|a| Some((a.name.clone(), a.peer?))).collect();
                 for (name, peer) in runners {
-                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&name))).await;
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&name))).await;
                 }
             }
         }
@@ -2295,13 +2303,72 @@ impl Hub {
 
     // ------------------------------------------------------------ network
 
-    /// Consume transport events forever (supervised).
-    pub async fn net_loop(self: Arc<Self>, rx: crate::memory::queue::Receiver<NetEvent>) -> anyhow::Result<()> {
-        // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
-        // listener's) for as long as they send.
+    /// The channel receivers that take the items of runner stream `stream`: those of the loop the net thread hands its
+    /// frames to (`crate::wire::fan::peek`), a session's that of its owner's shard ([`Hub::session_wire`]), the rest the
+    /// control loop's ([`Hub::wire`]). Which loop is read off the stream's name as the fan reads it, so each loop takes
+    /// its own receivers alone and their lock is never another loop's (goal 10, plan 01a1a87b2dae step 4; goal 5's rule).
+    fn links_of(&self, stream: &str) -> &crate::wire::link::Links {
+        crate::wire::uplink::session_of(stream).and_then(|id| self.session_wire.get(crate::harness::copies::owner_of(id, self.session_wire.len()))).unwrap_or(&self.wire)
+    }
+
+    /// What the server has of `runner`'s channel streams, the hub's loops' together (`crate::wire::fan::have_of`): as the
+    /// one loop's receivers said it, sent as its link comes up and every few seconds (docs/wire.md).
+    pub fn wire_have(&self, runner: &str) -> crate::wire::channel::Frame {
+        crate::wire::fan::have_of(std::iter::once(&self.wire).chain(self.session_wire.iter()), runner)
+    }
+
+    /// The hub's loops, each taking what the net thread fanned out to it (`crate::wire::fan`; goal 10, plan 01a1a87b2dae
+    /// step 4): the control loop, placed as the one loop was, and a session loop on each shard, beside that shard's owner of
+    /// agent sessions' copies, so a session's update goes to its owner on the shard it came to rather than through the
+    /// control loop's. Each supervised as the one loop was: one that ends is said, and nothing waits for it any more. The
+    /// caller's place is the loops' spawn site, which the shards' table of what held them names (`hyper_rt::slow`).
+    #[track_caller]
+    pub fn net_loops(self: &Arc<Self>, loops: crate::wire::fan::Loops) {
+        let crate::wire::fan::Loops { queues, marks } = loops;
+        for (me, rx) in queues.into_iter().enumerate() {
+            let (hub, marks) = (Arc::clone(self), Arc::clone(&marks));
+            let Some(shard) = me.checked_sub(1) else {
+                crate::sup::spawn_guarded("net-events", async move { hub.net_loop(me, rx, marks).await });
+                continue;
+            };
+            crate::rt::spawn_owner(shard, async move {
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(hub.net_loop(me, rx, marks))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(task = "net-events", shard, error = %format!("{e:#}"), "task failed"),
+                    Err(p) => {
+                        crate::metrics::global().panics_caught.inc();
+                        tracing::error!(task = "net-events", shard, panic = %crate::sup::panic_message(p.as_ref()), "task panicked; contained");
+                    }
+                }
+            });
+        }
+    }
+
+    /// One of the hub's loops, `me` among them (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4): the control loop
+    /// (`crate::wire::fan::CONTROL`), placed as the one loop was, or a shard's session loop, on that shard beside its
+    /// owner of agent sessions' copies. Takes transport events forever (supervised), each once its runner's earlier
+    /// events on the other loops that it may not overtake are taken (`crate::wire::fan::Marks`), then marks its number
+    /// taken, so what waits for it goes. The channel receivers its items are taken with are its own ([`Hub::links_of`]).
+    pub async fn net_loop(self: Arc<Self>, me: usize, rx: crate::memory::queue::Receiver<crate::wire::fan::Routed>, marks: Arc<crate::wire::fan::Marks>) -> anyhow::Result<()> {
+        // Said ended as it goes, however it goes: nothing waits for it then.
+        let _ending = marks.ending(me);
+        // Runners keep its channel full: its turns are bounded, or it holds its shard for as long as they
+        // send.
         let mut turns = crate::rt::Turns::new();
         // A turn starts afresh with an event this loop waited for (goal 10, plan 01a1a87b2dae step 5).
-        while let Some(ev) = turns.next(&rx).await {
+        while let Some(crate::wire::fan::Routed { ev, n, after, handed }) = turns.next(&rx).await {
+            // Its runner's earlier events it may not overtake, taken first where they went: mostly none (goal 10, plan
+            // 01a1a87b2dae step 4). A wait that parked gave the shard to its other work, as an empty queue's does, so
+            // its turn starts afresh too (step 5).
+            let order = if after.is_empty() {
+                Duration::ZERO
+            } else {
+                let dequeued = Instant::now();
+                if marks.wait(&after).await {
+                    turns = crate::rt::Turns::new();
+                }
+                dequeued.elapsed()
+            };
             // A frame whose read on the shard would take its turn past its quantum waits for the next turn, the shard
             // given up first (goal 9, plan 01a1a87b2cec step 3).
             if let NetEvent::Frame { data, .. } = &ev {
@@ -2314,10 +2381,21 @@ impl Hub {
                 NetEvent::Frame { at, .. } => Some(Arrived { at: *at, taken: began }),
                 _ => None,
             };
-            // Its first leg, every frame's: from the network thread handing it over to this loop taking it
-            // (goal 10, plan 01a1a87b2dae step 4).
+            // Its first leg, every frame's: from the network thread handing it over to this loop taking it, but for its
+            // wait for its runner's earlier frames on the other loops, a leg of its own (goal 10, plan 01a1a87b2dae
+            // step 4).
             if let Some(a) = arrived {
-                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToLoop, began.saturating_duration_since(a.at));
+                let to_loop = began.saturating_duration_since(a.at).saturating_sub(order);
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToLoop, to_loop);
+                // The control loop's apart, so the session loops' is told from it; and the net thread's hold of it, part
+                // of it, so the net thread's is told from the queue's and the loop's wake.
+                if me == crate::wire::fan::CONTROL {
+                    crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToControl, to_loop);
+                }
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Net, handed.saturating_duration_since(a.at));
+                if !after.is_empty() {
+                    crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Order, order);
+                }
             }
             // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
@@ -2327,6 +2405,8 @@ impl Hub {
             if let Err(e) = crate::rt::labeled(label, self.on_net_at(ev, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
+            // Taken: what of its runner's waits for it goes.
+            marks.took(me, n);
             // An agent session's update is timed where it's taken, by the shard that owns its copy,
             // from when it came (`Hub::runner_update`): its arrival went there with it.
             if let Some(a) = arrived {
@@ -2344,7 +2424,7 @@ impl Hub {
 
     /// Whether a frame of `kind` on `lane` is job output: bulk frames are, but on the conversation
     /// feed's and the files' lanes (messages, in bulk).
-    fn job_log(kind: Kind, lane: u32) -> bool {
+    pub(crate) fn job_log(kind: Kind, lane: u32) -> bool {
         kind == Kind::Log && lane != proto::LANE_CONVO && lane != proto::LANE_FILES
     }
 
@@ -2662,7 +2742,9 @@ impl Hub {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
-                let answer = match self.wire.on_item(agent, &stream, seq, low, body, Instant::now()) {
+                // Taken with its stream's loop's own receivers: this loop's (goal 10, plan 01a1a87b2dae step 4).
+                let links = self.links_of(&stream);
+                let answer = match links.on_item(agent, &stream, seq, low, body, Instant::now()) {
                     Arrival::Take(body) => {
                         // Read where it's quick to, else off the shard, in order either way, as a frame is
                         // (`crate::wire::payload::read_item`; goal 9, plan 01a1a87b2cec step 3).
@@ -2696,7 +2778,7 @@ impl Hub {
                                 Some((e.code().refusal(), why))
                             }
                         };
-                        Some(self.wire.answer(agent, &stream, seq, refusal))
+                        Some(links.answer(agent, &stream, seq, refusal))
                     }
                     Arrival::Answered(a) => a,
                     Arrival::Gap(want) => Some(want),
@@ -2891,7 +2973,7 @@ impl Hub {
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
                     self.cmds.ask(move |c| c.connected(peer)).await;
-                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&agent))).await;
                 } else {
                     let waited = self.cmds.ask(move |c| c.not_wire(peer)).await.unwrap_or_default();
                     self.send_waited(peer, waited).await;
@@ -5257,6 +5339,220 @@ pub(crate) mod tests {
                 assert_eq!(answered(&format!("s:{id}#a1")), Some((11, 0)), "{id}: every item answered taken");
             }
             assert_eq!(answered("s:s0#b1"), Some((1, 0)), "box-b's item answered taken, counting for nothing");
+            Ok(())
+        })
+    }
+
+    /// A test hub's loops, one a shard and its control loop, as the server starts them (`Hub::net_loops`): the net
+    /// thread's end that hands them what a runner sends, and how far each has taken (goal 10, plan 01a1a87b2dae step 4).
+    fn hub_loops(hub: &Arc<Hub>) -> (crate::wire::fan::Fan, Arc<crate::wire::fan::Marks>) {
+        let (fan, loops) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+        let marks = Arc::clone(&loops.marks);
+        hub.net_loops(loops);
+        (fan, marks)
+    }
+
+    /// `msg` from runner process `peer`, as the net thread hands it to the hub's loops.
+    fn hand(fan: &mut crate::wire::fan::Fan, peer: PeerId, msg: &AgentMsg) -> anyhow::Result<()> {
+        use crate::net::Hand as _;
+        let ev = NetEvent::Frame { peer, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(msg)?, at: Instant::now() };
+        anyhow::ensure!(fan.hand(ev).is_ok(), "the hub's loops took nothing");
+        Ok(())
+    }
+
+    /// Sessions whose copies are owned by each shard in turn, `n` of them: their updates go to every session loop
+    /// there is.
+    fn spread_sessions(n: usize) -> Vec<String> {
+        let shards = crate::wire::fan::shards();
+        (0..n).map(|i| (0u64..).map(|j| format!("s{i}-{j}")).find(|id| crate::harness::copies::owner_of(id, shards) == i % shards).unwrap_or_default()).collect()
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4, wire/link.rs as it is: each stream's items are taken with the receivers of the
+    /// loop the net thread hands its frames to, which is read off its name alike: a session's, its owner's shard's session
+    /// loop's own; a terminal's, the control loop's. So no loop takes another's receivers, and their lock is one loop's.
+    /// What the server says it has of a runner's streams is the loops' together, in the order of their names.
+    #[test]
+    fn g10_s4_a_streams_items_are_taken_with_its_loops_own_receivers() -> anyhow::Result<()> {
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let shards = crate::wire::fan::shards();
+            anyhow::ensure!(hub.session_wire.len() == shards, "{} session loops' receivers for {shards} shards", hub.session_wire.len());
+            let ids = spread_sessions(2 * shards);
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let data = proto::encode(&AgentMsg::Wire(Frame::Item { stream: stream.clone(), seq: 1, low: 0, body: Vec::new() }))?;
+                let crate::wire::fan::Head::Session(peeked) = crate::wire::fan::peek(Kind::Term, proto::LANE_TERM, &data) else { anyhow::bail!("{stream}: not a session's") };
+                let own = hub.session_wire.get(crate::harness::copies::owner_of(peeked, shards));
+                anyhow::ensure!(own.is_some_and(|own| std::ptr::eq(hub.links_of(&stream), own)), "{stream}: taken with another loop's receivers");
+            }
+            anyhow::ensure!(std::ptr::eq(hub.links_of("t:term1#a1"), &hub.wire), "a terminal's stream: the control loop's");
+            // Items of each, taken: what's said again is every stream, in the order of its name, as one loop's said it.
+            let none = serde_json::to_string(&crate::harness::core::Update::Events { events: Vec::new() })?;
+            let say = |id: &str| proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: none.clone() });
+            for id in &ids {
+                let _ = hub.on_net(NetEvent::Frame { peer: 1, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(&AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id)? }))?, at: Instant::now() }).await;
+            }
+            let _ = hub.on_net(NetEvent::Frame { peer: 1, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(&AgentMsg::Wire(Frame::Item { stream: "t:term1#a1".into(), seq: 1, low: 0, body: proto::encode(&AgentMsg::TermOutput { session: "term1".into(), data: vec![1] })? }))?, at: Instant::now() }).await;
+            let Frame::Have(has) = hub.wire_have("fedora") else { anyhow::bail!("not a Have") };
+            let mut want: Vec<String> = ids.iter().map(|id| format!("s:{id}#a1")).collect();
+            want.push("t:term1#a1".into());
+            want.sort();
+            assert_eq!(has.iter().map(|h| h.stream.clone()).collect::<Vec<_>>(), want, "every stream, once, in the order of its name");
+            assert!(has.iter().all(|h| h.upto == 1), "each item answered: {has:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's Caps, a barrier on the hub's control loop, comes after its sessions'
+    /// updates on their owners' session loops, however long those take: the Have it's answered with says every item before
+    /// it taken (its loops answered each), as the one loop's did.
+    #[test]
+    fn g10_s4_a_barrier_reads_what_its_runner_sent_before_it_on_the_session_loops() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, _) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(6);
+            const ITEMS: u64 = 12;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+            }
+            for seq in 2..=ITEMS {
+                for id in &ids {
+                    let ev = crate::harness::model::Event { id: format!("{id}-e{seq}"), seq, at: 1, parent: None, by: None, body: crate::harness::model::Body::Assistant { text: format!("{seq}"), streaming: false } };
+                    hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq, low: seq - 1, body: say(id, &Update::Events { events: vec![ev] })? }))?;
+                }
+            }
+            hand(&mut fan, 1, &AgentMsg::Caps { caps: proto::CAP_UNREAD | proto::CAP_WIRE })?;
+            let have = crate::rt::timeout(Duration::from_secs(30), async {
+                loop {
+                    let said = hub.sent.lock().iter().find_map(|(p, m)| match m {
+                        ServerMsg::Wire(Frame::Have(h)) if *p == 1 => Some(h.clone()),
+                        _ => None,
+                    });
+                    if let Some(h) = said {
+                        return h;
+                    }
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("no Have in 30 s"))?;
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let upto = have.iter().find(|h| h.stream == stream).map(|h| h.upto);
+                assert_eq!(upto, Some(ITEMS), "{stream}: the Have said before its runner's updates were taken");
+            }
+            // Each answered on its stream, in order, before the Have.
+            let sent = hub.sent.lock().clone();
+            let have_at = sent.iter().position(|(_, m)| matches!(m, ServerMsg::Wire(Frame::Have(_)))).unwrap_or(0);
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let acks: Vec<u64> = sent
+                    .iter()
+                    .take(have_at)
+                    .filter_map(|(_, m)| match m {
+                        ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream => Some(h.upto),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(acks, (1..=ITEMS).collect::<Vec<_>>(), "{stream}: each item answered once, in order, before the Have");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's Opens on their sessions' loops, then its inventory, a barrier on the
+    /// control loop. The inventory is read once the Opens are taken by the sessions' owners: the sessions it no longer
+    /// lists are let go of, as when one loop took both, never left to an Open taken after it; the one it lists stays,
+    /// where it runs.
+    #[test]
+    fn g10_s4_a_runners_inventory_is_read_after_its_opens() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, marks) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(4);
+            let mut handed = 0u64;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+                handed += 1;
+            }
+            let kept = ids.first().cloned().unwrap_or_default();
+            let inventory = crate::harness::host::Inventory { sessions: vec![kept.clone()], ..Default::default() };
+            hand(&mut fan, 1, &AgentMsg::HarnessInventory { json: serde_json::to_string(&inventory)? })?;
+            handed += 1;
+            crate::rt::timeout(Duration::from_secs(30), async {
+                while marks.taken(crate::wire::fan::CONTROL) < handed {
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the inventory wasn't taken in 30 s"))?;
+            for id in &ids {
+                hub.harness.applied(id).await;
+            }
+            anyhow::ensure!(hub.harness.located_on(&kept, "fedora"), "{kept}, which the inventory lists, was let go of");
+            for id in ids.iter().skip(1) {
+                assert!(hub.harness.info(id).is_none(), "{id}: its Open was taken after the inventory that no longer lists it");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's link closing as its sessions' updates are still being taken on their
+    /// loops. The close, a barrier, waits for them: its sessions end disconnected, as their runner is, none brought back by
+    /// an update taken after the close.
+    #[test]
+    fn g10_s4_a_close_racing_its_runners_updates_leaves_its_sessions_disconnected() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, marks) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(4);
+            let mut handed = 0u64;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+                handed += 1;
+            }
+            // Many updates each, the last of them handed just before the link goes.
+            for seq in 2..=40u64 {
+                for id in &ids {
+                    let state = Update::State { state: Box::new(crate::harness::model::State { status: crate::harness::model::Status::Running, ..Default::default() }) };
+                    hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq, low: seq - 1, body: say(id, &state)? }))?;
+                    handed += 1;
+                }
+            }
+            {
+                use crate::net::Hand as _;
+                anyhow::ensure!(fan.hand(NetEvent::Closed { peer: 1, reason: "the link dropped".into() }).is_ok(), "the hub's loops took nothing");
+                handed += 1;
+            }
+            // The close, the last event handed, taken whole on the control loop: its sessions said disconnected by their
+            // owners.
+            crate::rt::timeout(Duration::from_secs(30), async {
+                while marks.taken(crate::wire::fan::CONTROL) < handed {
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the close wasn't taken in 30 s"))?;
+            anyhow::ensure!(hub.agents.load().get("fedora").is_some_and(|a| !a.connected), "the runner reads connected after its link closed");
+            for id in &ids {
+                hub.harness.applied(id).await;
+                let status = hub.harness.info(id).map(|i| i.status);
+                assert_eq!(status, Some(crate::harness::model::Status::Disconnected), "{id}: an update taken after its runner's link closed");
+            }
             Ok(())
         })
     }
