@@ -1,0 +1,13 @@
+{
+  "name": "kiln-browser-lab",
+  "private": true,
+  "description": "kiln's browser lab: the Playwright driver, the probe page and the reference servers' origin (docs/browser-lab.md). A lab program, never a dependency of kiln's.",
+  "type": "module",
+  "scripts": {
+    "check": "node --check driver.mjs && node --check job.mjs && node --check origin.mjs && node --check check-origin.mjs && node --check control.mjs && node --check record.mjs && node --check catalogue.mjs && node --check probe/probe.js && python3 -I -m py_compile capture.py",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}
