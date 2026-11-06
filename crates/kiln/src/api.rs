@@ -189,10 +189,14 @@ impl srv::Handler for Api {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
-        // Boxed as the route is (goal 10, plan 01a1a87b2dae step 5): the layers a request is carried in
-        // hold a pointer to it, not its compressing. An answer it leaves as it is (a tiny answer to a POST, a
-        // type that doesn't compress, a stream) makes no future (goal 9, plan 01a1a87b2cec step 5).
-        let resp = if crate::http::compress::untouched(&asked, &resp) { resp } else { boxed(|| crate::http::compress::finish(asked, resp)).await };
+        // Finished here where its work fits the step's quantum (an answer left as it is, a small body validated),
+        // with no future made for it (goal 9, plan 01a1a87b2cec step 5); a body long to hash or compress goes to the
+        // compute pool in a future boxed as the route is (goal 10, plan 01a1a87b2dae step 5: the layers a request is
+        // carried in hold a pointer to it, not its compressing).
+        let resp = match crate::http::compress::finish_here(asked, resp) {
+            crate::http::compress::Finished::Now(resp) => resp,
+            crate::http::compress::Finished::Later(later) => boxed(|| crate::http::compress::finish_later(later)).await,
+        };
         // Its compressing counted in what it took, as W21-R15 observed it, for its class and its own timing alike.
         let took = began.elapsed();
         if let Some(class) = class {
@@ -8462,11 +8466,13 @@ mod tests {
             // body and its box, its header map and its timing. Two more allow for another test's request on the same
             // shard taking the map given back between two of these. And FINISH more since train 9 put main's compression
             // (W21-R15, `crate::http::compress::finish`) on this path: a GET answered 200 with a body it may validate,
-            // /healthz's "ok" too, gets its future boxed, the body gathered whole, a weak ETag (its digest as hex, then
-            // as `W/"…"`, then a header value), the ETag's and cache-control's room in the header map, and the body boxed
-            // again: 9 on both protocols, measured on main b6519ca5756 and on train 10 alike (25 and 22, 2026-11-06).
-            // Goal 9 step 5's cuts of finish's own allocations lower FINISH.
-            const FINISH: u64 = 9;
+            // /healthz's "ok" too, was 9 on both protocols, measured on main b6519ca5756 and on train 10 alike (25 and
+            // 22, 2026-11-06): its future boxed, its type lowered into a copy twice (to tell whether it compresses), a
+            // weak ETag (its digest as hex, then as `W/"…"`, then a header value's copy) and the body boxed again. Goal 9
+            // step 5 finishes it where it is (no future), tells its type in place and writes its ETag once into the
+            // buffer its header value takes: 2 left, the ETag's and the body's box
+            // (`crate::http::compress::tests::g9_s5_a_small_answer_is_finished_here_in_two_allocations`).
+            const FINISH: u64 = 2;
             let fixed = |costs: &Costs| costs.iter().find(|(p, _, _)| *p == "/healthz").map_or(u64::MAX, |(_, m, _)| m.blocks);
             anyhow::ensure!(fixed(&one) <= 16 + FINISH + 2 && fixed(&two) <= 13 + FINISH + 2, "the serve path's own: {} allocations over HTTP/1.1, {} over HTTP/2", fixed(&one), fixed(&two));
             Ok(())
