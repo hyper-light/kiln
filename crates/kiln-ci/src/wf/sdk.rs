@@ -152,6 +152,10 @@ impl Names<'_> {
         let required: Vec<&str> = s.get("required").and_then(Value::as_array).map(|r| r.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         let mut body = String::new();
         if let Some(props) = s.get("properties").and_then(Value::as_object) {
+            // By name, whatever order serde_json keeps them in (a workspace build, with
+            // `preserve_order`, keeps the schema's), so every build declares the same.
+            let mut props: Vec<(&String, &Value)> = props.iter().collect();
+            props.sort_by(|a, b| a.0.cmp(b.0));
             for (k, p) in props {
                 if let Some(d) = p.get("description").and_then(Value::as_str) {
                     body.push_str(&format!("{pad}/** {} */\n", doc(d)));
