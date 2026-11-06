@@ -3163,8 +3163,8 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
-/// encoded) and kept for the reads after it, unless a making begun after this one's was kept meanwhile (goal 10,
-/// plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
+/// encoded and named: `crate::reads::Made`) and kept for the reads after it, unless a making begun after this one's
+/// was kept meanwhile (goal 10, plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
 async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<crate::reads::Made> {
     let was = hub.harness.views.agents.now();
     let h = Arc::clone(hub);
