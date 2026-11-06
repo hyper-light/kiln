@@ -4129,6 +4129,7 @@ mod tests {
     /// gets the view from before at once; once the owner goes on, its readers take the new one.
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8 * MSG));
             let (bus, id) = (sim_bus(), "s1".to_owned());
@@ -4175,6 +4176,7 @@ mod tests {
     /// the order its sender sent them.
     #[test]
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count().max(1);
             let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2 * MSG));
@@ -4867,6 +4869,8 @@ mod tests {
     #[test]
     fn g9_s3_an_owner_takes_a_long_update_in_turns_that_give_its_shard_up() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
+        // It times its own tasks' turns: no test that keeps the shards busy beside it (goal 4, plan 01a1a59c2a9c step 5).
+        let _alone = crate::hub::tests::shards_timed();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
@@ -5054,6 +5058,7 @@ mod tests {
     /// once could each hold the other's.
     #[test]
     fn g4_s5_a_held_shard_holds_up_its_own_sessions_and_no_others() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count();
             anyhow::ensure!(shards >= 2, "{shards} shards: none to hold beside this test's");
@@ -5129,6 +5134,7 @@ mod tests {
     /// and no other's.
     #[test]
     fn g4_s5_many_sessions_on_few_shards_keep_their_order_and_none_is_lost() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let (count, senders, per) = (512usize, 8usize, 16u64);
             for owners in [1usize, 2] {

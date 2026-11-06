@@ -5182,6 +5182,7 @@ mod tests {
     fn updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
@@ -5276,6 +5277,7 @@ mod tests {
     fn g4_s5_runner_updates_keep_their_order_and_none_is_lost_on_busy_shards() -> anyhow::Result<()> {
         use crate::harness::model::{Body, Event, State};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
@@ -6019,6 +6021,7 @@ mod tests {
     #[test]
     fn g4_s5_events_that_come_out_of_order_end_in_their_numbers_order_once_each() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
@@ -6103,6 +6106,7 @@ mod tests {
     fn g4_s5_many_sessions_handed_over_by_one_loop_keep_their_order() -> anyhow::Result<()> {
         use crate::harness::model::State;
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let (count, per) = (256usize, 12u64);
@@ -6183,6 +6187,7 @@ mod tests {
     /// digests it made when it was taken; and once the last is let go of, the copy's spill file goes too.
     #[test]
     fn g4_s5_readers_holding_old_copies_keep_what_they_took() -> anyhow::Result<()> {
+        let _busy = crate::hub::tests::shards_kept_busy();
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = Location::Machine("box".into());
