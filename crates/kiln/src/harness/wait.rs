@@ -221,7 +221,15 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
     let started = Instant::now();
     let timeout = timeout.min(MAX);
     let first: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
+    // How it went, said to a test build's tests: its looks, and the events that woke it for one. On a loaded machine
+    // neither shows in its time (a wait that ended at its first look took 5.7 s under load).
+    #[cfg(test)]
+    let (mut looks, mut heard) = (0u32, 0u32);
     loop {
+        #[cfg(test)]
+        {
+            looks += 1;
+        }
         let now: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
         let done_each: Vec<bool> = now
             .iter()
@@ -237,13 +245,20 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
         let elapsed = started.elapsed();
         if done || mailed || elapsed >= timeout {
             let agents: Vec<Value> = ids.iter().zip(now.iter()).map(|(id, n)| n.as_ref().map_or_else(|| json!({"id": id, "stand": "ended", "closed": true}), brief)).collect();
-            return json!({
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut said = json!({
                 "done": done,
                 "timed_out": !done && elapsed >= timeout,
                 "waited_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 "until": if until == Until::Settled { "settled" } else { "change" },
                 "agents": agents,
             });
+            #[cfg(test)]
+            if let Some(o) = said.as_object_mut() {
+                o.insert("looks".into(), json!(looks));
+                o.insert("heard".into(), json!(heard));
+            }
+            return said;
         }
         // An event of theirs (or the waiter's: a message in its queue), or the next look anyway.
         let next = Instant::now() + RECHECK.min(timeout.saturating_sub(elapsed));
@@ -257,7 +272,13 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
                 break;
             };
             match crate::rt::timeout(rest, events.recv()).await {
-                Ok(Ok(ev)) if ids.iter().map(String::as_str).chain(waiter.map(|w| w.id.as_str())).any(|id| ev.contains(id)) => break,
+                Ok(Ok(ev)) if ids.iter().map(String::as_str).chain(waiter.map(|w| w.id.as_str())).any(|id| ev.contains(id)) => {
+                    #[cfg(test)]
+                    {
+                        heard += 1;
+                    }
+                    break;
+                }
                 Ok(Ok(_)) => {}
                 // Dropped some (a busy server): look again.
                 Ok(Err(async_broadcast::RecvError::Overflowed(_))) => break,
@@ -396,26 +417,29 @@ mod tests {
                 let peer = item(crate::harness::queued::from_agent("01a15c10306176b4a096f6c8d3100c54"), "Which commit has the fix?");
                 // In its queue when it starts waiting: it ends at once.
                 hub.harness.ingest(&there, "waiter", queue(vec![item("m1".into(), "From a person: later."), peer.clone()])).await;
-                let t = Instant::now();
+                // At once: on its first look, however long a loaded machine takes over it (5.7 s under load).
                 let early = wait(&hub, &ids, Until::Settled, false, Duration::from_secs(30), Some(&me)).await;
-                anyhow::ensure!(early.get("done") == Some(&json!(false)) && early.get("timed_out") == Some(&json!(false)) && t.elapsed() < Duration::from_secs(5), "{early}");
+                anyhow::ensure!(early.get("done") == Some(&json!(false)) && early.get("timed_out") == Some(&json!(false)) && early.get("looks") == Some(&json!(1)), "{early}");
                 anyhow::ensure!(early.pointer("/agents/0/stand") == Some(&json!("working")), "it still says where each stands: {early}");
                 // Not the waiter's own: it isn't woken by another's queue.
                 let other = wait(&hub, &ids, Until::Settled, false, Duration::from_millis(300), None).await;
                 anyhow::ensure!(other.get("timed_out") == Some(&json!(true)), "{other}");
-                // Coming during the wait: woken by it, well before the next look.
+                // Coming during the wait: woken by it (its queue's change, an event), not the next look ([`RECHECK`]): told
+                // by what woke it, not by its time, which a loaded machine stretches past the next look's.
                 hub.harness.ingest(&there, "waiter", queue(vec![])).await;
-                let t = Instant::now();
                 let (woken, ()) = futures::join!(wait(&hub, &ids, Until::Settled, false, Duration::from_secs(30), Some(&me)), async {
                     crate::rt::sleep(Duration::from_millis(200)).await;
                     hub.harness.ingest(&there, "waiter", queue(vec![peer.clone()])).await;
                 });
-                anyhow::ensure!(woken.get("timed_out") == Some(&json!(false)) && t.elapsed() < RECHECK, "{woken} after {:?}", t.elapsed());
+                // Every look after its first was an event's (none the next look's), and one was.
+                let (looks, heard) = (woken.get("looks").and_then(serde_json::Value::as_u64), woken.get("heard").and_then(serde_json::Value::as_u64));
+                anyhow::ensure!(woken.get("timed_out") == Some(&json!(false)) && heard.is_some_and(|h| h >= 1) && looks == heard.map(|h| h + 1), "{woken}");
                 Ok(())
             });
             let _ = tx.send(r);
         });
-        match rx.recv_timeout(Duration::from_secs(60)) {
+        // A hang's bound, never a pace.
+        match rx.recv_timeout(Duration::from_secs(300)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("the wait hung"),
         }
