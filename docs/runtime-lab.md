@@ -2882,7 +2882,7 @@ thread off a CPU. What holds it:
    likewise). A normal thread of the server's preempted mid-push on a shard's CPU then waits there, the shard
    spinning, until the load balancer moves it (it's cache-hot, so not at the first try) or the fair server's share
    comes round (its 50 ms of each second, deferred to the latest point that still serves it). Unpinned, as
-   production's run, the shards would meet it. **Missing until now (2026-11-06):** shards fixed to CPUs of their own
+   production's are, the shards would meet it. **Missing until now (2026-11-06):** shards fixed to CPUs of their own
    with the server's other threads kept off them, which kiln did only for declared `[server] cores`. Built:
    the class comes with that placement, derived from the machine's topology (docs/priority.md, "A real-time class for
    the shards"), or isn't asked for, said why.
