@@ -317,6 +317,9 @@ impl Names {
         let key = leg_label(leg);
         let mut labels = vec![(key.clone(), leg.to_owned())];
         labels.extend(owner.and_then(runner_label).map(|r| (r, "1".to_owned())));
+        // A test build's run, for the next run to sweep should this one be killed ([`super::docker::test_runs`]).
+        #[cfg(test)]
+        labels.extend(super::docker::test_runs::label().split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())));
         Names { key, suffix: format!("-{}", tag_of(leg)), labels, ..Names::default() }
     }
 
@@ -1843,7 +1846,11 @@ mod tests {
         use serde_json::json;
         let mut names = Names::for_leg("leg-a", Some("kiln.runner-work=abc"));
         let k = names.suffix.clone();
-        let ours = json!({ names.key.clone(): "leg-a", "kiln.socket.runner.abc": "1" });
+        let mut ours = json!({ names.key.clone(): "leg-a", "kiln.socket.runner.abc": "1" });
+        // And a test build's run (`super::super::docker::test_runs`).
+        if let (Some(o), Some((key, run))) = (ours.as_object_mut(), super::super::docker::test_runs::label().split_once('=')) {
+            o.insert(key.into(), json!(run));
+        }
         let net = rewritten(&Gather::NetworkCreate, &json!({"Name": "net", "Driver": "bridge"}), &mut names)?;
         assert_eq!(net, json!({"Name": format!("net{k}"), "Driver": "bridge", "Labels": ours}));
         let volume = rewritten(&Gather::VolumeCreate, &json!({"Name": "data", "Labels": {"x": "y"}}), &mut names)?;
