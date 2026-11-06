@@ -79,6 +79,7 @@ import { KindGlyph } from "./kind-glyph";
 import { parentWrote, type ThreadFrom } from "./subagent-tree";
 import { KeepButton } from "./subagent-branch";
 import { Highlighted } from "@/components/code/highlighted";
+import { BodiesContext, Whole } from "./whole";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -186,7 +187,10 @@ function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
           (c.diffs ?? []).map((d, i) => (
             <div key={`${c.id}-${i}`} className={cn(c.status === "denied" && "opacity-60")} data-ev={c.id}>
               {c.status === "denied" && <div className="hx-dim mb-1 text-[11px]">Refused — not applied</div>}
-              <FileDiffView diff={d} label={relPath(d.path, cwd)} defaultOpen={!many} reveal={now?.id === c.id ? now.n : 0} />
+              {/* Lean, its lines come once it shows (whole.tsx); its head says the file and the counts meanwhile. */}
+              <Whole e={c} fallback={<FileDiffView diff={d} label={relPath(d.path, cwd)} defaultOpen={false} />}>
+                {(w) => <FileDiffView diff={w.diffs?.[i] ?? d} label={relPath(d.path, cwd)} defaultOpen={!many} reveal={now?.id === c.id ? now.n : 0} />}
+              </Whole>
             </div>
           ))
         ) : (
@@ -233,7 +237,8 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   );
   const failed = c.status === "error" || (c.exit_code !== undefined && c.exit_code !== 0);
   // Nothing to show while it runs without output yet: the dot and the clock say it's running.
-  const out = c.output ? c.output : c.status === "running" ? null : "(no output)";
+  const outOf = (x: ToolEvent) => (x.output ? x.output : x.status === "running" ? null : "(no output)");
+  const out = outOf(c);
   return (
     <div className="hx-cmd" data-failed={failed || undefined} data-remote={elsewhere(c) || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -248,7 +253,12 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
         </span>
       </button>
       {c.detail && !(elsewhere(c) && c.detail === `on ${c.runner}`) && <div className="hx-cmd-why">{c.detail}</div>}
-      {open && out !== null && <Output text={out} truncated={c.truncated} error={failed} />}
+      {open && out !== null && (
+        // Lean, its output comes once it's opened (whole.tsx).
+        <Whole e={c} fallback={<Output text="" truncated={c.truncated} error={failed} />}>
+          {(w) => <Output text={outOf(w) ?? ""} truncated={w.truncated} error={failed} />}
+        </Whole>
+      )}
     </div>
   );
 }
@@ -1769,6 +1779,22 @@ export const Timeline = React.memo(function Timeline({
     io.observe(el);
     return () => io.disconnect();
   }, []);
+  // Near the top of what the session's store holds: the page before it comes (docs/wire.md, "Windows").
+  const more = useSession(store, (s) => s.more);
+  const older = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el) return;
+      const io = new IntersectionObserver(
+        ([e]) => {
+          if (e?.isIntersecting) void store.older();
+        },
+        { root: el.closest<HTMLElement>(".hx-timeline"), rootMargin: "1500px 0px 0px 0px" },
+      );
+      io.observe(el);
+      return () => io.disconnect();
+    },
+    [store],
+  );
   // Near the bottom of a window further back: what came after joins, and its near end lets go.
   const later = React.useCallback((el: HTMLDivElement | null) => {
     if (!el) return;
@@ -1882,114 +1908,118 @@ export const Timeline = React.memo(function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
-      {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
-      <div
-        ref={keeper.ref}
-        className="hx-timeline"
-        data-scroll-restoration-id={`timeline:${placeKey(agent, parent)}`}
-        onScroll={onScroll}
-        onPointerDownCapture={keeper.onTouch}
-        onKeyDownCapture={keeper.onTouch}
-      >
-        <div ref={marks} className="hx-flow">
-          {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
-          {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
-          {from === 0 && state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
-          {turns.length === 0 &&
-            (parent ? (
-              <div className="hx-sub-empty">
-                <p className="hx-sub-what">{task?.description || "Subagent"}</p>
-                {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
-                {task && (
-                  <div className="hx-sub-meta">
-                    <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
-                    <PrismLabel live={going}>{task.status}</PrismLabel>
-                    <TaskElapsed task={task} />
-                    {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
-                  </div>
-                )}
-                {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
-              </div>
-            ) : (
-              mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
-            ))}
-          {/* A turn that only passed a person's message on to a subagent (`Turn.relay`) is drawn as nothing: the message is in that subagent's thread. */}
-          {turns
-            .slice(from, to)
-            .map((t, j) =>
-              t.relay ? null : (
-                <TurnView
-                  key={t.key}
-                  turn={t}
-                  cwd={cwd}
-                  delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-                  live={running && from + j === turns.length - 1}
-                  doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
-                  compacting={from + j === turns.length - 1 ? compacting : undefined}
-                  turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
-                  onOpenTask={onOpenTask}
-                  meta={meta}
-                  onCommand={onCommand}
-                  agentLabel={agentLabel}
-                  reading={reading.current}
-                  queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
-                  onReply={onReply}
-                  lookup={lookup}
-                  spawn={spawn}
-                  kindName={agentLabel ?? kind}
-                  from={threadFrom}
-                  first={from + j === 0 && !state?.dropped}
-                />
-              ),
-            )}
-          {/* A finished subagent's thread ends with how and when, and the way back to its parent's. */}
-          {tail && threadFrom?.end && (
-            <div className="hx-thread-end" data-stand={threadFrom.end.stand}>
-              <span className="hx-thread-word">
-                <i aria-hidden="true" />
-                {threadFrom.end.word}
-              </span>
-              {threadFrom.end.at != null && <span className="hx-dim">{SAID_AT.format(threadFrom.end.at)}</span>}
-              <Link to={threadFrom.href} className="hx-thread-back">
-                <ArrowUpLeft size={13} />
-                {threadFrom.name}
-              </Link>
-              {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
-            </div>
-          )}
-          {/* A window further back: what came after joins as you scroll down to it. */}
-          {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
-          {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
-          {tail && hasAsks && onDecide && (
-            <div ref={asksRef} className="hx-asks">
-              {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
+    <BodiesContext.Provider value={store}>
+      <Contexts asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
+        {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
+        <div
+          ref={keeper.ref}
+          className="hx-timeline"
+          data-scroll-restoration-id={`timeline:${placeKey(agent, parent)}`}
+          onScroll={onScroll}
+          onPointerDownCapture={keeper.onTouch}
+          onKeyDownCapture={keeper.onTouch}
+        >
+          <div ref={marks} className="hx-flow">
+            {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
+            {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
+            {/* At the top of what's held, with more before it: the page before joins as you read up to it (keyed by where it begins, so each page watches anew). */}
+            {from === 0 && more && <div key={`older-${events[0]?.seq ?? 0}`} ref={older} className="hx-earlier" aria-hidden="true" />}
+            {from === 0 && !more && state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
+            {turns.length === 0 &&
+              (parent ? (
+                <div className="hx-sub-empty">
+                  <p className="hx-sub-what">{task?.description || "Subagent"}</p>
+                  {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
+                  {task && (
+                    <div className="hx-sub-meta">
+                      <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
+                      <PrismLabel live={going}>{task.status}</PrismLabel>
+                      <TaskElapsed task={task} />
+                      {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
+                    </div>
+                  )}
+                  {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
+                </div>
+              ) : (
+                mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
               ))}
-            </div>
-          )}
-          {tail && footer}
-          <div ref={endRef} aria-hidden="true" />
-          <div className="hx-waiting-anchor">
-            {!tail || (!hasAsks && !endSeen) ? (
-              <button type="button" className="hx-waiting" onClick={latest}>
-                {hasAsks && <i aria-hidden="true" />}
-                {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
-                <ArrowDown size={12} aria-hidden="true" />
-              </button>
-            ) : (
-              hasAsks &&
-              !asksSeen && (
-                <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+            {/* A turn that only passed a person's message on to a subagent (`Turn.relay`) is drawn as nothing: the message is in that subagent's thread. */}
+            {turns
+              .slice(from, to)
+              .map((t, j) =>
+                t.relay ? null : (
+                  <TurnView
+                    key={t.key}
+                    turn={t}
+                    cwd={cwd}
+                    delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+                    live={running && from + j === turns.length - 1}
+                    doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+                    compacting={from + j === turns.length - 1 ? compacting : undefined}
+                    turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
+                    onOpenTask={onOpenTask}
+                    meta={meta}
+                    onCommand={onCommand}
+                    agentLabel={agentLabel}
+                    reading={reading.current}
+                    queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
+                    onReply={onReply}
+                    lookup={lookup}
+                    spawn={spawn}
+                    kindName={agentLabel ?? kind}
+                    from={threadFrom}
+                    first={from + j === 0 && !state?.dropped && !more}
+                  />
+                ),
+              )}
+            {/* A finished subagent's thread ends with how and when, and the way back to its parent's. */}
+            {tail && threadFrom?.end && (
+              <div className="hx-thread-end" data-stand={threadFrom.end.stand}>
+                <span className="hx-thread-word">
                   <i aria-hidden="true" />
-                  {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+                  {threadFrom.end.word}
+                </span>
+                {threadFrom.end.at != null && <span className="hx-dim">{SAID_AT.format(threadFrom.end.at)}</span>}
+                <Link to={threadFrom.href} className="hx-thread-back">
+                  <ArrowUpLeft size={13} />
+                  {threadFrom.name}
+                </Link>
+                {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
+              </div>
+            )}
+            {/* A window further back: what came after joins as you scroll down to it. */}
+            {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+            {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
+            {tail && hasAsks && onDecide && (
+              <div ref={asksRef} className="hx-asks">
+                {pending.map((a) => (
+                  <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
+                ))}
+              </div>
+            )}
+            {tail && footer}
+            <div ref={endRef} aria-hidden="true" />
+            <div className="hx-waiting-anchor">
+              {!tail || (!hasAsks && !endSeen) ? (
+                <button type="button" className="hx-waiting" onClick={latest}>
+                  {hasAsks && <i aria-hidden="true" />}
+                  {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
                   <ArrowDown size={12} aria-hidden="true" />
                 </button>
-              )
-            )}
+              ) : (
+                hasAsks &&
+                !asksSeen && (
+                  <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                    <i aria-hidden="true" />
+                    {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+                    <ArrowDown size={12} aria-hidden="true" />
+                  </button>
+                )
+              )}
+            </div>
           </div>
         </div>
-      </div>
-    </Contexts>
+      </Contexts>
+    </BodiesContext.Provider>
   );
 });
