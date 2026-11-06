@@ -941,7 +941,7 @@ pub fn render(o: &mut String) {
             let _ = writeln!(o, "kiln_shard_last_stall_seconds{{shard=\"{index}\",task=\"{}\",spawned_at=\"{at}\",whose=\"{}\"}} {:.6}", r.task.0.slot(), r.whose.as_str(), r.held_ns as f64 / 1e9);
         }
     }
-    let _ = writeln!(o, "# HELP kiln_shard_queue_delay_seconds Each class's mean wait from ready to run on the shard, over the last 10 ms.\n# TYPE kiln_shard_queue_delay_seconds gauge");
+    let _ = writeln!(o, "# HELP kiln_shard_queue_delay_seconds Each class's mean wait from ready to run on the shard, over the probe's last period.\n# TYPE kiln_shard_queue_delay_seconds gauge");
     let _ = writeln!(
         o,
         "# HELP kiln_shard_queue_standing_seconds How long each class's queue on the shard has stood, most of the last tolerance (1 s) past its calm while the shard ran most of it, 0 once it no longer does: it sheds while it stands.\n# TYPE kiln_shard_queue_standing_seconds gauge"
