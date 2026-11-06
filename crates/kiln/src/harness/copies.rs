@@ -54,7 +54,7 @@ pub struct Ev {
 /// The events a chunk of [`Events`] holds: the square root of the most a copy keeps, so a change
 /// once a view shares them copies one chunk and the list of chunks (about two square roots of
 /// references), never every event.
-const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
+pub(crate) const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
 
 /// A session's newest events its copy keeps in memory, whatever else of it is spilled (`super::spill`; goal
 /// 11, plan 01a1a87b2e56 step 5): the events API's page as it's asked for without a `limit` (`GET
@@ -398,7 +398,7 @@ pub struct Chunk {
     /// memory, its segment read back where it's asked for (a snapshot, on the blocking pool).
     spilled: Option<super::spill::Spilled>,
     /// A compact one's texts, inflated by the first read of its copy's newest page that needed them and kept
-    /// for the reads after it while it's the newest compact chunk of its copy ([`Chunk::page_texts`]; goal 10,
+    /// for the reads after it while its copy's newest page reaches it ([`Chunk::page_texts`]; goal 10,
     /// plan 01a1a87b2dae step 5): the lab's events reads inflated a chunk's whole segment each time, on the
     /// request's shard (events at p99 1.1 to 2.0 ms, rt5 calm, the slowest read). Counted as text kept of a
     /// packed chunk (`crate::memory::SESSION_ENTRIES`). Only those its reads reached back to are kept
@@ -412,8 +412,8 @@ pub struct Chunk {
     /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
     /// process, 0.5% of the shards' time, beside the copy's view's own store.
     texts: OnceLock<ArcSwapOption<PageTexts>>,
-    /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
-    /// alone, as chunks are compacted ([`Events::compact`]).
+    /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
+    /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
     /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
@@ -760,8 +760,6 @@ impl Chunk {
         // step 5). A later page's read makes another.
         *self.sealing.get_mut() = false;
         *self.paged.get_mut() = false;
-        // What reads took of it is from before the change (goal 11, plan 01a1a87b2e56 step 5: `Shard::pack_idle`).
-        *self.page_read.get_mut() = false;
         if let Some(kept) = self.texts.take().and_then(ArcSwapOption::into_inner) {
             crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
         }
@@ -783,8 +781,7 @@ impl Chunk {
     }
 
     fn push(&mut self, ev: Ev) {
-        // The newest is compact only while its copy takes nothing in, and its next event has it read back off the
-        // shard first (`Mirror::thaw_for`; goal 11, plan 01a1a87b2e56 step 5); one read again here all the same.
+        // The newest is never compact (`Events::compact`); one read again first all the same.
         if !self.thaw() {
             return;
         }
@@ -1052,9 +1049,6 @@ impl Events {
                     }
                     joined.extend_from_slice(e.entry.text().as_bytes());
                 }
-                // A read took them: kept compact while its copy is idle, its texts are made as it is (goal 11, plan
-                // 01a1a87b2e56 step 5: `Events::compact`), so the reads after inflate nothing.
-                chunk.page_read.store(true, Ordering::Relaxed);
                 out.push(Bytes::from(joined));
             }
             i += n;
@@ -1240,8 +1234,6 @@ impl Events {
         if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq() == b.seq()) {
             return false;
         }
-        // Read since its copy last changed, as it was (an idle copy's newest read back so: goal 11, plan 01a1a87b2e56 step 5).
-        made.page_read.store(was.page_read.load(Ordering::Relaxed), Ordering::Relaxed);
         let Some(at) = self.chunks().iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
         let swapped = self.with_list(|chunks| match chunks.get_mut(at) {
             Some(slot) => {
@@ -1331,40 +1323,21 @@ impl Events {
             seal(c, home.cloned());
         }
         let ready: Vec<usize> = (0..self.older.len()).filter(|i| self.older.get(*i).is_some_and(|c| !c.is_compact() && c.packed().is_some())).collect();
-        // The newest, sealed while its copy took nothing in (`Shard::pack_idle`) and packed since, not changed (a change
-        // unpacks it): kept compact too (goal 11, plan 01a1a87b2e56 step 5), unless a read took its texts meanwhile.
-        let idle = self.newest.as_ref().filter(|c| !c.is_compact() && c.sealing.load(Ordering::Relaxed) && c.packed().is_some()).map(|c| c.page_read.load(Ordering::Relaxed));
-        if ready.is_empty() && idle.is_none() {
+        if ready.is_empty() {
             return;
         }
         // Whether a read of its newest page took the texts of its newest compact chunk until now, and from which of its
         // events: then the one this makes its newest compact chunk has its texts made now, of its events as they were,
         // from the same place on (`Chunk::warm`; goal 11, plan 01a1a87b2e56 step 5: what the reads reach, no more).
         let reach = self.chunks().iter().rev().find(|c| c.is_compact() && !c.is_spilled()).and_then(|c| c.page_reach());
+        let chunks = Arc::make_mut(&mut self.older);
         // The newest of those compacted here (they're in order), as it was.
         let mut newest: Option<(usize, Arc<Chunk>)> = None;
-        if !ready.is_empty() {
-            let chunks = Arc::make_mut(&mut self.older);
-            for i in ready {
-                if let Some(slot) = chunks.get_mut(i)
-                    && let Some(c) = slot.compacted()
-                {
-                    newest = Some((i, std::mem::replace(slot, Arc::new(c))));
-                }
-            }
-        }
-        // The idle newest: kept compact; or, a read having taken its texts since it was sealed (they're read as they are),
-        // as it is, its segment let go of (a copy of it a view shares is made without it).
-        if let Some(read) = idle
-            && let Some(slot) = self.newest.as_mut()
-        {
-            if read {
-                let kept = Arc::make_mut(slot);
-                kept.unpack();
-                // Still read since it last changed: not packed again until it changes.
-                *kept.page_read.get_mut() = true;
-            } else if let Some(made) = slot.compacted() {
-                *slot = Arc::new(made);
+        for i in ready {
+            if let Some(slot) = chunks.get_mut(i)
+                && let Some(c) = slot.compacted()
+            {
+                newest = Some((i, std::mem::replace(slot, Arc::new(c))));
             }
         }
         self.page_newest();
@@ -1377,15 +1350,24 @@ impl Events {
         self.took_out = true;
     }
 
-    /// Its newest compact chunk in memory is the one whose texts a read of its newest page keeps
-    /// ([`Chunk::page_texts`]; goal 10, plan 01a1a87b2dae step 5): set so, and the one before it (the newest
-    /// until now, the only other one set) let go of, so a copy keeps one chunk's texts at the most.
+    /// Its compact chunks in memory that hold any of its newest [`EVENTS_PAGE`] events (the page the events API gives
+    /// unasked for a limit) are those whose texts a read of its newest page keeps ([`Chunk::page_texts`]; goal 10, plan
+    /// 01a1a87b2dae step 5): set so as chunks are compacted and cut, and those it no longer reaches let go of then. The
+    /// page holds more events than a chunk ([`CHUNK`]), so wherever the open chunk holds fewer than the rest of it, it
+    /// reaches into two compact chunks. Its newest compact chunk's texts alone were kept: every read of the page inflated
+    /// the other off its shard (`Unread::Unkept`, a blocking job a read), where a copy whose open chunk held more read it
+    /// on its shard (`kiln-lab rate`'s `newest`, 2026-11-06). Each keeps what the reads reach back to in it, no more.
     fn page_newest(&self) {
-        let mut newest = true;
-        for c in self.chunks().iter().rev().filter(|c| c.is_compact() && !c.is_spilled()) {
-            if newest {
+        // The events in the chunks newer than the one looked at: the page reaches it while they're fewer than it holds.
+        let mut after = 0usize;
+        for c in self.chunks().iter().rev() {
+            let reached = after < EVENTS_PAGE;
+            after = after.saturating_add(c.len());
+            if !c.is_compact() || c.is_spilled() {
+                continue;
+            }
+            if reached {
                 c.paged.store(true, Ordering::SeqCst);
-                newest = false;
             } else if c.paged.swap(false, Ordering::SeqCst) {
                 c.unpage();
             } else {
@@ -1427,7 +1409,7 @@ impl Events {
     /// and its metas copied, on its owner's shard).
     pub(super) fn spilled(&mut self, chunks: &[Arc<Chunk>], made: Vec<Option<Chunk>>) -> usize {
         let mut n = 0;
-        // Spilled chunks are older ones: the newest is never spilled (`Events::spillable`), compact or not.
+        // Spilled chunks are compact, so older ones: the newest never is.
         let list = Arc::make_mut(&mut self.older);
         let mut from = 0;
         for (c, made) in chunks.iter().zip(made) {
@@ -1602,179 +1584,6 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
                 .await;
         }
     }));
-}
-
-/// A copy's gaps between the changes it takes, and when it last took one (consts-audit R1; goal 11, plan 01a1a87b2e56
-/// step 5): its busy gaps (a turn's events, its stream) and its quiet gaps (those past its busy gaps' bound: between its
-/// turns), each smoothed as RFC 6298 smooths a round trip ([`Smooth`]). It's idle once it has taken nothing in for longer
-/// than its quiet gaps' bound ([`Idle::after`]): longer than it's ever quiet between turns, give or take four of its
-/// variations. Its owner's alone.
-#[derive(Default)]
-pub(super) struct Gaps {
-    last: Option<Instant>,
-    busy: Smooth,
-    quiet: Smooth,
-}
-
-impl Gaps {
-    /// A change taken at `now`: its gap since the last learned, as a busy one or, past the busy ones' bound, a quiet one,
-    /// which it returns (every copy's are learned together too: [`Idle::quiet`]). The first gap is a busy one.
-    fn changed(&mut self, now: Instant) -> Option<u64> {
-        let last = self.last.replace(now)?;
-        let gap = u64::try_from(now.saturating_duration_since(last).as_nanos()).unwrap_or(u64::MAX);
-        match self.busy.bound() {
-            Some(bound) if gap > bound => {
-                self.quiet.learn(gap);
-                Some(gap)
-            }
-            _ => {
-                self.busy.learn(gap);
-                None
-            }
-        }
-    }
-
-    /// When it falls idle, having taken nothing in for `after` nanoseconds since its last change ([`Idle::after`]): none
-    /// before a change, or with nothing to judge by.
-    fn idle_at(&self, after: Option<u64>) -> Option<Instant> {
-        self.last?.checked_add(Duration::from_nanos(after?))
-    }
-}
-
-/// A sample smoothed as RFC 6298 (§2.2–2.3) smooths a round trip, nanoseconds, one owner's (`crate::rt::Smoothed` is the
-/// shared one's): the first sets the mean to it and the variation to half of it; after it the variation goes a quarter of
-/// the way to how far a sample falls from the mean, then the mean an eighth of the way to the sample.
-#[derive(Default, Clone, Copy, Debug)]
-struct Smooth {
-    mean: u64,
-    dev: u64,
-    learned: bool,
-}
-
-impl Smooth {
-    fn learn(&mut self, x: u64) {
-        (self.mean, self.dev) = if self.learned {
-            ((self.mean - self.mean / 8).saturating_add(x / 8), (self.dev - self.dev / 4).saturating_add(x.abs_diff(self.mean) / 4))
-        } else {
-            (x, x / 2)
-        };
-        self.learned = true;
-    }
-
-    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none before a sample.
-    fn bound(&self) -> Option<u64> {
-        self.learned.then(|| self.mean.saturating_add(self.dev.saturating_mul(4)))
-    }
-}
-
-/// What the owners of one [`Copies`] know of their copies falling idle (consts-audit R1; goal 11, plan 01a1a87b2e56 step 5):
-/// every copy's quiet gaps smoothed together, what a copy with none of its own yet is judged by; and the earliest a copy of
-/// theirs falls idle, scheduled by its changes and by their sweeps, for the task that has them swept then
-/// ([`sweep_when_idle`]). It was `IDLE_AFTER`, 5 s (`crate::os::alloc::COLD_AFTER`, jemalloc's dirty decay, chosen from the
-/// lab's profile), for every copy, swept every 5 s. No lock: atomics, and a [`crate::rt::Notify`].
-pub(super) struct Idle {
-    /// What [`Idle::due`] counts from.
-    base: Instant,
-    /// Every copy's quiet gaps.
-    quiet: crate::rt::Smoothed,
-    /// Nanoseconds past `base` the earliest scheduled copy falls idle; `u64::MAX`: none scheduled.
-    due: AtomicU64,
-    /// Told when a copy is scheduled earlier than any was, or its owners are gone.
-    wake: crate::rt::Notify,
-    /// Its owners are gone ([`Said`]'s drop): the sweeping task ends.
-    gone: AtomicBool,
-    /// A test's idle wait for every copy, nanoseconds ([`Idle::pin_after`]); 0: each its own, learned.
-    #[cfg(test)]
-    pinned_after: AtomicU64,
-}
-
-impl Default for Idle {
-    fn default() -> Self {
-        Self {
-            base: Instant::now(),
-            quiet: crate::rt::Smoothed::nothing_yet(),
-            due: AtomicU64::new(u64::MAX),
-            wake: crate::rt::Notify::new(),
-            gone: AtomicBool::new(false),
-            #[cfg(test)]
-            pinned_after: AtomicU64::new(0),
-        }
-    }
-}
-
-impl Idle {
-    /// How long a copy whose own quiet gaps' bound is `own` may take nothing in before it's idle: that, else every copy's
-    /// quiet gaps' bound; none before any copy was quiet between two changes. A test's where it pinned one.
-    fn after(&self, own: Option<u64>) -> Option<u64> {
-        #[cfg(test)]
-        {
-            let pinned = self.pinned_after.load(Ordering::Relaxed);
-            if pinned > 0 {
-                return Some(pinned);
-            }
-        }
-        own.or_else(|| self.quiet.bound())
-    }
-
-    /// A copy falls idle at `at`: its owners' sweep scheduled for then where that's sooner than the soonest scheduled, and
-    /// the sweeping task told. A change mostly finds one sooner already (one load, nothing written).
-    fn schedule(&self, at: Instant) {
-        let ns = u64::try_from(at.saturating_duration_since(self.base).as_nanos()).unwrap_or(u64::MAX).min(u64::MAX - 1);
-        if ns < self.due.load(Ordering::Relaxed) && ns < self.due.fetch_min(ns, Ordering::Relaxed) {
-            self.wake.notify();
-        }
-    }
-
-    /// When the soonest scheduled copy falls idle: none scheduled.
-    fn due(&self) -> Option<Instant> {
-        let ns = self.due.load(Ordering::Relaxed);
-        (ns != u64::MAX).then(|| self.base.checked_add(Duration::from_nanos(ns))).flatten()
-    }
-
-    /// The sweeps scheduled are under way: none scheduled until they, or changes, schedule the next.
-    fn clear(&self) {
-        self.due.store(u64::MAX, Ordering::Relaxed);
-    }
-
-    /// A test's: every copy idle once it has taken nothing in for `ns` (0: each as its own gaps say).
-    #[cfg(test)]
-    pub(super) fn pin_after(&self, ns: u64) {
-        self.pinned_after.store(ns, Ordering::Relaxed);
-    }
-}
-
-/// The owners of one [`Copies`] told to sweep their copies for idle ones ([`Shard::pack_idle`]) once the soonest of them
-/// falls idle, as their changes and their last sweeps scheduled ([`Idle`]; consts-audit R1): nothing is swept before a copy
-/// is due, and a copy is swept as it falls due. From wherever the runtime runs this; it ends once its owners are gone. Each
-/// sweep is one the owner takes a copy at a time across its turns (goal 9, plan 01a1a87b2cec step 3: one job over all of them
-/// held its shard for all of them, a chunk sealed, or kept compact and its copy published, for each: production's 134
-/// copies, about 34 a shard). It waits for room in a busy owner's inbox, so no owner's sweep is lost.
-async fn sweep_when_idle(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>, idle: Arc<Idle>) {
-    loop {
-        if idle.gone.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(at) = idle.due() else {
-            idle.wake.notified().await;
-            continue;
-        };
-        let now = Instant::now();
-        if at > now {
-            // Until then, or until a copy falls due sooner (or the owners go).
-            let _ = crate::rt::timeout(at.saturating_duration_since(now), idle.wake.notified()).await;
-            continue;
-        }
-        idle.clear();
-        let mut any = false;
-        for inbox in &inboxes {
-            if let Some(tx) = inbox.upgrade() {
-                any |= tx.send(Msg::Each(Box::new(Shard::pack_idle()))).await.is_ok();
-            }
-        }
-        if !any {
-            return;
-        }
-    }
 }
 
 /// What tells a copy's owner to keep its chunks compact (goal 11): at once once one is packed, not at
@@ -2211,9 +2020,6 @@ pub struct Mirror {
     /// Its view holds what's long to free, replaced since it went out (a long state's, meta's or changeset's last): the next
     /// publish lets go of it off the shard, as one holding chunks taken out ([`Mirror::publish`]; step 3).
     pub(super) long_to_free: bool,
-    /// Its gaps between the changes it takes, and when it last took one: when it falls idle ([`Shard::pack_idle`]; goal 11,
-    /// plan 01a1a87b2e56 step 5; consts-audit R1).
-    gaps: Gaps,
 }
 
 impl Drop for Mirror {
@@ -2381,7 +2187,6 @@ impl Mirror {
             state_ns: 0,
             meta_ns: 0,
             long_to_free: false,
-            gaps: Gaps::default(),
         }
     }
 
@@ -2423,36 +2228,6 @@ impl Mirror {
             Update::State { state } => self.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &self.state)),
             Update::Meta { meta } => self.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &self.meta)),
             _ => false,
-        }
-    }
-
-    /// A change it took at `now` (`Registry::apply`): its gap since its last learned, a quiet one taught to every copy's too
-    /// (`idle`), and when it falls idle scheduled with its owners' sweeps ([`Idle::schedule`]; consts-audit R1, goal 11, plan
-    /// 01a1a87b2e56 step 5).
-    pub(super) fn changed(&mut self, now: Instant, idle: &Idle) {
-        if let Some(quiet) = self.gaps.changed(now) {
-            idle.quiet.learn(quiet);
-        }
-        if let Some(at) = self.gaps.idle_at(idle.after(self.gaps.quiet.bound())) {
-            idle.schedule(at);
-        }
-    }
-
-    /// Its newest chunk packed off the shard and kept compact once it is, as a sealed chunk is ([`Events::compact`]):
-    /// its copy took nothing in for longer than it's quiet between its turns ([`Shard::pack_idle`]; goal 11, plan
-    /// 01a1a87b2e56 step 5). One packed already (a snapshot packs a full newest chunk) is kept compact now.
-    fn pack_newest(&mut self) {
-        let Some(newest) = self.events.chunks().last().cloned() else { return };
-        if newest.is_empty() || newest.is_compact() {
-            return;
-        }
-        if newest.packed().is_some() {
-            newest.sealing.store(true, Ordering::Relaxed);
-            let home = self.home();
-            self.events.compact(home.as_ref());
-            self.publish();
-        } else {
-            seal(&newest, self.home());
         }
     }
 
@@ -2808,17 +2583,14 @@ impl Mirror {
     }
 
     /// The compact chunk that taking event `id` numbered `seq` would read back to change (`upsert`: an event it has under
-    /// that id, or under that number with another id; or a new one, at its newest chunk kept compact), if one would be.
+    /// that id, or under that number with another id), if one would be.
     pub(super) fn thaw_for(&self, id: &str, seq: u64) -> Option<Arc<Chunk>> {
         let at = match self.index.get(&self.events, id) {
             Some(at) => at,
             None => {
-                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq());
-                if top.is_none_or(|top| seq > top) {
-                    // A new one, taken in at the newest chunk: one kept compact while its copy took nothing in
-                    // (`Shard::pack_idle`; goal 11, plan 01a1a87b2e56 step 5) is read back first, unless it's full (the
-                    // event begins a chunk of its own).
-                    return self.events.chunks().last().filter(|c| c.is_compact() && !c.is_full()).cloned();
+                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq())?;
+                if seq > top {
+                    return None;
                 }
                 let at = self.events.partition_point(|m| m.seq().is_some_and(|s| s < seq));
                 self.events.meta(at).filter(|m| m.seq() == Some(seq))?;
@@ -2829,9 +2601,10 @@ impl Mirror {
         self.events.chunks().get(c).filter(|c| c.is_compact()).cloned()
     }
 
-    /// The compact chunk that a stream into event `id` would read back to change ([`Mirror::append`]), if it would: its
-    /// newest, kept compact while its copy took nothing in (`Shard::pack_idle`; goal 11, plan 01a1a87b2e56 step 5), or
-    /// an older one the event is in.
+    /// The compact chunk that a stream into event `id` would read back to change ([`Mirror::append`]), if it would: an older
+    /// chunk the event is in (a long tool's output or a subagent's text, streaming on while newer events came), which its
+    /// owner reads back off its shard first (`Shard::want_thaw`; goal 9, plan 01a1a87b2cec step 3): taken on the shard,
+    /// each delta into it inflated the chunk there, or read a spilled one's file. The newest chunk is never compact.
     pub(super) fn thaw_for_stream(&self, id: &str) -> Option<Arc<Chunk>> {
         let at = self.index.get(&self.events, id)?;
         let (c, _) = self.events.place(at)?;
@@ -3119,19 +2892,9 @@ impl Rate {
 pub(super) struct Said {
     states: Took,
     metas: Took,
-    /// What they know of their copies falling idle, shared with the task that has them swept then ([`sweep_when_idle`]).
-    pub(super) idle: Arc<Idle>,
     /// A test's round trip to the compute pool for these owners alone ([`Said::pin_trip`]), nanoseconds; 0: the process's.
     #[cfg(test)]
     pinned_trip: AtomicU64,
-}
-
-impl Drop for Said {
-    /// Its owners are gone: the task that has them swept for idle copies ends.
-    fn drop(&mut self) {
-        self.idle.gone.store(true, Ordering::Relaxed);
-        self.idle.wake.notify();
-    }
 }
 
 impl Said {
@@ -3409,81 +3172,6 @@ impl Shard {
         Arc::clone(&self.said)
     }
 
-    /// Its copies that took nothing in for longer than they're quiet between their turns ([`Idle::after`], learned of each
-    /// copy's own gaps: consts-audit R1) have their newest chunk packed off the shard and kept compact once it is, as a
-    /// sealed chunk is ([`Mirror::pack_newest`]; goal 11, plan 01a1a87b2e56 step 5). An idle session's newest chunk kept its
-    /// events as they are, their texts whole, for as long as it was idle: up to 70 events, most of a session's whole texts in
-    /// memory (production's 126 idle copies of its 134, est. 17 MB). Its next event, or a stream into one of its events, has
-    /// it read back off the shard before it's taken (`Mirror::thaw_for`, `Mirror::thaw_for_stream`, [`Shard::want_thaw`]).
-    /// A copy as busy as its turns keep it is never packed between them, as with the 5 s every copy waited before
-    /// (`IDLE_AFTER`, jemalloc's dirty decay): its quiet gaps' bound is past them.
-    ///
-    /// Only one no read took since its last change: a copy whose page is read keeps its texts as they are (a read takes them
-    /// so), and kept compact it would hold its segment beside them. One kept compact that a read took since (its texts made
-    /// off the shard for it, then kept: `View::events_page`) is read back as its events, off the shard (one a sweep, as the
-    /// owner reads one back at a time), and isn't packed again until it changes.
-    ///
-    /// A sweep of its copies ([`Each`]), a copy at a time across its owner's turns, the first compact newest chunk a read took
-    /// read back as it ends (goal 9, plan 01a1a87b2cec step 3): one job over every copy of the shard held it for all of them.
-    /// As it ends, the soonest of its copies still to fall idle is scheduled with its owners' next sweep ([`Idle::schedule`]).
-    pub(super) fn pack_idle() -> Each {
-        Self::pack_idle_as_of(None)
-    }
-
-    /// [`Shard::pack_idle`], each copy judged idle or not as of `now` (none: as each is looked at): a test's later time.
-    fn pack_idle_as_of(now: Option<Instant>) -> Each {
-        let mut thaw: Option<(String, Arc<Chunk>)> = None;
-        let mut next: Option<Instant> = None;
-        let step = move |s: &mut Shard, id: Option<&str>| match id {
-            Some(id) => {
-                let (read_back, due) = s.pack_idle_one(id, now.unwrap_or_else(Instant::now));
-                if let Some(c) = read_back
-                    && thaw.is_none()
-                {
-                    thaw = Some((id.to_owned(), c));
-                }
-                if let Some(due) = due {
-                    next = Some(next.map_or(due, |n| n.min(due)));
-                }
-            }
-            None => {
-                if s.thaw.is_none()
-                    && let Some((id, c)) = thaw.take()
-                {
-                    s.want_thaw(&id, c);
-                }
-                if let Some(due) = next.take() {
-                    s.said.idle.schedule(due);
-                }
-            }
-        };
-        Each { left: None, label: &kinds::IDLE, pick: Box::new(|_: &str, _: &Mirror| true), step: Box::new(step) }
-    }
-
-    /// Session `id`'s copy in its owner's sweep for idle copies ([`Shard::pack_idle`]), at `now`: its newest chunk packed
-    /// where it fell idle by now ([`Idle::after`]) and no read took it since it changed; that chunk, where it's kept compact
-    /// and a read took it since, to be read back; and, where its newest is still to be packed, when it falls idle. None for
-    /// one packed now, or one a read took (its next change schedules it), or one nothing has taught when it falls idle.
-    fn pack_idle_one(&mut self, id: &str, now: Instant) -> (Option<Arc<Chunk>>, Option<Instant>) {
-        let idle = Arc::clone(&self.said.idle);
-        let Some(m) = self.mirrors.get_mut(id) else { return (None, None) };
-        let at = m.gaps.idle_at(idle.after(m.gaps.quiet.bound()));
-        let fell = at.is_some_and(|at| at <= now);
-        let (read_back, pack) = match m.events.chunks().last() {
-            Some(c) if c.is_compact() => (c.page_read.load(Ordering::Relaxed).then(|| Arc::clone(c)), false),
-            Some(c) => (None, fell && !c.page_read.load(Ordering::Relaxed)),
-            None => (None, false),
-        };
-        if pack {
-            m.pack_newest();
-        }
-        let due = match m.events.chunks().last() {
-            Some(c) if !pack && !c.is_compact() && !c.is_empty() && !c.page_read.load(Ordering::Relaxed) => at.filter(|at| *at > now),
-            _ => None,
-        };
-        (read_back, due)
-    }
-
     /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
     /// owner reads that chunk back on the blocking pool before it takes the rest ([`own`]), where it was read back on
     /// this shard, its every event inflated and parsed, for each such change (goal 9, plan 01a1a87b2cec step 3).
@@ -3501,15 +3189,7 @@ impl Shard {
     /// it's still the copy's, as it was. Whether it did.
     fn take_thawed(&mut self, id: &str, was: &Arc<Chunk>, made: Chunk) -> bool {
         self.thawed = Arc::downgrade(was);
-        self.mirrors.get_mut(id).is_some_and(|m| {
-            let swapped = m.events.swap_chunk(was, made);
-            // Out to its readers: a sweep read it back with no update after it to publish it (`Shard::pack_idle`; goal 11,
-            // plan 01a1a87b2e56 step 5), and its compact chunk goes with the view that held it, off the shard.
-            if swapped {
-                m.publish();
-            }
-            swapped
-        })
+        self.mirrors.get_mut(id).is_some_and(|m| m.events.swap_chunk(was, made))
     }
 
     /// Session `id`'s update stopped before event `e`, which goes in at `at` among its copy's events, numbered before its
@@ -3936,8 +3616,6 @@ mod kinds {
     pub static SPILLED: Label = Label { name: "owner work: a copy's spill taken in" };
     /// The chunk a copy's cut fell in, made again, taken in ([`super::Shard::trimmed`]).
     pub static TRIMMED: Label = Label { name: "owner work: a copy's cut taken in" };
-    /// The sweep for idle copies ([`super::Shard::pack_idle`]).
-    pub static IDLE: Label = Label { name: "owner sweep: idle copies packed" };
     /// Every other sweep of an owner's copies ([`super::Copies::on_each_session`]).
     pub static SWEEP: Label = Label { name: "owner sweep of its copies" };
 }
@@ -4065,7 +3743,6 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        drop(crate::rt::spawn(sweep_when_idle(inboxes.iter().map(crate::memory::queue::Sender::downgrade).collect(), Arc::clone(&said.idle))));
         Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
     }
 
@@ -5182,7 +4859,8 @@ mod tests {
     /// Goal 10, plan 01a1a87b2dae step 5: a copy's newest page read twice inflates its compact chunk once. The
     /// first read keeps the texts of the newest compact chunk (its alone), the second takes a slice of them,
     /// nothing inflated, and both say what the events' texts joined say. A newer chunk compacted, the older's
-    /// texts go; a read of a view from before then inflates and keeps nothing, and one of the new view keeps
+    /// texts stay while the page the API gives unasked for a limit (`EVENTS_PAGE`) reaches it, and go once it
+    /// doesn't; a read of a view from before then inflates and keeps nothing, and one of the new view keeps
     /// the newest's.
     #[test]
     fn g10_s5_a_page_read_twice_inflates_its_chunk_once() -> anyhow::Result<()> {
@@ -5217,29 +4895,37 @@ mod tests {
         let parts = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page again"))?;
         anyhow::ensure!(inflated() == was + 1, "the second read inflates nothing");
         anyhow::ensure!(parts.concat() == first.as_ref(), "the same page");
-        // A newer chunk sealed and compacted: the older's texts go.
-        push(&mut m, n + 1..=n + u64::try_from(CHUNK)?)?;
+        // A newer chunk sealed and compacted: the newest page still reaches the older, whose texts stay.
+        let chunk = u64::try_from(CHUNK)?;
+        push(&mut m, n + 1..=n + chunk)?;
+        anyhow::ensure!(kept(&m.view(), 1).is_some(), "the texts of a chunk the newest page reaches kept");
+        // Another: the page reaches the older no more, and its texts go.
+        push(&mut m, n + chunk + 1..=n + 2 * chunk)?;
         anyhow::ensure!(kept(&m.view(), 1).is_none(), "the older's texts let go of");
         let was = inflated();
         let _ = view.events_page(None, 50).ok_or_else(|| anyhow::anyhow!("the view from before"))?;
         anyhow::ensure!(inflated() == was + 1 && kept(&view, 1).is_none(), "a view from before inflates its own and keeps nothing");
         let now = m.view();
         let newest = now.events_json(None, 50).ok_or_else(|| anyhow::anyhow!("the newest page now"))?;
-        anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 2).is_some(), "the newest compact chunk's kept now");
+        anyhow::ensure!(String::from_utf8_lossy(&newest) == page(&m) && kept(&now, 3).is_some(), "the newest compact chunk's kept now");
         Ok(())
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a page read on a shard (`View::events_page_kept`) inflates nothing. One
     /// that needs a compact chunk's texts not kept yet says so (`Unread::Unkept`), and the read that makes them (off
     /// the shard: `View::events_page`) keeps the newest compact chunk's, so the shard's read after it answers the same
-    /// bytes from them; a page of the open chunk alone needs none; one that reaches an older compact chunk, whose
-    /// texts no read keeps, says so each time; and one the copy can't say is `Unread::Cannot`, as before.
+    /// bytes from them; a page of the open chunk alone needs none; one that reaches the compact chunk before it, which
+    /// the page the API gives unasked for a limit (`EVENTS_PAGE`) reaches too, has its texts kept by the read that made
+    /// them; one that reaches past that page, into a compact chunk whose texts no read keeps, says so each time; and one
+    /// the copy can't say is `Unread::Cannot`, as before.
     #[test]
     fn g10_s5_a_page_read_on_a_shard_inflates_nothing() -> anyhow::Result<()> {
         let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
         let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
-        // Two sealed chunks, compact, and the newest open with nine: the newest fifty reach into the second.
-        let n = u64::try_from(CHUNK * 2 + 9)?;
+        // Three sealed chunks, compact, and the newest open with nine: the newest fifty reach into the third, the page the
+        // API gives unasked for a limit into the second, and no further.
+        let n = u64::try_from(CHUNK * 3 + 9)?;
+        anyhow::ensure!(EVENTS_PAGE > CHUNK + 9 && EVENTS_PAGE < 2 * CHUNK + 9, "the page reaches the second and no further");
         for q in 1..=n {
             m.rev = q;
             m.upsert(entry(&format!("e{q}"), q));
@@ -5262,13 +4948,19 @@ mod tests {
         let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the kept page: {u:?}"))?;
         anyhow::ensure!(inflated() == was + 1, "the shard's read after it inflates nothing");
         anyhow::ensure!(kept.concat() == made.concat() && made.concat() == page(50).into_bytes(), "the same bytes, the events' texts joined");
-        // Past the open chunk and the newest compact one, into the older: kept by no read, so made off the shard each time.
+        // Past the open chunk and the newest compact one, into the one before, which the API's page reaches too: made off the
+        // shard once, with the newest compact chunk read again (the page reaches back past what its reads kept, and only
+        // what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and both kept from there.
         let long = CHUNK + 9 + 5;
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the older compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept), "the compact chunk before's texts aren't kept yet");
         anyhow::ensure!(view.events_page(None, long).map(|p| p.concat()) == Some(page(long).into_bytes()), "made off the shard");
-        // Made with the older one: the newest compact chunk read again too, as the page reaches back past what its reads kept
-        // (only what they reach is kept: goal 11, plan 01a1a87b2e56 step 5), and kept from there.
-        anyhow::ensure!(view.events_page_kept(None, long) == Err(Unread::Unkept) && inflated() == was + 3, "still not kept: an older chunk's never are");
+        let kept_long = view.events_page_kept(None, long).map_err(|u| anyhow::anyhow!("the longer kept page: {u:?}"))?;
+        anyhow::ensure!(inflated() == was + 3 && kept_long.concat() == page(long).into_bytes(), "kept: the shard's read after it inflates nothing");
+        // Past the API's page, into the oldest: kept by no read, so made off the shard each time.
+        let far = 2 * CHUNK + 9 + 5;
+        anyhow::ensure!(view.events_page_kept(None, far) == Err(Unread::Unkept), "the oldest compact chunk's texts aren't kept");
+        anyhow::ensure!(view.events_page(None, far).map(|p| p.concat()) == Some(page(far).into_bytes()), "made off the shard");
+        anyhow::ensure!(view.events_page_kept(None, far) == Err(Unread::Unkept) && inflated() == was + 5, "still not kept: a chunk past the page's never are");
         // An event with no number: the copy can't say the page (the store answers it), kept or not.
         m.rev = n + 1;
         m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
@@ -5310,11 +5002,11 @@ mod tests {
         // A chunk more compacted: the copy's page was read, so the new newest compact chunk's texts are made now.
         push(&mut m, n + 1..=n + chunk)?;
         n += chunk;
-        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_none(), "the newest compact chunk's texts made, the older's let go of");
-        // Another, with no read since: nothing made.
+        anyhow::ensure!(kept(&m, 2).is_some() && kept(&m, 1).is_some(), "the newest compact chunk's texts made, the one before's kept while the page reaches it");
+        // Another, with no read since: nothing made for it, and the one the page no longer reaches let go of.
         push(&mut m, n + 1..=n + chunk)?;
         n += chunk;
-        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 2).is_none(), "no read since: nothing kept");
+        anyhow::ensure!(kept(&m, 3).is_none() && kept(&m, 1).is_none(), "no read since: nothing made, nothing kept past the page");
         anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Unkept), "a read on a shard has them made off it");
         anyhow::ensure!(m.view().events_page(None, 50).is_some(), "made, and read");
         // Read since: the next compaction makes its texts, and the read after it inflates nothing.
@@ -6148,6 +5840,57 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: deltas streamed into an event of a long copy's older compact chunk (a long tool's
+    /// output, a subagent's text, still streaming while newer events came), taken by its owner, inflate nothing on the
+    /// owner's shard: the first has the chunk read back on the blocking pool first (`Mirror::thaw_for_stream`, the owner
+    /// marking the chunk it read back), and every delta is then taken where the event is, in order, the rest of the copy as
+    /// it was. Taken on the shard, each one inflated the chunk there, or read a spilled one's file (train 16's removal took
+    /// this path out with the idle newest's; copies-lat2 found it). (A count of inflations on the owner's thread would count
+    /// other tests' on that shard too.)
+    #[test]
+    fn g9_s3_a_stream_into_an_older_compact_chunks_event_never_inflates_on_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "streamed".to_owned();
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            let i = id.clone();
+            let first = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.events.chunks().first().filter(|c| c.is_compact()).cloned()
+                })
+                .await
+                .flatten();
+            let Some(first) = first else { anyhow::bail!("its first chunk compact") };
+            // Three deltas into e5, in the first chunk.
+            let deltas = [" one", " two", " three"];
+            for d in deltas {
+                let u = Update::Stream { id: "e5".into(), text: d.into() };
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+            }
+            copies.settled().await;
+            let (i, was) = (id.clone(), Arc::clone(&first));
+            let read_back = copies.on(&id, move |s| (s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was)), s.get(&i).and_then(|m| m.events.chunks().first().map(|c| !Arc::ptr_eq(c, &was) && !c.is_compact())))).await;
+            anyhow::ensure!(read_back == Some((true, Some(true))), "its chunk read back by its owner off the shard, and in its place: {read_back:?}");
+            let i = id.clone();
+            let now = copies.on(&id, move |s| s.get(&i).map(|m| (m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.get(5).map(|e| e.entry.text().to_owned())))).await.flatten();
+            let Some((len, Some(streamed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
+            anyhow::ensure!(len == CHUNK * 3 + 9 && streamed.contains(&deltas.concat()) && next == entry("e6", 6).text(), "{len} {streamed} {next}");
+            Ok(())
+        })
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 3: an event taken under an older number than a long copy's newest, one it doesn't
     /// have (a runner that started again sends it), goes in where its number says with nothing read again on its owner's
     /// shard: the copy's events are made again with it in on the blocking pool, the shard given up meanwhile (the owner
@@ -6297,288 +6040,6 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): an idle copy's newest chunk, sealed and packed, is kept compact as its
-    /// owner's compaction finds it (its events' texts let go of, their segment kept), unless a read took its texts since it
-    /// last changed: then it stays as it is, its segment let go of, still read (a change clears that). Kept compact, a read
-    /// on a shard has its texts made off it (`Unread::Unkept`), the read that makes them keeps them, and so marks it read.
-    /// Its next event, and a stream into its last, name it to be read back first (`Mirror::thaw_for`,
-    /// `Mirror::thaw_for_stream`). A snapshot carries every event once, in order, as frames and packed; a spill never takes
-    /// it; and a newest that changed after its seal isn't kept compact.
-    #[test]
-    fn g11_s5_heap_an_idle_copys_newest_chunk_is_kept_compact() -> anyhow::Result<()> {
-        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
-        // Two sealed chunks, compact, and the newest open with nine.
-        let mut n = u64::try_from(CHUNK * 2 + 9)?;
-        for q in 1..=n {
-            m.rev = q;
-            m.upsert(entry(&format!("e{q}"), q));
-        }
-        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
-            c.pack()?;
-        }
-        m.events.compact(None);
-        m.publish();
-        // Sealed while idle and packed, as the owner's sweep and the packer do (`Shard::pack_idle`; `seal` is the runtime's).
-        let seal_newest = |m: &Mirror| -> anyhow::Result<()> {
-            let newest = m.events.chunks().last().cloned().ok_or_else(|| anyhow::anyhow!("no newest"))?;
-            newest.sealing.store(true, Ordering::Relaxed);
-            newest.pack()?;
-            Ok(())
-        };
-        let newest = |m: &Mirror| m.events.chunks().last().cloned();
-        // A read of its newest page (the open chunk's nine) since it last changed: sealed, it stays as it is.
-        anyhow::ensure!(m.view().events_page_kept(None, 9).is_ok(), "the open chunk's page");
-        seal_newest(&m)?;
-        m.events.compact(None);
-        anyhow::ensure!(newest(&m).is_some_and(|c| !c.is_compact() && c.packed().is_none() && c.page_read.load(Ordering::Relaxed)), "read: as it is, its segment let go of, still read");
-        // Changed: no read since. Sealed, it's kept compact.
-        n += 1;
-        m.rev = n;
-        m.upsert(entry(&format!("e{n}"), n));
-        anyhow::ensure!(newest(&m).is_some_and(|c| !c.page_read.load(Ordering::Relaxed)), "a change clears what reads took");
-        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
-        seal_newest(&m)?;
-        m.events.compact(None);
-        m.publish();
-        let view = m.view();
-        let last = view.events.chunks().last().cloned().ok_or_else(|| anyhow::anyhow!("no newest"))?;
-        anyhow::ensure!(last.is_compact() && last.len() == 10 && view.events.len() == texts.len(), "the newest kept compact, nothing lost");
-        anyhow::ensure!(view.events.iter().map(|e| e.entry.text().to_owned()).collect::<Vec<_>>() == texts, "its events read as they were");
-        anyhow::ensure!(last.page_kept().is_none() && !last.page_read.load(Ordering::Relaxed), "no texts kept: none read since");
-        // A read on a shard has its texts made off it; the read that makes them keeps them, and marks it read.
-        anyhow::ensure!(view.events_page_kept(None, 10) == Err(Unread::Unkept), "not kept: made off the shard");
-        let page = view.events_page(None, 10).ok_or_else(|| anyhow::anyhow!("the page made"))?;
-        anyhow::ensure!(view.events_page_kept(None, 10).map(|p| p.concat()) == Ok(page.concat()), "kept for the reads after");
-        anyhow::ensure!(last.page_read.load(Ordering::Relaxed), "read: its owner's next sweep reads it back");
-        // What would read it back before it's changed: the next event, a stream into its last; not a stream into nothing.
-        anyhow::ensure!(m.thaw_for("next", n + 1).is_some_and(|c| Arc::ptr_eq(&c, &last)), "the next event reads it back first");
-        anyhow::ensure!(m.thaw_for_stream(&format!("e{n}")).is_some_and(|c| Arc::ptr_eq(&c, &last)), "a stream into its last reads it back first");
-        anyhow::ensure!(m.thaw_for_stream("nowhere").is_none(), "a stream into no event reads nothing back");
-        // A snapshot, as frames and packed: every event once, in order.
-        let ids = |frames: &[String]| -> Vec<String> {
-            frames.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).filter(|f| f.get("t").and_then(Value::as_str) == Some("events")).flat_map(|f| f.get("events").and_then(Value::as_array).cloned().unwrap_or_default()).filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned)).collect()
-        };
-        let want: Vec<String> = (1..=n).map(|q| format!("e{q}")).collect();
-        let snap = || super::super::registry::Snapshot { parts: view.parts(), files: None, store: None };
-        anyhow::ensure!(ids(&snap().frames()) == want, "its frames carry every event once, in order");
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(snap().packed(r#"{"t":"synced"}"#)?.as_slice()), &mut text)?;
-        anyhow::ensure!(ids(&text.lines().map(str::to_owned).collect::<Vec<_>>()) == want, "packed, the same");
-        anyhow::ensure!(m.events.spillable(0, 0).iter().all(|c| !Arc::ptr_eq(c, &last)), "a spill never takes it");
-        // An event at it, read back where it's taken (here: the test's thread): its newest a chunk of its events again.
-        n += 1;
-        m.rev = n;
-        m.upsert(entry(&format!("e{n}"), n));
-        anyhow::ensure!(m.events.len() == texts.len() + 1 && newest(&m).is_some_and(|c| !c.is_compact() && c.len() == 11), "taken in");
-        // Changed after its seal: not kept compact.
-        seal_newest(&m)?;
-        n += 1;
-        m.rev = n;
-        m.upsert(entry(&format!("e{n}"), n));
-        m.events.compact(None);
-        anyhow::ensure!(newest(&m).is_some_and(|c| !c.is_compact() && c.len() == 12), "a newest changed since its seal stays as it is");
-        Ok(())
-    }
-
-    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap), with goal 9's rule (plan 01a1a87b2cec step 3): an idle copy's owner, swept
-    /// once it has fallen idle ([`Shard::pack_idle`]: its copies' idle wait pinned to an hour, so no sweep of their own comes
-    /// between, and swept as of an hour on: consts-audit R1), has its newest chunk packed off its shard and kept compact.
-    /// Its next event has that chunk read back off the shard (the owner's read-back on the blocking pool: [`Shard::thawed`]
-    /// names it) before the event is taken, and so does a stream into an event of it, each taken once it's back: the copy
-    /// holds every event, in order, and the streamed text. Kept compact again and then read (its texts made off the shard for
-    /// the read), the next sweep reads it back as its events, and the sweeps after leave it so: it's read.
-    #[test]
-    fn g11_s5_heap_an_idle_copys_next_event_and_stream_read_its_newest_chunk_back_off_the_shard_first() -> anyhow::Result<()> {
-        use crate::harness::model::{Body, Event};
-        crate::rt::block_on(async {
-            let hub = crate::hub::tests::scratch_hub().await?;
-            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
-            copies.bind(&hub);
-            const IDLE: Duration = Duration::from_secs(3600);
-            copies.on_each(|s| s.said().idle.pin_after(u64::try_from(IDLE.as_nanos()).unwrap_or(u64::MAX))).await;
-            let id = "idle".to_owned();
-            let i = id.clone();
-            copies
-                .on(&id, move |s| {
-                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
-                })
-                .await;
-            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
-            let send = |u: Update| {
-                let (copies, id) = (Arc::clone(&copies), id.clone());
-                async move { copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await }
-            };
-            // Until `ok` holds of its view, half a minute at the most.
-            let until = |what: &'static str, ok: Box<dyn Fn(&View) -> bool + Send + Sync>| {
-                let (copies, id) = (Arc::clone(&copies), id.clone());
-                async move {
-                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                    while !copies.with(&id, |v| ok(v)).unwrap_or(false) {
-                        anyhow::ensure!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
-                        crate::rt::sleep(Duration::from_millis(5)).await;
-                    }
-                    anyhow::Ok(())
-                }
-            };
-            // A full chunk and nine: the newest open with nine.
-            let n = u64::try_from(CHUNK + 9)?;
-            anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
-            until("its events", Box::new(move |v: &View| v.events.len() == usize::try_from(n).unwrap_or(0))).await?;
-            // Swept as of when it's idle: its newest sealed, packed off the shard, kept compact. Each sweep as
-            // `sweep_when_idle` sends it, a copy at a time (goal 9, plan 01a1a87b2cec step 3), taken before the job after it.
-            let sweep = || {
-                let (copies, id) = (Arc::clone(&copies), id.clone());
-                async move {
-                    let _ = copies.send(&id, Msg::Each(Box::new(Shard::pack_idle_as_of(Instant::now().checked_add(IDLE))))).await;
-                    copies.applied(&id).await;
-                }
-            };
-            sweep().await;
-            sweep().await;
-            until("its newest kept compact", Box::new(|v: &View| v.events.chunks().last().is_some_and(|c| c.is_compact()))).await?;
-            let compact = copies.with(&id, |v| v.events.chunks().last().cloned()).flatten().ok_or_else(|| anyhow::anyhow!("no newest"))?;
-            // Its next event: the chunk read back off the shard first, then the event taken.
-            anyhow::ensure!(send(Update::Events { events: vec![said(n + 1)] }).await, "sent");
-            until("its next event", Box::new(move |v: &View| v.events.len() == usize::try_from(n + 1).unwrap_or(0))).await?;
-            let was = Arc::clone(&compact);
-            let read_back = copies.on(&id, move |s| s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was))).await;
-            anyhow::ensure!(read_back == Some(true), "its newest chunk read back by its owner off the shard");
-            let seqs = copies.with(&id, |v| v.events.metas().filter_map(|m| m.seq()).collect::<Vec<u64>>()).unwrap_or_default();
-            anyhow::ensure!(seqs == (1..=n + 1).collect::<Vec<u64>>(), "every event, in order");
-            anyhow::ensure!(copies.with(&id, |v| v.events.chunks().last().is_some_and(|c| !c.is_compact() && c.len() == 10)) == Some(true), "its newest a chunk of its events again");
-            // Idle again, then a stream into its last event: read back first too, then the text taken.
-            sweep().await;
-            sweep().await;
-            until("its newest kept compact again", Box::new(|v: &View| v.events.chunks().last().is_some_and(|c| c.is_compact()))).await?;
-            let compact = copies.with(&id, |v| v.events.chunks().last().cloned()).flatten().ok_or_else(|| anyhow::anyhow!("no newest"))?;
-            anyhow::ensure!(send(Update::Stream { id: format!("e{}", n + 1), text: " streamed".into() }).await, "sent");
-            let last = format!("e{}", n + 1);
-            until("the streamed text", Box::new(move |v: &View| v.events.last().is_some_and(|e| e.entry.id() == Some(last.as_str()) && e.entry.text().contains("streamed")))).await?;
-            let was = Arc::clone(&compact);
-            let read_back = copies.on(&id, move |s| s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was))).await;
-            anyhow::ensure!(read_back == Some(true), "read back off the shard before the stream was taken");
-            // Idle again, then read: its texts made off the shard for the read, the next sweep reads it back as its events.
-            sweep().await;
-            sweep().await;
-            until("its newest kept compact a third time", Box::new(|v: &View| v.events.chunks().last().is_some_and(|c| c.is_compact()))).await?;
-            let compact = copies.with(&id, |v| v.events.chunks().last().cloned()).flatten().ok_or_else(|| anyhow::anyhow!("no newest"))?;
-            anyhow::ensure!(copies.with(&id, |v| v.events_page(None, 5).is_some()) == Some(true), "its newest page read");
-            sweep().await;
-            until("its newest read back after the read", Box::new(|v: &View| v.events.chunks().last().is_some_and(|c| !c.is_compact()))).await?;
-            let was = Arc::clone(&compact);
-            let read_back = copies.on(&id, move |s| s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was))).await;
-            anyhow::ensure!(read_back == Some(true), "read back off the shard by the sweep after the read");
-            sweep().await;
-            sweep().await;
-            let left = copies.on(&id, |s| s.get("idle").and_then(|m| m.events.chunks().last().map(|c| !c.is_compact() && c.packed().is_none()))).await.flatten();
-            anyhow::ensure!(left == Some(true), "read since it last changed: not packed again");
-            Ok(())
-        })
-    }
-
-    /// Consts-audit R1 (goal 11, plan 01a1a87b2e56 step 5): a copy falls idle by its own gaps between the changes it takes,
-    /// where every copy waited 5 s (`IDLE_AFTER`, jemalloc's dirty decay). Do: teach one copy turns of 40 changes 25 ms
-    /// apart with 1.5 to 2.5 s between them (the lab's profile), another the same turns 15 to 25 s apart, a third 150 to 250
-    /// ms apart; then a copy with one change and no gap of its own, and owners that learned nothing. Expect: each copy's
-    /// gaps within a turn learned as busy and those between as quiet; each idle past its quiet gaps' bound, never between
-    /// its turns (its longest wait between them comes before it), so the slow copy only past tens of seconds, the quick one
-    /// past a few hundred milliseconds; the copy with no gap of its own judged by every copy's quiet gaps, smoothed
-    /// together; and none idle where nothing was learned.
-    #[test]
-    fn r1_a_copy_falls_idle_by_its_own_gaps_between_changes() -> anyhow::Result<()> {
-        let base = Instant::now();
-        let at = |ms: u64| base.checked_add(Duration::from_millis(ms)).ok_or_else(|| anyhow::anyhow!("no such time"));
-        let idle = Idle::default();
-        anyhow::ensure!(idle.after(None).is_none(), "nothing learned: none idle");
-        // Ten turns of 40 changes 25 ms apart, `quiet` between them in turn, from `from` ms; when its last change was.
-        let turns = |gaps: &mut Gaps, from: u64, quiet: [u64; 5]| -> anyhow::Result<u64> {
-            let mut t = from;
-            for turn in 0..10 {
-                for k in 0..40 {
-                    if let Some(q) = gaps.changed(at(t)?) {
-                        idle.quiet.learn(q);
-                    }
-                    if k < 39 {
-                        t += 25;
-                    }
-                }
-                if turn < 9 {
-                    t += quiet.get(turn % quiet.len()).copied().unwrap_or(0);
-                }
-            }
-            Ok(t)
-        };
-        let mut lab = Gaps::default();
-        let last = turns(&mut lab, 0, [2_000, 1_500, 2_500, 1_800, 2_200])?;
-        let busy = lab.busy.bound().ok_or_else(|| anyhow::anyhow!("no busy gaps"))?;
-        anyhow::ensure!(busy < 1_500_000_000, "the gaps within a turn are busy ones: their bound {busy} ns");
-        let lab_after = idle.after(lab.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
-        anyhow::ensure!(lab_after > 2_500_000_000 && lab_after < 10_000_000_000, "past its longest wait between turns, within seconds: {lab_after} ns");
-        let fell = lab.idle_at(idle.after(lab.quiet.bound())).ok_or_else(|| anyhow::anyhow!("never idle"))?;
-        anyhow::ensure!(fell > at(last + 2_500)? && fell <= at(last + 10_000)?, "idle {:?} after its last change", fell.saturating_duration_since(at(last)?));
-        let mut slow = Gaps::default();
-        turns(&mut slow, 0, [20_000, 15_000, 25_000, 18_000, 22_000])?;
-        let slow_after = idle.after(slow.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
-        anyhow::ensure!(slow_after > 25_000_000_000, "a copy quiet longer between its turns falls idle later: {slow_after} ns");
-        let mut quick = Gaps::default();
-        turns(&mut quick, 0, [200, 150, 250, 180, 220])?;
-        let quick_after = idle.after(quick.quiet.bound()).ok_or_else(|| anyhow::anyhow!("no quiet gaps"))?;
-        anyhow::ensure!(quick_after > 250_000_000 && quick_after < lab_after, "a copy quiet briefly between its turns falls idle sooner: {quick_after} ns");
-        // A copy with no gap of its own yet: every copy's quiet gaps, smoothed together, judge it.
-        let mut new = Gaps::default();
-        anyhow::ensure!(new.changed(at(0)?).is_none() && new.quiet.bound().is_none(), "one change: no gap");
-        anyhow::ensure!(idle.after(new.quiet.bound()) == idle.quiet.bound() && idle.quiet.bound().is_some(), "judged by every copy's");
-        Ok(())
-    }
-
-    /// Consts-audit R1 (goal 11, plan 01a1a87b2e56 step 5): a copy is swept as it falls idle, as its owners' changes scheduled
-    /// it, with no sweep every 5 s; and the task that has it swept ends with its owners. Do: owners whose copies fall idle
-    /// 300 ms after their last change (pinned, as a copy's gaps would teach it); a copy that takes its events; wait, sending no
-    /// sweep. Expect: its newest still as it was at once, then packed and kept compact; once the owners are gone, the task
-    /// that sweeps them told so.
-    #[test]
-    fn r1_a_copy_is_swept_as_it_falls_idle_and_no_sooner() -> anyhow::Result<()> {
-        use crate::harness::model::{Body, Event};
-        crate::rt::block_on(async {
-            let hub = crate::hub::tests::scratch_hub().await?;
-            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
-            copies.bind(&hub);
-            let after = Duration::from_millis(300);
-            copies.on_each(move |s| s.said().idle.pin_after(u64::try_from(after.as_nanos()).unwrap_or(u64::MAX))).await;
-            let idle = copies.on_each(|s| Arc::clone(&s.said().idle)).await.pop().ok_or_else(|| anyhow::anyhow!("no owner"))?;
-            let id = "falls-idle".to_owned();
-            let i = id.clone();
-            copies
-                .on(&id, move |s| {
-                    s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
-                })
-                .await;
-            let n = u64::try_from(CHUNK + 9)?;
-            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
-            let sent = Instant::now();
-            let u = Update::Events { events: (1..=n).map(said).collect() };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
-            copies.applied(&id).await;
-            let compact = || copies.with(&id, |v| v.events.chunks().last().is_some_and(|c| c.is_compact())).unwrap_or(false);
-            if sent.elapsed() < after {
-                anyhow::ensure!(!compact(), "packed before it fell idle");
-            }
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !compact() {
-                anyhow::ensure!(Instant::now() < deadline, "not swept in 30 s, {after:?} after it fell idle");
-                crate::rt::sleep(Duration::from_millis(5)).await;
-            }
-            anyhow::ensure!(sent.elapsed() >= after, "packed {:?} after its change, before it fell idle", sent.elapsed());
-            drop(copies);
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !idle.gone.load(Ordering::Relaxed) {
-                anyhow::ensure!(Instant::now() < deadline, "the owners' sweeping task wasn't told they're gone");
-                crate::rt::sleep(Duration::from_millis(5)).await;
-            }
-            Ok(())
-        })
-    }
-
     /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a copy's events read one after another ([`Reading`]), from the
     /// newest back as a window reads them, read each compact chunk again once for all of its events, where
     /// `Events::get` reads it again for each: the same events, and none past them.
@@ -6611,8 +6072,8 @@ mod tests {
     /// newest page's reads reached back to. With nine events in the open chunk, a page of 30 keeps the compact chunk's
     /// last 21 (inflated once); a page of 20 reaches less far back and takes a slice of them (nothing inflated); a page
     /// of 50 reaches further, inflates once more and keeps its last 41; a page of 30 again takes a slice of those. Each
-    /// page reads as the events' texts joined, and a page that reaches past the newest compact chunk keeps nothing of
-    /// the older one.
+    /// page reads as the events' texts joined, and the page the API gives unasked for a limit (`EVENTS_PAGE`), which
+    /// reaches past the newest compact chunk into the older, keeps of the older what it reaches, and the newest's whole.
     #[test]
     fn g11_s5_heap_a_page_keeps_the_texts_its_reads_reach_back_to() -> anyhow::Result<()> {
         let inflated = || super::super::packed::INFLATED.with(std::cell::Cell::get);
@@ -6650,9 +6111,14 @@ mod tests {
         read(30)?;
         anyhow::ensure!(inflated() == was + 2 && compact.page_kept() == suffix(41), "a page of 30 again: a slice of the longer");
         anyhow::ensure!(suffix(41) < suffix(70), "less than the whole chunk's texts");
-        // A page into the older compact chunk: it's inflated for that read and keeps nothing.
-        read(100)?;
-        anyhow::ensure!(older.page_kept().is_none() && compact.page_kept() == suffix(70), "the older keeps nothing; the newest compact chunk's whole kept");
+        // The API's page, into the older compact chunk: both inflated once, the older's last events it reaches kept, the newest
+        // compact chunk's whole; read again, nothing inflated.
+        let reach = EVENTS_PAGE.checked_sub(CHUNK + 9).ok_or_else(|| anyhow::anyhow!("the page reaches the older"))?;
+        let older_suffix = Some(older.texts_len() - older.off(older.metas().len().checked_sub(reach).ok_or_else(|| anyhow::anyhow!("past the older"))?));
+        read(EVENTS_PAGE)?;
+        anyhow::ensure!(inflated() == was + 4 && older.page_kept() == older_suffix && compact.page_kept() == suffix(70), "the older keeps its last {reach}, the newest compact chunk its whole ({:?}, {:?})", older.page_kept(), compact.page_kept());
+        read(EVENTS_PAGE)?;
+        anyhow::ensure!(inflated() == was + 4, "the API's page again: nothing inflated");
         Ok(())
     }
 
@@ -7534,7 +7000,8 @@ mod tests {
         let spill = || work(&kinds::SPILLED, |_: &mut Shard| {});
         let other = || Msg::Run(Box::new(|_: &mut Shard| {}));
         assert!(std::ptr::eq(label_of(&compact()), &kinds::COMPACT) && std::ptr::eq(label_of(&spill()), &kinds::SPILLED));
-        assert!(std::ptr::eq(label_of(&Msg::Each(Box::new(Shard::pack_idle()))), &kinds::IDLE), "the sweep for idle copies");
+        let sweep = Each { left: None, label: &kinds::SWEEP, pick: Box::new(|_: &str, _: &Mirror| true), step: Box::new(|_: &mut Shard, _: Option<&str>| {}) };
+        assert!(std::ptr::eq(label_of(&Msg::Each(Box::new(sweep))), &kinds::SWEEP), "a sweep of its copies");
         assert_eq!(label_of(&other()).name, "owner work on its copies");
         let mut costs = Costs::default();
         costs.learn(label_of(&spill()), 200_000);

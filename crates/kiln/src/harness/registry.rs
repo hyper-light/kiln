@@ -1161,9 +1161,7 @@ impl Snapshot {
                 gz.deflate(Compression::fast(), loose)?;
                 loose.clear();
                 gz.stored(br#"{"t":"events","events":["#);
-                // The newest, which the next event changes, deflated now; one kept compact while its copy took nothing in
-                // goes as it's packed (goal 11, plan 01a1a87b2e56 step 5).
-                if *i + 1 == chunks.len() && !chunk.is_full() && !chunk.is_compact() {
+                if *i + 1 == chunks.len() && !chunk.is_full() {
                     gz.segment(&chunk.deflate(Compression::fast())?);
                 } else {
                     let packed = match chunk.pack() {
@@ -2818,8 +2816,8 @@ impl Registry {
             s.want_thaw(id, c);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
-        // A stream into an event of a compact chunk (the newest, kept compact while its copy took nothing in: goal 11, plan
-        // 01a1a87b2e56 step 5): the same, once that chunk is read back off the shard, before the stream is taken.
+        // A stream into an event of an older compact chunk (a long tool's output, a subagent's text): the same, once that
+        // chunk is read back off the shard, before the stream is taken (goal 9, plan 01a1a87b2cec step 3).
         if let Update::Stream { id: event, .. } = &u
             && let Some(c) = m.thaw_for_stream(event).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
@@ -2845,8 +2843,6 @@ impl Registry {
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
         m.rev = m.rev.saturating_add(1);
-        // Its gap since its last change learned, and when it falls idle scheduled (consts-audit R1).
-        m.changed(std::time::Instant::now(), &said.idle);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
             // viewers from before start over too.
@@ -3598,12 +3594,9 @@ impl Registry {
         let (sid, added) = (id.to_owned(), added.to_vec());
         self.sessions
             .on(id, move |s| {
-                let said = s.said();
                 if let Some(m) = s.get_mut(&sid) {
                     // A revision of its own, past what its viewers have: else they'd take it as had.
                     m.rev = m.rev.saturating_add(1);
-                    // A change: when it falls idle scheduled from now (consts-audit R1).
-                    m.changed(std::time::Instant::now(), &said.idle);
                     m.commit(|m| {
                         let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Files { files: added }, rev: Some(m.rev) }.text();
                         Some(super::copies::payload_of(&text, m.rev))

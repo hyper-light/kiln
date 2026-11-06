@@ -2711,6 +2711,14 @@ window's end within noise of A; `api_read` p50/p99/p99.9 within noise (a first r
 microseconds slower, mostly in the warm-up); attach, websocket and runner wait within noise (the copies at work never sit
 idle 5 s). In production's shape the saving is the idle copies no one read since their last event; a profile with idle
 copies its readers don't read (`many` with all but 8 idle, no events reads of those) would show it.
+**Taken out (2026-11-06, after train 31), with what drove it (consts-audit R1's copies idle by their learned gaps and
+their scheduled sweep).** `kiln-lab rate` found the cost: the largest session's newest page, read after its copy sat idle
+past a sweep, was made off the shard at every read from then on. Compacting the idle newest moved `paged` onto it and
+off the older compact chunk the page also spans, and the read-back never paged that one again, so every read inflated
+it on the blocking pool (`Unread::Unkept`, one `fs` job a read). `newest` at 100/s on the M3 Ultra went from p50 0.44,
+p99 1.11 ms (production, before train 16) to 5.60 and 770 ms (train 25); adacachy's probe went from 0.5-1.0 to 2.0-4.5 ms.
+Latency and throughput come before memory (Ada, 2026-11-06), and the cut saved at most 17 MB in production's shape (~0
+in the lab), so a copy's newest chunk is never compact again, as before train 16.
 
 **Looked at, and not cut:**
 - **Sessions' copies, the rest.** What the open chunks hold as text (`session_entries`): the 24 idle copies' 50 events

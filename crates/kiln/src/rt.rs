@@ -1456,7 +1456,7 @@ fn nanos_since(t: Instant) -> u64 {
 /// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
 /// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
 /// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
-/// trip ([`POOL_TRIP`]), every session copy's quiet gaps (`crate::harness::copies`).
+/// trip ([`POOL_TRIP`]).
 pub struct Smoothed {
     mean: AtomicU64,
     dev: AtomicU64,
@@ -1477,12 +1477,6 @@ impl Smoothed {
     /// Its variation, nanoseconds: 0 until a sample was learned.
     pub fn dev(&self) -> u64 {
         self.dev.load(Ordering::Relaxed)
-    }
-
-    /// Its mean and four times its variation, as RFC 6298 (§2.3, K = 4) bounds a round trip: none until a sample was
-    /// learned.
-    pub fn bound(&self) -> Option<u64> {
-        self.mean().map(|mean| mean.saturating_add(self.dev().saturating_mul(4)))
     }
 
     /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
@@ -1813,6 +1807,13 @@ impl Default for Turns {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
+    /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
+    pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
@@ -1820,6 +1821,8 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
+    BLOCKING_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
     rt()?;
     let (tx, rx) = futures::channel::oneshot::channel::<R>();
     let job: Arc<Mutex<Option<(F, futures::channel::oneshot::Sender<R>)>>> = Arc::new(Mutex::new(Some((f, tx))));
