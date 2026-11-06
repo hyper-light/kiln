@@ -6757,12 +6757,15 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 const SNAPSHOT_PIECE: usize = 128 * 1024;
 
 /// The most bytes of a packed snapshot one WebSocket frame carries: what its socket writes at a time
-/// ([`ws::SOCKET_WRITE`]). The socket's writer copies a frame into its buffer whole before it writes any of it,
+/// ([`ws::SOCKET_WRITE`]) less the frame's head ([`ws::WRITE_FRAME`]), so a frame is a TLS record whole (goal 11, plan
+/// 01a1a87b2e56 step 5, the memory audit's row C12: a frame of `SOCKET_WRITE` bytes of payload went in a write of that and
+/// its 4-byte head, two records). The socket's writer copies a frame into its buffer whole before it writes any of it,
 /// on the shard that serves the socket, and a long session's snapshot is megabytes: a frame at a time goes, and
 /// the shard serves its other sockets between. The writer's buffer keeps the most it ever held while the socket
 /// is open, so a frame of a whole piece (128 KiB) kept 131 KiB for every viewer after its snapshot (goal 11,
-/// plan 01a1a87b2e56 step 5).
-const SNAPSHOT_FRAME: usize = ws::SOCKET_WRITE;
+/// plan 01a1a87b2e56 step 5); fed a piece's frames at once ([`send_pieces`]), it writes what it holds once that passes
+/// `SOCKET_WRITE`, two of these frames, and keeps 32 KiB.
+const SNAPSHOT_FRAME: usize = ws::WRITE_FRAME;
 
 /// `bytes` as one binary message in frames of at most [`SNAPSHOT_FRAME`] bytes (RFC 6455 5.4's
 /// fragments, which every client joins into the one message they are).
@@ -6843,11 +6846,25 @@ where
         held.made(if last { n } else { n.saturating_add(n) });
         let mut wrote = Ok(());
         for frame in pieces_of(bytes, first, last) {
-            if let Err(e) = tx.send(frame).await {
+            // Fed, not flushed: the socket's writer writes what it gathers once that passes its write, two of these frames,
+            // each a TLS record whole (the memory audit's row C12: each frame was flushed alone).
+            if let Err(e) = tx.feed(frame).await {
                 wrote = Err(e);
                 break;
             }
-            turns.end().await;
+            // Its turn over (`crate::rt::Turns::end`'s test): what's fed goes out before its shard goes to its other work.
+            if turns.over() {
+                if let Err(e) = tx.flush().await {
+                    wrote = Err(e);
+                    break;
+                }
+                hyper_rt::futures::yield_now().await;
+                turns = crate::rt::Turns::new();
+            }
+        }
+        // A flush a piece: what's left of it goes out while the next is waited for.
+        if wrote.is_ok() {
+            wrote = tx.flush().await;
         }
         first = false;
         let made = match made.take().or_else(|| next.as_mut().now_or_never()) {
@@ -8296,6 +8313,69 @@ mod tests {
         };
         anyhow::ensure!(sent == Sent { jobs: n - 1, pieces: n }, "its pieces' jobs alone: {sent:?}");
         anyhow::ensure!(joined(&frames)? == pieces.concat(), "the message its pieces make");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row C12: a packed snapshot's frames are what its socket writes,
+    /// each with its head a TLS record whole, and a piece's are flushed once. Through the page socket's writer
+    /// (`ws::commands_config`), a piece's frames fed and flushed once reach the connection in writes each a whole number of
+    /// records but the last, a record a frame; frames of `SOCKET_WRITE` bytes of payload went in writes of that and their
+    /// 4-byte head, two records each. Sent as they're made, a piece's frames are flushed once: they were flushed one by one.
+    #[test]
+    fn g11_s5_c12_a_snapshots_frames_are_its_sockets_writes_flushed_once_a_piece() -> anyhow::Result<()> {
+        /// A connection that takes each write whole and keeps how large it was.
+        #[derive(Default)]
+        struct Wire {
+            writes: Vec<usize>,
+        }
+        impl std::io::Read for Wire {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl std::io::Write for Wire {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(b.len());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sizes = [SNAPSHOT_PIECE, SNAPSHOT_PIECE + 5, 3 * SNAPSHOT_FRAME + 1, 7];
+        let pieces = fake_pieces(&sizes);
+        let record = ws::SOCKET_WRITE;
+        for (k, piece) in pieces.iter().enumerate() {
+            let mut socket = tungstenite::WebSocket::from_raw_socket(Wire::default(), tungstenite::protocol::Role::Server, Some(ws::commands_config()));
+            let frames: Vec<ws::Message> = pieces_of(piece.clone(), true, true).collect();
+            let count = frames.len();
+            for f in frames {
+                socket.write(f)?;
+            }
+            socket.flush()?;
+            let writes = &socket.get_ref().writes;
+            let head = writes.split_last().map_or(&[][..], |(_, rest)| rest);
+            anyhow::ensure!(head.iter().all(|w| w % record == 0), "piece {k}: writes of whole records but the last: {writes:?}");
+            anyhow::ensure!(writes.iter().map(|w| w.div_ceil(record)).sum::<usize>() == count, "piece {k}: a record a frame, {count} frames: {writes:?}");
+        }
+        // Sent as they're made: a flush a piece, at its last frame (none of a turn's end: not on a shard here).
+        let mut wire = Written::default();
+        let mut sent = Sent::default();
+        let n = pieces.len();
+        let make = |k: usize| {
+            let piece = pieces.get(k).cloned();
+            async move { Ok(((k + 1 < n).then_some(k + 1), piece)) }
+        };
+        futures::executor::block_on(async {
+            let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), 0).await;
+            send_pieces(&mut wire, &mut held, (Some(1), pieces.first().cloned()), make, &mut sent).await
+        })?;
+        let ends: Vec<usize> = pieces.iter().scan(0usize, |at, p| {
+            *at += p.len().div_ceil(SNAPSHOT_FRAME).max(1);
+            Some(*at)
+        }).collect();
+        anyhow::ensure!(wire.flushed_at == ends, "a flush a piece, at its last frame: {:?} for {ends:?}", wire.flushed_at);
+        anyhow::ensure!(joined(&wire.sent)? == pieces.concat(), "the message its pieces make");
         Ok(())
     }
 
