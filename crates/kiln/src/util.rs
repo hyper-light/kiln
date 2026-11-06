@@ -15,6 +15,13 @@ pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
 }
 
+/// A map of kiln's own keys, hashed seeded and fast (foldhash's `fast` variant, as `crate::observe` hashes its series):
+/// for keys no peer chooses to collide, each map that takes it says why (goal 9, plan 01a1a87b2cec step 5: std's SipHash
+/// on every runner frame's link and every session update's id was ~1% of the shards' CPU in train 16's lab, g9p16fp). Its
+/// seed is the process's own, drawn at random, so which keys share a bucket isn't a peer's to know either. A peer's own
+/// strings (an event's id, a header's name) stay on std's keyed SipHash.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+
 /// A new id: a UUIDv7 ([`new_v7`]) as 32 lowercase hex digits, which sort as they were made.
 pub fn new_id() -> String {
     new_v7().simple().to_string()
