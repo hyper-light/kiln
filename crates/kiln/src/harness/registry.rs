@@ -2366,6 +2366,12 @@ impl Registry {
         self.sessions.list_tagged()
     }
 
+    /// The shard whose owner holds session `id`'s copy and publishes its frames (`super::copies::owner_of`), among the
+    /// runtime's as `crate::rt::spawn_owner` takes them (goal 10, plan 01a1a87b2dae step 5).
+    pub fn owner_shard(&self, id: &str) -> usize {
+        self.sessions.owner_of(id)
+    }
+
     /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
     /// ([`super::copies::View::info_json`]). None when there's no such session.
     pub fn info_json(&self, id: &str) -> Option<bytes::Bytes> {

@@ -22,6 +22,7 @@ mod lab;
 mod measure;
 mod rate;
 mod report;
+mod rx;
 mod standin;
 mod stats;
 

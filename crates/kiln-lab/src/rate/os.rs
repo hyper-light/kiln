@@ -1,4 +1,4 @@
-//! The rate mode's OS interface, and the lab's only `unsafe`: the poller each generator thread waits in
+//! The rate mode's OS interface, and with `crate::rx` the lab's only `unsafe`: the poller each generator thread waits in
 //! (`polling`'s: epoll on Linux, kqueue on macOS, IOCP on Windows), and what a generator thread asks of its OS so
 //! it sends on time (Linux's timer slack, macOS's QoS class), the open-files limit its connections and the servers
 //! it starts live under, and the CPU clocks it reports its own cost by.
