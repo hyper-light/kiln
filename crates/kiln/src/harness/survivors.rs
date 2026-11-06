@@ -576,8 +576,9 @@ mod tests {
         let mut harness = std::process::Command::new("sh").arg("-c").arg(format!("exec {sleep_34}")).env(MARK, &id).spawn()?;
         let pid = harness.id();
         let look = || scan(&[(id.clone(), None)]);
-        // Looked at again until it runs as the sleeper (between fork and exec it shows no mark).
-        let until = std::time::Instant::now() + Duration::from_secs(5);
+        // Looked at again until it runs as the sleeper (between fork and exec it shows no mark), up to a hang's bound:
+        // a loaded machine's look over every process's environment takes what time it takes (5 s ran out).
+        let until = std::time::Instant::now() + Duration::from_secs(300);
         let mut seen = look();
         while !seen.get(&id).is_some_and(|s| s.apart.iter().any(|r| r.pid == pid)) && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(50));
@@ -617,27 +618,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn what_a_session_started_is_found_under_it_or_by_its_mark_until_it_is_stopped() -> anyhow::Result<()> {
-        // One under this process; one marked as session "s1"'s that runs apart (its shell exited).
-        let mut child = std::process::Command::new("sleep").arg("31").spawn()?;
+        // One under its harness; one marked as session "s1"'s that runs apart (its shell exited). The harness is a
+        // shell of this test's own, its one child the sleep: this test process stood in for it, but the tests beside
+        // it start theirs under it too, and a look notes the first 64 ([`MAX_RAN`]).
         let Some(sleep_32) = sleeper(32) else {
             eprintln!("skipped: nothing here sleeps as a process whose environment can be read");
-            let _ = child.kill();
             return Ok(());
         };
+        let mut harness = std::process::Command::new("sh").arg("-c").arg("sleep 31 & echo $!; wait").stdout(std::process::Stdio::piped()).spawn()?;
+        let mut line = String::new();
+        if let Some(out) = harness.stdout.take() {
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
+        }
+        let child: u32 = line.trim().parse()?;
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_32} >/dev/null 2>&1 & echo $!")).env(MARK, "s1").output()?;
         let apart: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
-        let me = std::process::id();
-        let look = || scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
-        // Its shell forked it: looked at again until it runs as the sleeper (a process caught
-        // between fork and exec shows no environment on macOS, so no mark).
-        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let look = || scan(&[("s1".to_owned(), Some(harness.id())), ("s2".to_owned(), None)]);
+        // Its shells forked them: looked at again until each runs as its sleeper (a process caught between fork and
+        // exec shows no environment on macOS, so no mark, and the shell's command), up to a hang's bound: a loaded
+        // machine's look over every process takes what time it takes (5 s ran out).
+        let ready = |seen: &HashMap<String, Seen>| seen.get("s1").is_some_and(|s| s.apart.iter().any(|r| r.pid == apart) && s.under.iter().any(|r| r.pid == child && r.command.contains("sleep 31")));
+        let until = std::time::Instant::now() + Duration::from_secs(300);
         let mut seen = look();
-        while !seen.get("s1").is_some_and(|s| s.apart.iter().any(|r| r.pid == apart)) && std::time::Instant::now() < until {
+        while !ready(&seen) && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(50));
             seen = look();
         }
         let s1 = seen.get("s1").cloned().unwrap_or_default();
-        let sleep = s1.under.iter().find(|r| r.pid == child.id()).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
+        let sleep = s1.under.iter().find(|r| r.pid == child).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
         assert!(sleep.command.contains("sleep 31"));
         assert!(s1.apart.iter().any(|r| r.pid == apart && r.command.contains("32")), "{:?}", s1.apart);
         assert!(seen.get("s2").is_some_and(|s| s.apart.is_empty() && s.under.is_empty()));
@@ -645,7 +653,7 @@ mod tests {
         // Another start time is another process.
         assert!(alive(&[Ran { started: sleep.started + 1, ..sleep.clone() }]).is_empty());
         stop_tree(&sleep);
-        let _ = child.wait();
+        let _ = harness.wait();
         assert!(alive(std::slice::from_ref(&sleep)).is_empty());
         let marked = s1.apart.iter().find(|r| r.pid == apart).cloned().ok_or_else(|| anyhow::anyhow!("not found apart"))?;
         stop_tree(&marked);

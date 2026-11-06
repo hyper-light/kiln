@@ -4956,8 +4956,10 @@ for line in sys.stdin:
     fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
         use super::super::model::SendMode;
         use std::os::unix::fs::PermissionsExt;
+        // Each wait's bound only ends a hang: a loaded machine starts, crashes and starts again a shell's stand-in
+        // in what time it takes (10 s ran out under load: "its start never came", "the crash never came").
         async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
-            let came = crate::rt::timeout(Duration::from_secs(10), async {
+            let came = crate::rt::timeout(Duration::from_secs(300), async {
                 while !done(&s.core.lock()) {
                     crate::rt::sleep(Duration::from_millis(20)).await;
                 }
@@ -5365,14 +5367,18 @@ for line in sys.stdin:
         crate::rt::block_on(async {
             let mut short = std::process::Command::new("sleep").arg("0.3").spawn()?;
             let pid = short.id();
-            // Reaped as soon as it exits (as the taken-over session's parent would).
+            // Reaped as soon as it exits (as the taken-over session's parent would): gone however long a loaded
+            // machine takes to end it (the bound only ends a hang).
             let reaper = std::thread::spawn(move || short.wait());
-            assert!(gone(pid, Duration::from_secs(5)).await);
+            assert!(gone(pid, Duration::from_secs(300)).await);
             let _ = reaper.join();
+            // One that runs on isn't gone: said once its wait is over, never before (a pace under 3 s failed under
+            // load), and the wait ends (the bound around it only ends a hang).
             let mut long = std::process::Command::new("sleep").arg("30").spawn()?;
             let t = Instant::now();
-            assert!(!gone(long.id(), Duration::from_millis(400)).await);
-            assert!(t.elapsed() < Duration::from_secs(3));
+            let ended = crate::rt::timeout(Duration::from_secs(300), gone(long.id(), Duration::from_millis(400))).await;
+            assert_eq!(ended, Ok(false), "a process still running is never gone, and the wait ends");
+            assert!(t.elapsed() >= Duration::from_millis(400), "said before its wait was over: {:?}", t.elapsed());
             let _ = long.kill();
             let _ = long.wait();
             anyhow::Ok(())

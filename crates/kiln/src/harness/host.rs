@@ -2654,8 +2654,10 @@ mod tests {
             }
             let out = cmd.output()?;
             let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
-            let mine = survivors::scan(&[("me".to_owned(), Some(std::process::id()))]).remove("me").unwrap_or_default().under;
-            let ran = |pid: u32| -> anyhow::Result<Ran> { mine.iter().find(|r| r.pid == pid).cloned().ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
+            // Each looked at as itself (as a session's harness is), not among this test process's children: the tests
+            // beside it start theirs there too, and a look notes the first 64 (`survivors::MAX_RAN`), which a loaded
+            // run's overlapping tests filled before this test's ("not seen").
+            let ran = |pid: u32| -> anyhow::Result<Ran> { survivors::scan(&[("look".to_owned(), Some(pid))]).remove("look").and_then(|s| s.harness).ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
             let (h, r) = (ran(harness.id())?, ran(recorded.id())?);
             {
                 let (tx, _rx) = async_channel::unbounded();

@@ -1287,7 +1287,8 @@ mod end_to_end {
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(60)) {
+        // A hang's bound, never a pace: a loaded machine takes what time it takes over them (60 s ran out under load).
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("the operations hung (a lock held across a wait?)"),
         }
@@ -1631,10 +1632,12 @@ mod end_to_end {
         assert_eq!(super::body_of("Rebase on main, then go on.\n\nThanks."), "Rebase on main, then go on.\n\nThanks.", "a parent's own words, as they are");
     }
 
-    /// Until `f` holds (the registry hears from the sessions' machines a moment later).
+    /// Until `f` holds (the registry hears from the sessions' machines a moment later), looking every 20 ms, up to a
+    /// hang's bound: never a pace (500 looks, 10 s, ran out under load).
     #[cfg(unix)]
     async fn until(f: impl Fn() -> bool, what: &str) -> anyhow::Result<()> {
-        for _ in 0..500 {
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if f() {
                 return Ok(());
             }
