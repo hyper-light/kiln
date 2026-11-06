@@ -2066,7 +2066,6 @@ impl Mirror {
     pub fn resume(&self, after: u64, files: Option<String>) -> Option<Vec<String>> {
         self.view().parts_since(after).map(|parts| super::registry::Snapshot { parts, files, store: None }.frames())
     }
-
 }
 
 /// What a shard's owner holds: its sessions' copies, by id, and every shard's board (its own to
@@ -3971,6 +3970,47 @@ mod tests {
         assert!(size_of::<Id>() <= 40 && size_of::<Meta>() <= 96, "an id {} bytes, a meta {}", size_of::<Id>(), size_of::<Meta>());
     }
 
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta's digest takes 8 bytes, where a `OnceLock<u64>` took 16:
+    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta is 88
+    /// bytes, against 96: about 0.4 MB less for the lab's realistic profile's 47,000 or so events kept.
+    #[test]
+    fn g11_s5_heap_a_metas_digest_takes_eight_bytes() {
+        let ev = Ev { entry: entry("e1", 1), at: 0 };
+        let m = Meta::of(&ev, 0);
+        assert_eq!(m.sum_made(), None, "none made as it came in");
+        let made = m.sum(&ev);
+        assert_eq!((made, m.sum_made()), (ev.entry.sum(), Some(ev.entry.sum())), "made, then kept");
+        let copy = m.clone();
+        assert!(copy.sum_made() == Some(made) && copy == m, "a clone keeps it");
+        assert_ne!(Meta::of(&ev, 0), m, "one made and one not aren't equal, as with a OnceLock");
+        assert!(size_of::<Meta>() <= 88, "a meta takes {} bytes", size_of::<Meta>());
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the index's bucket is 8 bytes (half of an id's keyed hash and its
+    /// event's place, each a `u32`), where it was 16; its table hashes a key by the key's own bits, in both halves of
+    /// the `u64` (a bucket picked by the low ones, tagged by the top seven); a place past a `u32` is kept apart by
+    /// its id; and every id is found where it is. A 5,000-event copy's table of 8,192 buckets is 72 KiB, not 136.
+    #[test]
+    fn g11_s5_heap_the_indexs_bucket_is_eight_bytes() {
+        use std::hash::Hasher as _;
+        assert_eq!(size_of::<(u32, u32)>(), 8);
+        let mut spread = Spread::default();
+        spread.write_u32(0x8000_0001);
+        assert_eq!(spread.finish(), 0x8000_0001_8000_0001, "the key in both halves");
+        let mut events = Events::default();
+        for q in 1..=3 {
+            events.push(Ev { entry: entry(&format!("e{q}"), q), at: 0 });
+        }
+        let mut index = Index::of(&events);
+        index.insert(&events, "far", usize::MAX);
+        assert_eq!((index.apart.get("far"), index.get(&events, "far")), (Some(&usize::MAX), Some(usize::MAX)), "a place past a bucket's, kept apart");
+        for q in 1..=3_u64 {
+            assert_eq!(index.get(&events, &format!("e{q}")), usize::try_from(q - 1).ok(), "e{q}");
+        }
+        index.drop_front(1);
+        assert_eq!((index.get(&events, "e1"), index.by_hash.len()), (None, 2), "the oldest let go of");
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 5: the index finds each id where it is, checked against the id its event's
     /// meta keeps; an id whose hash another's place already has is kept apart by itself and found there; places move
     /// down as the oldest go, those let go of leave it, and it stays what one made anew from the events is.
@@ -4027,46 +4067,5 @@ mod tests {
         let len = m.events.len();
         m.upsert(entry(&format!("e{n}"), n));
         assert_eq!(m.events.len(), len, "taken again where it is");
-    }
-
-    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a meta's digest takes 8 bytes, where a `OnceLock<u64>` took 16:
-    /// none until it's made, then kept, cloned with its meta and compared as the `OnceLock`'s was. A meta is 88
-    /// bytes, against 96: about 0.4 MB less for the lab's realistic profile's 47,000 or so events kept.
-    #[test]
-    fn g11_s5_heap_a_metas_digest_takes_eight_bytes() {
-        let ev = Ev { entry: entry("e1", 1), at: 0 };
-        let m = Meta::of(&ev, 0);
-        assert_eq!(m.sum_made(), None, "none made as it came in");
-        let made = m.sum(&ev);
-        assert_eq!((made, m.sum_made()), (ev.entry.sum(), Some(ev.entry.sum())), "made, then kept");
-        let copy = m.clone();
-        assert!(copy.sum_made() == Some(made) && copy == m, "a clone keeps it");
-        assert_ne!(Meta::of(&ev, 0), m, "one made and one not aren't equal, as with a OnceLock");
-        assert!(size_of::<Meta>() <= 88, "a meta takes {} bytes", size_of::<Meta>());
-    }
-
-    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): the index's bucket is 8 bytes (half of an id's keyed hash and its
-    /// event's place, each a `u32`), where it was 16; its table hashes a key by the key's own bits, in both halves of
-    /// the `u64` (a bucket picked by the low ones, tagged by the top seven); a place past a `u32` is kept apart by
-    /// its id; and every id is found where it is. A 5,000-event copy's table of 8,192 buckets is 72 KiB, not 136.
-    #[test]
-    fn g11_s5_heap_the_indexs_bucket_is_eight_bytes() {
-        use std::hash::Hasher as _;
-        assert_eq!(size_of::<(u32, u32)>(), 8);
-        let mut spread = Spread::default();
-        spread.write_u32(0x8000_0001);
-        assert_eq!(spread.finish(), 0x8000_0001_8000_0001, "the key in both halves");
-        let mut events = Events::default();
-        for q in 1..=3 {
-            events.push(Ev { entry: entry(&format!("e{q}"), q), at: 0 });
-        }
-        let mut index = Index::of(&events);
-        index.insert(&events, "far", usize::MAX);
-        assert_eq!((index.apart.get("far"), index.get(&events, "far")), (Some(&usize::MAX), Some(usize::MAX)), "a place past a bucket's, kept apart");
-        for q in 1..=3_u64 {
-            assert_eq!(index.get(&events, &format!("e{q}")), usize::try_from(q - 1).ok(), "e{q}");
-        }
-        index.drop_front(1);
-        assert_eq!((index.get(&events, "e1"), index.by_hash.len()), (None, 2), "the oldest let go of");
     }
 }
