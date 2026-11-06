@@ -3988,12 +3988,65 @@ mod tests {
         Err(format!("{id}: revision {rev}, {} events of {to}, the first out of place {:?}", events.len(), events.iter().zip(&want).find(|(a, b)| a != b)))
     }
 
-    /// Goal 4, plan 01a1a59c2a9c step 5: a shard held by one long poll, then blocked in a call, holds up its own owner's
+    /// A shard's hold ([`hold`]): let go of as it's dropped, however its test ends.
+    struct Held {
+        holding: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        /// Whether the hold is still on.
+        fn on(&self) -> bool {
+            self.holding.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Shard `held` held by one poll that doesn't end until it's let go (its [`Held`] dropped), or half a minute on at the
+    /// latest: spinning on the shard's thread, or asleep in a call (`blocked`). Back once it's begun.
+    async fn hold(held: usize, blocked: bool) -> anyhow::Result<Held> {
+        let (holding, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let poll = {
+            let (holding, release) = (Arc::clone(&holding), Arc::clone(&release));
+            async move {
+                holding.store(true, Ordering::SeqCst);
+                let cap = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
+                    if blocked {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                holding.store(false, Ordering::SeqCst);
+            }
+        };
+        anyhow::ensure!(crate::rt::spawn_on(held, poll), "shard {held} refused the hold");
+        let hold = Held { holding, release };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !hold.on() {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "the hold never began");
+            crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        Ok(hold)
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a shard held by one long poll, or blocked in a call, holds up its own owner's
     /// sessions and no other's. While it's held, the owner on this test's shard takes every change sent to its sessions,
-    /// each session's in order; the held owner's sessions take none (their senders wait for room in its inbox, nothing
-    /// dropped) and their readers still read their views (a read that waited on the held owner would have kept the hold
-    /// on to its end). Let go, the held owner takes every change it was sent, each session's in the order sent. With one
-    /// lock over every copy, as there was, a holder held so held up every session (the plan's f4, f5).
+    /// each session's in order; the held owner's sessions take none, and their readers still read their views (a read that
+    /// waited on the held owner would have kept the hold on to its end). Sent by a sender a session, every inbox holding
+    /// about four changes, the held owner's senders wait for room, nothing dropped. Handed over by one loop, as the hub's
+    /// loop hands over every runner's update, every inbox with room for them all (as an owner's holds a window of runners'
+    /// messages, `crate::net::EVENTS_BYTES`), the loop goes on past the held owner (past that room it would wait for it,
+    /// and every session's changes behind it: the bound is the room). Let go, the held owner takes every change it was
+    /// sent, each session's in the order sent. With one lock over every copy, as there was, a holder held so held up every
+    /// session (the plan's f4, f5). The one test of the process that holds a shard until it's done with it: two such at
+    /// once could each hold the other's.
     #[test]
     fn g4_s5_a_held_shard_holds_up_its_own_sessions_and_no_others() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -4002,75 +4055,62 @@ mod tests {
             // This test's task goes on on the shard it began on (a task stays where it's taken in); the next is held.
             let here = hyper_rt::futures::shard_id().and_then(|id| crate::rt::shard_holders().iter().position(|h| h.shard() == id.0)).ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
             let held = (here + 1) % shards;
-            // An owner a shard, as the server has them, each inbox holding about four changes.
-            let copies = Arc::new(Copies::start_with(sim_bus(), shards, 4 * MSG));
             let of = |k: usize| (0u32..).map(|n| format!("h{n}")).filter(|id| owner_of(id, shards) == k).take(6).collect::<Vec<_>>();
             let (theirs, ours) = (of(held), of(here));
-            for id in theirs.iter().chain(&ours) {
-                opened(&copies, id).await;
-            }
             let per = 60u64;
-            for (round, blocked) in [false, true].into_iter().enumerate() {
-                let (from, to) = (per * u64::try_from(round)? + 1, per * u64::try_from(round + 1)?);
-                // The hold: a poll that doesn't end until it's let go (or, at the latest, half a minute on), spinning on
-                // the shard's thread, then asleep in a call.
-                let (holding, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-                let hold = {
-                    let (holding, release) = (Arc::clone(&holding), Arc::clone(&release));
-                    async move {
-                        holding.store(true, Ordering::SeqCst);
-                        let cap = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                        while !release.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
-                            if blocked {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-                        holding.store(false, Ordering::SeqCst);
-                    }
-                };
-                anyhow::ensure!(crate::rt::spawn_on(held, hold), "shard {held} refused the hold");
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while !holding.load(Ordering::SeqCst) {
-                    anyhow::ensure!(std::time::Instant::now() < deadline, "the hold never began");
-                    crate::rt::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                // A sender a session, each on this test's shard (a task spawned from here stays here).
-                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+            for (blocked, one_loop) in [(false, false), (true, false), (false, true)] {
+                // An owner a shard, as the server has them.
+                let room = if one_loop { 2 * usize::try_from(per)? * (theirs.len() + ours.len()) * MSG } else { 4 * MSG };
+                let copies = Arc::new(Copies::start_with(sim_bus(), shards, room));
                 for id in theirs.iter().chain(&ours) {
-                    let (copies, id, done) = (Arc::clone(&copies), id.clone(), done_tx.clone());
-                    drop(crate::rt::spawn(async move {
-                        for n in from..=to {
-                            if !copies.send(&id, change(&id, n)).await {
-                                return;
-                            }
+                    opened(&copies, id).await;
+                }
+                let holds = hold(held, blocked).await?;
+                let (done_tx, done_rx) = async_channel::unbounded::<()>();
+                if one_loop {
+                    // This test's task the one loop, each session's change in turn.
+                    for n in 1..=per {
+                        for id in theirs.iter().chain(&ours) {
+                            anyhow::ensure!(copies.send(id, change(id, n)).await, "the owners went away");
                         }
-                        let _ = done.send(()).await;
-                    }));
+                        crate::rt::maybe_yield().await;
+                    }
+                } else {
+                    // A sender a session, each on this test's shard (a task spawned from here stays here).
+                    for id in theirs.iter().chain(&ours) {
+                        let (copies, id, done) = (Arc::clone(&copies), id.clone(), done_tx.clone());
+                        drop(crate::rt::spawn(async move {
+                            for n in 1..=per {
+                                if !copies.send(&id, change(&id, n)).await {
+                                    return;
+                                }
+                            }
+                            let _ = done.send(()).await;
+                        }));
+                    }
                 }
                 drop(done_tx);
                 // Ours to the end, while theirs is held.
-                loop {
-                    if ours.iter().all(|id| took_in_order(&copies, id, to).is_ok()) {
-                        break;
-                    }
-                    anyhow::ensure!(std::time::Instant::now() < deadline, "the other owner's sessions were held up too: {:?}", ours.iter().map(|id| took_in_order(&copies, id, to)).find(Result::is_err));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !ours.iter().all(|id| took_in_order(&copies, id, per).is_ok()) {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "blocked {blocked}, one loop {one_loop}: the other owner's sessions were held up too: {:?}", ours.iter().map(|id| took_in_order(&copies, id, per)).find(Result::is_err));
                     crate::rt::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 // Theirs took nothing meanwhile, and their views are read while the hold is still on.
                 for id in &theirs {
                     let rev = copies.with(id, |v| v.rev);
-                    anyhow::ensure!(rev == Some(from - 1), "{id} took a change while its shard was held: revision {rev:?}");
+                    anyhow::ensure!(rev == Some(0), "blocked {blocked}, one loop {one_loop}: {id} took a change while its shard was held: revision {rev:?}");
                 }
-                anyhow::ensure!(holding.load(Ordering::SeqCst), "the hold ended before the other owner's sessions were done");
-                release.store(true, Ordering::SeqCst);
-                for _ in theirs.iter().chain(&ours) {
-                    crate::rt::timeout(std::time::Duration::from_secs(30), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("a sender never got its changes in"))??;
+                anyhow::ensure!(holds.on(), "blocked {blocked}, one loop {one_loop}: the hold ended before the other owner's sessions were done");
+                drop(holds);
+                if !one_loop {
+                    for _ in theirs.iter().chain(&ours) {
+                        crate::rt::timeout(std::time::Duration::from_secs(30), done_rx.recv()).await.map_err(|_| anyhow::anyhow!("a sender never got its changes in"))??;
+                    }
                 }
                 copies.settled().await;
                 for id in theirs.iter().chain(&ours) {
-                    took_in_order(&copies, id, to).map_err(anyhow::Error::msg)?;
+                    took_in_order(&copies, id, per).map_err(|e| anyhow::anyhow!("blocked {blocked}, one loop {one_loop}: {e}"))?;
                 }
             }
             Ok(())
