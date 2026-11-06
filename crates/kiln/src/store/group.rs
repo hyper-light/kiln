@@ -204,9 +204,9 @@ impl Leaves {
         self.list.clear();
     }
 
-    /// The SHA-256 (hex) of the leaves of entries `from + 1` to `to`, in order: a checkpoint of
-    /// that stretch of the log, or why this member can't say it.
-    pub fn digest(&self, from: u64, to: u64) -> Result<String, Short> {
+    /// The leaves of entries `from + 1` to `to`, in order, copied ([`digest_of`] makes their checkpoint), or why this
+    /// member can't say them.
+    fn stretch(&self, from: u64, to: u64) -> Result<Vec<[u8; 32]>, Short> {
         if from < self.base {
             return Err(Short::Before(self.base));
         }
@@ -215,12 +215,23 @@ impl Leaves {
         }
         let skip = usize::try_from(from - self.base).unwrap_or(usize::MAX);
         let take = usize::try_from(to.saturating_sub(from)).unwrap_or(usize::MAX);
-        let mut h = sha2::Sha256::new();
-        for l in self.list.iter().skip(skip).take(take) {
-            h.update(l);
-        }
-        Ok(hex::encode(h.finalize()))
+        Ok(self.list.iter().skip(skip).take(take).copied().collect())
     }
+
+    /// The SHA-256 (hex) of the leaves of entries `from + 1` to `to`, in order: a checkpoint of
+    /// that stretch of the log, or why this member can't say it.
+    pub fn digest(&self, from: u64, to: u64) -> Result<String, Short> {
+        self.stretch(from, to).map(|s| digest_of(&s))
+    }
+}
+
+/// The SHA-256 (hex) of `stretch`'s leaves, in order: a checkpoint of that stretch of the log.
+fn digest_of(stretch: &[[u8; 32]]) -> String {
+    let mut h = sha2::Sha256::new();
+    for l in stretch {
+        h.update(l);
+    }
+    hex::encode(h.finalize())
 }
 
 /// Whether `db` is a copy of kiln.db a learner opens on: it says where it stands, and this build
@@ -617,7 +628,11 @@ impl Group {
     /// A checkpoint of the log as this member applied it: the SHA-256 (hex) of the leaves of
     /// entries `from + 1` to `to` ([`Leaves::digest`]), or why it can't say (docs/ci.md W27-R08).
     pub fn digest(&self, from: u64, to: u64) -> Result<String, Short> {
-        self.leaves.lock().digest(from, to)
+        // Copied under the lock and hashed once it's let go: the group's thread takes it to add each entry's leaf as it
+        // applies, and waits a copy's time at the most, not a hash's (goal 9, plan 01a1a87b2cec step 3: a period's
+        // leaves are up to 2 MiB).
+        let stretch = self.leaves.lock().stretch(from, to)?;
+        Ok(digest_of(&stretch))
     }
 
     /// The entry this member's leaves start after: it checks the log's checkpoints from there.

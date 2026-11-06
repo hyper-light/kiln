@@ -155,8 +155,10 @@ pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 
 /// Checkpoint `d`: signed, kept if it closes its period, and sent to the runner process holding the
 /// learner's replica, if it still does and takes custody records.
-async fn checkpoint(hub: &Hub, d: Due) {
-    let Some(group) = hub.store.group() else { return };
+async fn checkpoint(hub: &Arc<Hub>, d: Due) {
+    if hub.store.group().is_none() {
+        return;
+    }
     let instance = {
         let inst = hub.instances.load();
         inst.newest_with(&d.machine, crate::proto::CAP_CLUSTER).filter(|p| *p == d.peer).and_then(|p| inst.get(p)).map(crate::instances::Instance::label)
@@ -169,11 +171,21 @@ async fn checkpoint(hub: &Hub, d: Due) {
         hub.cluster.away(d.member);
         return;
     };
-    let Ok(digest) = group.digest(d.from, d.to) else {
+    // Worked out on the compute pool (goal 9, plan 01a1a87b2cec step 3): a SHA-256 over the leaves of the learner's
+    // period so far, up to 65,536 of them (2 MiB), on the shard that ran this loop every 10 s for each learner, up to
+    // 0.93 ms on the CPU in rt9's rounds.
+    let (h, from, to) = (Arc::clone(hub), d.from, d.to);
+    let digest = match crate::rt::compute(move || h.store.group().map(|g| g.digest(from, to))).await {
+        Ok(Some(Ok(digest))) => digest,
         // kiln no longer holds the leaves its period starts after (it started since, or the
         // learner's period outlasted what it keeps): one starts where the group stands.
-        hub.cluster.restart(d.member, d.to);
-        return;
+        Ok(Some(Err(_))) => {
+            hub.cluster.restart(d.member, d.to);
+            return;
+        }
+        // The group gone meanwhile (the server stopping), or a job that unwound: this one isn't sent, and its period's
+        // next comes in its time.
+        Ok(None) | Err(_) => return,
     };
     let server = super::server_uri(&hub.pki.organization());
     let why = if d.closes { "entries of kiln's cluster log, for the replica this runner keeps: the last of a period" } else { "entries of kiln's cluster log, for the replica this runner keeps" };

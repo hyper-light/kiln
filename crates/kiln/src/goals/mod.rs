@@ -2121,7 +2121,7 @@ where
                 return Ok(());
             }
             ticks = ticks.wrapping_add(1);
-            let (running, waiting) = self.round(&CHANGING).await;
+            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(&CHANGING)).await;
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but
             // for those `keep_going` leaves alone.
             let now = self.clock.unix_ms();
@@ -2137,44 +2137,56 @@ where
             // What follows, up to the settings' read, was one poll but where keep-going sends: its
             // turn on the shard is given up between the agents kept going and between the looks
             // after them, and each agent's children are found among those gathered once (goal 9,
-            // plan 01a1a87b2cec step 3).
+            // plan 01a1a87b2cec step 3). Its turns end their polls, whether or not other work wants the
+            // shard (`rt::Turns::end`): let go on unasked, the driver's polls ran 0.2 to 0.4 ms on
+            // the CPU in rt9's rounds.
             let mut turns = crate::rt::Turns::new();
-            let children = children_of(&all);
-            for info in keep_going(&all, &running, &waiting, &quiet) {
-                keep::tick(self.port, info, now, children_working(&children, &info.id)).await;
-                turns.after().await;
-            }
-            keep::retain(all.iter().map(|i| i.id.as_str()));
+            crate::rt::labeled(&KEEP_GOING, async {
+                let children = children_of(&all);
+                for info in keep_going(&all, &running, &waiting, &quiet) {
+                    keep::tick(self.port, info, now, children_working(&children, &info.id)).await;
+                    turns.end().await;
+                }
+                keep::retain(all.iter().map(|i| i.id.as_str()));
+            })
+            .await;
             if let Some(hub) = self.hub {
                 // Programs' workers held to their usage thresholds, and settings' notices delivered
                 // (docs/programs.md), every 15 s.
                 if ticks.is_multiple_of(10) {
                     crate::programs::enforce(hub).await;
                 }
-                turns.after().await;
+                turns.end().await;
                 // Parents told of their children that settled, so none has to wait for them (one
                 // that's quiet once it goes on).
-                crate::harness::told::tick(hub, &all, now, &running, &quiet).await;
-                turns.after().await;
+                crate::rt::labeled(&TOLD, crate::harness::told::tick(hub, &all, now, &running, &quiet)).await;
+                turns.end().await;
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
+                hyper_rt::futures::label(&ELSEWHERE);
                 crate::harness::elsewhere::tick(hub, &all, now);
-                turns.after().await;
-                // Subagents given the rest of their agent's settings once their harness lists them.
-                crate::harness::lineage::settle_settings(hub).await;
-                // What agents' goals wait on a person for, on their info: Mission Control's Needs
-                // you, and a card wherever you are in kiln (said at once too, as each change makes
-                // it: `say_held`).
-                {
-                    let _one = CHANGING.turn().await;
-                    say_held(hub).await;
-                }
-                // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
-                // one an agent, a version each time it proposes another.
-                for (agent, words) in hub.harness.take_proposed() {
-                    if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
-                        tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                // The infos copied for this tick let go of where they were made (`listed`): each a score
+                // of blocks, every session's freed on the driver's shard each tick (goal 9, plan
+                // 01a1a87b2cec step 3).
+                let_go(all).await;
+                crate::rt::labeled(&TAIL, async {
+                    // Subagents given the rest of their agent's settings once their harness lists them.
+                    crate::harness::lineage::settle_settings(hub).await;
+                    // What agents' goals wait on a person for, on their info: Mission Control's Needs
+                    // you, and a card wherever you are in kiln (said at once too, as each change makes
+                    // it: `say_held`).
+                    {
+                        let _one = CHANGING.turn().await;
+                        say_held(hub).await;
                     }
-                }
+                    // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
+                    // one an agent, a version each time it proposes another.
+                    for (agent, words) in hub.harness.take_proposed() {
+                        if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
+                            tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                        }
+                    }
+                })
+                .await;
             }
         }
     }
@@ -2194,7 +2206,12 @@ where
         // 01a1a87b2cec step 3).
         let mut turns = crate::rt::Turns::new();
         for info in self.agents_shared() {
-            turns.after().await;
+            turns.end().await;
+            // One with no goal set in it has none to adopt: the stacks aren't held for it (goal 9, plan 01a1a87b2cec
+            // step 3: the gate taken and given back for each agent, a fence each time, in the driver's first poll).
+            if set_goal(&info).is_none() {
+                continue;
+            }
             let _one = changing.turn().await;
             if let Err(e) = adopt(self, &info).await {
                 tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
@@ -2295,6 +2312,29 @@ async fn listed(hub: &Hub) -> Vec<Info> {
     crate::rt::compute(move || shared.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<Info>>()).await.unwrap_or_else(|_| hub.harness.list())
 }
 
+/// The copies [`listed`] made let go of on the compute pool too: each info is a score of blocks (its strings, lists and
+/// options), every session's freed on the driver's shard each tick, blocks another thread allocated (goal 9, plan
+/// 01a1a87b2cec step 3). Freed here, should the pool fail to take them.
+async fn let_go(all: Vec<Info>) {
+    let _ = crate::rt::compute(move || drop(all)).await;
+}
+
+/// The goal set in `info`'s agent that its stack may adopt ([`adopt`]): one pursued, or given up on for now but still
+/// set.
+fn set_goal(info: &Info) -> Option<&crate::harness::model::Objective> {
+    info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet"))
+}
+
+/// The goal driver's stretches, each poll of them labeled for the shards' table of what held them (`hyper_rt::slow`),
+/// so the lab says which held its shard (goal 9, plan 01a1a87b2cec step 3): its round of the stacks, keep-going's look
+/// at the agents no stack drives, the parents told of their children, the paused sessions moved elsewhere, and the
+/// tick's tail (subagents' settings, what waits on a person said on the infos, the plans agents proposed).
+static ROUND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' round" };
+static KEEP_GOING: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' keep-going" };
+static TOLD: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' parents told" };
+static ELSEWHERE: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' sessions moved elsewhere" };
+static TAIL: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' settings, holds and proposals" };
+
 /// The agents keep-going looks at: those no goal stack drives (`running`), but for one that paused
 /// its stack for a while (`waiting`: it waits on purpose, until it resumes) and one that's paused
 /// for usage (`quiet`: its session at a limit or its threshold, or its stack for its program's
@@ -2364,7 +2404,7 @@ where
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
 async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
-    let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return Ok(()) };
+    let Some(o) = set_goal(info) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store

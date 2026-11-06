@@ -897,29 +897,22 @@ impl Hub {
     /// machine that holds one), on the sync lane; a learner whose runner is away misses them.
     pub async fn cluster_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let Some(out) = self.store.group().map(crate::store::group::Group::outgoing) else { return Ok(()) };
-        let mut turns = crate::rt::Turns::new();
         // What every whole message says of itself, written once (goal 9, plan 01a1a87b2cec step 5: once a frame).
-        let whole = crate::store::learner::Msg::Raft { id: 0, part: 0, parts: 0 };
-        let whole_json = crate::store::learner::encode(&whole);
-        while let Ok((member, bytes)) = out.recv().await {
-            let peer = self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER));
-            let Some(peer) = peer else {
+        let whole_json = crate::store::learner::encode(&crate::store::learner::Msg::Raft { id: 0, part: 0, parts: 0 });
+        // Each message's learner found here, its frames (a copy of up to half a mebibyte each, a learner's catch-up
+        // many) made on the compute pool and sent in order, in turns (goal 9, plan 01a1a87b2cec step 3: made here
+        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds).
+        let route = |(member, bytes): (u64, Vec<u8>)| match self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER)) {
+            Some(peer) => Some((peer, self.cluster.frames(member, bytes))),
+            None => {
                 if let Some(g) = self.store.group() {
                     g.unreachable(member);
                 }
-                continue;
-            };
-            // A long message's parts made and sent one at a time, the shard given up between them once this
-            // loop has had its turn (goal 9, plan 01a1a87b2cec step 3: a learner's catch-up, copied and sent in
-            // one poll, held its shard up to 5.7 ms in the lab's g6c2).
-            for (msg, raft) in self.cluster.frames(member, bytes) {
-                let json = if msg == whole { whole_json.clone() } else { crate::store::learner::encode(&msg) };
-                if let Ok(b) = proto::encode(&ServerMsg::Cluster { json, raft }) {
-                    self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
-                }
-                turns.after().await;
+                None
             }
-        }
+        };
+        let make = move |frames: crate::store::learner::Frames| crate::store::learner::encoded(frames, &whole_json);
+        crate::net::send_made(&out, route, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
         Ok(())
     }
 
