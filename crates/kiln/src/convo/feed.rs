@@ -298,21 +298,13 @@ impl Shipper {
     fn start_as(store: Store, restore: bool, skip: Option<Skip>, hold: Hold) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         let (tx, rx) = links();
         let (out_tx, out_rx) = parts_out();
-        // Each commit, as a nudge in the same queue.
-        let watch = store.watch();
-        let nudge = tx.clone();
-        // The feed's two tasks on the next shards round-robin, not the one that starts it: a server
-        // starts every feed on the shard its start-up runs on (goal 9, plan 01a1a87b2cec step 3).
-        crate::rt::spawn_spread(async move {
-            while watch.recv().await.is_ok() {
-                if nudge.send(Link::Wrote).await.is_err() {
-                    break;
-                }
-            }
-        });
+        // Its store's commits, which it waits on at its store's tip ([`Store::watch`]).
+        let commits = store.watch();
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
         let signs = Signs::default();
-        crate::rt::spawn_spread(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone(), hold));
+        // On the next shard round-robin, not the one that starts it: a server starts every feed on the shard its start-up
+        // runs on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(ship(store, rx, commits, out_tx, restore, skip, stats.clone(), signs.clone(), hold));
         (Self { tx, stats, signs }, out_rx)
     }
 
@@ -353,7 +345,7 @@ struct Shipping {
 static CHANGED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[allow(clippy::too_many_arguments)]
-async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs, hold: Hold) {
+async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: std::sync::Arc<crate::rt::Notify>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs, hold: Hold) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -371,9 +363,8 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
     let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
-    // Its turns on its shard: what waits in its queue is taken without waiting (a commit's nudges pile up while its
-    // window is full, 20 a second for as long as its taker is slow), so it's given up between them once its turn would
-    // pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+    // Its turns on its shard: what waits in its queue is taken without waiting (its link's words pile up there while it
+    // reads), so it's given up between them once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
     let mut turns = crate::rt::Turns::new();
     // What its store committed since it last read all it had, held to ship as one batch (goal 9, plan 01a1a87b2cec step 5):
     // since when (the first commit it heard of since), and how far its store had grown as of that read ([`Store::grown`]).
@@ -390,11 +381,27 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
             Some(at) if up && st.acked.is_some() && st.flight.len() < WINDOW => (at + hold.every).saturating_duration_since(Instant::now()).min(Duration::from_secs(1)),
             _ => Duration::from_secs(1),
         };
-        let ev = match crate::rt::timeout(wait, rx.recv()).await {
-            Ok(Ok(ev)) => Some(ev),
+        // Its store's next commit is news only at its store's tip, holding nothing: holding, or reading on, it reads what
+        // came meanwhile as it goes on, so it waits on its link alone, and the commits meanwhile wake nothing (goal 9, plan
+        // 01a1a87b2cec step 5: [`Store::watch`]). One it didn't wait for is told as it next waits, however many came.
+        let at_tip = up && st.acked.is_some() && held.is_none() && !behind && through.is_none();
+        let next = async {
+            let link = std::pin::pin!(rx.recv());
+            if !at_tip {
+                return link.await.map(Some);
+            }
+            match futures::future::select(link, std::pin::pin!(commits.notified())).await {
+                futures::future::Either::Left((ev, _)) => ev.map(Some),
+                futures::future::Either::Right(((), _)) => Ok(Some(Link::Wrote)),
+            }
+        };
+        let ev = match crate::rt::timeout(wait, next).await {
+            Ok(Ok(ev)) => ev,
             Ok(Err(_)) => return,
             Err(_) => None,
         };
+        #[cfg(test)]
+        stats.woke();
         match ev {
             Some(Link::Up) => {
                 up = true;
@@ -1479,6 +1486,43 @@ mod tests {
             }
             let bodies: Vec<usize> = server.kept("a1", 10)?.map(|k| k.events.iter().map(|e| e.body.len()).collect()).unwrap_or_default();
             anyhow::ensure!(bodies.iter().any(|n| *n >= past.len()), "the event whole: {bodies:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a feed holding what its store committed is woken by none of the commits meanwhile
+    /// ([`Store::watch`]: a task of its own took each commit's word and passed it on, both woken for every commit), and ships
+    /// them all once its hold has passed. Do: a feed at its store's tip with a hold of 8 s; up to ten commits a writer's
+    /// commit apart (`COMMIT_MS`), each waited for, while half the hold lasts (a loaded disk holds a commit for hundreds of
+    /// ms); count its wakes over them. Expect: the first commit's, which starts its hold, and one a second for its wait's
+    /// own bound, not one a commit (more commits than that, so a wake a commit would show); every event at the server.
+    #[test]
+    fn g9_s5_a_feed_holding_what_came_is_woken_by_no_commit_meanwhile() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            const HOLD: Duration = Duration::from_secs(8);
+            const COMMITS: u64 = 10;
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            let (ship, out, mut partial) = shipper_at_tip(&runner, &server, Hold { every: HOLD, bytes: SHIP_AT_BYTES }).await?;
+            let (first, before) = (Instant::now(), ship.stats.wakes());
+            let (mut commits, mut took_for, mut wakes) = (0u64, Duration::ZERO, 0u64);
+            while commits < COMMITS && first.elapsed() < HOLD / 2 {
+                commits += 1;
+                runner.send("a1", &said(&format!("m{}", commits + 1), commits + 1, "the deadline"));
+                runner.sync()?;
+                (took_for, wakes) = (first.elapsed(), ship.stats.wakes().saturating_sub(before));
+                crate::rt::sleep(Duration::from_millis(super::super::store::COMMIT_MS)).await;
+            }
+            let most = 1 + took_for.as_secs() + 1;
+            anyhow::ensure!(commits > most, "{commits} commits in half the hold, against at most {most} wakes: too few to tell a wake a commit from none");
+            anyhow::ensure!(wakes <= most, "{wakes} wakes over {commits} commits in {took_for:?} while it held them (at most {most})");
+            let all = usize::try_from(1 + commits)?;
+            while server.kept("a1", 20)?.map_or(0, |k| k.events.len()) < all {
+                let (json, data) = crate::rt::timeout(HOLD * 2, out.recv()).await??;
+                for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                    ship.link(Link::Heard(m));
+                }
+            }
             Ok(())
         })
     }
