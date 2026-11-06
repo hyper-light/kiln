@@ -801,11 +801,13 @@ impl Chunk {
 /// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unread {
-    /// The range isn't all there, a compact chunk's segment can't be read, or one is spilled: the store answers.
+    /// The range isn't all there, or a compact chunk's segment can't be read (a spill file that doesn't give it back):
+    /// the store answers.
     Cannot,
     /// A compact chunk's texts the range needs aren't kept, and making them (inflating its segment) wasn't asked
-    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while it's
-    /// its copy's newest compact chunk (goal 10, plan 01a1a87b2dae step 5).
+    /// for: they're made off the request's shard ([`View::events_page`]), and kept for the reads after while its
+    /// copy's newest page reaches it (goal 10, plan 01a1a87b2dae step 5). A spilled chunk's are read from its spill
+    /// file there, and kept by no read (goal 11 audit A3).
     Unkept,
 }
 
@@ -1015,10 +1017,12 @@ impl Events {
     /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
     /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
     /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. [`Unread::Cannot`] where `texts_into` says none.
+    /// events' texts written out once. [`Unread::Cannot`] where the range isn't all there, or a chunk's segment can't be
+    /// read.
     ///
-    /// A compact chunk's segment is inflated only where `inflate` says so (step 5): a read on a shard takes the
-    /// texts its copy's reads kept, and has the others made off the shard ([`Unread::Unkept`]). An inflate is a
+    /// A compact chunk's segment is inflated only where `inflate` says so (step 5), and a spilled one's read from its
+    /// file first (goal 11 audit A3): a read on a shard takes the texts its copy's reads kept, and has the others made
+    /// off the shard ([`Unread::Unkept`]). An inflate is a
     /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
     /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
     /// 3.6 ms on the CPU, past the shards' quantum.
@@ -1028,8 +1032,14 @@ impl Events {
             let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
             let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
             let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
-            if n == 0 || chunk.is_spilled() {
+            if n == 0 {
                 return Err(Unread::Cannot);
+            }
+            // A spilled chunk's texts are read from its spill file off the runtime's threads alone, which may wait on disk:
+            // a read on a shard has them read off it (goal 11 audit A3). The store answered such a range: a read of its
+            // rows, each one's JSON read and written out again.
+            if chunk.is_spilled() && !inflate {
+                return Err(Unread::Unkept);
             }
             if i > range.start {
                 out.push(Bytes::from_static(b","));
@@ -5415,7 +5425,8 @@ mod tests {
     /// Goal 11, plan 01a1a87b2e56 step 5: a copy whose sealed chunks past its newest page went to its spill
     /// file attaches as it did: a viewer's snapshot (its frames, and packed as one message) and a catch-up are
     /// the same bytes, in the same order, as before the spill. The events API's newest page still comes from
-    /// memory, an older page from the store; and an event changed in a spilled chunk is read back and changed.
+    /// memory, an older page from the spill file, off the shard (goal 11 audit A3: from the store); and an event
+    /// changed in a spilled chunk is read back and changed.
     #[test]
     fn g11_s5_a_spilled_copy_attaches_as_it_did() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -5433,6 +5444,8 @@ mod tests {
         m.events.compact(None);
         m.publish();
         let before = attached(&m)?;
+        let older = m.view().events_json(Some(20), 10);
+        anyhow::ensure!(older.is_some(), "an older page from memory");
         let newest = m.view().events_json(None, 50);
         anyhow::ensure!(newest.is_some(), "the newest page from memory");
         let chunks = m.events.spillable(EVENTS_PAGE);
@@ -5449,7 +5462,9 @@ mod tests {
         anyhow::ensure!(resident(&m) < held, "what went to the file left the copy's memory: {} of {held}", resident(&m));
         anyhow::ensure!(attached(&m)? == before, "the same bytes, in the same order, after the spill");
         anyhow::ensure!(m.view().events_json(None, 50) == newest, "the newest page still from memory");
-        anyhow::ensure!(m.view().events_json(Some(20), 10).is_none(), "an older page is the store's to answer");
+        // An older page, from the spill file off the shard: the same bytes (goal 11 audit A3: the store answered it).
+        anyhow::ensure!(m.view().events_page_kept(Some(20), 10) == Err(Unread::Unkept), "an older page is read off the shard");
+        anyhow::ensure!(m.view().events_json(Some(20), 10) == older, "an older page from the spill file, the same bytes");
         // An event of a spilled chunk changed: read back, changed, its chunk in memory again.
         m.rev = n + 1;
         m.upsert(Arc::new(Entry::new(json!({"id": "e3", "seq": 3, "kind": "assistant", "text": "said again"}))));
@@ -5501,6 +5516,10 @@ mod tests {
         anyhow::ensure!(with.packed("synced").is_ok(), "packed from the store's events too");
         let without = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None };
         anyhow::ensure!(without.packed("synced").is_err(), "no store: refused, not made wrong");
+        // A page of the events API that touches one: refused off the shard as well, for the store to answer (goal 11 audit
+        // A3: such a page is read from the spill file, and one that doesn't read back is the store's).
+        anyhow::ensure!(m.view().events_page_kept(Some(20), 10) == Err(Unread::Unkept), "read off the shard");
+        anyhow::ensure!(m.view().events_page(Some(20), 10).is_none(), "refused there, the store's to answer");
         store.close()?;
         Ok(())
     }

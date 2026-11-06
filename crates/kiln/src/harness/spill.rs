@@ -124,6 +124,13 @@ fn less64(count: &AtomicU64, n: u64) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: segments read back from a spill file on this thread ([`Spilled::segment`]), as `super::packed::INFLATED`
+    /// counts inflates: what a request's polls on its shard read from disk (goal 11 audit A3: none).
+    pub(crate) static READ_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Where a segment went, and what to check it by: shared by every chunk that holds it (a view's copy
 /// and the owner's), its bytes counted live until the last lets go.
 #[derive(Clone)]
@@ -163,6 +170,8 @@ impl Spilled {
         } else {
             READS_POOL.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(test)]
+        READ_BACK.with(|n| n.set(n.get().wrapping_add(1)));
         let mut buf = vec![0u8; p.bytes];
         let read = read_at(&p.file.file, &mut buf, p.at).and_then(|()| {
             if crc32fast::hash(&buf) == p.sum { Ok(()) } else { Err(io::Error::new(io::ErrorKind::InvalidData, "a spilled segment didn't read back as written")) }
