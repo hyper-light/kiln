@@ -22,11 +22,12 @@ pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 /// What `out` holds, each sent in its turn (goal 9, plan 01a1a87b2cec step 3): its queue and the net thread's take a
 /// message without waiting, so a replica catching up (up to thousands waiting) was sent in one poll; then, taking
 /// turns, each message was still copied as it was encoded (up to half a mebibyte), 0.16 to 0.39 ms on the CPU in a
-/// poll in rt9's rounds. Each message's runner process is found here, its frame made on the compute pool, and the
-/// frames sent in order in turns that end their polls (`crate::net::send_made`).
+/// poll in rt9's rounds. Each message's runner process is found here, its frame made on the compute pool (or where it
+/// is, a batch of short ones: goal 9, plan 01a1a87b2cec step 5), and the frames sent in order in turns that end their
+/// polls (`crate::net::send_made`).
 async fn send_each(hub: &Hub, out: &async_channel::Receiver<Box<super::owner::Out>>) {
     let route = |m: Box<super::owner::Out>| hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE).map(|peer| (peer, m));
-    crate::net::send_made(out, route, observe_frame, |peer, b| hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b)).await;
+    crate::net::send_made(out, route, |m| m.bytes.len(), observe_frame, |peer, b| hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b)).await;
 }
 
 /// A message to a runner's replica as observe's lane carries it: its words beside its bytes. Made on the compute pool

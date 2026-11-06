@@ -901,9 +901,10 @@ impl Hub {
         let whole_json = crate::store::learner::encode(&crate::store::learner::Msg::Raft { id: 0, part: 0, parts: 0 });
         // Each message's learner found here, its frames (a copy of up to half a mebibyte each, a learner's catch-up
         // many) made on the compute pool and sent in order, in turns (goal 9, plan 01a1a87b2cec step 3: made here
-        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds).
+        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds); a write's few short messages
+        // made here, by their bytes (`crate::net::send_made`, step 5).
         let route = |(member, bytes): (u64, Vec<u8>)| match self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER)) {
-            Some(peer) => Some((peer, self.cluster.frames(member, bytes))),
+            Some(peer) => Some((peer, (bytes.len(), self.cluster.frames(member, bytes)))),
             None => {
                 if let Some(g) = self.store.group() {
                     g.unreachable(member);
@@ -911,8 +912,8 @@ impl Hub {
                 None
             }
         };
-        let make = move |frames: crate::store::learner::Frames| crate::store::learner::encoded(frames, &whole_json);
-        crate::net::send_made(&out, route, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
+        let make = move |(_, frames): (usize, crate::store::learner::Frames)| crate::store::learner::encoded(frames, &whole_json);
+        crate::net::send_made(&out, route, |(bytes, _)| *bytes, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
         Ok(())
     }
 
