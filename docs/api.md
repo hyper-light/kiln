@@ -19,6 +19,7 @@ screen.
 | GET | `/api/auth/otp?code=…` | one-time code from `kiln login` | 302 → `/` + cookie |
 | POST | `/api/auth/logout` | | 204 |
 | GET | `/api/me` | | `{ "authenticated": true, "version": "0.2.0", "hostname": "…" }` |
+| POST | `/api/me/door` | | the HTTP/3 door's URL with a single-use ticket and the certificate hashes to pin, or `{ "on": false }` (docs/browser-protocol.md, "The HTTP/3 door") |
 
 ## Types
 

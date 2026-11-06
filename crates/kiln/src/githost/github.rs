@@ -696,7 +696,7 @@ fn rfc3339(unix: i64) -> String {
 /// as it's broadcast, and every minute the ones GitHub may have missed.
 pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),

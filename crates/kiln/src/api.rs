@@ -657,6 +657,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let rest: Vec<&str> = rest.to_vec();
             boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
         }
+        // The HTTP/3 door's URL, pinned hashes and a single-use ticket for the caller (goal 4 step 6).
+        (&Method::POST, ["api", "me", "door"]) => Ok(srv::json(StatusCode::OK, &crate::h3door::info(&caller.name))),
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
         (&Method::POST, ["api", "me", "passkeys", "options"]) => {
@@ -1605,7 +1607,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     }
     let Ok(range) = byte_range(req, size) else { return Ok(unsatisfiable(size)) };
     let (start, end) = range.unwrap_or((0, size.saturating_sub(1)));
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let (tx, rx) = read_ahead(READ_AHEAD);
     crate::rt::spawn(async move {
         let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
         let mut at = start;
@@ -1684,7 +1686,7 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
     }
     let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let (tx, rx) = read_ahead(READ_AHEAD);
     let size = meta.size;
     crate::rt::spawn(async move {
         let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
@@ -1737,8 +1739,8 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
             let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
             let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
             let key = crate::harness::streams::recording_key(id, rid, what);
-            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, start, end) };
-            file_response(meta, &path, &etag, false, range, srv::channel_body(body))
+            let body = if meta.size == 0 { srv::channel_body(futures::stream::empty()) } else { srv::channel_body(crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, start, end)) };
+            file_response(meta, &path, &etag, false, range, body)
         }
         None => serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?,
     };
@@ -1780,7 +1782,7 @@ async fn serve_from(hub: &Arc<Hub>, id: &str, location: crate::harness::registry
     }
     let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
-    let (tx, rx) = async_channel::bounded::<Bytes>(2);
+    let (tx, rx) = read_ahead(MACHINE_AHEAD);
     let (h, session, p, m) = (hub.clone(), id.to_owned(), path.clone(), meta.clone());
     crate::rt::spawn(async move {
         let mut at = start;
@@ -2143,13 +2145,33 @@ async fn copy_changed(path: &std::path::Path) {
     }
 }
 
+/// A file's pieces of 256 KiB read ahead of the viewer that asked for it, at the most: as many as the channel
+/// they waited in held (a MiB a viewer). Its reader waits for room past them.
+const READ_AHEAD: usize = 4;
+
+/// A session's machine's file's pieces ([`crate::harness::files::PIECE`]) read ahead of its viewer, at the
+/// most: as many as the channel they waited in held.
+const MACHINE_AHEAD: usize = 2;
+
+/// A learner's copy of kiln.db read ahead of its runner, at the most: sixteen pieces of 256 KiB (four MiB), as
+/// many as the channel they waited in held.
+const COPY_AHEAD: usize = 16;
+
+/// A response's pieces read ahead of the connection that sends them (goal 4, plan 01a1a59c2a9c step 5):
+/// `ahead` of them whatever each carries, lock-free (`crate::memory::queue`: an async-channel's wait took
+/// event-listener's `Mutex`, the reader sending on its shard or thread and the connection waiting on its own),
+/// the reader waiting for room past them.
+fn read_ahead(ahead: usize) -> (crate::memory::queue::Sender<Bytes>, crate::memory::queue::Receiver<Bytes>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, ahead)
+}
+
 /// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from
 /// the file opened now. The next copy is made once this one is handed over and clears what a stop
 /// left behind, this copy's name among it: an open file outlives its name (and Windows keeps it).
-fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, async_channel::Receiver<Bytes>)> {
+fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, crate::memory::queue::Receiver<Bytes>)> {
     let mut f = std::fs::File::open(&path)?;
     let size = f.metadata()?.len();
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    let (tx, rx) = read_ahead(COPY_AHEAD);
     crate::rt::spawn(async move {
         let _ = crate::rt::blocking(move || -> std::io::Result<()> {
             use std::io::Read as _;
@@ -2254,8 +2276,8 @@ async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     let Ok(range) = byte_range(&req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
     let length = if meta.size == 0 { 0 } else { end.saturating_sub(start).saturating_add(1) };
-    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), start, end) };
-    let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", srv::channel_body(body));
+    let body = if req.method() == Method::HEAD || meta.size == 0 { srv::channel_body(futures::stream::empty()) } else { srv::channel_body(crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), start, end)) };
+    let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", body);
     r = srv::with_header(r, header::CONTENT_LENGTH, &length.to_string());
     r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
     if range.is_some() {
@@ -5031,8 +5053,18 @@ async fn events_let(hub: &Hub, out: &crate::wire::events::feed::Outbox, narrow: 
 async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked: Asked, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
     use crate::wire::events::feed::{self, At, Since};
     use futures::FutureExt as _;
-    let (mut tx, mut rx_ws) = socket.split();
+    let (mut tx, rx_ws) = socket.split();
+    // The page's own messages are asked for only once its socket woke (`ws::Gated`; goal 9, plan 01a1a87b2cec
+    // step 5): every frame the feed takes wakes this task, and each ask zero-filled the socket's read buffer and
+    // read nothing.
+    let mut rx_ws = ws::Gated::new(rx_ws);
+    // The hub's events and agent sessions' own, both numbered in the feed (W21-R15), which no push or read
+    // takes a lock of (`crate::wire::events::feed`; goal 4, plan 01a1a59c2a9c step 5, and goal 5's rule): no
+    // lock between this socket's shard and their senders'.
     let fd = &hub.feed;
+    // Listened to before the first look, for as long as the socket's open: a frame pushed while it looks
+    // wakes its next wait.
+    let woke = fd.listen();
     let batch = asked.batch;
     let (mut cursor, missed) = if batch { fd.resume(asked.after.as_deref()) } else { (fd.head(), false) };
     let mut out = feed::Outbox::new(asked.topics);
@@ -5047,7 +5079,6 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked:
     let mut sent_at: Option<Instant> = None;
     let mut due: Option<Instant> = None;
     loop {
-        let woke = fd.listen();
         cursor = take_since(hub, &mut tx, cursor, &mut out, batch, everything, &mut narrow, &mut agents).await?;
         if batch && (first || !out.is_empty()) {
             let now = Instant::now();
@@ -5070,7 +5101,7 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked:
             }
         };
         futures::select_biased! {
-            _ = woke.fuse() => {}
+            () = woke.woken().fuse() => {}
             _ = window.fuse() => {}
             msg = rx_ws.next().fuse() => {
                 let came = ui::came(msg);
@@ -6483,8 +6514,10 @@ const AUDITS_WAITING: usize = 256;
 /// they came, beside the socket: a command never waits for the store, whose one connection a busy
 /// disk's checkpoint or another caller's long write holds for seconds. A message once waited so
 /// before it went, and showed seconds late. What's waiting when the socket closes is still written.
-fn audits(store: &crate::store::Store, who: String) -> async_channel::Sender<String> {
-    let (tx, rx) = async_channel::bounded::<String>(AUDITS_WAITING);
+fn audits(store: &crate::store::Store, who: String) -> crate::memory::queue::Sender<String> {
+    // Lock-free (goal 4, plan 01a1a59c2a9c step 5): an async-channel's wait took event-listener's `Mutex`, the
+    // socket's commands on its shard and the writer waiting on its own.
+    let (tx, rx) = crate::memory::queue::places::<String>(&crate::memory::owners::CHANNELS, AUDITS_WAITING);
     let store = store.clone();
     crate::rt::spawn(async move {
         while let Ok(detail) = rx.recv().await {
@@ -6498,7 +6531,7 @@ fn audits(store: &crate::store::Store, who: String) -> async_channel::Sender<Str
 /// not what it says. It goes to the socket's writer of rows (`audits`, made at its first command),
 /// so the command goes on without waiting for the store; should that writer be gone, it's written
 /// here.
-async fn audit_command(hub: &Hub, audit: &mut Option<async_channel::Sender<String>>, who: &str, id: &str, c: &crate::harness::model::Command) {
+async fn audit_command(hub: &Hub, audit: &mut Option<crate::memory::queue::Sender<String>>, who: &str, id: &str, c: &crate::harness::model::Command) {
     let kind = serde_json::to_value(c).ok().and_then(|v| v.get("type").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
     let writer = audit.get_or_insert_with(|| audits(&hub.store, who.to_owned()));
     if let Err(async_channel::SendError(row)) = writer.send(format!("{id}: {kind}")).await {
@@ -6674,7 +6707,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let mut have = att.rev;
     let closed = || ws::text(SessionDown::from(SessionFrame::Closed).text());
     // The writer of its commands' audit rows (`audits`), from its first command.
-    let mut audit: Option<async_channel::Sender<String>> = None;
+    let mut audit: Option<crate::memory::queue::Sender<String>> = None;
     // Its last catch-up: when it ended, and how long it took to make and send.
     let mut caught_up: Option<(Instant, Duration)> = None;
     loop {
@@ -7031,7 +7064,7 @@ mod tests {
             let from = hub.feed.head();
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
-            hub.emit_harness(&serde_json::to_vec(&info)?);
+            hub.emit_harness("s1", &serde_json::to_vec(&info)?);
             hub.emit(&ServerEvent::Terminals);
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());
@@ -7069,9 +7102,16 @@ mod tests {
             }
             let mut three = Written::default();
             let mut out = crate::wire::events::feed::Outbox::new(None);
-            take_since(&hub, &mut three, behind, &mut out, false, true, &mut None, &mut None).await?;
+            let at = take_since(&hub, &mut three, behind, &mut out, false, true, &mut None, &mut None).await?;
             let said: Vec<String> = three.sent.iter().filter_map(text).collect();
-            anyhow::ensure!(said.first().map(String::as_str) == Some(ServerEvent::Resync.text().as_str()) && three.flushes == 1, "{said:?}");
+            // It starts over from where the feed is: `Resync`, and nothing from before the gap.
+            anyhow::ensure!(said == [ServerEvent::Resync.text()] && three.flushes == 1, "{said:?}");
+            let after = r#"{"type":"updates","n":"after"}"#;
+            hub.feed.push(Arc::from(after));
+            let mut four = Written::default();
+            take_since(&hub, &mut four, at, &mut out, false, true, &mut None, &mut None).await?;
+            let said: Vec<String> = four.sent.iter().filter_map(text).collect();
+            anyhow::ensure!(said.iter().any(|s| s == after) && !said.iter().any(|s| s.starts_with(r#"{"type":"updates","n":"#) && s != after), "then what comes after it: {said:?}");
             Ok(())
         })
     }
@@ -7139,6 +7179,98 @@ mod tests {
                 got.extend_from_slice(&chunk);
             }
             anyhow::ensure!(u64::try_from(want.len())? == size && got == want, "streamed {} of {} bytes", got.len(), want.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a response's pieces read ahead of their connection, on a lock-free
+    /// queue now. A learner's copy of kiln.db, read by a thread of its own, stops at [`COPY_AHEAD`] pieces
+    /// while nothing takes them (its connection behind) and goes on as they're taken; its body gives every
+    /// byte once, in order.
+    #[test]
+    fn g4_s5_a_copy_read_ahead_stops_at_its_places_and_streams_whole() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use http_body_util::BodyExt as _;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("copy.db");
+            // Three times the pieces it may read ahead, of the 256 KiB it reads at a time.
+            let want: Vec<u8> = (0..(3 * COPY_AHEAD * (256 << 10))).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            std::fs::write(&path, &want)?;
+            let (size, rx) = copy_body(path)?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while rx.len() < COPY_AHEAD && Instant::now() < deadline {
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            crate::rt::sleep(Duration::from_millis(100)).await;
+            anyhow::ensure!(rx.len() == COPY_AHEAD, "{} pieces read ahead, of {COPY_AHEAD}", rx.len());
+            let got = srv::channel_body(rx).collect().await?.to_bytes();
+            anyhow::ensure!(u64::try_from(want.len())? == size && got.as_ref() == want.as_slice(), "streamed {} of {} bytes", got.len(), want.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a socket's audit rows, on a lock-free queue now: with the store held,
+    /// its commands go on until [`AUDITS_WAITING`] rows wait (and the one being written), then wait for room
+    /// (a row is never dropped); once the store is free every row is written, in the order the commands came.
+    #[test]
+    fn g4_s5_a_sockets_audit_rows_wait_for_room_and_keep_their_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // The store's one connection held until the test lets it go.
+            let (held, holding) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
+            let (free, freed) = std::sync::mpsc::channel::<()>();
+            let busy = hub.store.clone();
+            let hold = crate::rt::spawn(async move {
+                busy.call(move |_| {
+                    let _ = held.send_blocking(());
+                    let _ = freed.recv_timeout(Duration::from_secs(30));
+                    Ok(())
+                })
+                .await
+            });
+            holding.recv().await?;
+            let rows = AUDITS_WAITING + 8;
+            let went = Arc::new(AtomicUsize::new(0));
+            let commands = crate::rt::spawn({
+                let (hub, went) = (Arc::clone(&hub), Arc::clone(&went));
+                async move {
+                    let mut audit = None;
+                    for n in 0..rows {
+                        let send: crate::harness::model::Command = serde_json::from_value(json!({"type": "send", "id": format!("m{n}"), "text": "go"}))?;
+                        audit_command(&hub, &mut audit, "user:dev1", &format!("row-{n}"), &send).await;
+                        went.store(n + 1, Ordering::Release);
+                    }
+                    anyhow::Ok(())
+                }
+            });
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            let gone = went.load(Ordering::Acquire);
+            anyhow::ensure!(gone <= AUDITS_WAITING + 1, "{gone} commands went with the store held: their rows didn't wait for room");
+            let _ = free.send(());
+            commands.await.map_err(|_| anyhow::anyhow!("the commands never went"))??;
+            let mut q = HashMap::new();
+            q.insert("limit".to_owned(), "1000".to_owned());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let written = loop {
+                let all = crate::audit::list(&hub.store, &q).await?;
+                let mut written: Vec<String> = all
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.get("action").and_then(serde_json::Value::as_str) == Some("agent.command"))
+                    .map(|r| r.get("detail").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned())
+                    .collect();
+                // Newest first: in the order they were written.
+                written.reverse();
+                if written.len() >= rows || Instant::now() > deadline {
+                    break written;
+                }
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            };
+            let want: Vec<String> = (0..rows).map(|n| format!("row-{n}: send")).collect();
+            anyhow::ensure!(written == want, "{} rows of {rows}: lost, doubled or out of order", written.len());
+            let _ = hold.await;
             Ok(())
         })
     }

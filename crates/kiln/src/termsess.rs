@@ -136,7 +136,7 @@ pub struct Session {
     /// It has had output.
     said: std::sync::atomic::AtomicBool,
     out: crate::memory::ring::Ring<Frame>,
-    input: async_channel::Sender<Input>,
+    input: crate::memory::queue::Sender<Input>,
     close: Shutdown,
     /// Output the hub had no room for in this session's relay ([`forward`]): gaps its relay repairs
     /// from the machine's replay of the session. Only rises.
@@ -171,12 +171,12 @@ impl Session {
         Self::with_id(id, target, command, cols, rows).0
     }
 
-    fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
+    fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, crate::memory::queue::Receiver<Input>) {
         Self::with_id(crate::util::new_id(), target, command, cols, rows)
     }
 
-    fn with_id(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
-        let (input, input_rx) = async_channel::bounded(1024);
+    fn with_id(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, crate::memory::queue::Receiver<Input>) {
+        let (input, input_rx) = inputs();
         let cols = cols.clamp(2, 1000);
         let rows = rows.clamp(2, 1000);
         let session = Arc::new(Self {
@@ -606,13 +606,35 @@ pub fn adopt_agent(hub: &Arc<Hub>, machine: &str, info: &crate::proto::TermInfo)
     run_agent(hub, machine.to_owned(), session, input, Some(ServerMsg::TermAttach { session: info.session.clone() }));
 }
 
+/// A terminal's keystrokes and resizes waiting for its relay, at the most: as many as the channel it was held
+/// ([`inputs`]). Past it one is dropped, said in the log, as it always was: a person typing that far ahead of
+/// their machine is told nothing else either way.
+const INPUTS: usize = 1024;
+
+/// A remote terminal's output waiting for its relay, at the most: as many as the channel it was held
+/// ([`relay`]). Past it output is a gap its relay repairs ([`forward`]).
+const RELAY: usize = 4096;
+
+/// A terminal's input queue: [`INPUTS`] of them whatever each carries (a keystroke or a paste), lock-free
+/// (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's
+/// `Mutex`, its viewers' sockets sending on their shards and its relay waiting on its own).
+fn inputs() -> (crate::memory::queue::Sender<Input>, crate::memory::queue::Receiver<Input>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, INPUTS)
+}
+
+/// A remote terminal's relay queue: [`RELAY`] outputs whatever each carries, lock-free, the hub's loop sending
+/// (without waiting, [`forward`]) and the relay taking (goal 4, plan 01a1a59c2a9c step 5, as [`inputs`]).
+fn relay() -> (crate::memory::queue::Sender<TermOut>, crate::memory::queue::Receiver<TermOut>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, RELAY)
+}
+
 /// Hands `out` to a terminal's relay without waiting (goal 3, plan 01a1a59c2a8e step 5): the hub's
 /// loop takes every runner's messages, and it waited for room in one terminal's relay, every runner's
 /// messages behind it. Output with no room is a gap in `session`, which its relay repairs from the
 /// machine's replay of the session (the relay asks for it, and sets aside what comes until it does);
 /// an end (`Exit`, `Gone`) with no room goes on its own once there is, after what came before it, as
 /// its relay's sender is taken from the hub's map with it and nothing follows it.
-pub fn forward(tx: &async_channel::Sender<TermOut>, session: Option<&Session>, out: TermOut) {
+pub fn forward(tx: &crate::memory::queue::Sender<TermOut>, session: Option<&Session>, out: TermOut) {
     match tx.try_send(out) {
         Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
         Err(async_channel::TrySendError::Full(TermOut::Data(_) | TermOut::Replay(_))) => {
@@ -656,12 +678,12 @@ async fn ask_replay(hub: &Arc<Hub>, machine: &str, session: &str) {
     }
 }
 
-fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_channel::Receiver<Input>, first: Option<ServerMsg>) {
+fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: crate::memory::queue::Receiver<Input>, first: Option<ServerMsg>) {
     hub.terminals.insert(&s);
     let h = Arc::clone(hub);
     crate::rt::spawn(async move {
         let key = format!("{machine}/{}", s.id);
-        let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
+        let (out_tx, out_rx) = relay();
         h.terms.update(|m| m.insert(key.clone(), out_tx.clone()));
         // A terminal to open is a live command (`crate::wire::commands`): refused at once while its
         // machine is away, and answered once it opened it. Unanswered, it goes on: its output says.
@@ -857,7 +879,9 @@ mod tests {
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a slow viewer's frames are kept up to the session's backlog in
     /// bytes (its count of frames too), counted as the terminals' feeds' on `/metrics`; past it the viewer
-    /// is told it fell behind, and the repaint it's sent then holds the session's state.
+    /// is told it fell behind, and goes on from after what it missed (goal 4, plan 01a1a59c2a9c step 5: the
+    /// frames it held from before are let go of, so none older than the gap follows the repaint), and the
+    /// repaint it's sent then holds the session's state.
     #[test]
     fn g11_s3_a_slow_viewers_frames_are_kept_up_to_the_backlog_in_bytes() {
         let (s, _input) = Session::new("local".into(), None, 80, 24);
@@ -875,7 +899,9 @@ mod tests {
         while let Ok(Frame::Data(d)) = slow.live.try_recv() {
             kept += d.len();
         }
-        assert!(kept <= BACKLOG_BYTES && kept >= BACKLOG_BYTES - chunk.len(), "the newest backlog's worth: {kept}");
+        assert_eq!(kept, 0, "nothing from before what it missed");
+        feed(&s, b"after");
+        assert!(matches!(slow.live.try_recv(), Ok(Frame::Data(d)) if &d[..] == b"after"), "it goes on from after the gap");
         assert!(s.attach().replay.len() >= BACKLOG_BYTES - 8192, "the repaint holds the backlog");
     }
 
@@ -899,6 +925,54 @@ mod tests {
             sent.push((cols, rows));
         }
         assert_eq!(sent, vec![(120, 40), (2, 1000)]);
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a terminal's input queue (lock-free now, `inputs`) holds [`INPUTS`]
+    /// keystrokes and pastes whatever each carries, as the channel it was did, in the order they came; one past
+    /// them is dropped, as it was.
+    #[test]
+    fn g4_s5_a_terminals_input_holds_its_places_in_order_whatever_each_carries() {
+        let (s, input) = Session::new("local".into(), None, 80, 24);
+        let paste = |n: usize| n.is_multiple_of(256);
+        for n in 0..INPUTS {
+            s.send(Input::Data(if paste(n) { vec![b'p'; 1 << 20] } else { n.to_string().into_bytes() }));
+        }
+        s.send(Input::Data(b"one past".to_vec()));
+        let mut got = 0;
+        while let Ok(Input::Data(d)) = input.try_recv() {
+            assert!(if paste(got) { d.len() == 1 << 20 } else { d == got.to_string().into_bytes() }, "input {got} out of order");
+            got += 1;
+        }
+        assert_eq!(got, INPUTS, "as many as its places, the one past them dropped");
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a remote terminal's relay (lock-free now, `relay`) holds [`RELAY`]
+    /// outputs whatever each carries, in order; output past them is a gap to repair (goal 3's), and its end
+    /// waits for room on its own, after what came before it.
+    #[test]
+    fn g4_s5_a_terminals_relay_holds_its_places_and_its_end_comes_last() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let s = Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
+            let (tx, rx) = relay();
+            let large = |n: usize| n.is_multiple_of(1024);
+            for n in 0..RELAY {
+                forward(&tx, Some(&s), TermOut::Data(if large(n) { vec![b'x'; 1 << 20] } else { n.to_le_bytes().to_vec() }));
+            }
+            anyhow::ensure!(s.gaps() == 0, "{} gaps within its places", s.gaps());
+            forward(&tx, Some(&s), TermOut::Data(b"past".to_vec()));
+            anyhow::ensure!(s.gaps() == 1, "output past its places is a gap: {}", s.gaps());
+            forward(&tx, None, TermOut::Exit { code: Some(0), error: None });
+            for n in 0..RELAY {
+                match rx.recv().await {
+                    Ok(TermOut::Data(d)) if large(n) => anyhow::ensure!(d.len() == 1 << 20, "output {n}"),
+                    Ok(TermOut::Data(d)) => anyhow::ensure!(d == n.to_le_bytes(), "output {n} out of order"),
+                    other => anyhow::bail!("output {n}: {other:?}"),
+                }
+            }
+            let end = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await;
+            anyhow::ensure!(matches!(end, Ok(Ok(TermOut::Exit { code: Some(0), .. }))), "its end, last: {end:?}");
+            Ok(())
+        })
     }
 
     #[test]

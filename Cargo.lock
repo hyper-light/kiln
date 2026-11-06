@@ -2444,8 +2444,12 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httparse",
+ "hyper-measure",
+ "hyper-quic",
  "hyper-rt",
  "memchr",
+ "rcgen",
+ "sha2 0.11.1",
  "tracing",
 ]
 

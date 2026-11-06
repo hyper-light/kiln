@@ -830,6 +830,7 @@ pub fn bus() -> &'static BusMetrics {
 }
 
 /// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
+#[derive(Default)]
 pub struct BusGauges {
     pub topics: Gauge,
     pub viewers: Gauge,
@@ -838,11 +839,22 @@ pub struct BusGauges {
     /// The most bytes one topic's retention has asked the bus to keep since the server started
     /// (`crate::harness::live`'s feeds raise it as they publish; goal 11, plan 01a1a87b2e56 step 3).
     pub topic_bytes_peak: Gauge,
+    /// The most the bus can hold with the topics and subscriptions it holds, never past its limit
+    /// (`crate::bus::QuiverBus::bound`; goal 11, plan 01a1a87b2e56 step 3).
+    pub memory_bound_bytes: Gauge,
 }
 
 pub fn bus_gauges() -> &'static BusGauges {
     static M: OnceLock<BusGauges> = OnceLock::new();
-    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default(), topic_bytes_peak: Gauge::default() })
+    M.get_or_init(BusGauges::default)
+}
+
+/// The bus's row of what the server's memory holds, by owner: its bytes, and its bound once the bus has been
+/// observed (its limit is set then; goal 11, plan 01a1a87b2e56 step 3). The bound is the one that binds: the
+/// most its topics and subscriptions can hold, never past its limit.
+fn bus_memory(g: &BusGauges) -> (u64, Option<u64>) {
+    let observed = g.memory_limit_bytes.get() > 0;
+    (u64::try_from(g.memory_bytes.get()).unwrap_or(0), observed.then(|| u64::try_from(g.memory_bound_bytes.get()).unwrap_or(0)))
 }
 
 /// The `kiln_bus_*` families, in the exposition.
@@ -998,6 +1010,21 @@ mod tests {
         let mut o = String::new();
         render_bus(&mut o);
         assert!(o.contains("# TYPE kiln_bus_topic_bytes_peak gauge\nkiln_bus_topic_bytes_peak "), "{o}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: the bus's row of the memory by owner gives the bound that binds
+    /// (what its topics can hold, set as the bus is observed), not its limit. Before the bus is observed it
+    /// says no bound. Once observed, a bus holding no topic is bound at 0. Its own gauges, not the process's,
+    /// which other tests' scrapes set.
+    #[test]
+    fn g11_s3_the_bus_memory_row_gives_the_bound_that_binds() {
+        let g = BusGauges::default();
+        g.memory_bytes.set(700);
+        assert_eq!(bus_memory(&g), (700, None), "not observed yet");
+        g.memory_limit_bytes.set(179_306_496);
+        assert_eq!(bus_memory(&g), (700, Some(0)), "observed with nothing to hold");
+        g.memory_bound_bytes.set(6_535_168);
+        assert_eq!(bus_memory(&g), (700, Some(6_535_168)), "a topic's most, under the limit");
     }
 
     /// CP-T3.2: the sends families render before anything was sent, as the sync families do.
@@ -1240,6 +1267,8 @@ pub fn render() -> String {
     scalar!("kiln_ws_clients", "gauge", "Connected UI websocket clients.", m.ws_clients.get());
     scalar!("kiln_supervisor_restarts_total", "counter", "Supervised subsystem restarts.", m.supervisor_restarts.get());
     scalar!("kiln_panics_caught_total", "counter", "Panics contained at task boundaries.", m.panics_caught.get());
+    // Goal 9, plan 01a1a87b2cec step 3: kiln's own log lines let go at their queue's bound (`crate::log_lines`).
+    scalar!("kiln_log_lines_dropped_total", "counter", "kiln's own log lines let go at their writer's queue's bound, each said in the log as the writer next writes.", crate::log_lines::dropped_total());
     scalar!("kiln_quic_streams_total", "counter", "QUIC streams accepted.", m.quic_streams.get());
 
     help(&mut o, "kiln_jobs_finished_total", "counter", "Finished jobs.");
@@ -1290,9 +1319,8 @@ pub fn render() -> String {
     crate::pool_health::render(&mut o);
     crate::placement::render(&mut o);
     // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
-    // count and its limit ([bus] memory).
-    let bus = bus_gauges();
-    let bus = (u64::try_from(bus.memory_bytes.get()).unwrap_or(0), u64::try_from(bus.memory_limit_bytes.get()).ok().filter(|l| *l > 0));
+    // count, and the most it can hold with what it holds, never past [bus] memory.
+    let bus = bus_memory(bus_gauges());
     let segments = u64::try_from(crate::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
     // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
     let search = kiln_search::memory();
