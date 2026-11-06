@@ -1247,10 +1247,13 @@ impl Hub {
         self.noted_unread(noted).await;
     }
 
+    /// `noted`'s rows audited and its pages told, each boxed where it's made: what notes a message that couldn't be read
+    /// holds a pointer to them, so a runner message's handlers, which may note one, stay small (goal 9, plan 01a1a87b2cec
+    /// step 5; `Hub::on_net_labeled`).
     async fn noted_unread(&self, noted: crate::wire::unread::Noted) {
-        self.audit_unread(noted.rows).await;
+        crate::api::boxed(|| self.audit_unread(noted.rows)).await;
         for page in &noted.changed {
-            self.emit_refused(page).await;
+            crate::api::boxed(|| self.emit_refused(page)).await;
         }
     }
 
@@ -2421,7 +2424,7 @@ impl Hub {
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied. What its piece held the shard for is learned as
             // it's taken (goal 9, plan 01a1a87b2cec step 3).
-            if let Err(e) = crate::wire::payload::Piece::take(piece, crate::rt::labeled(label, self.on_net_at(ev, &mut arrived))).await {
+            if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
             // Taken: what of its runner's waits for it goes.
@@ -2464,6 +2467,18 @@ impl Hub {
         }
     }
 
+    /// What a hub loop awaits for transport event `ev`, its polls labeled `label`: [`Hub::on_net_at`]'s future made boxed,
+    /// so the label and the loop's slot each hold a pointer to it, not a copy of it. Goal 9, plan 01a1a87b2cec step 5
+    /// (g10s4-loops' 072ac3e6e6f, item fb6c9ad6): carried by value, each runner message's future was copied whole into
+    /// each layer as it was made and handed down (the label keeps what it carries twice, as it's handed and as it's
+    /// pinned), 50,512 bytes in the test build at rt-next 39fdabc55a1, and the net loop's copies were 2.4% of a shard's CPU
+    /// at rt6 (train 16's profile, g9p16fp: about 35% of the shards' memmove samples were the loop's own). The rare
+    /// messages' handlers are boxed apart where they're made, so what every message's future holds stays small
+    /// (`on_net_at`, `on_agent_msg`, `on_read`).
+    fn on_net_labeled<'a>(self: &'a Arc<Self>, label: &'static hyper_rt::slow::Label, ev: NetEvent, arrived: &'a mut Option<Arrived>) -> impl Future<Output = anyhow::Result<()>> + 'a {
+        crate::rt::labeled(label, crate::api::boxed(move || self.on_net_at(ev, arrived)))
+    }
+
     /// What [`Hub::net_loop`] takes event `ev` as, a piece of its turn on its shard (`crate::wire::payload::Piece`; goal 9,
     /// plan 01a1a87b2cec step 3): a runner's frame, by what it carries; none for its link coming or going.
     fn piece_of(ev: &NetEvent) -> Option<crate::wire::payload::Piece> {
@@ -2481,7 +2496,9 @@ impl Hub {
     }
 
     /// A transport event, taken. `arrived`: when its frame came and this loop took it, taken by what's timed
-    /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`).
+    /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`). A message's
+    /// handler, and those of a runner going (once a link), are boxed where they're made: what every event's future
+    /// holds of them is a pointer (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
@@ -2504,7 +2521,7 @@ impl Hub {
                 self.peer_certs.update(|m| m.remove(&peer));
                 let name = self.peers.update(|m| m.remove(&peer));
                 self.relays.lost(peer);
-                self.handovers_lost(peer).await;
+                crate::api::boxed(|| self.handovers_lost(peer)).await;
                 let lost = self.instances.update(|i| i.lost(peer));
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
                     m.disconnected(name, peer);
@@ -2515,7 +2532,7 @@ impl Hub {
                     self.sync.machine(&name, syncing);
                     crate::observe::hub::lost(self, &name);
                     if self.instances.load().of(&name).is_empty() {
-                        self.agent_lost(&name, &reason).await;
+                        crate::api::boxed(|| self.agent_lost(&name, &reason)).await;
                     } else {
                         // Gone while another of its machine's processes goes on: retired, and its
                         // identity with it (docs/ci.md W27-R01).
@@ -2524,7 +2541,7 @@ impl Hub {
                         {
                             tracing::warn!(agent = %name, error = %format!("{e:#}"), "a retired runner process's identity wasn't revoked");
                         }
-                        self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
+                        crate::api::boxed(|| self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason)).await;
                     }
                 }
             }
@@ -2553,7 +2570,7 @@ impl Hub {
                         tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
                     }
                 }
-                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, self.on_carried(peer, carried, arrived)).await?,
+                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
                 crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
             },
         }
@@ -2791,8 +2808,12 @@ impl Hub {
                                 crate::rt::labeled(label, self.on_session_update(peer, agent, session, update, taken, arrived)).await;
                                 None
                             }
-                            // Its polls labeled by the kind of message it carries.
-                            crate::wire::payload::Item::Read { label, carried: Ok(m) } => Box::pin(crate::rt::labeled(label, self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                            // Its polls labeled by the kind of message it carries. Its handler boxed inside the
+                            // label, so the label holds a pointer to it, not a copy of it twice (goal 9, plan
+                            // 01a1a87b2cec step 5; `Hub::on_net_labeled`). Boxed as its own type, not as a
+                            // `dyn Future + Send` (`crate::api::boxed`): it holds this future in turn, so whether
+                            // it's Send can be shown only where the loops are spawned, not inside this one.
+                            crate::wire::payload::Item::Read { label, carried: Ok(m) } => crate::rt::labeled(label, Box::pin(self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
                             // What it carries can't be read: its NACK says so, as for an item
                             // that can't be read, and it's noted.
                             crate::wire::payload::Item::Read { carried: Err(e), .. } => {
@@ -2825,10 +2846,13 @@ impl Hub {
         }
     }
 
-    /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s.
+    /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s. The rare messages' handlers that are larger
+    /// than what the frequent ones' need (a hello, a process taking over, a job's end, a hand-over's pieces, what
+    /// comes with its Caps, a terminal's end) are boxed where they're made: this future, every message's, holds a
+    /// pointer to each, not room for the largest (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
-            return self.on_hello(peer, h).await;
+            return crate::api::boxed(|| self.on_hello(peer, h)).await;
         }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
@@ -2845,7 +2869,7 @@ impl Hub {
         if let Carried::Nothing(AgentMsg::Instance(ih)) = msg {
             let again = self.instances.update(|i| i.reannounce(peer, &ih));
             match again {
-                Some(drain) => self.instance_promoted(peer, drain).await,
+                Some(drain) => crate::api::boxed(|| self.instance_promoted(peer, drain)).await,
                 None => self.instances.update(|i| i.announce(peer, ih.clone())),
             }
             return Ok(());
@@ -2934,7 +2958,7 @@ impl Hub {
                     if self.ci_leg(&r.job).await {
                         self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
                     } else {
-                        self.job_done(&agent, r).await?;
+                        crate::api::boxed(|| self.job_done(&agent, r)).await?;
                     }
                 }
                 // Heard (taken, or not this runner's to give any more): it needn't send it again.
@@ -2994,10 +3018,10 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.update(|i| i.set_wide(peer, caps));
-                crate::headroom::control::on_caps(self, &agent, caps).await;
+                crate::api::boxed(|| crate::headroom::control::on_caps(self, &agent, caps)).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
-                    self.check_handover().await;
+                    crate::api::boxed(|| self.check_handover()).await;
                 }
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
@@ -3008,7 +3032,7 @@ impl Hub {
                     self.send_waited(peer, waited).await;
                 }
                 // One that takes its agent limit from here is sent what's set for its machine.
-                crate::harness::limit::on_caps(self, &agent, peer, caps).await;
+                crate::api::boxed(|| crate::harness::limit::on_caps(self, &agent, peer, caps)).await;
             }
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame, arrived).await,
             AgentMsg::Reach { to, link, open, data, close } => {
@@ -3028,8 +3052,8 @@ impl Hub {
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
-            AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
-            AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
+            AgentMsg::HarnessAdopted { session, error } => crate::api::boxed(|| self.handover_adopted(&agent, peer, session, error)).await,
             // A frame of the server's this runner couldn't read: noted against it, and on the page
             // of the session it was about when it holds that session now. (A send it couldn't read
             // its session's inbox there answers, as it answers any.) It's the runner's word, so
@@ -3073,7 +3097,7 @@ impl Hub {
                 }
                 let what = crate::instances::Owned::Terminal(session);
                 self.instances.update(|i| i.disown(&what));
-                self.check_retire().await;
+                crate::api::boxed(|| self.check_retire()).await;
             }
         }
         Ok(())
@@ -3244,7 +3268,10 @@ impl Hub {
     }
 
     /// What a runner's message carried, read where its frame was (`crate::wire::payload_of`): each
-    /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s.
+    /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s. As in [`Hub::on_agent_msg`], the rare
+    /// messages' larger handlers (a front door's status, its facts' fold, its power, an identity's ask, a
+    /// leg's records and signature, what its inventory lets go of) are boxed where they're made (goal 9, plan
+    /// 01a1a87b2cec step 5).
     async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
@@ -3330,7 +3357,7 @@ impl Hub {
                     }
                 }
             }
-            FromRunner::FrontDoorStatus(status) => crate::frontdoor::control::on_status(self, peer, agent, *status).await,
+            FromRunner::FrontDoorStatus(status) => crate::api::boxed(|| crate::frontdoor::control::on_status(self, peer, agent, *status)).await,
             FromRunner::HeadroomStatus(status) => crate::headroom::control::on_status(self, peer, agent, status),
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             FromRunner::JobEvent { job, event } => {
@@ -3379,7 +3406,7 @@ impl Hub {
                         // A machine known by its id saying so: its other records fold into it
                         // (docs/machines.md, "Duplicates fold into the machine's id").
                         if crate::join::machine_key(Some(&m)).as_deref() == Some(agent)
-                            && let Err(e) = self.fold_duplicates(agent).await
+                            && let Err(e) = crate::api::boxed(|| self.fold_duplicates(agent)).await
                         {
                             tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't fold this machine's other records");
                         }
@@ -3446,20 +3473,20 @@ impl Hub {
                     });
                 }
             },
-            FromRunner::Power(b) => self.on_power(agent, b).await,
+            FromRunner::Power(b) => crate::api::boxed(|| self.on_power(agent, b)).await,
             FromRunner::AgentLimit(held) => crate::harness::limit::on_held(self, peer, agent, held),
             // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
-            FromRunner::Identity(ask) => crate::identities::on_ask(self, peer, agent, ask).await,
+            FromRunner::Identity(ask) => crate::api::boxed(|| crate::identities::on_ask(self, peer, agent, ask)).await,
             // A leg's records, signed as the leg on its runner at its end (docs/ci.md W27-R05).
             FromRunner::LegResults { job, bundles } => {
                 if self.owns_job(peer, &job) {
-                    crate::ci::signed::taken(self, agent, &job, bundles).await;
+                    crate::api::boxed(|| crate::ci::signed::taken(self, agent, &job, bundles)).await;
                 }
             }
             // The provenance kiln wrote of what a leg built, signed as the leg, or why not (W27-R06).
             FromRunner::LegSignature { job, nonce, bundle, error } => {
                 if self.owns_job(peer, &job) {
-                    crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error).await;
+                    crate::api::boxed(|| crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error)).await;
                 }
             }
             // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08): read, checked and kept
@@ -3481,7 +3508,7 @@ impl Hub {
                 let left = self.harness.left_behind(agent, &inv);
                 inv.sessions.retain(|id| self.harness.runs_on(id, agent));
                 for id in &left {
-                    crate::mcp::let_go(self, agent, peer, id).await;
+                    crate::api::boxed(|| crate::mcp::let_go(self, agent, peer, id)).await;
                 }
                 // This process's sessions are its own; another process of the machine keeps
                 // the ones it holds (the registry forgets sessions a report leaves out), and
@@ -3537,8 +3564,8 @@ impl Hub {
                     });
                 }
                 // Hand-overs dropped as it went away get their word now it's back.
-                self.handovers_dropped(agent, peer, &own).await;
-                self.check_retire().await;
+                crate::api::boxed(|| self.handovers_dropped(agent, peer, &own)).await;
+                crate::api::boxed(|| self.check_retire()).await;
             }
         }
         Ok(())
@@ -5693,6 +5720,47 @@ pub(crate) mod tests {
             while crate::custody::refusals(&hub.store, 10).await?.is_empty() {
                 anyhow::ensure!(Instant::now() < deadline, "the custody record among them wasn't kept");
                 crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (g10s4-loops' 072ac3e6e6f, item fb6c9ad6): what a hub loop awaits for each runner
+    /// message holds the message's handler by pointer, not a copy of it in each layer it's carried in (its piece, its label,
+    /// the loop's slot, the channel item's label), and each handler holds the rare messages' larger handlers by pointer too.
+    /// A future that holds another inline is at least that one's size, so each is smaller than what it holds by pointer. In
+    /// the test build at rt-next 39fdabc55a1 the loop's per-message future was 50,512 bytes, on_net_at's 25,240, on_carried's
+    /// 12,200, on_agent_msg's 11,960 and on_read's 10,840, each copied whole as it was made and handed down: the net loop's
+    /// copies were 2.4% of a shard's CPU at rt6, and about 35% of the shards' memmoves in train 16's profile (g9p16fp).
+    #[test]
+    fn g9_s5_a_runner_messages_futures_hold_their_handlers_by_pointer() -> anyhow::Result<()> {
+        static LABEL: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "g9 s5" };
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut arrived = None;
+            let ev = || NetEvent::Frame { peer: 1, lane: proto::LANE_CONTROL, kind: Kind::Control, data: Vec::new(), at: Instant::now() };
+            let beat = || AgentMsg::Heartbeat { free_slots: 0, running: Vec::new() };
+            // Each made and measured, never polled, and gone by the next.
+            let per_message = size_of_val(&crate::wire::payload::Piece::take(Some(crate::wire::payload::Piece::job_log()), hub.on_net_labeled(&LABEL, ev(), &mut arrived)));
+            let on_net_at = size_of_val(&hub.on_net_at(ev(), &mut arrived));
+            let on_carried = size_of_val(&hub.on_carried(1, Ok(Carried::Nothing(beat())), &mut arrived));
+            let on_agent_msg = size_of_val(&hub.on_agent_msg(1, Carried::Nothing(beat()), &mut arrived));
+            let on_wire = size_of_val(&hub.on_wire(1, "a", crate::wire::channel::Frame::Have(Vec::new()), &mut arrived));
+            let on_read = size_of_val(&hub.on_read(1, "a", FromRunner::AiSessions(Vec::new()), &mut arrived));
+            // The largest of the rare handlers each boxes apart: a runner's machine gone, a job's end, an identity's ask.
+            let agent_lost = size_of_val(&hub.agent_lost("a", "gone"));
+            let job_done = size_of_val(&hub.job_done("a", JobResult { job: String::new(), status: Status::Running, exit_code: None, error: None, peak_rss: None, cpu_seconds: None }));
+            let on_ask = size_of_val(&crate::identities::on_ask(&hub, 1, "a", proto::IdentityAsk::default()));
+            let holds = [
+                ("the loop's per-message future", per_message, "on_net_at", on_net_at),
+                ("on_net_at", on_net_at, "on_carried", on_carried),
+                ("on_wire", on_wire, "on_agent_msg", on_agent_msg),
+                ("on_net_at", on_net_at, "agent_lost", agent_lost),
+                ("on_agent_msg", on_agent_msg, "job_done", job_done),
+                ("on_read", on_read, "identities::on_ask", on_ask),
+            ];
+            for (outer, o, inner, i) in holds {
+                anyhow::ensure!(o < i, "{outer}'s future is {o} bytes, {inner}'s {i}: it holds {inner} by value");
             }
             Ok(())
         })
