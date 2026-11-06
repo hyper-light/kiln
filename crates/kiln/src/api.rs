@@ -5779,11 +5779,16 @@ impl Joins {
 static JOINS: Joins = Joins { mean_ns: std::sync::atomic::AtomicU64::new(0), dev_ns: std::sync::atomic::AtomicU64::new(0) };
 
 /// The sessions' list as [`crate::harness::registry::Registry::list_tagged`] finds it or joins it, and how long its join
-/// took where it joined it (`None` where it found it as it was).
+/// held its thread on the CPU where it joined it (`None` where it found it as it was): what it would hold a shard for.
+/// The thread's own time (`crate::shard_health::CpuClock`), which the host's holds of it don't count in: a compute
+/// worker beside CPU hogs waits for its CPU a tick at a time, and joins timed so would read as longer than any quantum and
+/// keep every read on the pool. Its wall time where the OS keeps no time for a thread (Windows).
 fn list_timed(hub: &Hub) -> ((bytes::Bytes, Option<http::HeaderValue>), Option<Duration>) {
-    let (began, joins) = (Instant::now(), hub.harness.list_joins());
+    let mut cpu = crate::shard_health::CpuClock::Unchosen;
+    let (began, on_cpu, joins) = (Instant::now(), cpu.read(), hub.harness.list_joins());
     let listed = hub.harness.list_tagged();
-    (listed, (hub.harness.list_joins() != joins).then(|| began.elapsed()))
+    let held = on_cpu.zip(cpu.read()).map_or_else(|| began.elapsed(), |(from, to)| Duration::from_nanos(to.saturating_sub(from)));
+    (listed, (hub.harness.list_joins() != joins).then_some(held))
 }
 
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
