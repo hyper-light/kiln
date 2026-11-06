@@ -264,7 +264,7 @@ pub async fn put(hub: &Hub, q: &HashMap<String, String>, body: Value, by: &str) 
 
 /// Where `route` goes now, as the dispatcher explains it.
 pub(crate) async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.ok()?.ok()
 }
@@ -340,7 +340,7 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         // `nests_containers: true`: where one whose steps run podman would go.
         nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
     };
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
     let v = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;

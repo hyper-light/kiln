@@ -295,8 +295,13 @@ enum Msg {
     Close(mpsc::Sender<anyhow::Result<()>>),
 }
 
-/// Who wants to know that something was committed (a feed with nothing left to send waits on it).
-type Watchers = Arc<Mutex<Vec<async_channel::Sender<()>>>>;
+/// Who wants to know that something was committed (a feed with nothing left to send waits on it): each a queue of
+/// one place (`crate::memory::queue`), so a commit's word waits for its watcher, once, however many commits come
+/// meanwhile. Lock-free (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's word, sent on the writer's
+/// thread and waited for on a feed's shard (the server's to its mirrors, a runner's to the server), took
+/// event-listener's `Mutex` both ends, at every commit (55 a second in main's census, census16). The list is the
+/// writer's and [`Store::watch`]'s alone, never a shard's at work.
+type Watchers = Arc<Mutex<Vec<crate::memory::queue::Sender<()>>>>;
 
 fn notify(watchers: &Watchers) {
     watchers.lock().unwrap_or_else(PoisonError::into_inner).retain(|w| !matches!(w.try_send(()), Err(async_channel::TrySendError::Closed(_))));
@@ -695,8 +700,8 @@ impl Store {
 
     /// Woken (once, however many commits came) after a commit: what a feed with nothing left to
     /// send waits on.
-    pub fn watch(&self) -> async_channel::Receiver<()> {
-        let (tx, rx) = async_channel::bounded(1);
+    pub fn watch(&self) -> crate::memory::queue::Receiver<()> {
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
         self.watchers.lock().unwrap_or_else(PoisonError::into_inner).push(tx);
         rx
     }
@@ -992,6 +997,29 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a feed's watch is a lock-free queue of one place. No word waits
+    /// before a commit; commits made while its watcher looks elsewhere leave one word, which it takes, and none more
+    /// until the next commit; a watcher gone is let go at the next commit, and the one left still hears it.
+    #[test]
+    fn g5_a_watchers_word_waits_once_however_many_commits_came() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        let watch = store.watch();
+        anyhow::ensure!(watch.try_recv().is_err(), "a word before any commit");
+        for i in 1..=3u64 {
+            store.send("w1", &said(&format!("m{i}"), i, "x"));
+            store.sync()?;
+        }
+        anyhow::ensure!(watch.try_recv().is_ok(), "no word after three commits");
+        anyhow::ensure!(watch.try_recv().is_err(), "more than one word for three commits");
+        drop(store.watch());
+        anyhow::ensure!(store.watchers.lock().unwrap_or_else(PoisonError::into_inner).len() == 2, "the two watchers listed");
+        store.send("w1", &said("m4", 4, "x"));
+        store.sync()?;
+        anyhow::ensure!(store.watchers.lock().unwrap_or_else(PoisonError::into_inner).len() == 1, "the watcher gone wasn't let go");
+        anyhow::ensure!(watch.try_recv().is_ok(), "the watcher left didn't hear the next commit");
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: what a store's own feeds have to ship is read without asking its writer

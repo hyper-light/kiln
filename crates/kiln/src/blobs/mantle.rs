@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel::{Receiver, Sender};
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
 use kiln_seams::blobs::{self as seam, Access, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
@@ -20,7 +19,12 @@ use mantle_s3::checksum::{Algorithm, Checksum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// Requests waiting for the cell's clients. A full queue refuses before retaining another body.
+use crate::memory::queue::{Receiver, Sender};
+
+/// Requests waiting for the cell's clients. A full queue refuses before retaining another body. The requests' queue
+/// and each one's answer are `crate::memory::queue`'s, lock-free (goal 5, plan 01a1a59c2aae, its top goal): as
+/// async-channels, a request asked on a request's shard and taken on the client's took event-listener's `Mutex`,
+/// and so did its answer.
 const REQUESTS: usize = 64;
 /// A native upload's run, held whole before it's sent (and sent again from there), and a part's
 /// piece a completion reads for one: 8 MiB.
@@ -188,7 +192,7 @@ impl MantleBlobs {
     pub fn new(cfg: &Config, clock: Arc<dyn Clock>, object_max: u64, presign: super::local::Presign) -> anyhow::Result<Self> {
         let scope = Arc::new(Scope::new(cfg, object_max)?);
         let loaded = Loaded::read(cfg)?;
-        let (sender, receiver) = async_channel::bounded(REQUESTS);
+        let (sender, receiver) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, REQUESTS);
         let (bucket, create) = (cfg.bucket.clone(), cfg.create_bucket);
         crate::rt::spawn(async move {
             if let Err(e) = crate::rt::spawn_local(serve(loaded, bucket, create, receiver)) {
@@ -205,7 +209,7 @@ impl MantleBlobs {
     }
 
     async fn request<T: Send>(&self, make: impl FnOnce(Answer<T>) -> Call) -> Result<T, Refusal> {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         self.sender.try_send(Task { scope: Arc::clone(&self.scope), call: make(tx) }).map_err(|e| match e {
             async_channel::TrySendError::Full(_) => Refusal::Full { what: "Mantle requests", limit: REQUESTS as u64 },
             async_channel::TrySendError::Closed(_) => unavailable("Mantle's client has ended"),

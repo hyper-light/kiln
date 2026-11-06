@@ -27,7 +27,7 @@
 [[crate]]
 name = "event-listener"
 locks = "each Event's list of listeners (a std Mutex, its `std` feature): taken to add a listener, to take one out, to notify and as a listener is polled"
-reached = "every wait and wake of an async-channel still used (a runner's uplink and harness pumps, terminal.rs's PTY channels, and the API's, CI's and CD's that goals 4 and 5 didn't move), on the shards; async-lock (the password gate, cluster copies, the changes to goals, plans, programs and research, CI's uploads and steps in flight, mirrors' fetches and looks) and the Events kiln held itself (records.rs's changes, the conversation store's writer, a reach run's forwarder, headroom's held sessions, a runner's harness host and cache uploads, sync tasks' news) left it for crate::turn and crate::rt::Changed in goal 5, and `locks.py check` keeps both out of kiln's code (hot.toml's `waits`); memory::queue (sessions' inboxes, the net thread's queues, terminals' input and relay, logs; then reach's relay and live commands) left it for a lock-free list of its own in goals 4 and 5, and rt::Notify (reads.rs's reads made ahead, a terminal's relay's gaps; each events socket's wake, wire/events/feed.rs) and rt::Shutdown (the server's and the hub's loops, a terminal's close) took that list up in goal 5"
+reached = "every send to an async-channel (twice: 5.4.2's notify takes it whether or not anyone waits) and every receive (once), and a wait's listing, poll and going, on the sender's and the taker's threads. On the server's request, websocket and runner paths none is left (goal 5's top goal, after census16's 2,537 takes a second calm and 4 ms waited at the longest with hogs): the cluster group's, observe's and sync's messages to the runners, the conversation store's word to its feeds, kept files, a leg's end to the log index, the browser protocol's topics and sockets, CI's dispatcher's answers, file, archive, git and REAPI streams, Mantle's requests and the HTTP tunnel's relay moved to crate::memory::queue and crate::rt::Notify. What's left (hot.toml's `waiting`, each with why) is the runner process's own (its chaos delay line, microVMs, preview browser, front door, learner and repo sync), kiln as a client and its command line, and the server's off those paths (CD's engine, observe's archives, rehydrations and notifications, sync's collection, the LAN's discovery). async-lock and the Events kiln held itself left it in goal 5 (crate::turn, crate::rt::Changed); memory::queue, rt::Notify and rt::Shutdown wait on a lock-free list of their own; and `locks.py check` keeps all three out of kiln's code but what hot.toml lists (`waits`)"
 track_caller = ["src/intrusive.rs:with_inner"]
 
 [[crate]]
@@ -38,7 +38,7 @@ reached = "nowhere since goal 4 step 5, which made memory::lanes (agent sessions
 [[crate]]
 name = "async-tungstenite"
 locks = "a split WebSocket's two halves' stream (a std Mutex, `WebSocketStream::split`): taken by every frame sent, flushed or read"
-reached = "every WebSocket the API serves (events, agent sessions' live feeds, terminals, logs, the pages' sockets: api.rs and http/ws.rs split each socket into a sender and a reader)"
+reached = "every WebSocket the API serves (events, agent sessions' live feeds, terminals, logs, the pages' sockets: api.rs and http/ws.rs split each socket into a sender and a reader). Both halves are the socket's one task's, spawned on the shard its upgrade's handler ran on, so no other shard takes the lock (census16: 540.7 taken a second, never held when asked); `locks.py check` holds a split anywhere else to a `waiting` entry saying the same (hot.toml's `split`)"
 
 [[crate]]
 name = "parking"
@@ -48,7 +48,7 @@ reached = "event-listener's blocking waits: a thread blocked in an async-channel
 [[crate]]
 name = "uuid"
 locks = "the process's one v7 context (a std Mutex, `Uuid::now_v7`'s counter)"
-reached = "crate::util::new_id: each terminal session's id (termsess), each agent session's and each upload's (harness/registry, api)"
+reached = "uuid::Uuid::now_v7 where kiln still calls it: a runner's harness sessions' and hand-overs' ids, reach's run groups, upgrades, SBOMs, observe's incidents. crate::util::new_id (each terminal session's id, each agent session's and each upload's: the census16 rate, 0.1 a second) makes its v7 ids with no lock since goal 5's top goal (an atomic word of millisecond and counter); counted to show what's left"
 
 [[crate]]
 name = "futures-channel"
