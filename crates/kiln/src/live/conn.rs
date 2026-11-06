@@ -128,8 +128,10 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
     let _ = stats.congestion.set(congestion(&hub, control.as_deref()).await);
     let scope = scope_of(&hub, &caller).await;
     let mut changes = owner.changes();
-    let (started_tx, started_rx) = async_channel::bounded::<Started>(256);
-    let (answer_tx, answer_rx) = async_channel::bounded::<(u64, Outcome)>(REQUESTS_AT_ONCE);
+    // Lock-free queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): as async-channels, each
+    // turn of this loop listed a wait on each on event-listener's `Mutex`, and took it again to drop it.
+    let (started_tx, started_rx) = crate::memory::queue::places::<Started>(&crate::memory::owners::CHANNELS, 256);
+    let (answer_tx, answer_rx) = crate::memory::queue::places::<(u64, Outcome)>(&crate::memory::owners::CHANNELS, REQUESTS_AT_ONCE);
     let mut running = 0usize;
     let now = now_ms();
     let cfg = ServerConfig { version, build: env!("CARGO_PKG_VERSION").to_owned(), fragment: send::fragment(send::CHUNK_MIN), ..ServerConfig::default() };

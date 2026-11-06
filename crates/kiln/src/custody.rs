@@ -22,6 +22,7 @@ use crate::store::Store;
 pub mod blobs;
 pub mod cluster;
 pub mod feeds;
+pub mod runners;
 
 /// The most records a walk loads: a thing's chain, and its custodians' streams.
 pub const WALK_MAX: usize = 10_000;
@@ -595,9 +596,12 @@ fn under_on(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<Vec<Stri
 }
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
-/// come over that process's connection, and logged either way.
-pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
-    let instance = hub.instances.load().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+/// come over that process's connection (`instance`, as it was named when the record came; none, one
+/// from before processes said so), and logged either way. Runners' records come here one at a time,
+/// in the order they came, off the hub's loop ([`runners::intake_loop`]; goal 9, plan 01a1a87b2cec
+/// step 3).
+pub async fn on_runner(hub: &crate::hub::Hub, machine: &str, instance: Option<String>, bundle: Value) {
+    let instance = instance.unwrap_or_else(|| "legacy".to_owned());
     let came_from = format!("runner {machine} (instance {instance})");
     // Something another runner handed it over a reach link that it refused where it would have
     // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with

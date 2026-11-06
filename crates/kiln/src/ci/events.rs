@@ -71,7 +71,7 @@ pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Op
     let Some(l) = commit.workflows.iter().find(|l| l.runs && engine_runs(l) && (l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p))) else { return Ok(None) };
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
     if !start_given(hub, repo, &event, l, (&message, &author), serde_json::Value::Null, given).await? {
         return Ok(None);
@@ -453,7 +453,7 @@ pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: 
     let (message, _) = gitops::commit_info(hub, repo, sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha: sha.to_owned(), actor: actor.to_owned(), trusted: true, source: Source::Cd, message: Some(message.clone()), ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, path, &serde_json::Value::Object(serde_json::Map::new()));
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
     start_given(hub, repo, &e, &l, (&message, actor), serde_json::Value::Null, given).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok).ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{path} didn't start")))
@@ -524,7 +524,7 @@ async fn dispatch_with(
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let reply = super::dispatch::Given { reply: offered.then_some(tx), ..super::dispatch::Given::default() };
     let started = start_given(hub, repo, &e, l, (&message, actor), typed, reply).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     if !offered || !started {

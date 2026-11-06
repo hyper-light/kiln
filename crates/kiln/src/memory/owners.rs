@@ -43,6 +43,12 @@ pub static FEED_INTAKE: Owner = Owner::new("feed_intake");
 /// queue their hand-ons came in. At the bound a receipt is let go, said so, its hand-on unanswered.
 pub static CUSTODY_RECEIPTS: Owner = Owner::new("custody_receipts");
 
+/// Runners' custody records waiting for the task that reads, checks and keeps them in the order they came
+/// (`crate::custody::runners::Intake`; goal 9, plan 01a1a87b2cec step 3): at most
+/// [`crate::custody::runners::RECORDS_BYTES`], as much as the hub's queue of runner events they came off. At the
+/// bound the hub's loop waits, and behind it the net thread and QUIC's flow control: no record is let go.
+pub static CUSTODY_RECORDS: Owner = Owner::new("custody_records");
+
 /// Finished messages' mentions of files waiting for the task that keeps them (`crate::harness::kept`): at
 /// most `QUEUE_BYTES` there, an owner's inbox's bytes ([`crate::net::EVENTS_BYTES`]), where the messages
 /// came from. At the bound a message's files aren't kept as it finishes: they're read when someone looks.
@@ -192,7 +198,15 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// of their requests and a socket's audit rows (`crate::api`); and the runner process's own (goal 5, plan
 /// 01a1a59c2aae): its uplink and what its loop takes (`crate::agent`, `crate::exec::Uplink`), its sessions'
 /// lanes, control and updates (`crate::harness`, `crate::convo::store::tee`), its harnesses' and steps'
-/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Each item is counted at its place alone
+/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Then the server's that census16 found still
+/// on its request, websocket and runner paths (goal 5, plan 01a1a59c2aae, its top goal): the cluster group's,
+/// observe's and sync's messages to the runners (`crate::store::group`, `crate::observe`, `crate::sync::server`),
+/// the conversation store's word to its feeds (`crate::convo::store::Store::watch`), kept files' paths
+/// (`crate::keep`), the browser protocol's events, asks and starts (`crate::live`), the answers of CI's dispatcher
+/// and of Mantle's client (`crate::memory::queue::answer`), files', archived records', git's and REAPI's bytes on
+/// their way to a response or a file (`crate::rt::file_source`, `crate::rt::file_sink`, `crate::harness::archive`,
+/// `crate::ci::facade`, `crate::ci::work::reapi`), Mantle's requests, an HTTP tunnel's answers and bindings
+/// (`crate::tunnel`), and the process's signals. Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");
@@ -204,7 +218,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

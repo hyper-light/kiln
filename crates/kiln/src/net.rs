@@ -428,8 +428,9 @@ fn made_ns(bytes: usize) -> u64 {
 /// made where it is, its turn ended first if that wouldn't fit it (`rt::Turns::before`; goal 9, plan 01a1a87b2cec step
 /// 5). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard is
 /// given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends
-/// within the quantum. Returns once `out` is closed and empty.
-pub async fn send_made<M, X, F, S, Fut>(out: &async_channel::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, make: F, mut send: S)
+/// within the quantum. Returns once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no
+/// lock (goal 5, plan 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
+pub async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -1380,7 +1381,7 @@ mod tests {
             anyhow::ensure!(quantum_ns > 0, "a shard has a quantum");
             // Sends for several turns: two frames a message, a third of the messages with nowhere to go.
             let n = u32::try_from(quantum_ns.saturating_mul(8) / send_ns).unwrap_or(u32::MAX).max(64);
-            let (tx, rx) = async_channel::unbounded::<u32>();
+            let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
             for m in 0..n {
                 tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
             }
@@ -1443,7 +1444,7 @@ mod tests {
             const MESSAGES: u32 = 16;
             // A cluster write's few hundred bytes a learner; and one message past the bound, alone or not.
             for (each, here) in [(512usize, true), (MADE_HERE_MOST + 1, false)] {
-                let (tx, rx) = async_channel::unbounded::<u32>();
+                let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
                 for m in 0..MESSAGES {
                     tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
                 }

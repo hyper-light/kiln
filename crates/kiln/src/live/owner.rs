@@ -10,6 +10,11 @@
 //! A change pushed after a subscription's start was computed is pushed to it again by the broadcast;
 //! the server half drops what it already has by revision, so a start and the broadcast never lose or
 //! repeat a change between them.
+//!
+//! Its queues (the events, the asks, each socket's starts) are `crate::memory::queue`'s, lock-free (goal 5 of
+//! the API runtime program, plan 01a1a59c2aae, its top goal): as async-channels, every event the hub emitted, on
+//! whichever shard emitted it, and its receipt on the owner's shard took event-listener's `Mutex`, and so did
+//! every ask and start between a socket's shard and the owner's.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +36,7 @@ pub struct Change {
 #[derive(Debug)]
 pub enum Ask {
     /// How subscription `sub` of a socket starts, from `cursor`; answered on `reply`.
-    Start { sub: u32, topic: Topic, cursor: Option<Cursor>, reply: async_channel::Sender<Started> },
+    Start { sub: u32, topic: Topic, cursor: Option<Cursor>, reply: crate::memory::queue::Sender<Started> },
 }
 
 /// A subscription's start, for its socket.
@@ -57,8 +62,8 @@ const CHANGES_WAITING: usize = 8_192;
 /// The owner's handle: where events and asks go, and the changes come from.
 #[derive(Clone)]
 pub struct Handle {
-    events: async_channel::Sender<Arc<ServerEvent>>,
-    asks: async_channel::Sender<Ask>,
+    events: crate::memory::queue::Sender<Arc<ServerEvent>>,
+    asks: crate::memory::queue::Sender<Ask>,
     changes: Arc<Broadcast<Arc<Change>>>,
     born: u64,
 }
@@ -72,8 +77,8 @@ impl std::fmt::Debug for Handle {
 impl Handle {
     /// Starts the owner of topics of the server incarnation `born` (its clock's milliseconds).
     pub fn start(born: u64) -> Self {
-        let (events, events_rx) = async_channel::bounded(EVENTS_WAITING);
-        let (asks, asks_rx) = async_channel::bounded(ASKS_WAITING);
+        let (events, events_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, EVENTS_WAITING);
+        let (asks, asks_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, ASKS_WAITING);
         let changes = Arc::new(Broadcast::new(CHANGES_WAITING));
         let out = Arc::clone(&changes);
         crate::rt::spawn(async move { run(born, events_rx, asks_rx, &out).await });
@@ -103,7 +108,7 @@ impl Handle {
 }
 
 /// The owner's loop: events made into changes, asks answered, until both channels close.
-async fn run(born: u64, events: async_channel::Receiver<Arc<ServerEvent>>, asks: async_channel::Receiver<Ask>, out: &Broadcast<Arc<Change>>) {
+async fn run(born: u64, events: crate::memory::queue::Receiver<Arc<ServerEvent>>, asks: crate::memory::queue::Receiver<Ask>, out: &Broadcast<Arc<Change>>) {
     use futures::FutureExt as _;
     let mut topics = Topics::new(born);
     loop {

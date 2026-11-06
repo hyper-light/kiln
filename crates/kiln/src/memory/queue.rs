@@ -434,6 +434,16 @@ pub fn unbounded<T>(owner: &'static Owner) -> (Sender<T>, Receiver<T>) {
     made(Room::unbounded(owner), at_place::<T>)
 }
 
+/// A queue of one place for one answer (goal 5, plan 01a1a59c2aae, its top goal): an owner's reply to whoever
+/// asked it (CI's dispatcher's, Mantle's client's, the browser protocol's topics' owner's), counted as
+/// [`super::owners::CHANNELS`]'s. Its sender clones and its `try_send` never waits, as the async-channel bounded
+/// at one it replaces did, so a reply kept with what it answers (a run's start, `crate::ci::dispatch::Given`) goes
+/// once; and its receiver waits under any waker (a combinator's own among them), where hyper-rt's one-shot takes
+/// only its polling task's.
+pub fn answer<T>() -> (Sender<T>, Receiver<T>) {
+    places(&super::owners::CHANNELS, 1)
+}
+
 /// A queue's two ends, about `room`, its items counted by `weigh`.
 fn made<T>(room: Room, weigh: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
     made_in(Arc::new(room), weigh)
@@ -841,6 +851,25 @@ mod tests {
         let src = src.replace("\r\n", "\n");
         let code = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default();
         code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a queue for one answer holds one, as the async-channel bounded at
+    /// one it replaces did: a second `try_send` (a clone's too) is told it's full, the answer is taken once, waited
+    /// for on another thread than its sender's, and a sender gone with nothing sent ends the wait.
+    #[test]
+    fn g5_an_answer_holds_one_and_its_wait_ends_with_it_or_without() -> anyhow::Result<()> {
+        let (tx, rx) = answer::<u32>();
+        let again = tx.clone();
+        anyhow::ensure!(tx.try_send(7).is_ok(), "the answer refused");
+        anyhow::ensure!(matches!(again.try_send(8), Err(TrySendError::Full(8))), "a second answer went in");
+        anyhow::ensure!(rx.try_recv() == Ok(7), "the answer");
+        anyhow::ensure!(rx.try_recv() == Err(TryRecvError::Empty), "an answer twice");
+        let sender = std::thread::spawn(move || tx.try_send(9).is_ok());
+        anyhow::ensure!(rx.recv_blocking() == Ok(9), "the answer sent from another thread");
+        anyhow::ensure!(sender.join().unwrap_or(false), "the other thread's answer refused");
+        drop(again);
+        anyhow::ensure!(rx.recv_blocking() == Err(RecvError), "a wait whose senders went without answering didn't end");
+        Ok(())
     }
 
     /// Goal 4, plan 01a1a59c2a9c step 5 (goal 5's rule), run by kiln's CI with every test: the queue takes no

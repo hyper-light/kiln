@@ -916,7 +916,7 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
         if !who.is_owner() && !who.can("runs.approve", &Scope::Repo { repo: repo.name.clone() }) {
             return Err((StatusCode::FORBIDDEN, format!("{} may not approve runs of {}: that needs runs.approve there", who.name, repo.name)));
         }
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         hub.ci.send(super::dispatch::Msg::ApproveRun { run: run.to_owned(), by: who.name.clone(), approve: approved, reply: tx });
         let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
         let decided = crate::rt::timeout(Duration::from_secs(10), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;

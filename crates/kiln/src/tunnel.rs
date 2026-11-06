@@ -434,8 +434,11 @@ async fn relay_server(socket: ws::WebSocket, listener: SocketAddr, slot: &Slot, 
     let (mut tx, mut rx) = socket.split();
     let activity = Activity::new();
     // The answers to what couldn't be read, for the writer beside the datagrams: a writer that
-    // can't keep up with them can't with the tunnel either, and one past these is let go.
-    let (answers, answered) = async_channel::bounded::<Message>(16);
+    // can't keep up with them can't with the tunnel either, and one past these is let go. A queue
+    // that takes no lock (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): the
+    // writer waits on it beside every datagram, which on an async-channel listed and dropped a wait on
+    // event-listener's `Mutex` each time.
+    let (answers, answered) = crate::memory::queue::places::<Message>(&crate::memory::owners::CHANNELS, 16);
     let unread = |r: Refused| {
         note(sock.refused(&r));
         let _ = answers.try_send(ws::text(TunnelDown::Refused(r).text()));
@@ -473,7 +476,7 @@ async fn listener_to_ws<S>(
     udp: &UdpSocket,
     listener: SocketAddr,
     activity: &Activity,
-    answered: &async_channel::Receiver<Message>,
+    answered: &crate::memory::queue::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -515,7 +518,7 @@ where
 /// through a WebSocket to the server's HTTP port. Dropping it closes the tunnel.
 pub struct Relay {
     addr: SocketAddr,
-    bindings: async_channel::Sender<[u8; 32]>,
+    bindings: crate::memory::queue::Sender<[u8; 32]>,
     alive: Arc<AtomicBool>,
 }
 
@@ -527,7 +530,8 @@ impl Relay {
         let udp = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .map_err(|e| anyhow::anyhow!("bind the relay socket: {e}"))?;
         let addr = udp.local_addr().map_err(|e| anyhow::anyhow!("relay socket: {e}"))?;
-        let (bindings, bindings_rx) = async_channel::bounded(4);
+        // Lock-free queues, as the server's end's (`relay_server`).
+        let (bindings, bindings_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
         let alive = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&alive);
         crate::rt::spawn(async move {
@@ -567,7 +571,7 @@ impl Drop for Relay {
 async fn relay_agent(
     socket: ws::ClientSocket,
     udp: UdpSocket,
-    bindings: async_channel::Receiver<[u8; 32]>,
+    bindings: crate::memory::queue::Receiver<[u8; 32]>,
 ) -> anyhow::Result<&'static str> {
     let (mut tx, mut rx) = socket.split();
     // The endpoint's address, learned from what it sends (a rebuilt endpoint has a new port).
@@ -576,7 +580,7 @@ async fn relay_agent(
     // What it couldn't read of what came down, for the writer beside the datagrams to tell the
     // server (`unread`): a writer that can't keep up with them can't with the tunnel either, and one
     // past these is let go.
-    let (tell, to_tell) = async_channel::bounded::<Message>(16);
+    let (tell, to_tell) = crate::memory::queue::places::<Message>(&crate::memory::owners::CHANNELS, 16);
     let unread = |r: Refused| {
         let _ = tell.try_send(told(r));
     };
@@ -618,9 +622,9 @@ enum Up {
 async fn endpoint_to_ws<S>(
     tx: &mut WebSocketSender<S>,
     udp: &UdpSocket,
-    bindings: &async_channel::Receiver<[u8; 32]>,
+    bindings: &crate::memory::queue::Receiver<[u8; 32]>,
     endpoint: &Mutex<Option<SocketAddr>>,
-    to_tell: &async_channel::Receiver<Message>,
+    to_tell: &crate::memory::queue::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
