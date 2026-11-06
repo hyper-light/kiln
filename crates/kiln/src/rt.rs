@@ -168,9 +168,7 @@ pub fn pin(cores: Vec<u32>) {
     if CORES.get().is_some() {
         return;
     }
-    let mut shards = shard_cores(&cores, profile().shards);
-    shards.sort_unstable();
-    shards.dedup();
+    let shards = shard_cores_for(&cores);
     // Apart only where the other threads keep a core: the first, which `shard_cores` leaves them.
     let apart = !shards.is_empty() && shards.len() < cores.len();
     let _ = CORES.set(cores);
@@ -180,6 +178,29 @@ pub fn pin(cores: Vec<u32>) {
             Err(why) => tracing::warn!(why = %why, "the server's other threads share its shards' cores"),
         }
     }
+}
+
+/// Whether the shards are fixed where they take the real-time class ([`realtime`]), on CPUs of their own the
+/// machine's topology gives ([`class_cpus`]), rather than on cores of the server's own `[server] cores` declares:
+/// `/healthz/server` then says where in `priority.realtime`, not `priority.cores`.
+static CORES_FOR_CLASS: AtomicBool = AtomicBool::new(false);
+
+/// [`pin`] for the shards in the real-time class (goal 9, plan 01a1a87b2cec step 4): `cores` as it takes them, the
+/// first kept for the process's other threads and each shard on one of the next, fixed only where those other threads
+/// are kept off the shards' CPUs too; else nothing is fixed, and why not.
+fn pin_apart(cores: Vec<u32>) -> Result<(), String> {
+    if CORES.get().is_some() {
+        return Err("the shards are fixed already".to_owned());
+    }
+    let shards = shard_cores_for(&cores);
+    if shards.is_empty() || shards.len() >= cores.len() {
+        return Err("no CPU is left for the server's other threads".to_owned());
+    }
+    crate::os::keep_threads_off(&shards)?;
+    SHARDS_APART.store(true, Ordering::Relaxed);
+    CORES_FOR_CLASS.store(true, Ordering::Relaxed);
+    let _ = CORES.set(cores);
+    Ok(())
 }
 
 /// The real-time priority the shards ask for ([`realtime`]): the lowest (sched(7): 1 to 99), above
@@ -212,9 +233,161 @@ static REALTIME_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
 /// is busy in user space waits up to a tick, 1 ms, for it; a real-time one takes the CPU at once.
 /// Where the system refuses it (no `CAP_SYS_NICE` or `RLIMIT_RTPRIO` room; macOS and Windows), a shard
 /// runs as before, with a slice of its step, and the log and `/healthz/server` say why
-/// ([`realtime_status`]). Call it before the runtime starts: later calls change nothing.
+/// ([`realtime_status`]). Where it's granted, the shards take it only on CPUs of their own, the server's other
+/// threads kept off them ([`Place`]): on the server's cores where `[server] cores` declares them ([`pin`], called
+/// first), else on those the machine's topology gives ([`class_cpus`]); where there are no such CPUs, the shards
+/// don't ask, and the server says why. Call it before the runtime starts, on the thread that starts it: later
+/// calls change nothing.
 pub fn realtime(on: bool) {
+    // Once the runtime started its shards asked or didn't, and once placed they stay where they are.
+    if RT.get().is_some() || REALTIME_PLACE.get().is_some() {
+        return;
+    }
     REALTIME.store(on, Ordering::Relaxed);
+    if !on {
+        return;
+    }
+    let place = realtime_place();
+    if let Place::Held(why) = &place {
+        // No shard asks, so none gives the room up as the last of them answers ([`took_realtime`]): the server
+        // gives it up now, so nothing it starts inherits it.
+        if let Err(e) = crate::os::drop_realtime_room(None) {
+            tracing::warn!(why = %e, "what the server starts keeps its room for the real-time class");
+        }
+        tracing::warn!("the server's shards run at the normal class, with a slice of their step: the real-time class isn't asked for ({why})");
+    }
+    let _ = REALTIME_PLACE.set(place);
+}
+
+/// Where the server's shards take the real-time class (goal 9, plan 01a1a87b2cec step 4; [`realtime`]): each on a
+/// CPU no other shard and no other thread of the server's runs on, or not at all. A real-time shard on a CPU it
+/// shares hands it over only as the class allows, and on two counts that's past the bar the shards' delay is held
+/// to ([`place_on`]):
+/// - **with another shard**, the class hands a CPU between threads of one priority only at its quantum
+///   (`sched_rr_timeslice_ms`, 100 ms unless root set another), where the normal class shares it by the shards'
+///   slices;
+/// - **with a thread of the server's own**, a real-time thread's yield (`sched_yield`) lets only real-time threads
+///   of its priority run, and the shards wait for other threads' progress that way: concurrent-queue (2.5), under
+///   async-channel and kiln's own queues, waits for a push under way by yielding (`busy_wait`, in its `pop` and
+///   `push`), so a normal thread preempted mid-push on a shard's CPU waits there, the shard spinning, until the
+///   load balancer moves it or the fair server's share comes round (within Linux's second, from 6.12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    /// Each shard asks as it starts, as before: the class isn't granted here (this OS has none, or this process
+    /// has no room for it), so each is refused and says why ([`took_realtime`]).
+    Asked,
+    /// Each on a CPU of its own, the server's other threads kept off them: where, for a person.
+    Fixed(String),
+    /// None asks, though it was asked for: why, for a person.
+    Held(String),
+}
+
+/// Where the shards take the real-time class, decided as the server asks for it ([`realtime`]).
+static REALTIME_PLACE: OnceLock<Place> = OnceLock::new();
+
+/// [`Place`] for this process: as each shard is, where the class isn't granted here ([`class_granted`]); on the
+/// cores of the server's own `[server] cores` declares, already fixed ([`pin`]), where they give each shard one and
+/// keep the server's other threads off them; else on CPUs of their own the machine's topology gives
+/// ([`class_cpus`]), fixed there ([`pin_apart`]).
+fn realtime_place() -> Place {
+    if let Err(refusal) = class_granted() {
+        tracing::debug!(%refusal, "the real-time class isn't granted here: each shard asks, and says why it was refused");
+        return Place::Asked;
+    }
+    let shards = profile().shards;
+    let quantum = crate::os::rr_quantum_ns();
+    if let Some(cores) = CORES.get() {
+        return place_on(&shard_cores(cores, shards), SHARDS_APART.load(Ordering::Relaxed), shards, quantum);
+    }
+    match class_cpus(&crate::os::cpu_topology(), shards).and_then(|cores| pin_apart(cores.clone()).map(|()| cores)) {
+        Ok(cores) => place_on(&shard_cores(&cores, shards), true, shards, quantum),
+        Err(why) => Place::Held(why),
+    }
+}
+
+/// Whether this process may take the real-time class at [`REALTIME_PRIORITY`]: a thread of its own asks, then
+/// ends (the class is a thread's own, gone with it), so the kernel's answer has everything that decides it in it:
+/// the process's limit and capabilities, a real-time group's runtime, a seccomp policy. Off Linux, refused as a
+/// shard would be.
+fn class_granted() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("kiln-rt-class".into())
+        .spawn(|| hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY))
+        .map_err(|e| format!("no thread to ask with: {e}"))?
+        .join()
+        .map_err(|_| "the thread that asked ended before it answered".to_owned())?
+        .map_err(|refusal| realtime_why(&refusal))
+}
+
+/// [`Place`] for shards fixed to `cpus` (one for each shard, in their order), `apart` whether the process's other
+/// threads are kept off them, `quantum_ns` the class's round-robin quantum ([`crate::os::rr_quantum_ns`]): held
+/// where a shard would share its CPU with another shard for longer turns than the bar (`DELAY_BAR_NS`) allows, or
+/// with a thread of the server's own; else fixed, and where.
+fn place_on(cpus: &[u32], apart: bool, shards: u16, quantum_ns: Option<u64>) -> Place {
+    let mut own = cpus.to_vec();
+    own.sort_unstable();
+    own.dedup();
+    let list = crate::os::cpu_list_text(&own);
+    if own.len() < usize::from(shards) && quantum_ns.is_none_or(|q| q > DELAY_BAR_NS) {
+        let quantum = quantum_ns.map_or_else(|| "its quantum".to_owned(), |q| format!("its quantum, {} ms", q / 1_000_000));
+        return Place::Held(format!(
+            "its {shards} shards would share {} CPU(s), {list}: the class hands a CPU between shards of one priority only at {quantum} (sched_rr_timeslice_ms), past the 1 ms the shards' delay is held to, where the normal class shares it by their slices",
+            own.len()
+        ));
+    }
+    if !apart {
+        return Place::Held(format!(
+            "the server's other threads may run on its shards' CPUs, {list}: a real-time shard waiting on one of them by yielding (concurrent-queue's wait for a push under way, under async-channel) lets no normal thread run there"
+        ));
+    }
+    Place::Fixed(format!("each on a CPU of its own ({list}), the server's other threads kept off them"))
+}
+
+/// Where the shards take the real-time class with no cores of the server's own declared (goal 9, plan 01a1a87b2cec
+/// step 4), from the CPUs it may run on (`cpus`, [`crate::os::cpu_topology`]): `[kept, shard 1, …, shard n, the
+/// rest]`, what [`pin_apart`] takes, so each shard is fixed to a CPU of its own and the server's other threads keep
+/// every other one; or why there's no such place. From the machine's own topology, nothing set:
+/// - **its fastest CPUs first** (its core types where a hybrid machine's kernel lists them, else the kernel's
+///   capacity: [`crate::os::Cpu::rank`]), where a shard's ready work runs soonest, the next class only where the
+///   fastest has too few;
+/// - **one to a physical core**: SMT siblings share one core's pipeline, and two shards there would slow each other;
+/// - **in the last-level cache holding most of a class's cores, then the next**: the shards and the threads they hand
+///   work to share it; the kernel's order within each;
+/// - **the first kept for the server's other threads**, as [`shard_cores`] keeps one of declared cores and
+///   hyper-rt's placement keeps the fastest class's first: they keep a core whatever the shards take.
+///
+/// Fewer cores than a shard each and one more is no place: a real-time shard shares its CPU with no other shard and no
+/// thread of the server's own ([`Place`]).
+fn class_cpus(cpus: &[crate::os::Cpu], shards: u16) -> Result<Vec<u32>, String> {
+    if cpus.is_empty() {
+        return Err("this process's CPUs couldn't be read (its affinity, Linux's sysfs)".to_owned());
+    }
+    let mut by_id = cpus.to_vec();
+    by_id.sort_unstable_by_key(|c| c.id);
+    by_id.dedup_by_key(|c| c.id);
+    // One CPU to a physical core: each core's first.
+    let mut cores: Vec<crate::os::Cpu> = Vec::new();
+    for cpu in &by_id {
+        if !cores.iter().any(|c| c.core == cpu.core) {
+            cores.push(*cpu);
+        }
+    }
+    // The fastest class first; within it, the last-level cache holding most of its cores first, then the next, each
+    // in the kernel's order.
+    let held = |rank: u32, llc: u32| cores.iter().filter(|c| c.rank == rank && c.llc == llc).count();
+    let mut ranked: Vec<(u32, usize, u32, u32)> = cores.iter().map(|c| (c.rank, held(c.rank, c.llc), c.llc, c.id)).collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+    let need = usize::from(shards).saturating_add(1);
+    if ranked.len() < need {
+        return Err(format!(
+            "it may run on {} core(s), where {shards} shards and the server's other threads take {need}: a real-time shard shares its CPU with no other shard and no thread of the server's own",
+            ranked.len()
+        ));
+    }
+    let mut ordered: Vec<u32> = ranked.iter().take(need).map(|(_, _, _, id)| *id).collect();
+    let rest: Vec<u32> = by_id.iter().map(|c| c.id).filter(|id| !ordered.contains(id)).collect();
+    ordered.extend(rest);
+    Ok(ordered)
 }
 
 /// How the shards took the real-time class ([`realtime`]), for the log and `/healthz/server`.
@@ -230,16 +403,30 @@ pub struct Realtime {
     pub refused: u32,
     /// Why those refused were, for a person.
     pub why: Option<String>,
+    /// Where the shards take it: each on a CPU of its own, the server's other threads kept off them (goal 9, plan
+    /// 01a1a87b2cec step 4; [`Place`]); none where each asks as it is (the class isn't granted here).
+    pub place: Option<String>,
+    /// Why no shard asked for it, though it was asked for: they'd share CPUs with each other or with the server's
+    /// other threads ([`Place`]).
+    pub held: Option<String>,
 }
 
 impl Realtime {
-    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    /// The line it's said with once every shard has answered, or as it's held back; `None` before, or not asked
+    /// for.
     pub fn said(&self) -> Option<String> {
-        if !self.asked || self.took.saturating_add(self.refused) < self.shards {
+        if !self.asked {
             return None;
         }
+        if let Some(held) = &self.held {
+            return Some(format!("the server's shards run at the normal class, with a slice of their step: the real-time class isn't asked for ({held})"));
+        }
+        if self.took.saturating_add(self.refused) < self.shards {
+            return None;
+        }
+        let place = self.place.as_deref().map(|p| format!(", {p}")).unwrap_or_default();
         Some(match (self.took, &self.why) {
-            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}: a shard waking takes its CPU at once, whatever runs there"),
+            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}{place}: a shard waking takes its CPU at once, whatever runs there"),
             (0, why) => format!("the server's {} shards run at the normal class, with a slice of their step: the real-time class was refused ({})", self.refused, why.as_deref().unwrap_or("no reason given")),
             (took, why) => format!("{took} of the server's {} shards run in the real-time class, {} at the normal class: it was refused ({})", self.shards, self.refused, why.as_deref().unwrap_or("no reason given")),
         })
@@ -254,7 +441,19 @@ fn realtime_why(refusal: &hyper_rt::compute::Refusal) -> String {
         ),
         Some(io::ErrorKind::InvalidInput) => format!("{refusal}: the kernel doesn't take the round-robin real-time class here"),
         Some(_) => refusal.to_string(),
-        None => refusal.call.to_owned(),
+        None => format!("{}{}", refusal.call, realtime_instead()),
+    }
+}
+
+/// What the shards have in the real-time class's place where their OS has no such class for them to ask for
+/// (docs/priority.md, "macOS" and "Windows"; goal 9, plan 01a1a87b2cec step 4), said after its refusal.
+fn realtime_instead() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "; instead the server's launchd job runs at ProcessType Interactive and its legs and agents below normal (nice 10), so the scheduler runs the shards first on every core"
+    } else if cfg!(windows) {
+        "; instead the server runs above normal priority and its legs and agents below normal, in jobs of their own, and a waking thread of a higher priority level takes its CPU at once"
+    } else {
+        ""
     }
 }
 
@@ -265,12 +464,19 @@ pub fn realtime_status() -> Realtime {
 
 /// [`Realtime`] from the shards' `answers` ([`REALTIME_ANSWERS`]).
 fn realtime_of(answers: u32) -> Realtime {
+    let (place, held) = match REALTIME_PLACE.get() {
+        Some(Place::Fixed(place)) => (Some(place.clone()), None),
+        Some(Place::Held(why)) => (None, Some(why.clone())),
+        Some(Place::Asked) | None => (None, None),
+    };
     Realtime {
         asked: REALTIME.load(Ordering::Relaxed),
         shards: REALTIME_SHARDS.load(Ordering::Relaxed),
         took: answers % REFUSED_ONE,
         refused: answers / REFUSED_ONE,
         why: REALTIME_REFUSAL.get().map(realtime_why),
+        place,
+        held,
     }
 }
 
@@ -612,8 +818,12 @@ pub struct Cores {
     pub partition: Option<String>,
 }
 
-/// [`Cores`]; none where the server has no cores of its own ([`pin`] wasn't called).
+/// [`Cores`]; none where the server has no cores of its own ([`pin`] wasn't called), as where its shards were fixed
+/// for the real-time class alone ([`pin_apart`]: `priority.realtime` says where).
 pub fn cores_status() -> Option<Cores> {
+    if CORES_FOR_CLASS.load(Ordering::Relaxed) {
+        return None;
+    }
     let cores = CORES.get()?;
     Some(Cores {
         cores: crate::os::cpu_list_text(cores),
@@ -761,8 +971,10 @@ fn start() -> Result<Rt, String> {
     // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
     // the real-time class is asked for and granted ([`realtime`]), it takes that instead ([`shard_asks`]).
     // Where the nudge is asked for ([`nudge`]), a shard at the normal class nudges its CPU too, in the
-    // real-time class's place (goal 8, plan 01a1a59c2b29 step 7).
-    let realtime = REALTIME.load(Ordering::Relaxed);
+    // real-time class's place (goal 8, plan 01a1a59c2b29 step 7). None asks for the class where it's held back,
+    // as it would share a CPU with another shard or a thread of the server's own ([`Place`]; goal 9, plan
+    // 01a1a87b2cec step 4).
+    let realtime = REALTIME.load(Ordering::Relaxed) && !matches!(REALTIME_PLACE.get(), Some(Place::Held(_)));
     let shards = u32::try_from(holders.len()).unwrap_or(u32::MAX);
     if realtime {
         REALTIME_SHARDS.store(shards, Ordering::Relaxed);
@@ -2756,10 +2968,16 @@ mod tests {
     /// says why in a person's words, naming the grant `kiln install` writes.
     #[test]
     fn g9_s4_the_real_time_class_is_said_as_the_shards_took_it() {
-        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned) };
-        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None }.said(), None, "not asked for: nothing to say");
+        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned), place: None, held: None };
+        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None, place: None, held: None }.said(), None, "not asked for: nothing to say");
         assert_eq!(status(3, 0, None).said(), None, "not every shard has answered");
         assert!(status(4, 0, None).said().is_some_and(|s| s.contains("4 shards run in Linux's round-robin real-time class at priority 1")));
+        // Where they took it, and a class held back: said at once, though no shard answered.
+        let placed = Realtime { place: Some("each on a CPU of its own (1-4), the server's other threads kept off them".to_owned()), ..status(4, 0, None) };
+        assert!(placed.said().is_some_and(|s| s.contains("priority 1, each on a CPU of its own (1-4)")), "{:?}", placed.said());
+        let held = Realtime { asked: true, shards: 0, took: 0, refused: 0, why: None, place: None, held: Some("its 4 shards would share 1 CPU(s), 9".to_owned()) };
+        assert!(held.said().is_some_and(|s| s.contains("normal class") && s.contains("isn't asked for (its 4 shards would share")), "{:?}", held.said());
+        assert_eq!(Realtime { asked: false, ..held }.said(), None, "held, but never asked for: nothing to say");
         assert!(status(0, 4, Some("no room")).said().is_some_and(|s| s.contains("4 shards run at the normal class") && s.contains("no room")));
         assert!(status(1, 3, Some("no room")).said().is_some_and(|s| s.starts_with("1 of the server's 4 shards")));
         // EPERM, as Unix numbers it.
@@ -2769,10 +2987,206 @@ mod tests {
             assert!(why.contains("RLIMIT_RTPRIO") && why.contains("LimitRTPRIO=1"), "{why}");
         }
         let elsewhere = hyper_rt::compute::Refusal { call: "no real-time class to ask for on macOS", code: None };
-        assert_eq!(realtime_why(&elsewhere), "no real-time class to ask for on macOS");
+        let why = realtime_why(&elsewhere);
+        assert!(why.starts_with("no real-time class to ask for on macOS"), "{why}");
+        // What macOS and Windows do in its place, said after it there.
+        assert_eq!(why.contains("instead"), cfg!(any(target_os = "macos", windows)), "{why}");
         // Both kinds of answer counted in one atomic, each read back apart.
         let answers = 3 + 2 * REFUSED_ONE;
         assert_eq!((answers % REFUSED_ONE, answers / REFUSED_ONE), (3, 2));
+    }
+
+    /// A CPU of a machine's topology, for [`class_cpus`]'s cases.
+    fn cpu(id: u32, core: u32, llc: u32, rank: u32) -> crate::os::Cpu {
+        crate::os::Cpu { id, core, llc, rank }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: with no cores of the server's own declared, shards in the real-time class
+    /// take CPUs of their own from the machine's topology: its fastest first, one to a physical core, in the
+    /// last-level cache holding most of those, the first kept for the server's other threads, every other CPU theirs
+    /// too. Production's machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores) gives the shards 1-4 and
+    /// keeps 0; the lab's server held to fedora's efficiency cores, 16-31, gives them 17-20, as the lab's cores do;
+    /// fedora whole gives them its performance cores, one thread of each; a cache holding more cores wins; a fastest
+    /// class too small for them takes the next class's after its own; too few cores for a shard each and one more, or
+    /// none read, is no place.
+    #[test]
+    fn g9_s4_shards_in_the_class_take_cpus_of_their_own() -> anyhow::Result<()> {
+        let fixed = |cpus: &[crate::os::Cpu], shards: u16| class_cpus(cpus, shards).map(|cores| (cores.first().copied(), shard_cores(&cores, shards), cores));
+        // Production's: cores 0-15, CPU n + 16 the second thread of core n; caches 0-7,16-23 and 8-15,24-31.
+        let adacachy: Vec<crate::os::Cpu> = (0..32).map(|id| cpu(id, id % 16, if id % 16 < 8 { 0 } else { 8 }, 1024)).collect();
+        let (kept, shards, cores) = fixed(&adacachy, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![1, 2, 3, 4], "{kept:?} {shards:?}");
+        let mut every = cores.clone();
+        every.sort_unstable();
+        anyhow::ensure!(every == (0..32).collect::<Vec<u32>>(), "every CPU it may run on, once: {cores:?}");
+        // The lab's server on fedora's efficiency cores, 16-31: no SMT, one L3.
+        let lab: Vec<crate::os::Cpu> = (16..32).map(|id| cpu(id, id, 0, 0)).collect();
+        let (kept, shards, _) = fixed(&lab, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(16) && shards == vec![17, 18, 19, 20], "{kept:?} {shards:?}");
+        // fedora whole: performance cores 0-15 (threads 2k and 2k + 1 of a core), efficiency cores 16-31 below them.
+        let fedora: Vec<crate::os::Cpu> = (0..16).map(|id| cpu(id, id - id % 2, 0, 1)).chain((16..32).map(|id| cpu(id, id, 0, 0))).collect();
+        let (kept, shards, _) = fixed(&fedora, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![2, 4, 6, 8], "{kept:?} {shards:?}");
+        // A cache holding more of the fastest cores is taken first.
+        let lopsided: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1)).chain((2..8).map(|id| cpu(id, id, 2, 1))).collect();
+        let (kept, shards, _) = fixed(&lopsided, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(2) && shards == vec![3, 4, 5, 6], "{kept:?} {shards:?}");
+        // big.LITTLE with two big cores: the next class fills in, the fastest first.
+        let little: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1024)).chain((2..8).map(|id| cpu(id, id, 2, 446))).collect();
+        let (kept, shards, _) = fixed(&little, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![1, 2, 3, 4], "{kept:?} {shards:?}");
+        // Two cores of two threads: two shards and a core more don't fit.
+        let small: Vec<crate::os::Cpu> = (0..4).map(|id| cpu(id, id % 2, 0, 1)).collect();
+        anyhow::ensure!(class_cpus(&small, 2).is_err_and(|why| why.contains("2 core(s)")), "a place on two cores");
+        anyhow::ensure!(class_cpus(&small, 1).is_ok(), "one shard and a core for the rest");
+        anyhow::ensure!(class_cpus(&[], 2).is_err(), "a place with no CPU read");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: whether the class is granted is the kernel's own answer to a thread that
+    /// asks and ends: on Linux, granted with room in `RLIMIT_RTPRIO` (or as root), refused without it, saying what
+    /// would grant it; refused off Linux. The asking thread's class ends with it: this one's stays its own.
+    #[test]
+    fn g9_s4_whether_the_class_is_granted_is_asked_of_the_kernel() -> anyhow::Result<()> {
+        let before = hyper_rt::compute::thread_priority();
+        let granted = class_granted();
+        anyhow::ensure!(hyper_rt::compute::thread_priority() == before, "the asking changed this thread's class");
+        #[cfg(target_os = "linux")]
+        {
+            let limits = std::fs::read_to_string("/proc/self/limits")?;
+            let room = crate::os::rtprio_limits(&limits).is_some_and(|(soft, _)| soft >= u64::try_from(REALTIME_PRIORITY).unwrap_or(1));
+            if room {
+                anyhow::ensure!(granted.is_ok(), "room for priority {REALTIME_PRIORITY}, refused: {granted:?}");
+            } else if crate::os::uid() != 0 {
+                anyhow::ensure!(granted.as_ref().is_err_and(|why| why.contains("RLIMIT_RTPRIO")), "no room, and {granted:?}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(granted.is_err(), "granted off Linux");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: on this machine as this thread may run on it, the server's four shards in the
+    /// class take four physical cores, of its fastest class where that has five, none the kept CPU's, and every CPU it
+    /// may run on is listed once; or, where it has fewer than five cores, there's no place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_this_machines_shards_take_cores_of_their_own() -> anyhow::Result<()> {
+        let cpus = crate::os::cpu_topology();
+        let fastest = cpus.iter().map(|c| c.rank).max();
+        let all_cores: std::collections::BTreeSet<u32> = cpus.iter().map(|c| c.core).collect();
+        let cores_of_fastest: std::collections::BTreeSet<u32> = cpus.iter().filter(|c| Some(c.rank) == fastest).map(|c| c.core).collect();
+        let Ok(ordered) = class_cpus(&cpus, 4) else {
+            anyhow::ensure!(all_cores.len() < 5, "{} cores, and no place", all_cores.len());
+            return Ok(());
+        };
+        let of = |id: u32| cpus.iter().find(|c| c.id == id).copied();
+        let shards: Vec<crate::os::Cpu> = shard_cores(&ordered, 4).into_iter().filter_map(of).collect();
+        let kept = ordered.first().copied().and_then(of);
+        let cores: std::collections::BTreeSet<u32> = shards.iter().map(|c| c.core).collect();
+        anyhow::ensure!(shards.len() == 4 && cores.len() == 4, "shards {shards:?}");
+        anyhow::ensure!(cores_of_fastest.len() < 5 || shards.iter().all(|c| Some(c.rank) == fastest), "a shard off the fastest: {shards:?}");
+        anyhow::ensure!(kept.is_some_and(|k| !cores.contains(&k.core)), "the kept CPU {kept:?} on a shard's core");
+        let mut every = ordered.clone();
+        every.sort_unstable();
+        anyhow::ensure!(every == cpus.iter().map(|c| c.id).collect::<Vec<u32>>(), "not every CPU once: {ordered:?}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: shards take the real-time class only on CPUs of their own. Sharing one with
+    /// another shard is held back where the class's quantum (100 ms by default) is past the shards' 1 ms bar, and
+    /// allowed where root set it within it; sharing one with the server's other threads is held back; a CPU each,
+    /// the others kept off, is fixed and says where.
+    #[test]
+    fn g9_s4_the_class_is_held_back_where_a_shard_would_share_its_cpu() {
+        let held = |place: Place| match place {
+            Place::Held(why) => Some(why),
+            _ => None,
+        };
+        let shared = held(place_on(&shard_cores(&[8, 9, 10], 4), true, 4, Some(100_000_000)));
+        assert!(shared.as_deref().is_some_and(|why| why.contains("4 shards would share 2 CPU(s), 9-10") && why.contains("100 ms")), "{shared:?}");
+        assert!(held(place_on(&[9, 9], true, 2, None)).is_some(), "an unread quantum is the default's");
+        assert_eq!(place_on(&[9, 9], true, 2, Some(1_000_000)), Place::Fixed("each on a CPU of its own (9), the server's other threads kept off them".to_owned()), "turns within the bar");
+        let beside = held(place_on(&[1, 2], false, 2, Some(100_000_000)));
+        assert!(beside.as_deref().is_some_and(|why| why.contains("other threads may run on its shards' CPUs, 1-2") && why.contains("concurrent-queue")), "{beside:?}");
+        assert_eq!(place_on(&[1, 2, 3, 4], true, 4, Some(100_000_000)), Place::Fixed("each on a CPU of its own (1-4), the server's other threads kept off them".to_owned()));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: why the class needs CPUs of its own, on this machine's kernel where it's
+    /// granted. A thread in the real-time class that yields while it waits for a normal thread on its CPU (as
+    /// concurrent-queue waits for a push under way) lets it make no progress: the normal thread, ready on that CPU,
+    /// runs only once the real-time one stops (here after the shards' whole bar, 1 ms, of yields that each hand a
+    /// normal waiter's CPU over at once), where at the normal class it runs as the waiter yields. Where the class
+    /// isn't granted (no room, another OS) there's nothing to show, nor where a thread can't be put on the CPU.
+    #[test]
+    fn g9_s4_a_yielding_real_time_thread_holds_a_normal_one_on_its_cpu() -> anyhow::Result<()> {
+        if class_granted().is_err() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(cpu) = crate::os::cpu_topology().last().map(|c| c.id) else { return Ok(()) };
+            // Whether the normal thread ran while the waiter waited, the waiter in the class as asked and waiting at
+            // most `wait_ns`; none where a thread couldn't be placed as asked.
+            let ran_while_waiting = |realtime: bool, wait_ns: u64| -> anyhow::Result<Option<bool>> {
+                let start = std::time::Instant::now();
+                let stamp = move || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let on_cpu = move || {
+                    let mut set = rustix::thread::CpuSet::new();
+                    set.set(usize::try_from(cpu).unwrap_or(0));
+                    rustix::thread::sched_setaffinity(None, &set).is_ok()
+                };
+                let (ready, placed, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+                let (done, waited) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                // The normal thread: on the CPU, asleep until the waiter wakes it there as it starts waiting (so it's
+                // ready on that CPU, as a thread preempted mid-push is), then done. Asleep, not spinning, so it takes
+                // nothing from the tests beside it.
+                let normal = {
+                    let (ready, placed, go, done) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done));
+                    std::thread::spawn(move || {
+                        placed.store(on_cpu(), Ordering::Release);
+                        ready.store(true, Ordering::Release);
+                        while !go.load(Ordering::Acquire) && stamp() < 2_000_000_000 {
+                            std::thread::park_timeout(Duration::from_millis(10));
+                        }
+                        done.store(stamp().max(1), Ordering::Release);
+                    })
+                };
+                let wake = normal.thread().clone();
+                // The waiter: on the same CPU once the normal thread is, in the class as asked, waking it and yielding
+                // until it's done or the wait ends.
+                let waiter = {
+                    let (ready, placed, go, done, waited) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done), Arc::clone(&waited));
+                    std::thread::spawn(move || -> bool {
+                        let pinned = on_cpu();
+                        while !ready.load(Ordering::Acquire) && stamp() < 1_000_000_000 {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        let ok = pinned && placed.load(Ordering::Acquire) && (!realtime || hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY).is_ok());
+                        let from = stamp();
+                        go.store(true, Ordering::Release);
+                        wake.unpark();
+                        while ok && done.load(Ordering::Acquire) == 0 && stamp() < from.saturating_add(wait_ns) {
+                            std::thread::yield_now();
+                        }
+                        waited.store(stamp().max(1), Ordering::Release);
+                        ok
+                    })
+                };
+                let ok = waiter.join().map_err(|_| anyhow::anyhow!("the waiter panicked"))?;
+                normal.join().map_err(|_| anyhow::anyhow!("the normal thread panicked"))?;
+                let (done, waited) = (done.load(Ordering::Acquire), waited.load(Ordering::Acquire));
+                anyhow::ensure!(done > 0 && waited > 0, "a thread didn't finish: done {done}, waited {waited}");
+                Ok(ok.then_some(done < waited))
+            };
+            // At the normal class the waiter waits as long as it takes (its yield gives the other its turn at once);
+            // in the real-time class for the shards' bar, DELAY_BAR_NS, the CPU held from everything normal meanwhile.
+            let normal = ran_while_waiting(false, 2_000_000_000)?;
+            anyhow::ensure!(normal != Some(false), "at the normal class the waiter's yield didn't let the other run");
+            let realtime = ran_while_waiting(true, DELAY_BAR_NS)?;
+            anyhow::ensure!(realtime != Some(true), "in the real-time class the waiter's yield let a normal thread run on its CPU");
+        }
+        Ok(())
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge takes the real-time class's place where that's refused or

@@ -25,7 +25,10 @@
 #                unit given LimitRTPRIO=1 as kiln install's unit has, the server's soft limit raised to it). Run only
 #                where this user's service manager grants a unit that room (the most it gives is its own hard
 #                RLIMIT_RTPRIO, which only root raises); elsewhere skipped, and the log says so. rt-hogs is the shards
-#                in the class beside the hogs, rt-cores the class on cores of their own.
+#                in the class beside the hogs, rt-cores the class on cores of their own. Either way each shard in the
+#                class is on a CPU of its own, the server's other threads kept off them: its declared cores', else
+#                those the machine's topology gives within SERVER_CPUS (17-20 on fedora's 16-31: crate::rt's
+#                class_cpus), as kiln does on bare metal; the log's line for each round says where.
 #   spin-<cfg>:  <cfg> with each shard spinning before its parks as long as its own idle gaps make cheapest in CPU, up to
 #                16 µs (goal 9 step 4: KILN_RT_SPIN=1; hyper-rt's park_spin): it spends less CPU than parking at once
 #                wherever it spins, so it's the busy-share-safe spin.
@@ -131,10 +134,12 @@ one() {
     wait 2>/dev/null
   fi
   # How the shards ran, as the hook saw them as the window ended: their threads (hyper-rt-shard-N, cut to 15 bytes) in
-  # the real-time class (policy 2, SCHED_RR) of all of them.
+  # the real-time class (policy 2, SCHED_RR) of all of them, the CPUs each may run on, and the CPUs the server's other
+  # threads may run on, with how many of them each (goal 9 step 4: shards in the class each on a CPU of their own, the
+  # other threads off them).
   for aff in "$out"/rounds/*.hook/affinity.txt; do
     [ -s "$aff" ] || continue
-    say "round $i $cfg: $(awk '$2 ~ /^hyper-rt-shard/ {n++; if ($5 == "policy=2") rr++} END {printf "%d of %d shard threads in the real-time class", rr, n}' "$aff")"
+    say "round $i $cfg: $(awk '$1 == "child" {next} $2 ~ /^hyper-rt-shard/ {n++; if ($5 == "policy=2") rr++; on = on " " substr($3, 6); next} {rest[substr($3, 6)]++} END {printf "%d of %d shard threads in the real-time class, on CPUs%s; the other threads on", rr, n, on; for (c in rest) printf " %s (%d)", c, rest[c]}' "$aff")"
   done
   for data in "$out"/rounds/*.hook/perf.data; do
     [ -s "$data" ] || continue
