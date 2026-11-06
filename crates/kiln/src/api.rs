@@ -1822,7 +1822,7 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
-    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    let location = hub.harness.mentioned_where(id, &path).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
     serve_from(hub, id, location, path, req).await
 }
 
@@ -5840,14 +5840,16 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     // pieces they're kept in, nothing inflated or joined for this read (step 5). On the request's shard
     // only as the copy keeps them: a compact chunk's texts no read kept yet are inflated on the blocking
     // pool by the read that needs them first, and kept for the reads after (step 5: inflated on the shard,
-    // they were the lab's slowest read, a poll of `read /api/harness/sessions` 0.8 to 3.6 ms on the CPU).
+    // they were the lab's slowest read, a poll of `read /api/harness/sessions` 0.8 to 3.6 ms on the CPU). A
+    // spilled chunk's are read from its spill file there, the same bytes (goal 11 audit A3): the store
+    // answered a range that touched one, its rows read and each one's JSON written out again.
     match hub.harness.events_page_kept(id, before, limit) {
         Ok(events) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
         Err(crate::harness::copies::Unread::Unkept) => {
             if let Some(view) = hub.harness.view_held(id) {
                 match crate::rt::blocking(move || view.events_page(before, limit)).await {
                     Ok(Some(events)) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
-                    // The copy can't say it after all (a chunk spilled meanwhile): the store's.
+                    // The copy can't say it after all (a spill file that didn't give its chunk back): the store's.
                     Ok(None) => {}
                     Err(e) => tracing::debug!(session = id, error = %format!("{e:#}"), "a page's texts weren't made off the shard: the store answers"),
                 }
@@ -7993,6 +7995,82 @@ mod tests {
         Ok(r.into_body().collect().await?.to_bytes().to_vec())
     }
 
+    /// `fut`, and the segments its polls read back from spill files on the thread that polled them (a request's shard),
+    /// counted a poll at a time as [`inflated_in`] counts inflates.
+    async fn spill_read_in<F: Future>(fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut read = 0u64;
+        let out = std::future::poll_fn(|cx| {
+            let before = crate::harness::spill::READ_BACK.with(std::cell::Cell::get);
+            let polled = fut.as_mut().poll(cx);
+            read = read.wrapping_add(crate::harness::spill::READ_BACK.with(std::cell::Cell::get).wrapping_sub(before));
+            polled
+        })
+        .await;
+        (out, read)
+    }
+
+    /// A session `a` of machine `box` working in `/home/ada/work`, whose first event is `first` and whose next are six
+    /// chunks' replies and nine, once its first chunk is spilled (`crate::harness::spill`): what the tests of reads past a
+    /// copy's newest page read.
+    async fn spilled_session(hub: &Arc<Hub>, first: crate::harness::model::Event) -> anyhow::Result<u64> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let there = crate::harness::registry::Location::Machine("box".into());
+        let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), cwd: "/home/ada/work".into(), ..crate::harness::session::Info::default() };
+        hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
+        let n = u64::try_from(crate::harness::copies::CHUNK * 6 + 9)?;
+        let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the retry loop reads its \"deadline\""), streaming: false } };
+        hub.harness.ingest(&there, "a", Update::Events { events: std::iter::once(first).chain((2..=n).map(said)).collect() }).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !hub.harness.view_held("a").is_some_and(|v| v.events.chunks().first().is_some_and(|c| c.is_spilled())) {
+            anyhow::ensure!(Instant::now() < deadline, "the first chunk never spilled");
+            crate::rt::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(n)
+    }
+
+    /// Goal 11 audit A3 (goal 10, plan 01a1a87b2dae step 5): the events API answers a page that touches a spilled chunk from
+    /// its spill file, off the request's shard, not from the conversation store. Do: a session whose first chunk is spilled;
+    /// pages of it asked for before its 21st, 75th and newest events. Expect: each 200, the store's bytes, the store asked
+    /// for none, nothing inflated or read from a spill file on the request's shard. The store answered every such page, its
+    /// rows read and each one's JSON read and written out again: this fails on that code.
+    #[test]
+    fn g10_a3_an_events_page_past_the_newest_is_read_from_the_spill_file() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "1: the first".into(), streaming: false } };
+            let n = spilled_session(&hub, first).await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking({
+                let store = store.clone();
+                move || store.sync()
+            })
+            .await??;
+            let stored = |before: Option<u64>, limit: usize| -> anyhow::Result<Vec<u8>> {
+                let events: Vec<serde_json::Value> = store.events("a", before, limit)?.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+                Ok(serde_json::to_vec(&json!({ "events": events }))?)
+            };
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            for (before, limit) in [(Some(21), 10), (Some(75), 50), (None, 300)] {
+                let path = match before {
+                    Some(b) => format!("/api/harness/sessions/a/events?before={b}&limit={limit}"),
+                    None => format!("/api/harness/sessions/a/events?limit={limit}"),
+                };
+                let (((r, inflated), read), counts) = crate::reads::trace::traced(spill_read_in(inflated_in(Arc::clone(&api).handle(lab_get(&path)?)))).await;
+                let status = r.status();
+                let body = body_of(r).await?;
+                anyhow::ensure!(status == StatusCode::OK && body == stored(before, limit)?, "{path}: {status}, the store's bytes");
+                anyhow::ensure!(counts.asked == 0, "{path}: the store asked {} times", counts.asked);
+                anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
+            }
+            anyhow::ensure!(n > 300, "the newest 300 reach the spilled chunks");
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 2, traced: once the reads kept in memory are made, the reads the
     /// lab makes of agents' pages (the sessions, one session, its newest events, its plans, its goals
     /// and an agent's with none) never ask the store, each answering the bytes the store's path makes;
@@ -8127,6 +8205,30 @@ mod tests {
 
     /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the
     /// admin token, taking nothing packed.
+    /// Goal 11 audit A1, A3 (goal 10, plan 01a1a87b2dae step 5): `GET .../file?path=` looks for a mention of a file the
+    /// keeper doesn't list off the request's shard. Do: a person's message showing a picture, then six chunks' events, so
+    /// its chunk is compact and spilled; the file route asked for a file no message mentions, then for the picture. Expect:
+    /// 404 for the first, and the second found (its machine is asked for it: not connected here, 502), neither inflating
+    /// anything or reading a spill file on the request's shard. Every message was parsed whole on the shard, each compact
+    /// chunk inflated and each spilled one read from its file on the way: this fails on that code.
+    #[test]
+    fn g10_a1_a_files_mention_is_looked_for_off_the_requests_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let shown = Body::User { text: "Here's the phone view: ![phone](/home/ada/shot.png)".into(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None };
+            spilled_session(&hub, Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: shown }).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            for (path, found) in [("/home/ada/never.png", false), ("/home/ada/shot.png", true)] {
+                let ((r, inflated), read) = spill_read_in(inflated_in(Arc::clone(&api).handle(lab_get(&format!("/api/harness/sessions/a/file?path={path}"))?))).await;
+                anyhow::ensure!((r.status() != StatusCode::NOT_FOUND) == found, "{path}: {}", r.status());
+                anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
+            }
+            Ok(())
+        })
+    }
+
     fn lab_get(path: &str) -> anyhow::Result<Request> {
         Ok(http::Request::builder().method(Method::GET).uri(path).header(header::AUTHORIZATION, "Bearer test-admin-token").header(header::ACCEPT_ENCODING, "identity").body(srv::Incoming::empty())?)
     }
@@ -8316,9 +8418,8 @@ mod tests {
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
             hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // Two chunks' events and nine: the two sealed are packed off the owner's shard and kept compact, and the
-            // newest fifty reach into the second. A chunk's events, from the bound of what a copy keeps packed (two
-            // chunks' at a packed event's bytes).
-            let chunk = crate::harness::copies::PAGE_BYTES / (2 * crate::harness::copies::PACKED_EVENT_BYTES);
+            // newest fifty reach into the second.
+            let chunk = crate::harness::copies::CHUNK;
             let n = u64::try_from(2 * chunk + 9)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;

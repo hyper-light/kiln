@@ -3607,23 +3607,25 @@ impl Registry {
     }
 
     /// Where a session runs, when one of its messages mentions `path` (a relative mention, in its
-    /// folder): a viewer may read that file from its machine, and no other.
-    pub fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
-        let listed = self.keeper.lists_path(id, path);
-        self.sessions
-            .with(id, |v| {
-                let cwd = &v.info.cwd;
-                let said = || {
-                    v.events
-                        .iter()
-                        .rev()
-                        .filter(|e| matches!(e.entry.kind(), Some("user" | "assistant")))
-                        .filter_map(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned))
-                        .any(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
-                };
-                (listed || said()).then(|| Location::clone(&v.location))
-            })
-            .flatten()
+    /// folder): a viewer may read that file from its machine, and no other. A file its keeper lists is
+    /// said on the request's shard; else its messages are looked through on the blocking pool, newest
+    /// first, each one's `text` alone read of its JSON ([`mentions_in`]; goal 11 audit A1, A3): each was
+    /// parsed whole on the request's shard, every compact chunk inflated and every spilled one read from
+    /// its file on the way, for each file the keeper doesn't list (one too big, past a budget, or from
+    /// before kiln kept files).
+    pub async fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
+        let view = self.sessions.view(id)?;
+        if self.keeper.lists_path(id, path) {
+            return Some(Location::clone(&view.location));
+        }
+        let path = path.to_owned();
+        match crate::rt::blocking(move || mentions_in(&view, &path).then(|| Location::clone(&view.location))).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::debug!(session = id, error = %format!("{e:#}"), "a session's messages weren't looked through for a file off the shard");
+                None
+            }
+        }
     }
 
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
@@ -4434,16 +4436,39 @@ impl Registry {
         state.get::<Vec<super::model::QueueItem>>("queue").unwrap_or_default()
     }
 
-    /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
-    /// last reported, its last reply on its main thread (an `assistant` event) and its changeset.
-    pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
-        // References from its view; the copies made after.
-        let (state, reply, changes) = self.sessions.with(id, |v| {
-            let reply = v.events.iter().rev().find(|e| e.entry.kind() == Some("assistant") && e.entry.on_main_thread()).map(|e| Arc::clone(&e.entry));
-            (Arc::clone(&v.state), reply, v.changes.clone())
-        })?;
-        let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
-        Some((state.to_value(), reply.map(|e| e.value()), changes))
+    /// What `agents.get` reads of a session (`harness::ops`): its state as last reported. None of its events is read (goal
+    /// 11 audit A2(c): `conclusion` scanned back through them for a reply `agents.get` threw away, on the request's shard,
+    /// inflating every compact chunk and reading every spilled one on the way).
+    pub fn state_value(&self, id: &str) -> Option<Value> {
+        let state = self.sessions.with(id, |v| Arc::clone(&v.state))?;
+        Some(state.to_value())
+    }
+
+    /// Session `id`'s changeset as JSON: `Null` when it has none, or there's no such session.
+    pub fn changes_value(&self, id: &str) -> Value {
+        let changes = self.sessions.with(id, |v| v.changes.clone()).flatten();
+        changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()))
+    }
+
+    /// Session `id`'s last reply on its main thread (an `assistant` event of no subagent's), as `agents.result` and an
+    /// experiment read it: found by its place, which its copy keeps (`super::copies::Replied`), on the request's shard where
+    /// its chunk keeps its events as they are; else read from its chunk, or the copy scanned back for it, on the blocking
+    /// pool, where a compact chunk is inflated and a spilled one read from its file (goal 11 audit A2(c), A3: no shard
+    /// reads a spill file). Its JSON read where that costs least (`super::copies::reply_value`). None when it has none, or
+    /// there's no such session.
+    pub async fn reply(&self, id: &str) -> Option<Value> {
+        let view = self.sessions.view(id)?;
+        let entry = match view.reply_kept() {
+            Ok(kept) => kept,
+            Err(_) => match crate::rt::blocking(move || view.reply_read()).await {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::debug!(session = id, error = %format!("{e:#}"), "a session's last reply wasn't read off the shard");
+                    None
+                }
+            },
+        }?;
+        Some(super::copies::reply_value(entry).await)
     }
 
     /// Tests: session `id`'s changeset, as its machine would report it.
@@ -4476,6 +4501,25 @@ fn disconnected(m: &mut Mirror) -> Info {
     }
     m.commit(|m| m.state_frame());
     Info::clone(&m.info)
+}
+
+/// Whether one of `v`'s messages (what the person or the agent said, newest first) mentions `path`, resolved in its folder
+/// ([`Registry::mentioned_where`]): each one's `text` alone read of its JSON, nothing else of it made (goal 11 audit A1).
+fn mentions_in(v: &super::copies::View, path: &str) -> bool {
+    /// A message's text, borrowed from its JSON where it has no escapes.
+    #[derive(serde::Deserialize)]
+    struct Said<'a> {
+        #[serde(borrow, default)]
+        text: Option<std::borrow::Cow<'a, str>>,
+    }
+    let cwd = &v.info.cwd;
+    v.events.iter().rev().any(|e| {
+        if !matches!(e.entry.kind(), Some("user" | "assistant")) {
+            return false;
+        }
+        let Ok(said) = serde_json::from_str::<Said<'_>>(e.entry.text()) else { return false };
+        said.text.is_some_and(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
+    })
 }
 
 /// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent
@@ -6344,7 +6388,7 @@ mod tests {
         let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
         let mut events = parts.events.clone();
         events.compact(None);
-        let chunks = events.spillable(super::super::copies::EVENTS_PAGE, super::super::copies::PAGE_BYTES);
+        let chunks = events.spillable(super::super::copies::EVENTS_PAGE);
         let segments: Vec<Arc<super::super::packed::Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(events.spilled_where(&chunks, spilled) > 0, "some spilled");
