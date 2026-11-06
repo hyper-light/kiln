@@ -1300,8 +1300,8 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **The hub's net loop: a poll is a turn at the most** (`rt::Turns::end`, `before`): told that nothing else
   wanted the shard (`maybe_yield`), the loop went on into its next turn in the same poll, so a burst of
   runners' frames could hold the HTTP listener's shard two turns and more a poll (rt9's calm rounds:
-  `runner AgentMsg::Harness` 1.22 ms on the CPU, and in round 1 eight more of its labels 0.4 to 0.6 ms,
-  a cheap message's among them). Now its turn's end
+  `runner AgentMsg::Harness` 1.22 ms on the CPU, and in round 1 six more of its labels 0.40 to 0.52 ms,
+  cheap messages' among them: `HeadroomStatus`, `Identity`, whose signing is the compute pool's). Now its turn's end
   ends its poll (`yield_now`: the shard reads its inputs and comes back to the loop at once when nothing
   else is ready), and a frame whose read on the shard would take the turn past the quantum
   (`wire::payload::expected_ns`: its read and its item's message's, each by what reads of its kind took,
