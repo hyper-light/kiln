@@ -4729,6 +4729,9 @@ mod tests {
             let (_, meta_made, _) = held().await;
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
+            Ok(())
+        })
+    }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: each change of a session's info lets go of its last `harness` frame in the
     /// events socket's feed (`crate::wire::events::feed::Feed::push_over`): its copy keeps the newest frame's number,
