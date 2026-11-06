@@ -1555,6 +1555,127 @@ to another quantum:
 kiln-lab report --quantum-us 266.666 <run>/run.json
 ```
 
+### The allocator's slow path (step 3)
+
+Step 3 says too that nothing on a shard waits on the allocator's slow path. Production's allocator is jemalloc 5.3
+(kiln's `jemalloc` feature, Linux alone; tikv-jemalloc-sys 0.6.1's sources; `os::alloc`'s settings). macOS and Windows
+allocate through the system's allocator and glibc builds through glibc's malloc, none of which lets a thread take an
+arena, so what follows is Linux's.
+
+**What census16 counted** (main `e4b39c53f0b`, train 16's census build with jemalloc, production's layout, fedora;
+jemalloc's own counts, `scripts/locks/census_jemalloc.rs`; 88 to 102 threads in 5 automatic arenas):
+- calm: nothing blocked. Arena 1, the busiest, took `bins` 10,500 times a second and found one held 0.30 times;
+  `extents_dirty` 4,235 times, found held 2.75 times, each won within jemalloc's spin.
+- with hogs: `extents_dirty` blocked 0.050 ms a second on arena 1 (the longest 5 ms), 0.033 on arena 3 (13 ms), 0.017
+  on arena 0 (3 ms); `bins` were found held 0.07 to 0.30 times a second, none blocked in the window.
+- How to read them: jemalloc times a wait with `CLOCK_MONOTONIC_COARSE` (src/nstime.c), a jiffy (1 ms at fedora's
+  1,000 Hz), so a wait counts in whole milliseconds and one inside a jiffy counts none; its longest is the process's
+  (jemalloc keeps the maximum since it started), the fill's included. The counts, taken and found held, are exact.
+  jemalloc counts by mutex, not by thread: which thread waited, a shard, a pool's worker or a background thread, the
+  census can't say.
+
+**Who holds them** (jemalloc 5.3's src/arena.c, extent.c, pac.c, tcache.c and background_thread.c). A thread takes the
+automatic arena with the fewest threads as it first allocates (`arena_choose_hard`), so each holds about a fifth of the
+server's threads: shards, the blocking pool's and the compute pool's workers, the net thread and the rest alike.
+- An arena's `extents_dirty` is taken:
+  - by any thread of the arena that wants an extent: a slab, where a bin it refills from has none with room (the refill
+    lets go of the bin's lock first, `arena_cache_bin_fill_small`); an allocation past its cache (32 KiB,
+    `tcache_max`); a large one grown in place (`pac_expand_impl`). `extent_recycle` holds the lock through its search
+    and the split of the extent it found (`extent_split_impl`: an extent record from `extent_avail`, the radix tree
+    written, and where no record is free a new one from the arena's base, which can map a block of 2 MiB or more: an
+    `mmap` under the lock, rarely);
+  - by any thread freeing an extent of the arena, whichever arena the thread's own: a large allocation past its cache,
+    its cache's flush of large ones, a slab its free or flush emptied. `extent_record` coalesces a large extent with
+    its free neighbours under the lock and, where they come to `oversize_threshold` (8 MiB), purges them on that
+    thread at once (`extent_maximally_purge`);
+  - by its background thread (arena i's is the one of index i % 4), as it purges: `ecache_evict` takes the lock for
+    each extent it purges, finishing its delayed coalescing, and lets go of it for the `madvise`. On arena 1
+    `extents_retained` was taken 118.9 times a second calm and 128.0 with hogs, `extents_muzzy` 92.3 and 103.3. With
+    `muzzy_decay_ms:0` there are no muzzy pages, so `extents_muzzy`'s takes are large allocations grown in place that
+    found no dirty extent to grow into (`pac_expand_impl`), each going on to `extents_retained`. What's left of
+    `extents_retained`'s, 26.6 a second calm and 24.7 with hogs, bounds the purged extents recorded there. A purge
+    takes the lock once for each extent and at most once more, at its end, and only with an extent to purge, so the
+    background thread took `extents_dirty` at most 53 times a second of 4,235 calm (1.3%) and 49 of 4,963 with hogs
+    (1.0%);
+  - by a statistics refresh (`epoch`: `/metrics` on the blocking pool, the observe registry's thread), once a refresh.
+- An arena's `bins` are taken by a thread of the arena refilling its cache (one batch, up to half its slots), by any
+  thread whose cache's flush gives back regions of the arena (`tcache_bin_flush_impl` locks each region's own arena's
+  bin: a shard's flush takes the bins of the arenas its regions came from), and by a statistics refresh.
+- Never by the waiting shard itself: jemalloc's mutexes aren't recursive. A shard's own flush makes it wait on the
+  arenas what it frees came from, and makes others wait on it.
+
+Each hold is a few list, heap and radix tree updates (the base's `mmap` aside), which jemalloc's spin outlasts (600
+tries, `opt.mutex_max_spin`). So a wait past the spin is a holder off its CPU, preempted holding the lock: what hogs
+bring. The most exposed holder shares every arena: the compute pool's workers, at `SCHED_BATCH` and nice 10
+(`hyper_rt::compute::Rank::Below`), a tenth of a nice-0 thread's share (the kernel's weights, 110 to 1,024), and never
+preempting on a wake; then the blocking pool's at nice 0. The background thread is at most 1.3% of the takes.
+
+**The change** (`os::alloc::ShardArenas`, `KILN_ALLOC_SHARD_ARENAS`): the shards allocate in arenas no other thread
+does. They're made as the runtime starts (jemalloc's `arenas.create`; TUNING.md's "Explicit arenas"), and each shard's
+thread takes its own in its first task (`thread.arena`). `each` gives each shard its own; `one`, one arena the shards
+share. What still takes their locks: the shards, a thread freeing what a shard allocated (small regions in its cache's
+flush, a large one at once), their background thread's purge, a statistics refresh. What a shard frees of others'
+allocations still takes their arenas' locks, as before. The shards' arenas keep the run's decays, and jemalloc's
+background threads purge them as they purge every arena. Purging them on the shard instead would take
+`arena.<i>.purge`, all of it at once (while background threads run, jemalloc purges by the decay on them alone,
+`arena_decide_unforced_purge_eagerness`): what the decay keeps for reuse dropped, and the `madvise`s on the shard, to
+save the background thread's 1.3% of the takes. Unset, as by default (`os::alloc::SHARD_ARENAS`), the shards share
+the automatic arenas as before; once the A/B below holds, the layout it keeps goes in its place.
+
+What an arena of the shards' own costs at the least, beside what the A/B measures:
+- its metadata: its own base, 91,152 bytes as made (95,888 once it held a slab of every class, their extents'
+  records), and mallctl's copy of its statistics, which with it took `stats.metadata` up by 129,008 bytes (kiln's
+  jemalloc, tikv-jemalloc-sys 0.6.1 with `stats`, on adacachy: the first from
+  `g9_s3_a_fresh_arena_holds_its_metadata_and_a_slab_of_each_size`, the rest from a probe linked against the same
+  library);
+- a slab of each small size class it allocates from: one of every class is 552,960 bytes (36 classes, 135 pages;
+  `os::alloc::slab_bytes_of_every_small_size`, held to jemalloc's own bins and to a fresh arena's slabs by
+  `g9_s3_a_slab_of_every_small_size_is_what_jemalloc_cuts` and
+  `g9_s3_a_fresh_arena_holds_its_metadata_and_a_slab_of_each_size`), less what's allocated in them.
+
+So an arena of the shards' own adds at most 681,968 bytes of `metadata` and `slab_room` (the slack's part in slabs)
+before fragmentation: `each` with 4 shards at most 2.7 MB, `one` a quarter of that. `dirty` and `thread_caches` keep
+the same frees and caches, apart by arena. Against g9p16's 12.8 MB of `metadata` and 24.8 MB of `slack`. With either,
+goal 11's arena arms (`one-arena`, `bisect-arenas`) set how many arenas every other thread shares, not the shards: run
+with `KILN_ALLOC_SHARD_ARENAS` on both sides, an arm's latency risk is those threads' alone. As queued, those A/Bs run
+without it. `one` beside `_RJEM_MALLOC_CONF=narenas:4` keeps 5 arenas in all, and so their fixed cost: goal 11's to
+weigh with its arena arms.
+
+**The A/B** (the build: production's static musl build with jemalloc, of a tree with this change; kiln-lab of the same
+tree). The arms are `os::alloc::SHARD_ARENA_ARMS`: `shard-arenas-each` first, `shard-arenas-one` only where
+`shard-arenas-each`'s `metadata` and `slab_room` rose past their noise:
+
+```sh
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a shared --label-b shard-arenas-each --env-b KILN_ALLOC_SHARD_ARENAS=each --server-cpus 16-31 --layout production --rounds 8
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a shared --label-b shard-arenas-each --env-b KILN_ALLOC_SHARD_ARENAS=each --server-cpus 16-31 --layout production --rounds 8 --hogs 1x
+taskset -c 8-15 kiln-lab ab --a kiln --b kiln --label-a shard-arenas-each --label-b shard-arenas-one --env-a KILN_ALLOC_SHARD_ARENAS=each --env-b KILN_ALLOC_SHARD_ARENAS=one --server-cpus 16-31 --layout production --rounds 8 --hogs 1x
+```
+
+- Each B round's server log says `each shard allocates in an arena of its own, which no other thread does: <its
+  arenas>, shard by shard (KILN_ALLOC_SHARD_ARENAS=each)` (`one`: `the shards allocate in an arena no other thread
+  does`); a round whose log doesn't say it measured nothing.
+- Read: `shards.delay_p999_us` and each shard's (`shard<i>.delay_p999_us`), `shards.worst_delay_p999_us`,
+  `shards.busy_share`, `shards.slow_polls_per_s`, and step 3's check (`kiln-lab report <run>/run.json`: the listed
+  paths' longest polls, on the CPU and off it); API reads' and websocket frames' p99.9; the runner wait p99;
+  `server.cpu_ms_per_request`; `server.rss_anon_mb` and `server.allocator.{metadata,slab_room,slack,dirty,thread_caches}_mb`.
+  A shard reuses only its own dirty extents now, so the pages it faults in anew are a cost to see, which kiln-lab
+  doesn't record: the round's hook reads the server's `minflt` (the tenth field of `/proc/<pid>/stat`) at
+  `window-start` and `window-end`.
+- Kept where shard delay p99.9 with hogs is better beyond noise, or no worse with every other number held, and
+  `metadata` and `slab_room` rose by no more than above.
+
+**The census with it** (goal 5's census build of the same tree, its server's environment with
+`KILN_ALLOC_SHARD_ARENAS=each`, 3 rounds calm and 3 with hogs as census16's): locks.md's allocator table, the shards'
+arenas by the indices the server's log says.
+- `arena.<i>.extents_dirty`, `arena.<i>.bins` and `arena.<i>.large` (a manual arena lists its large allocations under
+  `large`), taken, held when asked and waited: held when asked near none, nothing waited.
+- Arenas 0 to 4, every other thread's, against census16's: what a shard's frees still take there is among theirs.
+- Exact, by thread, where the lab's machine gives root (an unstripped build, for jemalloc's symbols; Linux cuts the
+  shards' names to `hyper-rt-shard-`): each shard's waits in jemalloc's lock's slow path,
+  `sudo bpftrace -e 'uprobe:<kiln>:_rjem_je_malloc_mutex_lock_slow /pid == <pid> && comm == "hyper-rt-shard-"/ { @t[tid] = nsecs; } uretprobe:<kiln>:_rjem_je_malloc_mutex_lock_slow /@t[tid]/ { @us = hist((nsecs - @t[tid]) / 1000); delete(@t[tid]); }'`
+  over the window, calm and with hogs, A and B. Without root, the census and the share of slow polls off the CPU are
+  what the lab has.
+
 ## Goal 11: a tenth of the memory
 
 Goal 11 of the API runtime program (plan `01a1a87b2e5673758106c92602a8b04d`, research
