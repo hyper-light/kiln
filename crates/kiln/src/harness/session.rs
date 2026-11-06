@@ -646,11 +646,12 @@ impl Sink {
 
     /// Hands on an update taken in before (a tee passing a runner's updates on): when it was taken in goes with
     /// it where this sink keeps that ([`Sink::Stamped`]), never noted again here.
-    pub async fn send_taken(&self, t: Taken) -> Result<(), async_channel::SendError<Taken>> {
+    /// Its error boxed: an update and its stamp are large, and its callers ask only whether it went.
+    pub async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
         let Taken { session, update, at } = t;
-        let back = |(session, update): (String, Update)| async_channel::SendError(Taken { session, update, at });
+        let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
         match self {
-            Sink::Stamped(q) => q.send(Taken { session, update, at }).await,
+            Sink::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
             Sink::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
             Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
         }

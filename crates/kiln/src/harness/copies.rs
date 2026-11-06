@@ -2381,7 +2381,8 @@ pub struct Shard {
     write: Option<Writing>,
     /// What was made of the event last written out so, or tried, for the update's next take alone ([`Shard::take_written`]).
     written: Option<Written>,
-    /// Events written out so ([`Shard::written_off`]).
+    /// Events written out so ([`Shard::written_off`]): its tests' count.
+    #[cfg(test)]
     written_off: u64,
 }
 
@@ -2552,6 +2553,7 @@ impl Shard {
     }
 
     /// How many events of its sessions' updates this owner wrote out off its shard ([`Shard::want_write`]).
+    #[cfg(test)]
     pub(super) fn written_off(&self) -> u64 {
         self.written_off
     }
@@ -2880,7 +2882,8 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None, write: None, written: None, written_off: 0 };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new(), insert: None, inserted: None, write: None, written: None, #[cfg(test)]
+                written_off: 0 };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
@@ -3266,7 +3269,10 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
         Ok((e, made, took)) => {
             if made.is_some() {
                 wrote(&e, took);
-                shard.written_off = shard.written_off.saturating_add(1);
+                #[cfg(test)]
+                {
+                    shard.written_off = shard.written_off.saturating_add(1);
+                }
             }
             *slot = e;
             shard.written = Some(Written { session, id, seq, made });

@@ -348,17 +348,33 @@ the time), over what a connection carries at once, at least one for each of the 
 open-files limit to kiln's service's (1,048,576 on Linux, 10,240 on macOS) before any server starts,
 so servers run under production's, and holds connections to what it allows, saying so.
 
-Each read at each rate is one line of `results.jsonl` and a row of `report.md`: the rate asked and
-the rates sent and answered, good answers and errors (bad statuses, timeouts, connections cut, requests
+Each read at each rate is one line of `results.jsonl` and a row of `report.md`: the rate asked and the
+rates sent and answered, good answers and errors (bad statuses, timeouts, connections cut, requests
 never sent), p50, p99, p99.9 and the most from when each fell due (and the same from each send, what
 coordinated omission would have said), the answers' bytes, the server's CPU (CPUs' worth) and RSS
-through the window (its whole process tree: `/proc` every 100 ms on Linux, `ps` every second on
-macOS; Windows isn't sampled), and the generator's CPU, its busiest thread's work, and its own
-lateness. It says who couldn't keep up: the generator, when its busiest thread worked 90% of the window
-or its lateness at p99 is a tenth of the latency's; the connections, when the rate fell short while
-requests waited for one; the server, when it fell short otherwise (under 99% answered, or over 1%
-errors). Its threads ask their OS to be punctual (Linux's timer slack of 1 ns, macOS's
-user-interactive QoS) and spin through the last of each wait, their own oversleeps' 90th percentile.
+through the window (its whole process tree: `/proc` every 100 ms on Linux, `ps` every second on macOS;
+Windows isn't sampled), and the generator's CPU, its busiest thread's work, and its own lateness. On
+Linux it also reads what the host did to the server's threads between the window's ends: how long they
+waited, runnable, for a CPU (the kernel's run delay, each thread's `schedstat`), and the policy and nice
+value each ran at (`report.md` ends with each server's). It says who couldn't keep up: the generator,
+when its busiest thread worked 90% of the window; the host, when the server's threads, or its neediest
+thread (the most time on a CPU and waiting for one: a single-threaded server's loop), waited for a CPU
+at least as long as they ran (it got at most half the CPU it asked for) and that accounts for it: given
+the CPU it waited for it could have answered the rate, or, in a rate kept up, its wait an answer is a
+tenth of the latency's p99 (a server too slow even with that CPU is still the server, its wait said);
+the generator again, when its lateness at p99 is a tenth of the latency's; the connections, when the
+rate fell short while requests waited for one and the connections couldn't carry the rate at the
+server's median answer (timed from its send; when they could, its slower answers held them, a stall or a
+tail, and that's the server's); the server, when it fell short otherwise (under 99% answered, or over 1%
+errors). Its threads ask their OS to be punctual (Linux's timer slack of 1 ns, macOS's user-interactive
+QoS) and spin through the last of each wait, their own oversleeps' 90th percentile.
+
+A host can demote a server on its own. adacachy (CachyOS) runs ananicy-cpp, whose rule for `node` puts
+every Node process in `SCHED_IDLE` at nice 16 with idle I/O: T3 Code's server there gets a CPU only when
+nothing else wants one. In the rate mode's smoke test (2026-11-06, 100 a second, the realistic seed) it
+answered T3's list 1,000 of 1,000 in one window and 312 of 1,000 in another, its threads then waiting
+4.8 s for a CPU for each second they ran, 10 of its 17 in `SCHED_IDLE`. Compare products where no such
+rule runs, or where its owner has turned it off for the run.
 
 ## Main's baseline
 
