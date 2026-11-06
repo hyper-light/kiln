@@ -7273,11 +7273,14 @@ fn back(connected: u64, before: u64) -> f64 {
 mod tests {
     use super::*;
 
-    /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed.
+    /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed. One `slow` takes
+    /// each frame in its shard's whole quantum, as read while it takes it (the shard's own cell, which nothing changes
+    /// during a poll), so the turn that fed it is over (goal 10, plan 01a1a87b2dae step 5).
     #[derive(Default)]
     struct Written {
         sent: Vec<ws::Message>,
         flushes: usize,
+        slow: bool,
     }
 
     impl futures::Sink<ws::Message> for Written {
@@ -7286,6 +7289,11 @@ mod tests {
             std::task::Poll::Ready(Ok(()))
         }
         fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            if self.slow
+                && let Some(quantum) = hyper_rt::futures::step_budget_ns()
+            {
+                std::thread::sleep(Duration::from_nanos(quantum));
+            }
             self.get_mut().sent.push(item);
             Ok(())
         }
@@ -8431,11 +8439,16 @@ mod tests {
     /// shard a frame). A frame the viewer's catch-up held is skipped, the rest arrive whole and in order, the
     /// viewer's revision moves to the newest sent; a batch ending with the session's last frame is one write too,
     /// and says the viewer ends.
+    ///
+    /// Written off a shard, where no turn ends: on one, a batch longer than its shard's turn is flushed as each of its
+    /// turns ends as well (goal 10, plan 01a1a87b2dae step 5), as
+    /// `g10_s5_a_feeds_batch_longer_than_a_turn_goes_a_turn_at_a_time` shows; a debug build on a busy host took two
+    /// turns for these four frames.
     #[test]
     fn g9_s5_a_feeds_batch_goes_to_its_viewer_in_one_write() -> anyhow::Result<()> {
         /// Shape: the live frames of the batch: more than one, so one write for them all is seen.
         const FRAMES: u64 = 5;
-        crate::rt::block_on(async {
+        futures::executor::block_on(async {
             let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
             let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
             let (mut tx, _rx) = socket.split();
@@ -8462,6 +8475,28 @@ mod tests {
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
             anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a batch of a session's feed longer than its shard's turn goes out a turn at a
+    /// time: what a turn fed is flushed as the turn ends, and its poll ends there, the rest fed in the turns after (a
+    /// viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds). Each frame here
+    /// takes the shard's whole quantum (a `slow` [`Written`]), so each ends its turn: a flush as each turn ends and the
+    /// batch's own, the frames whole and in order, and the batch ends as one within a turn does.
+    #[test]
+    fn g10_s5_a_feeds_batch_longer_than_a_turn_goes_a_turn_at_a_time() -> anyhow::Result<()> {
+        /// Shape: the live frames of the batch: more than one, so a turn's end between two is seen.
+        const FRAMES: u64 = 3;
+        crate::rt::block_on(async {
+            let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
+            let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
+            let (mut tx, mut have) = (Written { slow: true, ..Written::default() }, 0);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
+            anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
+            anyhow::ensure!(tx.flushes == texts.len() + 1, "{} flushes: one as each of {} turns ended, and the batch's", tx.flushes, texts.len());
             Ok(())
         })
     }
