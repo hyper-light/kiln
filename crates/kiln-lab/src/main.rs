@@ -62,8 +62,8 @@ struct Common {
     #[arg(long, default_value = "shared")]
     layout: String,
     /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `flood` (that, with
-    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once) or `small`
-    /// (to try the lab out).
+    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once), `subagents`
+    /// (realistic, two of its active sessions in subagent turns of 100 events) or `small` (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).

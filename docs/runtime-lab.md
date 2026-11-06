@@ -202,7 +202,12 @@ agents calling MCP, none thinking: more work than one shard runs, as goal 6 over
 `--profile many` is production's whole shape rather than its
 busy hour's share: its ten runners and all 134 live feeds (the realistic profile's sizes, the rest of
 400 events), every one at work at the realistic pace, as goal 4 measures many sessions changing at
-once.
+once. `--profile subagents` is the realistic profile with two of its eight working sessions (the two
+longest) in subagent turns instead, as Claude Code's Task tool runs one: the Task's call, 100 events of
+its subagent's (each its child: `parent_tool_use_id` the Task's id), then the Task's result, which
+updates the Task's tool event 100 events after it began, on shards with the other sessions
+(copies-lat2's A2(b) shape; Ada's own sessions run subagents everywhere). Its report tells the frames
+of the other sessions (`websocket.others`) from the subagent sessions' (`websocket.subagents`).
 
 ### What it reports
 

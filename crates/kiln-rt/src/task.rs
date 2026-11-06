@@ -325,6 +325,10 @@ pub struct TaskSlot {
     pub word: u64,
     /// Whether the task is a service (it owns its cancellation cleanup), fixed at its admission.
     pub service: bool,
+    /// Whether its polls read the shard thread's CPU clock as they start, for a slow poll's time on the CPU where that
+    /// reading is a call (macOS): its spawn site ran past the quantum before (`crate::slow::CpuSites`; kiln's goal 9, plan
+    /// 01a1a87b2cec step 3).
+    pub(crate) cpu_watched: bool,
 }
 
 impl TaskSlot {
@@ -349,6 +353,7 @@ impl TaskSlot {
             joinable,
             word,
             service,
+            cpu_watched: false,
         }
     }
 
@@ -367,6 +372,7 @@ impl TaskSlot {
             joinable: false,
             word: 0,
             service: false,
+            cpu_watched: false,
         }
     }
 
