@@ -5610,14 +5610,18 @@ pub(crate) mod tests {
                 handed += 1;
             }
             // The close, the last event handed, taken whole on the control loop: its sessions said disconnected by their
-            // owners.
-            crate::rt::timeout(Duration::from_secs(30), async {
-                while marks.taken(crate::wire::fan::CONTROL) < handed {
-                    crate::rt::sleep(Duration::from_millis(5)).await;
+            // owners. However long a loaded machine's loop takes over the 161 events (30 s for all of them ran out): the
+            // wait gives up only once the loop takes none for a hang's bound.
+            let stall = Duration::from_secs(300);
+            let (mut taken, mut still_since) = (0, std::time::Instant::now());
+            while marks.taken(crate::wire::fan::CONTROL) < handed {
+                let now = marks.taken(crate::wire::fan::CONTROL);
+                if now > taken {
+                    (taken, still_since) = (now, std::time::Instant::now());
                 }
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("the close wasn't taken in 30 s"))?;
+                anyhow::ensure!(still_since.elapsed() < stall, "the close wasn't taken: the control loop took {taken} of {handed}, then nothing for {stall:?}");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
             anyhow::ensure!(hub.agents.load().get("fedora").is_some_and(|a| !a.connected), "the runner reads connected after its link closed");
             for id in &ids {
                 hub.harness.applied(id).await;

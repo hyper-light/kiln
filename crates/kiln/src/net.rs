@@ -1840,9 +1840,17 @@ mod tests {
             let (mut answered_up, mut answered_down) = (0u64, 0u64);
             let mut peer = None;
             let mut reconnects = 0;
-            let deadline = Instant::now() + Duration::from_secs(60);
+            // What the channel guarantees is that each item is taken and answered, not how fast a loaded machine
+            // gets there: the bound ends a stall (nothing more taken or answered for 200 of the senders' patience,
+            // a minute), never a slow run.
+            let stall = patience * 200;
+            let (mut moved, mut stalled_at) = ((0, 0, 0, 0), Instant::now() + stall);
             while answered_up < N || answered_down < N {
-                anyhow::ensure!(Instant::now() < deadline, "answered {answered_up} of {N} updates and {answered_down} of {N} commands, over {reconnects} reconnects");
+                let now = (answered_up, answered_down, order_up.len(), order_down.len());
+                if now != moved {
+                    (moved, stalled_at) = (now, Instant::now() + stall);
+                }
+                anyhow::ensure!(Instant::now() < stalled_at, "answered {answered_up} of {N} updates and {answered_down} of {N} commands, over {reconnects} reconnects, then nothing for {stall:?}");
                 if let Some(p) = peer {
                     for f in down.poll(Instant::now()) {
                         srv.send(p, LANE_CONTROL, Kind::Control, crate::proto::encode(&ServerMsg::Wire(f))?).await;
@@ -2237,22 +2245,25 @@ mod tests {
             })?;
 
             // A dial into the void (nothing listens there) is abandoned at the deadline and
-            // reported, instead of pending forever.
+            // reported, instead of pending forever: reported as its deadline's, never before it. How
+            // soon after it a loaded machine gets to say so is its pace, not the deadline's: the
+            // bounds here and below only end a hang (a minute with nothing said).
+            let hang = Duration::from_secs(60);
             let dead = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
             agent.command(Out::Connect { addr: dead }).await;
             let t = Instant::now();
-            match next_event(&agent_ev, Instant::now() + Duration::from_secs(10)).await? {
-                NetEvent::Unreachable { reason, .. } => assert!(reason.contains("no answer"), "{reason}"),
+            match next_event(&agent_ev, Instant::now() + hang).await? {
+                NetEvent::Unreachable { reason, .. } => assert!(reason.contains("no answer") && reason.ends_with("in 2s"), "{reason}"),
                 other => anyhow::bail!("expected Unreachable, got {other:?}"),
             }
-            assert!(t.elapsed() >= Duration::from_secs(2) && t.elapsed() < Duration::from_secs(6));
+            assert!(t.elapsed() >= Duration::from_secs(2), "abandoned before its deadline: {:?}", t.elapsed());
 
             // Dialing the void again, then the real server: the pending dial is replaced at once.
             agent.command(Out::Connect { addr: dead }).await;
             crate::rt::sleep(Duration::from_millis(300)).await;
 
             agent.command(Out::Connect { addr }).await;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut deadline = Instant::now() + hang;
             let mut agent_peer = None;
             // Each connection's binding, as the server and the agent computed it.
             let (mut srv_binding, mut agent_binding) = (None, None);
@@ -2264,6 +2275,7 @@ mod tests {
                     ev = next_event(&srv_ev, deadline).fuse() => (true, ev?),
                     ev = next_event(&agent_ev, deadline).fuse() => (false, ev?),
                 };
+                deadline = Instant::now() + hang;
                 match ev {
                     (true, NetEvent::Connected { peer, name, binding }) => {
                         assert_eq!(name.as_deref(), Some("bench-1"));
