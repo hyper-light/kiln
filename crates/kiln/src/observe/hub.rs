@@ -19,22 +19,21 @@ pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What `out` holds, each sent in its turn, the shard given up between them once this loop's turn would pass its
-/// quantum (goal 9, plan 01a1a87b2cec step 3): its queue and the net thread's take a message without waiting, so a
-/// replica catching up (up to thousands waiting, each up to half a mebibyte copied as it's encoded) was sent in one
-/// poll.
+/// What `out` holds, each sent in its turn (goal 9, plan 01a1a87b2cec step 3): its queue and the net thread's take a
+/// message without waiting, so a replica catching up (up to thousands waiting) was sent in one poll; then, taking
+/// turns, each message was still copied as it was encoded (up to half a mebibyte), 0.16 to 0.39 ms on the CPU in a
+/// poll in rt9's rounds. Each message's runner process is found here, its frame made on the compute pool, and the
+/// frames sent in order in turns that end their polls (`crate::net::send_made`).
 async fn send_each(hub: &Hub, out: &async_channel::Receiver<Box<super::owner::Out>>) {
-    let mut turns = crate::rt::Turns::new();
-    while let Ok(m) = out.recv().await {
-        let peer = hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE);
-        if let Some(peer) = peer {
-            let msg = ServerMsg::Observe { json: wire::encode(&m.msg), bytes: m.bytes };
-            if let Ok(b) = proto::encode(&msg) {
-                hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b).await;
-            }
-        }
-        turns.after().await;
-    }
+    let route = |m: Box<super::owner::Out>| hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE).map(|peer| (peer, m));
+    crate::net::send_made(out, route, observe_frame, |peer, b| hub.net.send(peer, proto::LANE_OBSERVE, Lane::Control, b)).await;
+}
+
+/// A message to a runner's replica as observe's lane carries it: its words beside its bytes. Made on the compute pool
+/// (`send_each`).
+fn observe_frame(m: Box<super::owner::Out>) -> Vec<Vec<u8>> {
+    let super::owner::Out { msg, bytes, .. } = *m;
+    proto::encode(&ServerMsg::Observe { json: wire::encode(&msg), bytes }).ok().into_iter().collect()
 }
 
 /// What a machine's runner said on observe's lane.

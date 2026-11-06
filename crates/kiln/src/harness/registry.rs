@@ -2355,7 +2355,7 @@ impl Registry {
     /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop): what's
     /// left of it when the owner's turn ran out (`over`, [`Registry::apply`]; goal 9), to take first next.
     #[allow(clippy::too_many_arguments)]
-    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<Ingest> {
+    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
         let ingest = self.prepare(hub, from, id, u, shipped)?;
         self.apply(s, hub, ingest, over)
     }
@@ -2410,11 +2410,13 @@ impl Registry {
     /// changed, then what the change tells the rest of kiln happens. Goal 4, plan 01a1a59c2a9c
     /// step 2: only this shard writes the copy.
     ///
-    /// An update's events are taken while its owner's turn lasts (`over`: its step quantum spent), one at
-    /// the least, and the copy goes out with those: the rest come back, for the owner to take first at
-    /// its next turn, before anything newer (goal 9, plan 01a1a87b2cec step 3: a runner's whole history
-    /// in one update held its owner's shard up to 83 ms).
-    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn() -> bool) -> Option<Ingest> {
+    /// An update's events are taken while its owner's turn lasts (`over`, asked after each with what the next
+    /// is expected to take to write out: whether the next and what ends the update would pass its step
+    /// quantum), one at the least, and the copy goes out with those: the rest come back, for the owner to
+    /// take first at its next turn, before anything newer (goal 9, plan 01a1a87b2cec step 3: a runner's whole
+    /// history in one update held its owner's shard up to 83 ms). One long to write out (a large tool output)
+    /// is written by its owner off the shard first (`super::copies::Shard::want_write`).
+    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
         let Ingest { from, id, mut u, shipped, reported } = i;
         let id = id.as_str();
         // Only the machine a session runs on speaks for it: a copy left behind where it went on
@@ -2428,6 +2430,9 @@ impl Registry {
         if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
             store.send(id, &u);
         }
+        // The event of this update its owner wrote out off the shard, or tried, for that event as it's taken (below; goal 9,
+        // plan 01a1a87b2cec step 3).
+        let mut written = s.take_written(id);
         // What the copy takes: each event's JSON and its text, written out once for the copy, its
         // live frame, its digest and every snapshot after (`Entry::of_event`, as they're taken, below);
         // a state's and a meta's JSON.
@@ -2516,6 +2521,9 @@ impl Registry {
         // (`super::copies::Shard::want_insert`).
         let tried = s.tried_insert(id);
         let mut insert = None;
+        // This update's next event long to write out, to be written so by its owner: where its session works, for the files
+        // it mentions (`super::copies::Shard::want_write`).
+        let mut write: Option<(String, Location)> = None;
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
@@ -2544,6 +2552,15 @@ impl Registry {
         {
             let rev = m.rev;
             s.want_insert(id, at, e, rev);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
+        // Its first event is long to write out (a large tool output) and wasn't written yet: the same, once its owner wrote it
+        // out off the shard (goal 9, plan 01a1a87b2cec step 3: `super::copies::Shard::want_write`).
+        if let Update::Events { events } = &u
+            && events.first().is_some_and(|e| written.as_ref().is_none_or(|w| !w.is(id, e)) && super::copies::long_to_write(e))
+        {
+            let (cwd, location) = (m.info.cwd.clone(), Location::clone(&m.location));
+            s.want_write(id, store.is_some(), cwd, location);
             return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
         }
         m.rev = m.rev.saturating_add(1);
@@ -2655,13 +2672,33 @@ impl Registry {
                         insert = Some((at, e.clone(), m.rev));
                         break;
                     }
-                    // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
-                    let entry = Arc::new(if store.is_some() {
-                        Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
-                    } else {
-                        Entry::of_event(e, None)
-                    });
-                    if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
+                    // As its owner wrote it out off the shard, or tried, where it was: else one after the first that's long to write
+                    // out is written so, it and those after it the rest (goal 9, plan 01a1a87b2cec step 3: a large tool output's
+                    // JSON and row, past the step's quantum on the shard). The first was judged so above, once.
+                    let tried_write = written.take().filter(|w| w.is(id, e));
+                    if tried_write.is_none() && taken > 0 && super::copies::long_to_write(e) {
+                        write = Some((m.info.cwd.clone(), Location::clone(&m.location)));
+                        break;
+                    }
+                    // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5), and timed, so what's
+                    // long to write is learned (step 3).
+                    let (entry, mentioned) = match tried_write.and_then(|w| w.made) {
+                        Some(made) => {
+                            rows.extend(made.row);
+                            (made.entry, made.mentions)
+                        }
+                        None => {
+                            let began = std::time::Instant::now();
+                            let entry = Arc::new(if store.is_some() {
+                                Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
+                            } else {
+                                Entry::of_event(e, None)
+                            });
+                            super::copies::wrote(e, began.elapsed());
+                            (entry, mentions(id, &m.info.cwd, &m.location, e))
+                        }
+                    };
+                    if let Some(job) = mentioned {
                         jobs.push(job);
                     }
                     // kiln's own words handed to its harness, with what they said then: what a
@@ -2679,8 +2716,9 @@ impl Registry {
                     }
                     entries.push(entry);
                     taken += 1;
-                    // Its turn spent: the rest at the owner's next (below), one taken at the least.
-                    if taken < events.len() && over() {
+                    // Its turn spent: the rest at the owner's next (below), one taken at the least. The next is expected to take
+                    // at least what writing it out does.
+                    if taken < events.len() && over(events.get(taken).map_or(0, super::copies::write_ns)) {
                         break;
                     }
                 }
@@ -2781,6 +2819,9 @@ impl Registry {
         }
         if let Some((at, e, rev)) = insert {
             s.want_insert(id, at, e, rev);
+        }
+        if let Some((cwd, location)) = write {
+            s.want_write(id, store.is_some(), cwd, location);
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -4097,7 +4138,7 @@ fn disconnected(m: &mut Mirror) -> Info {
 
 /// A finished message's mentions of files, to keep (`super::kept`): what the person or the agent
 /// said, never a tool's input or output.
-fn mentions(id: &str, cwd: &str, location: &Location, e: &super::model::Event) -> Option<Job> {
+pub(super) fn mentions(id: &str, cwd: &str, location: &Location, e: &super::model::Event) -> Option<Job> {
     let text = match &e.body {
         super::model::Body::User { text, .. } | super::model::Body::Assistant { text, streaming: false } => text,
         _ => return None,
@@ -5634,7 +5675,7 @@ mod tests {
                     let (mut turns, mut next) = (0, Some(ingest));
                     while let Some(i) = next.take() {
                         turns += 1;
-                        next = h.harness.apply(s, &h, i, &|| true);
+                        next = h.harness.apply(s, &h, i, &|_| true);
                     }
                     turns
                 })
