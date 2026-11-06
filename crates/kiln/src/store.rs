@@ -1267,7 +1267,7 @@ pub struct AgentRow {
     pub enrolled_at: i64,
 }
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;

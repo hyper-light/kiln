@@ -39,8 +39,9 @@ pub fn start<T>(events: &[T], end: usize, turns: usize, size: impl Fn(&T) -> usi
 }
 
 /// [`start`] of events read by their place (`event(i)`: what event `i` takes as sent, and whether it
-/// begins a turn), for events not held in one slice (a copy's chunks).
-pub fn start_at(end: usize, turns: usize, event: impl Fn(usize) -> Option<(usize, bool)>) -> usize {
+/// begins a turn), for events not held in one slice (a copy's chunks), read from `end` back, each once
+/// (so `event` may keep what it read last: `super::copies::Reading`).
+pub fn start_at(end: usize, turns: usize, mut event: impl FnMut(usize) -> Option<(usize, bool)>) -> usize {
     let (mut bytes, mut rows, mut held) = (0usize, 0usize, 0usize);
     // The oldest turn's start it holds whole, so far.
     let mut whole: Option<usize> = None;

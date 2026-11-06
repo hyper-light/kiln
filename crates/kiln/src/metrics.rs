@@ -90,14 +90,23 @@ impl Histogram {
     /// to each (goal 9, plan 01a1a87b2cec step 5: a shard's probe's delay, 40 of its 44 buckets every 10 ms on every
     /// shard; each request's latency classes). The bounds go up, as every family's list does and the exposition wants.
     pub fn observe(&self, secs: f64) {
+        self.observe_n(secs, 1);
+    }
+
+    /// `n` observations of `secs` at once, as [`Histogram::observe`] adds one: three adds, however many (goal 9, plan
+    /// 01a1a87b2cec step 5: a batch of a viewer's frames written with one write was three adds a frame).
+    pub fn observe_n(&self, secs: f64, n: u64) {
+        if n == 0 {
+            return;
+        }
         // NaN is at or under no bound: `+Inf`'s alone, as it was.
         let i = if secs.is_nan() { self.bounds.len() } else { self.bounds.partition_point(|b| *b < secs) };
         if let Some(c) = self.buckets.get(i) {
-            c.fetch_add(1, Ordering::Relaxed);
+            c.fetch_add(n, Ordering::Relaxed);
         }
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(n, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        self.sum_us.fetch_add((secs.max(0.0) * 1_000_000.0) as u64, Ordering::Relaxed);
+        self.sum_us.fetch_add(((secs.max(0.0) * 1_000_000.0) as u64).saturating_mul(n), Ordering::Relaxed);
     }
 
     /// Observations so far.
@@ -125,17 +134,98 @@ impl Histogram {
     }
 
     pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
-        let sep = if labels.is_empty() { "" } else { "," };
-        for (b, under) in self.cumulative() {
-            let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {under}");
+        render_histogram(out, name, labels, &self.cumulative(), self.count(), self.sum_us());
+    }
+}
+
+/// A histogram's series in the exposition: `cumulative` (each bound's count at or under it), then `+Inf`'s (`n`, every
+/// observation), the sum (`sum_us`, microseconds, said in seconds) and the count.
+fn render_histogram(out: &mut String, name: &str, labels: &str, cumulative: &[(f64, u64)], n: u64, sum_us: u64) {
+    let sep = if labels.is_empty() { "" } else { "," };
+    for (b, under) in cumulative {
+        let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {under}");
+    }
+    let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
+    #[allow(clippy::cast_precision_loss)]
+    let sum = sum_us as f64 / 1_000_000.0;
+    let wrap = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
+    let _ = writeln!(out, "{name}_sum{wrap} {sum}");
+    let _ = writeln!(out, "{name}_count{wrap} {n}");
+}
+
+/// A histogram the server's shards each observe into a copy of their own, on its own cache line, summed as it's read
+/// (goal 9, plan 01a1a87b2cec step 5): every runner's update, request and batch of a viewer's frames is timed into the
+/// route classes' and the runner legs' histograms (`crate::route_latency`) on whichever shard did the work, so one
+/// histogram's bucket, count and sum lines (and their neighbours', the classes' histograms side by side) went from one
+/// shard's cache to another's at nearly every observation: fifteen locked adds an agent's update, each a line taken
+/// from another core. A thread that isn't a shard (a test's, the compute pool's) observes into a copy the shards
+/// don't. Read and rendered as one histogram ([`Histogram`]'s own form).
+pub struct PerShard {
+    /// One for each of the most shards a server makes ([`crate::os::alloc::SHARDS`]; a shard past them shares by its id
+    /// modulo theirs), then the threads that aren't shards'.
+    copies: Box<[Line]>,
+}
+
+/// A histogram on cache lines of its own (128 bytes, the largest a target of kiln's has, Apple silicon's: as
+/// `crate::shard_health::Shard` and hyper-rt's pulse are).
+#[repr(align(128))]
+struct Line(Histogram);
+
+impl PerShard {
+    pub fn new(bounds: &'static [f64]) -> Self {
+        let shards = usize::try_from(crate::os::alloc::SHARDS).unwrap_or(1).max(1);
+        Self { copies: (0..=shards).map(|_| Line(Histogram::new(bounds))).collect() }
+    }
+
+    /// The copy the calling thread observes into: its shard's, else the last (no shard's).
+    fn mine(&self) -> Option<&Histogram> {
+        let shards = self.copies.len().saturating_sub(1).max(1);
+        let i = hyper_rt::futures::shard_id().map_or(self.copies.len().saturating_sub(1), |s| usize::from(s.0) % shards);
+        self.copies.get(i).map(|l| &l.0)
+    }
+
+    /// One observation, as [`Histogram::observe`], on the calling shard's copy.
+    pub fn observe(&self, secs: f64) {
+        if let Some(h) = self.mine() {
+            h.observe(secs);
         }
-        let n = self.count.load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {n}");
-        #[allow(clippy::cast_precision_loss)]
-        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        let wrap = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
-        let _ = writeln!(out, "{name}_sum{wrap} {sum}");
-        let _ = writeln!(out, "{name}_count{wrap} {n}");
+    }
+
+    /// `n` observations of `secs` at once, as [`Histogram::observe_n`], on the calling shard's copy.
+    pub fn observe_n(&self, secs: f64, n: u64) {
+        if let Some(h) = self.mine() {
+            h.observe_n(secs, n);
+        }
+    }
+
+    /// Observations so far, every copy's.
+    pub fn count(&self) -> u64 {
+        self.copies.iter().map(|l| l.0.count()).fold(0, u64::saturating_add)
+    }
+
+    /// The observations' sum so far, in microseconds, every copy's.
+    pub fn sum_us(&self) -> u64 {
+        self.copies.iter().map(|l| l.0.sum_us()).fold(0, u64::saturating_add)
+    }
+
+    /// Observations so far at or under each bound, every copy's ([`Histogram::cumulative`]).
+    pub fn cumulative(&self) -> Vec<(f64, u64)> {
+        let mut all: Vec<(f64, u64)> = Vec::new();
+        for l in self.copies.iter() {
+            let each = l.0.cumulative();
+            if all.is_empty() {
+                all = each;
+                continue;
+            }
+            for ((_, sum), (_, n)) in all.iter_mut().zip(each) {
+                *sum = sum.saturating_add(n);
+            }
+        }
+        all
+    }
+
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
+        render_histogram(out, name, labels, &self.cumulative(), self.count(), self.sum_us());
     }
 }
 
@@ -1015,6 +1105,48 @@ mod tests {
             assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"{b}\"}} {n}")), "{b}: {n} not in\n{out}");
         }
         assert!(out.lines().any(|l| l == format!("d_bucket{{s=\"0\",le=\"+Inf\"}} {}", seen.len())), "{out}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a histogram each shard observes into a copy of its own reads and renders as one
+    /// histogram of every observation would, wherever each was made (every shard, and a thread that's none's), each copy
+    /// on cache lines of its own; and `n` observations at once read as `n` made one by one.
+    #[test]
+    fn g9_s5_a_histogram_each_shard_keeps_a_copy_of_reads_as_one() -> anyhow::Result<()> {
+        let shard = crate::shard_health::DELAY_BUCKETS;
+        let (spread, one) = (Arc::new(PerShard::new(shard)), Histogram::new(shard));
+        let seen = [0.0, 0.000005, 0.00012, 0.0009, 0.001, 0.0035, 2.0, 75.0, f64::NAN];
+        let shards = crate::rt::shard_count();
+        anyhow::ensure!(shards > 0, "no shards");
+        for i in 0..shards {
+            let s = Arc::clone(&spread);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            anyhow::ensure!(
+                crate::rt::spawn_on(i, async move {
+                    for v in seen {
+                        s.observe(v);
+                    }
+                    s.observe_n(0.0002, 3);
+                    let _ = tx.send(());
+                }),
+                "shard {i} refused"
+            );
+            rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|_| anyhow::anyhow!("shard {i} never ran it"))?;
+            for v in seen {
+                one.observe(v);
+            }
+            for _ in 0..3 {
+                one.observe(0.0002);
+            }
+        }
+        spread.observe(0.5);
+        one.observe(0.5);
+        anyhow::ensure!(spread.count() == one.count() && spread.sum_us() == one.sum_us() && spread.cumulative() == one.cumulative(), "read as one: {} {}", spread.count(), one.count());
+        let (mut a, mut b) = (String::new(), String::new());
+        spread.render(&mut a, "d", "s=\"0\"");
+        one.render(&mut b, "d", "s=\"0\"");
+        anyhow::ensure!(a == b, "rendered as one:\n{a}\nagainst\n{b}");
+        anyhow::ensure!(std::mem::align_of::<Line>() >= 128 && std::mem::size_of::<Line>().is_multiple_of(128), "a copy on lines of its own");
+        Ok(())
     }
 
     #[test]

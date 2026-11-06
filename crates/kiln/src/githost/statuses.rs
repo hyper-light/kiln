@@ -87,7 +87,12 @@ pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     // catch-up never ran then (goal 9, plan 01a1a87b2cec step 3). Its first tick is at once: taken here.
     let mut minute = crate::rt::Interval::new(RECONCILE_EVERY);
     minute.tick().await;
+    // Each event a piece of the loop's turn, which ends its poll once it's over: the events waiting for it (up to the
+    // hub's ring of them, for a reader behind) were taken in one poll, up to 0.75 ms on the CPU in rt9's rounds (goal 9,
+    // plan 01a1a87b2cec step 3).
+    let mut turns = crate::rt::Turns::new();
     loop {
+        turns.end().await;
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {

@@ -84,6 +84,22 @@ impl Request {
     /// Its params read as a `T`: -32602 when they don't fit, saying where.
     pub fn params<T: DeserializeOwned>(&self) -> Result<T, Box<Refused>> {
         let p = if self.params.is_null() { json!({}) } else { self.params.clone() };
+        self.read_params(p)
+    }
+
+    /// Its params read as a `T`, as [`Request::params`] reads them, taken out of it (null left in
+    /// their place) rather than copied first: a call's arguments may be long (a program, a plan),
+    /// and were copied whole before they were read (goal 10, plan 01a1a87b2dae step 5).
+    pub fn take_params<T: DeserializeOwned>(&mut self) -> Result<T, Box<Refused>> {
+        let p = match std::mem::take(&mut self.params) {
+            Value::Null => json!({}),
+            p => p,
+        };
+        self.read_params(p)
+    }
+
+    /// `p`, its params, read as a `T`: -32602 when they don't fit, saying where.
+    fn read_params<T: DeserializeOwned>(&self, p: Value) -> Result<T, Box<Refused>> {
         serde_json::from_value(p).map_err(|e| Box::new(Refused::new(self.answer_id(), INVALID_PARAMS, format!("Invalid params: {e}")).about(&self.method)))
     }
 
@@ -277,6 +293,35 @@ mod tests {
         let list = read(&json!({"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {"cursor": 5}})).ok().and_then(|r| r.params::<Paginated>().err());
         assert!(list.as_ref().is_some_and(|e| e.code == INVALID_PARAMS && e.id == json!(11) && e.code() == Code::Malformed), "{list:?}");
         assert!(read(&json!({"jsonrpc": "2.0", "id": 12, "method": "tools/list", "params": {"cursor": "c1"}})).ok().is_some_and(|r| r.params::<Paginated>().is_ok()));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: params taken out of a request are read as they were read
+    /// from a copy, and refused alike, under its id and its method: an object, none (`{}`), an
+    /// array, and one that doesn't fit. What's left in their place is null.
+    #[test]
+    fn g10_s5_params_taken_are_read_as_a_copy_was() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Call {
+            name: String,
+            #[serde(default)]
+            arguments: Option<serde_json::Map<String, Value>>,
+        }
+        let cases = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "agents_list", "arguments": {"program": "x".repeat(1 << 10), "input": [1, {"a": null}]}}}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": "tools/call"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": ["agents_list"]}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"nam": "x"}}),
+        ];
+        for m in cases {
+            let req = read(&m);
+            assert!(req.is_ok(), "{m} is a request");
+            let Ok(mut req) = req else { continue };
+            let copied = req.params::<Call>();
+            let taken = req.take_params::<Call>();
+            assert_eq!(taken, copied, "{m}");
+            assert_eq!(req.params, Value::Null, "{m}");
+        }
     }
 
     /// No notification is answered: one a client sends is taken as it is, and one no client sends

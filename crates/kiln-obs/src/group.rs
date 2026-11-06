@@ -58,8 +58,16 @@ const CADENCE_ENTRIES: u64 = CADENCE_BYTES / 64;
 /// What may be uncommitted past the cadence: every sender's write in flight (one each).
 const UNCOMMITTED_ENTRIES: u64 = MEMBERS as u64 * 16;
 const UNCOMMITTED_BYTES: u64 = 16 * ENTRY_BYTES as u64;
-/// Recent entries the log keeps in memory for members a little behind.
-const CACHE_BYTES: u64 = 8 << 20;
+/// Recent entries the log keeps in memory for members a little behind: one append's (goal 11, plan
+/// 01a1a87b2e56 step 5). The replica keeps past this budget whatever it has yet to apply and whatever a
+/// learner in step has yet to acknowledge of what it was sent (hyper-durable's `Replica::keep`, through
+/// `LogStore::keep_after`), so the budget serves only a learner out of step: one that dropped and
+/// probes, or one the apply point has passed, sent nothing past it. Its next append, at most
+/// [`APPEND_BYTES`] of entries, comes from memory; one further behind takes an append's entries from the
+/// file at a time, each read that size, not a frame's, as one more than 8 MiB behind did before. It was
+/// 8 MiB, and the log held 3.19 MB of it in the lab (train 4's heap profile, `update_of` under `pump`):
+/// a round's whole log, about 20 KB a second, so the 256 KiB are about 13 s of a learner's lag.
+const CACHE_BYTES: u64 = APPEND_BYTES;
 /// Bytes the log's file may take: its persist area and the segments two cadences and what is
 /// uncommitted fill, with room for one more cadence of slack.
 const DISK_BYTES: u64 = 3 * CADENCE_BYTES + UNCOMMITTED_BYTES + (16 << 20);
@@ -88,7 +96,13 @@ pub fn log_config(align: Alignment) -> Result<LogConfig, hyper_log::LogError> {
 /// The log's layout with frames of `frame` bytes at least: hyper-log lays every update that came
 /// while it flushed into one frame and flushes once a frame, so a frame is what one flush carries.
 pub fn log_config_framed(align: Alignment, frame: usize) -> Result<LogConfig, hyper_log::LogError> {
-    LogConfig::derive(&Facts {
+    LogConfig::derive(&facts(align, frame, CACHE_BYTES))
+}
+
+/// The facts the log is laid out by, its cache `cache` bytes. Of them only the cache may differ from
+/// the facts a log file was made with: the rest give its segments and slots, which a log reopens by.
+fn facts(align: Alignment, frame: usize, cache: u64) -> Facts {
+    Facts {
         align,
         sealed: false,
         // The frame holds the largest entry in a record of its own (hyper-log's rule), so stating
@@ -100,8 +114,8 @@ pub fn log_config_framed(align: Alignment, frame: usize) -> Result<LogConfig, hy
         cadence_bytes: CADENCE_BYTES,
         uncommitted_entries: UNCOMMITTED_ENTRIES,
         uncommitted_bytes: UNCOMMITTED_BYTES,
-        cache_bytes: CACHE_BYTES,
-    })
+        cache_bytes: cache,
+    }
 }
 
 /// The group's log at `path`, made there if new, and the group's part of it.
@@ -187,4 +201,24 @@ pub fn pump<L: LogStore, M: StateMachine>(r: &mut Replica<L, M>, now: u64, waker
         }
     }
     Ok(wake)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The observe log keeps one append of recent entries in memory, its one group's whole share of the log's
+    /// cache, and nothing else of its layout moves: a log file made with the 8 MiB cache before it reopens with
+    /// this one, its segments and slots the same (goal 11, plan 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_the_observe_log_keeps_one_append_in_memory() -> Result<(), String> {
+        let align = Alignment::new(BLOCK).map_err(|e| format!("{e:?}"))?;
+        let config = log_config(align).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(config.max_groups, 1);
+        assert_eq!(config.group_cache, APPEND_BYTES, "one append for the one group");
+        let before = LogConfig::derive(&facts(align, FRAME_BYTES, 8 << 20)).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..config }, before, "the cache alone differs");
+        assert!(config.segment_bytes >= FRAME_BYTES as u64, "a frame still holds what one flush carries");
+        Ok(())
+    }
 }

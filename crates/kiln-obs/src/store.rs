@@ -1140,6 +1140,11 @@ impl Store {
                             match self.index.define(&mut self.symbols, fp, key, p.kind) {
                                 Ok(Defined::New(id)) => {
                                     done.counts.new_series += 1;
+                                    // A quarter more room at a time, as the index's columns grow (kiln's goal 11, plan
+                                    // 01a1a87b2e56 step 5): sized to its series exactly by a reopen or a retention's
+                                    // drop, the head doubled at the next new series, 120 bytes a series held twice.
+                                    crate::index::grow(&mut self.head, 1);
+                                    crate::index::grow(&mut self.last, 1);
                                     self.head.push(HeadSeries::default());
                                     self.last.push(i64::MIN);
                                     id

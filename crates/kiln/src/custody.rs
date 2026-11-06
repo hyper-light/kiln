@@ -349,6 +349,7 @@ pub(crate) mod recent {
     }
 
     /// Hops checked with records kept here, so far.
+    #[cfg(test)]
     pub fn served_so_far() -> u64 {
         SERVED.load(Ordering::Relaxed)
     }
@@ -3145,6 +3146,7 @@ mod tests {
     #[test]
     fn w27_r08_unreceived_searches_by_session_not_every_record() -> anyhow::Result<()> {
         let mut c = rusqlite::Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
         crate::store::migrations::apply(&mut c)?;
         let agent = |s: &str, epoch: u32| format!("kiln://hyper-light/person/ada/agent/{s}/epoch/{epoch}/machine/fedora/instance/01a14c4f");
         let record = |c: &rusqlite::Connection, digest: &str, kind: &str, counterpart: &str, at: i64, work: bool| -> anyhow::Result<()> {

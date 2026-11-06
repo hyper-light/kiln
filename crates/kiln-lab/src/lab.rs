@@ -106,6 +106,18 @@ impl Profile {
         Self { runners: 10, active: sessions.len(), sessions, ..Self::realistic() }
     }
 
+    /// The profile `name` names (`--profile`).
+    pub fn named(name: &str) -> anyhow::Result<Self> {
+        Ok(match name {
+            "small" => Self::small(),
+            "realistic" => Self::realistic(),
+            "overload" => Self::overload(),
+            "many" => Self::many(),
+            "flood" => Self::flood(),
+            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
+        })
+    }
+
     /// A small one, to try the lab out (and for its own test).
     pub fn small() -> Self {
         Self {
@@ -843,26 +855,22 @@ impl Hook {
     }
 }
 
-/// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
-pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
-    std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
-    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
-    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
-    let hook = Hook::from_env(&fleet, dir);
-    hook.run("server-up");
+/// `p`'s runners of `build` for `fleet`'s server, each its own `kiln agent` whose `claude` is the stand-in in `bin`,
+/// connected and with their headroom off: their names. (`kiln-lab rate` starts kiln this way too: goal 10, Ada's
+/// fixed-rate benchmark.)
+pub fn runners(fleet: &mut Fleet, build: &Build, p: &Profile, bin: &Path) -> anyhow::Result<Vec<String>> {
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
     }
     fleet.runners_ready(Duration::from_secs(180))?;
+    Ok(names)
+}
 
-    // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
-    // server's /metrics either side of it too: the conversation feed at its busiest, every session's
-    // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
-    let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
-    let fill_before = scrape(&fleet)?;
-    hook.run("fill-start");
+/// The fill: each of `p`'s sessions opened on its runner (of `names`), its conversation written as fast as it's
+/// taken, until every one is idle with its conversation in the server's store: the sessions (each its id and its
+/// events) and the seconds it took.
+pub fn fill(fleet: &Fleet, p: &Profile, names: &[String]) -> anyhow::Result<(Vec<(String, u64)>, f64)> {
     let filled = Instant::now();
     let mut opened: Vec<(String, u64)> = Vec::new();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -905,9 +913,29 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         anyhow::ensure!(Instant::now() < deadline, "the fill didn't finish: {} of {} sessions in", filled_ids.len(), opened.len());
         std::thread::sleep(Duration::from_millis(250));
     }
-    let fill_s = filled.elapsed().as_secs_f64();
+    Ok((opened, filled.elapsed().as_secs_f64()))
+}
+
+/// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
+pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
+    std::fs::create_dir_all(dir)?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
+    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
+    let hook = Hook::from_env(&fleet, dir);
+    hook.run("server-up");
+    let names = runners(&mut fleet, build, p, bin)?;
+
+    // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
+    // server's /metrics either side of it too: the conversation feed at its busiest, every session's
+    // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
+    let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
+    let fill_before = scrape(&fleet)?;
+    hook.run("fill-start");
+    let (opened, fill_s) = fill(&fleet, p, &names)?;
     hook.run("fill-end");
     let fill_after = scrape(&fleet)?;
+    let mut http = Http::new(fleet.port, &fleet.admin);
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
@@ -1096,6 +1124,19 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
         if let Some(b) = after.get("kiln_memory_bytes", &[("owner", owner.as_str())]) {
             n.insert(format!("server.memory.{owner}_mb"), b / 1e6);
         }
+    }
+    // What the allocator holds by kind, and its slack (`active` less `allocated`: room left in its pages and slabs),
+    // where the build says them (`kiln_memory_allocator_bytes`, jemalloc's statistics; goal 11, plan 01a1a87b2e56
+    // step 5): each arm of the A/B of jemalloc's settings moves one of them, and what A holds of each says which arms
+    // can move anonymous memory beyond noise (docs/runtime-lab.md).
+    let allocator = |kind: &str| after.get("kiln_memory_allocator_bytes", &[("kind", kind)]);
+    for kind in after.values_of("kiln_memory_allocator_bytes", "kind") {
+        if let Some(b) = allocator(&kind) {
+            n.insert(format!("server.allocator.{kind}_mb"), b / 1e6);
+        }
+    }
+    if let (Some(active), Some(allocated)) = (allocator("active"), allocator("allocated")) {
+        n.insert("server.allocator.slack_mb".into(), (active - allocated) / 1e6);
     }
     let shards = server_numbers(&mut n, "", before, after, secs);
     per_request_wakes(&mut n, before, after, requests);
@@ -1483,6 +1524,32 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a round reports what the allocator holds at the window's end, by kind and its
+    /// slack (`active` less `allocated`), in MB, so the A/B of jemalloc's settings compares each; a build whose
+    /// allocator says nothing (glibc's malloc, musl's) reports none of them.
+    #[test]
+    fn g11_s5_a_round_reports_what_the_allocator_holds_by_kind() {
+        let scrape = |says: bool| {
+            let mut t = String::from("process_resident_memory_bytes 300000000\n");
+            if says {
+                for (kind, bytes) in [("allocated", 90_000_000), ("thread_caches", 6_000_000), ("active", 100_000_000), ("dirty", 20_000_000), ("muzzy", 0)] {
+                    t.push_str(&format!("kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(true), &scrape(true), 60.0);
+        let at = |k: &str| n.get(k).copied();
+        assert_eq!(
+            [at("server.allocator.allocated_mb"), at("server.allocator.thread_caches_mb"), at("server.allocator.active_mb"), at("server.allocator.dirty_mb"), at("server.allocator.muzzy_mb")],
+            [Some(90.0), Some(6.0), Some(100.0), Some(20.0), Some(0.0)]
+        );
+        assert_eq!(at("server.allocator.slack_mb"), Some(10.0));
+        assert_eq!(crate::lab::better("server.allocator.dirty_mb"), crate::stats::Better::Lower, "less held is better");
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(false), &scrape(false), 60.0);
+        assert!(n.contains_key("server.rss_mb") && !n.keys().any(|k| k.starts_with("server.allocator.")), "{:?}", n.keys().collect::<Vec<_>>());
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a round reports the runner's hold of its updates beside the server's time
