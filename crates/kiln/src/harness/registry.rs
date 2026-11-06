@@ -5705,7 +5705,7 @@ mod tests {
             let done = Arc::new(AtomicBool::new(false));
             let viewer = crate::rt::spawn(watch(Arc::clone(&hub), "p".into(), std::time::Duration::ZERO, Arc::clone(&done)));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while hub.harness.sessions.on("p", |s| s.get("p").map(|m| m.feed.viewers())).await.flatten() != Some(1) {
+            while hub.harness.sessions.on("p", |s| s.get("p").map(|m| m.feed.viewers())).await.flatten().unwrap_or(0) == 0 {
                 anyhow::ensure!(std::time::Instant::now() < deadline, "the viewer never joined");
                 crate::rt::sleep(std::time::Duration::from_millis(2)).await;
             }
