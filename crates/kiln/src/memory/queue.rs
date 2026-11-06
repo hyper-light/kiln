@@ -149,8 +149,16 @@ pub(crate) struct Place {
     listed: AtomicBool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Places made on this thread (a test's: a wait that finds what it waits for makes none).
+    static PLACES_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Place {
     pub(crate) fn new() -> Arc<Self> {
+        #[cfg(test)]
+        PLACES_MADE.with(|n| n.set(n.get().saturating_add(1)));
         Arc::new(Self { waker: AtomicWaker::new(), listed: AtomicBool::new(false) })
     }
 
@@ -298,8 +306,12 @@ impl Room {
     }
 
     /// Takes `n` bytes, waiting (a task's wait: its thread goes on with others) until they fit; false when
-    /// the queue closed first.
+    /// the queue closed first. Room there, as a send mostly finds it, is taken with no place made for a wait
+    /// (goal 9, plan 01a1a87b2cec step 5: every send made one, an allocation and a free on the sender's shard).
     pub async fn take(&self, n: usize) -> bool {
+        if let Some(done) = self.look(n) {
+            return done;
+        }
         let place = Place::new();
         std::future::poll_fn(|cx| {
             if let Some(done) = self.look(n) {
@@ -315,8 +327,12 @@ impl Room {
     }
 
     /// [`Room::take`], blocking its thread: for a thread of its own, never the runtime's. Waits until
-    /// `until` at most (none: as long as it takes); false when it closed or the time ran out first.
+    /// `until` at most (none: as long as it takes); false when it closed or the time ran out first. Room there
+    /// is taken with no place or waker made for a wait, as [`Room::take`]'s.
     pub fn take_blocking(&self, n: usize, until: Option<Instant>) -> bool {
+        if let Some(done) = self.look(n) {
+            return done;
+        }
         let (place, waker) = (Place::new(), thread_waker());
         loop {
             if let Some(done) = self.look(n) {
@@ -734,8 +750,12 @@ impl<T> std::fmt::Debug for Receiver<T> {
 impl<T> Receiver<T> {
     /// The next item, waiting for one: an error once the queue is empty and no one sends to it any more.
     /// Cancel-safe: an item is taken and its bytes let go in the same poll. It waits in the receiver's own
-    /// place ([`Own`]), so one dropped before it ends (a select's arm) leaves nothing more listed.
+    /// place ([`Own`]), so one dropped before it ends (a select's arm) leaves nothing more listed. An item there
+    /// is taken without claiming that place (goal 9, plan 01a1a87b2cec step 5).
     pub async fn recv(&self) -> Result<T, RecvError> {
+        if let Some(taken) = self.look() {
+            return taken;
+        }
         let (place, _claim) = self.own.place();
         std::future::poll_fn(|cx| poll_taking(&self.inner, cx, &place)).await
     }
@@ -754,8 +774,12 @@ impl<T> Receiver<T> {
         }
     }
 
-    /// [`Receiver::recv`], blocking its thread: for a thread of its own, never the runtime's.
+    /// [`Receiver::recv`], blocking its thread: for a thread of its own, never the runtime's. An item there is
+    /// taken with no place or waker made for a wait (goal 9, plan 01a1a87b2cec step 5: each take made both).
     pub fn recv_blocking(&self) -> Result<T, RecvError> {
+        if let Some(taken) = self.look() {
+            return taken;
+        }
         let (place, waker) = (Place::new(), thread_waker());
         loop {
             if let Some(taken) = self.look() {
@@ -1195,6 +1219,33 @@ mod tests {
         drop(rx);
         assert_eq!(waiting.join().ok().flatten(), Some(PLACE + 5), "the waiting send ended, its item handed back");
         assert!(matches!(tx.try_send(Item(PLACE)), Err(TrySendError::Closed(_))));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a send that finds room and a take that finds an item make no place for a wait
+    /// (every send made one, and every blocking take one and a waker: allocations and frees on the hot path), and a take
+    /// that does wait is still woken with its item.
+    #[test]
+    fn g9_s5_a_send_that_finds_room_or_a_take_that_finds_an_item_makes_no_place() -> anyhow::Result<()> {
+        static OWNER: Owner = Owner::new("test_queue_no_place");
+        const SENT: usize = 64;
+        let (tx, rx) = bounded::<Item>(&OWNER, SENT * PLACE);
+        let made = || PLACES_MADE.with(std::cell::Cell::get);
+        let before = made();
+        for _ in 0..SENT / 2 {
+            anyhow::ensure!(futures::executor::block_on(tx.send(Item(PLACE))).is_ok(), "a send with room was refused");
+            anyhow::ensure!(tx.send_blocking(Item(PLACE)).is_ok(), "a blocking send with room was refused");
+        }
+        for _ in 0..SENT / 2 {
+            anyhow::ensure!(futures::executor::block_on(rx.recv()).is_ok(), "an item there wasn't taken");
+            anyhow::ensure!(rx.recv_blocking().is_ok(), "an item there wasn't taken");
+        }
+        let places = made().saturating_sub(before);
+        anyhow::ensure!(places == 0, "{places} places made for {SENT} sends and {SENT} takes that never waited");
+        let taking = std::thread::spawn(move || rx.recv_blocking().map(|i| i.0).ok());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        anyhow::ensure!(tx.try_send(Item(PLACE + 1)).is_ok(), "a send to an empty queue was refused");
+        anyhow::ensure!(taking.join().ok().flatten() == Some(PLACE + 1), "the waiting take wasn't woken with its item");
+        Ok(())
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a JSON value weighs what serde_json keeps of it, at least its
