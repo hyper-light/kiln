@@ -15,8 +15,10 @@ pub mod code;
 pub mod rpc;
 pub mod skills;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
@@ -559,15 +561,17 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
 /// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
 pub async fn http(hub: &Arc<Hub>, caller: Caller, body: kiln_http::Incoming) -> Result<Response, (StatusCode, String)> {
     use http_body_util::BodyExt as _;
-    let read = http_body_util::Limited::new(body, rpc::BODY_MOST).collect().await.map(|b| b.to_bytes());
+    // Its pieces as they came, joined where it's read ([`read_body`]).
+    let read = http_body_util::Limited::new(body, rpc::BODY_MOST).collect().await.map(http_body_util::Collected::aggregate);
     Ok(respond(hub, caller, read).await)
 }
 
 /// What a body `caller` sent is answered: its messages' answers, or 202 when none has one. A body
 /// it couldn't read whole is refused as JSON-RPC 2.0 has it, under a null id, and noted like any
-/// message it can't read: one past [`rpc::BODY_MOST`] (413), or one cut short.
-pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>) -> Response {
-    let bytes = match read {
+/// message it can't read: one past [`rpc::BODY_MOST`] (413), or one cut short. The answers go as
+/// they were written, in pieces, none joined or copied here ([`answers`], `srv::pieces`).
+pub(crate) async fn respond<B: bytes::Buf + Send + 'static>(hub: &Arc<Hub>, caller: Caller, read: Result<B, Box<dyn std::error::Error + Send + Sync>>) -> Response {
+    let body = match read {
         Ok(b) => b,
         Err(e) => {
             let (status, refused) = if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
@@ -579,27 +583,25 @@ pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::
             return srv::json(status, &server.refused(Box::new(refused)).await);
         }
     };
-    match answer(hub, caller, &bytes).await {
-        // Encoded in a turn of the shard's of its own: a tool's result is made, written out as its text, and then
-        // encoded again with that text in the answer, each a long computation for a long result, and in one poll
-        // they held the shard 1.2 ms a call at the mean in g11alloc2's calm rounds (`agents_list`'s), every read on
-        // that shard waiting behind them. Past its turn, with something else wanting the shard, the call gives it
-        // up between them (goal 10, plan 01a1a87b2dae step 5; `crate::rt::consume_budget`).
-        Some(a) => {
-            crate::rt::consume_budget().await;
-            srv::json(StatusCode::OK, &a)
-        }
-        None => srv::status(StatusCode::ACCEPTED),
+    let body = read_body(&READING, body).await;
+    match answers(hub, caller, body).await {
+        Ok(Some(parts)) => srv::response(StatusCode::OK, "application/json", srv::pieces(parts)),
+        Ok(None) => srv::status(StatusCode::ACCEPTED),
+        Err(e) => srv::text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e}")),
     }
 }
 
-/// What `bytes` that `caller` sent (one JSON-RPC message or a batch) is answered, if anything.
-/// Each message is read into a request, or refused as JSON-RPC 2.0 says (`rpc`) and noted against
-/// whoever sent it: the agent session its MCP token names, or the person.
-pub(crate) async fn answer(hub: &Arc<Hub>, caller: Caller, bytes: &[u8]) -> Option<Value> {
-    let body = rpc::body(bytes);
+/// What `body`'s messages, as `caller` sent them, are answered: the answer's bytes in pieces, sent as they are
+/// (`srv::pieces`), or none when every message was a notification. Each message is read into a request, or refused
+/// as JSON-RPC 2.0 says (`rpc`) and noted against whoever sent it: the agent session its MCP token names, or the
+/// person. Each request's result is written out with its answer where its length allows ([`written`]): a tool's,
+/// whatever its length, on the compute pool, never on the shard (goal 10, plan 01a1a87b2dae step 5; goal 9, plan
+/// 01a1a87b2cec step 3: `agents_list`'s result was written out as its text, and then again with that text as the
+/// answer, each in one piece on its shard, which in rt9's profile took about as much of the shards' time as the
+/// operation itself: `mcp::http` 1.2% of all samples, `ops::call` within it 0.6%).
+async fn answers(hub: &Arc<Hub>, caller: Caller, body: rpc::Body) -> serde_json::Result<Option<Vec<Bytes>>> {
     let server = Server { hub: hub.clone(), caller };
-    let mut answers = Vec::new();
+    let mut each = Vec::new();
     for m in body.messages {
         let answer = match m {
             // A notification is never answered; one no client sends is noted all the same.
@@ -607,21 +609,92 @@ pub(crate) async fn answer(hub: &Arc<Hub>, caller: Caller, bytes: &[u8]) -> Opti
                 if let Some(r) = req.unknown_notification() {
                     server.note(&r).await;
                 }
-                None
+                continue;
             }
-            Ok(req) => Some(match server.handle(&req).await {
-                Ok(result) => rpc_ok(req.answer_id(), result),
-                Err(refused) => server.refused(refused).await,
-            }),
-            Err(refused) => Some(server.refused(refused).await),
+            Ok(mut req) => match server.handle(&mut req).await {
+                Ok(made) => written(req.answer_id(), made).await?,
+                Err(refused) => Written::value(&server.refused(refused).await)?,
+            },
+            Err(refused) => Written::value(&server.refused(refused).await)?,
         };
-        answers.extend(answer);
+        each.push(answer);
     }
-    rpc::reply(body.batch, answers)
+    Ok(joined(body.batch, each))
+}
+
+/// What `bytes` that `caller` sent (one JSON-RPC message or a batch) is answered, read back as
+/// JSON; `None` for no answer (tests).
+#[cfg(test)]
+pub(crate) async fn answer(hub: &Arc<Hub>, caller: Caller, bytes: &[u8]) -> Option<Value> {
+    let parts = answers(hub, caller, rpc::body(bytes)).await.ok()??;
+    serde_json::from_slice(&parts.concat()).ok()
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+/// What reading a body of `/api/mcp` is expected to take, by its length ([`read_body`]): moving averages of each
+/// body's bytes and of how long reading it took where it ran, nanoseconds, a new sample weighing 1/8 (as RFC 6298
+/// smooths a round trip, and `crate::wire::payload` the reading of a runner's frames). Its requests on every shard
+/// teach it, each with a load and a store: a sample one loses to another at the same moment is no harm to an average.
+struct Expect {
+    bytes: AtomicU64,
+    ns: AtomicU64,
+}
+
+impl Expect {
+    /// An [`Expect`] with nothing learned.
+    const fn nothing_yet() -> Self {
+        Self { bytes: AtomicU64::new(0), ns: AtomicU64::new(0) }
+    }
+
+    /// Nanoseconds a body of `len` bytes is expected to take to read: it grows with its length at the rate the bodies
+    /// so far were read (their fixed cost in it, so a long one is expected to take longer than it does, not shorter).
+    /// Before one was read, longer than anything: the first is read off the shard, whatever its length, and teaches it
+    /// (a server's first call may be a long one, from a client that was already talking to it before it started).
+    fn expected(&self, len: u64) -> u64 {
+        len.saturating_mul(self.ns.load(Ordering::Relaxed)).checked_div(self.bytes.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
+    }
+
+    /// A body of `len` bytes took `took` nanoseconds to read, on a shard or off one.
+    fn learn(&self, len: u64, took: u64) {
+        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
+        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { (avg - avg / 8).saturating_add(sample / 8) };
+        self.bytes.store(smooth(self.bytes.load(Ordering::Relaxed), len), Ordering::Relaxed);
+        self.ns.store(smooth(self.ns.load(Ordering::Relaxed), took), Ordering::Relaxed);
+    }
+}
+
+/// What reading `/api/mcp`'s bodies is expected to take.
+static READING: Expect = Expect::nothing_yet();
+
+/// `body` read as JSON-RPC messages ([`rpc::body`]), joined first where it came in pieces: on the shard while that's
+/// expected (`expect`) to take less than a slow poll (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, as
+/// the hub's loop reads a runner's frames (`crate::wire::payload::read_frame`). A read is timed where it runs, so one
+/// off the shard teaches it too. Goal 10, plan 01a1a87b2dae step 5: a body, up to [`rpc::BODY_MOST`] (a program up
+/// to `code::Limits::program` in it), was joined and read on its shard whatever its length.
+async fn read_body<B: bytes::Buf + Send + 'static>(expect: &Expect, mut body: B) -> rpc::Body {
+    let len = body.remaining();
+    let n = u64::try_from(len).unwrap_or(u64::MAX);
+    let (read, took) = if expect.expected(n) > hyper_rt::slow::SLOW_POLL_NS {
+        match crate::rt::compute(move || timed(|| rpc::body(&body.copy_to_bytes(len)))).await {
+            Ok(read) => read,
+            // Its job lost (it panicked): the body unread, said so under a null id; not the sender's to be noted for.
+            Err(e) => return rpc::Body { batch: false, messages: vec![Err(Box::new(rpc::Refused::new(Value::Null, rpc::INTERNAL_ERROR, format!("Internal error: the body couldn't be read: {e:#}"))))] },
+        }
+    } else {
+        timed(|| rpc::body(&body.copy_to_bytes(len)))
+    };
+    expect.learn(n, took);
+    read
+}
+
+/// `f()`, and how long it took, nanoseconds.
+fn timed<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let began = std::time::Instant::now();
+    let out = f();
+    (out, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// A call (`what`: `tools/call goals_add`) of operation `name` whose input doesn't fit it
@@ -690,14 +763,15 @@ impl Server {
         refused.answer()
     }
 
-    /// A request's result, or why it's refused.
-    async fn handle(&self, req: &rpc::Request) -> Result<Value, Box<rpc::Refused>> {
+    /// A request's result, or why it's refused. Its params are taken out of it as they're read
+    /// ([`rpc::Request::take_params`] for a call's arguments, which may be long).
+    async fn handle(&self, req: &mut rpc::Request) -> Result<Made, Box<rpc::Refused>> {
         Ok(match req.method.as_str() {
             "initialize" => {
                 let p: rpc::Initialize = req.params()?;
                 let asked = p.protocol_version.unwrap_or_default();
                 let version = VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(VERSIONS.first().copied().unwrap_or("2025-11-25"));
-                json!({
+                Made::Here(json!({
                     "protocolVersion": version,
                     "capabilities": {
                         "tools": {"listChanged": false},
@@ -706,55 +780,67 @@ impl Server {
                     },
                     "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": instructions(&self.caller),
-                })
+                }))
             }
-            "ping" => json!({}),
+            "ping" => Made::Here(json!({})),
             "tools/list" => {
                 req.params::<rpc::Paginated>()?;
-                json!({"tools": tools(&self.hub)})
+                match tools_written(self.hub.cfg.cd.enabled).await {
+                    Ok(tools) => Made::Tools(tools),
+                    Err(e) => return Err(Box::new(rpc::Refused::new(req.answer_id(), rpc::INTERNAL_ERROR, format!("Internal error: kiln's tools couldn't be listed: {e:#}")))),
+                }
             }
             "tools/call" => {
-                let p: rpc::ToolsCall = req.params()?;
-                // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's.
-                if !matches!(p.name.as_str(), "code_search" | "code_run") && crate::ops::find(&self.hub, |op| is_tool(op, &p.name)).is_none() {
-                    return Err(Box::new(req.unknown_tool(&p.name)));
+                let p: rpc::ToolsCall = req.take_params()?;
+                let args = Value::Object(p.arguments.unwrap_or_default());
+                if matches!(p.name.as_str(), "code_search" | "code_run") {
+                    return Ok(self.call_code(&p.name, args).await);
                 }
-                self.call_tool(&p.name, Value::Object(p.arguments.unwrap_or_default())).await
+                // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's. The operation is found
+                // once, here, and called (goal 10, plan 01a1a87b2dae step 5: it was found again to be called).
+                match crate::ops::find(&self.hub, |op| is_tool(op, &p.name)) {
+                    Some(op) => self.call_op(&p.name, op, args).await,
+                    None => return Err(Box::new(req.unknown_tool(&p.name))),
+                }
             }
             "resources/list" => {
                 req.params::<rpc::Paginated>()?;
-                json!({"resources": skills::resources()})
+                Made::Here(json!({"resources": skills::resources()}))
             }
             "resources/read" => {
                 let p: rpc::ResourcesRead = req.params()?;
-                let uri = p.uri.as_str();
+                let uri = p.uri;
                 if uri.starts_with("kiln://") {
-                    return match self.read_kiln(uri).await {
-                        Ok(text) => Ok(json!({"contents": [{"uri": uri, "mimeType": if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, "text": text}]})),
+                    return match self.read_kiln(&uri).await {
+                        Ok(parts) => Ok(Made::Contents { mime: if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, uri, parts }),
                         Err(e) => Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, e))),
                     };
                 }
-                match skills::read(uri) {
-                    Some(c) => json!({"contents": [c]}),
+                match skills::read(&uri) {
+                    Some(c) => Made::Here(json!({"contents": [c]})),
                     None => return Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, format!("no resource {uri}")))),
                 }
             }
-            "skills/list" => json!({"skills": skills::list()}),
+            "skills/list" => {
+                skills::made().await;
+                Made::Here(json!({"skills": skills::list()}))
+            }
             "skills/get" => {
                 let p: rpc::SkillsGet = req.params()?;
                 let key = p.uri.or(p.name).unwrap_or_default();
+                skills::made().await;
                 match skills::get(&key) {
-                    Some(s) => s,
+                    Some(s) => Made::Here(s),
                     None => return Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, format!("no skill {key}")))),
                 }
             }
             "resources/templates/list" => {
                 req.params::<rpc::Paginated>()?;
-                json!({"resourceTemplates": templates()})
+                Made::Here(json!({"resourceTemplates": templates()}))
             }
             "prompts/list" => {
                 req.params::<rpc::Paginated>()?;
-                json!({"prompts": []})
+                Made::Here(json!({"prompts": []}))
             }
             _ => return Err(Box::new(req.unknown_method())),
         })
@@ -762,103 +848,271 @@ impl Server {
 
     /// One of kiln's resources (docs/ci.md §4.4), read through the operations, so the caller
     /// reads exactly what it may: a run's logs (every leg's steps', in order), a leg's step's
-    /// log, a workflow's file.
-    async fn read_kiln(&self, uri: &str) -> Result<String, String> {
+    /// log, a workflow's file. Its text in parts, each as its operation gave it (none copied), for
+    /// its answer's writing to join off the shard ([`Made::Contents`]; goal 10, plan 01a1a87b2dae
+    /// step 5: a run's logs, up to [`RUN_LOGS`], were copied three times over on the shard as they
+    /// were put together, then written out with their answer there).
+    async fn read_kiln(&self, uri: &str) -> Result<Vec<String>, String> {
         let call = |name: &'static str, input: Value| crate::ops::call(self.cx(), name, input);
         let said = |(_, m): crate::ops::Fail| m;
-        let text = |v: Value| v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
         let parts: Vec<&str> = uri.trim_start_matches("kiln://").split('/').collect();
         match parts.as_slice() {
             ["legs", leg, "logs", step] => {
                 let step: i64 = step.parse().map_err(|_| format!("{uri}: a step is its index"))?;
-                Ok(text(call("ci.legs.logs", json!({"leg": leg, "step": step})).await.map_err(said)?))
+                Ok(vec![taken(call("ci.legs.logs", json!({"leg": leg, "step": step})).await.map_err(said)?, "text")])
             }
             ["runs", run, "logs"] => {
                 let detail = call("ci.runs.get", json!({"run": run})).await.map_err(said)?;
-                let mut out = String::new();
+                let mut logs = RunLogs::default();
                 for l in detail.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
                     let Some(leg) = l.get("id").and_then(Value::as_str) else { continue };
                     let name = l.get("name").and_then(Value::as_str).or_else(|| l.get("key").and_then(Value::as_str)).unwrap_or(leg);
                     let steps = call("ci.legs.get", json!({"leg": leg})).await.map_err(said)?;
                     for st in steps.get("steps").and_then(Value::as_array).cloned().unwrap_or_default() {
                         let idx = st.get("idx").and_then(Value::as_i64).unwrap_or_default();
-                        let log = text(call("ci.legs.logs", json!({"leg": leg, "step": idx})).await.map_err(said)?);
-                        out.push_str(&format!("== {name} · {} ==\n{log}", st.get("name").and_then(Value::as_str).unwrap_or_default()));
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                        if out.len() > RUN_LOGS {
-                            out.push_str("… (the rest: read each leg's steps with ci.legs.logs)\n");
-                            return Ok(out);
+                        let log = taken(call("ci.legs.logs", json!({"leg": leg, "step": idx})).await.map_err(said)?, "text");
+                        if logs.step(name, st.get("name").and_then(Value::as_str).unwrap_or_default(), log) {
+                            return Ok(logs.parts);
                         }
                     }
                 }
-                Ok(out)
+                Ok(logs.parts)
             }
             ["workflows", owner, name, path @ ..] if !path.is_empty() => {
                 let v = call("ci.workflows.get", json!({"repo": format!("{owner}/{name}"), "path": path.join("/")})).await.map_err(said)?;
-                Ok(v.get("source").and_then(Value::as_str).unwrap_or_default().to_owned())
+                Ok(vec![taken(v, "source")])
             }
             _ => Err(format!("no resource {uri}: kiln's are kiln://runs/<id>/logs, kiln://legs/<id>/logs/<step> and kiln://workflows/<owner>/<repo>/<path>")),
         }
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> Value {
-        let cx = self.cx();
-        match name {
-            "code_search" | "code_run" => {
-                // Arguments that don't fit the tool's type: a tool error saying where and why, noted,
-                // as an operation's are. A program left out is refused, not run empty.
-                if let Some(m) = code_input(name).and_then(|i| i.fits(&args).err()) {
-                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), name, &m, None).await);
-                }
-                let program = args.get("program").and_then(Value::as_str).unwrap_or("").to_owned();
-                let mode = if name == "code_search" { code::Mode::Search } else { code::Mode::Run { input: args.get("input").cloned().unwrap_or(Value::Null) } };
-                // A thread of its own, not the pool's: a program waits on its calls for up to its
-                // wall clock (a minute), and their operations need the pool themselves (programs
-                // holding every file place while their calls waited for one stalled the share).
-                let result = crate::rt::on_thread("kiln-code", move || code::run(cx, mode, &program, code::Limits::default())).await;
-                match result {
-                    Ok(Ok(out)) => tool_ok(out),
-                    Ok(Err(e)) => tool_error_value(json!({"error": e.message, "code": e.code, "calls": e.calls})),
-                    Err(e) => tool_error(&format!("the sandbox could not run: {e:#}")),
-                }
+    /// Code mode's tool `tool` (`code_search`, `code_run`) called with `args`: read as the tool's
+    /// type, and its program run, on a thread of its own, not the pool's, nor the shard's (goal 10,
+    /// plan 01a1a87b2dae step 5: its arguments, a program up to `code::Limits::program` long among
+    /// them, were read and copied on the shard). A program waits on its calls for up to its wall
+    /// clock (a minute), and their operations need the pool themselves (programs holding every file
+    /// place while their calls waited for one stalled the share). Arguments that don't fit the
+    /// tool's type: a tool error saying where and why, noted, as an operation's are. A program left
+    /// out is refused, not run empty.
+    async fn call_code(&self, tool: &str, args: Value) -> Made {
+        let (cx, search) = (self.cx(), tool == "code_search");
+        let ran = crate::rt::on_thread("kiln-code", move || {
+            if let Some(m) = code_input(if search { "code_search" } else { "code_run" }).and_then(|i| i.fits(&args).err()) {
+                return Err(m);
             }
-            _ => {
-                let Some(op) = crate::ops::find(&self.hub, |op| is_tool(op, name)) else {
-                    return tool_error(&format!("no tool {name}"));
-                };
-                // An input that doesn't fit the operation: a tool error saying where and why, so
-                // the model can correct it; noted.
-                if let Some(m) = crate::ops::misfit(&self.caller, op.name, &args) {
-                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
-                }
-                match crate::ops::call(cx, op.name, args).await {
-                    // Its text, the result written out whole, made in a turn of the shard's of its own
-                    // (`respond`'s notes).
-                    Ok(v) => {
-                        crate::rt::consume_budget().await;
-                        tool_ok(v)
-                    }
-                    Err((_, e)) => tool_error(&e),
-                }
+            // Taken out of the arguments, as they were read: a string, and any JSON.
+            let (program, input) = match args {
+                Value::Object(mut a) => (a.remove("program"), a.remove("input")),
+                _ => (None, None),
+            };
+            let program = match program {
+                Some(Value::String(p)) => p,
+                _ => String::new(),
+            };
+            let mode = if search { code::Mode::Search } else { code::Mode::Run { input: input.unwrap_or(Value::Null) } };
+            Ok(code::run(cx, mode, &program, code::Limits::default()))
+        })
+        .await;
+        match ran {
+            Ok(Err(m)) => Made::Tool { result: misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {tool}"), tool, &m, None).await, error: true },
+            Ok(Ok(Ok(out))) => Made::Tool { result: out, error: false },
+            Ok(Ok(Err(e))) => Made::Tool { result: json!({"error": e.message, "code": e.code, "calls": e.calls}), error: true },
+            Err(e) => Made::Here(tool_error(&format!("the sandbox could not run: {e:#}"))),
+        }
+    }
+
+    /// Operation `op`'s tool `tool` called with `args`, as the caller may (`crate::ops::call`).
+    async fn call_op(&self, tool: &str, op: crate::ops::Info, args: Value) -> Made {
+        // An input that doesn't fit the operation: a tool error saying where and why, so the model
+        // can correct it; noted.
+        if let Some(m) = crate::ops::misfit(&self.caller, op.name, &args) {
+            return Made::Tool { result: misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {tool}"), op.name, &m, None).await, error: true };
+        }
+        match crate::ops::call(self.cx(), op.name, args).await {
+            Ok(v) => Made::Tool { result: v, error: false },
+            Err((_, e)) => Made::Here(tool_error(&e)),
+        }
+    }
+}
+
+/// A run's logs as `kiln://runs/<id>/logs` gives them (`Server::read_kiln`), in parts as they
+/// came: each step's heading and log, and a newline after a log that ends without one, up to
+/// [`RUN_LOGS`], then a word on the rest.
+#[derive(Default)]
+struct RunLogs {
+    parts: Vec<String>,
+    /// Their bytes.
+    len: usize,
+}
+
+impl RunLogs {
+    /// Step `step` of leg `leg`, its log `log`, after the others: whether that took them past
+    /// [`RUN_LOGS`], the word on the rest after it.
+    fn step(&mut self, leg: &str, step: &str, log: String) -> bool {
+        let ends = log.is_empty() || log.ends_with('\n');
+        self.put(format!("== {leg} · {step} ==\n"));
+        self.put(log);
+        if !ends {
+            self.put("\n".to_owned());
+        }
+        if self.len > RUN_LOGS {
+            self.put("… (the rest: read each leg's steps with ci.legs.logs)\n".to_owned());
+            return true;
+        }
+        false
+    }
+
+    fn put(&mut self, part: String) {
+        self.len = self.len.saturating_add(part.len());
+        self.parts.push(part);
+    }
+}
+
+/// Field `k` of `v`, a string, taken out of it (none copied); empty where it isn't one.
+fn taken(v: Value, k: &str) -> String {
+    match v {
+        Value::Object(mut o) => match o.remove(k) {
+            Some(Value::String(s)) => s,
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// A request's result, as [`Server::handle`] made it, for [`written`] to write out with its answer.
+enum Made {
+    /// Small and bounded (`initialize`'s, a ping's, a skill, a tool's error said in words): written
+    /// with its answer on the shard.
+    Here(Value),
+    /// A tool's answer: its result, which may be long (every agent's brief, a program's answer up to
+    /// 4 MiB), and whether it says an error (`isError`). Its text and its answer are written on the
+    /// compute pool ([`tool_answer`]).
+    Tool { result: Value, error: bool },
+    /// `tools/list`'s: every tool, written once ([`tools_written`]).
+    Tools(Bytes),
+    /// A resource of kiln's own (`kiln://…`, a run's logs up to [`RUN_LOGS`]), its text in parts:
+    /// joined and written with its answer on the compute pool.
+    Contents { uri: String, mime: &'static str, parts: Vec<String> },
+}
+
+/// An answer written out: its bytes, in pieces sent in order as they are (`srv::pieces`).
+struct Written(Vec<Bytes>);
+
+impl Written {
+    /// `answer` written here, on the shard: a small one (a refusal, a ping's, `initialize`'s).
+    fn value(answer: &Value) -> serde_json::Result<Written> {
+        crate::reads::trace::encoded();
+        serde_json::to_vec(answer).map(|b| Written(vec![Bytes::from(b)]))
+    }
+
+    /// `tools/list`'s answer to request `id`, as `rpc_ok(id, {"tools": [...]})` writes it, around
+    /// `tools`, which every answer shares as they were written once ([`tools_written`]).
+    fn tools(id: &Value, tools: Bytes) -> serde_json::Result<Written> {
+        let mut head = Vec::new();
+        ok_head(&mut head, id)?;
+        head.extend_from_slice(br#"{"tools":"#);
+        Ok(Written(vec![Bytes::from(head), tools, Bytes::from_static(b"}}")]))
+    }
+}
+
+/// `made`, the result of request `id`, written out with its answer (`rpc_ok`'s JSON): on the
+/// shard where it's small, else on the compute pool, so no answer's writing holds its shard (goal
+/// 10, plan 01a1a87b2dae step 5; goal 9, plan 01a1a87b2cec step 3). An answer that can't be
+/// written at all is the HTTP error it was ([`respond`]); one whose job was lost (it panicked) is
+/// answered saying so.
+async fn written(id: Value, made: Made) -> serde_json::Result<Written> {
+    match made {
+        Made::Here(result) => Written::value(&rpc_ok(id, result)),
+        Made::Tools(tools) => Written::tools(&id, tools),
+        Made::Tool { result, error } => {
+            let at = id.clone();
+            match crate::rt::compute(move || tool_answer(&at, result, error)).await {
+                Ok(answer) => answer.map(|b| Written(vec![Bytes::from(b)])),
+                Err(e) => Written::value(&rpc_ok(id, tool_error(&format!("its answer couldn't be written: {e:#}")))),
+            }
+        }
+        Made::Contents { uri, mime, parts } => {
+            let at = id.clone();
+            match crate::rt::compute(move || serde_json::to_vec(&rpc_ok(at, json!({"contents": [{"uri": uri, "mimeType": mime, "text": parts.concat()}]})))).await {
+                Ok(answer) => answer.map(|b| Written(vec![Bytes::from(b)])),
+                Err(e) => Written::value(&rpc::Refused::new(id, rpc::INTERNAL_ERROR, format!("Internal error: the resource couldn't be written: {e:#}")).answer()),
             }
         }
     }
 }
 
-fn tool_ok(v: Value) -> Value {
-    let text = serde_json::to_string(&v).unwrap_or_default();
-    json!({"content": [{"type": "text", "text": text}], "structuredContent": if v.is_object() { v } else { json!({"result": v}) }, "isError": false})
+/// What `rpc_ok(id, …)`'s JSON says before its result: `{"jsonrpc":"2.0","id":<id>,"result":`
+/// (and `}` after it), as serde_json writes that object, its keys in the order they're put in
+/// (its `preserve_order`, which kiln's build has through hyper-quic's qlog; a build that loses it
+/// fails `g10_s5_…`'s tests).
+fn ok_head(out: &mut Vec<u8>, id: &Value) -> serde_json::Result<()> {
+    out.extend_from_slice(br#"{"jsonrpc":"2.0","id":"#);
+    serde_json::to_writer(&mut *out, id)?;
+    out.extend_from_slice(br#","result":"#);
+    Ok(())
+}
+
+/// The answer to request `id` that a tool's `result` is, written whole: what `rpc_ok(id, r)`
+/// writes, where `r` is the tool's answer `{"content": [{"type": "text", "text": <result's
+/// JSON>}], "structuredContent": <result>, "isError": <error>}` (a result that isn't an object, and
+/// isn't an error, structured as `{"result": <result>}`). The result is written out once: its
+/// JSON is the text, and the structured content is that JSON again, so it's copied there rather
+/// than written a second time (goal 10, plan 01a1a87b2dae step 5). For the compute pool.
+fn tool_answer(id: &Value, result: Value, error: bool) -> serde_json::Result<Vec<u8>> {
+    let text = serde_json::to_string(&result)?;
+    // The result's JSON twice (as a string, and as the structured content): its escapes and the
+    // answer around it are the rest.
+    let mut out = Vec::with_capacity(text.len().saturating_mul(2));
+    ok_head(&mut out, id)?;
+    out.extend_from_slice(br#"{"content":[{"type":"text","text":"#);
+    serde_json::to_writer(&mut out, &text)?;
+    out.extend_from_slice(br#"}],"structuredContent":"#);
+    if error || result.is_object() {
+        out.extend_from_slice(text.as_bytes());
+    } else {
+        out.extend_from_slice(br#"{"result":"#);
+        out.extend_from_slice(text.as_bytes());
+        out.push(b'}');
+    }
+    out.extend_from_slice(if error { br#","isError":true}}"# } else { br#","isError":false}}"# });
+    Ok(out)
+}
+
+/// The body that answers `each`, a body's answers in order: one alone, a batch's in an array
+/// (`rpc::reply`'s, written out), or none at all where there's none (a notification has none).
+fn joined(batch: bool, each: Vec<Written>) -> Option<Vec<Bytes>> {
+    if !batch || each.is_empty() {
+        return each.into_iter().next().map(|w| w.0);
+    }
+    let mut parts = Vec::new();
+    for (i, w) in each.into_iter().enumerate() {
+        parts.push(Bytes::from_static(if i == 0 { b"[" } else { b"," }));
+        parts.extend(w.0);
+    }
+    parts.push(Bytes::from_static(b"]"));
+    Some(parts)
+}
+
+/// `tools/list`'s tools ([`tools_of`] every operation), written out once a process for each way
+/// its server may be (with deployments, `[cd] enabled`, and their operations, or without): each
+/// operation's name, summary and input type's schema are the same every time. Made and written on
+/// the compute pool the first time they're asked for, and shared after (goal 10, plan
+/// 01a1a87b2dae step 5; goal 9, plan 01a1a87b2cec step 3): each `tools/list` made the schemas of
+/// over 300 operations and wrote them out in one poll of its shard, and every MCP client asks for
+/// it as it starts.
+async fn tools_written(cd: bool) -> anyhow::Result<Bytes> {
+    static WITH_CD: OnceLock<Bytes> = OnceLock::new();
+    static WITHOUT_CD: OnceLock<Bytes> = OnceLock::new();
+    let kept = if cd { &WITH_CD } else { &WITHOUT_CD };
+    if let Some(tools) = kept.get() {
+        return Ok(tools.clone());
+    }
+    let tools = crate::rt::compute(move || serde_json::to_vec(&tools_of(crate::ops::listed(cd)))).await??;
+    Ok(kept.get_or_init(|| Bytes::from(tools)).clone())
 }
 
 fn tool_error(msg: &str) -> Value {
     json!({"content": [{"type": "text", "text": msg}], "isError": true})
-}
-
-fn tool_error_value(v: Value) -> Value {
-    let text = serde_json::to_string(&v).unwrap_or_default();
-    json!({"content": [{"type": "text", "text": text}], "structuredContent": v, "isError": true})
 }
 
 /// Every tool: code mode's two, then each operation.
@@ -1301,7 +1555,7 @@ mod tests {
             let past = http_body_util::Limited::new(http_body_util::Full::new(bytes::Bytes::from_static(b"[1,2,3]")), 4).collect().await.map(|b| b.to_bytes());
             let (status, v) = said(respond(&hub, agent.clone(), past).await).await;
             anyhow::ensure!(status == StatusCode::PAYLOAD_TOO_LARGE && code(&v) == Some(rpc::INVALID_REQUEST) && v.as_ref().and_then(|v| v.get("id")) == Some(&Value::Null), "{status} {v:?}");
-            let (status, v) = said(respond(&hub, agent.clone(), Err("connection reset".into())).await).await;
+            let (status, v) = said(respond(&hub, agent.clone(), Err::<bytes::Bytes, _>("connection reset".into())).await).await;
             anyhow::ensure!(status == StatusCode::BAD_REQUEST && code(&v) == Some(rpc::PARSE_ERROR), "{status} {v:?}");
             let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(2), "{kept:?}");
@@ -1380,5 +1634,209 @@ mod tests {
 
     fn want_len(v: &Value) -> usize {
         v.get("agents").and_then(Value::as_array).map_or(0, Vec::len)
+    }
+
+    /// A tool's answer as it was made before goal 10's step 5, the result written out as its text
+    /// and kept as its structured content (`{"result": …}` for one that isn't an object): what
+    /// [`tool_answer`] is held to.
+    fn tool_ok_as_before(v: Value) -> Value {
+        let text = serde_json::to_string(&v).unwrap_or_default();
+        json!({"content": [{"type": "text", "text": text}], "structuredContent": if v.is_object() { v } else { json!({"result": v}) }, "isError": false})
+    }
+
+    /// A tool's error with a structured answer (a misfit's, a program's), as it was made before.
+    fn tool_error_value_as_before(v: Value) -> Value {
+        let text = serde_json::to_string(&v).unwrap_or_default();
+        json!({"content": [{"type": "text", "text": text}], "structuredContent": v, "isError": true})
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a tool's answer, its result written out once (on the
+    /// compute pool), is the bytes its answer's JSON was when the result was written out as its
+    /// text and then again, with that text, as the answer (on the shard): for results of every
+    /// kind (an object whose keys aren't in order, strings that need escapes, numbers of each kind,
+    /// arrays, null), an error and not, under ids of each kind.
+    #[test]
+    fn g10_s5_a_tool_s_answer_is_the_bytes_it_was() -> anyhow::Result<()> {
+        let results = [
+            json!({"agents": [{"id": "s1", "summary": "a \"quoted\" line\nthen a tab\t, a \\, a bell \u{7}, é and 😀 </script>", "cost_usd": 0.1, "files_changed": 3}], "z": null, "a": [true, false]}),
+            json!({"result": {"nested": {"deep": [{"k": "v"}]}}, "calls": [{"name": "ci.runs.list", "ok": true}]}),
+            json!({}),
+            json!([]),
+            json!([1, -2, 2.5, 1e300, -0.000_001, 12_345_678_901_234_567_890_u64, "x"]),
+            json!("a string \"alone\"\r\n"),
+            json!(42),
+            json!(true),
+            Value::Null,
+        ];
+        let ids = [json!(7), json!(-1), json!(1.5), json!("a1"), json!("q\"u\\o\nte"), Value::Null];
+        for id in &ids {
+            for r in &results {
+                for error in [false, true] {
+                    let before = if error { tool_error_value_as_before(r.clone()) } else { tool_ok_as_before(r.clone()) };
+                    let want = serde_json::to_vec(&rpc_ok(id.clone(), before))?;
+                    let got = tool_answer(id, r.clone(), error)?;
+                    anyhow::ensure!(got == want, "{id} {r} {error}: {} against {}", String::from_utf8_lossy(&got), String::from_utf8_lossy(&want));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5 (goal 9, plan 01a1a87b2cec step 3): `tools/list`, its
+    /// tools made and written once (on the compute pool) for each way a server may be, deployments
+    /// on and off, and shared by every answer, answers the bytes it did when each call made and
+    /// wrote them on its shard, under each kind of id; and nothing of it is encoded on the shard.
+    #[test]
+    fn g10_s5_tools_list_is_written_once_and_answers_as_it_did() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for cd in [false, true] {
+                let hub = crate::hub::tests::scratch_hub_with(move |c| c.cd.enabled = cd).await?;
+                let mut shared: Option<Bytes> = None;
+                for id in [json!(1), json!("t-2"), json!(3)] {
+                    let body = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}}).to_string();
+                    let (parts, traced) = crate::reads::trace::traced(answers(&hub, Caller::owner(), rpc::body(body.as_bytes()))).await;
+                    let parts = parts?.unwrap_or_default();
+                    let want = serde_json::to_vec(&rpc_ok(id.clone(), json!({"tools": tools(&hub)})))?;
+                    anyhow::ensure!(parts.concat() == want, "cd {cd}, id {id}: {}", String::from_utf8_lossy(&parts.concat()));
+                    anyhow::ensure!(traced.encoded == 0, "cd {cd}, id {id}: encoded on the shard: {traced:?}");
+                    // The tools, as every answer shares them: written once.
+                    let list = parts.get(1).cloned().unwrap_or_default();
+                    anyhow::ensure!(shared.as_ref().is_none_or(|s| s.as_ptr() == list.as_ptr() && s.len() == list.len()), "cd {cd}, id {id}: written again");
+                    shared = Some(list);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: `agents_list` through `/api/mcp`, its answer written on
+    /// the compute pool, is the bytes its answer was when its result was written out as its text,
+    /// and then again with it as the answer, on its shard, and none of it is encoded on the shard.
+    /// So is a program's (`code_run`), and a batch's: a ping, `agents_list`, a message refused, a
+    /// notification (no answer), `tools/list` and a call whose arguments don't fit (noted), in
+    /// order.
+    #[test]
+    fn g10_s5_answers_written_off_the_shard_are_the_bytes_they_were() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for id in ["s1", "s2", "s3"] {
+                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+            }
+            let listed = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: Caller::owner() }, "agents.list", json!({})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(want_len(&listed) == 3, "{listed}");
+            let ask = |body: String| {
+                let hub = &hub;
+                async move { crate::reads::trace::traced(answers(hub, Caller::owner(), rpc::body(body.as_bytes()))).await }
+            };
+            let (parts, traced) = ask(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}"#.to_owned()).await;
+            let want = serde_json::to_vec(&rpc_ok(json!(7), tool_ok_as_before(listed.clone())))?;
+            let got = parts?.unwrap_or_default().concat();
+            anyhow::ensure!(got == want, "agents_list: {} against {}", String::from_utf8_lossy(&got), String::from_utf8_lossy(&want));
+            anyhow::ensure!(traced.encoded == 0, "agents_list's answer encoded on the shard: {traced:?}");
+            // A program's answer.
+            let program = json!({"jsonrpc": "2.0", "id": "p", "method": "tools/call", "params": {"name": "code_run", "arguments": {"program": "return input", "input": [1, {"a": "\"b\""}]}}});
+            let (parts, _) = ask(program.to_string()).await;
+            let want = serde_json::to_vec(&rpc_ok(json!("p"), tool_ok_as_before(json!({"result": [1, {"a": "\"b\""}], "calls": []}))))?;
+            let got = parts?.unwrap_or_default().concat();
+            anyhow::ensure!(got == want, "code_run: {} against {}", String::from_utf8_lossy(&got), String::from_utf8_lossy(&want));
+            // A batch.
+            let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agents_list","arguments":{}}},{"jsonrpc":"2.0","id":3},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":4,"method":"tools/list"},{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"goals_add","arguments":{"golas":["x"]}}}]"#;
+            let misfit = crate::ops::misfit(&Caller::owner(), "goals.add", &json!({"golas": ["x"]})).map(|m| m.answer("goals.add"));
+            anyhow::ensure!(misfit.is_some(), "goals.add takes no `golas`");
+            let want = serde_json::to_vec(&Value::Array(vec![
+                rpc_ok(json!(1), json!({})),
+                rpc_ok(json!(2), tool_ok_as_before(listed)),
+                rpc::Refused::new(json!(3), rpc::INVALID_REQUEST, "Invalid Request: no method").answer(),
+                rpc_ok(json!(4), json!({"tools": tools(&hub)})),
+                rpc_ok(json!(5), tool_error_value_as_before(misfit.unwrap_or_default())),
+            ]))?;
+            let (parts, _) = ask(batch.to_owned()).await;
+            let got = parts?.unwrap_or_default().concat();
+            anyhow::ensure!(got == want, "the batch: {} against {}", String::from_utf8_lossy(&got), String::from_utf8_lossy(&want));
+            // A batch of notifications alone has no answer.
+            let (parts, _) = ask(r#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#.to_owned()).await;
+            anyhow::ensure!(parts?.is_none(), "a notification isn't answered");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a body is read as it was, whole or in pieces, on the
+    /// compute pool (the first, and bodies learned slow to read) and on the shard (bodies learned
+    /// quick to read); what reading one is expected to take grows with its length at the rate
+    /// learned, a sample weighing an eighth, and is past any bound before one was read.
+    #[test]
+    fn g10_s5_a_body_is_read_alike_wherever_it_is_read() -> anyhow::Result<()> {
+        let learned = Expect::nothing_yet();
+        anyhow::ensure!(learned.expected(0) == u64::MAX && learned.expected(1) > hyper_rt::slow::SLOW_POLL_NS, "the first is read off the shard");
+        learned.learn(1_000, 5_000);
+        anyhow::ensure!(learned.expected(2_000) == 10_000, "{}", learned.expected(2_000));
+        // Bytes 1,000 − 125 + 1,125; nanoseconds 5,000 − 625 + 625: 2.5 ns a byte.
+        learned.learn(9_000, 5_000);
+        anyhow::ensure!(learned.expected(2_000) == 5_000, "{}", learned.expected(2_000));
+        crate::rt::block_on(async {
+            let program = "x".repeat(4 << 10);
+            let bodies = [
+                json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "code_run", "arguments": {"program": program}}}, {"jsonrpc": "2.0", "method": "notifications/initialized"}, 7]).to_string(),
+                r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#.to_owned(),
+                "{ not json".to_owned(),
+                "[]".to_owned(),
+            ];
+            for body in &bodies {
+                let whole = rpc::body(body.as_bytes());
+                let (a, b) = body.as_bytes().split_at_checked(body.len() / 2).unwrap_or_default();
+                // Nothing learned: the first off the shard. A nanosecond a MiB: on the shard, whatever its length.
+                // A second a byte: off it, whatever its length.
+                let (first, quick, slow) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
+                quick.learn(1 << 20, 1);
+                slow.learn(1, 1_000_000_000);
+                for (expect, at) in [(&first, "the first, on the compute pool"), (&quick, "on the shard"), (&slow, "on the compute pool")] {
+                    let read = read_body(expect, bytes::Buf::chain(Bytes::copy_from_slice(a), Bytes::copy_from_slice(b))).await;
+                    anyhow::ensure!(read.batch == whole.batch && read.messages == whole.messages, "{at}: {body}");
+                    let read = read_body(expect, Bytes::copy_from_slice(body.as_bytes())).await;
+                    anyhow::ensure!(read.batch == whole.batch && read.messages == whole.messages, "{at}, whole: {body}");
+                }
+                anyhow::ensure!(first.expected(1 << 30) < u64::MAX, "a read off the shard teaches it");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a run's logs, put together in parts as they came and
+    /// joined off the shard, are the text they were when each step was copied in on the shard:
+    /// logs that end in a newline and that don't, empty ones, and logs past [`RUN_LOGS`], after
+    /// which the rest is a word on it.
+    #[test]
+    fn g10_s5_a_run_s_logs_in_parts_are_the_text_they_were() {
+        fn as_before(steps: &[(&str, &str, String)]) -> String {
+            let mut out = String::new();
+            for (leg, step, log) in steps {
+                out.push_str(&format!("== {leg} · {step} ==\n{log}"));
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if out.len() > RUN_LOGS {
+                    out.push_str("… (the rest: read each leg's steps with ci.legs.logs)\n");
+                    return out;
+                }
+            }
+            out
+        }
+        let long = "y".repeat(RUN_LOGS);
+        let runs: [Vec<(&str, &str, String)>; 4] = [
+            vec![],
+            vec![("build", "checkout", "ok\n".to_owned()), ("build", "make", "no newline".to_owned()), ("test", "empty", String::new())],
+            vec![("build", "make", long.clone()), ("test", "after", "never read".to_owned())],
+            vec![("build", "a", "x\n".to_owned()), ("build", "b", long), ("build", "c", "z".to_owned())],
+        ];
+        for steps in &runs {
+            let mut logs = RunLogs::default();
+            for (leg, step, log) in steps {
+                if logs.step(leg, step, log.clone()) {
+                    break;
+                }
+            }
+            assert_eq!(logs.parts.concat(), as_before(steps), "{} steps", steps.len());
+            assert_eq!(logs.len, logs.parts.iter().map(String::len).sum::<usize>());
+        }
     }
 }
