@@ -2469,6 +2469,9 @@ mod tests {
                 anyhow::ensure!(futures::poll!(before.as_mut()).is_ready(), "which it starts");
             }
             anyhow::ensure!(futures::poll!(std::pin::pin!(turns.before(1_000_000_000))).is_ready(), "the next turn's first piece goes whatever it's expected to take");
+            Ok(())
+        })
+    }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): a loop that gives its turns up with `end` ends its poll with its
     /// turn, whether or not anything else wants its shard: of pieces that each take at least `PIECE`, a turn is over
