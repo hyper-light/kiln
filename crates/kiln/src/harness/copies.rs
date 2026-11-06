@@ -2804,6 +2804,21 @@ struct Listed {
     boards: Vec<Weak<Board>>,
     infos: Vec<Bytes>,
     json: Bytes,
+    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
+    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
+    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
+    /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
+    /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
+    etag: Option<http::HeaderValue>,
+}
+
+/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
+/// could be there), else its digest now.
+fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
+    match prior.and_then(|p| p.digested.get(i)) {
+        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
+        _ => crate::http::compress::digest(info),
+    }
 }
 
 impl Listed {
@@ -2921,8 +2936,17 @@ impl Copies {
     /// joined or copied (goal 10, plan 01a1a87b2dae steps 2 and 5). A read that finds a session come, gone
     /// or changed since joins it again, for itself and the reads after it.
     pub fn list_json(&self) -> Bytes {
-        if let Some(listed) = self.listed.load().as_ref().filter(|l| l.holds(&self.boards)) {
-            return listed.json.clone();
+        self.list_tagged().0
+    }
+
+    /// [`Copies::list_json`], and its weak ETag (`crate::http::compress::weak_etag`): named once for all the reads
+    /// that find the list as it was, of its infos' digests, each info digested once for every join that finds it
+    /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
+    /// session, while each state its agents send changes one session's info).
+    pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
+        let prior = self.listed.load_full();
+        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
+            return (listed.json.clone(), listed.etag.clone());
         }
         self.joins.fetch_add(1, Ordering::Relaxed);
         let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
@@ -2939,8 +2963,11 @@ impl Copies {
         }
         views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
         let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone() })));
-        json
+        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
+        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
+        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
+        (json, etag)
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it

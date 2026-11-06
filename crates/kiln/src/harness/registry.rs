@@ -2187,6 +2187,12 @@ impl Registry {
         self.sessions.list_json()
     }
 
+    /// [`Registry::list_json`] and its weak ETag, named once for every read that finds the list as it was
+    /// (`super::copies::Copies::list_tagged`; goal 9, plan 01a1a87b2cec step 5).
+    pub fn list_tagged(&self) -> (bytes::Bytes, Option<http::HeaderValue>) {
+        self.sessions.list_tagged()
+    }
+
     /// Session `id`'s info as `GET /api/harness/sessions/{id}` answers it, as its owner encoded it
     /// ([`super::copies::View::info_json`]). None when there's no such session.
     pub fn info_json(&self, id: &str) -> Option<bytes::Bytes> {
@@ -4963,6 +4969,53 @@ mod tests {
             let fewer = hub.harness.list_json();
             anyhow::ensure!(fewer.as_ref() == listed()?.as_slice() && !String::from_utf8_lossy(&fewer).contains(r#""id":"c""#) && joins() == joined + 2, "one went: {}", String::from_utf8_lossy(&fewer));
             anyhow::ensure!(hub.harness.list_json().as_ptr() == fewer.as_ptr() && joins() == joined + 2, "and then as it was");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the sessions' list is named by a weak ETag made once for every read that finds
+    /// it as it was: the digest of its infos' digests in its order (`crate::http::compress::digest`), each info's the
+    /// last join's where it's the same, so the same list is named the same (the very header value) and another list
+    /// another, as a digest of the list made from scratch says, through a change, a session that comes and one that
+    /// goes; and `GET /api/harness/sessions` is answered with it, a 304 for a request that holds it.
+    #[test]
+    fn g9_s5_the_sessions_list_is_named_once_for_the_reads_that_find_it_as_it_was() -> anyhow::Result<()> {
+        use crate::harness::model::State;
+        use crate::http::compress::{digest, weak_etag};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |id: &str, at: i64| Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), created_at: at, ..Info::default() }), since: None };
+            for (id, at) in [("b", 2), ("a", 1), ("c", 3)] {
+                hub.harness.ingest(&hub, &there, id, open(id, at)).await;
+            }
+            // Its name from scratch: each info as the list says it, digested, the digests digested in order.
+            let from_scratch = || -> anyhow::Result<String> {
+                let infos: Vec<Vec<u8>> = hub.harness.list().iter().map(serde_json::to_vec).collect::<Result<_, _>>()?;
+                let named: Vec<u8> = infos.iter().flat_map(|i| digest(i)).collect();
+                Ok(weak_etag(&digest(&named)).and_then(|v| v.to_str().ok().map(str::to_owned)).unwrap_or_default())
+            };
+            let tag = || hub.harness.list_tagged().1.and_then(|v| v.to_str().ok().map(str::to_owned)).unwrap_or_default();
+            let first = tag();
+            anyhow::ensure!(first.starts_with("W/\"") && first == from_scratch()?, "{first} against {}", from_scratch()?);
+            anyhow::ensure!(tag() == first, "the same list, the same name");
+            hub.harness.ingest(&hub, &there, "b", Update::State { state: Box::new(State { summary: "a new summary".into(), ..State::default() }) }).await;
+            let changed = tag();
+            anyhow::ensure!(changed != first && changed == from_scratch()?, "a changed info: {changed}");
+            hub.harness.ingest(&hub, &there, "d", open("d", 0)).await;
+            let more = tag();
+            anyhow::ensure!(more != changed && more == from_scratch()?, "one came: {more}");
+            hub.harness.ingest(&hub, &there, "c", Update::Closed).await;
+            let fewer = tag();
+            anyhow::ensure!(fewer != more && fewer == from_scratch()?, "one went: {fewer}");
+            // The read answers with it, and a request that holds it is answered 304.
+            let (json, etag) = hub.harness.list_tagged();
+            let etag = etag.ok_or_else(|| anyhow::anyhow!("no name"))?;
+            let mut resp = crate::http::server::response(http::StatusCode::OK, "application/json", crate::http::server::full(json));
+            resp.headers_mut().insert(http::header::ETAG, etag);
+            let req = http::Request::builder().method(http::Method::GET).uri("/api/harness/sessions").header(http::header::IF_NONE_MATCH, fewer.as_str()).body(kiln_http::Incoming::empty())?;
+            let answered = crate::http::compress::finish(crate::http::compress::Asked::of(&req), resp).await;
+            anyhow::ensure!(answered.status() == http::StatusCode::NOT_MODIFIED, "{}", answered.status());
             Ok(())
         })
     }
