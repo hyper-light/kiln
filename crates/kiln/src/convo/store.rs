@@ -150,6 +150,11 @@ pub struct Changes {
     pub upto: u64,
 }
 
+/// The bytes of `batch`'s rows, as the store counts a row ([`Row::bytes`]).
+pub fn batch_bytes(batch: &Changes) -> u64 {
+    batch.rows.iter().map(|c| u64::try_from(c.row.bytes()).unwrap_or(u64::MAX)).fold(0, u64::saturating_add)
+}
+
 /// Where following one file of a session's record goes on: its last line kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mark {
@@ -311,6 +316,9 @@ pub struct Queue {
     /// Bytes committed, and the microseconds their commits took: the writer's measured rate.
     written: AtomicU64,
     took_us: AtomicU64,
+    /// Bytes of feeds' batches taken in ([`Store::take`], [`Store::take_copy`]): with `written`, what this store's own
+    /// feeds have to ship ([`Store::grown`]).
+    taken: AtomicU64,
     /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
     /// was an event-listener `Event`, its list behind a `Mutex`).
     room: crate::rt::Changed,
@@ -600,10 +608,11 @@ impl Store {
     /// Blocking.
     pub fn take(&self, peer: &str, machine: Option<&str>, from: u64, batch: Changes) -> anyhow::Result<Took> {
         let (p, m) = (peer.to_owned(), machine.map(str::to_owned));
-        let w = self.watchers.clone();
+        let (w, q) = (self.watchers.clone(), Arc::clone(&self.queue));
         self.run(move |e| {
             let took = e.take(&p, m.as_deref(), from, &batch)?;
             if took.applied > 0 {
+                q.taken.fetch_add(batch_bytes(&batch), Ordering::Relaxed);
                 notify(&w);
             }
             Ok(took)
@@ -613,14 +622,22 @@ impl Store {
     /// Take a batch of a mirror's copy of this store ([`Engine::take_copy`]). Blocking.
     pub fn take_copy(&self, peer: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
         let p = peer.to_owned();
-        let w = self.watchers.clone();
+        let (w, q) = (self.watchers.clone(), Arc::clone(&self.queue));
         self.run(move |e| {
             let took = e.take_copy(&p, from, &batch)?;
             if took.applied > 0 {
+                q.taken.fetch_add(batch_bytes(&batch), Ordering::Relaxed);
                 notify(&w);
             }
             Ok(took)
         })
+    }
+
+    /// Bytes of rows this store has committed since it opened (`Row::bytes`): those put ([`Store::put`]) and those of
+    /// feeds' batches taken in. Read without asking its writer: what its own feeds have to ship grows by it (a feed
+    /// ships at once past `super::feed::SHIP_AT_BYTES` of them; goal 9, plan 01a1a87b2cec step 5).
+    pub fn grown(&self) -> u64 {
+        self.queue.written.load(Ordering::Relaxed).saturating_add(self.queue.taken.load(Ordering::Relaxed))
     }
 
     /// A copy has been taken whole: how many sessions it brought back. Blocking.
@@ -1002,6 +1019,29 @@ mod tests {
         store.sync()?;
         anyhow::ensure!(store.watchers.lock().unwrap_or_else(PoisonError::into_inner).len() == 1, "the watcher gone wasn't let go");
         anyhow::ensure!(watch.try_recv().is_ok(), "the watcher left didn't hear the next commit");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what a store's own feeds have to ship is read without asking its writer
+    /// ([`Store::grown`]): it grows by the rows put once they're committed, and by a feed's batch taken in, each by its rows'
+    /// bytes; a batch that brings nothing new grows it by nothing.
+    #[test]
+    fn g9_s5_a_store_grows_by_what_it_commits_and_takes() -> anyhow::Result<()> {
+        let (_a, runner) = scratch()?;
+        let (_b, server) = scratch()?;
+        anyhow::ensure!(runner.grown() == 0 && server.grown() == 0, "nothing yet");
+        let update = said("m1", 1, "the deadline");
+        let bytes: u64 = rows::of("a1", &update, 0).iter().map(|r| u64::try_from(r.bytes()).unwrap_or(u64::MAX)).sum();
+        runner.send("a1", &update);
+        runner.sync()?;
+        anyhow::ensure!(runner.grown() == bytes, "a commit's rows: {} against {bytes}", runner.grown());
+        let batch = runner.changes_as(0, 1 << 20, false)?;
+        let brought = batch_bytes(&batch);
+        anyhow::ensure!(brought > 0, "a batch of what it committed");
+        let took = server.take("runner", Some("box"), 0, batch.clone())?;
+        anyhow::ensure!(took.applied > 0 && server.grown() == brought, "a batch taken in: {} against {brought}", server.grown());
+        let again = server.take("runner", Some("box"), took.rev, Changes { rows: Vec::new(), upto: took.rev })?;
+        anyhow::ensure!(again.applied == 0 && server.grown() == brought, "a batch that brings nothing: {}", server.grown());
         Ok(())
     }
 

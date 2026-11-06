@@ -561,8 +561,20 @@ pub fn mentioned(text: &str) -> Vec<String> {
     }
     // Paths among the words: a word of a kind people show (most have no dot, which ends that at once) that's no
     // link or address. The same words as when links and addresses were looked for first in every word (goal 9,
-    // plan 01a1a87b2cec step 5: two searches a word of every event's text, on its copy's shard).
-    for word in text.split(char::is_whitespace) {
+    // plan 01a1a87b2cec step 5: two searches a word of every event's text, on its copy's shard). Only a word with a `/`
+    // in it can be one (a path full or from home: `bare_path`), so only those are looked at, each found by its first
+    // `/`: the same words, in the same order, as every word split from the text (goal 9, plan 01a1a87b2cec step 3: every
+    // word was trimmed and looked at, on its copy's owner's shard, about as long as the event took to write out).
+    let mut done = 0;
+    for slash in memchr::memchr_iter(b'/', text.as_bytes()) {
+        if slash < done {
+            continue;
+        }
+        // A `/` is ASCII, so the text splits around it; the word is what's between the whitespace on either side.
+        let start = text.get(..slash).and_then(|before| before.char_indices().rev().find(|(_, c)| c.is_whitespace())).map_or(0, |(i, c)| i + c.len_utf8());
+        let end = text.get(slash..).and_then(|after| after.char_indices().find(|(_, c)| c.is_whitespace())).map_or(text.len(), |(i, _)| slash + i);
+        done = end;
+        let Some(word) = text.get(start..end) else { continue };
         let w = word.trim_start_matches(['(', '[', '{', '"', '\'', '<', '*', '_', '`']).trim_end_matches([')', ']', '}', '"', '\'', '>', ',', '.', ';', ':', '!', '?', '*', '_', '`']);
         if shown_kind(w) && !w.contains("](") && !w.contains("://") && let Some(p) = bare_path(w) {
             add(p);
@@ -656,6 +668,70 @@ mod tests {
         );
         assert!(mentioned("![x](file:///tmp/a%20b.png)").contains(&"/tmp/a b.png".to_owned()));
         assert!(mentioned("no paths here, only a/b and 1/2").is_empty());
+    }
+
+    /// [`mentioned`] as it was, looking at every word split from the text: what it's held to.
+    fn mentioned_every_word(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |p: String| {
+            if !p.is_empty() && out.len() < MOST_MENTIONED && !out.contains(&p) {
+                out.push(p);
+            }
+        };
+        let mut rest = text;
+        while let Some(i) = rest.find("](") {
+            let Some(after) = rest.get(i + 2..) else { break };
+            rest = after;
+            let dest = if let Some(inner) = rest.strip_prefix('<') { inner.split('>').next().unwrap_or("") } else { rest.split([')', ' ', '\n']).next().unwrap_or("") };
+            if let Some(p) = link_path(dest) {
+                add(p);
+            }
+        }
+        let mut parts = text.split('`');
+        parts.next();
+        while let (Some(code), _) = (parts.next(), parts.next()) {
+            let c = code.trim();
+            if !c.contains(char::is_whitespace) && shown_kind(c) && let Some(p) = bare_path(c) {
+                add(p);
+            }
+        }
+        for word in text.split(char::is_whitespace) {
+            let w = word.trim_start_matches(['(', '[', '{', '"', '\'', '<', '*', '_', '`']).trim_end_matches([')', ']', '}', '"', '\'', '>', ',', '.', ';', ':', '!', '?', '*', '_', '`']);
+            if shown_kind(w) && !w.contains("](") && !w.contains("://") && let Some(p) = bare_path(w) {
+                add(p);
+            }
+        }
+        out
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a message's words are looked at only where a `/` is (a path among them is full or from
+    /// home), and what's found is what looking at every word found, in the same order: paths at either end, among punctuation,
+    /// past other kinds of whitespace (a no-break space, an ideographic one), several `/` to a word, and more than the most.
+    #[test]
+    fn g9_s3_words_looked_at_only_where_a_slash_is_find_what_every_word_did() {
+        let mut texts: Vec<String> = vec![
+            String::new(),
+            "/a.png".into(),
+            "/tmp/a.png".into(),
+            "see /tmp/a.png".into(),
+            "/tmp/a.png then".into(),
+            "(/tmp/a.png), \"~/b/c.pdf\"; and <~/x.md>!".into(),
+            "a\u{00a0}/tmp/no-break.png\u{3000}~/ideo.mp4\u{2003}end".into(),
+            "/x/y/z.log /x/y/z.log again /x/y/z.log".into(),
+            "word/after/slash.png and/also.pdf not/full.md".into(),
+            "https://example.com/a.png file:///tmp/f.png /ok/one.wav".into(),
+            "[a](/l/link.png) `/c/code.md` /w/word.csv ![i](~/img.gif)".into(),
+            "///// // / /.png /.. /a/.b /a/b. ~/ ~/x".into(),
+            "no slash at all, only words and dots. Here.".into(),
+            "\n/start/line.png\n\t/tab/x.mp3\r\n/cr/y.flac\n".into(),
+            "ünïcödé /ü/ñ.png ü/x.png".into(),
+            "**/bold/x.png** _/em/y.pdf_ `/tick/z.md`".into(),
+        ];
+        texts.push((0..40).map(|k| format!("/many/{k}.png")).collect::<Vec<_>>().join(" "));
+        texts.push(format!("{}/one.png", "x".repeat(10_000)));
+        for text in &texts {
+            assert_eq!(mentioned(text), mentioned_every_word(text), "{text:?}");
+        }
     }
 
     #[test]

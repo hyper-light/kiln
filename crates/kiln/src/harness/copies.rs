@@ -365,6 +365,11 @@ impl Index {
 /// 11 exports and bounds (`kiln_memory_bytes{owner="session_segments"}`).
 pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Chunks whose texts were made for their copy's reads on a shard's thread ([`Chunk::warm`]), for the tests that read it:
+/// none should be (goal 9, plan 01a1a87b2cec step 3: `warm_later`).
+#[cfg(test)]
+static WARMED_ON_SHARD: AtomicU64 = AtomicU64::new(0);
+
 /// What the reads of its copy's newest page kept of a compact chunk's texts joined ([`Chunk::page_texts`]):
 /// those from byte `from` of them on, the furthest back a read reached (goal 11, plan 01a1a87b2e56 step 5).
 struct PageTexts {
@@ -635,6 +640,10 @@ impl Chunk {
         // Where its metas say its texts end: else they aren't this chunk's (one changed since it was packed).
         if from + made.len() == self.texts_len() {
             self.keep_texts(&Arc::new(PageTexts { from, bytes: Bytes::from(made) }));
+            #[cfg(test)]
+            if crate::rt::on_shard() {
+                WARMED_ON_SHARD.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1297,6 +1306,18 @@ impl Events {
         Some(len)
     }
 
+    /// The compact chunk [`Events::keep_first`] would read again to keep the first events `keeps` keeps: the one its cut falls
+    /// inside, where that one is compact. None where it reads none again (the cut on a chunk's edge or past the last, or in a
+    /// chunk that isn't compact).
+    pub(super) fn cut_in(&self, keeps: impl Fn(&Meta) -> bool) -> Option<Arc<Chunk>> {
+        let kept = self.metas().take_while(|m| keeps(m)).count();
+        let (c, k) = self.place(kept)?;
+        if k == 0 {
+            return None;
+        }
+        self.chunk(c).filter(|c| c.is_compact()).cloned()
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self { took_out: true, ..Self::default() };
     }
@@ -1351,7 +1372,7 @@ impl Events {
             && let Some((i, was)) = newest
             && let Some(now) = self.older.get(i)
         {
-            now.warm(&was, reach);
+            warm_later(Arc::clone(now), was, reach);
         }
         self.took_out = true;
     }
@@ -1399,23 +1420,35 @@ impl Events {
         out
     }
 
-    /// Each of `chunks` swapped for its spilled form (`spilled`, in the same order), where it's still one of
-    /// these events' chunks as it was: one changed or let go of meanwhile stays as it is (its spilled bytes
-    /// go when nothing refers to them). How many were.
-    pub(super) fn spilled(&mut self, chunks: &[Arc<Chunk>], spilled: Vec<super::spill::Spilled>) -> usize {
+    /// Each of `chunks` swapped for its spilled form (`made`, in the same order, each [`Chunk::spilled_as`] made where the
+    /// spill was written: none where it couldn't be), where it's still one of these events' chunks as it was: one changed or
+    /// let go of meanwhile stays as it is (its spilled bytes go when nothing refers to them). How many were. Found in one
+    /// walk of the list, as both are in order (goal 9, plan 01a1a87b2cec step 3: each was looked for from the list's start,
+    /// and its metas copied, on its owner's shard).
+    pub(super) fn spilled(&mut self, chunks: &[Arc<Chunk>], made: Vec<Option<Chunk>>) -> usize {
         let mut n = 0;
         // Spilled chunks are older ones: the newest is never spilled (`Events::spillable`), compact or not.
         let list = Arc::make_mut(&mut self.older);
-        for (c, s) in chunks.iter().zip(spilled) {
-            if let Some(slot) = list.iter_mut().find(|slot| Arc::ptr_eq(slot, c))
-                && let Some(made) = c.spilled_as(s)
-            {
+        let mut from = 0;
+        for (c, made) in chunks.iter().zip(made) {
+            let Some(made) = made else { continue };
+            let Some(at) = list.get(from..).and_then(|rest| rest.iter().position(|slot| Arc::ptr_eq(slot, c))).map(|p| from + p) else { continue };
+            if let Some(slot) = list.get_mut(at) {
                 *slot = Arc::new(made);
                 n += 1;
             }
+            from = at + 1;
         }
         self.took_out |= n > 0;
         n
+    }
+
+    /// [`Events::spilled`] of `chunks` as `spilled` says they were written (`super::spill::write`), each one's spilled form made
+    /// here: as a test spills them.
+    #[cfg(test)]
+    pub(super) fn spilled_where(&mut self, chunks: &[Arc<Chunk>], spilled: Vec<super::spill::Spilled>) -> usize {
+        let made = chunks.iter().zip(spilled).map(|(c, s)| c.spilled_as(s)).collect();
+        self.spilled(chunks, made)
     }
 
     /// The first index whose event `pred` is false for, the events being those it's true for first.
@@ -1560,12 +1593,12 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
         if let Some(inbox) = home.inbox.upgrade() {
             let id = Arc::clone(&home.id);
             let _ = inbox
-                .send(Msg::Run(Box::new(move |s: &mut Shard| {
+                .send(work(&kinds::TRIMMED, move |s: &mut Shard| {
                     s.trimmed(&id, &was, left, made);
                     // The chunk as it was before its trim: let go of off the shard, as the view that held it was
                     // (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
                     let_go(was);
-                })))
+                }))
                 .await;
         }
     }));
@@ -1579,7 +1612,9 @@ fn trim_later(home: Home, cut: Arc<Chunk>, left: usize) {
 pub const IDLE_AFTER: Duration = crate::os::alloc::COLD_AFTER;
 
 /// Every [`IDLE_AFTER`], each owner told to pack its copies that took nothing in since it was last told
-/// ([`Shard::pack_idle`]), from wherever the runtime runs this; once no owner is left, it ends.
+/// ([`Shard::pack_idle`]), from wherever the runtime runs this; once no owner is left, it ends. It's a sweep the owner takes a
+/// copy at a time across its turns (goal 9, plan 01a1a87b2cec step 3): one job over all of them held its shard for all of
+/// them, a chunk sealed, or kept compact and its copy published, for each (production's 134 copies, about 34 a shard).
 async fn pack_idle_every(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>) {
     loop {
         crate::rt::sleep(IDLE_AFTER).await;
@@ -1588,7 +1623,7 @@ async fn pack_idle_every(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>) {
             if let Some(tx) = inbox.upgrade() {
                 any = true;
                 // Not waited for: an owner whose inbox is full has work, its copies taking things in.
-                let _ = tx.try_send(Msg::Run(Box::new(Shard::pack_idle)));
+                let _ = tx.try_send(Msg::Each(Box::new(Shard::pack_idle())));
             }
         }
         if !any {
@@ -1601,7 +1636,7 @@ async fn pack_idle_every(inboxes: Vec<crate::memory::queue::WeakSender<Msg>>) {
 /// the copy's next event, which an idle session may never have.
 fn compact_msg(home: &Home) -> Msg {
     let id = Arc::clone(&home.id);
-    Msg::Run(Box::new(move |s: &mut Shard| s.compact(&id)))
+    work(&kinds::COMPACT, move |s: &mut Shard| s.compact(&id))
 }
 
 /// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
@@ -2128,6 +2163,22 @@ pub(super) fn let_go<T: Send + 'static>(gone: T) {
     }
 }
 
+/// [`Chunk::warm`] of `now`, a copy's chunk just kept compact, from `was`, itself as it was (its events still in memory),
+/// made on the compute pool (goal 9, plan 01a1a87b2cec step 3): its texts from event `reach` on were copied on its owner's
+/// shard, a whole chunk's where the reads reached its start (70 events, a large tool output's megabytes among them). They're
+/// kept as a read keeps them (`Chunk::keep_texts`, which reads beside it take as they do), and a read that comes before
+/// they're made inflates the chunk, as every read did before any were made. Made where it is off a shard (a test's copy);
+/// none made where the pool doesn't take the job (at its bound, or none running): the reads make them.
+fn warm_later(now: Arc<Chunk>, was: Arc<Chunk>, reach: usize) {
+    if !crate::rt::on_shard() {
+        now.warm(&was, reach);
+        return;
+    }
+    if let Err(refused) = hyper_rt::compute::run(move || now.warm(&was, reach)) {
+        drop(refused);
+    }
+}
+
 impl Mirror {
     pub fn new(info: Info, location: Location, bus: Arc<dyn kiln_seams::Bus>) -> Self {
         let feed = Feed::open(bus, &info.id);
@@ -2188,27 +2239,44 @@ impl Mirror {
         }
     }
 
-    /// What writing out its next update of `u`'s kind is expected to take, nanoseconds: its last states' or metas' as they took
-    /// ([`Mirror::said_took`]); none for another kind (goal 9, plan 01a1a87b2cec step 3). A state is compared with its last,
-    /// written field by field and written again for its row; a meta made a value and compared: O(its size), and a session's
-    /// states keep about the size they had.
-    pub(super) fn said(&self, u: &Update) -> Option<u64> {
-        match u {
-            Update::State { .. } => Some(self.state_ns),
-            Update::Meta { .. } => Some(self.meta_ns),
-            _ => None,
-        }
+    /// What writing out its next update of `u`'s kind that changed is expected to take, nanoseconds: its last states' or metas'
+    /// as they took ([`Mirror::said_took`]), and before it had one, every session's (`all`: [`Said`]); none for another kind
+    /// (goal 9, plan 01a1a87b2cec step 3). A state is written field by field and written again for its row; a meta made a value
+    /// and compared: O(its size), and a session's states keep about the size they had. A session's first was written on its
+    /// owner's shard as its time was learned, however long: a harness's meta lists the same commands and controls for each of
+    /// its sessions (15 KB in the lab's, made a value in 0.4 to 0.5 ms on the CPU in a test build), and each of the lab's 32
+    /// sessions took its first on the shard.
+    pub(super) fn said(&self, u: &Update, all: &Said) -> Option<u64> {
+        let own = match u {
+            Update::State { .. } => self.state_ns,
+            Update::Meta { .. } => self.meta_ns,
+            _ => return None,
+        };
+        Some(if own > 0 { own } else { all.of(u).map_or(0, Took::mean) })
     }
 
-    /// Writing out its update of `u`'s kind (a state, a meta) took `took`, on its owner's shard or off it: learned as
-    /// [`WRITES`] learns a sample, its weight 1/8, the first taken as it is.
-    pub(super) fn said_took(&mut self, u: &Update, took: Duration) {
+    /// Writing out its update of `u`'s kind (a state, a meta) that changed took `took`, on its owner's shard or off it:
+    /// learned as [`WRITES`] learns a sample, its weight 1/8, the first taken as it is, for it and for every session's (`all`).
+    pub(super) fn said_took(&mut self, u: &Update, took: Duration, all: &Said) {
         let ns = nanos(took);
         let smooth = |avg: u64| if avg == 0 { ns } else { avg - avg / 8 + ns / 8 };
         match u {
             Update::State { .. } => self.state_ns = smooth(self.state_ns),
             Update::Meta { .. } => self.meta_ns = smooth(self.meta_ns),
-            _ => {}
+            _ => return,
+        }
+        if let Some(t) = all.of(u) {
+            t.learn(ns);
+        }
+    }
+
+    /// Whether `u` is the state or the meta its copy's was made of, the copy's still that one: the same again (a harness says
+    /// its meta at each turn), nothing to make of it (goal 9, plan 01a1a87b2cec step 5), so nothing long to (step 3).
+    pub(super) fn same_again(&self, u: &Update) -> bool {
+        match u {
+            Update::State { state } => self.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &self.state)),
+            Update::Meta { meta } => self.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &self.meta)),
+            _ => false,
         }
     }
 
@@ -2254,19 +2322,30 @@ impl Mirror {
         let file = self.spill_file.clone();
         drop(crate::rt::spawn(async move {
             let id = Arc::clone(&home.id);
-            let written = match crate::rt::blocking(move || super::spill::write(&dir, file, &id, &segments)).await {
+            // Written, and each chunk's spilled form made there too, its metas copied (`Chunk::spilled_as`): its owner swaps them
+            // in alone (goal 9, plan 01a1a87b2cec step 3). A spill of a fill's backlog copied its tens of chunks' metas on the
+            // owner's shard, 5 KB a chunk.
+            let of = chunks.clone();
+            let written = match crate::rt::blocking(move || {
+                super::spill::write(&dir, file, &id, &segments).map(|(file, spilled)| {
+                    let made: Vec<Option<Chunk>> = of.iter().zip(spilled).map(|(c, s)| c.spilled_as(s)).collect();
+                    (file, made)
+                })
+            })
+            .await
+            {
                 Ok(written) => written,
                 Err(e) => Err(std::io::Error::other(format!("{e:#}"))),
             };
             if let Some(inbox) = home.inbox.upgrade() {
                 let id = Arc::clone(&home.id);
                 let _ = inbox
-                    .send(Msg::Run(Box::new(move |s: &mut Shard| {
+                    .send(work(&kinds::SPILLED, move |s: &mut Shard| {
                         s.spilled(&id, &chunks, written);
                         // The chunks as they were before they spilled, each its metas and segment: let go of off the shard, as
                         // the view that held them was (`Mirror::publish`; goal 9, plan 01a1a87b2cec step 3).
                         let_go(chunks);
-                    })))
+                    }))
                     .await;
             }
         }));
@@ -2563,6 +2642,13 @@ impl Mirror {
         }
     }
 
+    /// The compact chunk that keeping its events through number `n` ([`Mirror::keep_through`]: an Open going on from `n`)
+    /// would read back, its cut falling inside it, if one would be: its owner reads it back off the shard first (goal 9, plan
+    /// 01a1a87b2cec step 3: `Shard::want_thaw`).
+    pub(super) fn thaw_for_open(&self, n: u64) -> Option<Arc<Chunk>> {
+        self.events.cut_in(|m: &Meta| m.seq().is_some_and(|q| q <= n))
+    }
+
     /// The compact chunk that taking event `id` numbered `seq` would read back to change (`upsert`: an event it has under
     /// that id, or under that number with another id; or a new one, at its newest chunk kept compact), if one would be.
     pub(super) fn thaw_for(&self, id: &str, seq: u64) -> Option<Arc<Chunk>> {
@@ -2744,6 +2830,8 @@ pub struct Shard {
     board_changed: bool,
     /// Where its copies' sealed chunks are spilled, once set (`Copies::spill_to`).
     spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
+    /// What writing out a session's state or meta that changed takes, every owner's sessions' learned together ([`Said`]).
+    said: Arc<Said>,
     /// A compact chunk of a session's copy that an update's next event changes, to be read back off the shard before it's
     /// taken ([`Shard::want_thaw`]; goal 9, plan 01a1a87b2cec step 3).
     thaw: Option<(String, Arc<Chunk>)>,
@@ -2865,6 +2953,68 @@ impl Rate {
     }
 }
 
+/// What writing out a session's state that changed takes, and a meta that changed, nanoseconds, every session's learned
+/// together by their owners ([`Took`]): what a session's first is expected to take, before it has one of its own
+/// (`Mirror::said`; goal 9, plan 01a1a87b2cec step 3). One for the owners of one [`Copies`] (the process's).
+#[derive(Default)]
+pub(super) struct Said {
+    states: Took,
+    metas: Took,
+}
+
+impl Said {
+    /// What every session's of `u`'s kind (a state, a meta) taught, none for another.
+    fn of(&self, u: &Update) -> Option<&Took> {
+        match u {
+            Update::State { .. } => Some(&self.states),
+            Update::Meta { .. } => Some(&self.metas),
+            _ => None,
+        }
+    }
+}
+
+/// A moving average of how long something took, nanoseconds, a new sample's weight 1/8 and the first taken as it is, as
+/// [`Rate`] learns its samples: every owner learns into it, a load and a store each, so a sample lost to another owner's at
+/// the same moment is one of many.
+#[derive(Default)]
+struct Took(AtomicU64);
+
+impl Took {
+    /// What it's expected to take: none until one was taken.
+    fn mean(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn learn(&self, ns: u64) {
+        let avg = self.0.load(Ordering::Relaxed);
+        self.0.store(if avg == 0 { ns } else { avg - avg / 8 + ns / 8 }, Ordering::Relaxed);
+    }
+}
+
+/// When a piece of an owner's work began, to learn what its kind takes as the shard's quantum holds a turn to (goal 9, plan
+/// 01a1a87b2cec step 3): on the CPU where its shard's thread says (`hyper_rt::futures::thread_run_ns`, as a turn's hold is
+/// told: `Turn::held`), else on the clock. On the clock, a state written in 30 µs while the host held the thread was learned
+/// as long, and the session's next states went off the shard for nothing (a test build at the lowest CPU weight, beside
+/// production and the agents' builds, had a 1 KB state's at past 100 µs).
+pub(super) struct Timer {
+    at: Instant,
+    cpu: Option<u64>,
+}
+
+impl Timer {
+    pub(super) fn start() -> Self {
+        Self { at: Instant::now(), cpu: hyper_rt::futures::thread_run_ns() }
+    }
+
+    /// What it took since it started: on the CPU where the thread said both then and now, else on the clock.
+    pub(super) fn took(&self) -> Duration {
+        match (self.cpu, hyper_rt::futures::thread_run_ns()) {
+            (Some(from), Some(now)) => Duration::from_nanos(now.saturating_sub(from)),
+            _ => self.at.elapsed(),
+        }
+    }
+}
+
 /// Whole nanoseconds of `d`.
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -2910,10 +3060,11 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
 }
 
 /// Whether `u`, an update of the session whose copy is `m`, is expected to hold its owner's shard past a slow poll to write
-/// out: a changeset by its bytes ([`long_changes`]), a state or a meta by what the session's last took ([`Mirror::said`]). It's
-/// written out on the compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
-pub(super) fn long_off(m: &Mirror, u: &Update) -> bool {
-    long_changes(u) || m.said(u).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS)
+/// out: a changeset by its bytes ([`long_changes`]), a state or a meta that changed (its caller tells the same one again
+/// apart: `Mirror::same_again`) by what the session's last took, or every session's before it had one ([`Mirror::said`],
+/// `all`). It's written out on the compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
+    long_changes(u) || m.said(u, all).is_some_and(|ns| ns > hyper_rt::slow::SLOW_POLL_NS)
 }
 
 /// What its owner needs to write session `session`'s update out off the shard ([`Shard::want_off`]): whether its row for the
@@ -3028,6 +3179,11 @@ impl Shard {
         &self.bus
     }
 
+    /// What its owners learned writing out its sessions' states and metas that changed ([`Said`]), held.
+    pub(super) fn said(&self) -> Arc<Said> {
+        Arc::clone(&self.said)
+    }
+
     /// Its copies that took nothing in since its last sweep ([`IDLE_AFTER`] ago: [`pack_idle_every`]) have their newest
     /// chunk packed off the shard and kept compact once it is, as a sealed chunk is ([`Mirror::pack_newest`]; goal 11,
     /// plan 01a1a87b2e56 step 5). An idle session's newest chunk kept its events as they are, their texts whole, for as
@@ -3039,29 +3195,45 @@ impl Shard {
     /// so), and kept compact it would hold its segment beside them. One kept compact that a read took since (its texts made
     /// off the shard for it, then kept: `View::events_page`) is read back as its events, off the shard (one a sweep, as the
     /// owner reads one back at a time), and isn't packed again until it changes.
-    pub(super) fn pack_idle(&mut self) {
-        let mut thaw = None;
-        for (id, m) in &mut self.mirrors {
-            let idle = std::mem::replace(&mut m.idle_rev, m.rev) == m.rev;
-            let (read_back, pack) = match m.events.chunks().last() {
-                Some(c) if c.is_compact() => (c.page_read.load(Ordering::Relaxed).then(|| Arc::clone(c)), false),
-                Some(c) => (None, idle && !c.page_read.load(Ordering::Relaxed)),
-                None => (None, false),
-            };
-            if pack {
-                m.pack_newest();
+    ///
+    /// A sweep of its copies ([`Each`]), a copy at a time across its owner's turns, the first compact newest chunk a read took
+    /// read back as it ends (goal 9, plan 01a1a87b2cec step 3): one job over every copy of the shard held it for all of them.
+    pub(super) fn pack_idle() -> Each {
+        let mut thaw: Option<(String, Arc<Chunk>)> = None;
+        let step = move |s: &mut Shard, id: Option<&str>| match id {
+            Some(id) => {
+                if let Some(c) = s.pack_idle_one(id)
+                    && thaw.is_none()
+                {
+                    thaw = Some((id.to_owned(), c));
+                }
             }
-            if thaw.is_none()
-                && let Some(c) = read_back
-            {
-                thaw = Some((id.clone(), c));
+            None => {
+                if s.thaw.is_none()
+                    && let Some((id, c)) = thaw.take()
+                {
+                    s.want_thaw(&id, c);
+                }
             }
+        };
+        Each { left: None, label: &kinds::IDLE, pick: Box::new(|_: &str, _: &Mirror| true), step: Box::new(step) }
+    }
+
+    /// Session `id`'s copy in its owner's sweep for idle copies ([`Shard::pack_idle`]): its newest chunk packed where it took
+    /// nothing in since the last sweep and no read took it since it changed; and that chunk, where it's kept compact and a
+    /// read took it since, to be read back.
+    fn pack_idle_one(&mut self, id: &str) -> Option<Arc<Chunk>> {
+        let m = self.mirrors.get_mut(id)?;
+        let idle = std::mem::replace(&mut m.idle_rev, m.rev) == m.rev;
+        let (read_back, pack) = match m.events.chunks().last() {
+            Some(c) if c.is_compact() => (c.page_read.load(Ordering::Relaxed).then(|| Arc::clone(c)), false),
+            Some(c) => (None, idle && !c.page_read.load(Ordering::Relaxed)),
+            None => (None, false),
+        };
+        if pack {
+            m.pack_newest();
         }
-        if self.thaw.is_none()
-            && let Some((id, c)) = thaw
-        {
-            self.want_thaw(&id, c);
-        }
+        read_back
     }
 
     /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
@@ -3240,10 +3412,10 @@ impl Shard {
     }
 
     /// A spill of session `id`'s chunks come back (`Mirror::spill_old`): written, each chunk still its
-    /// copy's as it was swapped for its spilled form, its readers given the view of that, and what sealed
-    /// meanwhile spilled in turn; refused, they stay in memory as they were, said (goal 11, plan 01a1a87b2e56
+    /// copy's as it was swapped for its spilled form (made where it was written: `made`), its readers given the view of that,
+    /// and what sealed meanwhile spilled in turn; refused, they stay in memory as they were, said (goal 11, plan 01a1a87b2e56
     /// step 5). Either way the next spill may go.
-    fn spilled(&mut self, id: &str, chunks: &[Arc<Chunk>], written: std::io::Result<(Arc<super::spill::File>, Vec<super::spill::Spilled>)>) {
+    fn spilled(&mut self, id: &str, chunks: &[Arc<Chunk>], written: std::io::Result<(Arc<super::spill::File>, Vec<Option<Chunk>>)>) {
         // Its copy gone meanwhile: what was written is let go of off the shard, its file deleted there with its last chunk
         // (goal 9, plan 01a1a87b2cec step 3).
         let Some(m) = self.mirrors.get_mut(id) else {
@@ -3341,6 +3513,7 @@ impl Shard {
                 }
             }
             Msg::Run(job) => job(self),
+            Msg::Work(work) => (work.job)(self),
             Msg::Each(mut each) => {
                 if each.left.is_none() {
                     each.left = Some(self.mirrors.iter().filter(|(id, m)| (each.pick)(id, m)).map(|(id, _)| id.clone()).collect());
@@ -3433,8 +3606,19 @@ type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 pub struct Each {
     /// The sessions picked as its owner first took it, those it hasn't taken yet: none picked until then.
     left: Option<Vec<String>>,
+    /// What its owner's polls taking it are labeled with, and what its kind takes is learned by ([`label_of`]).
+    label: &'static hyper_rt::slow::Label,
     pick: Box<dyn Fn(&str, &Mirror) -> bool + Send>,
     step: Box<dyn FnMut(&mut Shard, Option<&str>) + Send>,
+}
+
+/// Work of an owner's own on its copies, of a kind: what its polls taking it are labeled with, and what its kind takes is
+/// learned apart from every other's ([`label_of`], [`Costs`]; goal 9, plan 01a1a87b2cec step 3). Every job was one kind,
+/// "owner work on its copies", so a turn took a long one (a spill taken in) where the short ones (a chunk kept compact)
+/// had taught it what a job takes, and the lab's table couldn't tell which held the shard.
+pub struct Work {
+    label: &'static hyper_rt::slow::Label,
+    job: Job,
 }
 
 /// What an owner takes from its inbox.
@@ -3446,6 +3630,8 @@ pub enum Msg {
     Runner(Box<RunnerUpdate>),
     /// A sweep of its copies, a session at a time ([`Each`]).
     Each(Box<Each>),
+    /// Work of its own of a kind ([`Work`]): a chunk kept compact, a spill or a cut taken in.
+    Work(Box<Work>),
 }
 
 impl crate::memory::queue::Weigh for Msg {
@@ -3455,10 +3641,33 @@ impl crate::memory::queue::Weigh for Msg {
         size_of::<Msg>().saturating_add(match self {
             Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
             Msg::Run(job) => size_of_val(&**job),
+            Msg::Work(work) => size_of::<Work>().saturating_add(size_of_val(&*work.job)),
             Msg::Each(each) => size_of::<Each>().saturating_add(size_of_val(&*each.pick)).saturating_add(size_of_val(&*each.step)).saturating_add(each.left.as_ref().map_or(0, |l| l.iter().map(|id| size_of::<String>().saturating_add(id.len())).fold(0, usize::saturating_add))),
             Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
         })
     }
+}
+
+/// [`Work`] of kind `label`.
+fn work(label: &'static hyper_rt::slow::Label, job: impl FnOnce(&mut Shard) + Send + 'static) -> Msg {
+    Msg::Work(Box::new(Work { label, job: Box::new(job) }))
+}
+
+/// The kinds of an owner's own work ([`Work`], [`Each`]), as the shards' table of what held them names them (goal 9, plan
+/// 01a1a87b2cec step 3).
+mod kinds {
+    use hyper_rt::slow::Label;
+
+    /// A copy's chunks packed since kept compact ([`super::Shard::compact`]).
+    pub static COMPACT: Label = Label { name: "owner work: a copy's chunks kept compact" };
+    /// A copy's spill taken in ([`super::Shard::spilled`]).
+    pub static SPILLED: Label = Label { name: "owner work: a copy's spill taken in" };
+    /// The chunk a copy's cut fell in, made again, taken in ([`super::Shard::trimmed`]).
+    pub static TRIMMED: Label = Label { name: "owner work: a copy's cut taken in" };
+    /// The sweep for idle copies ([`super::Shard::pack_idle`]).
+    pub static IDLE: Label = Label { name: "owner sweep: idle copies packed" };
+    /// Every other sweep of an owner's copies ([`super::Copies::on_each_session`]).
+    pub static SWEEP: Label = Label { name: "owner sweep of its copies" };
 }
 
 /// The shard that owns session `id` among `shards`: FNV-1a over its id, so every process with as
@@ -3550,6 +3759,7 @@ impl Copies {
         let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::new())).collect::<Vec<_>>().into();
         let hub = Arc::new(OnceLock::new());
         let spill = Arc::new(OnceLock::new());
+        let said = Arc::new(Said::default());
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
@@ -3561,6 +3771,7 @@ impl Copies {
                 bus: Arc::clone(&bus),
                 board_changed: false,
                 spill: Arc::clone(&spill),
+                said: Arc::clone(&said),
                 thaw: None,
                 thawed: Weak::new(),
                 insert: None,
@@ -3767,7 +3978,7 @@ impl Copies {
                     }
                 }
             };
-            let each = Each { left: None, pick: Box::new(pick.clone()), step: Box::new(step) };
+            let each = Each { left: None, label: &kinds::SWEEP, pick: Box::new(pick.clone()), step: Box::new(step) };
             if inbox.send(Msg::Each(Box::new(each))).await.is_ok() {
                 answers.push(rx);
             }
@@ -3793,14 +4004,16 @@ impl Copies {
 }
 
 /// What an owner's polls taking `msg` are labeled with in the shards' table of what held them (goal 9, plan
-/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), a runner's as a taken one, and
-/// work on its copies as such.
+/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), a runner's as a taken one, its own work and
+/// sweeps by their kinds ([`kinds`]), and other work on its copies (a person's command, a session seeded) as such.
 fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     static WORK: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "owner work on its copies" };
     match msg {
         Msg::Update(i) => crate::wire::update_label(&i.u),
         Msg::Runner(r) => crate::wire::update_label(&r.update),
-        Msg::Run(_) | Msg::Each(_) => &WORK,
+        Msg::Run(_) => &WORK,
+        Msg::Work(work) => work.label,
+        Msg::Each(each) => each.label,
     }
 }
 
@@ -3926,7 +4139,7 @@ impl Costs {
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
-            Msg::Run(_) | Msg::Each(_) => return start,
+            Msg::Run(_) | Msg::Work(_) | Msg::Each(_) => return start,
         };
         match u {
             Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(self.tail.expected()),
@@ -4597,14 +4810,14 @@ mod tests {
         anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
         let got = newest.packed().cloned().ok_or_else(|| anyhow::anyhow!("the newest wasn't packed"))?;
         assert_eq!((&got.deflated, got.crc, got.len), (&want.deflated, want.crc, want.len), "the bytes one deflate makes");
-        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told to keep it compact");
+        assert!(matches!(told.try_recv(), Ok(Msg::Work(w)) if std::ptr::eq(w.label, &kinds::COMPACT)), "its owner told to keep it compact");
         // The middle begun, then packed by a snapshot that needed it.
         anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
         assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &middle) && p.next == 1), "the middle next");
         let snapshot = middle.pack()?;
         anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
         assert!(packer.now.is_none() && middle.packed().is_some_and(|s| Arc::ptr_eq(s, &snapshot)), "the snapshot's kept, the packer's let go of");
-        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told");
+        assert!(matches!(told.try_recv(), Ok(Msg::Work(w)) if std::ptr::eq(w.label, &kinds::COMPACT)), "its owner told");
         // The oldest begun, then let go of by its copy (the oldest let go of) and everyone else.
         anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
         assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &oldest)), "the oldest last");
@@ -4947,7 +5160,7 @@ mod tests {
         let resident = |m: &Mirror| m.events.chunks().iter().filter_map(|c| c.packed()).map(|s| s.deflated.len()).sum::<usize>();
         let held = resident(&m);
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
-        anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4, "every one of them spilled");
+        anyhow::ensure!(m.events.spilled_where(&chunks, spilled) == 4, "every one of them spilled");
         drop((chunks, segments));
         m.publish();
         anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_spilled()).all(|c| c.packed().is_none()), "a spilled chunk keeps no segment in memory");
@@ -4993,7 +5206,7 @@ mod tests {
         let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
-        anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4);
+        anyhow::ensure!(m.events.spilled_where(&chunks, spilled) == 4);
         drop((chunks, segments));
         // The file's bytes lost under it: each spilled chunk is refused as it's read back.
         for f in std::fs::read_dir(&folder)? {
@@ -5092,7 +5305,7 @@ mod tests {
             let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
             let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
             let (_file, spilled) = super::super::spill::write(&dir, None, &m.info.id, &segments)?;
-            Ok(m.events.spilled(&chunks, spilled))
+            Ok(m.events.spilled_where(&chunks, spilled))
         };
         // Events the lab's size: the two sealed chunks among the newest page stay.
         let mut small = Mirror::new(Info { id: "small".into(), ..Info::default() }, Location::Local, sim_bus());
@@ -5922,8 +6135,15 @@ mod tests {
             let n = u64::try_from(CHUNK + 9)?;
             anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
             until("its events", Box::new(move |v: &View| v.events.len() == usize::try_from(n).unwrap_or(0))).await?;
-            // Swept twice with nothing in between: its newest sealed, packed off the shard, kept compact.
-            let sweep = || copies.on(&id, |s| s.pack_idle());
+            // Swept twice with nothing in between: its newest sealed, packed off the shard, kept compact. Each sweep as
+            // `pack_idle_every` sends it, a copy at a time (goal 9, plan 01a1a87b2cec step 3), taken before the job after it.
+            let sweep = || {
+                let (copies, id) = (Arc::clone(&copies), id.clone());
+                async move {
+                    let _ = copies.send(&id, Msg::Each(Box::new(Shard::pack_idle()))).await;
+                    copies.applied(&id).await;
+                }
+            };
             sweep().await;
             sweep().await;
             until("its newest kept compact", Box::new(|v: &View| v.events.chunks().last().is_some_and(|c| c.is_compact()))).await?;
@@ -6734,7 +6954,8 @@ mod tests {
             let (big, bigger) = ("s".repeat(512 << 10), "t".repeat(512 << 10));
             let state = |summary: &str| Box::new(State { summary: summary.to_owned(), ..State::default() });
             let off = || async { copies.on(&id, |s| s.updates_off()).await.unwrap_or_default() };
-            // The first, written on the shard, teaches what its states take; the next goes off it, and the same again too.
+            // The first, written on the shard, teaches what its states take; the next goes off it. The same again is told apart
+            // on the shard, a compare, and nothing of it made there or off it.
             anyhow::ensure!(send(Update::State { state: state(&big) }).await, "sent");
             let was = off().await;
             anyhow::ensure!(send(Update::State { state: state(&bigger) }).await, "sent");
@@ -6742,7 +6963,7 @@ mod tests {
             let first = copies.on(&id, move |s| s.get(&i).map(|m| Arc::as_ptr(&m.state) as usize)).await.flatten();
             anyhow::ensure!(send(Update::State { state: state(&bigger) }).await, "sent");
             let after_states = off().await;
-            anyhow::ensure!(after_states == was + 2, "two states written out off its owner's shard: {was} then {after_states}");
+            anyhow::ensure!(after_states == was + 1, "one state written out off its owner's shard, the same again not: {was} then {after_states}");
             let i = id.clone();
             let now = copies.on(&id, move |s| s.get(&i).map(|m| (Arc::as_ptr(&m.state) as usize, m.state.to_value(), m.info.summary.len(), m.state_of.as_ref().is_some_and(|(_, made)| Arc::ptr_eq(made, &m.state))))).await.flatten();
             let Some((doc, value, summary, kept)) = now else { anyhow::bail!("no copy") };
@@ -6768,6 +6989,158 @@ mod tests {
             drop(viewer);
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's first long state or meta goes off its owner's shard once another session's
+    /// taught its owners what they take ([`Said`]), where it was written on the shard as its own time was learned. The first
+    /// session's first, written on the shard, teaches them; the other's first is written out off it, and taken as made there.
+    #[test]
+    fn g9_s3_a_sessions_first_long_state_or_meta_goes_off_its_owners_shard_once_another_taught_what_they_take() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            for id in ["first", "next"] {
+                let i = id.to_owned();
+                copies
+                    .on(id, move |s| {
+                        s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    })
+                    .await;
+            }
+            let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new() })));
+            let off = || async { copies.on("first", |s| s.updates_off()).await.unwrap_or_default() };
+            let learned = || async { copies.on("first", |s| (s.said().states.mean(), s.said().metas.mean())).await.unwrap_or_default() };
+            let state = |summary: String| Box::new(State { summary, ..State::default() });
+            let meta = |tag: &str| Box::new(Meta { agents: (0..20_000).map(|k| format!("{tag}-{k}")).collect(), ..Meta::default() });
+            anyhow::ensure!(send("first", Update::State { state: state("s".repeat(512 << 10)) }).await, "sent");
+            anyhow::ensure!(send("first", Update::Meta { meta: meta("first") }).await, "sent");
+            let was = off().await;
+            let (states, metas) = learned().await;
+            anyhow::ensure!(was == 0, "the first session's first state and meta written on the shard: {was} off it");
+            anyhow::ensure!(states > hyper_rt::slow::SLOW_POLL_NS && metas > hyper_rt::slow::SLOW_POLL_NS, "each taught its owners it's long: {states} ns, {metas} ns");
+            anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
+            anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
+            let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
+            let Some((off_now, Some((state_made, meta_made)))) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(off_now == was + 2, "the other session's first state and meta written out off its owner's shard: {was} then {off_now}");
+            anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made on the shard");
+            anyhow::ensure!(meta_made == serde_json::to_value(meta("next"))?, "its meta as made on the shard");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an Open going on from an event inside a compact chunk of its copy (a runner's reconnect
+    /// after it lost events the copy has) has that chunk read back by its owner off the shard first ([`Shard::thawed`] names
+    /// it), then is taken: the copy keeps its events through that one, in order, each where its index says.
+    #[test]
+    fn g9_s3_an_open_going_on_from_inside_a_compact_chunk_reads_it_back_off_its_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "reopened".to_owned();
+            let info = || Box::new(Info { id: id.clone(), kind: "claude".into(), epoch: 2, ..Info::default() });
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} said"), streaming: false } };
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            anyhow::ensure!(send(Update::Open { info: info(), since: None }).await, "opened");
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
+            // Its sealed chunks packed and kept compact: the second, which an Open going on from inside it cuts.
+            let i = id.clone();
+            let cut = copies
+                .on(&id, move |s| {
+                    let m = s.get_mut(&i)?;
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.publish();
+                    m.events.chunks().get(1).cloned().filter(|c| c.is_compact())
+                })
+                .await
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("the second chunk kept compact"))?;
+            let since = u64::try_from(CHUNK + 5)?;
+            anyhow::ensure!(send(Update::Open { info: info(), since: Some(since) }).await, "opened again");
+            let (i, was) = (id.clone(), Arc::clone(&cut));
+            let now = copies
+                .on(&id, move |s| {
+                    let read_back = s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was));
+                    s.get(&i).map(|m| (read_back, m.events.metas().filter_map(|x| x.seq()).collect::<Vec<u64>>(), m.events.metas().enumerate().all(|(at, meta)| m.index.get(&m.events, meta.id()) == Some(at))))
+                })
+                .await
+                .flatten();
+            let Some((read_back, seqs, indexed)) = now else { anyhow::bail!("no copy") };
+            anyhow::ensure!(read_back, "the chunk its cut fell in read back by its owner off the shard");
+            anyhow::ensure!(seqs == (1..=since).collect::<Vec<u64>>() && indexed, "kept through {since}, in order, each where its index says: {seqs:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the texts a compaction makes for a copy's reads (its newest page was read: `Chunk::warm`,
+    /// a chunk's worth where the reads reached its start) are made off its owner's shard, on the compute pool, and kept as a
+    /// read keeps them: as `g10_s5_a_read_copys_next_compact_chunk_is_warmed`'s copy, on an owner's shard.
+    #[test]
+    fn g9_s3_a_compacted_chunks_texts_for_its_reads_are_made_off_its_owners_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            let was = WARMED_ON_SHARD.load(Ordering::Relaxed);
+            let chunk = u64::try_from(CHUNK)?;
+            let made = copies
+                .on("warm", move |_| {
+                    let mut m = Mirror::new(Info { id: "warm".into(), ..Info::default() }, Location::Local, sim_bus());
+                    let push = |m: &mut Mirror, seqs: std::ops::RangeInclusive<u64>| {
+                        for q in seqs {
+                            m.rev = q;
+                            m.upsert(entry(&format!("e{q}"), q));
+                        }
+                        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                            let _ = c.pack();
+                        }
+                        m.events.compact(None);
+                        m.publish();
+                    };
+                    // Two sealed chunks, compact, the newest open with nine; its newest page read; then a chunk more compacted.
+                    push(&mut m, 1..=2 * chunk + 9);
+                    m.view().events_page(None, 50)?;
+                    push(&mut m, 2 * chunk + 10..=3 * chunk + 9);
+                    m.events.chunks().get(2).cloned()
+                })
+                .await
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("no third chunk"))?;
+            anyhow::ensure!(made.is_compact(), "the third chunk kept compact");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while made.page_kept().is_none() {
+                anyhow::ensure!(Instant::now() < deadline, "its texts were never made");
+                crate::rt::sleep(Duration::from_millis(2)).await;
+            }
+            anyhow::ensure!(WARMED_ON_SHARD.load(Ordering::Relaxed) == was, "made off its owner's shard");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an owner's own work is labeled by its kind, and what each kind takes is learned apart:
+    /// a long spill taken in doesn't teach a turn that a chunk kept compact takes as long, nor the other way, and a person's
+    /// command is neither.
+    #[test]
+    fn g9_s3_an_owners_own_work_is_labeled_and_learned_by_its_kind() {
+        let us = Duration::from_micros;
+        let compact = || work(&kinds::COMPACT, |_: &mut Shard| {});
+        let spill = || work(&kinds::SPILLED, |_: &mut Shard| {});
+        let other = || Msg::Run(Box::new(|_: &mut Shard| {}));
+        assert!(std::ptr::eq(label_of(&compact()), &kinds::COMPACT) && std::ptr::eq(label_of(&spill()), &kinds::SPILLED));
+        assert!(std::ptr::eq(label_of(&Msg::Each(Box::new(Shard::pack_idle()))), &kinds::IDLE), "the sweep for idle copies");
+        assert_eq!(label_of(&other()).name, "owner work on its copies");
+        let mut costs = Costs::default();
+        costs.learn(label_of(&spill()), 200_000);
+        costs.learn(label_of(&compact()), 5_000);
+        assert!(costs.expected(&spill()) >= us(200) && costs.expected(&compact()) < us(20), "{:?} {:?}", costs.expected(&spill()), costs.expected(&compact()));
+        assert_eq!(costs.expected(&other()), Duration::ZERO, "a person's command is neither");
     }
 
     /// Says, as it's dropped, whether the thread it's dropped on runs a shard.

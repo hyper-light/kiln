@@ -132,6 +132,16 @@ what it took, and says through where it has it.
      from every answer, so the server tells it once until a batch of it is taken. Answered each
      time, such a runner sent the same batches again for every answer, and each was answered the
      same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
+- **Batched.** A feed holds what its store commits and ships it as one batch once a tick has
+  passed since the first of it (`SHIP_EVERY`: the recorder's tick, 1 s), or at once past a
+  batch's worth (`SHIP_AT_BYTES`: `BATCH_BYTES`, 2 MiB). What it reads after it's told where to go
+  on, and what it still has to read of a backlog, go at once, as before; a copy sent back is never
+  held. The stores' own commits are as they were (`COMMIT_MS`). Each batch is a custody record of
+  both ends, kept in kiln.db, and a write the cluster group sends its learners: a batch per commit
+  made most of kiln.db's writes. So the server's store, and a mirror's copy, trail by up to a tick
+  more. What reads them can spare it: a move off a machine that's gone resumes from the harness's
+  record, whose lines reach the runner's store only at the recorder's tick already; the board looks
+  every 5 s; a mirror's copy is read only to restore from.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
