@@ -40,15 +40,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// How the shards nudge their CPUs (`[server] nudge`; docs/priority.md, "A nudge for the shards"). A config's
-/// `true` and `false`, from before it had a mode, are `on` and `off`.
+/// How the shards nudge their CPUs (`[server] nudge`; docs/priority.md, "A nudge for the shards").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     /// Never: the default, until a config declares another (docs/ci.md §0.3, "Opt-in automation").
     #[default]
     Off,
-    /// Every wait, from the shard's start: train 7's `nudge = true`.
+    /// Every wait, from the shard's start.
     On,
     /// While the shard's host holds its wakes (the module's notes): the mode a config declares.
     Auto,
@@ -65,7 +64,7 @@ impl Mode {
     }
 
     /// The mode a setting's word names: `off`, `on` or `auto`, and the words a flag is said with (`true`, `1`,
-    /// `yes`; `false`, `0`, `no`).
+    /// `yes`; `false`, `0`, `no`), as the lab's scripts say it (`KILN_RT_NUDGE=1`, scripts/priority_lab/s7c.sh).
     pub fn parse(word: &str) -> Option<Mode> {
         match word.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Mode::Auto),
@@ -75,10 +74,10 @@ impl Mode {
         }
     }
 
-    /// `KILN_RT_NUDGE`'s value as the lab sets it: a word [`Mode::parse`] knows, and anything else on, as the flag
-    /// it was read as before it had a mode (`kiln-lab ab --env-b KILN_RT_NUDGE=1`).
-    pub fn from_env(value: &str) -> Mode {
-        Mode::parse(value).unwrap_or(Mode::On)
+    /// `KILN_RT_NUDGE`'s value as the lab sets it (`kiln-lab ab --env-b KILN_RT_NUDGE=auto`): a word [`Mode::parse`]
+    /// knows; none for any other, which the config refuses, saying the words.
+    pub fn from_env(value: &str) -> Option<Mode> {
+        Mode::parse(value)
     }
 
     /// Its index in a byte, as `crate::rt` keeps it.
@@ -108,18 +107,8 @@ impl std::fmt::Display for Mode {
 
 impl<'de> serde::Deserialize<'de> for Mode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        /// What a config may say: a flag, as before the mode, or the mode's word.
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Said {
-            Flag(bool),
-            Word(String),
-        }
-        match Said::deserialize(d)? {
-            Said::Flag(true) => Ok(Mode::On),
-            Said::Flag(false) => Ok(Mode::Off),
-            Said::Word(word) => Mode::parse(&word).ok_or_else(|| serde::de::Error::custom(format!("nudge = \"{word}\": \"auto\", \"on\" or \"off\""))),
-        }
+        let word = String::deserialize(d)?;
+        Mode::parse(&word).ok_or_else(|| serde::de::Error::custom(format!("nudge = \"{word}\": \"auto\", \"on\" or \"off\"")))
     }
 }
 
@@ -618,22 +607,25 @@ mod tests {
         assert_eq!(reads(Here { may_ns: 166_700, ..Here::default() }), (0..periods).collect::<Vec<u64>>(), "auto");
     }
 
-    /// Goal 8, plan 01a1a59c2b29 step 7: `[server] nudge` takes a mode's word or the flag it was before; the lab's
-    /// `KILN_RT_NUDGE` too, anything not a word being on, as it was read before.
+    /// Goal 8, plan 01a1a59c2b29 step 7: `[server] nudge` takes a mode's word; the lab's `KILN_RT_NUDGE` too, and the
+    /// words a flag is said with, as its scripts set it. The flag the setting was before it had modes (`nudge = true`),
+    /// which no config of kiln's says, and an environment's word it doesn't know are refused, not read as on.
     #[test]
-    fn g8_s7_nudge_takes_a_mode_or_the_flag_it_was() -> anyhow::Result<()> {
+    fn g8_s7_nudge_takes_a_modes_word() -> anyhow::Result<()> {
         #[derive(serde::Deserialize)]
         struct Server {
             nudge: Mode,
         }
-        for (said, mode) in [("true", Mode::On), ("false", Mode::Off), ("\"auto\"", Mode::Auto), ("\"on\"", Mode::On), ("\"off\"", Mode::Off), ("\"Auto\"", Mode::Auto)] {
+        for (said, mode) in [("\"auto\"", Mode::Auto), ("\"on\"", Mode::On), ("\"off\"", Mode::Off), ("\"Auto\"", Mode::Auto)] {
             let s: Server = toml::from_str(&format!("nudge = {said}"))?;
             anyhow::ensure!(s.nudge == mode, "nudge = {said}: {:?}", s.nudge);
         }
-        anyhow::ensure!(toml::from_str::<Server>("nudge = \"sometimes\"").is_err(), "an unknown word is refused");
+        for refused in ["\"sometimes\"", "true", "false"] {
+            anyhow::ensure!(toml::from_str::<Server>(&format!("nudge = {refused}")).is_err(), "nudge = {refused} is refused");
+        }
         anyhow::ensure!(Mode::default() == Mode::Off, "off until declared (docs/ci.md §0.3, opt-in automation)");
         anyhow::ensure!(crate::config::Server::default().nudge == Mode::Off, "a server's config: off until it declares a mode");
-        for (v, mode) in [("1", Mode::On), ("true", Mode::On), ("yes please", Mode::On), ("0", Mode::Off), ("off", Mode::Off), ("no", Mode::Off), (" auto ", Mode::Auto)] {
+        for (v, mode) in [("1", Some(Mode::On)), ("true", Some(Mode::On)), ("0", Some(Mode::Off)), ("off", Some(Mode::Off)), ("no", Some(Mode::Off)), (" auto ", Some(Mode::Auto)), ("yes please", None)] {
             anyhow::ensure!(Mode::from_env(v) == mode, "KILN_RT_NUDGE={v}");
         }
         for mode in [Mode::Off, Mode::On, Mode::Auto] {

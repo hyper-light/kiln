@@ -83,7 +83,7 @@ impl Hub {
         for piece in pieces(caps) {
             self.build_piece(piece, peer, agent, build, caps).await;
             noted(piece);
-            turns.after().await;
+            turns.end().await;
         }
     }
 
@@ -267,7 +267,7 @@ mod tests {
             anyhow::ensure!(hub.store.queued_jobs(2000).await?.len() == 1000, "no runner: every one still queued");
             let code: String = include_str!("../hub.rs").split("\n#[cfg(test)]\npub(crate) mod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
             let walk = code.split("async fn schedule_once(&self)").nth(1).and_then(|rest| rest.split("for job in queued {").nth(1)).unwrap_or_default();
-            anyhow::ensure!(walk.trim_start().starts_with("turns.after().await;"), "each job's pick in a turn: {}", walk.get(..200).unwrap_or(walk));
+            anyhow::ensure!(walk.trim_start().starts_with("turns.end().await;"), "each job's pick in a turn, its poll ended with it: {}", walk.get(..200).unwrap_or(walk));
             Ok(())
         })
     }
@@ -285,7 +285,7 @@ mod tests {
             let (here, there) = (Location::Machine("g9s3-box".into()), Location::Machine("g9s3-other".into()));
             for (id, from) in [("g9s3-a", &here), ("g9s3-b", &there), ("g9s3-c", &here), ("g9s3-d", &Location::Local)] {
                 let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), ..Info::default() };
-                hub.harness.ingest(&hub, from, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(from, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             for target in ["agent:g9s3-box", "agent:g9s3-other", "local", "agent:g9s3-none"] {
                 let mut found = hub.harness.ids_on(target);

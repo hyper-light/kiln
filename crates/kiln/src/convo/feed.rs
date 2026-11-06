@@ -376,7 +376,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
     let mut grown_at = store.grown();
     let (mut behind, mut catching_up) = (false, false);
     loop {
-        turns.after().await;
+        turns.end().await;
         // Its store's next commit is news only at its store's tip, nothing on its way: with a batch on its way, or reading
         // on, it reads what came meanwhile as it goes on, so it waits on its link alone, and the commits meanwhile wake
         // nothing (goal 9, plan 01a1a87b2cec step 5: [`Store::watch`]). One it didn't wait for is told as it next waits,
@@ -1862,7 +1862,7 @@ mod tests {
         let ship = code.split("async fn ship(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
         let (on_shard, in_job) = ship.split_once("crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)>").unwrap_or_default();
         assert!(!on_shard.is_empty() && !on_shard.contains("skip(c.rev)") && in_job.contains("skip(c.rev)"), "{ship}");
-        assert!(on_shard.contains("turns.after().await"), "its turns: {ship}");
+        assert!(on_shard.contains("turns.end().await"), "its turns, each poll ended with its turn: {ship}");
     }
 
     /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.

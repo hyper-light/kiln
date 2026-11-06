@@ -17,8 +17,8 @@
 //! end before it reads the update (`crate::wire::payload`), so the update is read, and its unknown fields
 //! looked for, as a runner without the stamp would have sent it. A server from before the stamp reads the
 //! update as it always did: serde lets the field go, and it's counted (`kiln_wire_ignored_fields_total`, in the
-//! payloads looked at: at most one of a kind every 100 ms, every message of a kind that comes less often) and said
-//! once an hour, as docs/wire.md says a newer peer's field is.
+//! payloads looked at: one of a kind at a time, the next once the last is done) and said once an hour, as
+//! docs/wire.md says a newer peer's field is.
 
 use std::fmt::Write as _;
 use std::time::Duration;

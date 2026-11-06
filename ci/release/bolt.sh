@@ -12,13 +12,18 @@
 #
 #   bolt.sh tools                               print the directory with llvm-bolt, perf2bolt and merge-fdata
 #   bolt.sh check <binary>                      whether BOLT can move <binary>'s functions
-#   bolt.sh record <pid> <perf.data> [lbr|samples] [seconds]
-#                                               perf records process <pid> (user space), with its branch stacks
-#                                               (lbr, the default: Intel's LBR, AMD's LbrExtV2) or its
-#                                               instructions alone (samples), until stopped, or for <seconds>
+#   bolt.sh lbr                                 whether this machine's perf records branch stacks (exit 0) or not
+#   bolt.sh record <pid> <perf.data> [auto|lbr|samples] [seconds]
+#                                               perf records process <pid> (user space), until stopped, or for
+#                                               <seconds>: with its branch stacks (lbr: Intel's LBR, AMD's
+#                                               LbrExtV2, Arm's BRBE), or cycles:u samples with their call graphs
+#                                               (samples); auto, the default, takes lbr where `bolt.sh lbr` says
+#                                               this machine records them, and says which it took
 #   bolt.sh profile <binary> <out.fdata|out.yaml> <perf.data>...
 #                                               perf2bolt each recording of <binary> (a copy of it, stripped or
-#                                               not, with its build id), the profiles merged
+#                                               not, with its build id), the profiles merged; says of each whether
+#                                               it held branch records; BOLT_PROFILE_YAML=<out.yaml> writes the
+#                                               same profile as YAML too, from the same pass
 #   bolt.sh instrument <binary> <out> <dump> [seconds]
 #                                               <binary> with every edge counted: each process of it forks a
 #                                               writer that puts the counts since it started in
@@ -26,7 +31,11 @@
 #   bolt.sh window <first.fdata> <last.fdata> <out.fdata>
 #                                               the counts between two dumps of one instrumented process
 #   bolt.sh optimize <binary> <profile> <out>   <binary> laid out by <profile> (fdata, or YAML from another
-#                                               build: -infer-stale-profile), stripped, into <out>
+#                                               build: -infer-stale-profile), stripped, into <out>; says what the
+#                                               profile covered (<binary>.bolt.log, <binary>.bolt.txt)
+#   bolt.sh same <binary> <bolted>              whether <bolted> is <binary> laid out by BOLT: one build (its id,
+#                                               its last bit flipped as BOLT patches it), one `--version`, its code
+#                                               rewritten
 #   bolt.sh order <binary> <out.order> <perf.data|.fdata>...
 #                                               the functions each profile saw run in <binary>, hottest first,
 #                                               for the linker to lay out first (KILN_RELEASE_BOLT=<out.order>):
@@ -40,8 +49,8 @@
 #                    instrumentation runtime are kept. KILN_BOLT_URL and KILN_BOLT_SHA256 name another copy.
 #   PERF, PERF_LIBS  the perf binary, and a directory of its libraries (as scripts/shard_lab/hook.sh)
 #   BOLT_FREQ        perf's sampling frequency (perf's own default otherwise: 4000 a second)
-#   BOLT_EVENT       the event perf samples on (cycles:u; on a hybrid CPU, fedora's, that's each kind of core's:
-#                    cpu_atom/cycles/u names the E-cores' alone, where the lab's server runs)
+#   BOLT_EVENT       the event perf samples on (cycles:u, BOLT's README's; on a hybrid CPU, fedora's, that's each kind
+#                    of core's: cpu_atom/cycles/u names the E-cores' alone, where the lab's server runs)
 #   KILN_BOLT_ICF    optimize's identical code folding: safe (the default), all or none
 #   KILN_BOLT_ARGS   more llvm-bolt options for instrument and optimize (-thread-count=4, say)
 #   KILN_STRIP       the strip that strips optimize's output (strip)
@@ -118,13 +127,43 @@ check() {
   echo "$b: relocations and symbols kept; BOLT can move its functions"
 }
 
+# Whether this machine's perf records branch stacks of a user's own process with BOLT_EVENT's event (Intel's LBR,
+# AMD's LbrExtV2, Arm's BRBE; none in most virtual machines): a recording of `true` asked for them as `record` asks.
+# A PMU without them refuses the event as it opens, and one that takes it says BRANCH_STACK in the recording's
+# sample type.
+lbr_here() {
+  local tmp ok=1
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/bolt-lbr.XXXXXX") || return 1
+  # (grep reads it all: -q's early exit would fail the pipe.)
+  if perf_cmd record -q -e "${BOLT_EVENT:-cycles:u}" -j any,u -o "$tmp/probe.data" -- true > "$tmp/log" 2>&1 &&
+    perf_cmd evlist -v -i "$tmp/probe.data" 2> /dev/null | grep BRANCH_STACK > /dev/null; then
+    ok=0
+  fi
+  rm -rf "$tmp"
+  return "$ok"
+}
+
+# BOLT's README ("Step 1: Get Profile", llvm-project bolt/README.md): `perf record -e cycles:u -j any,u`, the branch
+# stacks LBR samples, wherever the CPU has them; without them, "you can use only sample events, such as cycles", which
+# perf2bolt reads with -ba (`profile` below), and "performance gains with BOLT are expected to be lower". Those carry
+# their call graphs here (DWARF's, perf's default size: kiln's release keeps no frame pointers and has .eh_frame), for
+# reading the profile (`perf report`, what calls into the hot code); perf2bolt reads their addresses alone.
 record() {
-  local pid=$1 out=$2 kind=${3:-lbr} secs=${4:-} cmd
+  local pid=$1 out=$2 kind=${3:-auto} secs=${4:-} cmd why=''
+  if [ "$kind" = auto ]; then
+    if lbr_here; then kind=lbr; else kind=samples why=", this machine's perf recording no branch stacks"; fi
+  fi
   cmd=(record -e "${BOLT_EVENT:-cycles:u}")
   case $kind in
-    lbr) cmd+=(-j any,u) ;;
-    samples) ;;
-    *) die "record takes lbr or samples, not $kind" ;;
+    lbr)
+      cmd+=(-j any,u)
+      echo "bolt.sh: recording process $pid with its branch stacks (LBR: -e ${BOLT_EVENT:-cycles:u} -j any,u)" >&2
+      ;;
+    samples)
+      cmd+=(--call-graph dwarf)
+      echo "bolt.sh: recording process $pid's samples with their call graphs$why (-e ${BOLT_EVENT:-cycles:u} --call-graph dwarf): perf2bolt reads their addresses alone (-ba)" >&2
+      ;;
+    *) die "record takes auto, lbr or samples, not $kind" ;;
   esac
   if [ -n "${BOLT_FREQ:-}" ]; then cmd+=(-F "$BOLT_FREQ"); fi
   cmd+=(-p "$pid" -o "$out")
@@ -134,7 +173,7 @@ record() {
 }
 
 profile() {
-  local bin=$1 out=$2 dir perf data i=0 parts=() ba format=()
+  local bin=$1 out=$2 dir perf data i=0 parts=() ba format=() yaml=${BOLT_PROFILE_YAML:-} also=() yparts=()
   shift 2
   [ $# -gt 0 ] || die "profile takes <binary> <out.fdata> <perf.data>..."
   dir=$(tools)
@@ -143,26 +182,47 @@ profile() {
   perf=$(command -v "${PERF:-perf}") || die "no perf (PERF)"
   for data in "$@"; do
     i=$((i + 1))
-    # A recording without branch stacks is perf2bolt's basic aggregation (--ba). (grep reads it all: -q's early exit
-    # would fail the pipe.)
-    ba=()
-    perf_cmd evlist -v -i "$data" 2> /dev/null | grep BRANCH_STACK > /dev/null || ba=(--ba)
+    # A recording without branch stacks is perf2bolt's basic aggregation (--ba; the README's -ba). (grep reads it all:
+    # -q's early exit would fail the pipe.)
+    if perf_cmd evlist -v -i "$data" 2> /dev/null | grep BRANCH_STACK > /dev/null; then
+      ba=()
+      echo "bolt.sh: $data: branch records (LBR)" >&2
+    else
+      ba=(--ba)
+      echo "bolt.sh: $data: samples alone, no branch records: perf2bolt's basic aggregation (--ba)" >&2
+    fi
+    # The same profile as YAML too, from the same pass (BOLT_PROFILE_YAML; OptimizingClang.md's `perf2bolt ... -o
+    # clang-7.fdata -w clang-7.yaml`): perf2bolt is the dear part, the binary's every function read (23 GiB, 50 s a
+    # recording on kiln's release, 2026-11-06).
+    also=()
+    if [ -n "$yaml" ]; then also=(-w "$yaml.$i") yparts+=("$yaml.$i"); fi
     # perf2bolt runs the perf it finds on PATH.
     if ! PATH="$(dirname "$perf"):$PATH" LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} \
-      "$dir/perf2bolt" --perfdata="$data" -o "$out.$i" ${ba[@]+"${ba[@]}"} ${format[@]+"${format[@]}"} "$bin" > "$out.$i.log" 2>&1; then
+      "$dir/perf2bolt" --perfdata="$data" -o "$out.$i" ${also[@]+"${also[@]}"} ${ba[@]+"${ba[@]}"} ${format[@]+"${format[@]}"} "$bin" > "$out.$i.log" 2>&1; then
       tail -n 20 "$out.$i.log" >&2
       die "perf2bolt failed on $data ($out.$i.log)"
     fi
     grep -E 'BOLT-INFO: .*have non-empty execution profile|BOLT-WARNING: BOLT is estimated|PERF2BOLT-(WARNING|ERROR)' "$out.$i.log" >&2 || true
     parts+=("$out.$i")
   done
-  if [ ${#parts[@]} -eq 1 ]; then
-    mv "${parts[0]}" "$out"
-  else
-    "$dir/merge-fdata" "${parts[@]}" > "$out"
-    rm -f "${parts[@]}"
-  fi
+  merged "$dir" "$out" "${parts[@]}"
   echo "$out: $(wc -l < "$out") lines from $# recording(s)"
+  if [ -n "$yaml" ]; then
+    merged "$dir" "$yaml" "${yparts[@]}"
+    echo "$yaml: the same, as YAML"
+  fi
+}
+
+# Profiles $3... merged into $2 by merge-fdata (in $1), which takes YAML's as it takes fdata's; the parts removed.
+merged() {
+  local dir=$1 out=$2
+  shift 2
+  if [ $# -eq 1 ]; then
+    mv "$1" "$out"
+  else
+    "$dir/merge-fdata" "$@" > "$out"
+    rm -f "$@"
+  fi
 }
 
 instrument() {
@@ -193,6 +253,28 @@ window() {
   echo "$3: $(wc -l < "$3") records ran between $1 and $2"
 }
 
+# The layout, every option from BOLT's own documents and none a number of ours:
+# - BOLT's README's "Step 3: Optimize with BOLT" (llvm-project bolt/README.md), its command whole:
+#   -reorder-blocks=ext-tsp     "perform layout optimizing I-cache behavior" (bolt/docs/CommandLineArgumentReference.md)
+#   -reorder-functions=cdsort   "use cache-directed sort": functions that run together laid out together, which
+#                               "works only with relocations" (the reference), hence zig-relocs.sh's --emit-relocs
+#   -split-functions            "split functions into fragments": each function's blocks that ran apart from those that
+#                               didn't (the default -split-strategy, profile2: "a hot and cold fragment using profiling
+#                               information")
+#   -split-all-cold             "outline as many cold basic blocks as possible"
+#   -split-eh                   "split C++ exception handling code": the landing pads, which run only as a contained
+#                               panic unwinds (kiln's panic = "unwind")
+#   -dyno-stats                 "print execution info based on profile": what the profile covered, which the README
+#                               reads ("We recommend the profile to cover 1B instructions as reported by BOLT
+#                               -dyno-stats option") and <binary>.bolt.txt says
+# - -icf=safe, the reference's "Enable safe identical code folding" (OptimizingClang.md folds with -icf=1): only
+#   functions whose address nothing takes, as the binary's C (SQLite, jemalloc, aws-lc, musl) may tell functions apart
+#   by address (KILN_BOLT_ICF=all folds every one, =none none).
+# - Not -use-gnu-stack (OptimizingClang.md's, "workaround for issues with strip/objcopy"): it gives the new segment
+#   PT_GNU_STACK's header, whose size musl takes as its threads' default stack (zig links 16 MiB there); BOLT's own new
+#   program headers strip and run as they are (test_bolt.py).
+# - Lite mode as llvm-bolt decides it ("skip processing of cold functions"): what the profile didn't see stays where
+#   the linker put it, in .bolt.org.text, out of the hot code's pages.
 optimize() {
   local bin=$1 prof=$2 out=$3 dir log stale=() extra=()
   [ -s "$prof" ] || die "$prof: no profile"
@@ -201,23 +283,77 @@ optimize() {
   log=$bin.bolt.log
   case $prof in *.yaml) stale=(-infer-stale-profile) ;; esac
   read -r -a extra <<< "${KILN_BOLT_ARGS:-}"
-  # -icf=safe folds only functions no code or data takes the address of: the binary's C (SQLite, jemalloc, aws-lc,
-  # musl) may tell functions apart by address, which folding them would merge (KILN_BOLT_ICF=all folds every one).
-  # Not -use-gnu-stack: it gives the new segment PT_GNU_STACK's header, whose size musl takes as its threads'
-  # default stack (zig links 16 MiB there); BOLT's own new program headers strip and run as they are.
   if ! "$dir/llvm-bolt" "$bin" -o "$bin.bolt" -data="$prof" \
     -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh \
     -icf="${KILN_BOLT_ICF:-safe}" -dyno-stats ${stale[@]+"${stale[@]}"} ${extra[@]+"${extra[@]}"} > "$log" 2>&1; then
     tail -n 20 "$log" >&2
     die "llvm-bolt failed ($log)"
   fi
-  "${KILN_STRIP:-strip}" --strip-all -o "$out" "$bin.bolt"
-  grep -E 'BOLT-INFO: (.*have non-empty execution profile|splitting separates|basic block reordering modified|ICF folded)' "$log" >&2 || true
-  echo "$out: laid out by $prof ($log); its loaded segments (address, KiB, flags):"
+  # Its .note.bolt_info out too: llvm-bolt's command line, this machine's paths and options in it, never loaded, and
+  # all that tells two layouts of one build and one profile apart (adacachy, 2026-11-06: five layouts, at 4 threads,
+  # all of them and none, on two paths, the same bytes without it). Where it was made is said beside BOLT's log.
+  "${KILN_STRIP:-strip}" --strip-all --remove-section=.note.bolt_info -o "$out" "$bin.bolt"
+  # Beside the log, not the output: dist/ ships every kiln-* file in it (build.sh's SHA256SUMS).
+  covered "$dir" "$prof" "$log" "$out" > "$bin.bolt.txt"
+  cat "$bin.bolt.txt" >&2
+  echo "$out: laid out by $prof ($log, $bin.bolt.txt); its loaded segments (address, KiB, flags):"
   local type off vaddr paddr filesz memsz rest
   readelf -lW "$out" | while read -r type off vaddr paddr filesz memsz rest; do
     if [ "$type" = LOAD ]; then printf '  %s %8d KiB  %s\n' "$vaddr" $((memsz / 1024)) "${rest% *}"; fi
   done
+}
+
+# What a layout's profile covered, from llvm-bolt's log $3 (tools in $1, profile $2, output $4): llvm-bolt's version,
+# the functions with a profile, the instructions the profile ran as -dyno-stats counts them before BOLT changed anything
+# (its first `executed instructions`), against the README's recommendation, the hot and cold bytes split apart, what ICF
+# folded, whether lite mode left the cold functions in place, and what the log warned of.
+covered() {
+  local dir=$1 prof=$2 log=$3 out=$4 ins
+  echo "layout of $out by $prof"
+  echo "llvm-bolt: $("$dir/llvm-bolt" --version 2> /dev/null | awk '/LLVM version/ { print $3; exit }')"
+  ins=$(awk '$2 == ":" && $3 == "executed" && $4 == "instructions" { print $1; exit }' "$log")
+  echo "instructions: ${ins:-unknown} (-dyno-stats; BOLT's README recommends a profile covering 1B)"
+  grep -E 'BOLT-INFO: (.*have non-empty execution profile|enabling lite mode|splitting separates|basic block reordering modified|ICF folded|.*profile.*stale|inferred)' "$log" || true
+  # (awk counts: grep -c exits 1 on none, which would end the script under pipefail.)
+  awk '/BOLT-WARNING/ { n++ } END { print "warnings: " n + 0 }' "$log"
+}
+
+# The address of $1's .text (readelf numbers sections `[ 1]` to `[99]`, so its index is cut off first).
+text_at() {
+  readelf -SW "$1" | sed -n 's/^ *\[ *[0-9]*\] *//p' | awk '$1 == ".text" { print $3; exit }'
+}
+
+# Build id $1 with its last bit flipped: what llvm-bolt makes of its input's ("BOLT-INFO: patched build-id (flipped
+# last bit)"), so a profile of one is never matched to the other.
+flipped() {
+  printf '%s%02x' "${1%??}" $((0x${1: -2} ^ 1))
+}
+
+# Whether $2 is $1 laid out by BOLT: both ELF files of one build (its build id, or that with its last bit flipped, as
+# llvm-bolt patches it), $2's code rewritten (a loaded segment more, or its .text moved: BOLT's new text), and both
+# saying the same `--version`, run here (an x86-64 Linux build runs on the machine that laid it out). What it can't say,
+# that the two behave alike, a round of the lab says (scripts/memory_lab/bolt-lab.sh smoke).
+same() {
+  local a=$1 b=$2 ia ib va vb how
+  [ -f "$a" ] || die "$a: no such file"
+  [ -f "$b" ] || die "$b: no such file"
+  ia=$(readelf -n "$a" 2> /dev/null | awk '$1 == "Build" && $2 == "ID:" { print $3; exit }')
+  ib=$(readelf -n "$b" 2> /dev/null | awk '$1 == "Build" && $2 == "ID:" { print $3; exit }')
+  [ -n "$ia" ] || die "$a has no build id: no telling it's $b's build"
+  if [ "$ib" = "$(flipped "$ia")" ]; then
+    how="build id $ia, its last bit flipped as BOLT patches it"
+  elif [ "$ib" = "$ia" ]; then
+    how="build id $ia"
+  else
+    die "$b (build id ${ib:-none}) isn't a layout of $a (build id $ia)"
+  fi
+  if [ "$(readelf -lW "$a" | grep -c '^ *LOAD')" = "$(readelf -lW "$b" | grep -c '^ *LOAD')" ] && [ "$(text_at "$a")" = "$(text_at "$b")" ]; then
+    die "$b's code lies as $a's does: not laid out"
+  fi
+  va=$("$a" --version 2>&1) || die "$a --version failed: $va"
+  vb=$("$b" --version 2>&1) || die "$b --version failed: $vb"
+  [ "$va" = "$vb" ] || die "$b says '$vb', $a '$va'"
+  echo "$b: $a laid out ($how), both '$va'"
 }
 
 # The functions the profiles saw run in $bin, hottest first, one a line, named as its symbol table names them
@@ -284,11 +420,15 @@ cmd=${1:-}
 case $cmd in
   tools) tools ;;
   check) [ $# -eq 1 ] || die "check takes <binary>"; check "$1" ;;
-  record) [ $# -ge 2 ] || die "record takes <pid> <perf.data> [lbr|samples] [seconds]"; record "$@" ;;
+  lbr)
+    if lbr_here; then echo "branch stacks: yes (perf record -e ${BOLT_EVENT:-cycles:u} -j any,u)"; else echo "branch stacks: no"; exit 1; fi
+    ;;
+  record) [ $# -ge 2 ] || die "record takes <pid> <perf.data> [auto|lbr|samples] [seconds]"; record "$@" ;;
   profile) profile "$@" ;;
   instrument) [ $# -ge 3 ] || die "instrument takes <binary> <out> <dump> [seconds]"; instrument "$@" ;;
   window) [ $# -eq 3 ] || die "window takes <first.fdata> <last.fdata> <out.fdata>"; window "$@" ;;
   optimize) [ $# -eq 3 ] || die "optimize takes <binary> <profile> <out>"; optimize "$@" ;;
   order) [ $# -ge 3 ] || die "order takes <binary> <out.order> <perf.data|.fdata>..."; order "$@" ;;
+  same) [ $# -eq 2 ] || die "same takes <binary> <bolted>"; same "$@" ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

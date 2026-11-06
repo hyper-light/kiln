@@ -57,6 +57,23 @@ pub(crate) fn started(pool: Pool) {
     }
 }
 
+static SPARE: OnceLock<fn() -> bool> = OnceLock::new();
+
+/// Sets, once for the process, a piece of work the compute pool's workers do with spare capacity alone: a worker that finds
+/// no job takes one piece (`then`, on its own thread) before it rests, and looks for jobs again after it, so no job waits
+/// behind more than one piece and none waits for a wake of its (kiln's consts-audit R3: runners' payloads looked at for
+/// fields this build doesn't know, which waited for a thread of their own that slept a tenth of a second at a time).
+/// `then` says whether it found a piece to do: none, and the worker rests. False when it was set already. No lock: a
+/// `OnceLock`, read as each worker finds nothing to do.
+pub fn when_spare(then: fn() -> bool) -> bool {
+    SPARE.set(then).is_ok()
+}
+
+/// A piece of the process's spare work, done on this worker's thread ([`when_spare`]): whether there was one.
+pub(crate) fn spare() -> bool {
+    SPARE.get().is_some_and(|then| then())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -72,11 +72,9 @@ pub(crate) fn proceed_in(here: &ShardContext, cx: &mut Context<'_>) -> Poll<()> 
 }
 
 /// The charge, and whether the leaf goes on: it does within the task's share, at the poll's first charge, and
-/// under a waker other than the polling task's own, which no refusal would make yield. A movable task's own waker
-/// is its own (`crate::movable`, kiln's goal 7): it yields at its share as a pinned task does.
+/// under a waker other than the polling task's own, which no refusal would make yield.
 fn proceeds(here: &ShardContext, cx: &Context<'_>) -> bool {
-    let own = crate::waker::polling_task_in(here, cx.waker()).is_some()
-        || here.movable.polling(cx.waker());
+    let own = crate::waker::polling_task_in(here, cx.waker()).is_some();
     here.charge(own)
 }
 
@@ -141,13 +139,9 @@ impl Class {
 }
 
 /// Sets the class of the task being polled: from its next listing it waits in that class's list, and its polls
-/// count to that class's share; tasks it spawns later take it. A movable task (`crate::movable`) waits in its
-/// class's queue from its next wake. The class it had; `None` off a task.
+/// count to that class's share; tasks it spawns later take it. The class it had; `None` off a task.
 pub fn set_class(class: Class) -> Option<Class> {
     registry::with_current(|here| {
-        if let Some(had) = here.movable.set_current_class(class) {
-            return Some(had);
-        }
         let slot = here.current_slot()?;
         Some(here.local.set_class(slot, class))
     })
@@ -156,22 +150,14 @@ pub fn set_class(class: Class) -> Option<Class> {
 
 /// The class of the task being polled; `None` off a task.
 pub fn class() -> Option<Class> {
-    registry::with_current(|here| {
-        here.movable
-            .current_class()
-            .or_else(|| here.current_slot().map(|slot| here.local.class_of(slot)))
-    })
-    .flatten()
+    registry::with_current(|here| here.current_slot().map(|slot| here.local.class_of(slot))).flatten()
 }
 
 /// Whether a task of a more urgent class than the polling task's waits on its shard, listed or woken itself and
 /// waiting for its release (kiln's goal 6, plan 01a1a59c2abe step 3): what a task that lowered its class gives way
-/// to ([`give_way`]). `false` off a task, and for a movable task, whose class's queue its carrier keeps.
+/// to ([`give_way`]). `false` off a task.
 pub fn outranked() -> bool {
     registry::with_current(|here| {
-        if here.movable.current_class().is_some() {
-            return false;
-        }
         here.current_slot()
             .is_some_and(|slot| here.local.waiting_above(here.local.class_of(slot)))
     })

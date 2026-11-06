@@ -28,43 +28,28 @@
 //! them off only where it starts no runner of its own (`[local_agent] enabled = false`, as the lab's server and a
 //! server whose runners are machines of their own): the server's own runner starts legs and agents (compilers,
 //! language servers, browsers) in this process, and those keep what the machine gives. The server's own helpers
-//! (git, a render) inherit it. `KILN_KEEP_THP=1` keeps them as the machine gives them, for the lab's A/B on one
-//! build. macOS and Windows give no transparent huge pages to turn off.
+//! (git, a render) inherit it. macOS and Windows give no transparent huge pages to turn off.
+//!
+//! The lab's A/B decided it (thp17, fedora 2026-11-06, 8 rounds a side calm and 8 with hogs, production's layout):
+//! off held 3.0 MB (calm) and 3.6 MB (hogs) less anonymous memory, turso's advised arenas, with no number worse
+//! beyond noise, latency included. So the switch that kept them for that A/B (`KILN_KEEP_THP`) went with it.
 
 use std::io;
-
-/// The environment variable that keeps transparent huge pages as the machine gives them (`1`): the A side of the
-/// lab's A/B on one build (`kiln-lab ab --env-a KILN_KEEP_THP=1`).
-pub const KEEP_VAR: &str = "KILN_KEEP_THP";
 
 /// What the server does with transparent huge pages ([`choose`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     /// Off for the process (`PR_SET_THP_DISABLE`).
     Off,
-    /// As the machine gives them: [`KEEP_VAR`] said so.
-    KeptAsAsked,
     /// As the machine gives them: the server's own runner starts legs and agents in this process, which would
     /// inherit the switch.
     KeptForItsRunner,
 }
 
-/// Whether `KILN_KEEP_THP` (its value `keep`) asks to keep transparent huge pages as the machine gives them.
-fn keeps(keep: Option<&str>) -> bool {
-    keep.is_some_and(|v| v.trim() == "1")
-}
-
-/// What a server does with transparent huge pages: off, unless `keep` (the environment's [`KEEP_VAR`]) asks to keep
-/// them or the server has a runner of its own (`own_runner`, `[local_agent] enabled`), whose legs and agents would
-/// inherit the switch.
-pub fn choose(keep: Option<&str>, own_runner: bool) -> Choice {
-    if keeps(keep) {
-        Choice::KeptAsAsked
-    } else if own_runner {
-        Choice::KeptForItsRunner
-    } else {
-        Choice::Off
-    }
+/// What a server does with transparent huge pages: off, unless the server has a runner of its own (`own_runner`,
+/// `[local_agent] enabled`), whose legs and agents would inherit the switch.
+pub fn choose(own_runner: bool) -> Choice {
+    if own_runner { Choice::KeptForItsRunner } else { Choice::Off }
 }
 
 /// What [`for_server`] did, for the server's log.
@@ -88,7 +73,6 @@ impl Done {
             (None, Some(true), Choice::Off) => format!(
                 "transparent huge pages are off for the server's process (PR_SET_THP_DISABLE): turso's arenas and the memory the machine would give them to hold the pages they touch, not 2 MiB around each ({WHY})"
             ),
-            (None, Some(_), Choice::KeptAsAsked) => format!("transparent huge pages stay as the machine gives them ({KEEP_VAR}=1) ({WHY})"),
             (None, Some(_), Choice::KeptForItsRunner) => {
                 format!("transparent huge pages stay as the machine gives them: the server's own runner starts legs and agents here, which would inherit the switch ({WHY})")
             }
@@ -98,12 +82,12 @@ impl Done {
 }
 
 /// Transparent huge pages for the server's process, before its runtime starts its threads: [`choose`]'s choice, made
-/// with the environment's [`KEEP_VAR`] and whether the server has a runner of its own (`own_runner`).
+/// with whether the server has a runner of its own (`own_runner`).
 pub fn for_server(own_runner: bool) -> Done {
-    let choice = choose(std::env::var(KEEP_VAR).ok().as_deref(), own_runner);
+    let choice = choose(own_runner);
     let refused = match choice {
         Choice::Off => turn_off().err(),
-        Choice::KeptAsAsked | Choice::KeptForItsRunner => None,
+        Choice::KeptForItsRunner => None,
     };
     Done { choice, off: are_off(), refused }
 }
@@ -136,18 +120,12 @@ pub fn are_off() -> Option<bool> {
 mod tests {
     use super::*;
 
-    /// Goal 11, plan 01a1a87b2e56 step 5: off, unless `KILN_KEEP_THP=1` keeps them or the server's own runner would
-    /// pass the switch to its legs and agents.
+    /// Goal 11, plan 01a1a87b2e56 step 5: off, unless the server's own runner would pass the switch to its legs and
+    /// agents, whatever the environment says: the lab's A/B decided it (thp17), and its switch went with it.
     #[test]
-    fn g11_s5_thp_is_off_unless_kept_or_the_server_has_its_own_runner() {
-        assert_eq!(choose(None, false), Choice::Off);
-        assert_eq!(choose(Some("0"), false), Choice::Off);
-        assert_eq!(choose(Some(""), false), Choice::Off);
-        assert_eq!(choose(Some("yes"), false), Choice::Off, "only 1 keeps them, as KILN_KEEP_PAGES");
-        assert_eq!(choose(Some("1"), false), Choice::KeptAsAsked);
-        assert_eq!(choose(Some(" 1\n"), true), Choice::KeptAsAsked, "the environment's word first");
-        assert_eq!(choose(None, true), Choice::KeptForItsRunner);
-        assert_eq!(choose(Some("0"), true), Choice::KeptForItsRunner);
+    fn g11_s5_thp_is_off_unless_the_server_has_its_own_runner() {
+        assert_eq!(choose(false), Choice::Off);
+        assert_eq!(choose(true), Choice::KeptForItsRunner);
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: the log says what was done and why, each case in its own words.
@@ -155,8 +133,6 @@ mod tests {
     fn g11_s5_the_log_says_what_was_done_with_thp() {
         let off = Done { choice: Choice::Off, off: Some(true), refused: None }.said();
         assert!(off.contains("are off for the server's process (PR_SET_THP_DISABLE)"), "{off}");
-        let asked = Done { choice: Choice::KeptAsAsked, off: Some(false), refused: None }.said();
-        assert!(asked.contains("KILN_KEEP_THP=1"), "{asked}");
         let runner = Done { choice: Choice::KeptForItsRunner, off: Some(false), refused: None }.said();
         assert!(runner.contains("the server's own runner"), "{runner}");
         let refused = Done { choice: Choice::Off, off: Some(false), refused: Some(io::Error::other("EINVAL")) }.said();
@@ -195,7 +171,6 @@ mod tests {
             let out = std::process::Command::new(std::env::current_exe()?)
                 .args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"])
                 .env(ALONE, "1")
-                .env_remove(KEEP_VAR)
                 .output()?;
             let said = String::from_utf8_lossy(&out.stdout);
             anyhow::ensure!(out.status.success(), "alone ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
