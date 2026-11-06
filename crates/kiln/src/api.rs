@@ -8354,6 +8354,94 @@ mod tests {
         })
     }
 
+    /// `fut`'s output, and the blocking pool's jobs its polls asked for on their own thread (`crate::rt::BLOCKING_ASKED`):
+    /// what a read sent off its shard.
+    async fn blocking_asked_in<F: Future>(fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut asked = 0u64;
+        let out = std::future::poll_fn(|cx| {
+            let before = crate::rt::BLOCKING_ASKED.with(std::cell::Cell::get);
+            let polled = fut.as_mut().poll(cx);
+            asked = asked.wrapping_add(crate::rt::BLOCKING_ASKED.with(std::cell::Cell::get).wrapping_sub(before));
+            polled
+        })
+        .await;
+        (out, asked)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5, as the fixed-rate benchmark found it (`kiln-lab rate`'s `newest`, 2026-11-06): a
+    /// session's newest page as the API gives it unasked for a limit (`EVENTS_PAGE`), read after its copy sat idle well past
+    /// any sweep for idle copies there was, is read on the request's shard as it was before, and says the same. Trains 16 and
+    /// 30 packed an idle copy's newest chunk: the compact chunk the page also spans lost its kept texts, and every read after
+    /// that inflated it on the blocking pool (`newest` at 100/s on the M3 Ultra: p50 0.44 to 5.60 ms, p99 1.11 to 770 ms).
+    /// Do: a session's two sealed chunks kept compact and its open one half way from the page's reach into a compact chunk to
+    /// full, so the page spans the open chunk and one compact chunk; a read, its texts made off the shard and kept; a quiet
+    /// gap and a turn of two events; then nothing for two of the former sweeps' periods and half another
+    /// (`os::alloc::COLD_AFTER`: a copy was packed at the second sweep that found it unchanged), past any learned one too.
+    /// Expect: three reads then, each asking the blocking pool for nothing and inflating nothing on its shard, all the same
+    /// bytes, the copy's page byte for byte, its newest `EVENTS_PAGE` events.
+    #[test]
+    fn g10_s5_an_idle_sessions_newest_page_is_read_on_its_shard() -> anyhow::Result<()> {
+        use crate::harness::copies::{EVENTS_PAGE, PACKED_EVENT_BYTES, PAGE_BYTES, Unread};
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            let opened = Instant::now();
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            // A chunk's events, from the bound of what a copy keeps packed (two chunks' at a packed event's bytes), and the
+            // open chunk's once the turn is in: past the page's reach into a compact chunk, short of sealing it.
+            let chunk = PAGE_BYTES / (2 * PACKED_EVENT_BYTES);
+            let open = (EVENTS_PAGE.saturating_sub(chunk) + chunk) / 2;
+            anyhow::ensure!(open > EVENTS_PAGE.saturating_sub(chunk) && open < chunk, "the page spans one compact chunk: {open} of {chunk}");
+            let n = u64::try_from(2 * chunk + open)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n - 2).map(said).collect() }).await;
+            let busy = opened.elapsed();
+            // Till its chunks are compact, the page is read from the events themselves.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+                anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = || {
+                let api = Arc::clone(&api);
+                async move {
+                    let ((r, inflated), asked) = blocking_asked_in(inflated_in(api.handle(lab_get("/api/harness/sessions/a/events")?))).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, inflated, asked))
+                }
+            };
+            let (status, _, _, _) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK && hub.harness.events_page_kept("a", None, EVENTS_PAGE).is_ok(), "the first read: {status}, its texts kept for the reads after it");
+            // A quiet gap past the fill's own time four times over (a copy idle by its learned gaps took it as one between
+            // turns), then a turn of two events: the open chunk changed after the read, as an agent's next turn changes it.
+            let quiet = busy.saturating_mul(4).saturating_sub(opened.elapsed());
+            crate::rt::sleep(quiet).await;
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: vec![said(n - 1)] }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: vec![said(n)] }).await;
+            // Nothing read or taken in, well past any sweep for idle copies there was.
+            let idle = crate::os::alloc::COLD_AFTER.saturating_mul(2).saturating_add(crate::os::alloc::COLD_AFTER / 2);
+            crate::rt::sleep(idle).await;
+            let mut bodies = Vec::new();
+            for k in 0..3 {
+                let (status, body, inflated, asked) = read().await?;
+                anyhow::ensure!(status == StatusCode::OK && asked == 0 && inflated == 0, "read {k} after {idle:?} idle: {status}, {asked} blocking jobs asked, {inflated} inflated on its shard");
+                bodies.push(body);
+            }
+            let copy = hub.harness.events_json("a", None, EVENTS_PAGE).ok_or_else(|| anyhow::anyhow!("the copy's page"))?;
+            anyhow::ensure!(bodies.iter().all(|b| b == copy.as_ref()), "every read the copy's page, byte for byte");
+            let events: serde_json::Value = serde_json::from_slice(&copy)?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            let page = u64::try_from(EVENTS_PAGE)?;
+            assert_eq!(seqs, (n - page + 1..=n).collect::<Vec<u64>>(), "its newest {page}, oldest first");
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: the conversation store's page of a session's events, now written out on the
     /// blocking pool (`stored_events`), is the bytes the request's shard wrote: each row's body read as JSON, one that
     /// isn't left out, as `srv::json` writes an answer.
