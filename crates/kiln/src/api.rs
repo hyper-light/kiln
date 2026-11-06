@@ -516,7 +516,10 @@ pub(crate) async fn live_read(hub: Arc<Hub>, caller: crate::authz::Caller, path:
     let Ok(req) = http::Request::builder().method(Method::GET).uri(path).body(kiln_http::Incoming::empty()) else {
         return (400, b"not a path".to_vec());
     };
-    let resp = match boxed(|| authorized(hub, caller, req)).await {
+    // Its segments, as the router splits a request's path for `authorized` (goal 10, plan 01a1a87b2dae step 5).
+    let at = req.uri().path().to_owned();
+    let seg = segments(&at);
+    let resp = match boxed(|| authorized(hub, caller, req, seg)).await {
         Ok(r) => r,
         Err(e) => e.into_response(),
     };
