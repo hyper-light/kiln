@@ -6657,7 +6657,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // wait, and a long session's megabytes went out in one poll, holding its shard's other viewers, owners and
     // requests 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
     // Its turn ends once its next frame would pass the shard's quantum, whether or not anything else wants the shard
-    // then (`crate::rt::Turns`, and a yield that always yields): a turn given up only where the shard is wanted
+    // then (`crate::rt::Turns::end`, a yield that always yields): a turn given up only where the shard is wanted
     // (`crate::rt::consume_budget`) goes on past the quantum where it isn't, and the snapshot's longest polls were
     // 2.4 to 3.5 ms on the CPU in rt9's calm rounds (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum).
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
@@ -6680,7 +6680,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
             let mut turns = crate::rt::Turns::new();
             for frame in pieces_of(piece, first, last) {
                 tx.send(frame).await?;
-                turn_after(&mut turns).await;
+                turns.end().await;
             }
             first = false;
             now = following;
@@ -6694,20 +6694,10 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         let n = f.capacity();
         tx.send(ws::text(f)).await?;
         held.written(n);
-        turn_after(&mut turns).await;
+        turns.end().await;
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
-}
-
-/// After a frame of a viewer's snapshot: its turn given up once its next frame, as long as the longest this turn,
-/// would take it past the shard's quantum, the shard given to its other tasks whether or not they want it now, and
-/// a turn begun afresh (goal 10, plan 01a1a87b2dae step 5).
-async fn turn_after(turns: &mut crate::rt::Turns) {
-    if turns.over() {
-        hyper_rt::futures::yield_now().await;
-        *turns = crate::rt::Turns::new();
-    }
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room

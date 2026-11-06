@@ -373,11 +373,12 @@ pub struct Chunk {
     /// packed chunk (`crate::memory::SESSION_ENTRIES`).
     ///
     /// Its cell is made by the first read that keeps them, or the compaction that makes them for a copy being
-    /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap pays every thread's debt slots, a locked compare-and-swap each, whenever
-    /// one of its cells is swapped or let go of, an empty one too (`Debt::pay_all`, no fast path for nothing
-    /// held). Every chunk dropped did that three times (its unpack's swap, its drop's, the cell's own), and
-    /// every event taken in at a copy's newest chunk drops one (the copy of it the view shared): rt7's calm
-    /// profile had it at 0.08% of the process, 0.5% of the shards' time, beside the copy's view's own store.
+    /// read ([`Chunk::warm`]), and a chunk no read paged has none (goal 9, plan 01a1a87b2cec step 5): arc-swap
+    /// pays every thread's debt slots, a locked compare-and-swap each, whenever one of its cells is swapped or
+    /// let go of, an empty one too (`Debt::pay_all`, no fast path for nothing held). Every chunk dropped did
+    /// that three times (its unpack's swap, its drop's, the cell's own), and every event taken in at a copy's
+    /// newest chunk drops one (the copy of it the view shared): rt7's calm profile had it at 0.08% of the
+    /// process, 0.5% of the shards' time, beside the copy's view's own store.
     texts: OnceLock<ArcSwapOption<Bytes>>,
     /// Whether it's its copy's newest compact chunk, whose texts a read keeps: set and unset by its owner
     /// alone, as chunks are compacted ([`Events::compact`]).
