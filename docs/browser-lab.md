@@ -202,13 +202,16 @@ and fetch for kiln today; Server-Sent Events, streaming fetch and fetch for the 
   the control echo is on another private address than the page's origin, which Chromium would
   otherwise hold for a permission; the target's own operations are all same-origin.
 - **Bytes.** The client link's frames both ways (the client's own `eth0`, every header, ACK and
-  retransmission), read every window (1 s) by the driver from its namespace's `/proc/net/dev`. Each
-  window's bytes go to the operations that completed in it; windows with none are left out; the
-  percentiles are across windows, and the mean is all bytes over all operations. The bytes above
-  the transport (what the page was given) are a mean beside it.
+  retransmission), read every 25 ms (`--window-ms`) by the driver from its namespace's
+  `/proc/net/dev`. A reading's bytes since the last reading an operation completed in go to the
+  operations completing in it, shared between them; a reading with none carries its bytes on to
+  the next that has one, so no byte is left out and, with readings finer than the operations' pace,
+  each operation is a sample of its own. The percentiles are across those samples, and the mean is
+  all bytes over all operations. The bytes above the transport (what the page was given) are a mean
+  beside it.
 - **Server CPU.** The server's scope (and, for the reference servers, their origin's scope, counted
-  with it and shown apart) read every window, less the background's rate, over the window's
-  operations (every client's); percentiles across windows, and the mean. The background is the
+  with it and shown apart) read every 25 ms the same way, less the background's rate, over the
+  reading's operations (every client's); percentiles across those samples, and the mean. The background is the
   server with nobody attached: once it is at rest (a server just started is still settling in: two
   5 s windows in a row within a quarter, or 2 ms a second, of each other, 90 s at most), two windows
   before the job, and one after it; its rate is the mean of before and after, and the larger of the
@@ -484,7 +487,17 @@ kiln-lab browser run --kiln path/to/kiln --h2o path/to/h2o --caddy path/to/caddy
   --payloads ~/.cache/kiln-bp/g1/catalogue/payloads --k 8 --rounds 5 --out DIR
 kiln-lab browser report DIR/run.json
 kiln-lab browser compare DIR/run.json kiln-today kiln-today-b
+kiln-lab browser compare A/run.json kiln-today kiln-today --b-run B/run.json   # two runs' cells
+kiln-lab browser merge --out ALL.json [--drop CASE,BROWSER,CONDITION,K] [--slim] PART/run.json...
 ```
+
+A pass in parts (`crates/kiln-lab/web/servers`): `run-pass.sh PARTS WORKERS` runs a list of parts
+(a name and the run's arguments a line, `after=` and `$H3` as the list's head says), each part a
+lab of its own writing `<out>/<part>/run.json` and `done`; `run-pass-tail.sh` adds workers from the
+list's end beside it; on a machine others share, `run-pass-mem.sh` starts a part only with
+`KILN_LAB_MIN_AVAIL_GB` (10) available, each in a unit of its own, and `guard-mem.sh` freezes the
+newest part's unit under 3 GB available and thaws it over 6, logging both. `pass1/step7.sh` is the
+pilot's checks.
 
 Adding a target (goals 3, 5, 6): a record in `targets()`, its server's start in `servers.rs`, and,
 if its carrier is new, the probe page's reading of it in `probe.js`.

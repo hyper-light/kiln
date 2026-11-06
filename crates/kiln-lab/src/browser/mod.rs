@@ -132,6 +132,10 @@ pub enum Cmd {
         /// (`stream,webkit,50k/1,8`), as often as needed (step 7's K check lowers K by cell).
         #[arg(long)]
         drop: Vec<String>,
+        /// For the repository (docs/browser-lab/<date>/): each job's per-operation counts (`op/...`)
+        /// left out (the raw run files under ~/.cache keep them), written without indentation.
+        #[arg(long)]
+        slim: bool,
         runs: Vec<PathBuf>,
     },
     /// Target `a` against target `b`, cell by cell, in one run (an A/A) or, with `--b-run`, in two.
@@ -265,7 +269,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             print!("{}", report::tables(&r));
             Ok(())
         }
-        Cmd::Merge { out, drop, runs } => {
+        Cmd::Merge { out, drop, slim, runs } => {
             let drops = drop.iter().map(|d| parse_drop(d)).collect::<anyhow::Result<Vec<_>>>()?;
             let mut merged: Option<report_run::BrowserRun> = None;
             let mut dropped = 0;
@@ -294,7 +298,13 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
                 runs.len(),
                 runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" ")
             );
-            std::fs::write(&out, serde_json::to_vec_pretty(&m)?)?;
+            if slim {
+                for j in &mut m.jobs {
+                    j.numbers.retain(|k, _| !k.starts_with("op/"));
+                }
+                m.command.push_str(" (slim)");
+            }
+            std::fs::write(&out, if slim { serde_json::to_vec(&m)? } else { serde_json::to_vec_pretty(&m)? })?;
             println!("{}: {} jobs from {} runs, {} failures, {dropped} jobs left out by --drop", out.display(), m.jobs.len(), runs.len(), m.failures.len());
             Ok(())
         }

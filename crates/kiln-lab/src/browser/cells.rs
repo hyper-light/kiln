@@ -3,13 +3,13 @@
 //!
 //! - **Time**: each operation's, from its server stamp (streams, bursts) or its scheduled time
 //!   (requests) to the page having it parsed.
-//! - **Bytes**: the client link's frames both ways over fixed windows, each window's bytes over the
-//!   operations that completed in it (windows with none are left out), percentiles across windows;
-//!   and the mean, all bytes over all operations. Also the bytes above the transport (what the page
-//!   was given), as a mean.
-//! - **Server CPU**: the server's scope (with its origin's, for the reference servers) over fixed
-//!   windows, less the background's rate measured just before with nobody attached, over the
-//!   window's operations (every client's), percentiles across windows; and the mean.
+//! - **Bytes**: the client link's frames both ways, read every tick; each tick's bytes since the last
+//!   tick an operation completed in, over the operations completing in it (a tick with none carries
+//!   its bytes on: `per_window`), percentiles across those; and the mean, all bytes over all
+//!   operations. Also the bytes above the transport (what the page was given), as a mean.
+//! - **Server CPU**: the server's scope (with its origin's, for the reference servers) read the same
+//!   way, less the background's rate measured just before with nobody attached, over the tick's
+//!   operations (every client's), percentiles across those; and the mean.
 
 use std::collections::BTreeMap;
 
