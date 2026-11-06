@@ -6668,6 +6668,12 @@ async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::R
     Ok((packing, piece?))
 }
 
+/// `held` let go of on the blocking pool, not on the shard that awaits this: what's left of a snapshot may be the last
+/// to hold what its copy has since let go of, as [`next_piece`] says (goal 9, plan 01a1a87b2cec step 3).
+async fn let_go<T: Send + 'static>(held: T) {
+    let _ = crate::rt::blocking(move || drop(held)).await;
+}
+
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
@@ -6687,7 +6693,16 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // then (`crate::rt::Turns::end`, a yield that always yields): a turn given up only where the shard is wanted
     // (`crate::rt::consume_budget`) goes on past the quantum where it isn't, and the snapshot's longest polls were
     // 2.4 to 3.5 ms on the CPU in rt9's calm rounds (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum).
-    let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
+    // Its weight is reckoned on the blocking pool too, where its pieces are made: a whole snapshot's adds up every
+    // chunk's events' lengths, a meta each (20,000 for the two longest sessions of kiln-lab's realistic profile, among
+    // the eight at work that its viewers open three times in four), read on the viewer's shard in the snapshot's first
+    // poll (step 3: `viewer snapshot` polls of 0.65 to 2.4 ms on the CPU in every round of g9p16's with hogs, train 16).
+    let (snapshot, weight) = crate::rt::blocking(move || {
+        let weight = snapshot.weight(packed);
+        (snapshot, weight)
+    })
+    .await?;
+    let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
     if packed {
         // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
         // it's held (so its last frame is known final), then written; what's in flight is those two, not the
@@ -6706,7 +6721,12 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
             // A turn from here: the piece came in a poll of its own, made on the blocking pool.
             let mut turns = crate::rt::Turns::new();
             for frame in pieces_of(piece, first, last) {
-                tx.send(frame).await?;
+                if let Err(e) = tx.send(frame).await {
+                    // Its viewer gone before its last piece: what's left of it let go of on the blocking pool, as one
+                    // all out is (`next_piece`), not on the viewer's shard (goal 9, plan 01a1a87b2cec step 3).
+                    let_go(packing).await;
+                    return Err(e.into());
+                }
                 turns.end().await;
             }
             first = false;
@@ -6813,6 +6833,21 @@ enum Live {
     Quiet,
 }
 
+/// `fut`'s output, and whether it was waited for (a poll of it was pending, so its task gave its shard up before it
+/// came): what follows it then begins a turn of its own on the shard (`crate::rt::Turns`; goal 9, plan 01a1a87b2cec
+/// step 3).
+async fn waited<F: Future>(fut: F) -> (F::Output, bool) {
+    let mut fut = std::pin::pin!(fut);
+    let mut pending = false;
+    let out = std::future::poll_fn(|cx| {
+        let polled = fut.as_mut().poll(cx);
+        pending |= polled.is_pending();
+        polled
+    })
+    .await;
+    (out, pending)
+}
+
 /// What a batch of a session's feed came to for its viewer ([`write_live_batch`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Fed {
@@ -6832,8 +6867,10 @@ enum Fed {
 /// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
 /// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
 /// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
-/// written (goal 1, plan 01a1a59c2a68 step 2).
-async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant) -> Result<Fed, S::Error>
+/// written (goal 1, plan 01a1a59c2a68 step 2). Written in its viewer's turn on its shard, `turns`, which the batches
+/// before it in the same poll took of (goal 9, plan 01a1a87b2cec step 3).
+#[allow(clippy::too_many_arguments)]
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
@@ -6843,7 +6880,6 @@ where
     // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
     // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
     // viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds).
-    let mut turns = crate::rt::Turns::new();
     for m in messages {
         let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
             tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
@@ -6883,7 +6919,7 @@ where
         if turns.over() {
             tx.flush().await?;
             hyper_rt::futures::yield_now().await;
-            turns = crate::rt::Turns::new();
+            *turns = crate::rt::Turns::new();
         }
     }
     if fed > 0 || came_to == Fed::Closed {
@@ -6941,6 +6977,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
         crate::rt::labeled(&VIEWER_SNAPSHOT, send_snapshot(&mut tx, att.snapshot, takes.packed)).await?;
     }
+    // Its snapshot's poll ends with its last frame, and what was published meanwhile goes in polls of its own (goal 9,
+    // plan 01a1a87b2cec step 3): read at once, those frames went on in the poll the snapshot's last turn took, a turn of
+    // their own after it.
+    hyper_rt::futures::yield_now().await;
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
     let topic = att.topic;
@@ -6960,10 +7000,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let mut audit: Option<crate::memory::queue::Sender<String>> = None;
     // Its last catch-up: when it ended, and how long it took to make and send.
     let mut caught_up: Option<(Instant, Duration)> = None;
+    // Its turn on its shard (goal 9, plan 01a1a87b2cec step 3): the batches of its feed read at once one after another
+    // (a viewer behind its feed) are written in one turn, its poll ending once the next frame would pass the shard's
+    // quantum (`write_live_batch`, `crate::rt::Turns::end`). Each batch began a turn of its own and gave its shard up
+    // only where something else wanted it (`crate::rt::consume_budget`), so a poll of several went on past the quantum.
+    // A batch the loop waited for begins a turn afresh: the wait gave its shard to its other work.
+    let mut turns = crate::rt::Turns::new();
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
-            async move {
+            waited(async move {
                 match from {
                     Some(from) => {
                         let wait = bus.wait(topic, from).fuse();
@@ -6982,7 +7028,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         Live::Feedless
                     }
                 }
-            }
+            })
         };
         // Set when what the feed holds for this viewer isn't what it should take next.
         let mut start_over = false;
@@ -6992,21 +7038,24 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     tx.send(ws::text(frame)).await?;
                 }
             }
-            w = live.fuse() => match w {
+            (w, fresh) = live.fuse() => match w {
                 Live::Ready => match crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await {
                     Ok(batch) => {
+                        if fresh {
+                            turns = crate::rt::Turns::new();
+                        }
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at)).await? {
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at, &mut turns)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
                         }
                         at = Some(next);
-                        // A viewer behind its feed reads batch after batch, each ready at once: past its
-                        // share of its shard, the shard's other tasks go between (as a snapshot's pieces do).
-                        crate::rt::consume_budget().await;
+                        // A viewer behind its feed reads batch after batch, each ready at once: its turn ends once its
+                        // next would pass the quantum, whether or not anything else wants the shard then.
+                        turns.end().await;
                     }
                     Err(Refusal::Behind { .. }) => {
                         crate::metrics::bus().lag_notices.inc();
@@ -7123,6 +7172,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             at = from;
             refusals = now;
             have = have.max(rev);
+            // As after an attach's snapshot: what was published meanwhile in polls of their own, a turn afresh.
+            hyper_rt::futures::yield_now().await;
+            turns = crate::rt::Turns::new();
         }
     }
 }
@@ -7307,6 +7359,8 @@ mod tests {
     struct Written {
         sent: Vec<ws::Message>,
         flushes: usize,
+        /// How many had been sent at each flush.
+        flushed_at: Vec<usize>,
         slow: bool,
     }
 
@@ -7325,7 +7379,9 @@ mod tests {
             Ok(())
         }
         fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
-            self.get_mut().flushes += 1;
+            let this = self.get_mut();
+            this.flushes += 1;
+            this.flushed_at.push(this.sent.len());
             std::task::Poll::Ready(Ok(()))
         }
         fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
@@ -8515,7 +8571,7 @@ mod tests {
             // The viewer's catch-up held revision 1: that frame isn't sent again.
             let mut have = 1;
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
             anyhow::ensure!(have == FRAMES, "the viewer has the newest sent: {have}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
@@ -8529,7 +8585,7 @@ mod tests {
             // A batch the session's last frame ends: one write, and the viewer ends with it.
             let closed = crate::harness::registry::Frame::of(SessionDown::from(SessionFrame::Closed));
             let last = vec![fed_frame(9, r#"{"t":"events","rev":9}"#, 9), kiln_seams::bus::Message { offset: 10, key: None, payload: crate::harness::live::encode(&closed), at_ms: 0 }];
-            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Closed, "{came_to:?}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
@@ -8551,11 +8607,55 @@ mod tests {
             let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
             let (mut tx, mut have) = (Written { slow: true, ..Written::default() }, 0);
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
             let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
             anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
             anyhow::ensure!(tx.flushes == texts.len() + 1, "{} flushes: one as each of {} turns ended, and the batch's", tx.flushes, texts.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a batch read at once after another goes on in the turn its viewer's poll
+    /// began, not one of its own: a turn already past its quantum ends after the batch's first frame (a flush, and its
+    /// poll's end), the rest fed in the next turn. Each batch began its turn afresh, so a poll of several batches went
+    /// on past the quantum.
+    #[test]
+    fn g9_s3_a_batch_goes_on_in_its_viewers_turn() -> anyhow::Result<()> {
+        /// Shape: the live frames of the batch: more than one, so the turn's end after the first is seen.
+        const FRAMES: u64 = 3;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
+            let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
+            // The batches before it in this poll took its whole quantum.
+            let mut turns = crate::rt::Turns::new();
+            std::thread::sleep(Duration::from_nanos(quantum));
+            let (mut tx, mut have) = (Written::default(), 0);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now(), &mut turns).await?;
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
+            anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
+            // A turn after it may end too on a busy host (a debug build's frame is slow): the first flush is the spent turn's.
+            anyhow::ensure!(tx.flushed_at.first() == Some(&1) && tx.flushed_at.last() == Some(&texts.len()), "flushed with {:?} sent: the spent turn's after the first frame, the batch's after its last", tx.flushed_at);
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: [`waited`] says whether what it awaited made its task wait (a poll of it was
+    /// pending), so a viewer's batch that came after a wait begins a turn of its own, and one ready at once goes on in
+    /// its poll's.
+    #[test]
+    fn g9_s3_waited_says_whether_its_task_waited() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (out, pending) = waited(async { 7 }).await;
+            anyhow::ensure!(out == 7 && !pending, "ready at once: {out}, waited {pending}");
+            let (out, pending) = waited(async {
+                hyper_rt::futures::yield_now().await;
+                8
+            })
+            .await;
+            anyhow::ensure!(out == 8 && pending, "after a yield: {out}, waited {pending}");
             Ok(())
         })
     }
