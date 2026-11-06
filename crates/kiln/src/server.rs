@@ -58,9 +58,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
     // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
     // 01a1a59c2a68 step 1).
-    if let Some(period) = crate::shard_health::period_from_env() {
-        crate::shard_health::start(period);
-    }
+    crate::shard_health::start(crate::shard_health::PERIOD);
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);

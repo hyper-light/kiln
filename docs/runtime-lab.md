@@ -14,7 +14,7 @@ benchmarking under realistic usage decide). Goal 1 of the API runtime program bu
 A probe pinned to each of hyper-rt's shards (`crate::rt::spawn_on`) sleeps a period on the shard (a quiet
 sleep from goal 9 step 5 on: below) and notes, as it runs, how late ready work ran: work that was ready on
 that shard waited that long. Node measures its loop the same way (`monitorEventLoopDelay`, sampling every 10 ms by default:
-research f8). The period (`shard_health::PERIOD`, 17.07 ms; `KILN_SHARD_PROBE_MS`, `0`: no probes) is the longest
+research f8). The period (`shard_health::PERIOD`, 17.07 ms) is the longest
 that still sees what the probe must (goal 9, plan 01a1a87b2cec step 5): hyper-rt's watchdog's limit, a step's
 worth of polls each a quantum (64 × 266.7 µs), so a probe is due inside every hold the watchdog reports; and within
 the lab's tail, ten probes or more past a round's p99.9 of the shards' delay (60 s × 4 shards at up to 24 ms). 10 ms

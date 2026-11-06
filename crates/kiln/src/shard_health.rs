@@ -64,9 +64,9 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::Histogram;
 
-/// How often each probe runs, unless `KILN_SHARD_PROBE_MS` says (`0`: no probes): the longest period that still sees
-/// what the probe must (goal 9, plan 01a1a87b2cec step 5: each wake a park and a turn of the shard's loop, CPU in its
-/// busy share; 10 ms, Node's default sampling and goal 1's first pick, was about 0.001 of each shard's). Its sleep is a
+/// How often each probe runs: the longest period that still sees what the probe must (goal 9, plan 01a1a87b2cec
+/// step 5: each wake a park and a turn of the shard's loop, CPU in its busy share; 10 ms, Node's default sampling and
+/// goal 1's first pick, was about 0.001 of each shard's). The server's are always on, at this period. Its sleep is a
 /// quiet one, so a shard woken by work within a period isn't woken for it, and one parked a period with no wake at all
 /// is ([`wake_every`]):
 /// - **Every hold hyper-rt's watchdog reports** ([`watchdog_limit`], `hyper_rt::watch`): it reports a poll held past
@@ -639,15 +639,6 @@ pub fn snapshots() -> Vec<Snapshot> {
 /// Every shard's figures, in the runtime's order (empty before [`start`]).
 pub fn shards() -> &'static [Shard] {
     SHARDS.get().map_or(&[], |s| &s[..])
-}
-
-/// The probes' period from `KILN_SHARD_PROBE_MS` (`0`: none), else [`PERIOD`].
-pub fn period_from_env() -> Option<Duration> {
-    match std::env::var("KILN_SHARD_PROBE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(PERIOD),
-    }
 }
 
 /// Starts a probe on every shard, waking every `period`: once a process; later calls do nothing.

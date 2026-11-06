@@ -7442,14 +7442,10 @@ async fn readyz(hub: &Hub) -> Response {
 ///   a period more for a wake, `crate::shard_health::Snapshot::held`);
 /// - `period_s`: the probes' period.
 ///
-/// Open, as `/healthz` is; 503 where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't
-/// been yet.
+/// Open, as `/healthz` is; 503 where the shards haven't been probed yet.
 fn shard_delay() -> Response {
-    let Some(period) = crate::shard_health::period_from_env() else {
-        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
-    };
     let shards = crate::shard_health::snapshots();
-    match delay_answer(&shards, period) {
+    match delay_answer(&shards, crate::shard_health::PERIOD) {
         Some(v) => srv::json(StatusCode::OK, &v),
         None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
     }
