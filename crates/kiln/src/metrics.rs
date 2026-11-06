@@ -798,21 +798,25 @@ impl NetMetrics {
 pub struct WireMetrics {
     pub refused: CounterVec,
     /// Fields this build doesn't know in payloads it read, taken (`crate::wire::payload`), by
-    /// `wire`: one for each such field of each message.
+    /// `wire`: one for each such field of each payload looked at, at most one of a kind (a message's
+    /// variant) every 100 ms and every one of a kind that comes less often.
     pub ignored: CounterVec,
+    /// The payloads looked at for such fields, by `wire` ([`WireMetrics::ignored`]'s): with it, a rate.
+    pub checked: CounterVec,
 }
 
 pub fn wire() -> &'static WireMetrics {
     static M: OnceLock<WireMetrics> = OnceLock::new();
     M.get_or_init(|| {
-        let (refused, ignored) = (CounterVec::new(&["wire", "code"]), CounterVec::new(&["wire"]));
+        let (refused, ignored, checked) = (CounterVec::new(&["wire", "code"]), CounterVec::new(&["wire"]), CounterVec::new(&["wire"]));
         for w in crate::wire::WIRES {
             for c in crate::wire::unread::Code::ALL {
                 refused.add(&[w.name(), c.name()], 0);
             }
             ignored.add(&[w.name()], 0);
+            checked.add(&[w.name()], 0);
         }
-        WireMetrics { refused, ignored }
+        WireMetrics { refused, ignored, checked }
     })
 }
 
@@ -824,9 +828,14 @@ fn render_wire(o: &mut String) {
     wire().refused.render(o, "kiln_wire_refused_total");
     let _ = writeln!(
         o,
-        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each message.\n# TYPE kiln_wire_ignored_fields_total counter"
+        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each payload looked at (at most one of a kind every 100 ms, every message of a kind that comes less often; kiln_wire_checked_payloads_total counts them).\n# TYPE kiln_wire_ignored_fields_total counter"
     );
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_checked_payloads_total Payloads kiln looked at for fields it didn't know, by wire: at most one of a kind (a message's variant) every 100 ms, every message of a kind that comes less often.\n# TYPE kiln_wire_checked_payloads_total counter"
+    );
+    wire().checked.render(o, "kiln_wire_checked_payloads_total");
 }
 
 /// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan

@@ -14,10 +14,12 @@
 //!
 //! A field a known payload has that this build doesn't know is taken, as docs/wire.md says (JSON,
 //! so either side can add fields): counted in `kiln_wire_ignored_fields_total{wire}`, one for each
-//! such field of each message, and logged once an hour for each wire and field. It's never refused
-//! or audited. serde can't say which fields it ignored inside an internally tagged enum (it reads
-//! one whole first), and most of these payloads are one, so they're found by writing the value
-//! read back and seeing what of what came it lacks.
+//! such field of each payload looked at, and logged once an hour for each wire and field. It's never
+//! refused or audited. At most one payload of a kind (a wire and a message's variant) is looked at
+//! every [`CHECK_EVERY`] (100 ms), and every one of a kind that comes less often ([`looks_at`]); those
+//! looked at are counted in `kiln_wire_checked_payloads_total{wire}`. serde can't say which fields it
+//! ignored inside an internally tagged enum (it reads one whole first), and most of these payloads are
+//! one, so they're found by writing the value read back and seeing what of what came it lacks.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -115,21 +117,25 @@ fn message_of(json: &str) -> Option<String> {
 
 /// `json`, what a message of variant `of` carries on `wire`, read as a `T`: `unknown` for a tag
 /// this build doesn't know, `malformed` for the rest it can't read. The fields of it `T` doesn't
-/// have are taken, counted and said in the log ([`Ignored`]).
+/// have are taken, counted and said in the log ([`Ignored`]), of a payload looked at ([`looks_at`]).
 ///
 /// On a shard it's read straight into its type, with no JSON tree between, and its unknown fields are
 /// looked for off the shard, by [`checker`]'s thread (goal 9, plan 01a1a87b2cec step 5: looking read each
 /// runner message's JSON into a tree, the type out of that, and the type back into another tree to
-/// compare, on the hub's shard). What can't be read straight is read the way it always was, so it's
-/// refused, and said why, as before.
+/// compare, on the hub's shard). Off one, one looked at is read through a tree, its unknown fields found
+/// as it's read, and the rest straight. What can't be read straight is read the way it always was, so
+/// it's refused, and said why, as before.
 pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
-    if crate::rt::on_shard()
+    let look = looks_at(wire, of);
+    if (!look || crate::rt::on_shard())
         && let Ok(read) = serde_json::from_str::<T>(json)
     {
-        check_later(wire, of, json, unknown_in::<T>);
+        if look {
+            check_later(wire, of, json, unknown_in::<T>);
+        }
         return Ok(read);
     }
-    read_by_tree(wire, of, json)
+    read_by_tree(wire, of, json, look)
 }
 
 /// [`payload`] of JSON the reader holds and has no more use for: on a shard, read straight into its type, then handed
@@ -137,18 +143,21 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
 /// 01a1a87b2cec step 5: each runner payload's text was copied whole on the hub's loop for its check). The same value,
 /// and the same refusal of what can't be read.
 pub fn payload_owned<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: String) -> Result<T, Box<Unreadable>> {
-    if crate::rt::on_shard()
+    let look = looks_at(wire, of);
+    if (!look || crate::rt::on_shard())
         && let Ok(read) = serde_json::from_str::<T>(&json)
     {
-        check_owned(wire, of, json, unknown_in::<T>);
+        if look {
+            check_owned(wire, of, json, unknown_in::<T>);
+        }
         return Ok(read);
     }
-    read_by_tree(wire, of, &json)
+    read_by_tree(wire, of, &json, look)
 }
 
-/// [`payload`]'s read off a shard, and of what couldn't be read straight on one: through a JSON tree, so what can't be
-/// read is refused saying why, and what of it the type doesn't keep is found as it's read.
-fn read_by_tree<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
+/// [`payload`]'s read off a shard of one looked at, and of what couldn't be read straight: through a JSON tree, so what can't
+/// be read is refused saying why, and what of it the type doesn't keep is found as it's read, where it's looked at (`look`).
+fn read_by_tree<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str, look: bool) -> Result<T, Box<Unreadable>> {
     let came: Value = serde_json::from_str(json).map_err(|e| {
         Box::new(Unreadable {
             of,
@@ -160,10 +169,78 @@ fn read_by_tree<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, j
         })
     })?;
     let read = T::deserialize(&came).map_err(|e| refused(of, &e))?;
-    if let Ok(kept) = serde_json::to_value(&read) {
-        say_unknown(wire, of, &unknown_fields(&came, &kept));
+    if look && let Ok(kept) = serde_json::to_value(&read) {
+        found(wire, of, &unknown_fields(&came, &kept));
     }
     Ok(read)
+}
+
+/// A payload of variant `of` on `wire` looked at, `fields` what it carried that this build doesn't know: counted as looked at
+/// (`kiln_wire_checked_payloads_total`), and its fields counted and said ([`say_unknown`]).
+fn found(wire: Wire, of: &'static str, fields: &[String]) {
+    crate::metrics::wire().checked.add(&[wire.name()], 1);
+    say_unknown(wire, of, fields);
+}
+
+/// The most kinds of payload [`looks_at`] keeps apart, each a wire and a message's variant: the variants of [`AgentMsg`] and
+/// [`ServerMsg`] fit [`KINDS`] each, and every other wire carries a few kinds, so twice their room keeps it under half full,
+/// where a linear probe finds a kind it holds in 1.5 looks on average (Knuth, TAOCP vol. 3, 6.4: (1 + 1/(1 - a)) / 2 at a
+/// load a of 1/2). A kind past them is looked at every time, as every payload was.
+const KINDS_LOOKED: usize = 4 * KINDS;
+
+/// A kind's place in [`LOOKED`]: its key (a hash of its wire and variant, never 0; 0: free) and when one of it was last
+/// looked at (nanoseconds since [`looked_base`], plus one; 0: never).
+struct Looked {
+    kind: std::sync::atomic::AtomicU64,
+    at: std::sync::atomic::AtomicU64,
+}
+
+/// When each kind of payload was last looked at ([`looks_at`]), claimed a kind a place as it first comes, with no lock.
+static LOOKED: [Looked; KINDS_LOOKED] = [const { Looked { kind: std::sync::atomic::AtomicU64::new(0), at: std::sync::atomic::AtomicU64::new(0) } }; KINDS_LOOKED];
+
+/// What [`LOOKED`]'s times count from.
+fn looked_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// A kind's key in [`LOOKED`]: FNV-1a's 64 bits of its wire's name and its variant, apart, never 0.
+fn kind_key(wire: Wire, of: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in wire.name().bytes().chain(std::iter::once(0)).chain(of.bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h.max(1)
+}
+
+/// Whether a payload of variant `of` on `wire` is looked at for fields this build doesn't know: at most one of a kind every
+/// [`CHECK_EVERY`], and every one of a kind that comes less often (goal 9, plan 01a1a87b2cec step 5: every payload was,
+/// each handed to [`checker`]'s thread from the shard that read it, 0.14% of the lab's samples on the shards, and read into
+/// trees twice more there, 2.9%, a quarter of the shards' own). A field a kind's every message carries is still in one
+/// looked at within [`CHECK_EVERY`] of its first; one only some carry, in time. Taken with a compare-and-swap, so of
+/// payloads of a kind at once only one is looked at.
+fn looks_at(wire: Wire, of: &str) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = kind_key(wire, of);
+    let start = usize::try_from(key % KINDS_LOOKED as u64).unwrap_or(0);
+    // Its place read first, and claimed only where free: a compare-and-swap that finds its kind there takes the line as a
+    // write would, from every shard that reads the kind.
+    let Some(place) = (0..KINDS_LOOKED).filter_map(|i| LOOKED.get((start + i) % KINDS_LOOKED)).find(|p| match p.kind.load(Relaxed) {
+        0 => match p.kind.compare_exchange(0, key, Relaxed, Relaxed) {
+            Ok(_) => true,
+            Err(held) => held == key,
+        },
+        held => held == key,
+    }) else {
+        return true;
+    };
+    let now = u64::try_from(looked_base().elapsed().as_nanos()).unwrap_or(u64::MAX).saturating_add(1);
+    let last = place.at.load(Relaxed);
+    let every = u64::try_from(CHECK_EVERY.as_nanos()).unwrap_or(u64::MAX);
+    if last != 0 && now.saturating_sub(last) < every {
+        return false;
+    }
+    place.at.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
 }
 
 /// Counts `fields`, what a message of variant `of` on `wire` carried that this build doesn't know, and
@@ -214,7 +291,7 @@ static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// it; where there's no such thread, they're looked for here, as before.
 fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>) {
     if checker().is_none() {
-        say_unknown(wire, of, &find(json));
+        found(wire, of, &find(json));
         return;
     }
     check_owned(wire, of, json.to_owned(), find);
@@ -223,7 +300,7 @@ fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<S
 /// [`check_later`] of a payload the reader has no more use for: handed on as it is.
 fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec<String>) {
     let Some(tx) = checker() else {
-        say_unknown(wire, of, &find(&json));
+        found(wire, of, &find(&json));
         return;
     };
     match tx.try_send(Check { wire, of, json, find }) {
@@ -235,7 +312,7 @@ fn check_owned(wire: Wire, of: &'static str, json: String, find: fn(&str) -> Vec
             }
         }
         // Its thread is gone: looked for here.
-        Err(async_channel::TrySendError::Closed(c)) => say_unknown(c.wire, c.of, &(c.find)(&c.json)),
+        Err(async_channel::TrySendError::Closed(c)) => found(c.wire, c.of, &(c.find)(&c.json)),
     }
 }
 
@@ -258,7 +335,7 @@ fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
         let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
             loop {
                 match rx.try_recv() {
-                    Ok(c) => say_unknown(c.wire, c.of, &(c.find)(&c.json)),
+                    Ok(c) => found(c.wire, c.of, &(c.find)(&c.json)),
                     Err(async_channel::TryRecvError::Empty) => std::thread::sleep(CHECK_EVERY),
                     Err(async_channel::TryRecvError::Closed) => break,
                 }
@@ -1400,6 +1477,11 @@ mod tests {
         crate::rt::block_on(async move {
             let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
             anyhow::ensure!(on == off, "on a shard {on:?}, off one {off:?}");
+            // At most one payload of a kind is looked at every CHECK_EVERY ([`looks_at`]): the one with `new`, read again on a
+            // shard once one has passed, is.
+            crate::rt::sleep(CHECK_EVERY).await;
+            let newer = CASES.last().copied().unwrap_or_default();
+            anyhow::ensure!(payload::<Two>(wire, "Two", newer).is_ok(), "{newer} wasn't read");
             // `new` came with something in it (`empty` didn't): counted once its thread has looked.
             let deadline = Instant::now() + Duration::from_secs(30);
             while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
@@ -1496,6 +1578,11 @@ mod tests {
         crate::rt::block_on(async move {
             let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload_owned::<Two>(wire, "Two", (*j).to_owned())).collect();
             anyhow::ensure!(on == lent, "on a shard {on:?}, off one {lent:?}");
+            // At most one payload of a kind is looked at every CHECK_EVERY ([`looks_at`]): the one with `handed`, handed over
+            // again on a shard once one has passed, is.
+            crate::rt::sleep(CHECK_EVERY).await;
+            let newer = CASES.last().copied().unwrap_or_default();
+            anyhow::ensure!(payload_owned::<Two>(wire, "Two", newer.to_owned()).is_ok(), "{newer} wasn't read");
             // `handed` came with something in it (`empty` didn't): counted once its thread has looked.
             let deadline = Instant::now() + Duration::from_secs(30);
             while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
@@ -1536,6 +1623,73 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         anyhow::ensure!(tx.takers_listed() == 0, "the checker's thread waits on its queue");
+        Ok(())
+    }
+
+    /// A payload type with one field, for the looks' tests.
+    #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+    struct OneField {
+        a: u32,
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: at most one payload of a kind is looked at every [`CHECK_EVERY`] ([`looks_at`]), and
+    /// a field every message of the kind carries is in one looked at within [`CHECK_EVERY`] of its first. Do: payloads of
+    /// one kind about a millisecond apart, off a shard (looked at where they're read), for three CHECK_EVERYs, none with the
+    /// field; then each with it, until it's counted. Expect: one looked at a CHECK_EVERY at the most, and at least one; the
+    /// field counted within a CHECK_EVERY of the first that carried it, and one send's gap (the test's own thread's turns).
+    #[test]
+    fn g9_s5_a_field_every_message_of_a_kind_carries_is_looked_at_within_one_check_every() -> anyhow::Result<()> {
+        // A wire no other test reads JSON on, so its counts are this test's alone.
+        let wire = Wire::BpDown;
+        let checked = || crate::metrics::wire().checked.get(&[wire.name()]);
+        let ignored = || crate::metrics::wire().ignored.get(&[wire.name()]);
+        let (began, looked_before) = (Instant::now(), checked());
+        let mut sent = 0u64;
+        while began.elapsed() < 3 * CHECK_EVERY {
+            payload::<OneField>(wire, "One", &format!(r#"{{"a":{sent}}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (took, looked) = (began.elapsed(), checked().saturating_sub(looked_before));
+        let most = u64::try_from(took.as_nanos() / CHECK_EVERY.as_nanos()).unwrap_or(u64::MAX).saturating_add(1);
+        anyhow::ensure!(sent > most, "{sent} payloads over {took:?}: too few to tell one looked at a CHECK_EVERY from each");
+        anyhow::ensure!((1..=most).contains(&looked), "{looked} of {sent} payloads of a kind looked at over {took:?} (at most {most})");
+        let (first, counted_before) = (Instant::now(), ignored());
+        let (mut last_sent, mut gap) = (first, Duration::ZERO);
+        while ignored() == counted_before {
+            anyhow::ensure!(first.elapsed() < 10 * CHECK_EVERY, "a field every message carries wasn't counted in {:?}", first.elapsed());
+            gap = gap.max(last_sent.elapsed());
+            last_sent = Instant::now();
+            payload::<OneField>(wire, "One", r#"{"a":1,"new":true}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let within = last_sent.saturating_duration_since(first);
+        anyhow::ensure!(within <= CHECK_EVERY + gap, "the field was in one looked at {within:?} after its first (a send's gap {gap:?})");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: every payload of a kind that comes less often than once a [`CHECK_EVERY`] is looked
+    /// at, and another kind's beside it is its own. Do: five rounds a CHECK_EVERY and a little apart, each a payload of one
+    /// kind and one of another at once, every one with a field the type doesn't have. Expect: all ten looked at, each field
+    /// counted.
+    #[test]
+    fn g9_s5_every_message_of_a_kind_that_comes_less_often_is_looked_at() -> anyhow::Result<()> {
+        // A wire no other test reads JSON on, so its counts are this test's alone.
+        let wire = Wire::BpUp;
+        let checked = || crate::metrics::wire().checked.get(&[wire.name()]);
+        let ignored = || crate::metrics::wire().ignored.get(&[wire.name()]);
+        let (looked_before, counted_before) = (checked(), ignored());
+        const ROUNDS: u64 = 5;
+        for n in 0..ROUNDS {
+            if n > 0 {
+                std::thread::sleep(CHECK_EVERY + Duration::from_millis(10));
+            }
+            for of in ["Rare", "Beside"] {
+                payload::<OneField>(wire, of, &format!(r#"{{"a":{n},"new":true}}"#)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+        let (looked, counted) = (checked().saturating_sub(looked_before), ignored().saturating_sub(counted_before));
+        anyhow::ensure!(looked == 2 * ROUNDS && counted == 2 * ROUNDS, "{looked} looked at and {counted} fields counted of {} payloads", 2 * ROUNDS);
         Ok(())
     }
 
