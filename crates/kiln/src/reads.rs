@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -135,7 +134,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
 }
 
 /// A read kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), for what's read from
-/// memory but changes by itself (the runners' live records, the server's uptime). What it holds is
+/// memory but changes as what it's made of does (the runners' live records). What it holds is
 /// keyed by what it was made of (`K`: the copies it read, each by identity, a copy swapped in whole
 /// being a change, and the few values it says), taken again at each read, cheaply, so it answers only
 /// while it says what a read made now would. Its maker ([`Views::start`]) makes it again as soon as
@@ -147,11 +146,6 @@ pub struct Ahead<K> {
     now: arc_swap::ArcSwapOption<(K, Made)>,
     /// It's been read: its maker keeps it made.
     asked: AtomicBool,
-    /// It's been read since its maker last looked ([`Ahead::take_read`]): what changes by itself (the overview's uptime)
-    /// is made again as it changes only while it is (goal 9, plan 01a1a87b2cec step 5).
-    read: AtomicBool,
-    /// Told at its first read since its maker last looked: its maker keeps it made again.
-    maker: Option<Arc<crate::rt::Notify>>,
 }
 
 /// A read kept ahead as it answers: its JSON, and the weak ETag that names it (`crate::http::compress::weak_etag` of
@@ -174,29 +168,14 @@ impl Made {
 
 impl<K> Default for Ahead<K> {
     fn default() -> Self {
-        Self { now: arc_swap::ArcSwapOption::empty(), asked: AtomicBool::new(false), read: AtomicBool::new(false), maker: None }
+        Self { now: arc_swap::ArcSwapOption::empty(), asked: AtomicBool::new(false) }
     }
 }
 
 impl<K> Ahead<K> {
-    /// One whose first read since its maker last looked tells `maker`.
-    fn telling(maker: &Arc<crate::rt::Notify>) -> Self {
-        Self { maker: Some(Arc::clone(maker)), ..Self::default() }
-    }
-
-    /// A read: it's asked for, and read since its maker last looked (its maker told, the first time).
+    /// A read: it's asked for.
     fn note_read(&self) {
         self.asked.store(true, Ordering::Relaxed);
-        if !self.read.swap(true, Ordering::Relaxed)
-            && let Some(maker) = &self.maker
-        {
-            maker.notify();
-        }
-    }
-
-    /// Whether it's been read since its maker last asked, asked now.
-    pub fn take_read(&self) -> bool {
-        self.read.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -275,8 +254,9 @@ impl PartialEq for AgentsKey {
 /// What the server says of itself now, in `GET /api/system` and the overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemNow {
-    /// Whole seconds: what the overview says changes once a second.
-    pub uptime_s: u64,
+    /// When the server started (unix ms): the pages count its uptime from it, so the overview isn't made again as the
+    /// uptime goes on (goal 9, plan 01a1a87b2cec step 5: it was made again every second while it was read).
+    pub started_ms: i64,
     pub hostname: String,
     pub children: Vec<crate::sup::ChildStatus>,
     /// Its machine's newest sample.
@@ -373,7 +353,7 @@ impl Default for Views {
             agent_rows: Arc::new(Kept::telling(crate::store::AGENT_ROWS_FROM, &wake)),
             agents: Ahead::default(),
             stats: Arc::new(Kept::telling(crate::store::STATS_FROM, &wake)),
-            overview: Ahead::telling(&wake),
+            overview: Ahead::default(),
             runs: Arc::new(Kept::new(RUNS_FROM)),
             me: Ahead::default(),
             attaching: AtomicUsize::new(0),
@@ -385,9 +365,9 @@ impl Default for Views {
 
 impl Views {
     /// Starts the maker of the reads kept ahead, once: a task of its own that makes each one read so
-    /// far again as soon as something it's made of changes ([`Views::changed`]), and the overview as
-    /// its uptime's next second comes while it's read, so a read finds it made. It holds the hub only
-    /// while it makes them, and ends once the hub is gone.
+    /// far again as soon as something it's made of changes ([`Views::changed`]), so a read finds it made; none
+    /// changes by itself, so it wakes for nothing else. It holds the hub only while it makes them, and ends once the
+    /// hub is gone.
     pub fn start(&self, hub: &Arc<crate::hub::Hub>) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
@@ -412,17 +392,11 @@ impl Drop for Views {
 /// The maker of the reads kept ahead ([`Views::start`]).
 async fn make_ahead(hub: std::sync::Weak<crate::hub::Hub>, wake: Arc<crate::rt::Notify>) {
     loop {
-        let next: Option<Instant> = match hub.upgrade() {
+        match hub.upgrade() {
             Some(hub) => crate::api::make_ahead(&hub).await,
             None => return,
-        };
-        let woken = wake.notified();
-        match next {
-            Some(at) => {
-                let _ = crate::rt::timeout(at.saturating_duration_since(Instant::now()), woken).await;
-            }
-            None => woken.await,
         }
+        wake.notified().await;
     }
 }
 

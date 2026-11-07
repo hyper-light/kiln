@@ -679,6 +679,9 @@ pub struct Hub {
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
+    /// When it started, in unix milliseconds: what the pages count its uptime from, so nothing of the server's is made
+    /// again as its uptime goes on (goal 9, plan 01a1a87b2cec step 5).
+    pub started_ms: i64,
     pub generation: u64,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
@@ -880,6 +883,7 @@ impl Hub {
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
+            started_ms: crate::util::now_ms(),
             generation,
             runners_before: AtomicU64::new(0),
             comeback: crate::comeback::Comeback::default(),

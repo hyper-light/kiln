@@ -3034,7 +3034,7 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
         let stats = hub.store.stats(Some(repos.clone())).await?;
         let queue = hub.store.queue_among(repos.clone()).await?;
-        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
+        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "started_ms": hub.started_ms, "hostname": null, "generation": hub.generation, "children": [], "sample": null });
         return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
     }
     // Kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), made of the last day's
@@ -3153,11 +3153,10 @@ fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<B
 /// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
 /// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
 /// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
-/// quantum), the overview here (its counts and a few kilobytes encoded). Says when the overview next changes
-/// by itself, while it's read: at the next second of the server's uptime, which it says. Read by none since its
-/// last turn, none: its next read tells it (goal 9, plan 01a1a87b2cec step 5: it was made every second for as
-/// long as the server ran once one read had asked for it).
-pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
+/// quantum), the overview here (its counts and a few kilobytes encoded). Neither changes by itself: the overview
+/// says when the server started, and the pages count its uptime (goal 9, plan 01a1a87b2cec step 5: it was made
+/// again every second while it was read, for its uptime).
+pub(crate) async fn make_ahead(hub: &Arc<Hub>) {
     let v = &hub.harness.views;
     if v.agents.asked()
         && let Some(key) = agents_key(hub)
@@ -3166,10 +3165,8 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     {
         tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it");
     }
-    if !v.overview.asked() {
-        return None;
-    }
-    if let Some(key) = overview_key(hub)
+    if v.overview.asked()
+        && let Some(key) = overview_key(hub)
         && !v.overview.holds(&key)
     {
         let was = v.overview.now();
@@ -3178,7 +3175,6 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
         }
     }
-    v.overview.take_read().then(|| kiln_seams::clock::later(hub.started, Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1))))
 }
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
@@ -3241,7 +3237,7 @@ fn agents_made(hub: &Hub, key: &crate::reads::AgentsKey) -> Vec<crate::hub::Agen
 /// What the server says of itself now ([`crate::reads::SystemNow`]).
 fn system_now(hub: &Hub) -> crate::reads::SystemNow {
     crate::reads::SystemNow {
-        uptime_s: hub.started.elapsed().as_secs(),
+        started_ms: hub.started_ms,
         hostname: crate::config::Config::hostname(),
         children: crate::server::registry().snapshot(),
         sample: hub.history.load().get("server").and_then(|q| q.back().cloned()),
@@ -3253,7 +3249,7 @@ fn system_now(hub: &Hub) -> crate::reads::SystemNow {
 fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_s": s.uptime_s,
+        "started_ms": s.started_ms,
         "hostname": s.hostname,
         "generation": hub.generation,
         "children": s.children,
@@ -3265,8 +3261,13 @@ fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
     })
 }
 
+/// `GET /api/system`, made as it's asked: its uptime too, for the API's readers from before `started_ms`.
 fn system_json(hub: &Hub) -> serde_json::Value {
-    system_of(hub, &system_now(hub))
+    let mut v = system_of(hub, &system_now(hub));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("uptime_s".into(), json!(hub.started.elapsed().as_secs()));
+    }
+    v
 }
 
 async fn system(hub: &Hub) -> Response {
@@ -8696,15 +8697,8 @@ mod tests {
             assert_eq!(seqs, (11..=60).collect::<Vec<u64>>(), "its newest fifty, oldest first");
             assert_eq!(got("/api/agents"), serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?);
             assert_eq!(got("/api/me"), serde_json::to_vec(&me_json(&hub, Some(&owner), Vec::new()))?);
-            // The uptime may have gone on a second between the two: compared without it.
-            let without_uptime = |mut v: serde_json::Value| {
-                if let Some(system) = v.get_mut("system").and_then(serde_json::Value::as_object_mut) {
-                    system.remove("uptime_s");
-                }
-                v
-            };
             let stored = overview_json(&hub, &hub.store.stats(None).await?, &hub.agent_list().await, &system_now(&hub), queue_now());
-            assert_eq!(without_uptime(serde_json::from_slice(&got("/api/overview"))?), without_uptime(stored));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&got("/api/overview"))?, stored);
             assert_eq!(got("/api/runs"), serde_json::to_vec(&crate::reads::runs(&hub.store, &HashMap::new(), None).await?)?);
             let plans = crate::plans::list(&hub, crate::plans::Asked { session: Some("a".into()), proposed: true, ..crate::plans::Asked::default() }).await?;
             assert_eq!(got("/api/plans?session=a&proposed=1"), serde_json::to_vec(&plans)?);
@@ -8993,50 +8987,32 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: reads.rs's maker, about one timer wake a second in the lab):
-    /// the overview kept ahead is made again as its uptime's second turns only while it's read. Do: a scratch hub's maker
-    /// started; the overview read once, and made again by its maker at its next second; then two and a half seconds
-    /// unread; then read again. Expect: unread, the same copy throughout (it was made every second for as long as the
-    /// server ran, once one read had asked for it); read again, its maker is told and makes it again at its next second.
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): the overview says when the server started, and
+    /// what it's made of doesn't change as the server's uptime goes on, so nothing makes it again for that (it was made
+    /// again every second while it was read; the pages count the uptime now). Do: a scratch hub's overview read; what
+    /// it's made of taken twice, a second and a half apart. Expect: it says `started_ms` and no `uptime_s`; the two
+    /// equal, but for the supervisor's children (another test's may change them meanwhile).
     #[test]
-    fn g9_s5_the_overview_is_made_again_each_second_only_while_its_read() -> anyhow::Result<()> {
+    fn g9_s5_the_overview_says_when_the_server_started_and_isnt_made_again_for_its_uptime() -> anyhow::Result<()> {
         // Each bound here only ends a hang: a loaded machine takes what time it takes.
         const HANG: Duration = Duration::from_secs(300);
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let v = &hub.harness.views;
-            v.start(&hub);
             let deadline = Instant::now() + HANG;
-            let read = |hub: &Arc<Hub>| -> anyhow::Result<Option<crate::reads::Made>> {
-                let Some(key) = overview_key(hub) else { return Ok(None) };
-                Ok(Some(hub.harness.views.overview.answer(key, |k| overview_made(hub, k))?))
-            };
-            let first = loop {
-                if let Some(made) = read(&hub)? {
-                    break made;
+            let made = loop {
+                if let Some(key) = overview_key(&hub) {
+                    break hub.harness.views.overview.answer(key, |k| overview_made(&hub, k))?;
                 }
                 anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             };
-            // Read since its maker's last look: made again once, at its next second.
-            while v.overview.now().is_some_and(|now| now.1.json == first.json) {
-                anyhow::ensure!(Instant::now() < deadline, "read, it was never made again at its next second");
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
-            let quiet = v.overview.now().ok_or_else(|| anyhow::anyhow!("nothing kept"))?;
-            crate::rt::sleep(Duration::from_millis(2_500)).await;
-            anyhow::ensure!(v.overview.now().is_some_and(|now| Arc::ptr_eq(&now, &quiet)), "made again while nobody read it");
-            let made = loop {
-                if let Some(made) = read(&hub)? {
-                    break made;
-                }
-                anyhow::ensure!(Instant::now() < deadline, "the overview couldn't be read again");
-                crate::rt::sleep(Duration::from_millis(5)).await;
-            };
-            while v.overview.now().is_some_and(|now| now.1.json == made.json) {
-                anyhow::ensure!(Instant::now() < deadline, "read again, it was never made again by its maker");
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
+            let said: serde_json::Value = serde_json::from_slice(&made.json)?;
+            anyhow::ensure!(said.pointer("/system/started_ms").and_then(serde_json::Value::as_i64) == Some(hub.started_ms), "{said}");
+            anyhow::ensure!(said.pointer("/system/uptime_s").is_none(), "an uptime that's stale as soon as it's kept: {said}");
+            let before = system_now(&hub);
+            crate::rt::sleep(Duration::from_millis(1_500)).await;
+            let after = system_now(&hub);
+            anyhow::ensure!(before == after || before.children != after.children, "what the overview's made of changed with nothing changed");
             Ok(())
         })
     }

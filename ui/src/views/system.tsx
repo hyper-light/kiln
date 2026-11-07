@@ -11,12 +11,12 @@ import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { fileStamp, saveFile, toCsv } from "@/lib/download";
-import { absoluteTime, formatUptime, shortIds } from "@/lib/format";
+import { absoluteTime, shortIds } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
 import { KeepSection } from "./keep/section";
 import { ReapSection } from "./reap";
-import { childStatus, RelTime } from "./shared";
+import { childStatus, RelTime, Uptime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 import { BuildsSection, UpdatesSection } from "./updates/section";
 
@@ -123,7 +123,7 @@ function Kpis({ d }: { d: SystemInfo | null }) {
       </div>
       <div className="kpi">
         <div className="label">Uptime</div>
-        <div className="kpi-value">{d ? formatUptime(d.uptime_s) : blank}</div>
+        <div className="kpi-value">{d ? <Uptime since={d.started_ms} /> : blank}</div>
       </div>
       <div className="kpi">
         <div className="label">Generation</div>
