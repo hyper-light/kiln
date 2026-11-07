@@ -5767,10 +5767,11 @@ pub(crate) mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 5: the scheduler's deadlines are its pending items' due times, each only once
     /// after what last took it, and nothing else (it swept every five seconds and looked every second). Do: a scratch
-    /// hub; its deadlines read fresh, after a check, with a runner away holding a job, back, with a pairing declined
-    /// while a job waits, and after a look past it. Expect: only the server's own grace (what ran before it started);
-    /// then the runner's offline notice and its grace for its job, whichever comes first; none of its once it's back;
-    /// the pairing's wait, to place, only while jobs wait and only after the last look.
+    /// hub; its deadlines read fresh, then once it began hearing its runners, after a check, with a runner away holding a
+    /// job, back, with a pairing declined while a job waits, and after a look past it. Expect: none before it hears its
+    /// runners; then only the server's own grace from when it began hearing them (what ran before it started, orphaned:
+    /// train 52's comeback.hearing); then the runner's offline notice and its grace for its job, whichever comes first;
+    /// none of its once it's back; the pairing's wait, to place, only while jobs wait and only after the last look.
     #[test]
     fn g9_s5_the_schedulers_deadlines_are_its_pending_items_due_times() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -5778,17 +5779,20 @@ pub(crate) mod tests {
             let grace = hub.comeback.grace();
             let now = Instant::now();
             let mut s = Scheduler { waiting: false, looked: now, checked: Some((now, crate::util::now_unix())), timeout_at: None, secrets_at: None };
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing heard of its runners yet, nothing pending: nothing due");
+            let heard = Instant::now();
+            hub.comeback.hearing(heard);
             let due = hub.scheduler_due(&s);
-            anyhow::ensure!(due.check == hub.started.checked_add(grace) && due.place.is_none(), "only the server's own grace: {:?} {:?}", due.check, due.place);
+            anyhow::ensure!(due.check == heard.checked_add(grace) && due.place.is_none(), "only the server's own grace, from when it began hearing its runners: {:?} {:?}", due.check, due.place);
             // Past the server's grace: nothing pending, no deadline at all.
-            s.checked = hub.started.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
             anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing pending, nothing due");
             let lost = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
             hub.put_agent(AgentLive { connected: false, lost_at: Some(lost), running: vec!["j1".into()], ..live_runner("box", "linux", "x86_64") });
             let away = [lost.checked_add(grace), crate::ci::notify::offline_at(&hub)].into_iter().flatten().min();
             s.checked = Some((now, crate::util::now_unix()));
             anyhow::ensure!(away.is_some() && hub.scheduler_due(&s).check.is_some_and(|t| Some(t) <= away), "a runner away holding a job: its grace or its notice");
-            s.checked = hub.started.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
             hub.change_agent("box", |a| {
                 a.connected = true;
                 a.lost_at = None;
