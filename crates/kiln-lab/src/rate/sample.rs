@@ -9,7 +9,7 @@
 //! 2026-11-06). The lab says so rather than charge the server.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +27,19 @@ pub struct Usage {
     pub procs: usize,
     pub root_cpu_s: f64,
     pub root_rss: u64,
+    /// Page faults since each process started, all of the tree's (Linux; 0 elsewhere): minor and major.
+    pub minflt: u64,
+    pub majflt: u64,
 }
 
-/// A process: its parent, its CPU seconds and its resident bytes.
+/// A process: its parent, its CPU seconds, its resident bytes and its page faults, minor and major.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Proc {
     ppid: u32,
     cpu_s: f64,
     rss: u64,
+    minflt: u64,
+    majflt: u64,
 }
 
 /// `root` and every process under it, from each process's parent.
@@ -60,6 +65,8 @@ fn usage(all: &BTreeMap<u32, Proc>, pids: &BTreeSet<u32>, root: u32) -> Usage {
             u.cpu_s += p.cpu_s;
             u.rss += p.rss;
             u.procs += 1;
+            u.minflt += p.minflt;
+            u.majflt += p.majflt;
         }
     }
     if let Some(r) = all.get(&root) {
@@ -68,20 +75,22 @@ fn usage(all: &BTreeMap<u32, Proc>, pids: &BTreeSet<u32>, root: u32) -> Usage {
     u
 }
 
-/// A Linux `/proc/<pid>/stat` line: its parent, CPU seconds (`utime` and `stime`, in `ticks`) and resident bytes
-/// (`rss`, in pages of `page`). The command's name (in parentheses) may hold spaces and parentheses: the fields
-/// are counted from its last `)`.
+/// A Linux `/proc/<pid>/stat` line: its parent, CPU seconds (`utime` and `stime`, in `ticks`), resident bytes
+/// (`rss`, in pages of `page`) and page faults (`minflt` and `majflt`). The command's name (in parentheses) may
+/// hold spaces and parentheses: the fields are counted from its last `)`.
 fn proc_stat(line: &str, ticks: f64, page: u64) -> Option<Proc> {
     let after = line.get(line.rfind(')')? + 1..)?;
     let f: Vec<&str> = after.split_whitespace().collect();
-    // Fields from the 3rd (state) on: ppid is the 4th, utime the 14th, stime the 15th, rss the 24th.
+    // Fields from the 3rd (state) on: ppid is the 4th, minflt the 10th, majflt the 12th, utime the 14th, stime the
+    // 15th, rss the 24th.
     let field = |n: usize| f.get(n - 3).copied();
     let ppid = field(4)?.parse().ok()?;
+    let (minflt, majflt) = (field(10)?.parse().ok()?, field(12)?.parse().ok()?);
     let ticks_used = field(14)?.parse::<u64>().ok()? + field(15)?.parse::<u64>().ok()?;
     let rss_pages = field(24)?.parse::<i64>().ok()?.max(0).unsigned_abs();
     #[allow(clippy::cast_precision_loss)]
     let cpu_s = ticks_used as f64 / ticks;
-    Some(Proc { ppid, cpu_s, rss: rss_pages * page })
+    Some(Proc { ppid, cpu_s, rss: rss_pages * page, minflt, majflt })
 }
 
 /// A thread of the tree as Linux says it: its scheduling policy, real-time priority and nice value
@@ -211,7 +220,7 @@ fn ps_lines(text: &str) -> BTreeMap<u32, Proc> {
             let ppid = w.next()?.parse().ok()?;
             let rss_kib: u64 = w.next()?.parse().ok()?;
             let cpu_s = ps_time(w.next()?)?;
-            Some((pid, Proc { ppid, cpu_s, rss: rss_kib * 1024 }))
+            Some((pid, Proc { ppid, cpu_s, rss: rss_kib * 1024, minflt: 0, majflt: 0 }))
         })
         .collect()
 }
@@ -306,6 +315,19 @@ pub struct Window {
     pub threads: usize,
     #[serde(default)]
     pub idle_threads: usize,
+    /// Linux: the tree's page faults through the window, minor (a page the kernel had: a fresh one zeroed, or one
+    /// cached or shared mapped in) and major (one read in from disk): what touching new memory cost the server in
+    /// the kernel (Ada, 2026-11-07: "allocs, reallocs, page faults").
+    #[serde(default)]
+    pub minor_faults: Option<u64>,
+    #[serde(default)]
+    pub major_faults: Option<u64>,
+    /// The first and last samples' moments on the wall clock, Unix seconds: what lines a sampler outside the lab
+    /// (the server's cgroup's counters) up with the window.
+    #[serde(default)]
+    pub from_unix_s: Option<f64>,
+    #[serde(default)]
+    pub to_unix_s: Option<f64>,
 }
 
 /// Samples `tree` from `from` to `to`, every [`EVERY`], and sums them up, with what the host did to its threads
@@ -315,11 +337,15 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
     tree.find();
     let (first, looked) = (threads(&tree.pids), Instant::now());
     let mut points: Vec<(f64, Usage)> = Vec::new();
+    let unix = || SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs_f64());
+    let (mut first_wall, mut last_wall) = (None, None);
     let mut next = Instant::now();
     loop {
         let now = Instant::now();
         if let Some(u) = tree.now() {
             points.push((now.duration_since(from).as_secs_f64(), u));
+            last_wall = unix();
+            first_wall = first_wall.or(last_wall);
         }
         if now >= to {
             break;
@@ -328,6 +354,7 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
         std::thread::sleep(next.min(to).saturating_duration_since(Instant::now()));
     }
     let mut w = summarize(&points);
+    (w.from_unix_s, w.to_unix_s) = (first_wall, last_wall);
     held(&first, &threads(&tree.pids), looked.elapsed().as_secs_f64(), &mut w);
     w
 }
@@ -338,6 +365,9 @@ fn summarize(points: &[(f64, Usage)]) -> Window {
     let mut w = Window { samples: points.len(), ..Window::default() };
     let (Some((t0, first)), Some((t1, last))) = (points.first(), points.last()) else { return w };
     let span = t1 - t0;
+    if cfg!(target_os = "linux") {
+        (w.minor_faults, w.major_faults) = (Some(last.minflt.saturating_sub(first.minflt)), Some(last.majflt.saturating_sub(first.majflt)));
+    }
     if span > 0.0 {
         w.cpu_share = Some((last.cpu_s - first.cpu_s).max(0.0) / span);
         w.root_cpu_share = Some((last.root_cpu_s - first.root_cpu_s).max(0.0) / span);
@@ -361,7 +391,7 @@ mod tests {
     #[test]
     fn rate_a_servers_usage_is_its_trees() {
         let p = proc_stat("4242 (node (worker) x) S 4000 4242 4242 0 -1 4194304 100 0 0 0 250 50 0 0 20 0 9 0 12345 999999 2500 18446744073709551615", 100.0, 4096);
-        assert_eq!(p, Some(Proc { ppid: 4000, cpu_s: 3.0, rss: 2500 * 4096 }));
+        assert_eq!(p, Some(Proc { ppid: 4000, cpu_s: 3.0, rss: 2500 * 4096, minflt: 100, majflt: 0 }));
         assert_eq!(ps_time("0:01.50"), Some(1.5));
         assert!(ps_time("12:34.56").is_some_and(|t| (t - 754.56).abs() < 1e-9));
         assert_eq!(ps_time("1:02:03.00"), Some(3723.0));
@@ -373,7 +403,7 @@ mod tests {
         assert!((u.cpu_s - 3.5).abs() < 1e-9 && u.rss == (2048 + 1024 + 100) * 1024 && u.procs == 3, "{u:?}");
         assert!((u.root_cpu_s - 2.0).abs() < 1e-9 && u.root_rss == 2048 * 1024, "{u:?}");
         // A window: 1.5 CPUs on average, 2 at the most, its memory's mean and most.
-        let at = |t: f64, cpu: f64, rss: u64| (t, Usage { cpu_s: cpu, rss, procs: 2, root_cpu_s: cpu / 2.0, root_rss: rss / 2 });
+        let at = |t: f64, cpu: f64, rss: u64| (t, Usage { cpu_s: cpu, rss, procs: 2, root_cpu_s: cpu / 2.0, root_rss: rss / 2, ..Usage::default() });
         let w = summarize(&[at(0.0, 10.0, 100_000_000), at(1.0, 11.0, 200_000_000), at(2.0, 13.0, 300_000_000)]);
         assert_eq!((w.cpu_share, w.cpu_share_max, w.root_cpu_share, w.samples, w.procs), (Some(1.5), Some(2.0), Some(0.75), 3, 2));
         assert_eq!((w.rss_mb, w.rss_mb_max, w.root_rss_mb_max), (Some(200.0), Some(300.0), Some(150.0)));
