@@ -61,7 +61,12 @@ fn ask(addr: SocketAddr, method: &str, path: &str, headers: &str, announce: usiz
     let mut buf = [0u8; 4096];
     // Read the head (a shed answer comes with its connection closing; a served one with its body).
     loop {
-        let n = s.read(&mut buf)?;
+        let n = match s.read(&mut buf) {
+            // A read with a timeout fails with EINTR once its process is stopped and resumed (signal(7)), as a paced
+            // test unit is: it read nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            read => read?,
+        };
         if n == 0 {
             break;
         }
