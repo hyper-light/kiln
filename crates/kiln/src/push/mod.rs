@@ -23,7 +23,7 @@ pub mod vapid;
 pub mod watch;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -287,10 +287,37 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "what was said of agents couldn't be read: some notes may be said again"),
     }
+    // The sleep until the first note waiting to settle is due, and when that is: armed while a note waits, and let go as
+    // soon as none does (goal 9, plan 01a1a87b2cec step 5: each note slept in a task of its own, which woke when it was
+    // due even after a change had called it off, as a turn's next calls off its end's: 2.2 timer wakes a second in the
+    // lab, train 34's census).
+    let mut settling: Option<(Instant, crate::rt::Sleep)> = None;
     loop {
-        let got = futures::select_biased! {
-            m = rx.recv().fuse() => m,
-            m = sessions.recv().fuse() => m,
+        let next = hub.push.watch.lock().next_due();
+        if settling.as_ref().map(|(at, _)| *at) != next {
+            settling = next.map(|at| (at, crate::rt::sleep_until(at)));
+        }
+        let got = {
+            let settled = async {
+                match settling.as_mut() {
+                    Some((_, sleep)) => sleep.await,
+                    None => std::future::pending().await,
+                }
+            };
+            futures::select_biased! {
+                m = rx.recv().fuse() => Some(m),
+                m = sessions.recv().fuse() => Some(m),
+                () = settled.fuse() => None,
+            }
+        };
+        let Some(got) = got else {
+            settling = None;
+            let notes = hub.push.watch.lock().due(Instant::now());
+            for n in notes {
+                let h = Arc::clone(&hub);
+                crate::rt::spawn(async move { tell(&h, n).await });
+            }
+            continue;
         };
         let text = match got {
             Ok(t) => t,
@@ -302,19 +329,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         };
         let Some(what) = follow(text).await else { continue };
         match what {
-            Followed::Harness(info) => {
-                let due = hub.push.watch.lock().heard(*info);
-                if let Some(d) = due {
-                    let h = Arc::clone(&hub);
-                    crate::rt::spawn(async move {
-                        crate::rt::sleep(d.after).await;
-                        let note = h.push.watch.lock().due(&d.agent, d.seq);
-                        if let Some(n) = note {
-                            tell(&h, n).await;
-                        }
-                    });
-                }
-            }
+            Followed::Harness(info) => hub.push.watch.lock().heard(*info, Instant::now()),
             Followed::Closed(id) => {
                 hub.push.watch.lock().closed(&id);
                 let h = Arc::clone(&hub);
@@ -494,7 +509,7 @@ mod tests {
     }
 
     /// The watch's lock is held only for `heard`, `due` and `closed`, never across a wait: from
-    /// many threads at once (as the event loop and the settling timers take it), each finishes.
+    /// many threads at once, each finishes.
     #[test]
     fn the_watch_is_never_held_across_a_wait() -> anyhow::Result<()> {
         use crate::harness::model::{Status, ToolKind};
@@ -509,12 +524,9 @@ mod tests {
                     let id = format!("ag{}", i % 5);
                     let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0), agent: None }] } else { Vec::new() };
                     let status = if approvals.is_empty() { Status::Running } else { Status::Waiting };
-                    let due = svc.watch.lock().heard(Info { id: id.clone(), status, approvals, ..Info::default() });
-                    if let Some(d) = due
-                        && svc.watch.lock().due(&d.agent, d.seq).is_some()
-                    {
-                        said += 1;
-                    }
+                    let now = std::time::Instant::now();
+                    svc.watch.lock().heard(Info { id: id.clone(), status, approvals, ..Info::default() }, now);
+                    said += svc.watch.lock().due(now + watch::Kind::NeedsYou.settle()).len();
                     if i % 97 == 0 {
                         svc.watch.lock().closed(&id);
                     }
@@ -575,6 +587,54 @@ mod tests {
             let Some(Followed::Closed(id)) = follow(Arc::from(ServerEvent::HarnessClosed { id: "s1".into() }.text())).await else { anyhow::bail!("a session gone, not read") };
             anyhow::ensure!(id == "s1");
             anyhow::ensure!(follow(Arc::from(ServerEvent::Terminals.text())).await.is_none(), "a frame it passes over");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: push's settling timers, 2.2 timer wakes a second in the lab,
+    /// each a turn's end its next turn called off): a note called off before it settles wakes nothing, and one left to
+    /// settle goes once it's due. Do: the listener on a scratch hub; an agent at work asks for an approval and has it
+    /// answered at once; then twice the settle with nothing. Expect: no timer of this file's ended a shard's park, unless
+    /// the note went (a machine so loaded it settled first): each note slept in a task of its own, which woke when it
+    /// was due even after it was called off. Then an approval left waiting: its note is said.
+    #[test]
+    fn g9_s5_a_note_called_off_before_it_settles_wakes_nothing() -> anyhow::Result<()> {
+        use crate::harness::model::{Status, ToolKind};
+        use crate::harness::session::{ApprovalBrief, Info};
+        use crate::wire::events::ServerEvent;
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let info = |status: Status, ask: Option<&str>| {
+                let approvals = ask.map(|id| ApprovalBrief { id: id.into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: 1, agent: None }).into_iter().collect();
+                ServerEvent::Harness { info: Box::new(Info { id: "ag1".into(), kind: "claude".into(), status, approvals, ..Info::default() }) }
+            };
+            let said = |hub: &Arc<Hub>, key: &'static str| {
+                let hub = Arc::clone(hub);
+                async move { hub.store.call(|c| store::said(c)).await.map(|all| all.iter().filter(|(agent, kind, kept)| agent == "ag1" && kind == "agent.needs_you" && kept == key).count()) }
+            };
+            let listening = hub.harness_events.receiver_count();
+            let task = crate::rt::spawn(run(Arc::clone(&hub)));
+            let deadline = Instant::now() + HANG;
+            while hub.harness_events.receiver_count() == listening {
+                anyhow::ensure!(Instant::now() < deadline, "the listener never listened");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let before = crate::rt::timer_wakes_in("push/mod.rs");
+            hub.emit(&info(Status::Running, None));
+            hub.emit(&info(Status::Waiting, Some("q1")));
+            hub.emit(&info(Status::Running, None));
+            crate::rt::sleep(watch::Kind::NeedsYou.settle() * 2).await;
+            let woke = crate::rt::timer_wakes_in("push/mod.rs").saturating_sub(before);
+            let went = said(&hub, "q1").await?;
+            anyhow::ensure!(woke <= u64::try_from(went)?, "{woke} timer wakes for a note called off before it settled ({went} said)");
+            hub.emit(&info(Status::Waiting, Some("q2")));
+            while said(&hub, "q2").await? == 0 {
+                anyhow::ensure!(Instant::now() < deadline, "a note left to settle was never said");
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            task.abort();
             Ok(())
         })
     }

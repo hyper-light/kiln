@@ -1119,6 +1119,14 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
+/// The parks the shards' timers ended so far, of the timers armed in a source file whose path ends with `file`
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`): what a test's own timers woke (goal 9, plan 01a1a87b2cec
+/// step 5). A timer that falls due while its shard runs ends no park, and isn't counted.
+#[cfg(test)]
+pub(crate) fn timer_wakes_in(file: &str) -> u64 {
+    shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
