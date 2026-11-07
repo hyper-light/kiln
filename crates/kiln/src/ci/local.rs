@@ -412,6 +412,7 @@ fn server_config(dir: &Path, http: u16, quic: u16, executor: Option<&str>) -> Co
     c
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a local server's start; its own word would tell
 async fn here_in(a: &RunArgs, root: &Path, ask: Value, dir: &Path, shutdown: &Shutdown) -> Result<u8> {
     if let Some(e) = a.executor.as_deref()
         && !matches!(e, "host" | "docker" | "firecracker" | "shards")
@@ -558,6 +559,7 @@ async fn runner_labels(api: &Api) -> HashMap<String, String> {
 
 /// Prints the runs' logs as they come and what happens to them, until they end. The exit code:
 /// 0 when every run succeeded, 130 when stopped here, else 1.
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 async fn follow(api: &Api, started: &Value, here: bool, shutdown: &Shutdown) -> Result<u8> {
     let runs: Vec<(String, String)> = started.get("runs").and_then(Value::as_array).map(|a| a.iter().filter_map(|r| Some((r.get("id")?.as_str()?.to_owned(), r.get("workflow")?.as_str()?.to_owned()))).collect()).unwrap_or_default();
     for s in started.get("skipped").and_then(Value::as_array).into_iter().flatten() {

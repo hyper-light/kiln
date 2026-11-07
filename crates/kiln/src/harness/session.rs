@@ -1658,6 +1658,7 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
 
 /// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
 /// still in it ended at once, then the group removed.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 fn end_group(g: crate::os::contain::Group, after: Duration) {
     crate::rt::spawn(async move {
         crate::rt::sleep(after).await;
@@ -1720,6 +1721,7 @@ fn kill_command(root: u32, command: &str) -> bool {
 }
 
 /// Wait (up to `wait`) for `pid` to be gone: whether it is.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 async fn gone(pid: u32, wait: Duration) -> bool {
     let end = Instant::now() + wait;
     while crate::os::pid_alive(pid) {
@@ -2497,6 +2499,7 @@ struct Synced {
 /// sent, their contents on the server, the log having brought them back), then where the copy
 /// stands, for the machine it goes to to take the log that far before it goes on there. None: its
 /// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
+#[allow(clippy::disallowed_methods)] // (e) a session's files flushed every FILES_EVERY; their writes could tell
 async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, String> {
     let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
     let folder = std::path::Path::new(cwd);
@@ -2720,6 +2723,7 @@ enum Arrived {
 /// A session that moved here goes on once its folder has taken its repo's sync log as far as the
 /// machine it left had it: it never starts on files older than the ones it left. Messages sent
 /// meanwhile wait in `carry`; closing it ends the wait.
+#[allow(clippy::disallowed_methods)] // (e) a session's files looked at every second; their writes could tell
 async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
     let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
     let Some(sync) = crate::sync::runner::global() else {
@@ -2941,6 +2945,7 @@ async fn unfenced(s: &Session, fence: &FenceFor, why: String) -> String {
 /// and queue, over reach. Ok once that runner has taken it over and runs it. One that may have taken
 /// it (all of it went, and no answer came) is asked again until it says: meanwhile the session
 /// takes nothing here.
+#[allow(clippy::disallowed_methods)] // (e) a hand-over's measured pause
 async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
     use super::moving::Carry;
     if mv.local {
@@ -3153,6 +3158,7 @@ fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static 
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // (e) a session's next due time; a picked 1.5 s look
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queue::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;

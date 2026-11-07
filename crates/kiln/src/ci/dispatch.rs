@@ -1146,6 +1146,7 @@ fn status_of(c: PlanC) -> Status {
 
 /// Starts the dispatcher when the engine is on, and the log indexer either way: with the engine off it
 /// keeps the legs not indexed (what the search counts) and indexes none.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 pub fn spawn(hub: Arc<Hub>) {
     if !hub.ci.indexing.swap(true, Ordering::Relaxed) {
         super::logsearch::spawn(Arc::clone(&hub), hub.cfg.ci.enabled);

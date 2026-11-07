@@ -187,6 +187,7 @@ pub struct Synced {
 /// Copy the tree at `root` to `peer` (as `key`), reporting progress to `ev`, handed on by `me`
 /// (`super::custody`). Started over (it then sends only what still differs) when a link drops in
 /// the middle.
+#[allow(clippy::disallowed_methods)] // (b) sync retry, linear backoff, picked
 pub async fn sync_tree(handle: &Handle, peer: &str, root: &Path, key: &str, me: Option<&super::custody::Signer>, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Synced> {
     let mut last_err = None;
     for attempt in 0..4 {
@@ -583,6 +584,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
 
 /// Serve the socket at `path` until this process exits. Unix only.
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // (b) bind and accept retried, picked
 pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::Result<PathBuf> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
 

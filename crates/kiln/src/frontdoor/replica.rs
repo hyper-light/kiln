@@ -325,6 +325,7 @@ fn target(uri: &http::Uri) -> String {
 
 /// `connect` tried up to [`DIALS`] times, a moment apart: a server on a busy machine takes a new
 /// connection late or drops its first packets, and the next try often gets through.
+#[allow(clippy::disallowed_methods)] // (b) redial, linear backoff, picked
 async fn redial<T, F: std::future::Future<Output = anyhow::Result<T>>>(mut connect: impl FnMut() -> F) -> anyhow::Result<T> {
     let mut tried = 1;
     loop {

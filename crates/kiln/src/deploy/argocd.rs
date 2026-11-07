@@ -880,6 +880,7 @@ impl Watches {
 /// compares it (every three minutes), so a silence this long is a stream that's gone.
 const STREAM_IDLE: Duration = Duration::from_secs(300);
 
+#[allow(clippy::disallowed_methods)] // (c) Argo CD's stream re-dialed after its wait
 async fn follow_stream(hub: Arc<Hub>, integration: String, s: Arc<Stream>, changed: Changed) {
     let mut wait = 1;
     while !hub.shutdown.is_cancelled() && !s.stopped.load(Ordering::SeqCst) {

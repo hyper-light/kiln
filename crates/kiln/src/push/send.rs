@@ -56,6 +56,7 @@ pub struct Sender<'a> {
 
 impl Sender<'_> {
     /// Sends `m` to `d`, waiting `waits` seconds before each attempt until one is taken.
+    #[allow(clippy::disallowed_methods)] // (b) a push retried on its schedule
     pub async fn deliver(&self, d: &Device<'_>, m: &Message<'_>, waits: &[u64]) -> Outcome {
         let body = match super::ece::encrypt(m.payload, d.p256dh, d.auth) {
             Ok(b) => b,

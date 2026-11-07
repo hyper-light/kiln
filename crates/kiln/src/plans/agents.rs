@@ -25,7 +25,6 @@
 //! of the step met before it (`super::stack`): the run ends as a stack with one diff per step.
 
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -41,8 +40,6 @@ use crate::hub::Hub;
 const STEPS: usize = 100;
 /// A goal's longest (as `crate::goals` keeps them).
 const GOAL: usize = 1990;
-/// How often the server looks at the runs under way.
-const EVERY: Duration = Duration::from_secs(2);
 
 /// Where and how one step's agent runs, over the run's own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -896,30 +893,89 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
 
 /// Drives every run under way, with no console open and across restarts. First, as kiln starts, it
 /// counts the steps of the plans kept without their count (`super::count_steps`), so a list of them
-/// in brief reads none of their words.
+/// in brief reads none of their words. Then it moves the runs under way on as what they wait for changes, by nothing
+/// else (goal 9, plan 01a1a87b2cec step 5: it read them every two seconds, about 0.4 timer wakes a second in the lab,
+/// train 34's census): a write to the runs, their steps or the goals; and while a run is under way, the info or the end
+/// of an agent session of one of its steps at work, or of its parent, or of one of the parent's children (whose room its
+/// waiting steps start within: a child's info names its parent).
 pub async fn drive(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
     match super::count_steps(&hub.store).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(plans = n, "plans' steps counted"),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "plans' steps not counted: their briefs count them from their words"),
     }
+    let written = hub.store.changes().watch(&["plan_runs", "plan_run_steps", "goal_items"]);
+    let mut sessions: Option<crate::memory::lanes::Reader<Arc<str>>> = None;
     loop {
-        if !hub.shutdown.sleep(EVERY).await {
-            return Ok(());
+        let running = under_way(&hub).await?;
+        // Listening before the runs are looked at: a session's change after the look is heard.
+        if running.is_empty() {
+            sessions = None;
+        } else if sessions.is_none() {
+            sessions = match hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes())) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the plans' driver can't hear agent sessions: their runs move on as their goals and steps are written");
+                    None
+                }
+            };
         }
-        let running: Vec<String> = hub
-            .store
-            .call(|c| {
-                let mut st = c.prepare("SELECT id FROM plan_runs WHERE mode = 'agents' AND state = 'running'")?;
-                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                Ok(v)
-            })
-            .await
-            .unwrap_or_default();
-        for run in running {
-            if let Err(e) = advance(&hub, &run).await {
+        let mut watched = Vec::new();
+        for run in &running {
+            if let Err(e) = advance(&hub, run).await {
                 tracing::warn!(%run, error = %format!("{e:#}"), "plan run");
             }
+            watched.extend(watched_by(&hub, run).await);
+        }
+        let heard = async {
+            let Some(events) = sessions.as_mut() else { return std::future::pending().await };
+            loop {
+                match events.recv().await {
+                    Ok(ev) if watched.iter().any(|id| ev.contains(id.as_str())) => return Heard::Change,
+                    Ok(_) => {}
+                    // Some lost: looked at again.
+                    Err(crate::memory::lanes::RecvError::Overflowed(_)) => return Heard::Change,
+                    Err(crate::memory::lanes::RecvError::Closed) => return Heard::Closed,
+                }
+            }
+        };
+        let woke = futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = written.notified().fuse() => Heard::Change,
+            h = heard.fuse() => h,
+        };
+        if matches!(woke, Heard::Closed) {
+            sessions = None;
+        }
+    }
+}
+
+/// What the plans' driver heard of the agent sessions.
+enum Heard {
+    Change,
+    /// Their events ended: the hub is going.
+    Closed,
+}
+
+/// The runs under way.
+async fn under_way(hub: &Hub) -> anyhow::Result<Vec<String>> {
+    hub.store
+        .read(|c| {
+            let mut st = c.prepare_cached("SELECT id FROM plan_runs WHERE mode = 'agents' AND state = 'running'")?;
+            let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(v)
+        })
+        .await
+}
+
+/// The agent sessions whose change can move run `run` on: its steps' agents at work, and its parent.
+async fn watched_by(hub: &Hub, run: &str) -> Vec<String> {
+    match load_run(hub, run).await {
+        Ok((head, rows)) => rows.into_iter().filter(|r| r.status == "started").filter_map(|r| r.agent).chain(head.config.parent).collect(),
+        Err(e) => {
+            tracing::warn!(%run, error = %format!("{e:#}"), "a plan run's agents weren't read: it moves on as its goals and steps are written");
+            Vec::new()
         }
     }
 }
@@ -1107,6 +1163,35 @@ pub async fn met(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the plans' driver, about 0.4 timer wakes a second, each a
+    /// read of the runs under way): with no run under way it arms no clock, and a write to the store wakes it. Do: a
+    /// scratch hub's driver started and settled; two and a half seconds; a write (a store in memory says no tables, so
+    /// every watch is told). Expect: no poll in the quiet (it woke every two seconds); the write wakes it.
+    #[test]
+    fn g9_s5_the_plans_driver_arms_no_clock_and_wakes_for_a_write() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = std::time::Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), drive(Arc::clone(&hub)))));
+            let seen = crate::rt::settled(&polls, until).await?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with no run under way");
+            let row = crate::store::AgentRow { name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: false, last_seen: 0, enrolled_at: 0 };
+            hub.store.upsert_agent(row).await?;
+            while polls.load(Ordering::Relaxed) == seen {
+                anyhow::ensure!(std::time::Instant::now() < until, "a write never woke the driver");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
 
     /// The run's sequencing on a hub of its own, under a timeout: in a plan whose steps don't say
     /// what they wait for, each step's agent starts once the step before is met, one unmet stops the

@@ -636,6 +636,7 @@ async fn op_id(api: &Api, path: &str) -> Option<u64> {
 }
 
 /// Waits for the sync after `before` to finish with the app healthy.
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 async fn wait_for(api: &Api, path: &str, json_out: bool, before: Option<u64>) -> Result<()> {
     let mut last = String::new();
     for _ in 0..1200 {

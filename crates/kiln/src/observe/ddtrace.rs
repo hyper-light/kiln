@@ -63,6 +63,7 @@ pub fn is_tracer(path: &str) -> bool {
 /// Starts the concentrator of this node (`host`) and the task that writes its buckets as they come
 /// due, until `shutdown`: then every bucket open, offered until taken (two seconds at the most), what
 /// the node owes as it stops (`super::owes_last`).
+#[allow(clippy::disallowed_methods)] // (e) a tracer's flush every second, picked
 pub fn start(o: Observe, host: String, shutdown: crate::rt::Shutdown) {
     if NODE.set((host.clone(), Mutex::new(Concentrator::new(&host)), Mutex::new(Sampler::new(target_tps())))).is_err() {
         return;
@@ -110,6 +111,7 @@ fn every_bucket(o: &Observe) -> Option<kiln_obs::otlp::metrics::Decoded> {
 }
 
 /// `batches` offered, each until taken (until `until`: a node behind on its writes).
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn offer_last(o: &Observe, batches: Vec<kiln_obs::otlp::metrics::Decoded>, until: std::time::Instant) {
     for mut d in batches {
         while let Err(back) = o.offer_samples_or_back(d) {
@@ -124,6 +126,7 @@ async fn offer_last(o: &Observe, batches: Vec<kiln_obs::otlp::metrics::Decoded>,
 
 /// As a runner retires (an upgrade's new build took over, its own jobs done), its process ending
 /// with nothing stopped: every bucket open written, and waited on, for `within` at the most.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn finish(within: Duration) {
     let Some(o) = super::api::get() else { return };
     let until = std::time::Instant::now() + within;

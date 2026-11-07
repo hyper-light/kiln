@@ -411,6 +411,7 @@ fn run_line(r: &Value) -> String {
     format!("#{:<5} {:<16} {:<28} {:<10} {:<9} {:<8} {}", r.get("number").and_then(Value::as_i64).unwrap_or(0), state, s("workflow").trim_start_matches(".github/workflows/"), s("event"), s("branch"), s("sha").get(..7).unwrap_or_default(), s("id"))
 }
 
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 pub async fn runs(args: RunsArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     if let Some(id) = &args.run {
@@ -463,6 +464,7 @@ pub struct LogsArgs {
     follow: bool,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 pub async fn logs(args: LogsArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let legs: Vec<(String, String)> = match api.call(Method::Get, &format!("/legs/{}", enc(&args.id)), None).await {

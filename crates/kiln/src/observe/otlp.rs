@@ -794,6 +794,7 @@ fn addr_of(var: &str, port: u16) -> Option<std::net::SocketAddr> {
 }
 
 /// Serves the runner's receiver until `shutdown`. A port held is said once and tried again.
+#[allow(clippy::disallowed_methods)] // (b) a local receiver's bind retried, picked
 pub async fn serve_local(addr: std::net::SocketAddr, o: Observe, shutdown: crate::rt::Shutdown) {
     use futures::FutureExt as _;
     let bind = || {

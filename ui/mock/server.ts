@@ -1571,7 +1571,7 @@ function overview() {
     },
     queue: queueCounts(),
     agents: { connected: connected.length, total: agents.size, slots: connected.reduce((s, a) => s + a.slots, 0), busy: connected.reduce((s, a) => s + a.busy, 0) },
-    system: { version: VERSION, uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
+    system: { version: VERSION, started_ms: STARTED - 86_000_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
   };
 }
 
@@ -2096,6 +2096,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/system" && m === "GET") {
       return json(res, 200, {
         version: VERSION,
+        started_ms: STARTED - 86_000_000,
         uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000,
         generation,
         children,

@@ -125,7 +125,3 @@ export function isTerminal(s: Status): boolean {
 export function isActive(s: Status): boolean {
   return s === "running" || s === "queued" || s === "pending";
 }
-
-export function formatUptime(s: number): string {
-  return formatDuration(s);
-}

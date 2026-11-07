@@ -270,6 +270,7 @@ impl Kept {
 
     /// Waits for the stream of `hub` before this one (its settings were changed) to have written
     /// its offsets down and ended.
+    #[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
     async fn turn(&self, hub: &str) -> Turn<'_> {
         while !super::lock(&self.reading).insert(hub.to_owned()) {
             crate::rt::sleep(Duration::from_millis(50)).await;
@@ -367,6 +368,7 @@ impl Progress {
 
     /// Waits a moment for what was offered to be written ([`STOP_WAIT`]), then writes the offsets
     /// down: a connection that failed, or a stream stopping, repeats only what was not written.
+    #[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
     async fn settle(&mut self, r: &Reader) {
         let end = Instant::now() + STOP_WAIT;
         loop {
@@ -392,6 +394,7 @@ impl Progress {
 
 /// Reads the hub until `stop` or `server` is cancelled: connected again after a failure, 1 s then
 /// doubling up to a minute, each failure and recovery an event once.
+#[allow(clippy::disallowed_methods)] // (c) Event Hubs pulled at its wait; its push would tell
 pub async fn run(r: Reader, stop: crate::rt::Shutdown, server: crate::rt::Shutdown) {
     let Some(hubs) = r.azure.event_hubs.clone() else { return };
     let mut failed = 0u32;
@@ -431,6 +434,7 @@ pub async fn run(r: Reader, stop: crate::rt::Shutdown, server: crate::rt::Shutdo
 
 /// One connection's reading, until it fails (an error) or is stopped (`Ok`): from the offsets
 /// written, each partition without one from the lookback.
+#[allow(clippy::disallowed_methods)] // (c) Event Hubs throttled: waits as it says; a picked pause
 async fn read(r: &Reader, hubs: &Config, stop: &crate::rt::Shutdown, server: &crate::rt::Shutdown, failed: &mut u32, progress: &mut Progress) -> anyhow::Result<()> {
     let tls = if hubs.tls { Some(Arc::new(crate::http::tls::ClientTls::new(crate::http::client::Roots::WebPki, None)?)) } else { None };
     let source = Source { bootstrap: vec![hubs.bootstrap()], topic: r.hub.clone(), tls, sasl: Some(sasl(r, hubs).await?), client: format!("kiln-{}", r.name) };

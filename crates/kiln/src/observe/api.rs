@@ -2266,6 +2266,7 @@ async fn refuse_tail(socket: crate::http::ws::WebSocket, why: &str) -> anyhow::R
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a log tail read every TAIL_READ; the store's writes could tell
 async fn follow_tail(socket: crate::http::ws::WebSocket, follower: kiln_obs::logs::tail::Follower, search: kiln_obs::logs::search::Search, rate: u32) -> anyhow::Result<()> {
     use futures::{FutureExt as _, StreamExt as _};
     use std::time::Instant;

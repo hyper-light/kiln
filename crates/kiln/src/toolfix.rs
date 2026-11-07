@@ -379,6 +379,7 @@ fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why
 /// Follows a fix's agent until it's done (idle, stopped or ended), then checks the runner and runs
 /// the job again. While it waits on a person, is paused or its machine is away, kiln waits for a
 /// change rather than for it to settle (which it already has).
+#[allow(clippy::disallowed_methods)] // (b) a failed wait retried after 30 s, picked
 async fn follow(hub: Arc<Hub>, cx: crate::ops::Cx, id: String) {
     let Some(agent) = hub.tool_fixes.load().get(&id).map(|f| f.agent.clone()) else { return };
     let until = std::time::Instant::now() + FOLLOW_FOR;
