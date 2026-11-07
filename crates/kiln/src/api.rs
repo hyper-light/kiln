@@ -7035,10 +7035,9 @@ fn session_error(error: String) -> String {
 /// largest messages (1 MiB) held for it at a time.
 const FEED_READ: usize = 16;
 
-/// How long a viewer with nothing to read waits before it looks whether its feed broke (a full bus
-/// may refuse the resync marker as well as its frames), and how long a viewer of a session whose
-/// feed the bus can't hold waits between snapshots. Under 5 s, so a viewer whose feed broke starts
-/// over within 5 s of it, its wait having begun at most a frame's handling after.
+/// How long a viewer of a session whose feed the bus can't hold waits between snapshots. A viewer with a feed waits
+/// on the feed and its refusals ([`crate::harness::live::Viewer::refused`]: a full bus may refuse the resync marker
+/// as well as its frames), on no clock (goal 9, plan 01a1a87b2cec step 5).
 const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a viewer's wait on its session's feed came to.
@@ -7048,8 +7047,8 @@ enum Live {
     Refused(kiln_seams::bus::Refusal),
     /// The session has no feed on the bus: time for another snapshot.
     Feedless,
-    /// A while with nothing: time to see whether the feed broke since (a full bus may refuse its
-    /// resync marker as well as its frames).
+    /// The feed refused something: time to see whether it broke since the viewer last started over (a full bus may
+    /// refuse its resync marker as well as its frames).
     Quiet,
 }
 
@@ -7315,12 +7314,14 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     }
     loop {
         let live = {
-            let (bus, topic, from) = (&hub.bus, &topic, at);
+            // Its refusals listened for before they're read: one after the read ends the wait; one before it, the read finds.
+            let (bus, topic, from, refused, broke) = (&hub.bus, &topic, at, viewer.refused(), viewer.refusals() != refusals);
             waited(async move {
                 match from {
+                    Some(_) if broke => Live::Quiet,
                     Some(from) => {
                         let wait = bus.wait(topic, from).fuse();
-                        let quiet = crate::rt::sleep(FEEDLESS).fuse();
+                        let quiet = refused.fuse();
                         futures::pin_mut!(wait, quiet);
                         futures::select_biased! {
                             w = wait => match w {

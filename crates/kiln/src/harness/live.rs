@@ -270,6 +270,9 @@ struct Shared {
     /// started over starts over again, whether or not a resync marker ever reaches it (a full bus
     /// may refuse that too).
     refusals: AtomicU64,
+    /// Told as `refusals` moves: a viewer waits on it beside its feed, so it learns its feed broke as it breaks (goal
+    /// 9, plan 01a1a87b2cec step 5: it looked after every four quiet seconds).
+    refused: crate::rt::Changed,
     /// The session ended (its feed dropped): the last of its viewers to go deletes the topic.
     ended: AtomicBool,
     /// The ended feed's topic was deleted: by whichever of the feed and its last viewer came first.
@@ -285,9 +288,15 @@ impl Shared {
     /// topic made again with the same settings is the one made). A refusal is counted.
     fn make(&self, generation: u32) -> Result<(), Refusal> {
         at_once(self.bus.create(&self.topic(generation), Topic { class: Class::Ephemeral, retain: retain() })).inspect_err(|_| {
-            self.refusals.fetch_add(1, Ordering::AcqRel);
+            self.refuse();
             crate::metrics::bus().refused.inc(&["create"]);
         })
+    }
+
+    /// A refusal counted, and the viewers told.
+    fn refuse(&self) {
+        self.refusals.fetch_add(1, Ordering::AcqRel);
+        self.refused.notify();
     }
 
     /// Deletes the ended feed's topic (of its last generation, `generation`), once.
@@ -382,6 +391,11 @@ impl Viewer {
     pub fn refusals(&self) -> u64 {
         self.shared.refusals.load(Ordering::Acquire)
     }
+
+    /// A wait for the feed's next refusal, begun now: listened for before [`Viewer::refusals`] is read.
+    pub fn refused(&self) -> crate::rt::Listen<'_> {
+        self.shared.refused.listen()
+    }
 }
 
 impl Drop for Viewer {
@@ -435,6 +449,7 @@ impl Feed {
             whole_state: AtomicUsize::new(0),
             whole_changes: AtomicUsize::new(0),
             refusals: AtomicU64::new(0),
+            refused: crate::rt::Changed::new(),
             ended: AtomicBool::new(false),
             deleted: AtomicBool::new(false),
         };
@@ -586,7 +601,7 @@ impl Feed {
 
     fn refused(&mut self, topic: &str, e: &Refusal) -> Published {
         self.broken = true;
-        self.shared.refusals.fetch_add(1, Ordering::AcqRel);
+        self.shared.refuse();
         crate::metrics::bus().refused.inc(&["publish"]);
         tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a frame the bus refused: the session's viewers start over at its next one");
         Published::Refused
@@ -828,6 +843,23 @@ mod tests {
         assert_eq!(feed.publish(&huge), Published::Refused);
         assert_eq!(feed.publish(&huge), Published::Refused);
         assert!(viewer.refusals() > before, "the viewer sees the refusals");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: a viewer of a quiet session looked whether its feed broke
+    /// every four seconds, about 0.3 timer wakes a second a viewer): a refusal wakes a viewer's wait begun before it,
+    /// and nothing else does. Do: a viewer's wait on its feed's refusals; looked at with none; a frame refused.
+    /// Expect: pending; then over.
+    #[test]
+    fn g9_s5_a_refusal_wakes_a_viewer_waiting_on_its_feed() -> anyhow::Result<()> {
+        let b = bus()?;
+        let mut feed = Feed::open(Arc::clone(&b), "s1");
+        let (viewer, _) = feed.attach(Patches::default());
+        let mut wait = std::pin::pin!(viewer.refused());
+        anyhow::ensure!(futures::FutureExt::now_or_never(wait.as_mut()).is_none(), "no refusal: still waiting");
+        let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+        anyhow::ensure!(feed.publish(&huge) == Published::Refused, "refused");
+        anyhow::ensure!(futures::FutureExt::now_or_never(wait.as_mut()).is_some(), "the refusal ended the wait");
         Ok(())
     }
 
