@@ -2662,20 +2662,21 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
 async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked; in brief, for
     // a list that opens each on asking (an agent's Plan tab).
-    let session = q.get("session").map(String::as_str).filter(|s| !s.is_empty());
-    let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
+    let session = q.get("session").filter(|s| !s.is_empty()).cloned();
+    let asked = crate::plans::Asked { q: q.get("q").cloned(), tag: q.get("tag").cloned(), session, proposed: q.get("proposed").is_some_and(|p| p == "1" || p == "true") };
     let brief = q.get("brief").is_some_and(|b| b == "1" || b == "true");
-    // Kept in memory while it's what the store holds, each plan encoded once (goal 10, plan
-    // 01a1a87b2dae step 2); otherwise from the store, as before.
-    if let Some(listed) = hub.harness.views.plans.fresh(&hub.store, crate::plans::listed) {
-        return Ok(pre_encoded(listed.1.answer(q.get("q").map(String::as_str), q.get("tag").map(String::as_str), session, proposed, brief)));
+    // What agents' pages read (the plans in brief, the plan an agent proposed) is kept in memory while
+    // it's what the store holds, each plan encoded once (goal 10, plan 01a1a87b2dae step 2); a search,
+    // or a list in full of the rest, from the store, which reads whole only the plans it answers with.
+    if crate::plans::Listed::answers(&asked, brief)
+        && let Some(listed) = hub.harness.views.plans.fresh(&hub.store, crate::plans::listed)
+    {
+        return Ok(pre_encoded(listed.1.answer(&asked, brief)));
     }
-    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
-    let plans = crate::plans::of_source(plans, session, proposed);
     if brief {
-        return Ok(srv::json(StatusCode::OK, &plans.iter().map(crate::plans::brief).collect::<Vec<_>>()));
+        return Ok(srv::json(StatusCode::OK, &crate::plans::briefs(hub, asked).await.map_err(plan_err)?));
     }
-    Ok(srv::json(StatusCode::OK, &plans))
+    Ok(srv::json(StatusCode::OK, &crate::plans::list(hub, asked).await.map_err(plan_err)?))
 }
 
 /// `GET /api/harness/sessions/{id}/goals`: its goal stack, kept in memory while it's what the store
@@ -7477,8 +7478,15 @@ async fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     hub.bus.observe();
     // Written out on the blocking pool, not on the request's shard: every family's every series, hundreds of
     // kilobytes, in one call, held a shard 2.5 ms in g9p7's calm lab (goal 10, plan 01a1a87b2dae step 5). What it
-    // reads is the process's, not a shard's.
-    let text = match crate::rt::blocking(crate::metrics::render).await {
+    // reads is the process's, not a shard's. The builds of the store's index migrations (`crate::store::indexes`)
+    // are written out with them.
+    let text = match crate::rt::blocking(|| {
+        let mut text = crate::metrics::render();
+        crate::store::indexes::render(&mut text);
+        text
+    })
+    .await
+    {
         Ok(text) => text,
         Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("the figures couldn't be written out: {e:#}")).into_response(),
     };
@@ -8172,7 +8180,7 @@ mod tests {
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
             hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
-            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            let source = crate::plans::Source { session: Some("a".into()), proposed: true, ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), tags: vec!["Lab".into()], source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::plans::create(&hub, crate::plans::New { body: "Another's".into(), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
@@ -8182,7 +8190,8 @@ mod tests {
             // it nothing. A write of the hub's own between the two makes them stale: tried again.
             let deadline = Instant::now() + Duration::from_secs(30);
             let fresh = || hub.harness.views.plans.fresh(&hub.store, crate::plans::listed).is_some() && hub.harness.views.goals.fresh(&hub.store, crate::goals::stacks).is_some();
-            let queries = [q(&[("session", "a")]), q(&[]), q(&[("brief", "1")]), q(&[("q", "MEASURE")]), q(&[("tag", "Lab")]), q(&[("q", "  ")]), q(&[("session", "nobody")])];
+            // The plans agents' pages read: in brief, and the plan an agent proposed (its Plan tab).
+            let queries = [q(&[("session", "a"), ("proposed", "1")]), q(&[("proposed", "1")]), q(&[("brief", "1")]), q(&[("brief", "1"), ("tag", "Lab")]), q(&[("brief", "1"), ("session", "a")]), q(&[("brief", "1"), ("q", "  ")]), q(&[("brief", "1"), ("session", "nobody")])];
             let (list, one, events, plans, goals, none) = loop {
                 while !fresh() {
                     anyhow::ensure!(Instant::now() < deadline, "the reads kept in memory weren't made");
@@ -8209,11 +8218,28 @@ mod tests {
             let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a in the list"))?;
             assert_eq!(one.as_ref(), serde_json::to_vec(&a)?.as_slice());
             assert!(events.starts_with(br#"{"events":[{"#), "{}", String::from_utf8_lossy(&events));
+            // Each as the plans in full say, filtered by their tag, their words, their agent and whether
+            // it proposed them; and so is each read the store answers (a search, a list in full).
+            let all = crate::plans::list(&hub, crate::plans::Asked::default()).await?;
+            let want = |query: &HashMap<String, String>| -> anyhow::Result<Vec<u8>> {
+                let words = query.get("q").map(|q| q.to_lowercase()).filter(|q| !q.trim().is_empty());
+                let session = query.get("session").filter(|s| !s.is_empty());
+                let p: Vec<&crate::plans::Plan> = all
+                    .iter()
+                    .filter(|p| query.get("tag").is_none_or(|t| p.tags.contains(t)))
+                    .filter(|p| words.as_ref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))))
+                    .filter(|p| session.is_none_or(|x| p.source.as_ref().and_then(|s| s.session.as_ref()) == Some(x)))
+                    .filter(|p| !query.contains_key("proposed") || p.source.as_ref().is_some_and(|s| s.proposed))
+                    .collect();
+                Ok(if query.contains_key("brief") { serde_json::to_vec(&p.iter().map(|p| crate::plans::brief(p)).collect::<Vec<_>>())? } else { serde_json::to_vec(&p)? })
+            };
+            let stored = [q(&[("session", "a")]), q(&[]), q(&[("q", "MEASURE")]), q(&[("tag", "Lab")]), q(&[("q", "  ")]), q(&[("session", "nobody")]), q(&[("brief", "1"), ("q", "MEASURE")])];
             for (query, got) in queries.iter().zip(&plans) {
-                let p = crate::plans::list(&hub, query.get("q").cloned(), query.get("tag").cloned()).await?;
-                let p = crate::plans::of_source(p, query.get("session").map(String::as_str).filter(|s| !s.is_empty()), false);
-                let want = if query.contains_key("brief") { serde_json::to_vec(&p.iter().map(crate::plans::brief).collect::<Vec<_>>())? } else { serde_json::to_vec(&p)? };
-                assert_eq!(String::from_utf8_lossy(got), String::from_utf8_lossy(&want), "{query:?}");
+                assert_eq!(String::from_utf8_lossy(got), String::from_utf8_lossy(&want(query)?), "{query:?}");
+            }
+            for query in &stored {
+                let got = body_of(plans_list(&hub, query).await.map_err(api)?).await?;
+                assert_eq!(String::from_utf8_lossy(&got), String::from_utf8_lossy(&want(query)?), "{query:?}");
             }
             assert_eq!(goals, serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
             assert_eq!(none, serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
@@ -8512,7 +8538,7 @@ mod tests {
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
             hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
-            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            let source = crate::plans::Source { session: Some("a".into()), proposed: true, ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
             // A runner (its row, its live record) and a repository's run.
@@ -8556,7 +8582,7 @@ mod tests {
                 "/api/me",
                 "/api/overview",
                 "/api/runs",
-                "/api/plans?session=a",
+                "/api/plans?session=a&proposed=1",
                 "/api/harness/sessions/a/goals",
                 "/api/harness/sessions/nobody/goals",
             ];
@@ -8601,8 +8627,8 @@ mod tests {
             let stored = overview_json(&hub, &hub.store.stats(None).await?, &hub.agent_list().await, &system_now(&hub), queue_now());
             assert_eq!(without_uptime(serde_json::from_slice(&got("/api/overview"))?), without_uptime(stored));
             assert_eq!(got("/api/runs"), serde_json::to_vec(&crate::reads::runs(&hub.store, &HashMap::new(), None).await?)?);
-            let plans = crate::plans::of_source(crate::plans::list(&hub, None, None).await?, Some("a"), false);
-            assert_eq!(got("/api/plans?session=a"), serde_json::to_vec(&plans)?);
+            let plans = crate::plans::list(&hub, crate::plans::Asked { session: Some("a".into()), proposed: true, ..crate::plans::Asked::default() }).await?;
+            assert_eq!(got("/api/plans?session=a&proposed=1"), serde_json::to_vec(&plans)?);
             assert_eq!(got("/api/harness/sessions/a/goals"), serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
             assert_eq!(got("/api/harness/sessions/nobody/goals"), serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
             // A runner's live record changed: its maker makes the list again before any read, and the

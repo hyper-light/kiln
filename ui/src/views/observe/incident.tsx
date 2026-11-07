@@ -26,7 +26,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
-import { formatDuration, relativeTime } from "@/lib/format";
+import { formatDuration, relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { change, invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
@@ -88,7 +88,7 @@ function IncidentView({ id }: { id: string }) {
             <Severity s={a.severity} /> <IncidentState s={a.state} />
             <span className="text-[#8c8f98]">
               {" "}
-              — declared {relativeTime(seconds(a.declared))} by {m ? "its monitor" : a.declared_by.name}
+              — declared {relativeTime(seconds(a.declared))} by {m ? "its monitor" : shortIds(a.declared_by.name)}
               {a.state === "resolved" && a.resolved ? `, resolved ${relativeTime(seconds(a.resolved))}` : ""}
               {a.is_test ? " · a test" : ""}
             </span>
@@ -276,7 +276,7 @@ function Timeline({ id }: { id: string }) {
             <time dateTime={c.created} title={at(c.created)}>
               {relativeTime(seconds(c.created))}
             </time>{" "}
-            · {c.author}
+            · {shortIds(c.author)}
             {c.cell_type === "markdown" && c.important && <span className="chip ml-2">important</span>}
           </p>
           <Cell c={c} />

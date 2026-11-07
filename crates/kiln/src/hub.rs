@@ -3628,25 +3628,20 @@ impl Hub {
         let held_by_other = |job: &str| {
             self.instances.load().owner(&crate::instances::Owned::Job(job.to_owned())).is_some_and(|o| o != peer && others.contains(&o))
         };
-        // Reconcile what the agent says it runs with what we think it runs.
-        let db_running: Vec<Job> = self
-            .store
-            .running_jobs()
-            .await?
-            .into_iter()
-            .filter(|j| j.agent.as_deref() == Some(name.as_str()))
-            .collect();
+        // Reconcile what the agent says it runs with what we think it runs: the ids of the jobs the
+        // store has running on it, the rest of their rows unread (the DB query audit, 2026-11-06).
+        let db_running: Vec<String> = self.store.running_on(name.clone()).await?;
         let mut keep = Vec::new();
-        for j in &db_running {
-            if h.running.contains(&j.id) {
-                keep.push(j.id.clone());
-            } else if held_by_other(&j.id) {
+        for id in &db_running {
+            if h.running.contains(id) {
+                keep.push(id.clone());
+            } else if held_by_other(id) {
                 // Another runner process of this machine runs it.
             } else {
                 self.store
-                    .requeue_job(j.id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
+                    .requeue_job(id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
                     .await?;
-                self.emit_job(&j.id).await;
+                self.emit_job(id).await;
             }
         }
         // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
@@ -4259,14 +4254,14 @@ impl Hub {
     }
 
     async fn schedule_once(&self) -> anyhow::Result<()> {
-        let queued = self.store.queued_jobs(2000).await?;
+        // The waiting jobs, how many run, and the waiting jobs' runs, as one read saw them (the DB query
+        // audit, 2026-11-06: where it read the first two apart and then each run on its own).
+        let crate::store::Scheduling { queued, running, runs } = self.store.scheduling(2000).await?;
         metrics::global().jobs_queued.set(i64::try_from(queued.len()).unwrap_or(i64::MAX));
-        let running = i64::try_from(self.store.running_jobs().await?.len()).unwrap_or(0);
         metrics::global().jobs_running.set(running);
         if queued.is_empty() {
             return Ok(());
         }
-        let mut runs = HashMap::new();
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
         // Its turns on its shard: a queue that finds no runner was walked whole in one poll, every second; one job's
@@ -4276,11 +4271,7 @@ impl Hub {
         for job in queued {
             turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
-            if !runs.contains_key(&job.run_id) {
-                let r = self.store.run(job.run_id.clone()).await?;
-                runs.insert(job.run_id.clone(), r);
-            }
-            let Some(Some(run)) = runs.get(&job.run_id) else { continue };
+            let Some(run) = runs.get(&job.run_id) else { continue };
             // `if:` conditions are evaluated against the run.
             if let Some(cond) = &spec.condition {
                 let mut ctx = Context::default();
@@ -4493,15 +4484,9 @@ impl Hub {
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
-        let now = crate::util::now_unix();
-        for job in self.store.running_jobs().await? {
-            let Some(spec) = &job.spec else { continue };
-            let Some(started) = job.started_at else { continue };
-            let limit = i64::from(spec.timeout_minutes) * 60;
-            // Its time limit doesn't run while it's paused (W26-R22).
-            if now - started - job.paused_s(now) <= limit {
-                continue;
-            }
+        // The jobs past their limit (its time doesn't run while a job's paused, W26-R22), read alone (the
+        // DB query audit, 2026-11-06: where every running job was read whole and its spec parsed).
+        for job in self.store.timed_out(crate::util::now_unix()).await? {
             let sent = self.cancel_sent.load().get(&job.id).copied();
             match sent {
                 None => {
@@ -4518,7 +4503,7 @@ impl Hub {
                     self.cancel_sent.update(|c| c.remove(&job.id));
                     let (run_id, _) = self
                         .store
-                        .finish_job(job.id.clone(), Status::TimedOut, None, Some(format!("exceeded {} min", spec.timeout_minutes)), None, None)
+                        .finish_job(job.id.clone(), Status::TimedOut, None, Some(format!("exceeded {} min", job.minutes)), None, None)
                         .await?;
                     self.logs.finish(&job.id);
                     self.emit_job(&job.id).await;
@@ -4572,8 +4557,9 @@ impl Hub {
         }
         self.declined.update(|d| d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF));
         // Running jobs assigned to agents we have no session for at all (after a server restart).
+        // By their ids and runners alone, the rest of their rows unread (the DB query audit, 2026-11-06).
         if self.started.elapsed() > AGENT_GRACE
-            && let Ok(running) = self.store.running_jobs().await {
+            && let Ok(running) = self.store.running_holders().await {
                 // Jobs held by a connected agent, or by one still inside its reconnect grace, are
                 // not orphans.
                 let known: HashSet<String> = self
@@ -4583,10 +4569,10 @@ impl Hub {
                     .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= AGENT_GRACE))
                     .flat_map(|a| a.running.clone())
                     .collect();
-                for j in running {
-                    if !known.contains(&j.id) && j.agent.as_deref() != Some("-")
-                        && let Ok(true) = self.store.requeue_job(j.id.clone(), "orphaned after restart".into()).await {
-                            self.emit_job(&j.id).await;
+                for (id, agent) in running {
+                    if !known.contains(&id) && agent.as_deref() != Some("-")
+                        && let Ok(true) = self.store.requeue_job(id.clone(), "orphaned after restart".into()).await {
+                            self.emit_job(&id).await;
                         }
                 }
             }
@@ -6142,6 +6128,45 @@ pub(crate) mod tests {
         let by_run = ranked.first().map(|c| c.runner.name.clone());
         assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
         Ok(())
+    }
+
+    /// The DB query audit (2026-11-06): the scheduler's timeout check acts on the jobs past their limit
+    /// alone: a cancel to the runner of each (its time paused left out), then, a minute on without its
+    /// runner's word, the job ended as timed out, saying its limit.
+    #[test]
+    fn dbq_r4_the_timeout_check_acts_on_the_jobs_past_their_limit() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let now = crate::util::now_unix();
+            hub.store
+                .call(move |c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r1', 'acme/x', '', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', 'r1', 1, 'ci', 'push', 'main', 'abc', 'running', 0);",
+                    )?;
+                    for (id, agent, started, paused_ms) in [("over", "ag-a", now - 200, 0), ("paused", "ag-a", now - 200, 100_000), ("within", "ag-b", now - 30, 0)] {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, started_at, paused_ms) VALUES (?1, 'run1', ?1, ?1, 'running', '[]', '[]', '{\"timeout_minutes\":2}', ?2, ?3, ?4)",
+                            rusqlite::params![id, agent, started, paused_ms],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            hub.check_timeouts().await?;
+            let sent: Vec<String> = hub.cancel_sent.load().keys().cloned().collect();
+            anyhow::ensure!(sent == ["over"], "a cancel for the one past its limit alone: {sent:?}");
+            let long_ago = Instant::now().checked_sub(Duration::from_secs(61)).ok_or_else(|| anyhow::anyhow!("no minute before now"))?;
+            hub.cancel_sent.update(|c| c.insert("over".into(), long_ago));
+            hub.check_timeouts().await?;
+            let over = hub.store.job("over".into()).await?.ok_or_else(|| anyhow::anyhow!("over is gone"))?;
+            anyhow::ensure!(over.status == Status::TimedOut && over.error.as_deref() == Some("exceeded 2 min"), "{:?} {:?}", over.status, over.error);
+            anyhow::ensure!(hub.cancel_sent.load().is_empty(), "settled");
+            for id in ["paused", "within"] {
+                anyhow::ensure!(hub.store.job(id.into()).await?.is_some_and(|j| j.status == Status::Running), "{id} runs on");
+            }
+            Ok(())
+        })
     }
 }
 

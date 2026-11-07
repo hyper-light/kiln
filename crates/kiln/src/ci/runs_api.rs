@@ -69,7 +69,7 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
                 "{RUN_SELECT} AND r.rowid < ?1 AND (?2 IS NULL OR p.name = ?2 OR p.id = ?2) AND (?3 IS NULL OR r.workflow_id = ?3 OR r.pipeline = ?3)
                  AND (?4 IS NULL OR r.branch = ?4) AND (?5 IS NULL OR r.event = ?5) AND (?6 IS NULL OR r.conclusion = ?6) AND (?7 IS NULL OR r.actor = ?7)
                  AND (?9 IS NULL OR p.name IN (SELECT value FROM json_each(?9)))
-                 ORDER BY r.rowid DESC LIMIT ?8"
+                 ORDER BY r.rowid DESC LIMIT +?8"
             );
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![cursor, repo, workflow, branch, event, conclusion, actor, limit + 1, only], run_row)?;
@@ -533,8 +533,9 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 }
 
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
-/// was (a new run; `{ mode: "all" }`, the default).
-pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+/// was (a new run; `{ mode: "all" }`, the default), by `by`: agent session `agent` (its whole id)
+/// when one asks.
+pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
     // Another provider's run (W23): its provider reruns it.
     if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
@@ -571,7 +572,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
     let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = crate::memory::queue::answer();
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), agent: agent.map(str::to_owned), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),

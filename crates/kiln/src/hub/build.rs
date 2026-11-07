@@ -262,9 +262,9 @@ mod tests {
             let planned = crate::pipeline::plan(&crate::pipeline::parse(&yaml)?, &crate::pipeline::Context::default())?;
             let run = Run { id: "run1".into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
             hub.store.create_run(run, planned).await?;
-            anyhow::ensure!(hub.store.queued_jobs(2000).await?.len() == 1000, "a thousand queued");
+            anyhow::ensure!(hub.store.scheduling(2000).await?.queued.len() == 1000, "a thousand queued");
             hub.schedule_once().await?;
-            anyhow::ensure!(hub.store.queued_jobs(2000).await?.len() == 1000, "no runner: every one still queued");
+            anyhow::ensure!(hub.store.scheduling(2000).await?.queued.len() == 1000, "no runner: every one still queued");
             let code: String = include_str!("../hub.rs").split("\n#[cfg(test)]\npub(crate) mod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
             let walk = code.split("async fn schedule_once(&self)").nth(1).and_then(|rest| rest.split("for job in queued {").nth(1)).unwrap_or_default();
             anyhow::ensure!(walk.trim_start().starts_with("turns.end().await;"), "each job's pick in a turn, its poll ended with it: {}", walk.get(..200).unwrap_or(walk));

@@ -63,6 +63,8 @@ pub struct Given {
     pub reply: Option<crate::memory::queue::Sender<String>>,
     /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
     pub culprit: Option<Try>,
+    /// The agent session that asked for the run (its whole id), when one did: kept with the run.
+    pub agent: Option<String>,
 }
 
 /// A culprit-finding try (docs/ci.md W28-R57), as kiln's bisection starts it. A gate's goes at
@@ -172,6 +174,8 @@ pub enum Msg {
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
         by: String,
+        /// The agent session rerunning it (its whole id), when one is.
+        agent: Option<String>,
         reply: crate::memory::queue::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
@@ -622,6 +626,10 @@ pub struct Handle {
     kept: Rcu<HashMap<String, (String, i64)>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09): set once, then read.
     restored: OnceLock<Restored>,
+    /// Whether the log indexer runs for this hub (`super::logsearch::spawn`), engine on or off.
+    indexing: AtomicBool,
+    /// The lanes' verdict books, kept between reads (`super::verdict::Books`).
+    pub books: super::verdict::Books,
 }
 
 /// What the dispatcher rebuilt as it started: the unfinished runs, their legs, and how long it took.
@@ -635,7 +643,7 @@ pub struct Restored {
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
-        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new() }
+        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new(), indexing: AtomicBool::new(false), books: super::verdict::Books::default() }
     }
 }
 
@@ -1136,8 +1144,12 @@ fn status_of(c: PlanC) -> Status {
     }
 }
 
-/// Starts the dispatcher when the engine is on.
+/// Starts the dispatcher when the engine is on, and the log indexer either way: with the engine off it
+/// keeps the legs not indexed (what the search counts) and indexes none.
 pub fn spawn(hub: Arc<Hub>) {
+    if !hub.ci.indexing.swap(true, Ordering::Relaxed) {
+        super::logsearch::spawn(Arc::clone(&hub), hub.cfg.ci.enabled);
+    }
     if !hub.cfg.ci.enabled {
         return;
     }
@@ -1146,7 +1158,6 @@ pub fn spawn(hub: Arc<Hub>) {
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
     super::insights::spawn(Arc::clone(&hub));
-    super::logsearch::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
@@ -1353,8 +1364,8 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, placed, by, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
+            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, placed, by, agent, reply } => {
+                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, (&by, agent.as_deref())).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
                 Ok(())
             }
@@ -1546,7 +1557,7 @@ impl Dispatch {
             model,
             input: String::new(),
         };
-        let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        let (number, rowid) = runs::create_for(&self.hub, &s.repo, new, s.given.agent.clone()).await?;
         if let Some(r) = &s.given.reply {
             let _ = r.try_send(id.clone());
         }
@@ -1969,7 +1980,7 @@ impl Dispatch {
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
-        by: &str,
+        (by, agent): (&str, Option<&str>),
     ) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
@@ -2000,7 +2011,7 @@ impl Dispatch {
             .filter(|(_, key, j, _)| j.as_deref().is_some_and(|j| !again.runs(j, key)))
             .filter_map(|(id, key, _, _)| last.get(key).map(|rep| (key.clone(), (report_from_json(rep), id.clone()))))
             .collect();
-        let attempt = runs::start_attempt(&self.hub, run, by).await?;
+        let attempt = runs::start_attempt(&self.hub, run, by, agent).await?;
         let mut github = v.get("github").cloned().unwrap_or_default();
         if let Some(o) = github.as_object_mut() {
             o.insert("run_attempt".into(), serde_json::Value::String(attempt.to_string()));

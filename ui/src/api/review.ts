@@ -7,6 +7,7 @@ import { apiPath } from "@/lib/peer-base";
 import type { AboutAsk, AgentBrief } from "./harness";
 import { request } from "./client";
 import { signed } from "@/lib/signing";
+import { shortIds } from "@/lib/format";
 
 export type DiffState = "draft" | "needs-review" | "changes-requested" | "accepted" | "landing" | "landed" | "abandoned";
 
@@ -518,10 +519,10 @@ export const dependenciesRes = (key: string, to: number, from: number | null): R
 export const agentFixesRes = (repo: string): Res<AgentFixes> => ({ key: `review/agent-fixes/${repo}`, fetch: (s) => reviewApi.agentFixes(repo, s) });
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
-/** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */
+/** Who someone is, in words: `agent:a1b2` → "agent a1b2" (a session's whole id by its first eight), `user:ada` → "ada". */
 export function whoSaid(principal: string): string {
   if (principal.startsWith("user:")) return principal.slice(5);
-  if (principal.startsWith("agent:")) return `agent ${principal.slice(6).split(/\s/)[0] ?? ""}`;
+  if (principal.startsWith("agent:")) return `agent ${shortIds(principal).slice(6).split(/\s/)[0] ?? ""}`;
   if (principal === "admin") return "the owner";
   return principal;
 }

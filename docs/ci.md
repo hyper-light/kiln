@@ -407,7 +407,9 @@ New tables come from migrations. The current schema (what `SCHEMA` in `store.rs`
 baseline. Each migration is one file in `crates/kiln/src/store/migrations/`, named
 `<yyyymmdd-hhmm>_<ws>_<topic>.sql` (embedded at build time). They are applied in name order at
 start, each in a transaction, recorded by name in a `migrations` table, and never edited once
-merged, so parallel branches never compete for a number (§5.2). All ids are UUIDv7 strings
+merged, so parallel branches never compete for a number (§5.2). A migration of indexes alone is
+built once kiln serves instead, an index a transaction, and recorded by name with its last
+(`store/indexes.rs`, docs/resilience.md C5). All ids are UUIDv7 strings
 (`crate::util::new_id`). JSON columns hold documented types. The blocks below are numbered for
 reading only.
 
@@ -10261,9 +10263,11 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
   takes a thing by its name and a digest both records agree on first: a leg's hand-on names an
   image's index and each platform's manifest by one name.
 - *Walking a chain* (step 15): `kiln custody walk <digest>` (`GET /api/custody/walk?digest=`, or
-  `?name=`) walks a thing's chain back from where it's used (a record's digest, or a thing's: an
-  image, an artifact, a commit) to where it was made, hop by hop: each record signed by a custodian
-  entitled to it, each digest the last one's, no gap in a custodian's numbers. It says each hop in
+  `?name=`: the newest thing of that name, the case of its ASCII letters aside, or the newest of
+  any name it begins when it ends in `*`, its only wildcard: `%` and `_` are themselves) walks a
+  thing's chain back from where it's used (a record's digest, or a thing's: an image, an artifact,
+  a commit) to where it was made, hop by hop: each record signed by a custodian entitled to it,
+  each digest the last one's, no gap in a custodian's numbers. It says each hop in
   words ("the runner on fedora-2 received commit 4c1e2a from kiln"), or names the first break: the
   record it's at, its kind and why. A record kiln keeps that no longer checks as kiln took it
   (changed where it's kept, or another record's envelope in its place) is a break at that record

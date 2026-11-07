@@ -78,15 +78,40 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_TERM_SESSION",
     "KILN_TRACE_FD",
     "KILN_MACHINE_ID",
+    // A live server's data, addresses and caches, and a runner's socket, as a session under it has
+    // them: `Config::load` takes the first nine over a test's own config (a test's server opened
+    // production's kiln.db through `KILN_DATA_DIR`, 2026-11-06).
+    "KILN_DATA_DIR",
+    "KILN_HTTP_ADDR",
+    "KILN_QUIC_ADDR",
+    "KILN_QUIC_ADVERTISE",
+    "KILN_PUBLIC_URL",
+    "KILN_WEBRTC_ADDR",
+    "KILN_WEBRTC_ADVERTISE",
+    "KILN_CLUSTER_GROUP",
+    "KILN_CLUSTER_LEARNERS",
+    "KILN_RUNNER_SOCK",
+    "KILN_GIT_CACHE",
+    "KILN_REGISTRY_HOST",
+    "KILN_RELAY_LISTEN",
+    "KILN_OTLP_ADDR",
+    "KILN_OTLP_GRPC_ADDR",
     // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
     // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
     "GIT_CONFIG_GLOBAL",
 ];
 
-/// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets
-/// itself goes on).
+/// This build's `kiln`, as a test starts it: none of the `KILN_*` variables the test runs with, those
+/// [`NOT_INHERITED`] names and any other (a kiln the test starts is its own: one a runner's session
+/// passed on points it at that session's server, data, sockets or tokens), nor the rest of
+/// [`NOT_INHERITED`]. What the test sets itself goes on.
 pub fn kiln() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    for (var, _) in std::env::vars_os() {
+        if var.to_str().is_some_and(|v| v.starts_with("KILN_")) {
+            cmd.env_remove(&var);
+        }
+    }
     for var in NOT_INHERITED {
         cmd.env_remove(var);
     }

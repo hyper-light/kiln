@@ -1179,6 +1179,11 @@ pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::R
     done
 }
 
+/// Whether `e` is SQLite's busy or locked: another connection held kiln.db past this one's wait.
+fn busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<rusqlite::Error>().and_then(rusqlite::Error::sqlite_error_code).is_some_and(|c| matches!(c, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
 /// A database that builds from before [`CONF`] kept the configuration on [`STATE`] in, as a fifth
 /// column: it moves to [`CONF`] and the column goes, in one commit, so the releases before them
 /// start on it again. The column's, when it says one, is the newest: only those builds write it.
@@ -1214,6 +1219,8 @@ impl Machine {
              CREATE TABLE IF NOT EXISTS {MARK} (one INTEGER PRIMARY KEY CHECK (one = 1), applied INTEGER NOT NULL);"
         ))?;
         unwiden(&conn)?;
+        // A statement or two for each table an entry writes, as many as the store's writer runs.
+        conn.set_prepared_statement_cache_capacity(crate::store::WRITER_STATEMENTS);
         let (at, seq, configuration) = stands(&conn)?;
         Ok(Machine {
             conn,
@@ -1420,9 +1427,20 @@ impl StateMachine for Machine {
         // kiln.db commits without waiting for the disk (synchronous NORMAL); one that does makes
         // everything before it durable too, so the log may start past it.
         let at = self.applied;
-        stand(&self.conn, at, &self.configuration).map_err(|_| Fatal("kiln.db couldn't be made durable"))?;
-        self.durable = at;
-        Ok(())
+        match stand(&self.conn, at, &self.configuration) {
+            Ok(()) => {
+                self.durable = at;
+                Ok(())
+            }
+            // The store's writer held kiln.db past this connection's wait (an index built after kiln
+            // serves, `crate::store::indexes`): not durable yet, so the log keeps what's after where it
+            // is, and a compaction after makes it so. Fenced for it, the group would stop.
+            Err(e) if busy(&e) => {
+                tracing::info!(index = at.index, "kiln.db was busy as the cluster group made it durable: the log keeps its entries until it isn't");
+                Ok(())
+            }
+            Err(_) => Err(Fatal("kiln.db couldn't be made durable")),
+        }
     }
 }
 
@@ -1567,6 +1585,31 @@ mod tests {
             store.flush_group()?;
         }
         start_a_release_from_before(&db)
+    }
+
+    /// The DB query audit (2026-11-06): kiln.db held by another connection past the group's wait (the
+    /// store's writer building an index after kiln serves) leaves it not durable yet, not fenced: the
+    /// log keeps its entries, and once kiln.db is free the next persist makes it durable. Any other
+    /// failure is still the machine's.
+    #[test]
+    fn dbq_r4_a_busy_kiln_db_is_made_durable_later_not_fenced() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let mut m = Machine::open(&db, None)?;
+        m.conn.busy_timeout(Duration::from_millis(20))?;
+        let before = m.durable;
+        m.applied = Point { index: before.index + 5, term: 1 };
+        let other = Connection::open(&db)?;
+        other.execute_batch("BEGIN IMMEDIATE")?;
+        anyhow::ensure!(m.persist().is_ok(), "busy is not the machine's failure");
+        anyhow::ensure!(m.durable == before, "not durable yet: {:?}", m.durable);
+        other.execute_batch("COMMIT")?;
+        anyhow::ensure!(m.persist().is_ok() && m.durable == m.applied, "durable once kiln.db is free: {:?}", m.durable);
+        anyhow::ensure!(stands(&m.conn)?.0.index == m.applied.index, "cluster_state stands where it was applied");
+        m.applied = Point { index: m.applied.index + 1, term: 1 };
+        m.conn.execute_batch(&format!("DROP TABLE {STATE}"))?;
+        anyhow::ensure!(m.persist().is_err(), "another failure fences");
+        Ok(())
     }
 
     /// A database an earlier build of this release ran keeps the configuration on [`STATE`], in a

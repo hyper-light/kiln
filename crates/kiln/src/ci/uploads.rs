@@ -252,16 +252,17 @@ pub async fn local_runs_value(hub: &Hub, repo: &str, caller: Option<&Caller>, as
         None => (true, "admin".to_owned()),
         Some(c) => (c.is_owner(), c.name.clone()),
     };
-    let (runs, skipped) = start_runs(hub, &repo, &ask, trusted, &actor, true).await?;
+    let (runs, skipped) = start_runs(hub, &repo, &ask, trusted, (&actor, caller.and_then(|c| c.agent.as_deref())), true).await?;
     let what = format!("{} {} at {}: {} run(s){}", repo.name, if ask.event.is_empty() { "push" } else { ask.event.as_str() }, ask.sha, runs.len(), if trusted { "" } else { ", untrusted" });
     hub.store.audit(actor, "ci.runs.local".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &json!({ "runs": runs, "skipped": skipped, "trusted": trusted })))
 }
 
-/// The runs `ask` asks for of commit `ask.sha`, `trusted` or not, as `actor`'s: those that started
-/// (`{ id, workflow }`), and those that didn't, with why. Local runs' and bisections'; a
-/// bisection's run its workflow whatever its triggers' filters say (`match_triggers` false).
-pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor: &str, match_triggers: bool) -> Result<(Vec<Value>, Vec<Value>), Fail> {
+/// The runs `ask` asks for of commit `ask.sha`, `trusted` or not, as `actor`'s (agent session
+/// `agent`'s, its whole id, when one asks): those that started (`{ id, workflow }`), and those that
+/// didn't, with why. Local runs' and bisections'; a bisection's run its workflow whatever its
+/// triggers' filters say (`match_triggers` false).
+pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, (actor, agent): (&str, Option<&str>), match_triggers: bool) -> Result<(Vec<Value>, Vec<Value>), Fail> {
     if !is_sha(&ask.sha) {
         return Err(bad("`sha` is the commit's 40 hex digits"));
     }
@@ -319,7 +320,7 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor:
             continue;
         }
         let (tx, rx) = crate::memory::queue::answer();
-        let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx), culprit: ask.culprit };
+        let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx), culprit: ask.culprit, agent: agent.map(str::to_owned) };
         super::events::start_given(hub, &repo, &event, &loaded, (&message, &author), typed, given).await.map_err(|e| internal(&e))?;
         match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
             Ok(Ok(id)) => runs.push(json!({ "id": id, "workflow": l.path })),
@@ -479,7 +480,7 @@ async fn run_once(
     event.actor = actor.clone();
     event.source = kiln_ci::trigger::Source::Api;
     let (tx, rx) = crate::memory::queue::answer();
-    let given = Given { reply: Some(tx), ..Given::default() };
+    let given = Given { reply: Some(tx), agent: caller.and_then(|c| c.agent.clone()), ..Given::default() };
     super::events::start_given(hub, repo, &event, &l, (message, &who), typed, given).await.map_err(|e| internal(&e))?;
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(run)) => Ok(Once { run, sha, trusted, actor }),

@@ -119,12 +119,17 @@ async fn assign(cx: Cx, v: Value) -> Out {
     if is_agent(&cx) && cx.caller.agent.as_ref().is_none_or(|me| Some(me) != coordinator.as_ref()) {
         return Err((StatusCode::FORBIDDEN, format!("a program's tracks are assigned by its coordinator ({}) or the person", coordinator.as_deref().unwrap_or("none yet"))));
     }
-    let t = before.tracks.iter().find(|x| x.id == track).ok_or((StatusCode::BAD_REQUEST, format!("{id} has no track {track}")))?;
+    if !before.tracks.iter().any(|x| x.id == track) {
+        return Err((StatusCode::BAD_REQUEST, format!("{id} has no track {track}")));
+    }
     // Changed as they're kept now, under the lock (then the stacks', to hand the goal over).
     let writing = super::WRITING.turn().await;
     let mut all = super::assignments(&cx.hub.store, &id).await.map_err(failed)?;
     let now = crate::util::now_ms();
     let mut a = all.get(&track).cloned().unwrap_or_default();
+    // The goal the track has under way on its worker, as its assignment records it: the one that
+    // comes back to the coordinator's stack when the track's handed another, or none.
+    let back = a.goal.clone();
     // The worker: any agent kiln knows that works for the same person as the coordinator (or, with
     // none yet, as the person assigning it).
     match v.get("agent") {
@@ -167,11 +172,16 @@ async fn assign(cx: Cx, v: Value) -> Out {
     if met && goal.is_none() {
         return Err((StatusCode::CONFLICT, format!("{track} has no goal under way to say met")));
     }
+    // How the coordinator's stack changes with it, if it does: its goal handed to the worker (or said
+    // met), or none (the track's brought back).
+    let mut hand: Option<(String, Option<String>, Option<String>, bool)> = None;
     if let Some(g) = &goal {
         let c = coordinator.as_deref().ok_or((StatusCode::CONFLICT, format!("{id} has no coordinator yet: its master plan hasn't run as goals")))?;
         let stack = crate::goals::get(&cx.hub, c).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let item = stack.items.iter().find(|i| i.id == *g).ok_or((StatusCode::BAD_REQUEST, format!("the coordinator's stack has no goal {g}")))?;
-        let key = super::goal_key(&item.text).filter(|(_, n)| format!("T{n}") == track).ok_or((StatusCode::BAD_REQUEST, format!("goal {g} isn't one of {track}'s (its id doesn't start {track})")))?;
+        if super::goal_key(&item.text).is_none_or(|(_, n)| format!("T{n}") != track) {
+            return Err((StatusCode::BAD_REQUEST, format!("goal {g} isn't one of {track}'s (its id doesn't start {track})")));
+        }
         let new = a.goal.as_deref() != Some(g.as_str()) && !met;
         // Above 80% of a weekly window no new goal starts (the master plan's §5).
         if new && before.rule.holds_new_goals() {
@@ -184,19 +194,14 @@ async fn assign(cx: Cx, v: Value) -> Out {
         if !met && a.agent.is_empty() {
             return Err((StatusCode::BAD_REQUEST, format!("{track} has no worker: assign one (`agent`) to put a goal under way")));
         }
-        let prefix = super::track_prefix(&key.0).unwrap_or(&key.0).to_owned();
-        let on = (!met).then_some(a.agent.as_str());
-        if !crate::goals::delegate(&cx.hub.store, c, &prefix, Some(g.as_str()), on, met, now).await.map_err(failed)? {
-            return Err((StatusCode::CONFLICT, format!("goal {g} of the coordinator's stack isn't one still to come")));
-        }
+        hand = Some((c.to_owned(), Some(g.clone()), (!met).then(|| a.agent.clone()), met));
         a.goal = (!met).then(|| g.clone());
-    } else if (matches!(v.get("goal"), Some(Value::Null)) || a.agent.is_empty())
-        && let (Some(c), Some(key)) = (coordinator.as_deref(), t.goal.as_ref().and_then(|g| g.key.clone()))
-    {
-        // No goal under way any more (or no worker): the track's delegated goal comes back to the
+    } else if matches!(v.get("goal"), Some(Value::Null)) || a.agent.is_empty() {
+        // No goal under way any more (or no worker): the track's handed-out goal comes back to the
         // stack.
-        let prefix = super::track_prefix(&key).unwrap_or(&key).to_owned();
-        crate::goals::delegate(&cx.hub.store, c, &prefix, None, None, false, now).await.map_err(failed)?;
+        if let (Some(c), Some(_)) = (coordinator.as_deref(), back.as_deref()) {
+            hand = Some((c.to_owned(), None, None, false));
+        }
         a.goal = None;
     }
     a.at = now;
@@ -206,7 +211,17 @@ async fn assign(cx: Cx, v: Value) -> Out {
     } else {
         all.insert(track.clone(), a);
     }
-    super::save_assignments(&cx.hub.store, &id, &all).await.map_err(failed)?;
+    match hand {
+        // The coordinator's stack and the assignment changed in one transaction: they never disagree
+        // on the goal under way.
+        Some((c, item, on, met)) => {
+            let record = (super::assignments_key(&id), serde_json::to_string(&all).map_err(|e| failed(e.into()))?);
+            if !crate::goals::delegate(&cx.hub.store, &c, back.as_deref(), item.as_deref(), on.as_deref(), met, record, now).await.map_err(failed)? {
+                return Err((StatusCode::CONFLICT, format!("goal {} of the coordinator's stack isn't one still to come", item.unwrap_or_default())));
+            }
+        }
+        None => super::save_assignments(&cx.hub.store, &id, &all).await.map_err(failed)?,
+    }
     drop(writing);
     cx.hub.store.audit(cx.caller.name.clone(), "programs.assign".into(), format!("{id} {track}")).await;
     cx.hub.emit(&crate::wire::events::ServerEvent::Program { program: id.clone() });

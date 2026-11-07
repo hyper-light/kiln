@@ -208,7 +208,7 @@ pub async fn list(s: &Site<'_>, q: &std::collections::HashMap<String, String>) -
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM diffs WHERE repo_id = ?1 AND (?2 = 'all' OR (?2 = 'open' AND state NOT IN ('landed', 'abandoned')) OR (?2 = 'closed' AND state IN ('landed', 'abandoned')))
-                 AND (?3 IS NULL OR trunk = ?3) ORDER BY number DESC LIMIT ?4 OFFSET ?5",
+                 AND (?3 IS NULL OR trunk = ?3) ORDER BY number DESC LIMIT +?4 OFFSET ?5",
             )?;
             let rows = st.query_map(params![repo, want, base, per_page, (page - 1) * per_page], |r| r.get::<_, String>(0))?;
             Ok(rows.filter_map(Result::ok).collect())
