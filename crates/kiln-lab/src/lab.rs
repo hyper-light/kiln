@@ -277,6 +277,9 @@ pub fn machine() -> Machine {
 pub struct Place {
     pub cpus: Option<String>,
     pub layout: String,
+    /// systemd resource-control properties the server's scope takes besides its weight (`KEY=VALUE`;
+    /// [`Place::with_server_properties`]).
+    pub server_properties: Vec<String>,
 }
 
 /// The weights production's layout gives the server and the hogs (`systemd.resource-control`'s
@@ -292,7 +295,20 @@ impl Place {
             anyhow::ensure!(cfg!(target_os = "linux"), "--server-cpus needs Linux (taskset)");
             anyhow::ensure!(!cpus_in(c).is_empty(), "--server-cpus takes a CPU list (16-31, or 0-3,8), not {c:?}");
         }
-        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned() })
+        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned(), server_properties: Vec::new() })
+    }
+
+    /// The server's scope held to `props` as well, systemd's resource-control properties (`KEY=VALUE`;
+    /// production's layout, where the server has a scope of its own): a constrained instance, as a small
+    /// cloud instance's or a container's limits hold it (Ada, 2026-11-07: one or two vCPUs, 128 to 256 MB,
+    /// under high load: `AllowedCPUs=0`, `CPUQuota=100%`, `MemoryMax=128M`, `MemorySwapMax=0`).
+    pub fn with_server_properties(mut self, props: &[String]) -> anyhow::Result<Self> {
+        anyhow::ensure!(props.is_empty() || self.production(), "--server-property needs --layout production, where the server has a scope of its own");
+        for p in props {
+            anyhow::ensure!(p.split_once('=').is_some_and(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty()), "--server-property takes KEY=VALUE (MemoryMax=128M), not {p:?}");
+        }
+        self.server_properties = props.to_vec();
+        Ok(self)
     }
 
     fn production(&self) -> bool {
@@ -303,11 +319,17 @@ impl Place {
     /// execs it in place, so its pid and process group stay the lab's to stop), on the server's CPUs
     /// when it has its own.
     pub fn command(&self, program: &Path, weight: u32, unit: &str) -> Command {
+        self.placed(program, weight, unit, &[])
+    }
+
+    /// [`Place::command`], its scope also given `properties`.
+    fn placed(&self, program: &Path, weight: u32, unit: &str, properties: &[String]) -> Command {
         let mut wrap: Vec<OsString> = Vec::new();
         if self.production() {
             wrap.extend(["systemd-run", "--user", "--scope", "--quiet", "--collect"].map(OsString::from));
             wrap.push(format!("--unit={unit}").into());
             wrap.push(format!("--property=CPUWeight={weight}").into());
+            wrap.extend(properties.iter().map(|p| OsString::from(format!("--property={p}"))));
             wrap.push("--".into());
         }
         if let Some(c) = &self.cpus {
@@ -324,9 +346,9 @@ impl Place {
         }
     }
 
-    /// The server's command (`program`), placed.
+    /// The server's command (`program`), placed, its scope held to the server's properties.
     pub fn server(&self, program: &Path, unit: &str) -> Command {
-        self.command(program, SERVER_WEIGHT, unit)
+        self.placed(program, SERVER_WEIGHT, unit, &self.server_properties)
     }
 }
 
@@ -1343,6 +1365,7 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     let shards = server_numbers(&mut n, "", before, after, secs);
     per_request_wakes(&mut n, before, after, requests);
     per_request_pools(&mut n, before, after, requests);
+    per_request_memory(&mut n, before, after, requests);
     // The routes': how long each class took and waited at the server, at p99 and at p99.9 (the bar's: goal 10,
     // plan 01a1a87b2dae step 5, so a class's tail can be set against its legs at the server).
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
@@ -1664,6 +1687,27 @@ fn per_request_pools(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
     for share in after.values_of("kiln_blocking_run_seconds_count", "share") {
         if let Some(v) = grown("kiln_blocking_run_seconds_count", &[("share", share.as_str())]) {
             n.insert(format!("blocking.{share}.per_request"), v / requests);
+        }
+    }
+}
+
+/// What each of the window's `requests` cost the server's memory in work (allocs-metric, beside
+/// `server.cpu_ms_per_request`): the allocations its allocator served (`kiln_memory_allocations_total`, jemalloc's
+/// count) as `server.allocations_per_request`, and the page faults it took by kind (`kiln_memory_page_faults_total`)
+/// as `server.<kind>_faults_per_request`, where the build has their series.
+fn per_request_memory(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
+    if requests == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let requests = requests as f64;
+    let grown = |family: &str, want: &[(&str, &str)]| Some(after.get(family, want)? - before.get(family, want)?);
+    if let Some(v) = grown("kiln_memory_allocations_total", &[]) {
+        n.insert("server.allocations_per_request".into(), v / requests);
+    }
+    for kind in after.values_of("kiln_memory_page_faults_total", "kind") {
+        if let Some(v) = grown("kiln_memory_page_faults_total", &[("kind", kind.as_str())]) {
+            n.insert(format!("server.{kind}_faults_per_request"), v / requests);
         }
     }
 }
@@ -2249,6 +2293,32 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_pools(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// allocs-metric: the window's allocations and page faults are reported per request, each kind of fault by its
+    /// name, from the scrapes either side of it; no requests, or a build without the series, nothing.
+    #[test]
+    fn allocs_metric_allocations_and_faults_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = format!("kiln_memory_allocations_total {}\n", 500.0 * k);
+            for (kind, faults) in [("minor", 30.0), ("major", 2.0)] {
+                t.push_str(&format!("kiln_memory_page_faults_total{{kind=\"{kind}\"}} {}\n", faults * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_memory(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("server.allocations_per_request", 50.0), ("server.minor_faults_per_request", 3.0), ("server.major_faults_per_request", 0.2)] {
+            let got = n.get(key).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert_eq!(n.len(), 3, "{n:?}");
+        let mut none = BTreeMap::new();
+        per_request_memory(&mut none, &scrape(1.0), &scrape(2.0), 0);
+        assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+        let older = measure::Scrape::parse("process_cpu_seconds_total 1\n");
+        per_request_memory(&mut none, &older, &older, 10);
+        assert!(none.is_empty(), "a build without the series: {none:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: how long the shards' parks lasted is reported from their histograms, all

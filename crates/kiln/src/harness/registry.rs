@@ -3207,7 +3207,7 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) && matches!(u, Update::Meta { .. }) {
+        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|c| super::copies::said_off(c, said.sides())) && matches!(u, Update::Meta { .. }) {
             // A meta that changed, its session's metas long to write out (past a turn, or dearer than the compute pool's round
             // trip: `super::copies::Said::sides`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
             // 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
@@ -5352,7 +5352,7 @@ mod tests {
                                     return None;
                                 }
                                 if let Some(m) = s.get_mut("s") {
-                                    while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
+                                    while m.said(&u, &said).is_some_and(|c| super::super::copies::said_off(c, said.sides())) {
                                         m.said_took(&u, std::time::Duration::ZERO, &said);
                                     }
                                 }

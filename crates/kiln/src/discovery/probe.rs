@@ -719,6 +719,7 @@ mod tests {
             let addrs = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))];
             let started = Instant::now();
             let found = sweep_port(&addrs, port, Via::Scan, &Shutdown::new(), &mut progress).await.map_err(anyhow::Error::msg)?;
+            let swept = started.elapsed();
             stop.cancel();
             let _ = crate::rt::timeout(Duration::from_secs(5), served).await;
             let i = found.iter().find(|i| i.id == a.id).ok_or_else(|| anyhow::anyhow!("not found"))?;
@@ -728,7 +729,7 @@ mod tests {
             assert!(i.expires > Instant::now() + Duration::from_secs(100));
             assert!(seen.iter().any(|s| s.id == a.id));
             // It lingered for late answers, and no longer.
-            assert!(started.elapsed() >= LINGER && started.elapsed() < LINGER + Duration::from_secs(2));
+            assert!(swept >= LINGER && swept < LINGER + Duration::from_secs(2), "swept in {swept:?}");
             Ok(())
         })
     }

@@ -7078,13 +7078,15 @@ struct Read {
     now_us: u64,
     at: Instant,
     woken: crate::route_latency::FrameLeg,
+    /// What its viewer's flushes are learned to cost a byte, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec step 3).
+    costs: &'static kiln_http::turn::Writes,
 }
 
 impl Read {
     /// A batch read now, its viewer's task woken at `woke_us`, on its session's owner's shard (`own`) or another.
     fn now(woke_us: u64, own: bool) -> Self {
         let woken = if own { crate::route_latency::FrameLeg::Woken } else { crate::route_latency::FrameLeg::WokenOther };
-        Self { woke_us, now_us: crate::harness::live::now_us(), at: Instant::now(), woken }
+        Self { woke_us, now_us: crate::harness::live::now_us(), at: Instant::now(), woken, costs: &FLUSHES }
     }
 }
 
@@ -7111,12 +7113,20 @@ enum Fed {
 /// to take it up (`read.woke_us`) and that write (goal 10, plan 01a1a87b2dae step 5: `crate::route_latency::FrameLeg`).
 /// Written in its viewer's turn on its shard, `turns`, which the batches before it in the same poll took of (goal 9, plan
 /// 01a1a87b2cec step 3).
+///
+/// What a flush of what it fed costs is weighed too, by what a viewer's flushes are learned to cost a byte (`read.costs`,
+/// [`FLUSHES`]): before a frame whose flush with what's fed wouldn't fit what's left of the poll's quantum, what's fed goes
+/// and the turn ends with it (goal 9, plan 01a1a87b2cec step 3). Fed in a turn of cheap feeds, a batch was flushed whole as
+/// it ended, its write (a system call of all of it) past the quantum: a viewer's live polls held their shard 0.64 ms on the
+/// CPU calm at the longest in g9p35.
 async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
     use futures::SinkExt as _;
-    let mut fed = 0u64;
+    let (mut fed, costs) = (0u64, read.costs);
+    // What's fed since the last flush, in bytes.
+    let mut unflushed = 0usize;
     let mut came_to = Fed::Written;
     // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
     // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
@@ -7150,6 +7160,12 @@ where
             came_to = Fed::StartOver;
             break;
         }
+        // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
+        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.fitting(room)).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
+            flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
+            give_turn_up(costs).await;
+            *turns = crate::rt::Turns::new();
+        }
         if let Some(at) = published {
             let waited = Duration::from_micros(read.now_us.saturating_sub(at));
             crate::metrics::bus().delivery_seconds.observe(waited.as_secs_f64());
@@ -7157,21 +7173,51 @@ where
             crate::route_latency::observe_frame(read.woken, Duration::from_micros(read.woke_us.saturating_sub(at)));
         }
         *have = (*have).max(rev);
+        unflushed = unflushed.saturating_add(said.len());
         tx.feed(ws::text(said)).await?;
         fed = fed.saturating_add(1);
         if turns.over() {
-            tx.flush().await?;
-            hyper_rt::futures::yield_now().await;
+            flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
+            give_turn_up(costs).await;
             *turns = crate::rt::Turns::new();
         }
     }
     if fed > 0 || came_to == Fed::Closed {
-        tx.flush().await?;
+        flush_timed(tx, costs, unflushed).await?;
     }
     let wrote = read.at.elapsed();
     crate::route_latency::observe_took(crate::route_latency::Class::Websocket, wrote, fed);
     crate::route_latency::observe_frames(crate::route_latency::FrameLeg::Write, wrote, fed);
     Ok(came_to)
+}
+
+/// What flushing a viewer's socket is learned to cost a byte (`kiln_http::turn::Writes`): every viewer's flushes teach it
+/// ([`flush_timed`]), and its turns given up what coming back costs ([`give_turn_up`]); each batch's are weighed by it
+/// ([`write_live_batch`]; goal 9, plan 01a1a87b2cec step 3).
+static FLUSHES: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+
+/// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
+/// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
+async fn give_turn_up(costs: &kiln_http::turn::Writes) {
+    hyper_rt::futures::yield_now().await;
+    if let Some(poll) = hyper_rt::futures::poll_clock() {
+        costs.resumed(poll.held_ns());
+    }
+}
+
+/// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
+/// socket (a flush that waited took its peer's time, not its own).
+async fn flush_timed<S>(tx: &mut S, costs: &kiln_http::turn::Writes, bytes: usize) -> Result<(), S::Error>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+{
+    use futures::SinkExt as _;
+    let began = Instant::now();
+    let (flushed, waited) = waited(tx.flush()).await;
+    if !waited && bytes > 0 {
+        costs.learn(u64::try_from(bytes).unwrap_or(u64::MAX), u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    flushed
 }
 
 /// The session sockets' viewers that ran on another shard than their session's owner, and on it, in this test process
@@ -9490,6 +9536,125 @@ mod tests {
             anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
             // A turn after it may end too on a busy host (a debug build's frame is slow): the first flush is the spent turn's.
             anyhow::ensure!(tx.flushed_at.first() == Some(&1) && tx.flushed_at.last() == Some(&texts.len()), "flushed with {:?} sent: the spent turn's after the first frame, the batch's after its last", tx.flushed_at);
+            Ok(())
+        })
+    }
+
+    /// A viewer's socket whose flush takes its time on the thread, `ns_per_byte` a byte of what was fed since the last: what a
+    /// batch's flushes are weighed by (goal 9, plan 01a1a87b2cec step 3).
+    struct Flushed {
+        ns_per_byte: u64,
+        sent: Vec<ws::Message>,
+        unflushed: usize,
+        /// The bytes each flush wrote.
+        flushes: Vec<usize>,
+    }
+
+    impl futures::Sink<ws::Message> for Flushed {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            this.unflushed += item.len();
+            this.sent.push(item);
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            let this = self.get_mut();
+            let until = Instant::now() + Duration::from_nanos(this.ns_per_byte.saturating_mul(u64::try_from(this.unflushed).unwrap_or(u64::MAX)));
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            this.flushes.push(std::mem::take(&mut this.unflushed));
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a batch of a session's feed is flushed within its viewer's poll's quantum, by what
+    /// its flushes are learned to cost: what's fed goes before a frame whose flush with it wouldn't fit, and the turn ends
+    /// there, rather than all of it flushed as the turn of cheap feeds ended. Do: a socket whose flush takes 2 ns a byte;
+    /// a batch of 32 KiB frames whose flush whole is four of the shard's quanta, to teach its costs, then another. Expect:
+    /// the second is flushed in more than one flush, the frames whole and in order, and none of its polls holds its shard
+    /// twice the quantum on the CPU (a flush of all of it, as before, is four).
+    #[test]
+    fn g9_s3_a_viewers_batch_is_flushed_within_its_polls_quantum() -> anyhow::Result<()> {
+        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        /// Shape: each frame's padding, and the socket's flush, nanoseconds a byte.
+        const FRAME: usize = 32 << 10;
+        const NS_PER_BYTE: u64 = 2;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let frames = quantum.saturating_mul(4).div_ceil(NS_PER_BYTE.saturating_mul(u64::try_from(FRAME)?)) + 1;
+            let texts: Vec<String> = (1..=2 * frames).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(FRAME))).collect();
+            let batch = |from: u64| -> Vec<kiln_seams::bus::Message> { (from..from + frames).filter_map(|rev| texts.get(usize::try_from(rev - 1).ok()?).map(|t| fed_frame(rev, t, rev))).collect() };
+            let read = || Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
+            let mut tx = Flushed { ns_per_byte: NS_PER_BYTE, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
+            let mut have = 0;
+            write_live_batch(&mut tx, batch(1), &mut have, Default::default(), "sessions/s/0.0", read(), &mut crate::rt::Turns::new()).await?;
+            let taught = tx.flushes.len();
+            // The next batch's turn starts in a poll of its own.
+            hyper_rt::futures::yield_now().await;
+            let (mut turns, mut longest, mut most_quantum) = (crate::rt::Turns::new(), 0u64, quantum);
+            let came_to = {
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch(frames + 1), &mut have, Default::default(), "sessions/s/0.0", read(), &mut turns));
+                std::future::poll_fn(|cx| {
+                    let (polled, spent) = hyper_rt::futures::spent(|| writing.as_mut().poll(cx));
+                    longest = longest.max(spent.cpu_ns.unwrap_or(spent.wall_ns));
+                    // The quantum as the shard reads it (its online estimate may move).
+                    most_quantum = most_quantum.max(hyper_rt::futures::step_budget_ns().unwrap_or(0));
+                    polled
+                })
+                .await?
+            };
+            anyhow::ensure!(came_to == Fed::Written && have == 2 * frames, "{came_to:?}, the viewer at {have}");
+            let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
+            anyhow::ensure!(sent == texts, "the frames, whole and in order");
+            let flushed = tx.flushes.get(taught..).unwrap_or_default();
+            anyhow::ensure!(flushed.len() > 1, "the second batch went in {} flush(es): {flushed:?}", flushed.len());
+            anyhow::ensure!(longest < most_quantum.saturating_mul(2), "a poll of the batch held its shard {longest} ns on the CPU, the quantum {most_quantum} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a viewer's batch whose flushes cost more or less by turns still goes a few frames a
+    /// flush: what's fed goes before a frame whose flush with it wouldn't fit what's left of the poll's quantum at the
+    /// dearest its flushes cost. Do: teach a viewer's costs flushes of 64 KiB at 0.5 and 5 ns a byte by turns, then write it
+    /// a batch of 32 frames, each a fortieth of the quantum's worth at 5 ns a byte. Expect: a quarter as many flushes as
+    /// frames at the most, and as few polls. RFC 6298's bound, its mean and four deviations, was past the quantum and fit
+    /// nothing: the batch went a flush, and its shard given up, a frame.
+    #[test]
+    fn g9_s3_a_viewers_batch_whose_flushes_vary_goes_a_few_frames_a_flush() -> anyhow::Result<()> {
+        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        /// Shape: the batch's frames.
+        const FRAMES: u64 = 32;
+        for _ in 0..16 {
+            COSTS.learn(64 << 10, 32_768);
+            COSTS.learn(64 << 10, 327_680);
+        }
+        let quantum = crate::rt::block_on(async { hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard")) })?;
+        let frame = usize::try_from(quantum / 40)?;
+        let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(frame))).collect();
+        let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
+        crate::rt::block_on(async move {
+            let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
+            let (mut have, mut polls, mut turns) = (0, 0u64, crate::rt::Turns::new());
+            let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
+            let came_to = {
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", read, &mut turns));
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    writing.as_mut().poll(cx)
+                })
+                .await?
+            };
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let flushes = u64::try_from(tx.flushes.len())?;
+            anyhow::ensure!(flushes * 4 <= FRAMES && polls * 4 <= FRAMES, "{FRAMES} frames in {flushes} flushes and {polls} polls: {:?}", tx.flushes);
             Ok(())
         })
     }
