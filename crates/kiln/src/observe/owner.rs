@@ -894,6 +894,9 @@ struct Owner {
     replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
     viewed: Instant,
+    /// Whether the view last published said this node counts the windows records came in: it leads the group and its
+    /// store has replayed its log (`crate::observe::logmetrics`).
+    counts: bool,
     /// The bytes observe's folder holds (the store's files, the group's log, snapshots), and when
     /// they were last counted.
     dir_bytes: u64,
@@ -983,6 +986,7 @@ impl Owner {
             replayed,
             view,
             viewed: Instant::now(),
+            counts: false,
             dir_bytes: 0,
             sized: None,
             out,
@@ -1947,7 +1951,17 @@ impl Owner {
         if self.viewed.elapsed() >= VIEW_EVERY {
             self.viewed = Instant::now();
             let view = self.make_view();
+            // Its counters of windows wake as it takes up counting them, or leaves it (goal 9, plan 01a1a87b2cec step 5:
+            // they looked every second whether it counted or not).
+            let counts = view.leader != 0 && view.leader == view.member && view.replayed;
             *lock(&self.view) = view;
+            if counts != self.counts {
+                self.counts = counts;
+                if let Some((t, s)) = &self.touched {
+                    t.wake();
+                    s.wake();
+                }
+            }
         }
     }
 
