@@ -15,7 +15,7 @@ import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useAction } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
-import { formatDuration, relativeTime } from "@/lib/format";
+import { formatDuration, relativeTime, shortIds } from "@/lib/format";
 import { useFieldText } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
@@ -218,7 +218,7 @@ function List({ query, from, onFrom, filtered, show, onDeclare }: { query: strin
 function Row({ i, now }: { i: Incident; now: number }) {
   const a = i.attributes;
   const commander = i.relationships.commander_user.data?.id ?? null;
-  const by = a.kiln.monitor ? `by its monitor ${a.kiln.monitor.name}` : `by ${a.declared_by.name}`;
+  const by = a.kiln.monitor ? `by its monitor ${a.kiln.monitor.name}` : `by ${shortIds(a.declared_by.name)}`;
   return (
     <tr>
       <td className="truncate-cell">

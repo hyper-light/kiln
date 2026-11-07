@@ -37,7 +37,7 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             let run = v.pointer("/check_run/external_id").and_then(Value::as_str).unwrap_or_default().to_owned();
             if !run.is_empty() {
                 let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
-                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" }), &by).await;
+                let r = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "all" }), &by, None).await;
                 hub.store.audit("github".into(), "ci.runs.rerun".into(), format!("{run} from GitHub's Re-run ({})", if r.is_ok() { "started" } else { "refused" })).await;
             }
         }
@@ -45,7 +45,7 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             let (sha, full) = (v.pointer("/check_suite/head_sha").and_then(Value::as_str).unwrap_or_default().to_owned(), v.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default().to_owned());
             for run in runs_of(hub, &full, &sha).await {
                 let by = v.pointer("/sender/login").and_then(Value::as_str).unwrap_or("github").to_owned();
-                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" }), &by).await;
+                let _ = crate::ci::runs_api::rerun(hub, &run, &json!({ "mode": "failed" }), &by, None).await;
             }
         }
         // GitHub Actions' runs, for repositories whose CI provider it is (W23-R03).
@@ -83,6 +83,10 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
     Ok(srv::status(StatusCode::ACCEPTED))
 }
 
+/// A commit's v2 runs, each rerun on its own: sought on `runs_repo_sha` rather than found among every
+/// v2 run of the repository on `runs_lane` (the DB query audit, 2026-11-06).
+const RUNS_OF: &str = "SELECT id FROM runs INDEXED BY runs_repo_sha WHERE repo_id = ?1 AND sha = ?2 AND workflow_id IS NOT NULL";
+
 /// KilnCI's runs of GitHub's repository `full` at `sha`.
 async fn runs_of(hub: &Hub, full: &str, sha: &str) -> Vec<String> {
     let Some(app) = github::app(hub).await else { return Vec::new() };
@@ -91,7 +95,7 @@ async fn runs_of(hub: &Hub, full: &str, sha: &str) -> Vec<String> {
     let (id, sha) = (repo.id.clone(), sha.to_owned());
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT id FROM runs WHERE repo_id = ?1 AND sha = ?2 AND workflow_id IS NOT NULL")?;
+            let mut st = c.prepare(RUNS_OF)?;
             let rows = st.query_map(params![id, sha], |r| r.get::<_, String>(0))?;
             Ok(rows.filter_map(Result::ok).collect())
         })
@@ -184,4 +188,40 @@ pub async fn show(hub: &Hub) -> Result<Response, Fail> {
         StatusCode::OK,
         &json!({ "configured": true, "source": if from_config { "config" } else { "manifest" }, "id": app.id, "slug": app.slug, "html_url": app.html_url, "install_url": install, "webhook": app.webhook_secret.is_some(), "web_url": app.web, "api_url": app.api }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W14-R10's "Re-run all" of a check suite (the DB query audit, 2026-11-06): its commit's v2 runs,
+    /// those of its repository at that commit and no other's, sought by commit.
+    #[test]
+    fn w14_r10_a_check_suite_s_runs_are_sought_by_commit() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (got, plan) = store
+                .call(|c| {
+                    c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0), ('o', 'acme/other', 'u', 0);")?;
+                    let runs = [
+                        ("a", "r", 1, "main", "s", 100, Some("w")), ("b", "r", 2, "main", "s", 100, Some("v")), ("c", "r", 3, "dev", "s", 50, Some("w")),
+                        ("d", "r", 4, "main", "s", 90, Some("w")), ("e", "r", 5, "main", "t", 80, Some("w")), ("f", "r", 6, "main", "s", 70, None),
+                        ("g", "o", 1, "main", "s", 60, Some("w")), ("h", "r", 7, "main", "s", 100, Some("w")),
+                    ];
+                    for (id, repo, n, branch, sha, at, workflow) in runs {
+                        c.execute(
+                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id) VALUES (?1, ?2, ?3, 'ci', 'push', ?4, ?5, 'succeeded', ?6, ?7)",
+                            params![id, repo, n, branch, sha, at, workflow],
+                        )?;
+                    }
+                    let got: std::collections::BTreeSet<String> = c.prepare(RUNS_OF)?.query_map(["r", "s"], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {RUNS_OF}"))?.query_map(["r", "s"], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    Ok((got, plan.join(" | ")))
+                })
+                .await?;
+            assert_eq!(got, ["a", "b", "c", "d", "h"].map(str::to_owned).into_iter().collect(), "v2 runs of acme/app at s: not e (another commit), f (v1), g (another repository)");
+            assert!(plan.contains("runs_repo_sha") && !plan.contains("runs_lane"), "{plan}");
+            Ok(())
+        })
+    }
 }

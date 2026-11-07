@@ -156,8 +156,8 @@ fn w26_r18_agents_words_are_signed_as_the_agent() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "threads: {st} {body}");
     let threads: Value = serde_json::from_str(&body)?;
     let comments: Vec<Value> = threads.get("threads").or(Some(&threads)).and_then(Value::as_array).into_iter().flatten().flat_map(|t| t.get("comments").and_then(Value::as_array).cloned().unwrap_or_default()).collect();
-    // The agent comments as its session does: `agent:<its id's start>@<its runner's machine id>`.
-    let principal = format!("agent:{}@{}", id.get(..8).unwrap_or(&id), common::machine("box-a"));
+    // The agent comments as review knows its session: by its whole id (`agent:<id>`), whatever runner it calls through.
+    let principal = format!("agent:{id}");
     let agents: Vec<&Value> = comments.iter().filter(|c| field(c, "author") == principal).collect();
     assert_eq!(agents.len(), 2, "the agent's comment and its reply, each taken\n{threads}\nthe agent's MCP server said: {}", out());
     for c in &agents {
@@ -839,8 +839,8 @@ fn w26_r18_a_review_agent_asked_onto_a_change() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "GET", "/api/repos/acme%2Fapp/diffs", &s.admin, None)?;
     anyhow::ensure!(st == 200, "diffs: {st} {body}");
     let listed: Value = serde_json::from_str(&body)?;
-    let start = format!("agent:{}", agent.get(..8).unwrap_or(&agent));
-    anyhow::ensure!(!listed.get("diffs").or(Some(&listed)).and_then(Value::as_array).into_iter().flatten().any(|d| field(d, "author").starts_with(&start)), "no diff of its own came of it: {body}");
+    let theirs = format!("agent:{agent}");
+    anyhow::ensure!(!listed.get("diffs").or(Some(&listed)).and_then(Value::as_array).into_iter().flatten().any(|d| field(d, "author") == theirs), "no diff of its own came of it: {body}");
     // Its approval doesn't count: the trunk doesn't say agents-can-approve.
     w.run(&fake, "approve", "return await kiln.ci.diffs.review({diff: \"D1\", action: \"accept\", body: \"fine by me\"});")?;
     let (st, body) = http(s.port, "GET", "/api/diffs/D1/land", &s.admin, None)?;

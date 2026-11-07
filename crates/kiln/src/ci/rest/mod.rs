@@ -292,7 +292,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             let git_ref = ask.get("ref").and_then(Value::as_str).unwrap_or_default().to_owned();
             let inputs = ask.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
             // A job's run shares its trust: nothing more to hold it to.
-            match super::events::workflow_dispatch(hub, &r, &git_ref, which, &inputs, "github-actions[bot]", None).await {
+            match super::events::workflow_dispatch(hub, &r, &git_ref, which, &inputs, ("github-actions[bot]", None, None)).await {
                 Ok(()) => Ok(srv::status(StatusCode::NO_CONTENT)),
                 Err(e) => Ok(message(e.status, &e.message)),
             }

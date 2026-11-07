@@ -541,7 +541,7 @@ pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json:
         started?;
         return Ok(srv::status(StatusCode::NO_CONTENT));
     }
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, ("kiln", started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -591,14 +591,14 @@ pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming, start
     let repo = find_repo(hub, repo).await?;
     let ask: AgentAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     let git_ref = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
-    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, agent, started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, (agent, started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, ("kiln", started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 

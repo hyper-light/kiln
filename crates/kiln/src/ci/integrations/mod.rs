@@ -529,9 +529,11 @@ pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
 }
 
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
+    // Read every second (the replies' mailboxes), beside the writer and prepared once (the DB query
+    // audit, 2026-11-06).
     hub.store
         .read(|c| {
-            let mut q = c.prepare(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
+            let mut q = c.prepare_cached(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
             let rows = q.query_map([], row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -542,14 +544,16 @@ pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
 /// documents are served, since those accounts' syncs mint tokens. Only reads.
 pub async fn federates(hub: &Hub) -> bool {
     hub.store
-        .call(|c| Ok(c.query_row("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1", [], |_| Ok(())).optional()?.is_some()))
+        .read(|c| Ok(c.prepare_cached("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1")?.query_row([], |_| Ok(())).optional()?.is_some()))
         .await
         .unwrap_or(false)
 }
 
+/// An integration by name. Beside the writer and prepared once (the DB query audit, 2026-11-06):
+/// whoever changed one awaited it first ([`create`], [`update`] read it back after their writes).
 pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
     let name = name.trim().to_ascii_lowercase();
-    hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"), params![name], row).optional()?)).await
+    hub.store.read(move |c| Ok(c.prepare_cached(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"))?.query_row(params![name], row).optional()?)).await
 }
 
 /// What an integration is made with that's secret: its token or password, and its signing secret

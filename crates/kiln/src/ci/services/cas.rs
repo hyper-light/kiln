@@ -317,7 +317,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
     let candidates: Vec<String> = hub
         .store
         .call(move |c| {
-            let mut q = c.prepare(&format!("SELECT digest FROM cas_index WHERE last_used_at < ?1 AND {UNREFERENCED} LIMIT ?2"))?;
+            let mut q = c.prepare(&format!("SELECT digest FROM cas_index WHERE last_used_at < ?1 AND {UNREFERENCED} LIMIT +?2"))?;
             let rows = q.query_map(params![cutoff, i64::try_from(COLLECT_MAX).unwrap_or(i64::MAX)], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })

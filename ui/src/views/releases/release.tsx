@@ -23,6 +23,7 @@ import { Answer, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 import { Highlighted } from "@/components/code/highlighted";
+import { shortIds } from "@/lib/format";
 
 function Head({ r }: { r: Release | null; id: number }) {
   return (
@@ -98,7 +99,7 @@ function Answers({ r, hold }: { r: Release; hold: Hold }) {
         <ul className="rel-answers">
           {r.approvals.map((a) => (
             <li key={`${a.by}-${a.at}`}>
-              <span data-approved={a.approved}>{a.approved ? "approved" : "rejected"}</span> by {a.by} · <RelTime ts={a.at} />
+              <span data-approved={a.approved}>{a.approved ? "approved" : "rejected"}</span> by {shortIds(a.by)} · <RelTime ts={a.at} />
               {a.note && <q>{a.note}</q>}
             </li>
           ))}
@@ -178,7 +179,7 @@ function ReleaseView({ id }: { id: number }) {
     { label: "Environment", value: r.environment },
     { label: "Kind", value: r.kind },
     ...(r.version ? [{ label: "Version", value: <code>{r.version}</code> }] : []),
-    { label: "Asked by", value: `${r.requested_by}${r.origin === "git" ? " (a commit kiln didn't make)" : ""}` },
+    { label: "Asked by", value: `${shortIds(r.requested_by)}${r.origin === "git" ? " (a commit kiln didn't make)" : ""}` },
     { label: "Asked", value: <RelTime ts={r.created_at} /> },
     ...(r.committed_at ? [{ label: "Committed", value: <RelTime ts={r.committed_at} /> }] : []),
     ...(r.ended_at ? [{ label: "Ended", value: <RelTime ts={r.ended_at} /> }] : []),

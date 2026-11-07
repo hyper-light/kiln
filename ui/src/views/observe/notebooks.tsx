@@ -14,7 +14,7 @@ import { PageIntro, SearchField, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import { ObserveNav, useParam, useParams } from "./parts";
@@ -130,12 +130,12 @@ function List({ type, templates, filter }: { type: string; templates: boolean; f
                     </Link>
                     <p className="truncate text-[11px] text-[#8c8f98] md:hidden">
                       <span className="sm:hidden">{kind} · </span>
-                      {a.author.handle}
+                      {shortIds(a.author.handle)}
                       <span className="sm:hidden"> · changed {relativeTime(seconds(a.modified))}</span>
                     </p>
                   </td>
                   <td className="hidden text-[12px] sm:table-cell">{a.metadata.type ? <span className="chip">{kind.toLowerCase()}</span> : <span className="text-[#8c8f98]">—</span>}</td>
-                  <td className="hidden text-[12px] md:table-cell">{a.author.handle}</td>
+                  <td className="hidden text-[12px] md:table-cell">{shortIds(a.author.handle)}</td>
                   <td className="hidden text-right text-[12px] text-[#8c8f98] sm:table-cell">{relativeTime(seconds(a.modified))}</td>
                 </tr>
               );

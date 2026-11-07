@@ -127,12 +127,8 @@ pub async fn release(hub: &Hub, r: &Release) -> Result<Value, Fail> {
 pub async fn export(hub: &Hub, target: &Target) -> Result<Value, Fail> {
     let w = walked_to(hub, target).await?;
     let Some(size) = w.under.as_ref().map(|k| k.size) else { return Err((StatusCode::CONFLICT, "kiln's server has signed no checkpoint of its trail yet".into())) };
-    let (pt, to) = (trail::PAYLOAD_REVOCATION.to_owned(), i64::try_from(size).map_err(|e| internal(e.into()))?);
-    let revoked: Vec<String> = hub
-        .store
-        .call(move |c| Ok(c.prepare("SELECT statement FROM trail WHERE payload_type = ?1 AND idx < ?2 ORDER BY idx")?.query_map(params![pt, to], |r| r.get(0))?.collect::<Result<_, _>>()?))
-        .await
-        .map_err(internal)?;
+    let to = i64::try_from(size).map_err(|e| internal(e.into()))?;
+    let revoked: Vec<String> = hub.store.read(move |c| Ok(c.prepare(&revocations_sql())?.query_map([to], |r| r.get(0))?.collect::<Result<_, _>>()?)).await.map_err(internal)?;
     for d in &revoked {
         let _ = w.holding(d).await;
     }
@@ -148,6 +144,13 @@ pub async fn export(hub: &Hub, target: &Target) -> Result<Value, Fail> {
         links,
     };
     serde_json::to_value(e).map_err(|e| internal(e.into()))
+}
+
+/// The revocations under a checkpoint of `?1` entries, in the order kiln took them: read off their
+/// own index (`trail_revocations`), not the whole trail, so the payload type is a literal, the one
+/// the index's `WHERE` names.
+fn revocations_sql() -> String {
+    format!("SELECT statement FROM trail WHERE payload_type = '{}' AND idx < ?1 ORDER BY idx", trail::PAYLOAD_REVOCATION)
 }
 
 /// A revision's Source VSA (docs/ci.md W27-R10; SLSA v1.2's source track): commit `sha` of
@@ -207,6 +210,7 @@ async fn walked<'h>(hub: &'h Hub, start: Start<'_>) -> Result<Walk<'h>, Fail> {
         revocations,
         under,
         refused,
+        tiles: crate::trail::Tiles::default(),
         links: Vec::new(),
         rests: Vec::new(),
         record: parking_lot::Mutex::new(Record::default()),
@@ -284,6 +288,8 @@ struct Walk<'h> {
     /// The newest checkpoint; and why kiln's server signs none now, when it doesn't.
     under: Option<crate::trail::Kept>,
     refused: Option<String>,
+    /// The trail's tiles this walk read: every proof in it is against the one checkpoint.
+    tiles: crate::trail::Tiles,
     links: Vec<Link>,
     /// The digests of the statements each link rests on, beside it.
     rests: Vec<Vec<String>>,
@@ -323,7 +329,7 @@ impl Walk<'_> {
     async fn holding(&self, digest: &str) -> Result<(Held, Vec<(Value, i64)>), String> {
         self.record.lock().touched.push(digest.to_owned());
         let size = self.under.as_ref().map_or(0, |k| k.size);
-        let h = crate::trail::holding(&self.hub.store, digest, size).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("the trail has no {}", short_digest(digest)))?;
+        let h = crate::trail::holding(&self.hub.store, digest, size, &self.tiles).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("the trail has no {}", short_digest(digest)))?;
         let (Some(k), Some(proof)) = (&self.under, h.proof) else {
             if h.entry.index < size {
                 return Err(format!("the trail's tiles up to {size} aren't all kept: entry {} has no proof", h.entry.index));
@@ -412,7 +418,7 @@ impl Walk<'_> {
             let rows: Vec<(String, String)> = self
                 .hub
                 .store
-                .call(move |c| Ok(c.prepare("SELECT digest, bundle FROM land_signatures WHERE repo_id = ?1 AND trunk = ?2 ORDER BY signed_at, rowid")?.query_map(params![id, t], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?))
+                .read(move |c| Ok(c.prepare("SELECT digest, bundle FROM land_signatures WHERE repo_id = ?1 AND trunk = ?2 ORDER BY signed_at, rowid")?.query_map(params![id, t], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?))
                 .await?;
             let mut lands = Lands::default();
             for (digest, bundle) in rows {
@@ -753,7 +759,7 @@ async fn provenance_of(hub: &Hub, digest: &str) -> anyhow::Result<Option<String>
     let (d, kind) = (digest.to_ascii_lowercase(), kiln_ci::attest::PROVENANCE.to_owned());
     let bundle: Option<String> = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let sql = "SELECT a.bundle FROM ci_attestations a JOIN ci_attestation_subjects s ON s.attestation_id = a.id WHERE s.digest = ?1 AND a.predicate_type = ?2 ORDER BY a.id DESC LIMIT 1";
             Ok(c.query_row(sql, params![d, kind], |r| r.get(0)).optional()?)
         })
@@ -970,6 +976,30 @@ mod tests {
         assert_eq!(Target::of(&q(&[("change", "D12"), ("limit", "3")])), Ok(Target::Change("D12".into())));
         assert!(Target::of(&q(&[])).is_err_and(|(s, _)| s == StatusCode::BAD_REQUEST), "nothing to verify");
         assert!(Target::of(&q(&[("change", "D12"), ("deploy", "7")])).is_err(), "two at once");
+    }
+
+    /// An export's revocations are read off their own index, not the whole trail: those under the
+    /// checkpoint, in the order kiln took them.
+    #[test]
+    fn w27_r10_an_exports_revocations_are_read_off_their_index() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let mut revoked = Vec::new();
+            for i in 0..6u32 {
+                let s = trail::revocation(Some(&format!("{i:08x}")), None, "fedora-2", 1_790_000_000, "a test", "ada");
+                let payload = statement::payload(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                revoked.push(trail::about(trail::PAYLOAD_REVOCATION, &payload).0);
+                store.call(move |c| crate::trail::own(c, trail::PAYLOAD_REVOCATION, &s, 1_790_000_000)).await?;
+                let said = trail::checked_commit("acme/app", "refs/heads/main", &format!("{i:040x}"), None, "unsigned", None);
+                store.call(move |c| crate::trail::own(c, trail::PAYLOAD_CHECKED, &said, 1_790_000_000)).await?;
+            }
+            let under: Vec<String> = store.read(|c| Ok(c.prepare(&revocations_sql())?.query_map([8], |r| r.get(0))?.collect::<Result<_, _>>()?)).await?;
+            assert_eq!(under, revoked.get(..4).unwrap_or_default(), "of 12 entries, those under 8");
+            let plan: Vec<String> = store.read(|c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {}", revocations_sql()))?.query_map([8], |r| r.get(3))?.collect::<Result<_, _>>()?)).await?;
+            assert!(plan.iter().any(|p| p.contains("trail_revocations")), "{plan:?}");
+            assert!(plan.iter().all(|p| !p.contains("TEMP B-TREE")), "{plan:?}");
+            Ok(())
+        })
     }
 
     #[test]
