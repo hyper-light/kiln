@@ -118,11 +118,16 @@ impl Costs {
         (units > 0).then(|| self.ns.load(Relaxed) as f64 / units as f64)
     }
 
+    /// The dearest a unit cost of those its window holds, nanoseconds: what [`Costs::fit`] holds a unit to with nothing to
+    /// put off (`fit(free, 0)` is at least one where it's within `free`); none until one was learned.
+    pub fn dearest(&self) -> Option<f64> {
+        self.buckets.iter().rev().find(|b| b.units.load(Relaxed) > 0).map(|b| f64::from_bits(b.dearest.load(Relaxed)))
+    }
+
     /// The cheapest and the dearest a unit cost of those its window holds, nanoseconds: none until one was learned.
     pub fn range(&self) -> Option<(f64, f64)> {
-        let held = |b: &&Bucket| b.units.load(Relaxed) > 0;
-        let (low, high) = (self.buckets.iter().find(held)?, self.buckets.iter().rev().find(held)?);
-        Some((f64::from_bits(low.cheapest.load(Relaxed)), f64::from_bits(high.dearest.load(Relaxed))))
+        let low = self.buckets.iter().find(|b| b.units.load(Relaxed) > 0)?;
+        Some((f64::from_bits(low.cheapest.load(Relaxed)), self.dearest()?))
     }
 
     /// The rule work is weighed by: the most units whose cost past `free` nanoseconds (negative: already past by that) is
