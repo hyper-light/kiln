@@ -495,7 +495,7 @@ pub(crate) mod tests {
     fn t_t2_2_1_a_webhook_endpoint_down_for_10_minutes_gets_every_event_in_order() -> anyhow::Result<()> {
         let clock = SimClock::new();
         crate::rt::block_on(async move {
-            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |cfg| cfg.ci.allow_private_targets = vec!["127.0.0.1".into()]).await?;
+            let hub = crate::hub::tests::persisted_hub_on(Arc::new(clock.clone()), |cfg| cfg.ci.allow_private_targets = vec!["127.0.0.1".into()]).await?;
             let ep = endpoint()?;
             ep.down.store(true, Ordering::SeqCst);
             let url = format!("http://127.0.0.1:{}/hook", ep.port);

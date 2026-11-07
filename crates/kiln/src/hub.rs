@@ -763,6 +763,27 @@ impl Hub {
         join_token: String,
         shutdown: Shutdown,
     ) -> anyhow::Result<Arc<Self>> {
+        // The bus every session's live feed rides, and kiln's CI and deploy events (docs/bus.md):
+        // Quiver's node, in this process, the one node of a cluster of one for the persisted class.
+        let bus = crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))?;
+        Self::new_with_bus(clock, cfg, store, logs, net, pki, admin_token, join_token, shutdown, bus)
+    }
+
+    /// A hub on `bus`, opened by its maker: the server's with the persisted class
+    /// ([`Hub::new_on`]), a test's with what the test needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_bus(
+        clock: Arc<dyn kiln_seams::Clock>,
+        cfg: Arc<Config>,
+        store: Store,
+        logs: Logs,
+        net: NetHandle,
+        pki: Arc<crate::pki::Pki>,
+        admin_token: String,
+        join_token: String,
+        shutdown: Shutdown,
+        bus: crate::bus::QuiverBus,
+    ) -> anyhow::Result<Arc<Self>> {
         let mut blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
         // What it keeps there and reads back, recorded as it changes hands (docs/ci.md W27-R08).
         blobs.blobs = Arc::new(crate::custody::blobs::Attested::new(Arc::clone(&blobs.blobs), blobs.kind.as_str(), store.clone(), Arc::clone(&pki)));
@@ -770,9 +791,6 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
-        // The bus every session's live feed rides, and kiln's CI and deploy events (docs/bus.md):
-        // Quiver's node, in this process, the one node of a cluster of one for the persisted class.
-        let bus = crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))?;
         // The search across a change (W26-R07): an index per tree in the server's cache.
         let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
@@ -5331,17 +5349,25 @@ pub(crate) mod tests {
 
     /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
     pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
-        scratch_hub_in(clock, None, f).await
+        scratch_hub_in(clock, None, false, f).await
+    }
+
+    /// A scratch hub whose bus serves the persisted class too, as the server's does: for the tests
+    /// of kiln's events (crate::events), which ride it. The others' buses serve the ephemeral class
+    /// alone: a test's hub lives as long as its process, and each persisted node holds its threads
+    /// and logs for as long, a test binary's hundred of them its cores.
+    pub(crate) async fn persisted_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_in(clock, None, true, f).await
     }
 
     /// A scratch hub whose kiln.db is the file `db` and whose bus keeps its data in `bus`: a
     /// second one on them takes up where the first stopped (a restart).
     pub(crate) async fn restartable_hub(clock: Arc<dyn kiln_seams::Clock>, db: &std::path::Path, bus: &std::path::Path) -> anyhow::Result<Arc<Hub>> {
         let bus = bus.to_string_lossy().into_owned();
-        scratch_hub_in(clock, Some(db.to_path_buf()), move |cfg| cfg.bus.data = bus).await
+        scratch_hub_in(clock, Some(db.to_path_buf()), true, move |cfg| cfg.bus.data = bus).await
     }
 
-    async fn scratch_hub_in(clock: Arc<dyn kiln_seams::Clock>, db: Option<std::path::PathBuf>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+    async fn scratch_hub_in(clock: Arc<dyn kiln_seams::Clock>, db: Option<std::path::PathBuf>, persisted: bool, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
@@ -5369,7 +5395,8 @@ pub(crate) mod tests {
         let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
         let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
-        Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
+        let bus = if persisted { crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))? } else { crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))? };
+        Hub::new_with_bus(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new(), bus)
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): a terminal whose relay has no

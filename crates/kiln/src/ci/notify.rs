@@ -1898,7 +1898,7 @@ mod tests {
         let clock = SimClock::new();
         crate::rt::block_on(async move {
             let rule = Rule { on: vec!["agent.finished".into()], cond: None, to: vec!["webhook:hook".into()], throttle: None };
-            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), move |cfg| {
+            let hub = crate::hub::tests::persisted_hub_on(Arc::new(clock.clone()), move |cfg| {
                 cfg.ci.allow_private_targets = vec!["127.0.0.1".into()];
                 cfg.ci.notify = vec![rule];
             })
