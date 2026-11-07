@@ -3683,7 +3683,11 @@ impl Shard {
         match written {
             Ok((file, spilled)) => {
                 m.spill_refused = false;
-                m.spill_file = Some(file);
+                // The file it spilled to before, where this spill went to a new one, let go of off the shard should this be
+                // its last reference (`super::spill::give_way`): its removal held the shard past the quantum.
+                if let (Some(old), Some(new)) = (m.spill_file.replace(file), m.spill_file.as_ref()) {
+                    super::spill::give_way(old, new);
+                }
                 if m.events.spilled(chunks, spilled) > 0 {
                     m.publish();
                 }
@@ -5861,6 +5865,50 @@ mod tests {
                 anyhow::ensure!(std::time::Instant::now() < deadline, "the spill file outlived its session");
                 crate::rt::sleep(std::time::Duration::from_millis(5)).await;
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a spill that went to a new file lets the file the copy spilled to before go off its
+    /// owner's shard, where that file's removal and close (its last reference the copy's) held the shard 130 to 250 µs, past
+    /// the quantum, as "a copy's spill taken in" in a Mac's lab. Do: on its owner's shard, a copy whose spill file no chunk
+    /// refers to any more takes in a spill written to a new file. Expect: the old file is removed, off any shard; its owner
+    /// removed it, on its shard, before.
+    #[test]
+    fn g9_s3_a_spill_to_a_new_file_lets_the_old_one_go_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let tmp = tempfile::tempdir()?;
+            let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            let (bus, id) = (sim_bus(), "s1".to_owned());
+            let info = Info { id: id.clone(), ..Info::default() };
+            let i = id.clone();
+            copies.on(&id, move |s| s.insert(i, Mirror::new(info, Location::Local, bus))).await;
+            let (old, new) = (dir.new_file(&id)?, dir.new_file(&id)?);
+            let was = old.path().to_owned();
+            let i = id.clone();
+            let took = copies
+                .on(&id, move |s| {
+                    let m = s.get_mut(&i)?;
+                    m.spilling = true;
+                    m.spill_file = Some(old);
+                    s.spilled(&i, &[], Ok((new, Vec::new())));
+                    Some(crate::rt::on_shard())
+                })
+                .await
+                .flatten();
+            anyhow::ensure!(took == Some(true), "the spill was taken in on its owner's shard");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let on_shard = loop {
+                let gone = super::super::spill::GONE.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.iter().find(|(p, _)| *p == was).map(|(_, s)| *s);
+                if let Some(on_shard) = gone {
+                    break on_shard;
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the old spill file was never let go of");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            anyhow::ensure!(!on_shard, "the old spill file was removed on its owner's shard");
+            anyhow::ensure!(!was.exists(), "the old spill file is still there");
             Ok(())
         })
     }
