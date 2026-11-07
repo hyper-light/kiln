@@ -23,6 +23,14 @@ pub static NET_EVENTS: Owner = Owner::new("net_events");
 /// waits, and behind it the net thread and QUIC's flow control.
 pub static SESSION_INBOXES: Owner = Owner::new("session_inboxes");
 
+/// Session copies' sealed chunks' texts, held as text until their copies keep them compact (`crate::harness::copies`'s
+/// `packing`; join-burst, item 2): at most a share of what the server may hold ([`crate::memory::room`]), measured again
+/// as runners come and go and as memory is short. Counted as a chunk seals (its owner never waits for the packer) and let
+/// go of as the chunk goes (kept compact once packed, cut, its copy ended), is changed, or is given up by the packer. Past
+/// the bound what hands the copies runners' updates waits, and behind it the hub's loops, the net thread and QUIC's flow
+/// control: nothing is dropped.
+pub static SESSION_PACKING: Owner = Owner::new("session_packing");
+
 /// The server's own sessions' updates waiting for the loop that hands them to their owners
 /// (`crate::harness::registry`'s `local_rx`): at most [`crate::net::EVENTS_BYTES`], as much as the owner's
 /// inbox they go to next. At the bound a session waits to send.
@@ -224,7 +232,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 29] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &SESSION_PACKING, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

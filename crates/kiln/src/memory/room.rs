@@ -22,13 +22,14 @@ use super::queue::Room;
 
 /// The owners of runners' bytes on their way to the copies, in the buffers the room is for: left out of what the server
 /// holds beside them.
-const IN_FLIGHT: [&Owner; 2] = [&super::owners::NET_EVENTS, &super::owners::SESSION_INBOXES];
+const IN_FLIGHT: [&Owner; 3] = [&super::owners::NET_EVENTS, &super::owners::SESSION_INBOXES, &super::owners::SESSION_PACKING];
 
 /// The server's buffers of runners' bytes, which fill together while its copies are behind, each a share: the net
-/// thread's own (what it holds before it holds the runners' lanes), the hub loops' queues (`net_events`), and each of
-/// `shards` shards' session inbox (`session_inboxes`).
+/// thread's own (what it holds before it holds the runners' lanes), the hub loops' queues (`net_events`), each of
+/// `shards` shards' session inbox (`session_inboxes`), and the copies' sealed texts waiting for the packer
+/// (`session_packing`).
 pub const fn buffers(shards: usize) -> usize {
-    shards.saturating_add(2)
+    shards.saturating_add(3)
 }
 
 /// A share of `room` bytes, `runners` runners connected to a server of `shards` shards: the room cut into a window for
@@ -148,22 +149,23 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// join-burst, item 1: the room is cut into a window for each runner connected (one at the least) and a share for each
-    /// buffer that fills with theirs while the copies are behind (the net thread's, the hub loops' queues, each shard's
-    /// inbox), so together, full, they hold the room and no more. A 256 MiB instance holding 96 MiB beside them, 4 runners,
-    /// 2 shards: 160 MiB in 8 shares of 20 MiB, where each was a 64 MiB window (4 x 64 MiB of windows, 64 MiB the net
-    /// thread held before it held the lanes, 64 MiB of the loops' queues, 64 MiB of each inbox: 512 MiB in all).
+    /// join-burst, items 1 and 2: the room is cut into a window for each runner connected (one at the least) and a share for
+    /// each buffer that fills with theirs while the copies are behind (the net thread's, the hub loops' queues, each shard's
+    /// inbox, the copies' texts waiting for the packer), so together, full, they hold the room and no more. A 256 MiB
+    /// instance holding 112 MiB beside them, 4 runners, 2 shards: 144 MiB in 9 shares of 16 MiB, where each was a 64 MiB
+    /// window (4 x 64 MiB of windows, 64 MiB the net thread held before it held the lanes, 64 MiB of the loops' queues, 64
+    /// MiB of each inbox: 512 MiB in all) and the texts waiting for the packer had no bound.
     #[test]
     fn join_burst_the_room_is_cut_into_a_share_for_each_runner_and_buffer() {
-        assert_eq!(buffers(2), 4);
-        assert_eq!(share_of(160 * MIB, 4, 2), 20 * MIB);
-        let full = share_of(160 * MIB, 4, 2) * u64::try_from(4 + buffers(2)).unwrap_or(0);
-        assert!(full <= 160 * MIB, "full, they hold the room and no more: {full}");
-        assert_eq!(share_of(160 * MIB, 0, 2), share_of(160 * MIB, 1, 2), "the next runner to come has a window");
-        assert!(share_of(160 * MIB, 32, 2) < share_of(160 * MIB, 4, 2), "more runners, smaller shares");
+        assert_eq!(buffers(2), 5);
+        assert_eq!(share_of(144 * MIB, 4, 2), 16 * MIB);
+        let full = share_of(144 * MIB, 4, 2) * u64::try_from(4 + buffers(2)).unwrap_or(0);
+        assert_eq!(full, 144 * MIB, "full, they hold the room and no more");
+        assert_eq!(share_of(144 * MIB, 0, 2), share_of(144 * MIB, 1, 2), "the next runner to come has a window");
+        assert!(share_of(144 * MIB, 32, 2) < share_of(144 * MIB, 4, 2), "more runners, smaller shares");
         assert_eq!(share_of(0, 4, 2), 0, "no room: nothing past one item at a time");
         let old = 4 * 64 * MIB + 64 * MIB + 64 * MIB + 2 * 64 * MIB;
-        assert!(full * 3 < old, "a third of the 512 MiB the windows and buffers could hold together: {full} of {old}");
+        assert!(full * 3 < old, "under a third of the 512 MiB the windows and buffers could hold together: {full} of {old}");
     }
 
     /// join-burst, item 1: the share is measured from what the server may hold less what it holds beside its buffers, and

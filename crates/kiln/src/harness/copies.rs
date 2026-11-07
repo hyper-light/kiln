@@ -430,6 +430,10 @@ pub struct Chunk {
     /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
     /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
+    /// Its texts' bytes counted as sealed texts its copy holds ([`packing`]), from its sealing until it goes (its copy keeps
+    /// it compact once it's packed, a cut, its copy's end, the last view that held it let go of), it's changed, or the packer
+    /// gives it up, whichever comes first (join-burst, item 2): none otherwise.
+    packing: AtomicUsize,
     /// Whether a read of its copy's events took its texts ([`Events::page_parts`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
     /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
@@ -448,7 +452,7 @@ impl Clone for Chunk {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
         let spilled = self.spilled.clone().filter(|_| self.is_compact());
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) }
     }
 }
 
@@ -462,7 +466,7 @@ impl Drop for Chunk {
 impl Chunk {
     fn of(evs: Vec<Ev>) -> Self {
         let meta = evs.iter().map(Meta::of).collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) }
     }
 
     pub fn len(&self) -> usize {
@@ -699,7 +703,7 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) })
     }
 
     /// Whether its segment is on disk (`super::spill`), not in memory.
@@ -727,7 +731,7 @@ impl Chunk {
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
     /// memory (one changed since is kept as it is).
     fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
-        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -778,6 +782,24 @@ impl Chunk {
         self.packed.get().map_or(made, Arc::clone)
     }
 
+    /// Its texts counted from now as sealed texts its copy holds until it keeps them compact ([`packing`]; join-burst, item
+    /// 2): what the copies' intake waits on past its share. Never waits itself: an owner never waits for the packer.
+    fn await_packer(&self) {
+        let bytes = self.meta.iter().map(Meta::text_len).fold(0, usize::saturating_add);
+        packing().force(bytes);
+        self.packing.store(bytes, Ordering::Release);
+    }
+
+    /// The packer gave it up (it couldn't pack it, or its job ended before it came to it): its texts uncounted, once, and
+    /// the intake told. A snapshot packs it should it need it, as before; its copy keeps it as text meanwhile, as it keeps
+    /// its newest chunk.
+    fn packer_gave_up(&self) {
+        let bytes = self.packing.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            packing().give(bytes);
+        }
+    }
+
     /// Its texts as an `events` frame joins them, deflated at `level` now and kept nowhere (the newest
     /// chunk, which the next event changes).
     pub fn deflate(&self, level: Compression) -> std::io::Result<Segment> {
@@ -802,6 +824,12 @@ impl Chunk {
         *self.paged.get_mut() = false;
         if let Some(kept) = self.texts.take().and_then(ArcSwapOption::into_inner) {
             crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
+        }
+        // Changed or gone (its copy kept it compact, a view let go of it, a cut, an end): its texts no longer held as it was
+        // sealed. Sealed again, it's counted again.
+        let waited = std::mem::take(self.packing.get_mut());
+        if waited > 0 {
+            packing().give(waited);
         }
     }
 
@@ -1803,9 +1831,25 @@ static SEALED: OnceLock<crate::memory::queue::Sender<Sealed>> = OnceLock::new();
 /// The packer's queue ([`SEALED`]): lock-free, its owners on every shard sending and the packer taking (goal 4,
 /// plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex` on both sides). No bound, as
 /// the channel it was had none: an owner never waits for the packer, and each chunk seals once, so it holds at
-/// most one entry a chunk the copies keep as text (`crate::memory::owners::SESSION_ENTRIES`' bound).
+/// most one entry a chunk the copies keep as text, whose texts [`packing`] bounds.
 fn sealed_queue() -> (crate::memory::queue::Sender<Sealed>, crate::memory::queue::Receiver<Sealed>) {
     crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
+
+/// The sealed chunks' texts the copies hold until they keep them compact, every copy's
+/// (`crate::memory::owners::SESSION_PACKING`): bounded at a share of what the server may hold, following it as it's measured
+/// again (`crate::memory::room`; join-burst, item 2). A chunk's are counted as it seals ([`Chunk::await_packer`]: no owner
+/// waits for the packer) and let go of as the chunk goes (its copy keeps it compact once the packer has packed it, a cut,
+/// its copy's end, the last view holding it let go of), as it's changed, or as the packer gives it up. Past the bound, what
+/// hands the copies runners' updates waits ([`Copies::packed_within`]): in a fill the packer fell behind and the copies held
+/// nearly all of the fill's text (startup-footprint's join: session_entries 112 to 153 MB).
+fn packing() -> &'static Arc<crate::memory::queue::Room> {
+    static PACKING: OnceLock<Arc<crate::memory::queue::Room>> = OnceLock::new();
+    PACKING.get_or_init(|| {
+        let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::SESSION_PACKING, crate::memory::room::share()));
+        crate::memory::room::follow(&room);
+        room
+    })
 }
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
@@ -1820,7 +1864,26 @@ fn seal(chunk: &Arc<Chunk>, home: Option<Home>) {
         drop(crate::rt::spawn(pack_sealed(rx)));
         tx
     });
-    let _ = packer.try_send((Arc::downgrade(chunk), home));
+    chunk.await_packer();
+    if packer.try_send((Arc::downgrade(chunk), home)).is_err() {
+        chunk.packer_gave_up();
+    }
+}
+
+/// Bytes counted as waiting for the packer past twice its bound now, for a test of what waits on it ([`pretend_packed`] lets
+/// them go): how many.
+#[cfg(test)]
+pub(crate) fn pretend_behind() -> usize {
+    let room = packing();
+    let bytes = room.bound().saturating_mul(2).saturating_add(1).saturating_sub(room.held());
+    room.force(bytes);
+    bytes
+}
+
+/// `bytes` a test counted as waiting for the packer ([`pretend_behind`]) let go of.
+#[cfg(test)]
+pub(crate) fn pretend_packed(bytes: usize) {
+    packing().give(bytes);
 }
 
 /// The chunk a copy's cut fell in (`cut`, compact: [`Events::drain_whole`]) made again of its events past its
@@ -1896,6 +1959,21 @@ struct Packer {
     later: Vec<Home>,
 }
 
+/// What the packer took and won't pack, its job ended before it came to them (a pool that failed it): given up on, so their
+/// texts wait for it no longer ([`packing`]). A job that ends as it should has none.
+impl Drop for Packer {
+    fn drop(&mut self) {
+        for (chunk, _) in self.waiting.drain(..) {
+            if let Some(c) = chunk.upgrade() {
+                c.packer_gave_up();
+            }
+        }
+        if let Some(p) = self.now.take() {
+            p.chunk.packer_gave_up();
+        }
+    }
+}
+
 /// A sealed chunk being packed ([`Packer`]): its events fed in so far, and what they deflated to.
 struct Packing {
     chunk: Arc<Chunk>,
@@ -1951,7 +2029,10 @@ impl Packer {
                     chunk.keep(made);
                     self.tell(home);
                 }
-                Err(e) => tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it"),
+                Err(e) => {
+                    chunk.packer_gave_up();
+                    tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
+                }
             }
             return None;
         }
@@ -1964,6 +2045,7 @@ impl Packer {
             _ => Err(std::io::Error::other("a chunk's metas and events don't match")),
         };
         if let Err(e) = fed {
+            p.chunk.packer_gave_up();
             tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
             return None;
         }
@@ -4232,6 +4314,20 @@ impl Copies {
         Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
     }
 
+    /// Back at once while the copies' sealed chunks' texts not yet kept compact are within their bound, a share of what the
+    /// server may hold ([`packing`]; join-burst, item 2); past it, once the packer and the copies' owners have brought them
+    /// back within it.
+    /// What hands the copies runners' updates waits here ([`super::registry::Registry::from_runner`], `ingest_from`):
+    /// behind it the hub's loops, the net thread, and QUIC's flow control hold the runners, which keep every event, so
+    /// nothing is dropped and each session's updates go on in order. Looked at without a write: a wait takes its place
+    /// only past the bound.
+    pub async fn packed_within(&self) {
+        let room = packing();
+        if room.held() > room.bound() {
+            let _ = room.take(0).await;
+        }
+    }
+
     /// What the owners' inboxes may hold together now, in bytes: as much as may wait for the owners, and so as much
     /// as their updates' rows may wait for the conversation store before what hands them updates waits
     /// (`crate::convo::store::Store::room_within`; goal 10, plan 01a1a87b2dae step 5).
@@ -5547,6 +5643,68 @@ mod tests {
         assert!(told.is_empty(), "no owner told of a chunk gone");
         assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
         drop(owner);
+        Ok(())
+    }
+
+    /// join-burst, item 2: a sealed chunk's texts are counted as held (`packing`, the bound the copies' intake waits at)
+    /// from its sealing until the chunk goes, which its copy's keeping it compact once it's packed does (or a cut, its
+    /// copy's end, the last view holding it let go of), until it's changed, or until the packer gives it up; let go of once.
+    /// Packed, its texts are still held until its copy keeps it compact, and still counted. Counting allocates nothing.
+    #[test]
+    fn join_burst_a_sealed_chunks_texts_count_until_its_copy_lets_them_go() -> anyhow::Result<()> {
+        use crate::rt::Step;
+        let mut events = Events::default();
+        let mut sealed = Vec::new();
+        for s in 1..=u64::try_from(CHUNK * 3 + 1)? {
+            if let Some(c) = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s }) {
+                sealed.push(c);
+            }
+        }
+        let [given_up, by_packer, source] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
+        let texts = |c: &Chunk| c.metas().iter().map(Meta::text_len).sum::<usize>();
+        // The backlog's room made (and the server's share measured) once a process, before what's counted.
+        let _ = packing();
+        let before = crate::os::counted::made();
+        for c in [&given_up, &by_packer] {
+            c.await_packer();
+        }
+        assert_eq!(crate::os::counted::made().blocks, before.blocks, "counting allocates nothing");
+        for c in [&given_up, &by_packer] {
+            assert_eq!(c.packing.load(Ordering::Acquire), texts(c), "its texts counted as it seals");
+        }
+        // Packed by the packer: its texts still held as text until its copy keeps it compact, and still counted.
+        let (tx, rx) = sealed_queue();
+        tx.try_send((Arc::downgrade(&by_packer), None)).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        let mut packer = Packer { rx, waiting: Vec::new(), now: None, later: Vec::new() };
+        let mut pieces = 0;
+        while by_packer.packed().is_none() {
+            anyhow::ensure!(matches!(packer.piece(&|| true), Step::More), "the job ended before the chunk was packed");
+            pieces += 1;
+            anyhow::ensure!(pieces <= CHUNK + 1, "{pieces} pieces and the chunk isn't packed");
+        }
+        assert_eq!(by_packer.packing.load(Ordering::Acquire), texts(&by_packer), "packed, still held: still counted");
+        // Kept compact by its copy: its compact form swapped in, the sealed chunk let go of, and its count with it as it goes
+        // (`Chunk::unpack`, which its drop calls: below).
+        let was = Arc::downgrade(&by_packer);
+        drop(by_packer);
+        events.compact(None);
+        anyhow::ensure!(was.upgrade().is_none(), "kept compact: the sealed chunk let go of");
+        // Given up on: the job ended with it waiting.
+        tx.try_send((Arc::downgrade(&given_up), None)).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        while let Ok(sealed) = packer.rx.try_recv() {
+            packer.waiting.push(sealed);
+        }
+        drop(packer);
+        assert_eq!(given_up.packing.load(Ordering::Acquire), 0, "given up on: no longer counted");
+        // Changed in place, or gone: what's packed of it let go of (`Chunk::unpack`), and its count with it; sealed again,
+        // it's counted again.
+        let mut changed = Chunk::of(source.evs()?.into_owned());
+        changed.await_packer();
+        anyhow::ensure!(changed.packing.load(Ordering::Acquire) == texts(&changed));
+        changed.unpack();
+        assert_eq!(changed.packing.load(Ordering::Acquire), 0, "changed or gone: no longer counted");
+        changed.await_packer();
+        assert_eq!(changed.packing.load(Ordering::Acquire), texts(&changed), "sealed again: counted again");
         Ok(())
     }
 

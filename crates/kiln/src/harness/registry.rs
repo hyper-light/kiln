@@ -2666,6 +2666,7 @@ impl Registry {
             other => other,
         };
         self.room_for_rows(shipped).await;
+        self.sessions.packed_within().await;
         let take = super::copies::Take { from: from.clone(), id: id.to_owned(), u, shipped };
         if !self.sessions.send(id, Msg::Take(Box::new(take))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
@@ -2674,10 +2675,12 @@ impl Registry {
 
     /// An update from a session's runner, handed to the shard that owns its copy to judge and take
     /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
-    /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
+    /// owner's inbox has it, waiting only while it's full, or while the copies' texts waiting for the packer are past
+    /// their share (`super::copies::Copies::packed_within`; join-burst, item 2), as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
         let id = r.session.clone();
         self.room_for_rows(r.shipped).await;
+        self.sessions.packed_within().await;
         if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
             tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
         }
@@ -6432,6 +6435,45 @@ mod tests {
             q.pretend_written(past);
             hub.harness.sessions.applied("s").await;
             anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2", "m3"], "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// join-burst, item 2: what hands a session's owner its updates waits while the copies' sealed texts waiting for the
+    /// packer are past their share of what the server may hold, and goes on as the packer lets them go: none dropped,
+    /// each in order. Within the share it looks without a write and allocates nothing. The packer's backlog is made past
+    /// its bound by bytes counted as waiting (as a sealed chunk's are), twice the bound past it, should another test's
+    /// runner measure the share again meanwhile, and let go of however the test ends.
+    #[test]
+    fn join_burst_the_intake_waits_while_the_packer_is_behind_and_drops_nothing() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        struct Behind(usize);
+        impl Drop for Behind {
+            fn drop(&mut self) {
+                super::super::copies::pretend_packed(self.0);
+            }
+        }
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Update::Events { events: vec![Event { id: format!("p{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let within = std::time::Duration::from_secs(10);
+            // The backlog's room made once a process, before what's counted.
+            let _ = futures::FutureExt::now_or_never(hub.harness.sessions.packed_within());
+            let before = crate::os::counted::made();
+            let looked = futures::FutureExt::now_or_never(hub.harness.sessions.packed_within());
+            anyhow::ensure!(looked.is_some() && crate::os::counted::made().blocks == before.blocks, "within its share: back at once, nothing allocated");
+            crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(1))).await.map_err(|_| anyhow::anyhow!("update 1 waited"))?;
+            let behind = Behind(super::super::copies::pretend_behind());
+            {
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&there, "s", said(2), true));
+                anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "the packer behind: the hand-off waits");
+                drop(behind);
+                crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
+            }
+            crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(3))).await.map_err(|_| anyhow::anyhow!("update 3 waited"))?;
+            anyhow::ensure!(copy_of(&hub, "s") == ["p1", "p2", "p3"], "{:?}", copy_of(&hub, "s"));
             Ok(())
         })
     }
