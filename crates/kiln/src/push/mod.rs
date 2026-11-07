@@ -295,7 +295,6 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 /// The next event waiting already for the listener on `battery` or `sessions`, a battery's first; none where neither has one.
 fn waiting(battery: &mut crate::memory::lanes::Reader<Arc<str>>, sessions: &mut crate::memory::lanes::Reader<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
     for lane in [battery, sessions] {
