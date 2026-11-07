@@ -128,8 +128,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // or past their grace, an attach to a session it has no copy of yet waits for it (`crate::harness::returning`;
     // docs/wire.md, "Restarts"): armed before any runner's message is taken in. `kiln workflow run`'s own server has
     // no agent sessions.
+    // As long as runners took to come back before this start (`crate::comeback`).
+    hub.take_comebacks().await;
     if !cfg.ci.local {
-        hub.harness.returning.arm(runners_before, hub.started + crate::hub::AGENT_GRACE);
+        hub.harness.returning.arm(runners_before, hub.started + hub.comeback.grace());
     }
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).

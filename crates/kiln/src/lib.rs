@@ -19,6 +19,7 @@ pub mod ci;
 pub mod h3door;
 pub mod http;
 pub mod kubeapi;
+pub mod comeback;
 pub mod config;
 pub mod config_cli;
 pub mod convo;

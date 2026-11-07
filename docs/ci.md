@@ -2056,7 +2056,8 @@ W20.
     slot. The rebuild used to put such a leg back on the runner, where it stayed running for good
     and held the slot: a server's own runner, back before the rebuild with none of its legs, hit it
     on every restart that found its legs running.
-  - A runner that doesn't come back within its reconnect grace (45 s) loses its legs the same way.
+  - A runner that doesn't come back within its grace (learned from how long runners take to come
+    back: docs/machines.md, "The grace to come back") loses its legs the same way.
   - Checked: `tests/chaos.rs` (`w05_r05_hellos_before_the_rebuild`, the rebuild made 10 s late by
     the chaos fault `rebuild=`) and `tests/restart.rs`
     (`w05_r05_a_restart_loses_what_its_runner_lost`,

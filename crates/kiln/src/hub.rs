@@ -44,8 +44,6 @@ fn secrets_of(cfg: &Config) -> Vec<(String, String)> {
         .collect()
 }
 
-/// How long a persistent agent may be gone before its jobs are requeued.
-pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
 const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
@@ -608,6 +606,8 @@ pub struct Hub {
     pub generation: u64,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
+    /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
+    pub comeback: crate::comeback::Comeback,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -803,6 +803,7 @@ impl Hub {
             started: Instant::now(),
             generation,
             runners_before: AtomicU64::new(0),
+            comeback: crate::comeback::Comeback::default(),
             admin_token,
             join_token,
             ephemeral_tokens: Default::default(),
@@ -2211,12 +2212,20 @@ impl Hub {
         Ok(folded)
     }
 
+    /// What runners took to come back before this start, from kiln.db ([`crate::comeback`]): the grace their jobs and
+    /// attaches get from now on.
+    pub async fn take_comebacks(&self) {
+        if let Ok(Some(kept)) = self.store.kv_get(crate::comeback::KEY.to_owned()).await {
+            self.comeback.take_kept(&kept);
+        }
+    }
+
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
     /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
     /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
     /// than the grace, as pods connected before it started may still come back.
     pub async fn forget_finished_pods(&self) -> Vec<String> {
-        if self.started.elapsed() <= AGENT_GRACE {
+        if self.started.elapsed() <= self.comeback.grace() {
             return Vec::new();
         }
         self.forget_pods_but_waiting().await
@@ -2225,11 +2234,12 @@ impl Hub {
     /// [`Hub::forget_finished_pods`], whatever the server's age.
     async fn forget_pods_but_waiting(&self) -> Vec<String> {
         // Those connected, or gone less than the grace ago: they may come back for their jobs.
+        let grace = self.comeback.grace();
         let keep: Vec<String> = self
             .agents
             .load()
             .values()
-            .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= AGENT_GRACE)))
+            .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= grace)))
             .map(|a| a.name.clone())
             .collect();
         let gone = match self.store.forget_finished_pods(keep).await {
@@ -2745,8 +2755,9 @@ impl Hub {
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
         // Connections drop transiently (network blips, server restarts): every agent, pods
-        // included, gets AGENT_GRACE to reconnect and reclaim its jobs. A pod that is really gone
-        // (deleted, evicted, OOM-killed) is requeued right away.
+        // included, gets its grace to reconnect and reclaim its jobs (as long as runners took to
+        // come back, `crate::comeback`). A pod that is really gone (deleted, evicted, OOM-killed) is
+        // requeued right away.
         if snapshot.ephemeral && !snapshot.running.is_empty() {
             let gone = match self.k8s.get().and_then(Option::as_ref) {
                 Some(k) => !k.agent_pod_alive(name).await,
@@ -3719,6 +3730,20 @@ impl Hub {
             stale: false,
         };
         let prev = self.agents.load().get(&name).map(|a| AgentLive::clone(a));
+        // Back still running jobs: how long it took to come back (`crate::comeback`), since the server lost it, or,
+        // one this server hasn't seen since it started (it ran them through the restart), since the start.
+        let came_back = match &prev {
+            _ if h.running.is_empty() => None,
+            Some(p) if !p.connected => p.lost_at.map(|t| t.elapsed()),
+            Some(_) => None,
+            None => Some(self.started.elapsed()),
+        };
+        if let Some(after) = came_back {
+            let kept = self.comeback.came_back(after);
+            if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
+                tracing::warn!(error = %format!("{e:#}"), "how long runners take to come back wasn't kept for the next start");
+            }
+        }
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
         // Its battery as last said, until it says again.
@@ -4532,10 +4557,12 @@ impl Hub {
     }
 
     async fn check_lost_agents(&self) {
+        // As long as runners took to come back (`crate::comeback`).
+        let grace = self.comeback.grace();
         // Jobs of a runner process that went away while its machine stayed connected through
         // another one, and did not come back in time.
         let expired: Vec<(String, Vec<String>)> = self.lost_instances.update(|g| {
-            let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > AGENT_GRACE).map(|(p, _)| *p).collect();
+            let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > grace).map(|(p, _)| *p).collect();
             peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
         });
         for (name, jobs) in expired {
@@ -4559,20 +4586,20 @@ impl Hub {
             .agents
             .load()
             .values()
-            .filter(|a| !a.connected && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE) && !a.running.is_empty())
+            .filter(|a| !a.connected && a.lost_at.is_some_and(|t| t.elapsed() > grace) && !a.running.is_empty())
             .map(|a| a.name.clone())
             .collect();
         for name in lost {
             self.requeue_agent_jobs(&name, "agent did not reconnect").await;
         }
         // A job's pod gone past its grace with nothing left to run: a new copy only when there's one.
-        let gone = |a: &AgentLive| a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE);
+        let gone = |a: &AgentLive| a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > grace);
         if self.agents.load().values().any(|a| gone(a)) {
             self.agents.update(|m| m.retain(|_, a| !gone(a)));
         }
         self.declined.update(|d| d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF));
         // Running jobs assigned to agents we have no session for at all (after a server restart).
-        if self.started.elapsed() > AGENT_GRACE
+        if self.started.elapsed() > grace
             && let Ok(running) = self.store.running_jobs().await {
                 // Jobs held by a connected agent, or by one still inside its reconnect grace, are
                 // not orphans.
@@ -4580,7 +4607,7 @@ impl Hub {
                     .agents
                     .load()
                     .values()
-                    .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= AGENT_GRACE))
+                    .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= grace))
                     .flat_map(|a| a.running.clone())
                     .collect();
                 for j in running {
@@ -6045,6 +6072,37 @@ pub(crate) mod tests {
         })
     }
 
+    /// docs/machines.md, "The grace to come back" (Ada, 2026-11-06: no arbitrary constants): the grace a runner gets to come back
+    /// is learned from how long runners took to come back holding their work (`crate::comeback`), not 45 s whatever they
+    /// did. A runner back holding a job 3 s after the server lost it teaches the grace (RFC 6298's bound: 3 s and four
+    /// times 1.5 s); then one lost 30 s ago holding a job has it taken back, and one lost 1 s ago keeps its own. With the
+    /// 45 s grace the one lost 30 s ago kept its job. What's learned is kept for the next start, which takes it.
+    #[test]
+    fn comeback_the_grace_a_runner_gets_is_learned_from_how_long_runners_took_to_come_back() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
+            anyhow::ensure!(hub.comeback.grace() == crate::comeback::PRIOR, "nothing learned yet");
+            hub.put_agent(lost("box", Duration::from_secs(3), "job-b"));
+            hub.pending_peers.update(|m| m.insert(1, "box".into()));
+            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") })).await?;
+            let grace = hub.comeback.grace();
+            anyhow::ensure!((Duration::from_secs(9)..Duration::from_secs(20)).contains(&grace), "back in 3 s: {grace:?}");
+            hub.put_agent(lost("gone", Duration::from_secs(30), "job-g"));
+            hub.put_agent(lost("blip", Duration::from_secs(1), "job-x"));
+            hub.check_lost_agents().await;
+            let running = |n: &str| hub.agents.load().get(n).map(|a| a.running.clone()).unwrap_or_default();
+            anyhow::ensure!(running("gone").is_empty(), "lost 30 s ago, past the learned grace: its job taken back");
+            anyhow::ensure!(running("blip") == ["job-x"], "lost 1 s ago, within it: its job waits for it");
+            // Kept: the next start takes it.
+            let kept = hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db"))?;
+            let next = crate::comeback::Comeback::default();
+            next.take_kept(&kept);
+            anyhow::ensure!(next.grace() == hub.comeback.grace(), "{kept}");
+            Ok(())
+        })
+    }
+
     /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's gone
     /// past its grace and its job ended; one gone within the grace stays.
     #[test]
@@ -6061,7 +6119,7 @@ pub(crate) mod tests {
                 running: Vec::new(),
                 ..live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(lost("kiln-abc-1", AGENT_GRACE * 2));
+            hub.put_agent(lost("kiln-abc-1", hub.comeback.grace() * 2));
             hub.put_agent(lost("kiln-def-1", Duration::from_secs(1)));
             // A server younger than the grace forgets none: pods may be coming back to it.
             anyhow::ensure!(hub.forget_finished_pods().await.is_empty());
