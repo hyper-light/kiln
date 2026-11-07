@@ -3,7 +3,7 @@
 //!
 //! * **Linux with kiln's `jemalloc` feature**: production's static musl build, as `ci/release/build.sh` builds
 //!   it by default (`KILN_LINUX_ALLOCATOR` is `jemalloc` unless a build says `musl`), the lab's pick
-//!   ([`JEMALLOC_CONF`]). jemalloc 5.3 is the binary's allocator (`main.rs`'s `#[global_allocator]`), with the
+//!   ([`JEMALLOC_CONF`]). jemalloc 5.3 is the binary's allocator (`src/bin/kiln.rs`'s `#[global_allocator]`), with the
 //!   settings below in its `malloc_conf`. jemalloc reads them at its first allocation, before `main`;
 //!   `_RJEM_MALLOC_CONF` in the environment overrides them, a setting at a time (a lab's A/B of one build).
 //! * **Linux on glibc** (a build from source for `*-linux-gnu`): glibc's malloc, its arenas capped at
