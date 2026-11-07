@@ -1330,7 +1330,7 @@ pub fn offline_at(hub: &Hub) -> Option<std::time::Instant> {
         .load()
         .values()
         .filter(|a| !a.connected && !a.ephemeral && !a.outpost)
-        .filter(|a| told.as_ref().is_none_or(|t| !t.contains(&a.name)))
+        .filter(|a| (*told).as_ref().is_none_or(|t| !t.contains(&a.name)))
         .filter_map(|a| a.lost_at?.checked_add(OFFLINE_AFTER))
         .min()
 }

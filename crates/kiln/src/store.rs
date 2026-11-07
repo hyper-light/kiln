@@ -2250,7 +2250,7 @@ impl Store {
 
     /// The v1 jobs running at `now` past their time limit, in the order they were made: their spec's
     /// `timeout_minutes`, a whole number (none, no limit), against how long they've run with their pauses
-    /// left out (W26-R22). What the scheduler acts on once the first falls due ([`Scheduling::timeout_at`]), read
+    /// left out (W26-R22). What the scheduler acts on once the first falls due ([`Store::next_timeout`]), read
     /// alone: each running job's start, pauses and limit (the DB query audit, 2026-11-06: where it read every
     /// running job whole and parsed its spec).
     pub async fn timed_out(&self, now: i64) -> anyhow::Result<Vec<TimedOut>> {
