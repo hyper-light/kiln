@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use flate2::Compression;
-use kiln_http::turn::Costs;
 use serde_json::Value;
 
 use super::core::{MAX_EVENTS, Update};
@@ -2293,8 +2292,8 @@ pub struct Mirror {
     spill_refused: bool,
     /// What writing out its states and metas that changed costs ([`Mirror::said`]), so a long one is written out off its
     /// owner's shard ([`long_off`]; goal 9, plan 01a1a87b2cec step 3).
-    states: Costs,
-    metas: Costs,
+    states: kiln_http::turn::Costs,
+    metas: kiln_http::turn::Costs,
     /// Its view holds what's long to free, replaced since it went out (a long state's, meta's or changeset's last): the next
     /// publish lets go of it off the shard, as one holding chunks taken out ([`Mirror::publish`]; step 3).
     pub(super) long_to_free: bool,
@@ -2462,8 +2461,8 @@ impl Mirror {
             spill_file: None,
             spilling: false,
             spill_refused: false,
-            states: Costs::nothing_yet(),
-            metas: Costs::nothing_yet(),
+            states: kiln_http::turn::Costs::nothing_yet(),
+            metas: kiln_http::turn::Costs::nothing_yet(),
             long_to_free: false,
         }
     }
@@ -2474,7 +2473,7 @@ impl Mirror {
     /// session's states keep about the size they had. Nothing learned yet, its caller writes it off the shard ([`said_off`]):
     /// a harness's meta lists the same commands and controls for each of its sessions (15 KB in the lab's, made a value in
     /// 0.4 to 0.5 ms on the CPU in a test build, 2.5 ms in the lab on a Mac).
-    pub(super) fn said<'a>(&'a self, u: &Update, all: &'a Said) -> Option<&'a Costs> {
+    pub(super) fn said<'a>(&'a self, u: &Update, all: &'a Said) -> Option<&'a kiln_http::turn::Costs> {
         self.own(u).filter(|c| c.mean().is_some()).or_else(|| all.of(u))
     }
 
@@ -2487,7 +2486,7 @@ impl Mirror {
     }
 
     /// Its own costs of `u`'s kind: its states', its metas'; none for another kind.
-    fn own(&self, u: &Update) -> Option<&Costs> {
+    fn own(&self, u: &Update) -> Option<&kiln_http::turn::Costs> {
         match u {
             Update::State { .. } => Some(&self.states),
             Update::Meta { .. } => Some(&self.metas),
@@ -3165,8 +3164,8 @@ impl Rate {
 /// step 3). One for the owners of one [`Copies`] (the process's).
 #[derive(Default)]
 pub(super) struct Said {
-    states: Costs,
-    metas: Costs,
+    states: kiln_http::turn::Costs,
+    metas: kiln_http::turn::Costs,
     /// A test's round trip to the compute pool for these owners alone ([`Said::pin_trip`]), nanoseconds; 0: the process's.
     #[cfg(test)]
     pinned_trip: AtomicU64,
@@ -3174,7 +3173,7 @@ pub(super) struct Said {
 
 impl Said {
     /// What every session's of `u`'s kind (a state, a meta) taught, none for another.
-    fn of(&self, u: &Update) -> Option<&Costs> {
+    fn of(&self, u: &Update) -> Option<&kiln_http::turn::Costs> {
         match u {
             Update::State { .. } => Some(&self.states),
             Update::Meta { .. } => Some(&self.metas),
@@ -3318,7 +3317,7 @@ pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
 /// Whether a state or meta whose kind costs `costs` is written off its owner's shard: on a shard, unless one is expected to
 /// cost no more than the compute pool's round trip and the quantum, the rule work is weighed by with nothing free
 /// (`kiln_http::turn::Costs::fit`), which nothing learned of it or of the pool meets (the pool's run teaches); off one, never.
-pub(super) fn said_off(costs: &Costs, sides: crate::rt::Sides) -> bool {
+pub(super) fn said_off(costs: &kiln_http::turn::Costs, sides: crate::rt::Sides) -> bool {
     sides.quantum_ns.is_some_and(|q| costs.fit(0, sides.trip_ns.map_or(0, |t| t.min(q))).is_none_or(|n| n == 0))
 }
 
@@ -5869,14 +5868,14 @@ mod tests {
         let shard = crate::rt::Sides { quantum_ns: Some(266_667), trip_ns: Some(60_000) };
         let none = crate::rt::Sides { quantum_ns: None, trip_ns: Some(60_000) };
         let took = |ns: u64| {
-            let c = Costs::nothing_yet();
+            let c = kiln_http::turn::Costs::nothing_yet();
             c.learn(1, ns);
             c
         };
-        assert!(said_off(&Costs::nothing_yet(), shard), "nothing learned, on a shard: off it, where the pool's run teaches what it takes");
+        assert!(said_off(&kiln_http::turn::Costs::nothing_yet(), shard), "nothing learned, on a shard: off it, where the pool's run teaches what it takes");
         assert!(!said_off(&took(20_000), shard), "learned short: on the shard");
         assert!(said_off(&took(2_000_000), shard), "learned long: off the shard");
-        assert!(!said_off(&Costs::nothing_yet(), none), "off any shard: where it's asked");
+        assert!(!said_off(&kiln_http::turn::Costs::nothing_yet(), none), "off any shard: where it's asked");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a session's states are judged by what they cost on average, not by their last few.
