@@ -17,8 +17,8 @@
 //!
 //! Frames refused with `LaneFull` wait in a bounded per-lane outbox and are sent again once the
 //! lane says it has room (`Event::LaneRoom`), or as the connection drains. A failure or panic inside the loop ends that
-//! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. The
-//! owner can force the same rebuild with [`Out::Rebuild`] (the agent's dial watchdog does).
+//! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. A dial
+//! the owner asks for while connected, or elsewhere than the one in flight, starts over the same way.
 //!
 //! Every frame the loop lets go before the wire is counted, by lane and reason
 //! (`crate::metrics::NetMetrics`, docs/wire.md "Loss below the channel"). A control frame is never
@@ -192,8 +192,6 @@ pub enum Out {
     RevokeKeys { keys: Vec<String>, why: String },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
-    /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
-    Rebuild,
     /// A test build's fault (`crate::runner::chaos`: `shed=`, `twice=`, `late=`): frames dropped,
     /// sent twice or sent late as [`Shed`] says, from now on, beside the faults said before.
     Shed(Shed),
@@ -657,7 +655,7 @@ impl crate::memory::queue::Weigh for Out {
             Out::Revoke { name } | Out::Unrevoke { name } => name.len(),
             Out::RevokeKeys { keys, why } => keys.iter().map(String::len).sum::<usize>().saturating_add(why.len()),
             Out::Copy(path) => path.as_os_str().len(),
-            Out::Disconnect { .. } | Out::Connect { .. } | Out::Rebuild | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
+            Out::Disconnect { .. } | Out::Connect { .. } | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
         })
     }
 }
@@ -1270,7 +1268,6 @@ async fn run_loop(
                                 }
                             }
                         }
-                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                     }
                 }
                 with_driver!(&mut driver, d => {
@@ -2304,11 +2301,11 @@ mod tests {
                     }
                     _ => {}
                 }
-                // Once the first connection carried both frames, rebuild while connected: the
-                // agent must come back on its own (in-flight frames die with the old connection).
+                // Once the first connection carried both frames, a dial while connected rebuilds:
+                // the agent must come back on its own (in-flight frames die with the old connection).
                 if !rebuilt && replies >= 1 && logs >= 1 {
                     rebuilt = true;
-                    agent.command(Out::Rebuild).await;
+                    agent.command(Out::Connect { addr }).await;
                 }
                 // Both connections delivered the control round trip and the 1 MiB bulk frame.
                 if replies >= 2 && logs >= 2 {
