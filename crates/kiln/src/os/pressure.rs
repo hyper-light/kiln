@@ -345,35 +345,44 @@ mod tests {
         Ok(())
     }
 
-    /// join-burst, item 3: a purge gives jemalloc's dirty pages back at once, where its decay (5 s) would have kept them: a
-    /// 64 MiB block written whole and freed leaves its pages dirty (resident) until then; after the purge, under half of
-    /// it is dirty (other tests allocate beside this one), and the block's pages are faulted in again only if asked again.
+    /// join-burst, item 3: a purge gives jemalloc's dirty pages back at once, where its decay (5 s) would have kept them:
+    /// 32 blocks of 1 MiB written whole and freed leave their pages dirty (resident; each under jemalloc's
+    /// `oversize_threshold`, 8 MiB, past which an allocation's arena purges as it frees); after the purge, more than half
+    /// of them are given back (other tests allocate beside this one), and no page is read in for it.
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     #[test]
     #[allow(unsafe_code)]
     fn join_burst_a_purge_gives_jemallocs_dirty_pages_back_at_once() {
         use std::alloc::{GlobalAlloc as _, Layout};
-        const BLOCK: usize = 64 << 20;
+        const BLOCK: usize = 1 << 20;
+        const BLOCKS: usize = 32;
         let Ok(layout) = Layout::from_size_align(BLOCK, 4096) else {
             return;
         };
-        // SAFETY: a layout of non-zero size.
-        let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
-        assert!(!block.is_null());
-        // SAFETY: `block` is BLOCK bytes, jemalloc's, written whole here.
-        unsafe { std::ptr::write_bytes(block, 1, BLOCK) };
-        // SAFETY: `block` came from jemalloc with `layout`.
-        unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
-        let freed = crate::os::alloc::stats().unwrap_or_default();
-        let block_bytes = u64::try_from(BLOCK).unwrap_or(u64::MAX);
-        assert!(freed.dirty >= block_bytes / 2, "the freed block's pages are dirty until its decay: {freed:?}");
+        let freed_bytes = u64::try_from(BLOCK * BLOCKS).unwrap_or(u64::MAX);
+        let dirty = || crate::os::alloc::stats().map_or(0, |s| s.dirty);
+        let before = dirty();
+        let mut blocks = Vec::with_capacity(BLOCKS);
+        for _ in 0..BLOCKS {
+            // SAFETY: a layout of non-zero size.
+            let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+            assert!(!block.is_null());
+            // SAFETY: `block` is BLOCK bytes, jemalloc's, written whole here.
+            unsafe { std::ptr::write_bytes(block, 1, BLOCK) };
+            blocks.push(block);
+        }
+        for block in blocks {
+            // SAFETY: `block` came from jemalloc with `layout`.
+            unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
+        }
+        let freed = dirty();
+        assert!(freed >= before.saturating_add(freed_bytes / 2), "the freed blocks' pages are dirty until their decay: {before} then {freed}");
         let majors = || crate::os::page_faults().map(|f| f.major);
-        let before = majors();
+        let faults = majors();
         relieve(Source::Events);
-        let purged = crate::os::alloc::stats().unwrap_or_default();
-        assert!(purged.dirty < block_bytes / 2, "purged at once: {freed:?} then {purged:?}");
+        let purged = dirty();
+        assert!(purged.saturating_add(freed_bytes / 2) <= freed, "purged at once: {freed} dirty then {purged}");
         assert!(heard().iter().any(|(s, n)| *s == Source::Events && *n >= 1));
-        // A purge faults nothing in: it gives pages back.
-        assert_eq!(majors(), before, "no page read in");
+        assert_eq!(majors(), faults, "a purge reads no page in: it gives pages back");
     }
 }
