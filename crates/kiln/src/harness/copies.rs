@@ -2470,10 +2470,9 @@ impl Mirror {
     /// What writing out its next update of `u`'s kind that changed is expected to take, nanoseconds: its last states' or metas'
     /// as they took ([`Mirror::said_took`]), and before it had one, every session's (`all`: [`Said`]); none for another kind
     /// (goal 9, plan 01a1a87b2cec step 3). A state is written field by field and written again for its row; a meta made a value
-    /// and compared: O(its size), and a session's states keep about the size they had. A session's first was written on its
-    /// owner's shard as its time was learned, however long: a harness's meta lists the same commands and controls for each of
-    /// its sessions (15 KB in the lab's, made a value in 0.4 to 0.5 ms on the CPU in a test build), and each of the lab's 32
-    /// sessions took its first on the shard.
+    /// and compared: O(its size), and a session's states keep about the size they had. None learned yet (0), its caller writes
+    /// it off the shard ([`long_off`]): a harness's meta lists the same commands and controls for each of its sessions (15 KB
+    /// in the lab's, made a value in 0.4 to 0.5 ms on the CPU in a test build, 2.5 ms in the lab on a Mac).
     pub(super) fn said(&self, u: &Update, all: &Said) -> Option<u64> {
         let own = match u {
             Update::State { .. } => self.state_ns,
@@ -3327,10 +3326,19 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
 /// or to cost it more than the compute pool's round trip ([`Said::sides`]; consts-audit B1: it was past a slow poll, 100 µs): a changeset by its bytes
 /// ([`long_changes`]), a state or a meta that changed (its caller tells the same one again apart: `Mirror::same_again`) by
 /// what the session's last took, or every session's before it had one ([`Mirror::said`], `all`). It's written out on the
-/// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+/// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3). Nothing learned yet of its kind (no session's
+/// written one), it's written off the shard too, as the first frame read and the first push parse are, and the pool's run
+/// teaches what it takes: the lab's 32 sessions started together, so each wrote its first 15 KB meta on its owner's shard
+/// before any had been learned, 2.5 ms on the CPU there.
 pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
     let sides = all.sides();
-    long_changes(u, sides) || m.said(u, all).is_some_and(|ns| !sides.take_here(ns, ns))
+    long_changes(u, sides) || m.said(u, all).is_some_and(|ns| said_off(ns, sides))
+}
+
+/// Whether a state or meta expected to take `ns` (0: nothing learned of its kind yet) is written off its owner's shard:
+/// on a shard, when nothing's learned or it doesn't fit there ([`crate::rt::Sides::take_here`]); off one, never.
+fn said_off(ns: u64, sides: crate::rt::Sides) -> bool {
+    sides.quantum_ns.is_some() && (ns == 0 || !sides.take_here(ns, ns))
 }
 
 /// What reading a reply's JSON into its tree takes by its bytes ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
@@ -5869,6 +5877,22 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's first meta (15 KB in the lab, the same commands and controls for each of
+    /// a harness's sessions) was made on its owner's shard whenever nothing of metas had been learned yet, and the lab's 32
+    /// sessions start together, so each made its first there: 2.5 ms on the CPU on a Mac. Do: weigh writing out a state or
+    /// meta with nothing learned (0), on a shard with a 266.7 µs quantum and a 60 µs pool round trip, then off any shard; and
+    /// one learned short (20 µs) and one learned long (2 ms) on the shard. Expect: nothing learned, off the shard (the pool's
+    /// run teaches it); short, on it; long, off it; off any shard, where it's asked.
+    #[test]
+    fn g9_s3_a_state_or_meta_with_nothing_learned_is_written_off_the_shard() {
+        let shard = crate::rt::Sides { quantum_ns: Some(266_667), trip_ns: Some(60_000) };
+        let none = crate::rt::Sides { quantum_ns: None, trip_ns: Some(60_000) };
+        assert!(said_off(0, shard), "nothing learned, on a shard: off it, where the pool's run teaches what it takes");
+        assert!(!said_off(20_000, shard), "learned short: on the shard");
+        assert!(said_off(2_000_000, shard), "learned long: off the shard");
+        assert!(!said_off(0, none), "off any shard: where it's asked");
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 3: a spill that went to a new file lets the file the copy spilled to before go off its
     /// owner's shard, where that file's removal and close (its last reference the copy's) held the shard 130 to 250 µs, past
     /// the quantum, as "a copy's spill taken in" in a Mac's lab. Do: on its owner's shard, a copy whose spill file no chunk
@@ -7588,11 +7612,11 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: a session's first long state or meta goes off its owner's shard once another session's
-    /// taught its owners what they take ([`Said`]), where it was written on the shard as its own time was learned. The first
-    /// session's first, written on the shard, teaches them; the other's first is written out off it, and taken as made there.
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's first long state or meta goes off its owner's shard, the very first ones
+    /// too: with nothing learned of their kind yet they're written off the shard, and the pool's runs teach its owners what
+    /// they take ([`Said`]); a later session's first, long by what they learned, goes off as well, and each is taken as made.
     #[test]
-    fn g9_s3_a_sessions_first_long_state_or_meta_goes_off_its_owners_shard_once_another_taught_what_they_take() -> anyhow::Result<()> {
+    fn g9_s3_a_sessions_first_long_state_or_meta_goes_off_its_owners_shard_from_the_first() -> anyhow::Result<()> {
         use crate::harness::model::{Meta, State};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
@@ -7617,15 +7641,15 @@ mod tests {
             anyhow::ensure!(send("first", Update::Meta { meta: meta("first") }).await, "sent");
             let was = off().await;
             let (states, metas) = learned().await;
-            anyhow::ensure!(was == 0, "the first session's first state and meta written on the shard: {was} off it");
+            anyhow::ensure!(was == 2, "the first session's first state and meta, nothing learned of either yet, written off the shard: {was} off it");
             anyhow::ensure!(!pinned().take_here(states, states) && !pinned().take_here(metas, metas), "each taught its owners it's long to write out against {:?}: {states} ns, {metas} ns", pinned());
             anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
             let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
             let Some((off_now, Some((state_made, meta_made)))) = now else { anyhow::bail!("no copy") };
             anyhow::ensure!(off_now == was + 2, "the other session's first state and meta written out off its owner's shard: {was} then {off_now}");
-            anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made on the shard");
-            anyhow::ensure!(meta_made == serde_json::to_value(meta("next"))?, "its meta as made on the shard");
+            anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made off the shard");
+            anyhow::ensure!(meta_made == serde_json::to_value(meta("next"))?, "its meta as made off the shard");
             Ok(())
         })
     }
