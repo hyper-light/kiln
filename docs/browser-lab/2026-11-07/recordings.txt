@@ -1,0 +1,9 @@
+$ bash -c cd /home/adalundhe/.cache/kiln-bp/g1/lab-snap3/web && node catalogue.mjs compare /home/adalundhe/.cache/kiln-bp/g1/record-b/recordings /home/adalundhe/.cache/kiln-bp/g1/record-c/recordings
+{
+ "a": 2933,
+ "b": 2801,
+ "compared": 2773,
+ "equal": 2773,
+ "differ": []
+}
+exit 0
