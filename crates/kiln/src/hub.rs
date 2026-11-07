@@ -1326,6 +1326,12 @@ impl Hub {
 
     /// The audit log's rows a minute for what the wires couldn't read, as they come due.
     pub(crate) async fn tick_unread(&self) {
+        // Its copy swapped only once a minute's over (goal 9, plan 01a1a87b2cec step 5): swapped at each of the commands
+        // loop's seconds, it was a new copy a second, and the runners' list kept ahead of what it's made of (this copy
+        // among it, `crate::reads::AgentsKey`) was made again for the read after, on the compute pool.
+        if !self.refusals.load().due() {
+            return;
+        }
         let rows = self.refusals.update(crate::wire::unread::Refusals::tick);
         self.audit_unread(rows).await;
     }
@@ -5318,6 +5324,35 @@ pub(crate) mod tests {
     /// test turns terminals on.
     pub(crate) async fn scratch_hub() -> anyhow::Result<Arc<Hub>> {
         scratch_hub_with(|_| {}).await
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the unread wires' audit swaps the refusals' copy only once a minute's over:
+    /// swapped at each of the commands loop's seconds, it was a new copy a second, and the runners' list kept ahead of
+    /// what it's made of (that copy among it) was made again for the read after. Do: a scratch hub on a simulated clock;
+    /// a refusal noted (its row at once, its minute begun); ticks within the minute; the minute over; a tick after.
+    /// Expect: the same copy across the ticks within the minute; its end closes the window, a new copy; then the same.
+    #[test]
+    fn g9_s5_the_unread_audit_swaps_its_copy_only_once_a_minute_is_over() -> anyhow::Result<()> {
+        use crate::wire::unread::{Code, Sender, Unread, Wire};
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |_| {}).await?;
+            let u = Unread { wire: Wire::Runner, from: Sender::Runner { name: "box".into(), instance: "main".into() }, what: "variant 51".into(), code: Code::Unknown, why: "AgentMsg has 51 variants".into() };
+            let noted = hub.refusals.update(|r| r.note(u.clone(), None));
+            anyhow::ensure!(noted.rows.len() == 1, "the first refusal's row at once");
+            let before = hub.refusals.get();
+            hub.tick_unread().await;
+            clock.advance(Duration::from_secs(30));
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&before, &hub.refusals.get()), "a new copy within the minute, with nothing due");
+            clock.advance(Duration::from_secs(31));
+            hub.tick_unread().await;
+            let after = hub.refusals.get();
+            anyhow::ensure!(!Arc::ptr_eq(&before, &after), "the minute's over: its window closes");
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&after, &hub.refusals.get()), "a new copy after the minute, with nothing due");
+            Ok(())
+        })
     }
 
     pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
