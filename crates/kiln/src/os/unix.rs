@@ -336,6 +336,13 @@ pub fn private_memory(_on: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// The page faults this process has taken since it started, every thread's, ended ones' included
+/// (`getrusage(RUSAGE_SELF)`: one system call, nothing allocated; allocs-metric).
+pub fn page_faults() -> Option<super::Faults> {
+    let usage = nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF).ok()?;
+    Some(super::Faults { minor: u64::try_from(usage.minor_page_faults()).ok()?, major: u64::try_from(usage.major_page_faults()).ok()? })
+}
+
 /// Whether `pid` is still running (and signalable by us). A zombie (dead, not yet reaped) is not.
 pub fn pid_alive(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()) && !is_zombie(pid)
@@ -518,6 +525,38 @@ mod path_tests {
         let script = format!("{line}\n{line}\nprintf %s \"$PATH\"");
         let out = std::process::Command::new("sh").arg("-c").arg(script).env("HOME", home).env("PATH", "/usr/bin:/bin").output()?;
         assert_eq!(String::from_utf8_lossy(&out.stdout), "/home/me/.local/bin:/usr/bin:/bin");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use rustix::mm::{MapFlags, ProtFlags};
+
+    /// allocs-metric: a fresh page the process writes is a minor fault on `/metrics`: each page of a new mapping
+    /// written once raises `kiln_memory_page_faults_total{kind="minor"}` by at least one. On Linux the mapping takes
+    /// no huge pages, so each page faults alone; other tests faulting beside this one only add.
+    #[test]
+    #[allow(unsafe_code)]
+    fn allocs_metric_a_fresh_page_written_is_a_minor_fault_on_metrics() -> anyhow::Result<()> {
+        const PAGES: usize = 256;
+        let page = rustix::param::page_size();
+        let len = page.checked_mul(PAGES).ok_or_else(|| anyhow::anyhow!("{PAGES} pages of {page} bytes"))?;
+        let minor = || crate::memory::scraped("kiln_memory_page_faults_total{kind=\"minor\"}").ok_or_else(|| anyhow::anyhow!("no minor faults on /metrics"));
+        // SAFETY: a new private mapping of `len` bytes, where the kernel puts it.
+        let map = unsafe { rustix::mm::mmap_anonymous(std::ptr::null_mut(), len, ProtFlags::READ | ProtFlags::WRITE, MapFlags::PRIVATE) }?;
+        #[cfg(target_os = "linux")]
+        // SAFETY: the mapping just made, whole.
+        unsafe { rustix::mm::madvise(map, len, rustix::mm::Advice::LinuxNoHugepage) }?;
+        let before = minor()?;
+        for at in (0..len).step_by(page) {
+            // SAFETY: `at` is within the mapping, this test's alone and writable.
+            unsafe { map.cast::<u8>().add(at).write_volatile(1) };
+        }
+        let after = minor()?;
+        // SAFETY: the mapping made above, unmapped once and not touched after.
+        unsafe { rustix::mm::munmap(map, len) }?;
+        anyhow::ensure!(after >= before + u64::try_from(PAGES)?, "{PAGES} fresh pages written: {before} then {after} minor faults");
         Ok(())
     }
 }
