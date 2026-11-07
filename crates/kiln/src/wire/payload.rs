@@ -908,11 +908,14 @@ async fn read_frame_by(expect: &Expect, data: Vec<u8>, hello: bool) -> Frame {
     frame
 }
 
-/// `read()`'s frame, and how long it took, nanoseconds.
+/// `read()`'s frame, and what it cost the thread that read it, nanoseconds: a read is computation on memory, so its time on
+/// the CPU unless it's known it waited (`hyper_rt::futures::Spent::compute_cost_ns`). What [`Expect`] learns, so a loaded
+/// host's preemptions, which hold a shard whatever it runs, don't send short reads off it (goal 9, plan 01a1a87b2cec step
+/// 5: on a host at load 75 the reads' wall times varied so that 37-55 µs reads went to the pool, their callers waiting
+/// 218-363 µs for them).
 fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
-    let began = Instant::now();
-    let frame = read();
-    (frame, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    let (frame, spent) = hyper_rt::futures::spent(read);
+    (frame, spent.compute_cost_ns())
 }
 
 /// [`read_frame`]'s work, where it runs: a channel item's body and an update's JSON kept in the frame's own buffer
@@ -1241,6 +1244,27 @@ pub fn command_class(json: &str) -> super::Class {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what a read teaches is its cost to the thread ([`timed`]: its CPU time unless it
+    /// waited inside a call). Do: one kind of read learned from reads a loaded host preempted (wall 300 µs, 40 µs of it on the
+    /// CPU, no wait of its own), another from reads that waited inside a call as long. Expect, against a quantum of 266.7 µs
+    /// and a pool round trip of 200 µs: the preempted kind read on the shard, at its CPU time; the waiting kind off it.
+    /// Weighed by their wall times, as before, both went off.
+    #[test]
+    fn g9_s5_a_read_is_weighed_by_its_cpu_time_unless_it_waited() {
+        use hyper_rt::futures::Spent;
+        let sides = crate::rt::Sides { quantum_ns: Some(crate::rt::STEP_BUDGET_NS), trip_ns: Some(200_000) };
+        let (preempted, waited, by_wall) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
+        let read = |cpu: u64, blocked: bool| Spent { wall_ns: 300_000, cpu_ns: Some(cpu), blocked: Some(blocked) };
+        for _ in 0..32 {
+            preempted.learn(1_000, read(40_000, false).compute_cost_ns(), true);
+            waited.learn(1_000, read(40_000, true).compute_cost_ns(), true);
+            by_wall.learn(1_000, read(40_000, false).wall_ns, true);
+        }
+        assert_eq!(preempted.on_shard_with(1_000, sides), Some(40_000), "preempted: on the shard, at its CPU time");
+        assert_eq!(waited.on_shard_with(1_000, sides), None, "it waited: off the shard");
+        assert_eq!(by_wall.on_shard_with(1_000, sides), None, "by its wall time, as before: off the shard");
+    }
     use crate::exec::Up;
     use crate::wire::unread::Page;
     use kiln_seams::clock::SimClock;

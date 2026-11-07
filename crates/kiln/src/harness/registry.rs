@@ -4517,7 +4517,13 @@ impl Registry {
             // Closed there, or once its machine is back; one its machine doesn't run is gone there.
             Some(Location::Machine(machine)) => {
                 use crate::wire::commands::Answer;
-                matches!(hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await, Answer::Taken | Answer::Sent | Answer::Parked)
+                let answer = hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+                // Closed there: its own command streams go, as the runner lets go of them (runner-fan).
+                if answer == Answer::Taken {
+                    let session = id.to_owned();
+                    hub.cmds.tell(move |c| c.forget_session(&session));
+                }
+                matches!(answer, Answer::Taken | Answer::Sent | Answer::Parked)
             }
         };
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
@@ -6331,8 +6337,8 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 10, plan 01a1a87b2dae step 5: a session's owner never waits for the conversation store. With the store past
-    /// its writer's bound, one update after another is taken by the owner and its copy has them (the owner waited
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's owner never waits for the conversation store. With rows waiting for
+    /// its writer, one update after another is taken by the owner and its copy has them (the owner waited
     /// between turns, so the second waited for the writer); only once the store holds as much as the owners' inboxes
     /// may does what hands it updates wait, and goes on as the writer lets rows go.
     #[test]
@@ -6345,8 +6351,8 @@ mod tests {
             let said = |n: u64| Update::Events { events: vec![Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
             hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             let q = store.queue();
-            // Past the writer's own bound, within the inboxes'.
-            let past = q.bound().saturating_add(1);
+            // Rows wait for the writer, within what the inboxes may hold.
+            let past = 1;
             q.pretend_waiting(past);
             let within = std::time::Duration::from_secs(10);
             for n in 1..=2 {

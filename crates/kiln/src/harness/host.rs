@@ -431,6 +431,14 @@ pub struct Host {
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
 pub const LANE: usize = 1024;
 
+/// The runtime's shard that owns agent session `id` (`super::copies::owner_of` of the shards a fan has session loops for):
+/// where its tasks run (its harness's drive, its lane) and where its frames are taken (a runner's session loop,
+/// `crate::wire::fan`; the server's copy of it, `super::copies`), so a frame for it crosses no other thread on its way to
+/// it (runner-fan). They ran wherever its opening ran: every session of a runner on its loop's shard.
+pub fn owner_shard(id: &str) -> usize {
+    super::copies::owner_of(id, crate::wire::fan::shards())
+}
+
 /// Longest a move waits for what its sessions' lanes hold to be done before it reads what their
 /// inboxes took: a lane can wait on a sink nobody drains while its runner hands its sessions over.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
@@ -441,7 +449,9 @@ enum Lane {
     /// ([`Inbox::bring`]), and its inbox opened; `back`: taken back by this host at the epoch it left
     /// at (its inbox's fence lifted).
     Open { epoch: u64, back: bool },
-    Cmd { c: Box<Command>, epoch: Option<u64> },
+    /// A command or a message for it, sent for `epoch`; `at`: when it was handed to the lane, for its wait there
+    /// (`crate::route_latency::InLeg::ToSession`; runner-fan).
+    Cmd { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant },
     /// A message for it, sent for `epoch`, that this machine couldn't read, its id `message` read:
     /// its inbox says what became of it ([`unread_message`]); `why`, as it's said.
     Unread { message: String, epoch: Option<u64>, why: String },
@@ -1226,7 +1236,7 @@ impl Host {
     /// there's no session `id` here, or its lane holds its most (a message is answered `Full`).
     pub fn command_at(&self, id: &str, c: Command, epoch: Option<u64>) -> bool {
         let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
-        match lane.try_send(Lane::Cmd { c: Box::new(c), epoch }) {
+        match lane.try_send(Lane::Cmd { c: Box::new(c), epoch, at: std::time::Instant::now() }) {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Cmd { c, .. })) => {
                 if let Some((message, _)) = message_of(&c) {
@@ -1253,7 +1263,8 @@ impl Host {
         lanes.insert(id.to_owned(), (tx, ended.clone()));
         let before = self.ending.lock().remove(id);
         let (me, id) = (self.me.clone(), id.to_owned());
-        crate::rt::spawn(async move {
+        // On its session's own shard, beside its harness's task and the loop that takes its frames (runner-fan).
+        crate::rt::spawn_owner(owner_shard(&id), async move {
             if let Some(before) = before {
                 let _ = before.recv().await;
             }
@@ -1317,7 +1328,11 @@ impl Host {
     /// One thing down session `id`'s lane.
     async fn step(&self, id: &str, item: Lane) {
         match item {
-            Lane::Cmd { c, epoch } => self.take(id, *c, epoch).await,
+            Lane::Cmd { c, epoch, at } => {
+                // Its wait in the lane, behind what the session was told before it (runner-fan).
+                crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                self.take(id, *c, epoch).await
+            }
             Lane::Unread { message, epoch, why } => self.unread(id, message, epoch, &why).await,
             Lane::Mark(done) => {
                 let _ = done.send(());
@@ -2654,8 +2669,19 @@ mod tests {
             }
             let out = cmd.output()?;
             let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
-            let mine = survivors::scan(&[("me".to_owned(), Some(std::process::id()))]).remove("me").unwrap_or_default().under;
-            let ran = |pid: u32| -> anyhow::Result<Ran> { mine.iter().find(|r| r.pid == pid).cloned().ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
+            // Seen by its mark before the restart is staged, as the restart's look finds it: until its shell has exec'd it
+            // a process shows no environment on macOS, and a pyenv shim (a bash script, Apple's bash until it execs
+            // Python) stays so for a while, which a loaded machine stretches; looked at then, it wasn't taken back over
+            // (Mac Studio 2, 20 runs of 20). Looked at again until it shows, up to a hang's bound.
+            let shows = || survivors::scan(&[("left-running".to_owned(), None)]).get("left-running").is_some_and(|s| s.apart.iter().any(|r| r.pid == marked));
+            let until = std::time::Instant::now() + Duration::from_secs(300);
+            while !shows() && std::time::Instant::now() < until {
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            }
+            // Each looked at as itself (as a session's harness is), not among this test process's children: the tests
+            // beside it start theirs there too, and a look notes the first 64 (`survivors::MAX_RAN`), which a loaded
+            // run's overlapping tests filled before this test's ("not seen").
+            let ran = |pid: u32| -> anyhow::Result<Ran> { survivors::scan(&[("look".to_owned(), Some(pid))]).remove("look").and_then(|s| s.harness).ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
             let (h, r) = (ran(harness.id())?, ran(recorded.id())?);
             {
                 let (tx, _rx) = async_channel::unbounded();

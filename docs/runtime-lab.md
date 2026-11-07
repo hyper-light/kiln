@@ -5,7 +5,9 @@ latency), and from outside, by `kiln-lab` (`crates/kiln-lab`), which replays rea
 against any build, with CPU hogs beside it when asked, and compares two builds round by round. Every
 change to how the server schedules its work is decided by these numbers (Ada: A/B test, and let
 benchmarking under realistic usage decide). Goal 1 of the API runtime program built them: plan
-`01a1a59c2a68718493e26b9415f54824`, research `01a1a59c2a6a73dea4da7a2ba2c36848`.
+`01a1a59c2a68718493e26b9415f54824`, research `01a1a59c2a6a73dea4da7a2ba2c36848`. What a browser
+gets over a slow, lossy link, against HTTP/2 and HTTP/3 servers, is the same lab's other half:
+[browser-lab.md](browser-lab.md) (`kiln-lab browser`).
 
 ## What `/metrics` shows
 
@@ -68,9 +70,11 @@ The lab reports the shards' delay p99.9 both ways (`shards.delay_*` and, from th
 | `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
 The families from `kiln_shard_steps_total` to `kiln_shard_socket_calls_idle_total` (`crate::shard_health::Wakes`,
-`Calls` and `ParkTimes`) are copied at a probe's first wake and every 5th after (`shard_health::COUNTS_EVERY`, the
-whole periods within 100 ms, `COUNTS_AGE`): they move every 85 ms, the rest every wake (goal 9, plan 01a1a87b2cec
-step 5). Read as differences across the lab's window, 60 s, a copy 100 ms old moves a count by 0.3% at the most.
+`Calls` and `ParkTimes`) are copied at a probe's first wake and then for each read of `/metrics`, at the probe's runs
+within a period of when the next read may come, as the time between reads is learned (`shard_health::Reads`;
+consts-audit B3): a read finds them a period (17.07 ms) old at the most, and with no reader they aren't copied. The rest
+move every wake (goal 9, plan 01a1a87b2cec step 5). They were copied at every 5th wake (`COUNTS_EVERY`, the whole
+periods within 100 ms, `COUNTS_AGE`), whatever read them.
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -202,7 +206,12 @@ agents calling MCP, none thinking: more work than one shard runs, as goal 6 over
 `--profile many` is production's whole shape rather than its
 busy hour's share: its ten runners and all 134 live feeds (the realistic profile's sizes, the rest of
 400 events), every one at work at the realistic pace, as goal 4 measures many sessions changing at
-once.
+once. `--profile subagents` is the realistic profile with two of its eight working sessions (the two
+longest) in subagent turns instead, as Claude Code's Task tool runs one: the Task's call, 100 events of
+its subagent's (each its child: `parent_tool_use_id` the Task's id), then the Task's result, which
+updates the Task's tool event 100 events after it began, on shards with the other sessions
+(copies-lat2's A2(b) shape; Ada's own sessions run subagents everywhere). Its report tells the frames
+of the other sessions (`websocket.others`) from the subagent sessions' (`websocket.subagents`).
 
 ### What it reports
 
@@ -1354,7 +1363,8 @@ CPUs):
 - `cores-calm`, `cores`: the server on cores of its own (`[server] cores`, and its scope's
   `AllowedCPUs=`), calm and with the hogs on the CPUs past the server's;
 - `q<µs>-<configuration>`: a configuration with the shards' step quantum at `<µs>`
-  (`KILN_RT_QUANTUM_US`).
+  (`KILN_RT_QUANTUM_US`, fractions too: `q266.7-calm`). A value the server can't read stops it,
+  said, never dropped.
 
 With `PROF=1` each configuration gets one round more with perf recording the server over its window
 (`hook.sh`), kept apart from the measured rounds; every round's hook writes which CPUs each of the
@@ -1469,7 +1479,9 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   quantum also sets a cooperative task's share of its shard and its loops' turns (`rt::Turns`), how often
   a busy shard reads its inputs, the slow polls' threshold (twice it: 533 µs), the watchdog's stall (64
   quanta: 17.1 ms), the compute pool's pieces, the slice each shard asks for, and placement's margin.
-  `KILN_RT_QUANTUM_US` still sets another for the lab's A/B of quanta. The derivation is
+  `KILN_RT_QUANTUM_US` still sets another for the lab's A/B of quanta, in microseconds, fractions
+  too; a value the server can't read stops it, said (it was dropped with nothing said, and B2's lab ran
+  its pinned arm, 266.7, unpinned). The derivation is
   `rt::tests::g9_s3_the_step_quantum_is_derived_from_the_lab`.
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece

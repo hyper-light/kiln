@@ -174,10 +174,21 @@ pub fn spawn_at(
     Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle, pid }, rx))
 }
 
-/// A terminal's output on its way out: 256 pieces at the most, as the channel it was held, its reader
-/// waiting for room past them.
+/// A terminal's output on its way out, in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what its
+/// reader's socket takes while the terminal writes the next piece, a piece past it; consts-audit B4: 256 pieces, as
+/// the channel it was held), its reader waiting for room past it.
 fn output() -> (crate::memory::queue::Sender<PtyOut>, crate::memory::queue::Receiver<PtyOut>) {
-    crate::memory::queue::places(&crate::memory::owners::CHANNELS, 256)
+    crate::memory::queue::pipe(&crate::memory::owners::CHANNELS)
+}
+
+/// A piece of output weighs its bytes; an exit nothing.
+impl crate::memory::queue::Weigh for PtyOut {
+    fn weight(&self) -> usize {
+        match self {
+            PtyOut::Data(data) => data.len(),
+            PtyOut::Exit(_) => 0,
+        }
+    }
 }
 
 /// A terminal's keystrokes on their way in: unbounded, as the channel it was (a write never waits:
@@ -300,26 +311,27 @@ mod tests {
     })
     }
 
-    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a terminal's output is a lock-free queue
-    /// of 256 pieces, as its channel was. Not taken while its program writes far more, it holds 256 and no
-    /// more (its reader waits for room); then taken, every byte comes once, in order, its exit with it; and
-    /// it ends once its program has.
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side; consts-audit B4: a terminal's output is a lock-free
+    /// pipe whose room its pace sets (it was 256 pieces, as its channel was). Not taken while its program writes far more,
+    /// it holds no more than its room, two pieces while nothing has taken any (its pace unlearned), and its reader waits
+    /// for room; then taken, every byte comes once, in order, its exit with it; and it ends once its program has.
     #[cfg(unix)]
     #[test]
-    fn g5_a_terminals_output_holds_its_bound_keeps_its_order_and_ends() -> anyhow::Result<()> {
+    fn g5_b4_a_terminals_output_holds_its_room_keeps_its_order_and_ends() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            // Past 256 of its reader's largest reads (32 KiB).
+            // Far past what its room holds of its reader's largest reads (32 KiB). Every number in full (macOS's `seq`
+            // writes 1000000 on as 1e+06).
             let lines = 1_100_000u32;
-            let (s, rx) = spawn(Some("/bin/sh"), Some(&format!("seq 1 {lines}")), 80, 24)?;
-            let full = crate::rt::timeout(std::time::Duration::from_secs(30), async {
-                while rx.len() < 256 {
+            let (s, rx) = spawn(Some("/bin/sh"), Some(&format!("seq -f %.0f 1 {lines}")), 80, 24)?;
+            let came = crate::rt::timeout(std::time::Duration::from_secs(30), async {
+                while rx.is_empty() {
                     crate::rt::sleep(std::time::Duration::from_millis(10)).await;
                 }
             })
             .await;
-            anyhow::ensure!(full.is_ok(), "its output never filled: {} pieces", rx.len());
+            anyhow::ensure!(came.is_ok(), "its output never came");
             crate::rt::sleep(std::time::Duration::from_millis(200)).await;
-            anyhow::ensure!(rx.len() == 256, "{} pieces held, past the 256 it holds", rx.len());
+            anyhow::ensure!((1..=2).contains(&rx.len()), "{} pieces held ({} bytes, its room {}), past the two an unlearned pace holds", rx.len(), rx.held(), rx.bound());
             let (mut out, mut code) = (Vec::new(), None);
             loop {
                 match crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.map_err(|_| anyhow::anyhow!("its output never ended"))? {

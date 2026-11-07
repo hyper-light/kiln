@@ -4848,12 +4848,14 @@ mod stack_tests {
     use super::*;
     use crate::harness::lineage::{Ask, Starter, start};
 
+    /// `f` on the runtime, up to a hang's bound: never a pace (90 s ran out under load, its agents' starts and
+    /// stacks taking what time a loaded machine takes).
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("it hung"),
         }
@@ -4875,7 +4877,9 @@ mod stack_tests {
 
     /// Until the agent no longer stands starting (its start fails: no harness here).
     async fn settled(hub: &Hub, id: &str) {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s, went on before it had), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(id).is_some_and(|i| i.status != Status::Starting) {
                 return;
             }

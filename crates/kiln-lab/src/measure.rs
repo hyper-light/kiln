@@ -352,6 +352,18 @@ pub fn histogram_quantile(q: f64, buckets: &[(f64, f64)]) -> Option<f64> {
     Some(lower.0)
 }
 
+/// What of a histogram's observations went past its last finite bound (its `+Inf` bucket): how many, and that bound, the
+/// least they took. None where none did, or where it has no `+Inf` bucket or no finite one.
+pub fn past_last_bound(buckets: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let &(top, total) = buckets.last()?;
+    if !top.is_infinite() {
+        return None;
+    }
+    let &(bound, below) = buckets.iter().rev().find(|(b, _)| b.is_finite())?;
+    let past = total - below;
+    (past > 0.0).then_some((past, bound))
+}
+
 /// The largest bound any of a histogram's observations reached (`+Inf`: past its last bound).
 pub fn histogram_top(buckets: &[(f64, f64)]) -> Option<f64> {
     let total = buckets.last()?.1;

@@ -53,6 +53,63 @@ pub fn thread_run_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)).flatten()
 }
 
+/// What a piece of work spent on the thread that ran it ([`spent`]; kiln's goal 9, plan 01a1a87b2cec step 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spent {
+    /// Its wall time, nanoseconds.
+    pub wall_ns: u64,
+    /// Its time on the CPU, nanoseconds, where the thread's clock tells it (its shard's task clock, else the OS's clock for
+    /// the thread: Linux and macOS).
+    pub cpu_ns: Option<u64>,
+    /// Whether it waited inside a call (the thread switched out of its own accord), where the OS counts such switches per
+    /// thread (Linux): off the CPU for its own wait, not because the host ran something else on it.
+    pub blocked: Option<bool>,
+}
+
+impl Spent {
+    /// What the work costs whichever thread runs it, nanoseconds: its time on the CPU where the thread's clock tells it and
+    /// it's known not to have waited inside a call, so a host's preemption, which holds the thread whatever it runs, isn't
+    /// counted as the work's; its wall time otherwise (it waited, which it would on any thread, or that isn't known).
+    pub fn cost_ns(&self) -> u64 {
+        match (self.cpu_ns, self.blocked) {
+            (Some(cpu), Some(false)) => cpu.min(self.wall_ns),
+            _ => self.wall_ns,
+        }
+    }
+
+    /// [`Spent::cost_ns`] for computation on memory (decoding, encoding), which makes no call that waits: its time on the
+    /// CPU where the thread's clock tells it, whether or not the OS can say it didn't wait (macOS and Windows count no
+    /// thread's switches); its wall time where it's known it did wait (a page brought back from swap) or no clock tells.
+    pub fn compute_cost_ns(&self) -> u64 {
+        match (self.cpu_ns, self.blocked) {
+            (Some(cpu), Some(false) | None) => cpu.min(self.wall_ns),
+            _ => self.wall_ns,
+        }
+    }
+}
+
+/// Runs `work` on the calling thread and says what it spent ([`Spent`]): kiln's estimates of where work runs (a shard or
+/// the compute pool) learn its cost from it, so a loaded host's preemptions don't send short work off its shard (kiln's
+/// goal 9, plan 01a1a87b2cec step 5: on a host at load 75, 37-55 µs reads of runners' frames went to the pool, where their
+/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the clock, the thread's
+/// CPU clock (its shard's task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its
+/// voluntary switches (`getrusage`), each before and after.
+pub fn spent<R>(work: impl FnOnce() -> R) -> (R, Spent) {
+    let task = thread_run_ns();
+    let os = if task.is_none() { crate::attribution::thread_cpu_now() } else { None };
+    let switches = crate::attribution::voluntary_switches_now();
+    let began = std::time::Instant::now();
+    let out = work();
+    let wall_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let cpu_ns = match (task, os) {
+        (Some(from), _) => thread_run_ns().map(|to| to.saturating_sub(from)),
+        (None, Some(from)) => crate::attribution::thread_cpu_now().map(|to| to.saturating_sub(from)),
+        (None, None) => None,
+    };
+    let blocked = switches.and_then(|from| crate::attribution::voluntary_switches_now().map(|to| to > from));
+    (out, Spent { wall_ns, cpu_ns, blocked })
+}
+
 /// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
 /// ends up to a tick later than due by design, and later still by [`scheduler_overrun_ns`]. A wait that must
 /// end before another's (an answer before its asker gives up) sets both aside. Zero off a shard thread.
@@ -458,3 +515,6 @@ impl Drop for Sleep {
         }
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod spent_tests;

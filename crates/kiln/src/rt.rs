@@ -868,7 +868,8 @@ const fn polls_ahead_at_p999(busy_ppm: u64) -> u64 {
 /// shard was held so 0.3% of the time or more, past the 0.1% its p99.9 can spare, so its p99.9 was 1295 µs. Under
 /// lazy preemption (fedora's) the host's wait is the CPU's next tick instead, up to 1 ms (docs/priority.md,
 /// wake-2): step 4's to keep off (cores of their own), not the quantum's. `KILN_RT_QUANTUM_US` sets another,
-/// for the lab's A/B of quanta.
+/// for the lab's A/B of quanta, in microseconds, a fraction too ([`quantum_us_ns`]): a value it can't read stops the
+/// runtime, said.
 pub const STEP_BUDGET_NS: u64 = DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(LAB_BUSY_PPM).saturating_add(1);
 
 /// The most tasks a shard's step polls (hyper-rt's `RuntimeConfig::batch`), as kiln's shards have run since hyper-rt
@@ -896,6 +897,21 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
         wake_tracking: None,
         latency_objective_ns: None,
     }
+}
+
+/// The step quantum `KILN_RT_QUANTUM_US` sets, nanoseconds: `v` microseconds above 0, a fraction too (`266.7`, to the
+/// nanosecond); an error naming the variable for anything else (empty, not a number, 0 or less, not finite).
+fn quantum_us_ns(v: &str) -> Result<u64, String> {
+    let refused = || format!("KILN_RT_QUANTUM_US={v:?}: not a number of microseconds above 0 (the shards' step quantum, as 266.7)");
+    let us = v.trim().parse::<f64>().map_err(|_| refused())?;
+    if !us.is_finite() || us <= 0.0 {
+        return Err(refused());
+    }
+    let ns = (us * 1000.0).round();
+    if ns < 1.0 || ns > u64::MAX as f64 {
+        return Err(refused());
+    }
+    Ok(ns as u64)
 }
 
 /// The blocking pool's shares.
@@ -931,9 +947,10 @@ fn start() -> Result<Rt, String> {
     }
     let mut config = runtime_config(p.shards, p.tasks_per_shard);
     // The step quantum from `KILN_RT_QUANTUM_US`: the lab's A/B of quanta on one build (goal 9, plan
-    // 01a1a87b2cec step 3).
-    if let Some(us) = std::env::var("KILN_RT_QUANTUM_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
-        config.step_budget_ns = us.saturating_mul(1000);
+    // 01a1a87b2cec step 3; scripts/shard_lab's q<µs> arms). A value it can't read stops the runtime, said: it was
+    // dropped with nothing said, and a lab's pinned arm (266.7) ran unpinned (consts-audit).
+    if let Ok(v) = std::env::var("KILN_RT_QUANTUM_US") {
+        config.step_budget_ns = quantum_us_ns(&v)?;
     }
     if let Some(cores) = CORES.get() {
         config.cores = shard_cores(cores, p.shards);
@@ -2470,6 +2487,19 @@ impl<'a> Listen<'a> {
         Arc::clone(&held.place)
     }
 
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify.
+    pub fn wait(mut self) {
+        let waker = crate::memory::queue::thread_waker();
+        while !self.over() {
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return;
+            }
+            std::thread::park();
+        }
+    }
+
     /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
     /// notify came.
     pub fn wait_deadline(mut self, until: Instant) -> bool {
@@ -2603,13 +2633,14 @@ const SINK_BATCH: usize = 1 << 20;
 
 /// Stream a file in chunks. Opening happens now (so a missing file is an error here); each chunk is
 /// read on the blocking pool, and no thread waits while the consumer is slow. The stream ends at
-/// end of file (or a read error, which is logged). Its chunks wait in a queue of four
-/// (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top goal), as in the
-/// async-channel it was, whose every chunk took event-listener's `Mutex` (a download's, an artifact's).
+/// end of file (or a read error, which is logged). Its chunks wait in a pipe whose room its pace sets
+/// (`crate::memory::queue::pipe`: what its consumer takes while the next chunk is read, a chunk past it;
+/// consts-audit B4: four, as the channel it replaced held), lock-free (goal 5, plan 01a1a59c2aae, its top goal:
+/// the async-channel it was took event-listener's `Mutex` for every chunk, a download's, an artifact's).
 pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     let path = path.into();
     let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 4);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     spawn(async move {
         let mut offset = 0u64;
         loop {
@@ -2648,8 +2679,10 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::qu
 /// Write a stream of chunks to a new file. Send chunks into the returned sender, drop it, then
 /// await the future for the byte count. Writing runs concurrently (bounded), so the sender sees
 /// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write. Its chunks
-/// wait in a queue of sixteen (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top
-/// goal), as in the async-channel it was, whose every chunk took event-listener's `Mutex` (an upload's).
+/// wait in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what the file's writes take while
+/// the next chunk comes, a chunk past it; consts-audit B4: sixteen, as the channel it replaced held),
+/// lock-free (goal 5, plan 01a1a59c2aae, its top goal: the async-channel it was took event-listener's `Mutex`
+/// for every chunk, an upload's).
 pub fn file_sink(
     path: impl Into<PathBuf>,
     max: u64,
@@ -2659,7 +2692,7 @@ pub fn file_sink(
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     let writer = spawn(async move {
         let mut total = 0u64;
         // Each receive a charge of the task's turn (`hyper_rt::coop`).
@@ -3322,30 +3355,43 @@ mod tests {
         Ok(())
     }
 
-    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
-    /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
-    /// it works, as it would not under futures' `buffered`.
+    /// Until `begun` reaches `n`: how an item waits for the others begun beside it. Run one at a time, the items
+    /// would wait for ever; at once, they go on together, however slowly a loaded machine runs them.
+    async fn all_begun(begun: &AtomicUsize, n: usize) {
+        while begun.load(Ordering::SeqCst) < n {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (the first four wait for
+    /// each other, which one at a time they never could: a wait on that, not on how fast a loaded machine sleeps),
+    /// and polls them under the task's own waker: a hyper-rt connect inside it works, as it would not under
+    /// futures' `buffered`.
     #[test]
     fn each_runs_n_at_once_in_order_under_the_task_s_own_waker() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
-            let t = Instant::now();
-            let out = each(0..12u64, 4, |i| {
-                let (running, most) = (running.clone(), most.clone());
+            let begun = Arc::new(AtomicUsize::new(0));
+            let items = each(0..12u64, 4, |i| {
+                let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                 async move {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     most.fetch_max(now, Ordering::SeqCst);
+                    begun.fetch_add(1, Ordering::SeqCst);
+                    if i < 4 {
+                        all_begun(&begun, 4).await;
+                    }
                     // Later items finish first: the order kept is the items', not the finishing.
                     sleep(Duration::from_millis(50 - (i % 4) * 10)).await;
                     running.fetch_sub(1, Ordering::SeqCst);
                     i * 10
                 }
-            })
-            .await;
+            });
+            // The bound only ends a hang (the first four begun one at a time), never a slow run.
+            let out = timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first four never ran at once"))?;
             assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
             assert_eq!(most.load(Ordering::SeqCst), 4);
-            assert!(t.elapsed() < Duration::from_millis(400), "three rounds of 50 ms, not twelve: {:?}", t.elapsed());
             assert!(each(Vec::<u8>::new(), 3, |x| async move { x }).await.is_empty());
             // A connect under `each`: refused by the port, not by the runtime.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3362,25 +3408,30 @@ mod tests {
 
     /// Outputs handed over in the items' order as they become ready, not all at the end; an item
     /// begun only once a place is free and what came before was handed over (so it sees what the
-    /// handing changed); `n` at once at the most, ready-and-waiting ones counted; a connect works.
+    /// handing changed); `n` at once at the most, ready-and-waiting ones counted, and at once (the
+    /// first three wait for each other, [`all_begun`]); a connect works.
     #[test]
     fn each_in_order_hands_each_over_in_turn_and_begins_the_next_after() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
+            let begun = Arc::new(AtomicUsize::new(0));
             let handed = Mutex::new(Vec::<u64>::new());
             // What each item saw handed over when it was begun.
             let seen = Mutex::new(Vec::<(u64, usize)>::new());
-            let t = Instant::now();
-            each_in_order(
+            let items = each_in_order(
                 0..12u64,
                 3,
                 |i| {
-                    let (running, most) = (running.clone(), most.clone());
+                    let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                     seen.lock().unwrap_or_else(PoisonError::into_inner).push((i, handed.lock().unwrap_or_else(PoisonError::into_inner).len()));
                     async move {
                         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
+                        begun.fetch_add(1, Ordering::SeqCst);
+                        if i < 3 {
+                            all_begun(&begun, 3).await;
+                        }
                         // Later items finish first: the order handed over is the items'.
                         sleep(Duration::from_millis(40 - (i % 3) * 10)).await;
                         running.fetch_sub(1, Ordering::SeqCst);
@@ -3388,15 +3439,15 @@ mod tests {
                     }
                 },
                 |r| handed.lock().unwrap_or_else(PoisonError::into_inner).push(r),
-            )
-            .await;
+            );
+            // The bound only ends a hang (the first three begun one at a time), never a slow run.
+            timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first three never ran at once"))?;
             assert_eq!(*handed.lock().unwrap_or_else(PoisonError::into_inner), (0..12).map(|i| i * 10).collect::<Vec<_>>());
-            assert!(most.load(Ordering::SeqCst) <= 3);
+            assert_eq!(most.load(Ordering::SeqCst), 3);
             // Three places: item i is begun only once i - 2 were handed over.
             for (i, before) in seen.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(*before as u64 + 2 >= *i, "item {i} begun with {before} handed over");
             }
-            assert!(t.elapsed() < Duration::from_millis(600), "about four rounds of 40 ms: {:?}", t.elapsed());
             let none = Mutex::new(0);
             each_in_order(Vec::<u8>::new(), 3, |x| async move { x }, |_| *none.lock().unwrap_or_else(PoisonError::into_inner) += 1).await;
             assert_eq!(*none.lock().unwrap_or_else(PoisonError::into_inner), 0);
@@ -3913,6 +3964,27 @@ mod tests {
             timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
             Ok(())
         })
+    }
+
+    /// Consts-audit: `KILN_RT_QUANTUM_US` reads fractional microseconds, to the nanosecond, where it read whole ones and
+    /// dropped the rest with nothing said (a lab's arm pinned at 266.7 ran unpinned). Do: 266.7, 250, 0.5, with spaces.
+    /// Expect: 266,700 ns, 250,000 ns, 500 ns.
+    #[test]
+    fn a_pinned_quantum_reads_fractional_microseconds() {
+        assert_eq!(quantum_us_ns("266.7"), Ok(266_700));
+        assert_eq!(quantum_us_ns("250"), Ok(250_000));
+        assert_eq!(quantum_us_ns(" 0.5 "), Ok(500));
+    }
+
+    /// Consts-audit: a value of `KILN_RT_QUANTUM_US` it can't read is refused with an error naming it, the runtime not
+    /// started, never dropped with nothing said. Do: nothing, words, 0, a negative, not-a-number, infinity, less than a
+    /// nanosecond. Expect: each an error that names `KILN_RT_QUANTUM_US` and the value.
+    #[test]
+    fn an_unreadable_pinned_quantum_is_refused_by_name() {
+        for v in ["", "abc", "0", "-5", "NaN", "inf", "0.0001", "266,7"] {
+            let said = quantum_us_ns(v).err().unwrap_or_default();
+            assert!(said.starts_with("KILN_RT_QUANTUM_US=") && said.contains(&format!("{v:?}")), "{v:?}: {said:?}");
+        }
     }
 
     /// Consts-audit B1 (goal 9, plan 01a1a87b2cec step 3): work stays on its shard only where it fits a turn (the quantum) and

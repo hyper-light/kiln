@@ -1901,8 +1901,10 @@ mod tests {
         let a = server.call("code_run", &json!({ "program": program }));
         let (code, path) = (a.pointer("/structuredContent/result/code"), a.pointer("/structuredContent/result/path"));
         assert!(code == Some(&json!("unknown_field")) && path == Some(&json!("/comand")), "{a}");
-        // Each told the server, which noted it before it answered.
-        let notes: Vec<Value> = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(60)).ok()).filter(|q| q.get("op") == Some(&json!("unread"))).take(2).collect();
+        // Each told the server, which noted it before it answered: told on a thread of its own, and noted on the
+        // test runtime's shards beside every other test's work, each in what time a loaded machine takes. The
+        // bound on each only ends a hang (60 s ran out under load, the second note on its way).
+        let notes: Vec<Value> = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(300)).ok()).filter(|q| q.get("op") == Some(&json!("unread"))).take(2).collect();
         let what: Vec<&str> = notes.iter().filter_map(|q| q.get("what").and_then(Value::as_str)).collect();
         assert!(what.contains(&"tools/call run") && what.contains(&"code_run kiln.machines.run"), "{notes:?}");
         assert!(notes.iter().all(|q| q.get("session") == Some(&json!("s1")) && q.get("code") == Some(&json!("malformed"))), "{notes:?}");

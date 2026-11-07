@@ -13,6 +13,10 @@
 //! - `lab:hog:<threads>:<secs>`: `threads` threads busy on the CPU for `secs` seconds, an event a
 //!   second meanwhile (an agent's build or test run beside the server: goal 8's headroom lab,
 //!   docs/priority.md);
+//! - `lab:subagent:<n>:<ms>`: a subagent's turn, as Claude Code's Task tool runs one: the Task's call,
+//!   then `n` events of the subagent's own, `ms` apart, each its child (`parent_tool_use_id` the Task's
+//!   id), then the Task's result, which updates the Task's tool event `n` events after it began
+//!   (copies-lat2's A2(b) shape; Ada's own sessions run subagents everywhere);
 //! - anything else: a short turn.
 //!
 //! Every event carries `@lab:<µs since the epoch>` from when it was written, so a viewer can tell how
@@ -140,8 +144,8 @@ fn plan(text: &str) -> (u64, Duration) {
     match (it.next(), it.next(), it.next()) {
         (Some("prefill"), Some(n), _) => (n.parse().unwrap_or(0), Duration::ZERO),
         (Some("turn"), Some(n), Some(ms)) => (n.parse().unwrap_or(0), Duration::from_millis(ms.parse().unwrap_or(0))),
-        // Its events come as it burns ([`hog_plan`]).
-        (Some("hog"), _, _) => (0, Duration::ZERO),
+        // Its events come as it burns ([`hog_plan`]), or as its subagent works ([`subagent_plan`]).
+        (Some("hog" | "subagent"), _, _) => (0, Duration::ZERO),
         _ => (5, Duration::from_millis(100)),
     }
 }
@@ -150,6 +154,48 @@ fn plan(text: &str) -> (u64, Duration) {
 fn hog_plan(text: &str) -> Option<(u64, Duration)> {
     let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:hog:"))?.split(':');
     Some((it.next()?.parse().ok()?, Duration::from_secs(it.next()?.parse().ok()?)))
+}
+
+/// A subagent turn's words (`lab:subagent:<n>:<ms>`): how many of the subagent's events, and how far apart.
+fn subagent_plan(text: &str) -> Option<(u64, Duration)> {
+    let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:subagent:"))?.split(':');
+    Some((it.next()?.parse().ok()?, Duration::from_millis(it.next()?.parse().ok()?)))
+}
+
+/// The `k`th event of a subagent turn of `n` events (`lab:subagent:<n>:<ms>`), as Claude Code's stream-json says a Task
+/// tool's run: first the Task's call (`k` 0), then the subagent's own events (`k` 1 to `n`), each a long session's mix as
+/// [`event`] writes it with the Task's id as its `parent_tool_use_id`, then the Task's result (`k` `n + 1`), which
+/// updates the Task's tool event `n` events after it began. Past that, nothing.
+fn subagent_event(r: &mut Lcg, session: &str, turn: u64, k: u64, n: u64) -> Vec<Value> {
+    let stamp = format!("{STAMP}{} ", now_us());
+    let task = format!("toolu_{session}_{turn}_task");
+    if k == 0 {
+        return vec![json!({
+            "type": "assistant",
+            "message": {"id": format!("msg_{session}_{turn}_task"), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "tool_use", "id": task, "name": "Task", "input": {"description": format!("{stamp}{}", words(r, 5)), "prompt": words(r, 40), "subagent_type": "general-purpose"}}], "stop_reason": null, "usage": {"input_tokens": 1, "output_tokens": 1}},
+            "parent_tool_use_id": null,
+            "session_id": session,
+        })];
+    }
+    if k <= n {
+        let mut lines = event(r, session, turn, k.saturating_sub(1));
+        for line in &mut lines {
+            if let Some(o) = line.as_object_mut() {
+                o.insert("parent_tool_use_id".to_owned(), Value::String(task.clone()));
+            }
+        }
+        return lines;
+    }
+    if k == n.saturating_add(1) {
+        let w = 60 + r.below(200);
+        return vec![json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"tool_use_id": task, "type": "tool_result", "content": format!("{stamp}{}", words(r, w)), "is_error": false}]},
+            "parent_tool_use_id": null,
+            "session_id": session,
+        })];
+    }
+    Vec::new()
 }
 
 /// `threads` threads busy on the CPU until `until`, as the lab's own hogs are (`crate::lab::hog`).
@@ -201,7 +247,13 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
         .and_then(|w| w.get(1).cloned())
         .unwrap_or_else(|| format!("lab-{}", now_us()));
     let short: String = session.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
-    let seed = session.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    // `KILN_LAB_SEED` (the browser lab's): the same seed and folder say the same things in any
+    // run, whatever the session's id (goal 1 of the browser protocol program, step 3).
+    let key = match std::env::var("KILN_LAB_SEED") {
+        Ok(s) => format!("{s}/{}", std::env::current_dir().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()),
+        Err(_) => session.clone(),
+    };
+    let seed = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     let mut r = Lcg(seed);
     let (tx, rx) = mpsc::channel::<Value>();
     let stdout = std::io::stdout();
@@ -265,6 +317,17 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
                 let _ = b.join();
             }
         }
+        // A subagent turn: the Task's call, its subagent's events, the Task's result, `every` apart.
+        if let Some((n, every)) = subagent_plan(&text_of(&m)) {
+            for k in 0..n.saturating_add(2) {
+                for l in subagent_event(&mut r, &short, turn, k, n) {
+                    say(l, true)?;
+                }
+                if k <= n {
+                    std::thread::sleep(every);
+                }
+            }
+        }
         for k in 0..n {
             let lines = event(&mut r, &short, turn, k);
             let paced = !every.is_zero();
@@ -302,5 +365,30 @@ mod tests {
             let _ = b.join();
         }
         assert!(t.elapsed() < Duration::from_secs(5), "burned {:?}", t.elapsed());
+    }
+
+    /// copies-lat2's A2(b) shape (main's ask, 2026-11-06): a subagent turn is read from its words, and its Task's tool
+    /// event is updated, by the Task's result, more than 70 events after it began, every event between the subagent's
+    /// own (its `parent_tool_use_id` the Task's id) and the result its parent's (none).
+    #[test]
+    fn a2b_a_subagent_turn_updates_its_task_more_than_70_events_after_it_began() {
+        assert_eq!(subagent_plan("lab:subagent:100:25"), Some((100, Duration::from_millis(25))));
+        assert_eq!(subagent_plan("go lab:subagent:3:0 now"), Some((3, Duration::ZERO)));
+        assert_eq!(subagent_plan("lab:turn:40:25"), None);
+        assert_eq!(plan("lab:subagent:100:25"), (0, Duration::ZERO), "the turn's events are the subagent's alone");
+        let n = crate::lab::Profile::subagents().subagent_events;
+        let mut r = Lcg(7);
+        let lines: Vec<Value> = (0..n + 3).flat_map(|k| subagent_event(&mut r, "s1", 2, k, n)).collect();
+        let call = lines.first().and_then(|l| l.pointer("/message/content/0"));
+        assert_eq!(call.and_then(|c| c.get("name")).and_then(Value::as_str), Some("Task"), "{call:?}");
+        let task = call.and_then(|c| c.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        assert!(!task.is_empty(), "the Task's call has no id: {call:?}");
+        let result = lines.iter().position(|l| l.pointer("/message/content/0/tool_use_id").and_then(Value::as_str) == Some(task.as_str()));
+        assert_eq!(result, Some(lines.len() - 1), "the Task's result is the turn's last line");
+        let between = lines.get(1..lines.len() - 1).unwrap_or_default();
+        assert!(between.len() > 70 && between.len() as u64 >= n, "{} lines between the Task's call and its result", between.len());
+        assert!(between.iter().all(|l| l.get("parent_tool_use_id").and_then(Value::as_str) == Some(task.as_str())), "a line between isn't the subagent's");
+        assert_eq!(lines.last().and_then(|l| l.get("parent_tool_use_id")), Some(&Value::Null));
+        assert_eq!(subagent_event(&mut r, "s1", 2, n + 2, n), Vec::<Value>::new(), "nothing past the result");
     }
 }

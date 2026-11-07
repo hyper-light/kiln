@@ -47,10 +47,100 @@ pub fn find() -> Option<String> {
         };
         let Some(full) = found else { continue };
         if answers(&full, FIND_WAIT) {
+            #[cfg(test)]
+            test_runs::swept_once(&full);
             return Some(full.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// What a test build of kiln makes on the machine's engine carries its run (`kiln.test-run`: its host, its process
+/// id and that process's start), and the first test of a run to look for the engine removes what runs whose process
+/// is gone left there (a test killed mid-leg: its containers and its leg's network, which holds one of the engine's
+/// few address pools until no leg can start, "all predefined address pools have been fully subnetted"). A run still
+/// going, or one this machine can't tell is gone (another host's, or on Windows), is left alone.
+#[cfg(test)]
+pub(crate) mod test_runs {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// The label's key.
+    pub(crate) const KEY: &str = "kiln.test-run";
+
+    /// This run, as its label says it: `<host>/<pid>/<start>` (the start as Linux keeps it, in ticks since boot; 0
+    /// where it can't be read, so only the process id tells).
+    pub(crate) fn label() -> &'static str {
+        static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        LABEL.get_or_init(|| {
+            let pid = std::process::id();
+            format!("{KEY}={}/{pid}/{}", crate::os::hostname(), started(pid).unwrap_or(0))
+        })
+    }
+
+    /// When process `pid` started, in clock ticks since boot (`/proc/<pid>/stat`'s 22nd field): another process
+    /// given the same id later has another. Linux's alone.
+    fn started(pid: u32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.get(stat.rfind(')')? + 1..)?.split_whitespace().nth(19)?.parse().ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Whether the run a label's value names is gone: on this host, its process ended (or its id is another
+    /// process's now). Never on Windows, where a test can't tell.
+    pub(crate) fn gone(value: &str) -> bool {
+        let mut parts = value.split('/');
+        let (Some(host), Some(Ok(pid)), Some(Ok(start))) = (parts.next(), parts.next().map(str::parse::<u32>), parts.next().map(str::parse::<u64>)) else { return false };
+        if host != crate::os::hostname() || pid == std::process::id() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            started(pid) != Some(start) || crate::os::is_zombie(pid)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let _ = start;
+            !crate::os::pid_alive(pid)
+        }
+        #[cfg(windows)]
+        {
+            let _ = (pid, start);
+            false
+        }
+    }
+
+    /// Removes what gone runs left on the engine at `bin`, once a process: their containers (and their anonymous
+    /// volumes), then their networks and volumes.
+    pub(crate) fn swept_once(bin: &Path) {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| sweep(bin));
+    }
+
+    fn sweep(bin: &Path) {
+        let listed = |args: &[&str]| -> Vec<String> {
+            let format = format!("{{{{.{}}}}} {{{{.Label \"{KEY}\"}}}}", if args.first() == Some(&"ps") || args.first() == Some(&"network") { "ID" } else { "Name" });
+            Command::new(bin)
+                .args(args)
+                .args(["--filter", &format!("label={KEY}"), "--format", &format])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_once(' ')).filter(|(_, run)| gone(run)).map(|(id, _)| id.to_owned()).collect())
+                .unwrap_or_default()
+        };
+        for (list, remove) in [(&["ps", "-a"][..], &["rm", "--force", "--volumes"][..]), (&["network", "ls"][..], &["network", "rm"][..]), (&["volume", "ls"][..], &["volume", "rm", "--force"][..])] {
+            let ids = listed(list);
+            if !ids.is_empty() {
+                let _ = Command::new(bin).args(remove).args(&ids).output();
+            }
+        }
+    }
 }
 
 /// How long `find` waits for the engine to answer `version`. A daemon that's stuck never does, and
@@ -654,9 +744,13 @@ impl Cli {
         self.owner.as_deref()
     }
 
-    /// `--label <owner>`, for what it starts.
+    /// `--label <owner>`, for what it starts; in a test build, its run's too ([`test_runs`]).
     pub fn owner_args(&self) -> Vec<String> {
-        self.owner.iter().flat_map(|o| [s("--label"), o.clone()]).collect()
+        #[cfg(test)]
+        let run = Some(test_runs::label().to_owned());
+        #[cfg(not(test))]
+        let run = None::<String>;
+        self.owner.iter().cloned().chain(run).flat_map(|o| [s("--label"), o]).collect()
     }
 
     /// Pulls go through kiln's mirrors at `host` for the registries it mirrors.
@@ -1696,22 +1790,13 @@ mod tests {
         let heard = said.clone();
         let failed = crate::rt::block_on(async move {
             let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", None, Vec::new(), None, &|_| {}).await?;
+            // The runner's labels too (this run's among them, for a sweep should it be killed: `test_runs`).
             let run = [
-                s("run"),
-                s("-d"),
-                s("--label"),
-                c.label.clone(),
-                s("--health-cmd"),
-                s("false"),
-                s("--health-interval"),
-                s("1s"),
-                s("--health-retries"),
-                s("1"),
-                s("alpine:latest"),
-                s("sh"),
-                s("-c"),
-                s("echo kiln-probe-out; echo kiln-probe-err >&2; exec sleep 120"),
-            ];
+                vec![s("run"), s("-d"), s("--label"), c.label.clone()],
+                cli.owner_args(),
+                ["--health-cmd", "false", "--health-interval", "1s", "--health-retries", "1", "alpine:latest", "sh", "-c", "echo kiln-probe-out; echo kiln-probe-err >&2; exec sleep 120"].map(s).to_vec(),
+            ]
+            .concat();
             let id = cli.run(&run, &BTreeMap::new(), CALL).await?;
             let r = c.healthy("db", &id, &|m: String| heard.lock().push(m)).await;
             let _ = cli.run(&[s("rm"), s("-f"), id], &BTreeMap::new(), CALL).await;
