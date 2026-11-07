@@ -39,8 +39,9 @@ pub struct Costs {
 struct Bucket {
     units: AtomicU64,
     ns: AtomicU64,
-    /// The dearest a unit of it cost, f64 bits.
+    /// The dearest a unit of it cost, and the cheapest, f64 bits: the cheapest set by the first unit after it held none.
     dearest: AtomicU64,
+    cheapest: AtomicU64,
 }
 
 impl Costs {
@@ -53,7 +54,7 @@ impl Costs {
             squares: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             window: AtomicU64::new(hyper_rt::machine::bench::MIN_SAMPLES as u64),
-            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0) } }; BUCKETS],
+            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0), cheapest: AtomicU64::new(0) } }; BUCKETS],
         }
     }
 
@@ -64,10 +65,14 @@ impl Costs {
         }
         let cost = ns as f64 / units as f64;
         if let Some(b) = self.buckets.get(bucket(cost)) {
-            add(&b.units, units);
+            let held = b.units.load(Relaxed);
+            b.units.store(held.saturating_add(units), Relaxed);
             add(&b.ns, ns);
             if cost > f64::from_bits(b.dearest.load(Relaxed)) {
                 b.dearest.store(cost.to_bits(), Relaxed);
+            }
+            if held == 0 || cost < f64::from_bits(b.cheapest.load(Relaxed)) {
+                b.cheapest.store(cost.to_bits(), Relaxed);
             }
         }
         add(&self.units, units);
@@ -111,6 +116,13 @@ impl Costs {
     pub fn mean(&self) -> Option<f64> {
         let units = self.units.load(Relaxed);
         (units > 0).then(|| self.ns.load(Relaxed) as f64 / units as f64)
+    }
+
+    /// The cheapest and the dearest a unit cost of those its window holds, nanoseconds: none until one was learned.
+    pub fn range(&self) -> Option<(f64, f64)> {
+        let held = |b: &&Bucket| b.units.load(Relaxed) > 0;
+        let (low, high) = (self.buckets.iter().find(held)?, self.buckets.iter().rev().find(held)?);
+        Some((f64::from_bits(low.cheapest.load(Relaxed)), f64::from_bits(high.dearest.load(Relaxed))))
     }
 
     /// The rule work is weighed by: the most units whose cost past `free` nanoseconds (negative: already past by that) is
