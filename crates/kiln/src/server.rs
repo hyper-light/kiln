@@ -62,7 +62,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
-    crate::updates::warm_own_binary().await;
+    // Its binary opened, none of it read: what asks for its build first reads it, off the startup path
+    // (`updates::own_binary`).
+    crate::updates::open_own();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;

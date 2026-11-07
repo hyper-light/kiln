@@ -2627,7 +2627,7 @@ pub async fn recv<T>(rx: &crate::memory::queue::Receiver<T>) -> Result<T, async_
 }
 
 /// Read size for file streams.
-const FILE_CHUNK: usize = 256 * 1024;
+pub(crate) const FILE_CHUNK: usize = 256 * 1024;
 /// Bytes a file sink gathers before one write.
 const SINK_BATCH: usize = 1 << 20;
 
