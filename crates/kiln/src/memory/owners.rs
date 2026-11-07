@@ -265,7 +265,7 @@ mod tests {
         use crate::harness::copies::{Ingest, Msg};
         use crate::harness::core::Update;
         let said: crate::harness::model::Event = serde_json::from_value(serde_json::json!({"id": "e1", "seq": 1, "at": 0, "kind": "assistant", "text": "x".repeat(100_000)}))?;
-        let msg = |u: Update| Msg::Update(Box::new(Ingest { from: crate::harness::registry::Location::Local, id: "s1".into(), u, shipped: false, reported: String::new() }));
+        let msg = |u: Update| Msg::Update(Box::new(Ingest { from: crate::harness::registry::Location::Local, id: "s1".into(), u, shipped: false, reported: String::new(), came: None }));
         let (big, small) = (msg(Update::Events { events: vec![said] }).weight(), msg(Update::Closed).weight());
         anyhow::ensure!(big >= small + 100_000, "{big} against {small}");
         // The server's own sessions' updates go into a queue counted the same way, ahead of the inbox.

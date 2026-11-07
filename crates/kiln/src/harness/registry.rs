@@ -41,7 +41,7 @@ pub fn message_id(c: &Command) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local,
     Machine(String),
@@ -694,10 +694,10 @@ pub(super) mod write {
         "[".len() + bytes + n.saturating_sub(1) * ",".len() + "]".len()
     }
 
-    /// `{"t":"<tag>","<key>":<value>}`: a meta, a changeset.
-    pub fn value(w: &mut impl Write, tag: &str, key: &str, v: &Value, rev: Option<u64>) -> io::Result<()> {
-        head(w, tag, Some(key))?;
-        serde_json::to_writer(&mut *w, v)?;
+    /// `{"t":"meta","meta":<json>}`, a catalog's JSON as it was written once (`super::super::copies::Catalog`).
+    pub fn meta(w: &mut impl Write, json: &[u8], rev: Option<u64>) -> io::Result<()> {
+        head(w, "meta", Some("meta"))?;
+        w.write_all(json)?;
         tail(w, rev)
     }
 
@@ -825,27 +825,20 @@ fn keep_json_in(dir: &std::path::Path, file: &str, value: &impl serde::Serialize
     Ok(())
 }
 
-/// A shared JSON `null`: a copy's meta or state before it has one.
-pub(super) fn null() -> Arc<Value> {
-    static NULL: std::sync::LazyLock<Arc<Value>> = std::sync::LazyLock::new(|| Arc::new(Value::Null));
-    Arc::clone(&NULL)
-}
-
 /// A snapshot of a copy, or what a viewer lacks of it since a revision, not yet made into frames
 /// (`super::copies::View::parts`, `View::parts_since`): references to what an immutable view holds.
 pub struct Parts {
     /// Its info, made into the head's JSON where the snapshot is written (off the shard that takes
     /// it: goal 10, plan 01a1a87b2dae step 3).
     pub(super) info: Arc<Info>,
-    pub(super) meta: Arc<Value>,
+    pub(super) meta: Arc<super::copies::Catalog>,
     pub(super) state: Arc<StateDoc>,
     pub(super) changes: Option<Files>,
     pub(super) events: super::copies::Events,
     /// Since a revision: only the events changed after it (it begins with `resumed`). None: the
     /// session whole (it begins with `open`).
     pub(super) since: Option<u64>,
-    /// Its meta's and state's last frames' sizes: the room theirs take.
-    pub(super) meta_bytes: usize,
+    /// Its state's last frame's size: the room its takes.
     pub(super) state_bytes: usize,
     /// The copy's revision as of the parts.
     pub(super) rev: u64,
@@ -1034,7 +1027,9 @@ impl Snapshot {
     /// with hogs, goal 9, plan 01a1a87b2cec step 3), and then on the blocking pool, a round trip for every attach.
     pub fn weight(&self, packed: bool) -> usize {
         let p = &self.parts;
-        let frames = p.meta_bytes.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
+        // Its meta's frame only where it sends one (`plan`): a null meta has none.
+        let meta = if p.meta.value().is_null() { 0 } else { self.room(&Part::Meta) };
+        let frames = meta.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
         let events = p.events.chunks().iter().map(|c| match (packed, c.packed(), c.spilled_bytes()) {
             (true, Some(s), _) => s.deflated.len(),
             (true, None, Some(n)) => n,
@@ -1054,7 +1049,7 @@ impl Snapshot {
     fn plan(&self) -> Plan {
         let p = &self.parts;
         let mut parts = vec![Part::Head];
-        if !p.meta.is_null() {
+        if !p.meta.value().is_null() {
             parts.push(Part::Meta);
         }
         if !p.state.is_null() {
@@ -1129,7 +1124,7 @@ impl Snapshot {
         match part {
             // Its info, written as it's made (a few hundred bytes).
             Part::Head => 0,
-            Part::Meta => p.meta_bytes,
+            Part::Meta => write::envelope("meta", Some("meta"), None) + p.meta.json().len(),
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
@@ -1149,7 +1144,7 @@ impl Snapshot {
                 let head = SessionDown { frame: if of.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: of.window } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
             }
-            Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
+            Part::Meta => write::meta(w, p.meta.json(), None),
             Part::State => write::state(w, &p.state, None),
             Part::Changes => match &p.changes {
                 Some(files) => write::changes(w, files.iter().map(|f| &**f), None),
@@ -2280,7 +2275,12 @@ impl Registry {
                 info.subagents = SubagentBrief::of(&tasks);
             }
             let mut m = Mirror::new(info.clone(), Location::Machine(machine), Arc::clone(&self.bus));
-            m.meta = Arc::new(u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null));
+            if let Some(read) = u.meta.as_deref().map(super::copies::Catalog::read) {
+                match read {
+                    Ok(c) => m.meta = Arc::new(c),
+                    Err(e) => tracing::warn!(session = %u.id, error = %e, "an away session's stored meta doesn't read: its copy has none until its machine says it"),
+                }
+            }
             let mut state = StateDoc::of_value(&state);
             state.set("status", &json!("disconnected"));
             m.state = Arc::new(state);
@@ -2557,7 +2557,7 @@ impl Registry {
     pub fn meta(&self, id: &str) -> Option<Value> {
         // Copied from the view held, not from where it's read.
         let meta = self.sessions.with(id, |v| Arc::clone(&v.meta))?;
-        Some(Value::clone(&meta))
+        Some(meta.value().clone())
     }
 
     pub fn location(&self, id: &str) -> Option<Location> {
@@ -2747,7 +2747,7 @@ impl Registry {
             }
             self.raise_epoch(id, info.epoch);
         }
-        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported })
+        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported, came: super::live::came() })
     }
 
     /// An update of a session from the machine it runs on, as the shard that owns the session's copy
@@ -2762,8 +2762,10 @@ impl Registry {
     /// history in one update held its owner's shard up to 83 ms). One long to write out (a large tool output)
     /// is written by its owner off the shard first (`super::copies::Shard::want_write`).
     pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
-        let Ingest { from, id, mut u, shipped, reported } = i;
+        let Ingest { from, id, mut u, shipped, reported, came } = i;
         let id = id.as_str();
+        // The frames it makes carry where it came from, at whichever turn it's taken (goal 10, plan 01a1a87b2dae step 5).
+        let _came = super::live::carrying(came);
         // Only the machine a session runs on speaks for it: a copy left behind where it went on
         // from says nothing more of it.
         if !matches!(u, Update::Open { .. }) && s.get(id).is_some_and(|m| *m.location != from) {
@@ -2782,12 +2784,15 @@ impl Registry {
         // nothing long to: told apart first, on the shard (a compare), and only one that changed is judged by what its kind takes
         // (`super::copies::Mirror::said`), so a session's first long one goes off the shard too (step 3).
         let same = s.get(id).is_some_and(|m| m.same_again(&u));
+        // A meta that changed, one of its harness's catalogs on this owner saying it already (another of its sessions said it):
+        // taken as it is, nothing made (goal 9, plan 01a1a87b2cec step 3; goal 11).
+        let shared = if same { None } else { s.catalog_for(id, &u) };
         // What every session's states and metas taught their owners, for one's first.
         let said = s.said();
         let tried = s.take_off_written(id);
-        if tried.is_none() && !same && s.get(id).is_some_and(|m| super::copies::long_off(m, &u, &said)) {
+        if tried.is_none() && !same && shared.is_none() && s.get(id).is_some_and(|m| super::copies::long_off(m, &u, &said)) {
             s.want_off(id, store.is_some());
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported, came });
         }
         // An Open going on from an event inside a compact chunk of its copy (a runner's reconnect after it lost events the copy
         // has): that chunk is read back off the shard first, as one an update changes is, nothing of the Open taken yet (goal 9,
@@ -2796,7 +2801,7 @@ impl Registry {
             && let Some(c) = s.get(id).filter(|m| m.info.epoch == info.epoch).and_then(|m| m.thaw_for_open(*n)).filter(|c| !std::ptr::eq(s.thawed().as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported, came });
         }
         let (mut written_off, took_off) = match tried {
             Some(w) => {
@@ -2914,7 +2919,7 @@ impl Registry {
         // let go of off the shard, as the event's megabytes are freed with it (below).
         let mut write: Option<(String, Location)> = None;
         let mut took_written = false;
-        let Some(m) = s.get_mut(id) else {
+        let Some((m, catalogs)) = s.copy_and_catalogs(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
                 store.send(id, &u);
@@ -2933,7 +2938,7 @@ impl Registry {
             && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // A stream into an event of an older compact chunk (a long tool's output, a subagent's text): the same, once that
         // chunk is read back off the shard, before the stream is taken (goal 9, plan 01a1a87b2cec step 3).
@@ -2941,7 +2946,7 @@ impl Registry {
             && let Some(c) = m.thaw_for_stream(event).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // Its first event goes in under an older number than the copy's newest: the same, once the copy's events are made
         // again with it in off the shard (goal 9, plan 01a1a87b2cec step 3).
@@ -2950,7 +2955,7 @@ impl Registry {
         {
             let rev = m.rev;
             s.want_insert(id, at, e, rev);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // Its first event is long to write out (a large tool output) and wasn't written yet: the same, once its owner wrote it
         // out off the shard (goal 9, plan 01a1a87b2cec step 3: `super::copies::Shard::want_write`).
@@ -2959,9 +2964,47 @@ impl Registry {
         {
             let (cwd, location) = (m.info.cwd.clone(), Location::clone(&m.location));
             s.want_write(id, store.is_some(), cwd, location);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         m.rev = m.rev.saturating_add(1);
+        // The meta its machine said (goal 9, plan 01a1a87b2cec step 3; goal 11): its copy's catalog already (the same again), else
+        // one of its harness's on this owner, taken as it is; else made into one, by its owner off the shard or here (timed, so a
+        // session's long ones go off it), and kept among its harness's.
+        if let Update::Meta { meta } = &mut u {
+            let made = match (written_off.take(), shared) {
+                (Some(super::copies::OffMade::Meta { made, .. }), _) => {
+                    m.long_to_free = true;
+                    Some((made, took_off))
+                }
+                _ if same => {
+                    meta_same = true;
+                    None
+                }
+                (_, Some(c)) => {
+                    m.meta = c;
+                    None
+                }
+                _ => {
+                    let began = super::copies::Timer::start();
+                    let made = super::copies::Catalog::made(std::mem::take(meta));
+                    Some((made, Some(row_took.saturating_add(began.took()))))
+                }
+            };
+            match made {
+                Some((Ok(made), took)) => {
+                    m.meta = catalogs.keep(&m.location, &m.info.kind, made);
+                    m.encodings.meta += 1;
+                    if let Some(took) = took {
+                        m.said_took(&u, took, &said);
+                    }
+                }
+                Some((Err(e), _)) => {
+                    tracing::warn!(session = id, error = %e, "a session's meta couldn't be made its catalog: its copy keeps the one it had");
+                    meta_same = true;
+                }
+                None => {}
+            }
+        }
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
             // viewers from before start over too.
@@ -3052,37 +3095,8 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { meta } => {
-                // The same meta as the copy's was made of, the copy's still that value: the same again, not made
-                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5). As its owner wrote it out off the shard, or
-                // here, timed, so a session's long metas go off it (step 3).
-                match written_off.take() {
-                    Some(super::copies::OffMade::Meta { value, .. }) => {
-                        match value {
-                            Some(v) => {
-                                m.meta = Arc::new(v);
-                                m.long_to_free = true;
-                            }
-                            None => meta_same = true,
-                        }
-                        if let Some(took) = took_off {
-                            m.said_took(&u, took, &said);
-                        }
-                    }
-                    _ if same => meta_same = true,
-                    // Made, and timed, only where it changed, as a state is (above).
-                    _ => {
-                        let began = super::copies::Timer::start();
-                        let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
-                        if *m.meta == meta {
-                            meta_same = true;
-                        } else {
-                            m.meta = Arc::new(meta);
-                        }
-                        m.said_took(&u, row_took.saturating_add(began.took()), &said);
-                    }
-                }
-            }
+            // Taken above.
+            Update::Meta { .. } => {}
             // As its owner wrote it out off the shard, or here, timed, so what's long to write is learned (goal 9, plan
             // 01a1a87b2cec step 3).
             Update::Changes { files } => match written_off.take() {
@@ -3210,11 +3224,6 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|c| super::copies::said_off(c, said.sides())) && matches!(u, Update::Meta { .. }) {
-            // A meta that changed, its session's metas long to write out (past a turn, or dearer than the compute pool's round
-            // trip: `super::copies::Said::sides`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
-            // 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
-            m.commit_meta_off()
         } else {
             m.commit(|m| match &u {
                 _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
@@ -3226,11 +3235,10 @@ impl Registry {
             });
             None
         };
-        // What the copy's state or meta was made of, kept with the value as made (a name given here in it): the
-        // same one again finds it so (above).
+        // What the copy's state was made of, kept with the value as made (a name given here in it): the same one again finds
+        // it so (above).
         match u {
             Update::State { state } => m.state_of = Some((state, Arc::clone(&m.state))),
-            Update::Meta { meta } => m.meta_of = Some((meta, Arc::clone(&m.meta))),
             // Events among which one its owner wrote out off the shard (a large tool output): let go of off it too, the
             // event's megabytes freed there (goal 9, plan 01a1a87b2cec step 3).
             Update::Events { events } if took_written => super::copies::let_go(events),
@@ -3313,7 +3321,7 @@ impl Registry {
             s.publish_board();
             self.returning.came();
         }
-        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
+        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came })
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
@@ -4872,6 +4880,7 @@ mod tests {
         let odd = json!({"id": "e\"1\u{2028}", "seq": 3, "text": "line\nnext } ] \\ ☃", "n": [1, 2.5, null, true], "o": {"z": 1, "a": {"b": []}}});
         let files = [json!({"path": "src/a.rs", "added": 3, "hunks": [{"lines": ["+x", "-y \"q\""]}]}), json!({"path": "b.rs", "tree": "/w"})];
         let gone = vec![json!({"path": "c.rs"}), json!({"path": "d.rs", "tree": "/w"})];
+        let odd_json = serde_json::to_vec(&odd)?;
         for rev in [None, Some(0), Some(42)] {
             let e = Entry::new(odd.clone());
             let fs: Vec<Entry> = files.iter().cloned().map(Entry::new).collect();
@@ -4881,7 +4890,7 @@ mod tests {
             assert_eq!(written(&|b| write::events(b, std::iter::empty::<&Entry>(), rev)), say(SessionFrame::Events { events: Vec::new() }));
             assert_eq!(written(&|b| write::state(b, &StateDoc::of_value(&odd), rev)), say(SessionFrame::State { state: odd.clone() }));
             assert_eq!(written(&|b| write::state(b, &StateDoc::default(), rev)), say(SessionFrame::State { state: Value::Null }));
-            assert_eq!(written(&|b| write::value(b, "meta", "meta", &odd, rev)), say(SessionFrame::Meta { meta: odd.clone() }));
+            assert_eq!(written(&|b| write::meta(b, &odd_json, rev)), say(SessionFrame::Meta { meta: odd.clone() }));
             assert_eq!(written(&|b| write::changes(b, fs.iter(), rev)), say(SessionFrame::Changes { files: Value::Array(files.to_vec()) }));
             let set: Vec<&Entry> = fs.iter().collect();
             assert_eq!(written(&|b| write::changes_patch(b, &set, &gone, rev)), say(SessionFrame::ChangesPatch { set: files.to_vec(), gone: gone.clone() }));
@@ -5235,9 +5244,8 @@ mod tests {
             let was = encodings().await;
             hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
             let heard = sent(&hub, &topic, &mut at);
-            let mut want = Vec::new();
-            write::value(&mut want, "meta", "meta", &serde_json::to_value(&meta)?, hub.harness.rev("s"))?;
-            anyhow::ensure!(heard == vec![String::from_utf8(want)?], "the meta's frame as before: {heard:?}");
+            let want = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Meta { meta: serde_json::to_value(&meta)? }, rev: hub.harness.rev("s") }.text();
+            anyhow::ensure!(heard == vec![want], "the meta's frame as before: {heard:?}");
             anyhow::ensure!(encodings().await.meta == was.meta + 1, "the meta encoded once");
             hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
@@ -5299,6 +5307,137 @@ mod tests {
             let (_, meta_made, _) = held().await;
             hub.harness.ingest(&there, "s", Update::Meta { meta: Box::new(meta) }).await;
             anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3; goal 11: the sessions of one harness share its meta. Each owner makes one catalog of a
+    /// meta its sessions say, and each of them on it holds that one: taking it allocates no more than the same meta again does
+    /// and makes and encodes nothing, its frame is one block written once, and every viewer's frame and snapshot of it is byte
+    /// for byte the socket's own, as each session wrote its own before.
+    #[test]
+    fn g9_s3_a_harnesss_sessions_share_its_meta_made_once() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, Route, SlashCommand};
+        use crate::os::counted::{Made, made};
+        use crate::wire::ui::{SessionDown, SessionFrame};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // Its owners weigh writing out on their shards against a round trip of their own, a second's: every catalog is made
+            // on the shard, where it's counted (consts-audit B1).
+            hub.harness.sessions.on_each(|s| s.said().pin_trip(1_000_000_000)).await;
+            let there = Location::Machine("box".into());
+            // As the lab's harness says it: its commands, each with what it does (15 KB).
+            let meta = |version: &str| Meta {
+                version: version.into(),
+                commands: (0..100)
+                    .map(|k| SlashCommand { name: format!("command-{k}"), description: "reads what the agent did and says it in a few words ".repeat(2), hint: String::new(), group: String::new(), args: String::new(), aliases: Vec::new(), route: Route::default() })
+                    .collect(),
+                ..Meta::default()
+            };
+            // More sessions than owners.
+            let ids: Vec<String> = (0..=2 * crate::rt::shard_count().max(1)).map(|k| format!("s{k}")).collect();
+            let owners: std::collections::HashSet<usize> = ids.iter().map(|id| hub.harness.sessions.owner_of(id)).collect();
+            for id in &ids {
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            }
+            let held = || async {
+                let mut held = Vec::new();
+                for id in &ids {
+                    let i = id.clone();
+                    let of = hub.harness.sessions.on(id, move |s| s.get(&i).map(|m| (Arc::as_ptr(&m.meta) as usize, m.encodings.meta))).await.flatten();
+                    held.push((hub.harness.sessions.owner_of(id), of.unwrap_or_default()));
+                }
+                held
+            };
+            // What `u` allocates on its owner's shard, taken as a runner's update is. Off Linux a catalog's making is learned on
+            // the clock (`super::super::copies::Timer`), so the session's metas are taught short first: each is made where it's
+            // counted, on the shard (as `g9_s5_what_an_update_costs_its_owner` teaches its states).
+            let take = |id: &str, u: Update| {
+                let (owner, at, id) = (Arc::clone(&hub), there.clone(), id.to_owned());
+                async move {
+                    let on = id.clone();
+                    let blocks = owner.harness.sessions.on(&on, {
+                        let owner = Arc::clone(&owner);
+                        move |s| {
+                            let said = s.said();
+                            if let Some(m) = s.get_mut(&id) {
+                                while m.said(&u, &said).is_some_and(|c| super::super::copies::said_off(c, said.sides())) {
+                                    m.said_took(&u, std::time::Duration::ZERO, &said);
+                                }
+                            }
+                            let before = made();
+                            let rest = owner.harness.take_from(s, &owner, &at, &id, u, true, &|_| false);
+                            let after = made();
+                            rest.is_none().then_some(Made { blocks: after.blocks.saturating_sub(before.blocks), bytes: after.bytes.saturating_sub(before.bytes) })
+                        }
+                    });
+                    blocks.await.flatten()
+                }
+            };
+            // Unwatched: the first of each owner's sessions makes the catalog; each after it takes that one.
+            let mut costs = Vec::new();
+            for id in &ids {
+                costs.push((hub.harness.sessions.owner_of(id), take(id, Update::Meta { meta: Box::new(meta("2.1")) }).await));
+            }
+            let again = take(ids.first().map_or("", String::as_str), Update::Meta { meta: Box::new(meta("2.1")) }).await;
+            // What a session's copy kept of its own before: the meta as its machine said it, and the value made of it.
+            let before = made();
+            let said = Box::new(meta("2.1"));
+            let value = serde_json::to_value(&*said)?;
+            let own = made().bytes.saturating_sub(before.bytes);
+            drop((said, value));
+            let costs: Vec<(usize, Made)> = costs.into_iter().map(|(owner, m)| m.map(|m| (owner, m))).collect::<Option<_>>().ok_or_else(|| anyhow::anyhow!("a meta not taken whole, on the shard"))?;
+            let again = again.ok_or_else(|| anyhow::anyhow!("the same again not taken whole, on the shard"))?;
+            let mut seen = std::collections::HashSet::new();
+            let shared: Vec<Made> = costs.iter().filter(|(owner, _)| !seen.insert(*owner)).map(|(_, m)| *m).collect();
+            eprintln!("g9_s3 a harness's meta, taken by each session: {costs:?}; each after its owner's first {shared:?}; the same again {again:?}; a copy's own before, about {own} bytes");
+            anyhow::ensure!(!shared.is_empty() && shared.iter().all(|m| m.blocks <= again.blocks), "each session after an owner's first takes its catalog for no more than the same again ({again:?}): {shared:?}");
+            let now = held().await;
+            let made_on = |owner: usize| now.iter().filter(|(o, _)| *o == owner).map(|(_, (_, n))| *n).sum::<u64>();
+            let ptrs = |owner: usize| now.iter().filter(|(o, _)| *o == owner).map(|(_, (p, _))| *p).collect::<std::collections::HashSet<_>>();
+            anyhow::ensure!(owners.iter().all(|o| made_on(*o) == 1 && ptrs(*o).len() == 1), "one catalog made on each owner, every session there holding it: {now:?}");
+            // Its frame: one block, the frame's own, written once.
+            let first = ids.first().cloned().unwrap_or_default();
+            let (blocks, framed, rev) = hub
+                .harness
+                .sessions
+                .on(&first.clone(), move |s| {
+                    let u = Update::Meta { meta: Box::default() };
+                    s.get_mut(&first).map(|m| {
+                        let before = made();
+                        let mut p = m.frame_of(&u, &[]);
+                        let blocks = made().blocks.saturating_sub(before.blocks);
+                        (blocks, super::super::live::decode_ref(p.text()).map(|f| f.text.to_owned()), m.rev)
+                    })
+                })
+                .await
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let said = |rev: Option<u64>| -> anyhow::Result<String> { Ok(SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta("2.1"))? }, rev }.text()) };
+            anyhow::ensure!(blocks == 1 && framed == Some(said(Some(rev))?), "its frame one block ({blocks}), as before: {framed:?}");
+            // Watched: two metas, said by every other session, so each owner's are said in turn: each made once on each owner it's
+            // said on, and each viewer sent its own frame as before.
+            let version = |k: usize| if k.is_multiple_of(2) { "2.2" } else { "2.3" };
+            let mut viewers = Vec::new();
+            for id in &ids {
+                let a = hub.harness.attach(id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
+                anyhow::ensure!(a.frames().iter().filter(|f| f.starts_with(r#"{"t":"meta""#)).eq([&said(None)?]), "its snapshot's meta as before: {:?}", a.frames());
+                viewers.push((id.clone(), a.viewer, a.topic, a.at.unwrap_or_default()));
+            }
+            let was = held().await;
+            for (k, id) in ids.iter().enumerate() {
+                anyhow::ensure!(take(id, Update::Meta { meta: Box::new(meta(version(k))) }).await.is_some(), "{id}'s meta taken whole, on the shard");
+            }
+            for (k, (id, _viewer, topic, at)) in viewers.iter_mut().enumerate() {
+                let heard = sent(&hub, topic, at);
+                let want = SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta(version(k)))? }, rev: hub.harness.rev(id) }.text();
+                anyhow::ensure!(heard == vec![want], "{id}'s viewer has its meta's frame as before: {heard:?}");
+            }
+            let now = held().await;
+            let said_on: std::collections::HashSet<(usize, &str)> = now.iter().enumerate().map(|(k, (owner, _))| (*owner, version(k))).collect();
+            let remade = now.iter().zip(&was).map(|((_, (_, n)), (_, (_, w)))| n.saturating_sub(*w)).sum::<u64>();
+            let held_on: std::collections::HashSet<(usize, usize)> = now.iter().map(|(owner, (p, _))| (*owner, *p)).collect();
+            anyhow::ensure!(remade == said_on.len() as u64 && held_on.len() == said_on.len(), "each meta made once on each owner it's said on ({}): {remade} made, {} held", said_on.len(), held_on.len());
             Ok(())
         })
     }
@@ -6499,7 +6638,7 @@ mod tests {
             for id in ["s", "fill"] {
                 hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             }
-            let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() });
+            let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new(), came: None });
             let (mut took, mut fills) = (Vec::new(), 0);
             // Only bounds a hang: past it the test fails rather than waits forever.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

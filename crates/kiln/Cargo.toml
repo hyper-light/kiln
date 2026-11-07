@@ -166,7 +166,7 @@ tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time", "resource", "poll", "inotify"] }
-rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param"] }
+rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param", "fs"] }
 filedescriptor = "0.8"
 
 # Windows: process trees as job objects; a file's identity (its volume and file index), which the

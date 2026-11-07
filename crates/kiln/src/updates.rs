@@ -203,47 +203,204 @@ pub fn build_id(sha256_hex: &str) -> String {
     sha256_hex.get(..12).unwrap_or(sha256_hex).to_owned()
 }
 
-/// This binary's SHA-256 (hex) and size, computed once.
-pub fn own_binary() -> Result<(String, u64), String> {
-    static OWN: OnceLock<Result<(String, u64), String>> = OnceLock::new();
-    OWN.get_or_init(|| {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        hash_file(&exe).map_err(|e| format!("{e:#}"))
-    })
-    .clone()
+/// This binary, as kiln tells builds apart ([`own_binary`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Own {
+    pub sha256: String,
+    pub size: u64,
+    /// The build it is ([`build_id`]), or the build it was before kiln signed it on this Mac
+    /// (`crate::os::macsign`).
+    pub build: String,
 }
 
-/// Reads this build's hash ([`own_binary`]) once, off the runtime. The runner and the server ask
-/// for it from async code without waiting (`own_build()`), and the first ask reads the whole
-/// binary: seconds for a test build, a runtime shard and every task on it held that long.
-pub async fn warm_own_binary() {
-    let _ = crate::rt::blocking(own_binary).await;
+/// Where knowing this binary stands ([`own_binary`]). Nothing reads it before something asks, and
+/// no ask holds a thread while it's read.
+enum OwnState {
+    /// Opened ([`open_own`]), none of it read. A server or runner opens it as it starts, so a binary
+    /// another process puts at its path meanwhile (an upgrade's) is never taken for this one.
+    Unasked(Result<std::fs::File, String>),
+    /// Being read on a thread of its own ([`OwnBinary::start`]).
+    Reading,
+    /// Read: what it is, or why it couldn't be.
+    Known(Result<Own, String>),
 }
 
-/// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
-/// on this Mac, when it did (`crate::os::macsign`).
-pub fn own_build() -> String {
-    own_binary().map_or_else(
-        |_| "unknown".to_owned(),
-        |(h, _)| std::env::current_exe().ok().and_then(|p| crate::os::macsign::build_of(&p, &h)).unwrap_or_else(|| build_id(&h)),
-    )
+/// What an ask of [`OwnBinary`] does next.
+enum OwnNext {
+    Known(Result<Own, String>),
+    Wait,
+    Read(Result<std::fs::File, String>),
 }
 
-pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
+struct OwnBinary {
+    state: Mutex<OwnState>,
+    /// Told as the state turns `Known`.
+    known: crate::rt::Changed,
+}
+
+impl OwnBinary {
+    fn opening(path: std::io::Result<PathBuf>) -> Self {
+        let file = path.and_then(|p| crate::os::open_read_once(&p)).map_err(|e| format!("open this binary: {e}"));
+        Self { state: Mutex::new(OwnState::Unasked(file)), known: crate::rt::Changed::new() }
+    }
+
+    /// The first ask takes the opened file to read; asks while it's read wait.
+    fn next(&self) -> OwnNext {
+        let mut state = self.state.lock();
+        match std::mem::replace(&mut *state, OwnState::Reading) {
+            OwnState::Unasked(file) => OwnNext::Read(file),
+            OwnState::Reading => OwnNext::Wait,
+            OwnState::Known(own) => {
+                *state = OwnState::Known(own.clone());
+                OwnNext::Known(own)
+            }
+        }
+    }
+
+    fn read(&self, file: Result<std::fs::File, String>) -> Result<Own, String> {
+        #[cfg(test)]
+        tests::wait_while_reads_held();
+        let own = file.and_then(|f| identify(&f).map_err(|e| format!("read this binary: {e}")));
+        self.set(own.clone());
+        own
+    }
+
+    fn set(&self, own: Result<Own, String>) {
+        *self.state.lock() = OwnState::Known(own);
+        self.known.notify();
+    }
+
+    /// Reads it on a thread of its own, below the priority of the process's other threads
+    /// (`crate::os::lower_thread_priority`): whatever waits for it waits on, and nothing else does.
+    fn start(&'static self, file: Result<std::fs::File, String>) {
+        let reader = std::thread::Builder::new().name("kiln-own-binary".to_owned()).spawn(move || {
+            crate::os::lower_thread_priority();
+            self.read(file)
+        });
+        if let Err(e) = reader {
+            self.set(Err(format!("start reading this binary: {e}")));
+        }
+    }
+
+    async fn get(&'static self) -> Result<Own, String> {
+        loop {
+            let known = self.known.listen();
+            match self.next() {
+                OwnNext::Known(own) => return own,
+                OwnNext::Wait => known.await,
+                OwnNext::Read(file) => {
+                    self.start(file);
+                    known.await;
+                }
+            }
+        }
+    }
+
+    fn now(&'static self) -> Option<Result<Own, String>> {
+        match self.next() {
+            OwnNext::Known(own) => Some(own),
+            OwnNext::Wait => None,
+            OwnNext::Read(file) => {
+                self.start(file);
+                None
+            }
+        }
+    }
+
+    fn get_blocking(&self) -> Result<Own, String> {
+        loop {
+            let known = self.known.listen();
+            match self.next() {
+                OwnNext::Known(own) => return own,
+                OwnNext::Wait => known.wait(),
+                OwnNext::Read(file) => return self.read(file),
+            }
+        }
+    }
+}
+
+fn own() -> &'static OwnBinary {
+    static OWN: OnceLock<OwnBinary> = OnceLock::new();
+    OWN.get_or_init(|| OwnBinary::opening(std::env::current_exe()))
+}
+
+/// Opens this binary, reading none of it: a server and a runner do as they start
+/// ([`OwnState::Unasked`]).
+pub fn open_own() {
+    own();
+}
+
+/// Starts reading this binary now, for a process that wants it soon: a runner says its build as it
+/// connects, and the read goes on beside the connection.
+pub fn read_own() {
+    let own = own();
+    if let OwnNext::Read(file) = own.next() {
+        own.start(file);
+    }
+}
+
+/// This binary's SHA-256, size and build. The first ask starts reading it, on a thread of its own,
+/// through the page cache without filling it ([`hash_through`]); every ask waits for it without
+/// holding a thread.
+pub async fn own_binary() -> Result<Own, String> {
+    own().get().await
+}
+
+/// What's known of this binary now, never waiting (an ask starts reading it): `None` while it's read.
+pub fn own_binary_now() -> Option<Result<Own, String>> {
+    own().now()
+}
+
+/// [`own_binary`] for a command's own work and the blocking pool's jobs, never a server's or a
+/// runner's shard: the calling thread reads the binary when nothing has started to.
+pub fn own_binary_blocking() -> Result<Own, String> {
+    own().get_blocking()
+}
+
+/// This binary's build id ("unknown" if it can't be read), waited for as [`own_binary`] is.
+pub async fn own_build() -> String {
+    build_or_unknown(&own_binary().await)
+}
+
+/// [`own_build`] as [`own_binary_blocking`] waits.
+pub fn own_build_blocking() -> String {
+    build_or_unknown(&own_binary_blocking())
+}
+
+fn build_or_unknown(own: &Result<Own, String>) -> String {
+    own.as_ref().map_or_else(|_| "unknown".to_owned(), |o| o.build.clone())
+}
+
+/// What the binary open at `f` is.
+fn identify(f: &std::fs::File) -> std::io::Result<Own> {
+    let (sha256, size) = hash_through(f)?;
+    let build = std::env::current_exe().ok().and_then(|p| crate::os::macsign::build_of(&p, &sha256)).unwrap_or_else(|| build_id(&sha256));
+    Ok(Own { sha256, size, build })
+}
+
+/// The SHA-256 (hex) and size of the file open at `f`, read from its start once, through: each
+/// piece let go of the page cache once hashed (`crate::os::read_once_past`), so a binary of hundreds
+/// of MB read under a small memory limit leaves the pages the process works from where they were.
+fn hash_through(f: &std::fs::File) -> std::io::Result<(String, u64)> {
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut size = 0u64;
+    let mut buf = vec![0u8; crate::rt::FILE_CHUNK];
+    let mut at = 0u64;
     loop {
-        let n = f.read(&mut buf)?;
+        let n = crate::os::read_at(f, &mut buf, at)?;
         if n == 0 {
             break;
         }
-        size += n as u64;
         h.update(buf.get(..n).unwrap_or_default());
+        let len = u64::try_from(n).unwrap_or(u64::MAX);
+        crate::os::read_once_past(f, at, len);
+        at = at.saturating_add(len);
     }
-    Ok((hex::encode(h.finalize()), size))
+    Ok((hex::encode(h.finalize()), at))
+}
+
+pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
+    let f = crate::os::open_read_once(p).with_context(|| format!("open {}", p.display()))?;
+    Ok(hash_through(&f)?)
 }
 
 /// The release build for an OS and architecture (Linux gets the static one). An Intel Mac has
@@ -882,7 +1039,8 @@ pub async fn unstore(hub: &Hub, target: &str) -> bool {
 /// Every binary kiln can hand out right now.
 pub fn binaries(hub: &Hub) -> Vec<Binary> {
     let mut v = Vec::new();
-    if let Ok((sha256, size)) = own_binary() {
+    // Listed once it's read: an ask starts reading it ([`own_binary_now`]).
+    if let Some(Ok(Own { sha256, size, .. })) = own_binary_now() {
         let sha = (!crate::api::COMMIT.is_empty()).then(|| crate::api::COMMIT.to_owned());
         v.push(Binary { target: crate::api::TARGET.to_owned(), build: build_id(&sha256), sha256, size, origin: "server".to_owned(), at: 0, run: None, sha, by: None });
     }
@@ -937,7 +1095,7 @@ async fn download_release(version: &str, target: &str, dir: &Path) -> anyhow::Re
 /// here, else this version's release fetched from GitHub. Returns (sha256, size).
 pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u64)> {
     if target == crate::api::TARGET {
-        return own_binary().map_err(|e| anyhow::anyhow!("can't read this server's own binary: {e}"));
+        return own_binary().await.map(|o| (o.sha256, o.size)).map_err(|e| anyhow::anyhow!("can't read this server's own binary: {e}"));
     }
     if let Some(b) = stored(hub, target) {
         return Ok((b.sha256, b.size));
@@ -1117,7 +1275,7 @@ async fn check_image(hub: &Hub, image: &str, node: Option<&str>) -> anyhow::Resu
     let sha = log.split_whitespace().next().unwrap_or_default();
     anyhow::ensure!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "unexpected output from the check pod: {}", log.trim());
     let build = build_id(sha);
-    Ok(ImageCheck { image: image.to_owned(), node: node.map(str::to_owned), newer: build != own_build(), build: Some(build), error: None, checked_at: crate::util::now_unix() })
+    Ok(ImageCheck { image: image.to_owned(), node: node.map(str::to_owned), newer: build != own_build().await, build: Some(build), error: None, checked_at: crate::util::now_unix() })
 }
 
 // ------------------------------------------------------------------ jobs
@@ -1650,7 +1808,7 @@ pub fn from_words(hub: &Hub, b: &Binary) -> String {
 }
 
 pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
-    let mine = own_build();
+    let mine = own_build().await;
     // Each runner's record a piece of this turn, which ends its poll once it's over: each finds the runner's processes
     // by a look through the terminals and the sessions, and every runner's was made in one poll, with the runners' list
     // before them (the fleet's loop every minute: 0.3 to 0.6 ms on the CPU in each of rt9's rounds; goal 9, plan
@@ -2243,9 +2401,10 @@ fn supervised() -> bool {
     std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1")
 }
 
-pub fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
+pub async fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
     let release = release(hub, force);
-    let build = own_build();
+    let own = own_binary().await;
+    let build = build_or_unknown(&own);
     let image = image(hub, force);
     let mut s = ServerInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -2278,8 +2437,7 @@ pub fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
         s.namespace = Some(ns);
         return s;
     }
-    let mine = own_binary().ok();
-    let upload = stored(hub, crate::api::TARGET).filter(|b| mine.as_ref().is_none_or(|(h, _)| *h != b.sha256));
+    let upload = stored(hub, crate::api::TARGET).filter(|b| !own.as_ref().is_ok_and(|o| o.sha256 == b.sha256));
     let replacement = match (&upload, &release) {
         (Some(b), _) => Some(Replacement { origin: "upload", build: Some(b.build.clone()), version: None }),
         (None, r) if r.newer && own_release_target().is_some() => Some(Replacement { origin: "release", build: None, version: r.latest.clone() }),
@@ -2313,7 +2471,7 @@ pub async fn upgrade_server(hub: &Arc<Hub>, action: &str) -> anyhow::Result<Job>
     if let Some(j) = hub.updates.running_for("server", "server") {
         return Ok(j);
     }
-    let info = server(hub, false);
+    let info = server(hub, false).await;
     match action {
         "restart" => {
             let (deployment, ns) = kube_identity().ok_or_else(|| anyhow::anyhow!("kiln isn't running in Kubernetes"))?;
@@ -2395,7 +2553,7 @@ async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf)
     };
     anyhow::ensure!(executable(&arrived.head), "that binary is not an executable");
     let build = build_id(&arrived.sha256);
-    anyhow::ensure!(build != own_build(), "that is the build already running");
+    anyhow::ensure!(build != own_build().await, "that is the build already running");
     u.update(hub, id, |j| j.to_build = Some(build.clone()));
     u.say(hub, id, format!("installing build {build} over {}", exe.display()));
     crate::rt::blocking(move || -> anyhow::Result<()> {
@@ -2641,16 +2799,16 @@ pub async fn runner_build() -> AgentMsg {
     let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
     let rootless = if docker != 0 && crate::rt::blocking(crate::runner::docker::rootless_engine).await.unwrap_or(false) { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
+    AgentMsg::Build { build: own_build().await, caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
 /// runs and where its kiln checkout is (`crate::fleet`).
-pub fn runner_facts() -> AgentMsg {
+pub async fn runner_facts() -> AgentMsg {
     let facts = kiln_ci::facts::RunnerFacts {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        kiln: Some(kiln_facts()),
+        kiln: Some(kiln_facts().await),
         probed_at: crate::util::now_unix(),
         ..kiln_ci::facts::RunnerFacts::default()
     };
@@ -2658,10 +2816,10 @@ pub fn runner_facts() -> AgentMsg {
 }
 
 /// The kiln this runner runs, and where kiln's source is on its machine.
-pub fn kiln_facts() -> kiln_ci::facts::KilnFacts {
+pub async fn kiln_facts() -> kiln_ci::facts::KilnFacts {
     kiln_ci::facts::KilnFacts {
         commit: crate::api::COMMIT.to_owned(),
-        build: own_build(),
+        build: own_build().await,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         target: crate::api::TARGET.to_owned(),
         checkout: kiln_checkout().map(|p| p.to_string_lossy().into_owned()),
@@ -2713,8 +2871,8 @@ pub const OUTPOST_CAPS: u32 =
     crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP | crate::proto::CAP_FILES;
 
 /// An outpost's [`AgentMsg::Build`].
-pub fn outpost_build() -> AgentMsg {
-    AgentMsg::Build { build: own_build(), caps: OUTPOST_CAPS }
+pub async fn outpost_build() -> AgentMsg {
+    AgentMsg::Build { build: own_build().await, caps: OUTPOST_CAPS }
 }
 
 #[cfg(test)]
@@ -3455,5 +3613,133 @@ mod tests {
         }
         assert_eq!(j.log.len(), KEEP_LINES);
         assert_eq!(j.log.first().map(String::as_str), Some("10"));
+    }
+
+    // ------------------------------------------------------------ this binary, read off the startup path
+
+    /// In a process of its own, every read of its binary held ([`g11_startup_a_server_serves_before_it_reads_its_binary`]).
+    const HOLD_READS: &str = "KILN_TEST_HOLD_OWN_READS";
+    /// What that process says once its server answered with its binary unread.
+    const SERVED: &str = "served, its binary unread";
+    /// How long a test build's server may take to answer, on a loaded machine.
+    const SERVE_WITHIN: Duration = Duration::from_secs(120);
+
+    static READS_HELD: AtomicBool = AtomicBool::new(false);
+
+    /// A read of this binary waits here while reads are held ([`OwnBinary::read`]): for good, in the process that holds
+    /// them, which ends without letting them go.
+    pub(super) fn wait_while_reads_held() {
+        while READS_HELD.load(Ordering::SeqCst) {
+            std::thread::park();
+        }
+    }
+
+    /// Goal 11, the constrained instance (Ada, 2026-11-07): a server held to 128 MB was killed for memory 8.4 s after it
+    /// started, and its start had read its whole binary (270 MB, a release build) to hash it, filling its page cache
+    /// with it and faulting its own code back in 4,300 times. Now nothing reads the binary until something asks for
+    /// its build, and the server serves without waiting for that. In a process of its own, with every read of its
+    /// binary held, a server answers `/readyz` and its binary is still unread; one whose start waits for the hash, as it
+    /// did, never answers.
+    #[test]
+    fn g11_startup_a_server_serves_before_it_reads_its_binary() -> anyhow::Result<()> {
+        if std::env::var_os(HOLD_READS).is_some() {
+            return serve_with_reads_held();
+        }
+        let me = "updates::tests::g11_startup_a_server_serves_before_it_reads_its_binary";
+        let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me, "--nocapture", "--test-threads=1"]).env(HOLD_READS, "1").output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        anyhow::ensure!(out.status.success() && said.contains(SERVED), "the server's start, its binary's reads held:\n{said}");
+        Ok(())
+    }
+
+    fn serve_with_reads_held() -> anyhow::Result<()> {
+        READS_HELD.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir()?;
+        let http = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let quic = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port();
+        let mut cfg = crate::config::Config::default();
+        cfg.server.http_addr = format!("127.0.0.1:{http}");
+        cfg.server.quic_addr = format!("127.0.0.1:{quic}");
+        cfg.server.public_url = format!("http://127.0.0.1:{http}");
+        cfg.server.quic_advertise = cfg.server.quic_addr.clone();
+        cfg.server.data_dir = dir.path().to_path_buf();
+        cfg.server.admin_token_file = None;
+        cfg.server.https = false;
+        cfg.repos.clear();
+        cfg.gitops.orgs.clear();
+        cfg.secrets.clear();
+        cfg.local_agent.enabled = false;
+        cfg.kubernetes.enabled = false;
+        cfg.terminal.enabled = false;
+        cfg.discovery.enabled = false;
+        cfg.discovery.announce = false;
+        cfg.discovery.browse = false;
+        cfg.discovery.join_requests = false;
+        cfg.observe.enabled = false;
+        crate::rt::block_on(async move {
+            use futures::FutureExt as _;
+            let shutdown = crate::rt::Shutdown::new();
+            let server = crate::rt::spawn(crate::server::run(cfg, shutdown.clone()));
+            let ready = async {
+                let client = crate::http::client::Client::public()?;
+                let url = format!("http://127.0.0.1:{http}/readyz");
+                let began = Instant::now();
+                while !client.get(&url).send().await.is_ok_and(|r| r.is_success()) {
+                    anyhow::ensure!(began.elapsed() < SERVE_WITHIN, "no answer from /readyz within {SERVE_WITHIN:?}");
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                anyhow::Ok(())
+            };
+            let answered = futures::select! {
+                ended = server.fuse() => Err(anyhow::anyhow!("the server ended before it answered: {ended:?}")),
+                ready = ready.fuse() => ready,
+            };
+            let unread = matches!(*own().state.lock(), OwnState::Unasked(_) | OwnState::Reading);
+            shutdown.cancel();
+            answered?;
+            anyhow::ensure!(unread, "the server read its binary before it answered");
+            println!("{SERVED}");
+            Ok(())
+        })
+    }
+
+    /// Goal 11, the constrained instance: what asks for this binary waits for one read of it, made on a thread of its
+    /// own, however many ask at once and however they ask; the file read is the one opened before anyone asked.
+    #[test]
+    fn g11_startup_its_binary_is_read_once_for_every_ask() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln");
+        let bytes: Vec<u8> = (0..crate::rt::FILE_CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes)?;
+        let own: &'static OwnBinary = Box::leak(Box::new(OwnBinary::opening(Ok(path.clone()))));
+        anyhow::ensure!(matches!(*own.state.lock(), OwnState::Unasked(Ok(_))), "opened, unread");
+        // Another binary at its path now (an upgrade's) isn't the one read.
+        std::fs::remove_file(&path)?;
+        std::fs::write(&path, b"another build")?;
+        let want = Own { sha256: hex::encode(Sha256::digest(&bytes)), size: u64::try_from(bytes.len())?, build: build_id(&hex::encode(Sha256::digest(&bytes))) };
+        let asked = crate::rt::block_on(async move { Ok(futures::future::join_all((0..8).map(|_| own.get())).await) })?;
+        anyhow::ensure!(asked.iter().all(|a| a.as_ref() == Ok(&want)), "every ask, one read: {asked:?}");
+        anyhow::ensure!(own.now().as_ref() == Some(&Ok(want.clone())) && own.get_blocking() == Ok(want), "known, without waiting");
+        Ok(())
+    }
+
+    /// Goal 11, the constrained instance: hashing a file reads it through without keeping it in the page cache, where a
+    /// server held to 128 MB had kept 120 MB of its binary 0.6 s after it started. Before: every page read stayed.
+    #[cfg(unix)]
+    #[test]
+    fn g11_startup_hashing_a_file_leaves_none_of_it_in_the_page_cache() -> anyhow::Result<()> {
+        // Beside the test binary: a file system with a page cache (a temporary directory may be in memory).
+        let near = std::env::current_exe()?.parent().map(Path::to_path_buf).ok_or_else(|| anyhow::anyhow!("the test binary's directory"))?;
+        let dir = tempfile::tempdir_in(near)?;
+        let path = dir.path().join("kiln");
+        let bytes: Vec<u8> = (0..crate::rt::FILE_CHUNK * 8).map(|i| (i % 253) as u8).collect();
+        let file = crate::os::write_uncached(&path, &bytes)?;
+        let (before, pages) = crate::os::cached_pages(&file)?;
+        anyhow::ensure!(before == 0 && pages > 0, "written out of the cache: {before} of {pages} pages cached");
+        let (sha256, size) = hash_file(&path)?;
+        anyhow::ensure!(sha256 == hex::encode(Sha256::digest(&bytes)) && size == u64::try_from(bytes.len())?, "its hash and size");
+        let (after, _) = crate::os::cached_pages(&file)?;
+        anyhow::ensure!(after == 0, "{after} of its {pages} pages left in the page cache by reading it");
+        Ok(())
     }
 }

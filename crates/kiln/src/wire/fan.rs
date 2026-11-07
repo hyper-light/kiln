@@ -79,7 +79,9 @@ pub enum Head<'a> {
 
 /// `AgentMsg`'s variants that a session's update from the same runner is judged by: who the runner is and
 /// what it can do, which sessions it holds, and a session going from one of its processes to another.
-const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted"];
+/// A runner's admission (docs/resilience.md R5) is one too: what of it is taken hangs on its `Admit`, and its `Settled`
+/// ends it once its earlier updates are taken.
+const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted", "Admit", "Settled"];
 
 /// Its variants that read what its runner's sessions said (where one runs, its epoch, its holder): word of a
 /// frame it couldn't read, about a session it holds; an identity it asks for one (answered at once once the
@@ -196,6 +198,8 @@ struct Tags {
     harness: u64,
     wire: u64,
     item: u64,
+    /// `AgentMsg::Admit`'s ([`admits`]).
+    admit: u64,
     /// Each `AgentMsg` tag's [`Head`], by tag; a tag past them (a newer runner's) is a barrier.
     heads: Vec<Head<'static>>,
 }
@@ -228,8 +232,14 @@ fn tags() -> &'static Tags {
                 }
             })
             .collect();
-        Tags { harness: tag(agent, "Harness"), wire: tag(agent, "Wire"), item: tag(variants_of::<super::channel::Frame>(), "Item"), heads }
+        Tags { harness: tag(agent, "Harness"), wire: tag(agent, "Wire"), item: tag(variants_of::<super::channel::Frame>(), "Item"), admit: tag(agent, "Admit"), heads }
     })
+}
+
+/// Whether runner frame `data` is an `Admit` (docs/resilience.md R5), read off its head and nothing more: of a runner
+/// being let go (`crate::hub::admission`), it's the one frame heard, as it's how it comes back.
+pub fn admits(data: &[u8]) -> bool {
+    varint(data).is_some_and(|(tag, _)| tag == tags().admit)
 }
 
 /// The postcard varint at the head of `b` (as a `u64`, from at most ten bytes), and what follows it.
@@ -360,8 +370,9 @@ const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "Harness
 
 /// Its variants that what a session loop takes is judged by, ordered both ways against it: the handshake and what it
 /// says the server takes (a session's custody, its relays, its unread words), what the server kept of its sessions, a
-/// session's identity at an epoch and the work kiln handed it, how many sessions the machine runs at once.
-const SERVER_BARRIERS: &[&str] = &["Welcome", "Refused", "Caps", "Kept", "Identity", "Custody", "AgentLimit"];
+/// session's identity at an epoch and the work kiln handed it, how many sessions the machine runs at once; and the
+/// server's word of when to dial it again (its admission's turn, its drain's notice: docs/resilience.md R5).
+const SERVER_BARRIERS: &[&str] = &["Welcome", "Refused", "Caps", "Kept", "Identity", "Custody", "AgentLimit", "Later", "Back"];
 
 /// Its variants of a protocol of their own the link carries.
 const SERVER_CARRIED: &[&str] = &["Sync", "Observe", "Cluster", "Convo", "Reach", "ReachRefused", "PortData", "PortAck", "PortClose"];

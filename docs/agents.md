@@ -367,6 +367,9 @@ viewer can ask for less of both, in the socket's query:
   last. A long conversation's arrives in about a tenth of the bytes.
 - `patch=state`: after the snapshot's whole `state`, a state comes as only what changed in it:
   `state_patch {set, gone?}`, the top-level fields set, and those it no longer has.
+- `timing=1`: each live frame is followed by `timing {published, read, arrived?, took?, runner?}`,
+  the server's times with it in microseconds since the epoch (`runner`: its runner's hold, a
+  duration), as `Kiln-Timing` gives an API read its own; the load lab splits slow frames by them.
 
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
 `resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
