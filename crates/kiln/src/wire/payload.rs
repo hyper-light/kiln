@@ -328,6 +328,22 @@ fn looking(wire: Wire, of: &str) -> bool {
     place_of(wire, of).is_some_and(|p| p.busy.load(std::sync::atomic::Ordering::Acquire))
 }
 
+/// The look at payloads of variant `of` on `wire` ([`looks_at`]), taken once whatever look at one of them is under way is done
+/// (the compute pool given turns meanwhile: its spare time is the checker's), and held till it's dropped: a test's, whose
+/// reads of the kind meanwhile are read straight, none handed on to be looked at. 30 s at the most.
+#[cfg(test)]
+pub(crate) async fn look_held(wire: Wire, of: &str) -> anyhow::Result<Looking> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(look) = looks_at(wire, of) {
+            return Ok(look);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the look at a {of} on {} under way wasn't done in 30 s", wire.name());
+        crate::rt::compute(|| ()).await?;
+        crate::rt::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// Counts `fields`, what a message of variant `of` on `wire` carried that this build doesn't know, and
 /// says each in the log that wasn't said within the hour.
 fn say_unknown(wire: Wire, of: &'static str, fields: &[String]) {
@@ -1624,7 +1640,7 @@ mod tests {
                 hear_item(&hub, 1, "s:s1#a1", seq, &AgentMsg::Harness { session: "s1".into(), json: json.clone() }).await?;
                 noted += 1;
                 let nack = hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
-                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == "s:s1#a1" => has.nacks.iter().find(|n| n.seq == seq).map(|n| n.code),
+                    ServerMsg::Wire(Frame::Ack(has)) if &*has.stream == "s:s1#a1" => has.nacks.iter().find(|n| n.seq == seq).map(|n| n.code),
                     _ => None,
                 });
                 let want = if code == Code::Unknown { Refusal::Unsupported } else { Refusal::Malformed };

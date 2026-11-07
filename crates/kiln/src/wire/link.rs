@@ -35,7 +35,7 @@ impl Seen {
     /// What it says of stream `stream`, as [`Receiver::has`] says it.
     fn has(&self, stream: &str) -> Has {
         let upto = self.upto.load(Ordering::Acquire);
-        Has { stream: stream.to_owned(), upto, nacks: Vec::clone(&self.nacks.load()) }
+        Has { stream: Arc::from(stream), upto, nacks: Vec::clone(&self.nacks.load()) }
     }
 }
 
@@ -69,9 +69,10 @@ impl Links {
         Frame::Have(streams.map(|s| s.load().iter().map(|(name, seen)| seen.has(name)).collect()).unwrap_or_default())
     }
 
-    /// An item came from `runner`, at `now`. A stream's first item starts its key over: the server
-    /// lets go of what it had of that session's (or terminal's) earlier streams.
-    pub fn on_item(&self, runner: &str, stream: &str, seq: Seq, low: Seq, body: Vec<u8>, now: Instant) -> Arrival {
+    /// An item of stream `stream` came from `runner`, at `now`: whether to apply what it carries, which its caller holds
+    /// ([`Receiver::on_item`]). A stream's first item starts its key over: the server lets go of what it had of that
+    /// session's (or terminal's) earlier streams.
+    pub fn on_item(&self, runner: &str, stream: &str, seq: Seq, low: Seq, now: Instant) -> Arrival {
         self.with_receiver(runner, |rx| {
             let mut gone: Vec<String> = Vec::new();
             if seq == 1
@@ -90,7 +91,7 @@ impl Links {
             // sender's `low` let go of refusals or moved past what they had: else nothing is published (goal 9, plan
             // 01a1a87b2cec step 3: every item's was, made anew).
             let seen = rx.seen(stream);
-            let arrival = rx.on_item(stream, seq, low, body, now);
+            let arrival = rx.on_item(stream, seq, low, now);
             if !gone.is_empty() || rx.seen(stream) != seen {
                 self.publish(runner, stream, rx, &gone);
             }
@@ -207,7 +208,7 @@ mod tests {
             ("t:term#b1.0", 2, None),
         ];
         for (stream, seq, refusal) in steps {
-            let _ = links.on_item("a", stream, seq, 0, vec![1], now);
+            let _ = links.on_item("a", stream, seq, 0, now);
             let _ = links.answer("a", stream, seq, refusal.clone());
             if seq == 1
                 && let Some(key) = key_of(stream)
@@ -215,7 +216,7 @@ mod tests {
                 let prefix = format!("{key}#");
                 receivers.forget_where(|s| s != stream && s.starts_with(&prefix));
             }
-            let _ = receivers.on_item(stream, seq, 0, vec![1], now);
+            let _ = receivers.on_item(stream, seq, 0, now);
             let _ = match refusal {
                 None => receivers.took(stream, seq),
                 Some((code, why)) => receivers.refused(stream, seq, code, why),
@@ -231,35 +232,35 @@ mod tests {
     fn a_sessions_new_stream_replaces_its_old_one() {
         let now = Instant::now();
         let links = Links::new();
-        assert!(matches!(links.on_item("a", "s:x#b1.0", 1, 0, vec![1], now), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:x#b1.0", 1, 0, now), Arrival::Take(_)));
         links.answer("a", "s:x#b1.0", 1, None);
-        assert!(matches!(links.on_item("a", "s:y#b1.0", 1, 0, vec![1], now), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:y#b1.0", 1, 0, now), Arrival::Take(_)));
         links.answer("a", "s:y#b1.0", 1, None);
         // x starts over under its next generation: its old stream goes; y's stays.
-        assert!(matches!(links.on_item("a", "s:x#b1.1", 1, 0, vec![2], now), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:x#b1.1", 1, 0, now), Arrival::Take(_)));
         links.answer("a", "s:x#b1.1", 1, Some((Refusal::Refused, "no".into())));
         let Frame::Have(has) = links.have("a") else { return };
-        let mut names: Vec<&str> = has.iter().map(|h| h.stream.as_str()).collect();
+        let mut names: Vec<&str> = has.iter().map(|h| &*h.stream).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["s:x#b1.1", "s:y#b1.0"]);
         // Another runner's are its own.
         let Frame::Have(other) = links.have("b") else { return };
         assert!(other.is_empty());
     }
-    /// Goal 9, plan 01a1a87b2cec step 3: once a runner's stream is known, an item that changes nothing its receivers say costs
-    /// them nothing made, and its answer one block, the answer's stream name: what they publish of the stream is stored in
-    /// place. The runner's and the stream's names were copied for each item and each answer, and a whole copy of what the
-    /// receivers have made and swapped in for each item and each answer, though an item had changed nothing it said: nine
-    /// blocks an item. What's said again is still what the receivers have.
+    /// Goal 9, plan 01a1a87b2cec step 3: once a runner's stream is known, an item that changes nothing its receivers say, and
+    /// its answer, cost them nothing made: what they publish of the stream is stored in place, and the answer's stream name is
+    /// the one they keep, shared. The runner's and the stream's names were copied for each item and each answer, and a whole
+    /// copy of what the receivers have made and swapped in for each item and each answer, though an item had changed nothing
+    /// it said: nine blocks an item; then one, its answer's copy of its stream's name. What's said again is still what the
+    /// receivers have.
     #[test]
-    fn g9_s3_an_item_and_its_answer_make_its_answer_alone() {
+    fn g9_s3_an_item_and_its_answer_make_nothing() {
         let now = Instant::now();
         let links = Links::new();
         let mut receivers = Receiver::new();
         for seq in 1..=8 {
-            let (body, mirrored) = (vec![1], vec![1]);
             let before = crate::os::counted::made();
-            let taken = links.on_item("a", "s:x#b1.0", seq, seq - 1, body, now);
+            let taken = links.on_item("a", "s:x#b1.0", seq, seq - 1, now);
             let item = crate::os::counted::made();
             let answer = links.answer("a", "s:x#b1.0", seq, None);
             let answered = crate::os::counted::made();
@@ -268,9 +269,9 @@ mod tests {
             // The first two make the runner's and the stream's places.
             if seq > 2 {
                 assert_eq!(item.blocks - before.blocks, 0, "item {seq}: nothing made for it");
-                assert_eq!(answered.blocks - item.blocks, 1, "item {seq}'s answer: its stream's name");
+                assert_eq!(answered.blocks - item.blocks, 0, "item {seq}'s answer: nothing made for it");
             }
-            let _ = receivers.on_item("s:x#b1.0", seq, seq - 1, mirrored, now);
+            let _ = receivers.on_item("s:x#b1.0", seq, seq - 1, now);
             let _ = receivers.took("s:x#b1.0", seq);
             let (Frame::Have(said), Frame::Have(has)) = (links.have("a"), receivers.have()) else { return };
             assert_eq!(said, has, "after item {seq}");

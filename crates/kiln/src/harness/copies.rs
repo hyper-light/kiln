@@ -3882,9 +3882,10 @@ pub struct Ingest {
 /// Every runner's updates were judged on the hub's one loop, on the HTTP listener's shard, behind every
 /// runner's other messages (the lab's runner wait at p99, 155 to 195 ms).
 pub struct RunnerUpdate {
-    /// The runner process it came from, and its machine.
+    /// The runner process it came from, and its machine (its name shared with the hub's map of runners' links: goal 9, plan
+    /// 01a1a87b2cec step 3).
     pub peer: hyper_transport::PeerId,
-    pub agent: String,
+    pub agent: Arc<str>,
     pub session: String,
     pub update: Update,
     /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`), as its

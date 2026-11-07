@@ -1891,8 +1891,8 @@ mod tests {
                             };
                             let (rx, took, tx, answered) = if server { (&mut up_in, &mut took_up, &mut down, &mut answered_down) } else { (&mut down_in, &mut took_down, &mut up, &mut answered_up) };
                             match frame {
-                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body, Instant::now()) {
-                                    Arrival::Take(body) => {
+                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, Instant::now()) {
+                                    Arrival::Take(_) => {
                                         if let Some(i) = index(&body) {
                                             if let Some(t) = took.get_mut(i) {
                                                 *t += 1;

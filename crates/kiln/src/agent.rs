@@ -3086,8 +3086,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Newer => wire_in.forget_where(|s| s != stream && crate::wire::commands::superseded(&stream, s)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
-                                Arrival::Take(body) => match proto::read_server(&body) {
+                            let answer = match wire_in.on_item(&stream, seq, low, Instant::now()) {
+                                Arrival::Take(_) => match proto::read_server(&body) {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
                                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, crate::wire::unread::Code::Malformed, "Wire", why) {

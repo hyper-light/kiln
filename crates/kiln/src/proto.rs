@@ -1011,6 +1011,37 @@ pub(crate) mod wire_bytes {
     }
 }
 
+/// A name a message carries that its maker shares where it keeps it (`Arc<str>`; goal 9, plan 01a1a87b2cec step 3): text on
+/// the wire, as a `String` is, so a peer of any build reads either; read into one block, as a `String` is (serde's own
+/// `Arc<str>` reads a `Box<str>` first and copies it into another).
+pub(crate) mod shared_str {
+    use std::sync::Arc;
+
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+        d.deserialize_str(Text)
+    }
+
+    struct Text;
+
+    impl serde::de::Visitor<'_> for Text {
+        type Value = Arc<str>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("text")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Arc<str>, E> {
+            Ok(Arc::from(v))
+        }
+    }
+}
+
 /// `v` as postcard writes it, into one buffer the size it comes to (goal 9, plan 01a1a87b2cec step 5): measured
 /// first (a walk that adds up lengths, a byte string's or a text's at once), then written once. Written into a buffer
 /// that grew as it went, a message was copied again at each doubling: in rt7's calm profile half of what the cluster
@@ -1302,6 +1333,35 @@ mod tests {
             AgentMsg::Convo { json: j, data: d } => anyhow::ensure!(j == json && d == data, "read back as {j:?} {d:?}"),
             _ => anyhow::bail!("read back as another message"),
         }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a channel answer's stream name, shared where its receiver keeps it (`shared_str`),
+    /// is the same on the wire and in JSON as the `String` it was, each shape reads the other's, and read off the wire it's
+    /// one block, as a `String`'s is (serde's own `Arc<str>` makes two).
+    #[test]
+    fn g9_s3_a_shared_name_keeps_the_wire_and_reads_into_one_block() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Has, Nack, Refusal, Seq};
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Old {
+            stream: String,
+            upto: Seq,
+            nacks: Vec<Nack>,
+        }
+        let nacks = vec![Nack { seq: 8, code: Refusal::Unknown, why: "gone".into() }];
+        let new = Has { stream: "s:s1#7.0".into(), upto: 9, nacks: nacks.clone() };
+        let old = Old { stream: "s:s1#7.0".into(), upto: 9, nacks };
+        let (n, o) = (encode(&new)?, encode(&old)?);
+        anyhow::ensure!(n == o, "{} and {} bytes on the wire", n.len(), o.len());
+        anyhow::ensure!(decode::<Has>(&o)? == new && decode::<Old>(&n)? == old, "didn't read back");
+        let json = serde_json::to_string(&new)?;
+        anyhow::ensure!(json == serde_json::to_string(&old)? && serde_json::from_str::<Has>(&json)? == new, "in JSON: {json}");
+        let answer = encode(&Frame::Ack(Has { stream: "s:s1#7.0".into(), upto: 9, nacks: Vec::new() }))?;
+        let before = crate::os::counted::made();
+        let read = decode::<Frame>(&answer)?;
+        let made = crate::os::counted::made().blocks - before.blocks;
+        drop(read);
+        anyhow::ensure!(made == 1, "its name read into {made} blocks");
         Ok(())
     }
 
