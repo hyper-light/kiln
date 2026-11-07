@@ -31,7 +31,7 @@ enum Kept {
     Other(Bytes),
 }
 
-/// A shared null state: a copy's before it has one (as `super::registry::null` is its meta's).
+/// A shared null state: a copy's before it has one (as `super::copies::Catalog::none` is its meta's).
 pub fn none() -> Arc<StateDoc> {
     static NONE: std::sync::LazyLock<Arc<StateDoc>> = std::sync::LazyLock::new(|| Arc::new(StateDoc::default()));
     Arc::clone(&NONE)
