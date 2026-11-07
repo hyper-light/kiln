@@ -1337,11 +1337,13 @@ mod tests {
             // The second waits while what's after the tee has no room.
             let waited = Duration::from_millis(30);
             crate::rt::sleep(waited).await;
+            // Taking the first is what frees the room the second waits for.
+            let freed = Instant::now();
             let first = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             let second = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             anyhow::ensure!(waiting.await.unwrap_or(false), "the second went");
             anyhow::ensure!(first.session == "a1" && matches!(&second.update, Update::Events { events } if events.first().is_some_and(|e| e.id == "m2")), "in order: {first:?} {second:?}");
-            anyhow::ensure!(before <= second.at && second.at.elapsed() >= waited, "taken in as it was sent, its wait for room counted from then");
+            anyhow::ensure!(before <= second.at && second.at <= freed, "taken in as it was sent, before what's after the tee had room for it");
             // Into a sink of plain updates, as before.
             let (plain, got) = async_channel::unbounded();
             let (sink, _held) = tee_held(plain, None);
