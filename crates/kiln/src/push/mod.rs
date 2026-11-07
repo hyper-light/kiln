@@ -263,7 +263,7 @@ async fn follow(text: Arc<str>) -> Option<Followed> {
 /// against `sides` (the shard's quantum and the compute pool's round trip, `crate::rt::Sides::take_here`): where it fits a
 /// turn and costs no more than the pool's round trip; off it past either, and while nothing is learned (the first teaches).
 fn parses_here(expect: &crate::wire::payload::Expect, len: u64, sides: crate::rt::Sides) -> bool {
-    expect.on_shard_with(len, sides).is_some()
+    expect.on_shard_with(len, 0, sides).is_some()
 }
 
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the

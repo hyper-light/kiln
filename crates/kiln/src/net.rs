@@ -1567,7 +1567,7 @@ mod tests {
                     _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
                 }
             }
-            anyhow::ensure!(fresh.on_shard_with(1, crate::rt::Sides { quantum_ns: None, trip_ns: None }).is_some(), "the first batch, made on the pool, taught what making takes");
+            anyhow::ensure!(fresh.on_shard_with(1, 0, crate::rt::Sides { quantum_ns: None, trip_ns: None }).is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }
