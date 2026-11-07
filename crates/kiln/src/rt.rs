@@ -1127,6 +1127,15 @@ pub(crate) fn timer_wakes_in(file: &str) -> u64 {
     shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
 }
 
+/// The parks the timers armed in `file` ended ([`timer_wakes_in`]) over `d`, slept here, so the sleep's own isn't
+/// counted against `file` (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn timer_wakes_over(file: &str, d: Duration) -> u64 {
+    let before = timer_wakes_in(file);
+    sleep(d).await;
+    timer_wakes_in(file).saturating_sub(before)
+}
+
 /// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
 /// 01a1a87b2cec step 5).
 #[cfg(test)]
@@ -2476,6 +2485,16 @@ impl Notify {
     pub async fn notified(&self) {
         hyper_rt::coop::consume_budget().await;
         self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+    }
+
+    /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
+    /// something that waits on it (goal 9, plan 01a1a87b2cec step 5). A permit left meanwhile is taken at the next.
+    pub async fn notified_while(&self, on: bool) {
+        if on {
+            self.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 }
 

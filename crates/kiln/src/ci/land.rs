@@ -84,18 +84,39 @@ pub fn recheck() {
     kick();
 }
 
-/// The queue, for as long as the server runs: each trunk with entries, every few seconds or when
-/// kicked.
+/// How often a queue with entries (or diffs waiting to land as they're ready) is stepped with nothing said: its host's
+/// changes and queue are read then (a host with no word to kiln when they move), its candidates' tests and the waiting
+/// diffs' readiness.
+const STEP_EVERY: Duration = Duration::from_secs(3);
+
+/// The queue, for as long as the server runs: each trunk with entries, when kicked (an entry came or changed, a
+/// review: [`kick`], level-triggered, so none is lost), and while it has entries or diffs waiting to land every
+/// [`STEP_EVERY`]; with neither, no clock at all (goal 9, plan 01a1a87b2cec step 5: it looked every three seconds whether it had entries or not, about
+/// 0.3 timer wakes a second in the lab, train 34's census).
 pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     loop {
-        if let Err(e) = tick(&hub).await {
-            tracing::warn!(error = %format!("{e:#}"), "the land queue stumbled");
-        }
+        let entries = match tick(&hub).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the land queue stumbled");
+                true
+            }
+        };
+        let step = async {
+            if entries {
+                // (c) its host's changes and merge queue have no word to kiln: GitHub's `pull_request` and
+                // `merge_group` webhooks would kick it; and its candidates' runs, a write kiln could watch.
+                #[allow(clippy::disallowed_methods)]
+                crate::rt::sleep(STEP_EVERY).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             () = kicker().notified().fuse() => {}
-            () = crate::rt::sleep(Duration::from_secs(3)).fuse() => {}
+            () = step.fuse() => {}
         }
     }
 }
@@ -1051,7 +1072,8 @@ async fn ready(hub: &Arc<Hub>, d: &Diff) -> bool {
 
 /// The diffs waiting to land when ready: each into the queue once it may, its wait over once it's
 /// in one (whoever put it there), landed or abandoned.
-async fn waiting(hub: &Arc<Hub>) {
+/// Whether diffs wait to land as they're ready.
+async fn waiting(hub: &Arc<Hub>) -> bool {
     // Every tick, beside the writer rather than in its turn, and prepared once (the DB query audit,
     // 2026-11-06).
     let ids: Vec<String> = hub
@@ -1063,6 +1085,7 @@ async fn waiting(hub: &Arc<Hub>) {
         })
         .await
         .unwrap_or_default();
+    let any = !ids.is_empty();
     for id in ids {
         match diffs::find(hub, &id).await {
             Ok(Some(d)) if matches!(d.state.as_str(), "landing" | "landed" | "abandoned") => forget(hub, &id).await,
@@ -1074,6 +1097,7 @@ async fn waiting(hub: &Arc<Hub>) {
             Err(e) => tracing::warn!(diff = %id, error = %format!("{e:#}"), "a diff waiting to land couldn't be read"),
         }
     }
+    any
 }
 
 // ------------------------------------------------------------------ building candidates
@@ -1495,9 +1519,10 @@ async fn files_of(hub: &Hub, path: &str, parent: &str, commit: &str) -> BTreeSet
 
 // ------------------------------------------------------------------ the queue's step
 
-async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
-    waiting(hub).await;
-    // Every 3 s, beside the writer and prepared once, as `waiting`'s.
+/// Whether the queue has entries under way, or diffs wait to land as they're ready.
+async fn tick(hub: &Arc<Hub>) -> anyhow::Result<bool> {
+    let waits = waiting(hub).await;
+    // Beside the writer and prepared once, as `waiting`'s.
     let groups: Vec<(String, String)> = hub
         .store
         .read(|c| {
@@ -1507,7 +1532,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
         })
         .await?;
     if groups.is_empty() {
-        return Ok(());
+        return Ok(waits);
     }
     let repos = hub.store.repos().await?;
     for (repo_id, trunk) in groups {
@@ -1516,7 +1541,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
             tracing::warn!(repo = %repo.name, %trunk, error = %format!("{e:#}"), "the land queue couldn't move");
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// One step of a trunk's queue (docs/ci.md W28-R100 to R109): what waits on Review asked again,
@@ -3101,6 +3126,28 @@ async fn off_host(hub: &Arc<Hub>, e: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the land queue's loop, about 0.3 timer wakes a second: every
+    /// three seconds whether it had entries or not): with no entry and no diff waiting to land it arms no clock. Do: a
+    /// scratch hub's queue loop started and settled; three and a half seconds. Expect: no timer of the queue's woke a
+    /// shard (it woke every three seconds). Counted by the timers' place, not the loop's polls: a kick from a test beside
+    /// it is a word, not a clock.
+    #[test]
+    fn g9_s5_the_land_queue_arms_no_clock_while_nothing_waits() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicU64;
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), run_loop(Arc::clone(&hub)))));
+            crate::rt::settled(&polls, until).await?;
+            let woke = crate::rt::timer_wakes_over("ci/land.rs", std::time::Duration::from_millis(3500)).await;
+            anyhow::ensure!(woke == 0, "{woke} timer wakes in 3500 ms with nothing waiting to land");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
 
     #[test]
     fn w14_r08_uncovered() {
