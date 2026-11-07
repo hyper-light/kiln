@@ -3,18 +3,18 @@
 //! components come from the UI server (`crate::uiserver`); a page that renders only in the browser
 //! (every one the build doesn't list as rendered on the server, `_server-pages.json`) gets the app's
 //! shell (`_shell.html`) from here, as does every page without the UI server. Compressible files go
-//! out brotli-compressed (or gzipped, to a browser that doesn't take brotli), each compressed once and
-//! kept in memory: the embedded ones in the background as the server starts (`warm`), so no request
-//! waits. Only this build's files are kept so, which bounds what they take (`crate::memory::UI_ASSETS`;
-//! goal 11, plan 01a1a87b2e56 step 3); an earlier build's goes as its build packed it, or as it is.
+//! out brotli-compressed, or gzipped to a client that doesn't take brotli, as the build packed them into the
+//! binary (`build.rs`, `crate::ui_pack`): no request waits for a copy, and none goes out uncompressed after a
+//! restart (goal 11's audit, row B15). Only a debug build's file changed since it was built is packed here,
+//! with brotli, on its first request; an earlier build's goes as its build packed it, or as it is.
 //!
 //! Every response carries a strong ETag of the bytes it sends (its file's SHA-256 and its coding),
 //! and a request whose If-None-Match names it gets a 304 with no body: the shell and the other
 //! unhashed files (`no-cache`) cost a revalidation, not a download, on a repeat visit (goal 8 of the
 //! browser protocol program, plan 01a1a832ebfd step 3; docs/http.md "The UI's files").
 //!
-//! Earlier builds' assets are kept on disk (`keep_assets`), each with the brotli copy its build
-//! packed, so a page loaded before a deploy can still load the parts it hasn't yet. An asset no
+//! Earlier builds' assets are kept on disk (`keep_assets`), each with the brotli and gzip copies its
+//! build packed, so a page loaded before a deploy can still load the parts it hasn't yet. An asset no
 //! build has is a 404, never `index.html`: a browser handed HTML for a script fails in a way only a
 //! reload fixes.
 //!
@@ -28,7 +28,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -44,24 +43,25 @@ use crate::rcu::Rcu;
 #[allow_missing = true]
 struct Assets;
 
-/// The UI's files the build packed with brotli (`build.rs`, by `crate::ui_pack`): `PACKED`, each a file's name,
-/// the SHA-256 of the file it was packed from and its packed bytes, in name order. They're served from the
-/// binary's own pages: no server compresses them as it starts, nor keeps the copies on its heap (goal 11, plan
-/// 01a1a87b2e56 step 5).
+/// The UI's files the build packed (`build.rs`, by `crate::ui_pack`): `PACKED` with brotli and `PACKED_GZ` with gzip,
+/// each a file's name, the SHA-256 of the file it was packed from and its packed bytes, in name order. They're served
+/// from the binary's own pages: no server compresses them as it starts or as they're asked for, nor keeps the copies
+/// on its heap (goal 11, plan 01a1a87b2e56 step 5; goal 11's audit, row B15).
 mod built {
-    include!(concat!(env!("OUT_DIR"), "/ui_brotli.rs"));
+    include!(concat!(env!("OUT_DIR"), "/ui_packed.rs"));
 }
+
+/// A table of the build's packed copies, as [`built::PACKED`] is.
+type Table = &'static [(&'static str, [u8; 32], &'static [u8])];
+
+/// The build's tables a response is packed from: brotli's, then gzip's.
+const BUILT: (Table, Table) = (built::PACKED, built::PACKED_GZ);
 
 /// `name`'s copy in `table` (one like [`built::PACKED`]), if it was packed from the very file whose SHA-256 is
 /// `sha`: a debug build reads its files from disk, which may have changed since it was built.
-fn built_in(table: &'static [(&'static str, [u8; 32], &'static [u8])], name: &str, sha: &[u8; 32]) -> Option<Bytes> {
+fn built_in(table: Table, name: &str, sha: &[u8; 32]) -> Option<Bytes> {
     let at = table.binary_search_by(|(n, _, _)| (*n).cmp(name)).ok()?;
     table.get(at).filter(|(_, s, _)| s == sha).map(|(_, _, b)| Bytes::from_static(b))
-}
-
-/// `name`'s copy that this build packed, if it was packed from this very file.
-fn built(name: &str, sha: &[u8; 32]) -> Option<Bytes> {
-    built_in(built::PACKED, name, sha)
 }
 
 const PLACEHOLDER: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>kiln</title>
@@ -97,17 +97,21 @@ pub fn keep_assets(data_dir: &Path) {
             tracing::warn!(error = %e, file, "can't keep a UI asset");
             continue;
         }
-        // With the brotli copy this build packed of it, so an earlier build's goes packed too (goal 8,
-        // plan 01a1a832ebfd step 3): on disk, nothing on the heap.
-        let br = dir.join(format!("{file}.br"));
-        if !br.exists()
-            && let Some(b) = built(&name, &f.metadata.sha256_hash())
-            && let Err(e) = std::fs::write(&br, &b)
-        {
-            tracing::warn!(error = %e, file, "can't keep a UI asset's brotli copy");
+        // With the brotli and gzip copies this build packed of it, so an earlier build's goes packed too, to a
+        // client that takes gzip alone as to a browser (goal 8, plan 01a1a832ebfd step 3; goal 11's audit, row
+        // B15): on disk, nothing on the heap.
+        let sha = f.metadata.sha256_hash();
+        let copies = [(dir.join(format!("{file}.br")), BUILT.0), (dir.join(format!("{file}.gz")), BUILT.1)];
+        for (copy, table) in &copies {
+            if !copy.exists()
+                && let Some(b) = built_in(table, &name, &sha)
+                && let Err(e) = std::fs::write(copy, &b)
+            {
+                tracing::warn!(error = %e, file, copy = %copy.display(), "can't keep a UI asset's packed copy");
+            }
         }
         // Its age counts from the last build that had it.
-        for p in [&path, &br] {
+        for p in std::iter::once(&path).chain(copies.iter().map(|(c, _)| c)) {
             let _ = std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(now));
         }
     }
@@ -291,19 +295,16 @@ fn kept_in(dir: &Path, path: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(asset_file(path)?)).ok()
 }
 
-/// The brotli copy of an earlier build's asset its build packed, when one is kept (`keep_assets`).
-fn kept_br(dir: &Path, path: &str) -> Option<Bytes> {
-    std::fs::read(dir.join(format!("{}.br", asset_file(path)?))).ok().map(Bytes::from)
+/// The copy of an earlier build's asset its build packed with `coding` (`br` or `gzip`), when one is kept
+/// (`keep_assets`).
+fn kept_packed(dir: &Path, path: &str, coding: &str) -> Option<Bytes> {
+    let suffix = if coding == "br" { "br" } else { "gz" };
+    std::fs::read(dir.join(format!("{}.{suffix}", asset_file(path)?))).ok().map(Bytes::from)
 }
 
-/// The files gzipped so far, by name: read on every request for one, written once a file (goal 5 of the API
-/// runtime program, plan 01a1a59c2aae: a copy swapped in whole, `crate::rcu`).
-fn gz_cache() -> &'static Rcu<HashMap<String, Bytes>> {
-    static C: OnceLock<Rcu<HashMap<String, Bytes>>> = OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
-/// The files brotli-compressed so far, as [`gz_cache`].
+/// A debug build's files brotli-compressed so far (those changed since it was built, which its tables can't hold),
+/// by name: read on every request for one, written once a file (goal 5 of the API runtime program, plan
+/// 01a1a59c2aae: a copy swapped in whole, `crate::rcu`).
 fn br_cache() -> &'static Rcu<HashMap<String, Bytes>> {
     static C: OnceLock<Rcu<HashMap<String, Bytes>>> = OnceLock::new();
     C.get_or_init(Default::default)
@@ -350,37 +351,28 @@ fn smaller(name: &str, data: &[u8], mut out: Vec<u8>, cache: &Rcu<HashMap<String
     Some(out)
 }
 
-/// `name` packed (brotli or gzip, by its cache), made already; else none now, and made that way on the
-/// compute pool for the next request (once at a time for a file and a coding): CPU work, which held a
-/// place of the blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4). Only the
-/// coding asked for is made: browsers take brotli, so a gzip copy is made only for a client that takes
-/// gzip alone (goal 11, plan 01a1a87b2e56 step 5). Only this build's files (`ours`) are packed and kept:
-/// an earlier build's goes as it is, so what's kept is bounded by the build (goal 11, step 3).
-fn packed(name: &str, data: &Bytes, cache: &'static Rcu<HashMap<String, Bytes>>, ours: bool) -> Option<(Bytes, &'static str)> {
-    let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
-    if let Some(b) = cache.load().get(name) {
-        return Some((b.clone(), coding));
+/// A debug build's file `name` that its build didn't pack (changed since), brotli-packed already; else none now, and
+/// packed on the compute pool for the next request (once at a time a file): CPU work, which held a place of the
+/// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4). Only this build's files (`ours`)
+/// are packed and kept: an earlier build's goes as it is, so what's kept is bounded by the build (goal 11, step 3).
+fn packed(name: &str, data: &Bytes, ours: bool) -> Option<Bytes> {
+    if let Some(b) = br_cache().load().get(name) {
+        return Some(b.clone());
     }
     if !ours {
         return None;
     }
-    static MAKING: OnceLock<Rcu<std::collections::HashSet<(&'static str, String)>>> = OnceLock::new();
+    static MAKING: OnceLock<Rcu<std::collections::HashSet<String>>> = OnceLock::new();
     let making = MAKING.get_or_init(Default::default);
-    if making.update(|m| m.insert((coding, name.to_owned()))) {
+    if making.update(|m| m.insert(name.to_owned())) {
         let (name, data) = (name.to_owned(), data.clone());
         drop(crate::rt::spawn(async move {
             let n = name.clone();
-            let _ = crate::rt::compute(move || make(&n, &data, coding)).await;
-            let key = (coding, name);
-            making.update(|m| m.remove(&key));
+            let _ = crate::rt::compute(move || brotli(&n, &data)).await;
+            making.update(|m| m.remove(&name));
         }));
     }
     None
-}
-
-/// `data`, `name`'s, packed as `coding` says (`br` or `gzip`), and kept so.
-fn make(name: &str, data: &[u8], coding: &str) -> Option<Bytes> {
-    if coding == "br" { brotli(name, data) } else { gzip(name, data) }
 }
 
 /// Whether an Accept-Encoding header takes `coding` (and doesn't refuse it with q=0).
@@ -391,43 +383,6 @@ fn accepts(header: Option<&str>, coding: &str) -> bool {
             it.next().is_some_and(|c| c.eq_ignore_ascii_case(coding)) && !it.any(|p| p.replace(' ', "").eq_ignore_ascii_case("q=0"))
         })
     })
-}
-
-/// Compresses every embedded file that's worth it with brotli, the coding browsers take, so no browser's
-/// request has to wait for it: on the compute pool, a file at a time (goal 3, plan 01a1a59c2a8e step 4: CPU
-/// work, which held one of the blocking pool's places for as long as every file took, written out with the
-/// assets' files). A gzip copy is made only for a client that takes gzip alone (`packed`): kept for every
-/// file as well, gzip took 3.8 MB of the 5.4 MB the UI's files held in the lab's realistic profile, whose
-/// pages (as a browser's: `br, gzip`) never asked for one (goal 11, plan 01a1a87b2e56 step 5). The bound of
-/// what the UI's files keep in memory (`crate::memory::UI_ASSETS`) is the brotli copies made here and, for
-/// each, its file's own size: a gzip copy is kept only when it's smaller than its file. A file the build packed
-/// (`built`) is served from the binary, so nothing is made here for it, and only a gzip copy counts.
-pub async fn warm() {
-    let names: Vec<String> = Assets::iter().map(|n| n.into_owned()).collect();
-    let made = crate::rt::compute_map(names, |name| {
-        let Some(f) = Assets::get(&name) else { return 0 };
-        if !crate::ui_pack::worth(&crate::ui_pack::mime_of(&name), f.data.len()) {
-            return 0;
-        }
-        if built(&name, &f.metadata.sha256_hash()).is_some() {
-            return f.data.len();
-        }
-        brotli(&name, &f.data).map_or(0, |b| b.len()).saturating_add(f.data.len())
-    })
-    .await;
-    match made {
-        Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().fold(0usize, |a, b| a.saturating_add(*b))),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for"),
-    }
-}
-
-fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
-    if let Some(b) = gz_cache().load().get(name) {
-        return Some(b.clone());
-    }
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    enc.write_all(data).ok()?;
-    smaller(name, data, enc.finish().ok()?, gz_cache())
 }
 
 /// A static file of the UI, if `req` asks for one: this build's, or an earlier build's asset (a page
@@ -449,12 +404,15 @@ pub fn static_file(req: &Request) -> Option<Response> {
         }
         None if path.starts_with("assets/") => match kept(path) {
             Some(b) => {
-                // Packed as its build packed it, when the request takes brotli.
+                // Packed as its build packed it, in the coding the request takes: brotli, else gzip.
                 let sha = crate::ui_pack::sha256(&b);
-                if accepts(srv::header_str(req, &header::ACCEPT_ENCODING), "br")
-                    && let Some(br) = KEPT.get().and_then(|d| kept_br(d, path))
-                {
-                    return Some(send(req, path, br, Some("br"), &sha));
+                let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
+                for coding in ["br", "gzip"] {
+                    if accepts(asked, coding)
+                        && let Some(packed) = KEPT.get().and_then(|d| kept_packed(d, path, coding))
+                    {
+                        return Some(send(req, path, packed, Some(coding), &sha));
+                    }
                 }
                 (Bytes::from(b), None)
             }
@@ -511,17 +469,21 @@ pub fn shell(req: &Request) -> Response {
 /// `data`, `name`'s, packed as the request takes it where it's worth it; `ours`: this build's file, by its
 /// SHA-256 (none for an earlier build's).
 fn respond(req: &Request, name: &str, data: Bytes, ours: Option<[u8; 32]>) -> Response {
+    respond_from(BUILT, req, name, data, ours)
+}
+
+/// [`respond`], packed from `tables` (brotli's and gzip's, the build's: [`BUILT`]). A file the build packed goes as it
+/// packed it, in the coding the request takes, from its first request on: a client that takes gzip alone got it as
+/// it is until a copy was made on request (goal 11's audit, row B15). Only a debug build's file changed since it was
+/// built, which no table holds, is brotli-packed here, on the compute pool, and goes as it is until then.
+fn respond_from(tables: (Table, Table), req: &Request, name: &str, data: Bytes, ours: Option<[u8; 32]>) -> Response {
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
     let worth = crate::ui_pack::worth(mime.as_ref(), data.len());
-    // Packed as the build packed it, else as made already: one not made yet goes as it is this once,
-    // and is packed on the blocking pool for the requests after it (a large file at brotli's best
-    // takes seconds, and this request's thread serves every socket on it, a restart's first pages
-    // most of all).
     let packed = if worth && accepts(asked, "br") {
-        ours.and_then(|sha| built(name, &sha)).map(|b| (b, "br")).or_else(|| packed(name, &data, br_cache(), ours.is_some()))
+        ours.and_then(|sha| built_in(tables.0, name, &sha)).or_else(|| packed(name, &data, ours.is_some())).map(|b| (b, "br"))
     } else if worth && accepts(asked, "gzip") {
-        packed(name, &data, gz_cache(), ours.is_some())
+        ours.and_then(|sha| built_in(tables.1, name, &sha)).map(|b| (b, "gzip"))
     } else {
         None
     };
@@ -618,16 +580,19 @@ mod tests {
         assert!(!none_match(None, &tag));
     }
 
-    /// Goal 8, plan 01a1a832ebfd step 3: an earlier build's asset goes packed as its build packed it, kept beside it.
+    /// Goal 8, plan 01a1a832ebfd step 3: an earlier build's asset goes packed as its build packed it, kept beside it,
+    /// each coding's copy for that coding (goal 11's audit, row B15: gzip's too).
     #[test]
     fn g8_s3_a_kept_asset_goes_as_its_build_packed_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("old-1.js"), b"old".repeat(1000))?;
         std::fs::write(dir.path().join("old-1.js.br"), b"OLDBR")?;
+        std::fs::write(dir.path().join("old-1.js.gz"), b"OLDGZ")?;
         assert_eq!(kept_in(dir.path(), "assets/old-1.js"), Some(b"old".repeat(1000)));
-        assert_eq!(kept_br(dir.path(), "assets/old-1.js").as_deref(), Some(&b"OLDBR"[..]));
-        assert!(kept_br(dir.path(), "assets/../old-1.js").is_none());
-        assert!(kept_br(dir.path(), "assets/new-2.js").is_none());
+        assert_eq!(kept_packed(dir.path(), "assets/old-1.js", "br").as_deref(), Some(&b"OLDBR"[..]));
+        assert_eq!(kept_packed(dir.path(), "assets/old-1.js", "gzip").as_deref(), Some(&b"OLDGZ"[..]));
+        assert!(kept_packed(dir.path(), "assets/../old-1.js", "br").is_none());
+        assert!(kept_packed(dir.path(), "assets/new-2.js", "gzip").is_none());
         Ok(())
     }
 
@@ -722,20 +687,18 @@ mod tests {
     #[test]
     fn g11_s3_only_this_builds_files_are_kept_packed() {
         let data = Bytes::from("an earlier build's script ".repeat(200));
-        assert!(packed("assets/earlier-g11test.js", &data, br_cache(), false).is_none());
-        assert!(packed("assets/earlier-g11test.js", &data, gz_cache(), false).is_none());
+        assert!(packed("assets/earlier-g11test.js", &data, false).is_none());
         assert!(!br_cache().load().contains_key("assets/earlier-g11test.js"));
-        assert!(!gz_cache().load().contains_key("assets/earlier-g11test.js"));
         let before = crate::memory::UI_ASSETS.bytes();
-        let made = gzip("assets/ours-g11test.js", data.as_ref()).map_or(0, |b| b.len());
+        let made = brotli("assets/ours-g11test.js", data.as_ref()).map_or(0, |b| b.len());
         assert!(made > 0);
         assert!(crate::memory::UI_ASSETS.bytes() >= before + made);
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 5: a copy is kept only when it's smaller than its file, and only in the
-    /// coding asked for: a brotli copy (what browsers take) doesn't bring a gzip one with it.
+    /// Goal 11, plan 01a1a87b2e56 step 5: a copy made here (a debug build's file changed since it was built) is kept
+    /// only when it's smaller than its file.
     #[test]
-    fn g11_s5_a_copy_is_kept_only_smaller_and_only_as_asked() {
+    fn g11_s5_a_copy_is_kept_only_smaller() {
         // Bytes no compressor shortens (a xorshift stream): nothing kept, the file goes as it is.
         let mut x = 0x9e37_79b9_7f4a_7c15_u64;
         let noise: Vec<u8> = (0..4096)
@@ -746,16 +709,12 @@ mod tests {
                 u8::try_from(x & 0xff).unwrap_or(0)
             })
             .collect();
-        assert!(gzip("assets/noise-g11s5.bin", &noise).is_none());
-        assert!(!gz_cache().load().contains_key("assets/noise-g11s5.bin"));
+        assert!(brotli("assets/noise-g11s5.bin", &noise).is_none());
+        assert!(!br_cache().load().contains_key("assets/noise-g11s5.bin"));
         let text = "kiln's ui, a line again and again\n".repeat(400);
-        let br = make("assets/asked-g11s5.js", text.as_bytes(), "br").unwrap_or_default();
+        let br = brotli("assets/asked-g11s5.js", text.as_bytes()).unwrap_or_default();
         assert!(!br.is_empty() && br.len() < text.len());
         assert!(br_cache().load().contains_key("assets/asked-g11s5.js"));
-        assert!(!gz_cache().load().contains_key("assets/asked-g11s5.js"), "a gzip copy only when one is asked for");
-        let gz = make("assets/asked-g11s5.js", text.as_bytes(), "gzip").unwrap_or_default();
-        assert!(!gz.is_empty() && gz.len() < text.len());
-        assert!(gz_cache().load().contains_key("assets/asked-g11s5.js"));
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: a copy the build packed goes out only for the very file it was packed
@@ -776,5 +735,81 @@ mod tests {
             assert_eq!(back.as_slice(), f.data.as_ref(), "{name}");
             assert!(packed.len() < f.data.len(), "{name}: kept only when smaller");
         }
+        for (name, sha, packed) in built::PACKED_GZ {
+            let Some(f) = Assets::get(name).filter(|f| &f.metadata.sha256_hash() == sha) else { continue };
+            assert_eq!(gunzip(packed).as_deref(), Some(f.data.as_ref()), "{name}");
+            assert!(packed.len() < f.data.len(), "{name}: kept only when smaller");
+        }
+    }
+
+    /// `data` inflated from gzip, if it's whole.
+    fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(data).read_to_end(&mut back).ok()?;
+        Some(back)
+    }
+
+    /// A GET of `path` that takes `encodings` (none: no Accept-Encoding).
+    fn get(path: &str, encodings: Option<&str>) -> anyhow::Result<Request> {
+        let mut b = http::Request::builder().method(http::Method::GET).uri(path);
+        if let Some(e) = encodings {
+            b = b.header(header::ACCEPT_ENCODING, e);
+        }
+        Ok(b.body(srv::Incoming::empty())?)
+    }
+
+    /// A response's coding and its body's bytes.
+    fn coding_and_body(r: Response) -> anyhow::Result<(Option<String>, Bytes)> {
+        use http_body_util::BodyExt as _;
+        let coding = r.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let body = crate::rt::block_on(async move { Ok(r.into_body().collect().await?.to_bytes()) })?;
+        Ok((coding, body))
+    }
+
+    /// Goal 11's audit, row B15 (bp-g8, plan 01a1a832ebfd step 3: compressible UI responses sent uncompressed after a
+    /// restart = 0): a client that takes gzip alone (every browser over plain http://, which sends no `br`) gets the
+    /// build's gzip copy from its very first request, as a browser gets the brotli one. Before, the first gzip-only
+    /// request of each file went as it is, while a copy was made on the compute pool for the requests after it
+    /// (`gz_cache`), and so again after every restart. Here nothing came before the request: no copy made, none kept.
+    #[test]
+    fn g11_b15_a_gzip_only_client_gets_no_compressible_file_uncompressed_from_its_first_request() -> anyhow::Result<()> {
+        let name = "assets/first-g11b15.js";
+        let data: Vec<u8> = (0..4000).flat_map(|i| format!("export const kiln{i} = \"{i}\";\n").into_bytes()).collect();
+        let sha = crate::ui_pack::sha256(&data);
+        let br: &'static [u8] = Box::leak(crate::ui_pack::brotli(&data).unwrap_or_default().into_boxed_slice());
+        let gz: &'static [u8] = Box::leak(crate::ui_pack::gzip(&data).unwrap_or_default().into_boxed_slice());
+        let tables: (Table, Table) = (Box::leak(vec![(name, sha, br)].into_boxed_slice()), Box::leak(vec![(name, sha, gz)].into_boxed_slice()));
+        for asked in ["gzip", "gzip, deflate", "deflate, gzip;q=0.8", "br;q=0, gzip"] {
+            let (coding, body) = coding_and_body(respond_from(tables, &get(&format!("/{name}"), Some(asked))?, name, Bytes::from(data.clone()), Some(sha)))?;
+            assert_eq!(coding.as_deref(), Some("gzip"), "{asked}: the first request is packed");
+            assert_eq!(gunzip(&body).as_deref(), Some(data.as_slice()), "{asked}: it inflates to the file");
+        }
+        // A browser's (`br, gzip`) gets the brotli copy; a client that takes neither, the file as it is.
+        let (coding, body) = coding_and_body(respond_from(tables, &get(&format!("/{name}"), Some("gzip, deflate, br"))?, name, Bytes::from(data.clone()), Some(sha)))?;
+        assert_eq!((coding.as_deref(), body.as_ref()), (Some("br"), br));
+        let (coding, body) = coding_and_body(respond_from(tables, &get(&format!("/{name}"), None)?, name, Bytes::from(data.clone()), Some(sha)))?;
+        assert_eq!((coding, body.as_ref()), (None, data.as_slice()));
+        // Nothing was made or kept to answer them: the server packs no copy on a request.
+        assert!(!br_cache().load().contains_key(name));
+        // And the same of this build's own files, each that's worth packing (with the UI built in).
+        for name in Assets::iter() {
+            let Some(f) = Assets::get(&name) else { continue };
+            let sha = f.metadata.sha256_hash();
+            if !crate::ui_pack::worth(&crate::ui_pack::mime_of(&name), f.data.len()) {
+                continue;
+            }
+            if built_in(BUILT.1, &name, &sha).is_none() {
+                // No gzip copy: a debug build's file changed since it was built (no table holds it), or one gzip
+                // doesn't shorten (which goes as it is).
+                let changed = built_in(BUILT.0, &name, &sha).is_none();
+                assert!(changed || crate::ui_pack::gzip(&f.data).is_none_or(|g| g.len() >= f.data.len()), "{name}: worth packing, and no gzip copy");
+                continue;
+            }
+            let (coding, body) = coding_and_body(respond(&get(&format!("/{name}"), Some("gzip"))?, &name, embedded(f.data.clone()), Some(sha)))?;
+            assert_eq!(coding.as_deref(), Some("gzip"), "{name}");
+            assert_eq!(gunzip(&body).as_deref(), Some(f.data.as_ref()), "{name}");
+        }
+        Ok(())
     }
 }
