@@ -720,7 +720,7 @@ async fn wake_every(me: &Shard, i: usize, period: Duration, runs: u64, reads: &R
         me.note(sample, now, counters.as_ref(), cpu, reads.due(nanos(now.saturating_duration_since(base())), span_ns));
         // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4): a
         // run with no sample, none late (the shard was parked as the probe fell due: no queue).
-        crate::overload::tick(i, sample.map_or(Duration::ZERO, |(late, _)| late), cpu, counters.as_ref());
+        crate::overload::tick(i, sample.map_or(Duration::ZERO, |(late, _)| late), counters.as_ref());
         // Whether its host holds its wakes, and so whether it nudges its CPU (goal 8, plan 01a1a59c2b29 step 7).
         crate::nudge::tick(i, now, counters.as_ref());
     }

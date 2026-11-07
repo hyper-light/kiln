@@ -101,17 +101,29 @@ const BACKGROUND: (&str, &str, &str) = ("PUT", "/api/sync/blobs/abc", "authoriza
 const NORMAL: (&str, &str, &str) = ("GET", "/api/runs", "authorization: Bearer kiln_pat_test\r\n");
 const CRITICAL: (&str, &str, &str) = ("GET", "/healthz", "");
 
+/// The status `request` is answered with. It carries no body: shed, a request's body stays unread in the server's socket
+/// as it closes, and the reset that sends can reach a client a loaded host keeps from reading before the answer itself.
 fn status_of(addr: SocketAddr, (method, path, headers): (&str, &str, &str)) -> anyhow::Result<u16> {
-    let body: &[u8] = if method == "PUT" { b"x" } else { b"" };
-    Ok(ask(addr, method, path, headers, body.len(), body)?.0)
+    Ok(ask(addr, method, path, headers, 0, b"")?.0)
 }
 
-/// Busy tasks of `class` on every shard, each working a step quantum at a time and yielding between, until `stop`.
-fn load(class: Class, per_shard: usize, stop: &Arc<AtomicBool>) -> anyhow::Result<()> {
+/// Ends a [`load`]'s tasks as it drops: the test's end, or its failure, so the next test starts from calm.
+struct Load(Arc<AtomicBool>);
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Busy tasks of `class` on every shard, each working a step quantum at a time and yielding between, until the
+/// [`Load`] they come with drops.
+fn load(class: Class, per_shard: usize) -> anyhow::Result<Load> {
     let quantum = Duration::from_nanos(kiln::rt::runtime_config(1, 1).step_budget_ns);
+    let load = Load(Arc::new(AtomicBool::new(false)));
     for holder in kiln::rt::shard_holders() {
         for _ in 0..per_shard {
-            let stop = Arc::clone(stop);
+            let stop = Arc::clone(&load.0);
             // In its class from its first poll, as the server's connections start in theirs.
             hyper_rt::runtime::submit_movable_as(holder, class, async move {
                 while !stop.load(Ordering::Acquire) {
@@ -125,7 +137,7 @@ fn load(class: Class, per_shard: usize, stop: &Arc<AtomicBool>) -> anyhow::Resul
             .map_err(|e| anyhow::anyhow!("a shard refused the load: {e}"))?;
         }
     }
-    Ok(())
+    Ok(load)
 }
 
 /// Waits until `done` holds, for at most 30 s, asking every 20 ms.
@@ -164,6 +176,13 @@ fn server() -> anyhow::Result<(SocketAddr, Arc<Probe>)> {
         Ok((addr, probe))
     });
     started.clone().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Whether every shard sheds `class` by its own queue, as /metrics says: each shard's queue stands on its own, so a
+/// request spread to another shard than the one that shed the last may still be served.
+fn every_shard_sheds(class: Class) -> bool {
+    let metrics = kiln::metrics::render();
+    (0..kiln::rt::shard_holders().len()).all(|shard| metrics.contains(&format!("kiln_shard_shedding{{shard=\"{shard}\",class=\"{}\"}} 1", class.as_str())))
 }
 
 /// Requests shed so far by class, less `before`.
@@ -221,15 +240,15 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     let calm_until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < calm_until {
         for request in [BACKGROUND, NORMAL, CRITICAL] {
-            anyhow::ensure!(status_of(addr, request)? == 200, "calm: {request:?} served");
+            let status = status_of(addr, request)?;
+            anyhow::ensure!(status == 200, "calm: {request:?} served, not {status}: {:?}: {}", kiln::overload::readiness(), shedding());
         }
     }
     anyhow::ensure!(shed_since(before) == [0, 0, 0], "nothing shed while calm");
 
     // Background work floods every shard: Background requests are shed, Normal and Critical served.
-    let background_load = Arc::new(AtomicBool::new(false));
-    load(Class::Background, 200, &background_load)?;
-    until("Background requests shed", || Ok(status_of(addr, BACKGROUND)? == 503))?;
+    let background_load = load(Class::Background, 200)?;
+    until("every shard to shed Background requests", || Ok(every_shard_sheds(Class::Background))).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()))?;
     let reached = probe.reached.load(Ordering::Relaxed);
     // A shed request's body is never read: one announced at a megabyte and never sent is answered at once.
     let (status, headers, took) = ask(addr, BACKGROUND.0, BACKGROUND.1, BACKGROUND.2, 1 << 20, b"")?;
@@ -242,8 +261,7 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     anyhow::ensure!(status_of(addr, CRITICAL)? == 200, "Critical served");
 
     // Normal work floods them too: every shard sheds Normal requests as well; Critical ones are served, and promptly.
-    let normal_load = Arc::new(AtomicBool::new(false));
-    load(Class::Normal, 200, &normal_load)?;
+    let normal_load = load(Class::Normal, 200)?;
     until("every shard to shed Normal requests", || Ok(kiln::overload::readiness().is_some_and(|(every, _)| every))).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()))?;
     anyhow::ensure!(status_of(addr, NORMAL)? == 503, "Normal requests shed");
     let mut critical = Vec::new();
@@ -266,8 +284,8 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     anyhow::ensure!(metrics.contains("kiln_shed_total{class=\"background\"}") && metrics.contains("kiln_shard_shedding{shard=\"0\",class=\"normal\"}"), "sheds on /metrics");
 
     // The load goes: everything is served again.
-    normal_load.store(true, Ordering::Release);
-    background_load.store(true, Ordering::Release);
+    drop(normal_load);
+    drop(background_load);
     until("everything served again", || Ok(status_of(addr, BACKGROUND)? == 200 && status_of(addr, NORMAL)? == 200))?;
     anyhow::ensure!(status_of(addr, CRITICAL)? == 200);
     Ok(())
@@ -320,7 +338,8 @@ fn g6_s4_work_waiting_in_a_pool_sheds_background_then_normal_and_never_critical(
     let calm_until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < calm_until {
         for request in [BACKGROUND, NORMAL, CRITICAL] {
-            anyhow::ensure!(status_of(addr, request)? == 200, "calm: {request:?} served");
+            let status = status_of(addr, request)?;
+            anyhow::ensure!(status == 200, "calm: {request:?} served, not {status}: {:?}: {}", kiln::overload::readiness(), shedding());
         }
     }
 
@@ -328,7 +347,7 @@ fn g6_s4_work_waiting_in_a_pool_sheds_background_then_normal_and_never_critical(
     let drains = Drains(Arc::clone(&wait));
     let feeder = backlog(Arc::clone(&wait));
     let shed_background = until("Background requests shed for the store's backlog", || Ok(status_of(addr, BACKGROUND)? == 503)).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()));
-    let (status, headers, _) = ask(addr, BACKGROUND.0, BACKGROUND.1, BACKGROUND.2, 1, b"x")?;
+    let (status, headers, _) = ask(addr, BACKGROUND.0, BACKGROUND.1, BACKGROUND.2, 0, b"")?;
     let normal_served = status_of(addr, NORMAL)?;
     let critical_served = status_of(addr, CRITICAL)?;
     let metrics = kiln::metrics::render();
