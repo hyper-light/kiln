@@ -5575,6 +5575,51 @@ pub(crate) mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): an idle server's loops arm no timer beyond their
+    /// pending deadlines. Do: a scratch hub with nothing queued, running, away or due; its scheduler, plans' driver,
+    /// screens' watch and monitors started (each counted by its polls: a timer of another test in its file can't count
+    /// against it), and its land queue and conflict ladder (counted by their files' timer wakes: a kick from a test beside
+    /// them is a word, not a clock); five seconds. Expect: no poll and no timer wake, but the scheduler's one deadline,
+    /// the server's own grace, which is the runners' redial bound away. Each of these woke on its own clock before: every
+    /// second, two seconds, three.
+    #[test]
+    fn g9_s5_an_idle_servers_loops_arm_no_clock() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let monitors = crate::observe::monitors::Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+            let loops = [("scheduler", Arc::new(AtomicU64::new(0))), ("plans", Arc::new(AtomicU64::new(0))), ("screens", Arc::new(AtomicU64::new(0))), ("monitors", Arc::new(AtomicU64::new(0)))];
+            let [(_, sched), (_, plans), (_, screens), (_, mons)] = &loops;
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(sched), Arc::clone(&hub).scheduler_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(plans), crate::plans::agents::drive(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(screens), crate::harness::screen::watch(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(mons), Arc::clone(&monitors).run(hub.shutdown.clone()))));
+            drop(crate::rt::spawn(crate::ci::land::run_loop(Arc::clone(&hub))));
+            drop(crate::rt::spawn(crate::ci::ladder::run_loop(Arc::clone(&hub))));
+            for (_, polls) in &loops {
+                crate::rt::settled(polls, until).await?;
+            }
+            let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+            let files = ["ci/land.rs", "ci/ladder.rs"];
+            let before: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            let woke = crate::rt::timer_wakes_over("ci/land.rs", Duration::from_secs(5)).await;
+            anyhow::ensure!(hub.started.checked_add(hub.comeback.grace()).is_none_or(|t| t > Instant::now()), "the server's grace fell in the quiet");
+            let after: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            for ((name, polls), was) in loops.iter().zip(&seen) {
+                let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                anyhow::ensure!(polled == 0, "{name}: {polled} polls in 5 s, idle");
+            }
+            for ((file, b), a) in files.iter().zip(&before).zip(&after) {
+                anyhow::ensure!(a == b, "{file}: {} timer wakes in 5 s, idle", a.saturating_sub(*b));
+            }
+            anyhow::ensure!(woke == 0, "ci/land.rs: {woke} timer wakes in 5 s, idle");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: the scheduler's deadlines are its pending items' due times, each only once
     /// after what last took it, and nothing else (it swept every five seconds and looked every second). Do: a scratch
     /// hub; its deadlines read fresh, after a check, with a runner away holding a job, back, with a pairing declined
