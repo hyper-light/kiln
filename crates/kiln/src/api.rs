@@ -2790,6 +2790,7 @@ struct Login {
     token: String,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -2861,6 +2862,7 @@ struct PasswordLogin {
     name: Option<String>,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_password(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: PasswordLogin =
@@ -2907,6 +2909,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
 
 /// `POST /api/auth/passkey`: a passkey's answer to its challenge; the session of whoever it's
 /// theirs (docs/ci.md W10).
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_passkey(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3958,6 +3961,7 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
 /// `POST /api/agents/:name/probe` (docs/ci.md W13-R01, on request): the runner probes its facts
 /// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
 /// 202 without one.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
     let Some(before) = hub.agents.load().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
         return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
@@ -4035,6 +4039,7 @@ fn outpost_invite(hub: &Hub) -> Response {
     )
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
@@ -4122,6 +4127,7 @@ fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
 /// certificate and a CSR signed with that certificate's key ([`crate::pki::Pki::sign_instance`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll_instance(hub: &Hub, req: Request) -> R {
     let r: crate::agent::InstanceRequest =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -4169,6 +4175,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// machine says it is, and while a process of it is connected (what it holds would move from under
 /// it). An id known already, not connected, is the same machine's second record: the two merge,
 /// and every other record of the machine not connected folds in with them ([`Hub::fold_duplicates`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused rekey's picked delay (slows guessing)
 async fn rekey_agent(hub: &Hub, req: Request) -> R {
     let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
@@ -4520,6 +4527,7 @@ async fn create_join(hub: &Hub, req: Request) -> R {
 
 /// `GET /api/join-requests/:id`: the machine polls with its secret (`Authorization: Bearer`); an
 /// admin sees the request as listed.
+#[allow(clippy::disallowed_methods)] // (e) polls a join's answer; the join's decision could tell
 async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     let now = Instant::now();
     if authed(hub, headers) {
@@ -7244,6 +7252,7 @@ static VIEWER_COMMAND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "vi
 /// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
 /// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
 /// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
+#[allow(clippy::disallowed_methods)] // (e) a viewer with no feed snapshots every FEEDLESS; its session's changes could tell. A catch-up's pacing is measured
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, who: String) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;

@@ -717,6 +717,7 @@ async fn send_email(hub: &Hub, i: &Integration, target: Option<&str>, password: 
 
 /// Delivers through `spec`, retrying (now, after 2 s, after 15 s), and records how it went (with
 /// what it's about: a run's id, or `agent:<id>`). The inbox takes it at once.
+#[allow(clippy::disallowed_methods)] // (b) a delivery retried on its schedule
 async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about: &str, m: &Msg, spec: &str) {
     let mut attempts = 0;
     let inbox = spec == "inbox" || spec.starts_with("inbox:");

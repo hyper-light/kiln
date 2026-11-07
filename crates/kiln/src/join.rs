@@ -645,6 +645,7 @@ fn error_text(body: &[u8]) -> String {
         .unwrap_or_else(|| crate::util::truncate(&String::from_utf8_lossy(body), 300).to_owned())
 }
 
+#[allow(clippy::disallowed_methods)] // (b) join request retry, picked
 async fn submit(http: &Client, server: &str, me: &Machine, csr: &str, secret: &str, say: &(dyn Fn(&str) + Send + Sync), shutdown: &Shutdown) -> anyhow::Result<Created> {
     let body = NewRequest {
         name: me.name.clone(),
@@ -770,6 +771,7 @@ fn store(state_dir: &Path, server: &str, key_pem: &str, a: &Approval, quic: &str
 
 /// Ask `server` to let this machine join, show the verification code (through `say`), wait for the
 /// admin's decision and store the credentials in `state_dir`, like enrollment does.
+#[allow(clippy::disallowed_methods)] // (c) polls the server for the join's answer; a push from the server would tell
 pub async fn request(server: &str, me: &Machine, state_dir: &Path, say: &(dyn Fn(&str) + Send + Sync), shutdown: &Shutdown) -> anyhow::Result<Joined> {
     let server = server.trim().trim_end_matches('/').to_owned();
     anyhow::ensure!(server.starts_with("http://") || server.starts_with("https://"), "the server URL must start with http:// or https://");
@@ -958,6 +960,7 @@ pub async fn find_servers(wait: Duration, interfaces: &[String]) -> anyhow::Resu
 
 /// The joinable servers a running discovery table heard: waits until one shows up (and a moment
 /// longer, to hear the others), at most `max`.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn servers_in(table: &crate::discovery::Table, max: Duration) -> Vec<Instance> {
     let start = Instant::now();
     loop {

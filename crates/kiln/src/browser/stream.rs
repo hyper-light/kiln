@@ -335,6 +335,7 @@ impl Surface {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
     async fn settle(&self) {
         match self {
             Self::Tab(t) => {
@@ -395,6 +396,7 @@ impl Streams {
     /// A conversation's browser, started ahead of its first stream (a person is choosing what to
     /// open: `super::apps`'s look), so what they open opens at once. One nothing opens in stops
     /// a while later, as one whose streams closed does.
+    #[allow(clippy::disallowed_methods)] // (e) a warm browser kept IDLE_BROWSER, then closed: a deadline
     pub fn warm(&'static self, dir: &Path, session: &str) {
         let (dir, profile) = (dir.to_path_buf(), format!("conversation:{session}"));
         crate::rt::spawn(async move {
@@ -413,6 +415,7 @@ impl Streams {
     }
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `outs`.
+    #[allow(clippy::disallowed_methods)] // (c) polls a browser's page; CDP events would tell
     pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, outs: Outs) -> anyhow::Result<Value> {
         let out = outs.events.clone();
         let engine = super::driven::Engine::parse(spec.engine.as_deref().unwrap_or(""))?;
@@ -576,6 +579,7 @@ impl Streams {
 
     /// Close a stream: its capture stops, its tab goes. A browser left with no streams stops a
     /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
+    #[allow(clippy::disallowed_methods)] // (e) a browser kept IDLE_BROWSER after its last viewer: a deadline
     pub async fn close(&self, id: &str) {
         let Some(s) = self.open.lock().remove(id) else { return };
         // A recording of it is finished first (and its viewers told where it is).
@@ -769,6 +773,7 @@ fn yes() -> bool {
     true
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     let s = streams().get(&a.stream).filter(|s| s.session == a.session).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
     anyhow::ensure!(!s.personal, "that page is open in its person's own profile (their sign-ins): it's theirs to use, not yours. Show it yourself with show_live to use it");
@@ -827,6 +832,7 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
 }
 
 /// One of the agent's actions in stream `s`: what it did, to say (none for a wait).
+#[allow(clippy::disallowed_methods)] // (e) a step's own wait, as the program asked; a picked settle
 async fn act_one(s: &Stream, verb: &str, arg: &Value) -> anyhow::Result<Option<Value>> {
     let point = |v: &Value| -> Option<(f64, f64)> {
         let p = v.as_array()?;
@@ -1012,6 +1018,7 @@ async fn said(s: Arc<Stream>, out: async_channel::Sender<Out>) {
 /// Another engine's page's picture, taken as it changes and handed to its encoder (`kiln.push`):
 /// often while it changes or was just used, seldom while it's still (a picture that hasn't changed
 /// goes nowhere), not at all while nobody looks and nothing records.
+#[allow(clippy::disallowed_methods)] // (e) frames paced by a measured gap; a picked retry
 async fn pump(s: std::sync::Weak<Stream>) {
     use base64::Engine as _;
     let mut last: Vec<u8> = Vec::new();
@@ -1361,6 +1368,7 @@ impl Stream {
     /// A tab of its own from now on: one its page opened (`opener`; shown when Chrome shows it, as
     /// a link to a new tab is, not one opened in the background), or one its viewer asked for
     /// (`show`).
+    #[allow(clippy::disallowed_methods)] // (c) polls a browser's page; CDP events would tell
     async fn adopt(self: &Arc<Self>, target: String, opener: Option<String>, show: bool) -> anyhow::Result<()> {
         let Surface::Tab(tabs) = &self.page else { return Ok(()) };
         if tabs.has(&target) {
@@ -1531,6 +1539,7 @@ impl Stream {
 
     /// Do again what a recording's log (`path`) did, as it was done: its page, its window, then
     /// each input and action after its pause (`super::record::replay_steps`).
+    #[allow(clippy::disallowed_methods)] // (e) a replay's recorded pauses
     async fn replay(&self, path: &str) -> anyhow::Result<usize> {
         let p = PathBuf::from(path);
         let log = crate::rt::blocking(move || super::record::read_log(&p)).await??;

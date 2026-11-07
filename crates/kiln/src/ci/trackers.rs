@@ -120,6 +120,7 @@ async fn act(client: &Client, config: &Value, target: Option<&str>, n: &Note<'_>
 
 /// `f` until it succeeds, three times at most (now, after 2 s, after 15 s). Each is one change,
 /// so a retry doesn't repeat what already went through: not a comment on an issue before it.
+#[allow(clippy::disallowed_methods)] // (b) a tracker call retried on its schedule
 async fn again<T, F, Fut>(mut f: F) -> Result<T, String>
 where
     F: FnMut() -> Fut,

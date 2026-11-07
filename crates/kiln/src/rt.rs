@@ -1725,6 +1725,7 @@ where
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
 /// for a full share, and asks again with the job handed back; with no pool running it runs the job by
 /// `alone` on a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the compute pool full: asked again on a doubling backoff from 1 ms
 async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(1);
     loop {
@@ -1912,6 +1913,7 @@ thread_local! {
 
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the blocking pool's share full: asked again on a doubling backoff from 1 ms
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -2444,6 +2446,21 @@ impl Shutdown {
         self.0.waits.until(|| self.is_cancelled()).await;
     }
 
+    /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
+    /// 01a1a87b2cec step 5). Its sleep is counted against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep_until(&self, deadline: Instant) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(deadline, site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        }
+    }
+
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
     /// against the caller's place where it wakes a shard ([`Sleep`]).
     #[track_caller]
@@ -2840,6 +2857,7 @@ pub struct Signals {
 }
 
 impl Signals {
+    #[allow(clippy::disallowed_methods)] // (b) a signal stream's error retried after a picked 100 ms
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
         let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();

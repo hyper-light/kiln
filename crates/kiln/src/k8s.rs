@@ -205,6 +205,7 @@ impl K8s {
     /// no job isn't this loop's: a CI pool's executor (`ci::pools::reap_pods` keeps those), an image
     /// check. Taken for a finished job's, an executor's pod went within 15 s of starting, its leg
     /// lost with it.
+    #[allow(clippy::disallowed_methods)] // (c) Kubernetes: finished pods reaped every 15 s; its watch API would tell
     pub async fn reap_loop(self: Arc<Self>, hub: Arc<Hub>) -> anyhow::Result<()> {
         let mut pending_since: std::collections::HashMap<String, Instant> = Default::default();
         loop {

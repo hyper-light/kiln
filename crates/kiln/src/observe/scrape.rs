@@ -339,6 +339,7 @@ pub async fn scrape_once(http: &Client, t: &Target) -> anyhow::Result<(String, F
 }
 
 /// A target's task: a scrape at each of its times until it is changed, gone, or the process stops.
+#[allow(clippy::disallowed_methods)] // (a) each target scraped at its user-set interval
 async fn scrape_loop(http: Arc<Client>, name: String, host: String, t: Target, stop: crate::rt::Shutdown, server: crate::rt::Shutdown, state: Arc<Mutex<State>>) {
     let every = Duration::from_secs(t.every_s);
     if !stop.sleep(offset(&name, &t, every)).await || server.is_cancelled() {

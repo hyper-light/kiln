@@ -365,6 +365,7 @@ async fn load_into(blobs: &dyn kiln_seams::blobs::Blobs, kept: &Mutex<HashMap<St
 /// [`load`] (at once, when `now`; else a minute on), and again a while apart (a minute, doubling to
 /// a quarter of an hour), until the store answers for every binary: one unavailable when the server
 /// started isn't left out for good.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 pub async fn load_until_read(hub: Arc<Hub>, now: bool) {
     let mut wait = Duration::from_secs(60);
     if !now {
@@ -786,6 +787,7 @@ pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) ->
 /// for the other platforms aren't built from the commit this server runs, it runs the release
 /// pipeline on that commit, so every runner can be upgraded to exactly what the server runs. A
 /// commit not in the repository yet is tried again later.
+#[allow(clippy::disallowed_methods)] // (c) an upgrade's step followed every IN_STEP_EVERY; the runner's word could tell
 pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     if crate::api::COMMIT.is_empty() || !hub.cfg.updates.in_step {
@@ -1072,6 +1074,7 @@ fn check_pod(name: &str, image: &str, pull_policy: &str, node: Option<&str>, pri
 /// Start a short pod on the server's node with the server's image (as a restart would) and read
 /// the SHA-256 of the kiln binary in it. Uses the job namespace and the access kiln already has
 /// there (create pods, read their logs).
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn check_image(hub: &Hub, image: &str, node: Option<&str>) -> anyhow::Result<ImageCheck> {
     let k = &hub.cfg.kubernetes;
     anyhow::ensure!(!image.is_empty(), "no kiln image is configured (kubernetes.agent_image)");
@@ -1853,6 +1856,7 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
 /// `install --agent --upgrade`, reporting back (UpgradeLog / UpgradeDone). A runner that takes
 /// the binary in place restarts its own process (same pid, terminals handed over) and so may
 /// never send UpgradeDone: the new build reporting in is what completes the job.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     let u = &hub.updates;
     // That exact build: the server may hand out more than one for a platform.
@@ -2074,6 +2078,7 @@ fn strip(s: &str) -> String {
 }
 
 /// Through a terminal on the runner (it knows nothing of upgrades): download, check, install.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &str) {
     use crate::termsess::Frame;
     let u = &hub.updates;
@@ -2544,6 +2549,7 @@ pub fn prune_versions(state_dir: &Path, keep: &str) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
     use std::io::{Read as _, Seek as _};
     let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });

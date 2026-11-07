@@ -1,5 +1,8 @@
 //! kiln: a self-hosted GitOps CI/CD job server for the hyper-light stack.
 
+// Tests drive real time: they wait on it as they must (`clippy.toml`'s timers are for what ships).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod access;
 pub mod accounts;
 pub mod audit;

@@ -1501,6 +1501,7 @@ impl Host {
     /// [`Host::move_out`], each session signed for as it goes when `sign` (the new build takes
     /// sessions so, docs/ci.md W27-R08): its hand-on, at the epoch it has, of its timeline as it's
     /// handed over, if this process holds its key at that epoch.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
     pub async fn move_out_signing(&self, sign: bool) -> Vec<(Saved, Option<Box<session::Handed>>, Option<serde_json::Value>)> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         // They take no messages as they're handed over: sent again, those go where they went.

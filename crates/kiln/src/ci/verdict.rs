@@ -800,6 +800,7 @@ fn is_final(v: &Value) -> bool {
 /// (`ci.verdict.wait`, W28-R58): the commit's verdict once it is final (`until: final`, the
 /// default) or once it changes at all (`until: any`), or when `timeout_s` (600 at most) runs out:
 /// the verdict then, whether it is final, and whether the time ran out.
+#[allow(clippy::disallowed_methods)] // (e) a verdict's wait, bounded at 30 s a look; its writes could tell
 pub async fn wait(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String, String>) -> Result<Value, Fail> {
     use futures::FutureExt as _;
     let any = q.get("until").map(String::as_str) == Some("any");

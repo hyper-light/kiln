@@ -337,13 +337,8 @@ impl Rehydrations {
                 continue;
             }
             // Past already, by the clock on the wall: at once.
-            let end = self.first_end().map(|end| Duration::from_millis(u64::try_from(end.saturating_sub(now)).unwrap_or(0)));
-            let ends = async {
-                match end {
-                    Some(d) => crate::rt::sleep(d).await,
-                    None => std::future::pending().await,
-                }
-            };
+            let end = self.first_end().map(|end| std::time::Instant::now() + Duration::from_millis(u64::try_from(end.saturating_sub(now)).unwrap_or(0)));
+            let ends = crate::rt::due(end);
             futures::select_biased! {
                 () = shutdown.cancelled().fuse() => return,
                 () = self.changed.notified().fuse() => {}

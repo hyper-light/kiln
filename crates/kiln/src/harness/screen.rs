@@ -91,6 +91,7 @@ fn beside(t: Info, agent: &str, starts_on: bool) -> Option<Beside> {
 
 /// Opens a terminal beside `agent` (or, for its shell, returns the one already open, running
 /// `command` in it).
+#[allow(clippy::disallowed_methods)] // (e) waits a picked while for the shell's prompt; its first output could tell
 pub async fn open(hub: &Arc<Hub>, agent: &str, o: Open) -> anyhow::Result<Beside> {
     let info = hub.harness.list().into_iter().find(|i| i.id == agent).ok_or_else(|| anyhow::anyhow!("no such agent"))?;
     let kind = Kind::get(&info.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {}", info.kind))?;

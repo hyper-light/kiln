@@ -207,6 +207,7 @@ fn with_relay(v: &mut Value, binary: &Path, buildkitd: Option<&Path>) -> bool {
 /// BuildKit container `name`'s loopback relay ([`Loopback`]), once it runs (its maker starts it
 /// right after making it): the static kiln run in it, and the runner's connections waiting at its
 /// published port, each spliced on to the server when it hands one over, until the leg ends.
+#[allow(clippy::disallowed_methods)] // (c) polls Docker's socket for the relay
 async fn loopback_relay(name: String, l: Loopback, stop: crate::rt::Shutdown) {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};

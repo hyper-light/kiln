@@ -210,6 +210,7 @@ async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &st
 
 /// Where the session goes on on `to`, and what of its folder came along (in words). `away`: `from`
 /// is away, so nothing is copied from it.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away: bool) -> Result<(String, Option<String>), String> {
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     // The machines as what's said of them names them.

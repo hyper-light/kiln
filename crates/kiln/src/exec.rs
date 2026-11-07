@@ -436,6 +436,7 @@ impl Exec {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms and sampled every 2 s, picked
     async fn run_piped(
         &self,
         idx: u32,
@@ -524,6 +525,7 @@ impl Exec {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms and sampled every 2 s, picked
     async fn run_pty(
         &self,
         idx: u32,
@@ -646,6 +648,7 @@ impl Exec {
             .await;
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) upload retry, linear backoff, picked
     async fn upload_artifacts(&self, ws: &Path) -> anyhow::Result<usize> {
         let patterns = self.assign.spec.artifacts.clone();
         let root = ws.to_path_buf();
@@ -699,6 +702,7 @@ impl Exec {
     /// end (its size and digest): one that breaks off costs that piece, and the upload goes on
     /// from where the server's pieces end. `false`: the server doesn't take them so (an older one,
     /// which answers no `GET` for how much came).
+    #[allow(clippy::disallowed_methods)] // (b) upload retry, linear backoff, picked
     async fn upload_pieces(&self, url: &str, bytes: &bytes::Bytes) -> anyhow::Result<bool> {
         use sha2::Digest as _;
         let token = &self.assign.job_token;

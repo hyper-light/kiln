@@ -31,6 +31,7 @@ use crate::hub::Hub;
 const EVERY: Duration = Duration::from_secs(3600);
 
 /// The services' upkeep, while the CI engine runs.
+#[allow(clippy::disallowed_methods)] // (e) the CI store's upkeep every EVERY, picked
 pub fn spawn_maintenance(hub: Arc<Hub>) {
     crate::rt::spawn(async move {
         loop {

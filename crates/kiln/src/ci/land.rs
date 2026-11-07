@@ -93,6 +93,7 @@ const STEP_EVERY: Duration = Duration::from_secs(3);
 /// review: [`kick`], level-triggered, so none is lost), and while it has entries or diffs waiting to land every
 /// [`STEP_EVERY`]; with neither, no clock at all (goal 9, plan 01a1a87b2cec step 5: it looked every three seconds whether it had entries or not, about
 /// 0.3 timer wakes a second in the lab, train 34's census).
+#[allow(clippy::disallowed_methods)] // (c) its host's changes and merge queue send no word; GitHub's pull_request and merge_group webhooks would
 pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     loop {
@@ -105,9 +106,6 @@ pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         };
         let step = async {
             if entries {
-                // (c) its host's changes and merge queue have no word to kiln: GitHub's `pull_request` and
-                // `merge_group` webhooks would kick it; and its candidates' runs, a write kiln could watch.
-                #[allow(clippy::disallowed_methods)]
                 crate::rt::sleep(STEP_EVERY).await;
             } else {
                 std::future::pending::<()>().await;

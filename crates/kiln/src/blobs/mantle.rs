@@ -320,6 +320,7 @@ fn lose() -> bool {
 
 /// Asks `ask` until it's answered for good, or until `until` leaves no room for the next pause. A
 /// `mutation`'s first answer is lost where this test build says so ([`lose`]).
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn patiently(until: u64, mutation: bool, mut ask: impl AsyncFnMut() -> Result<Reply, ClientError>) -> Result<Reply, ClientError> {
     let mut pauses = Pauses::new();
     let mut losing = mutation && lose();
@@ -455,6 +456,7 @@ fn one_put<S: Restart>(size: u64) -> bool {
 /// node to check before anything commits. Its answer lost, the key says whether the cell applied it
 /// (`held`: its reply where it holds this write), so a write applied isn't sent again and leaves no
 /// second version; one it didn't is asked again ([`Pauses`]).
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn put_once<S: Restart>(client: &mut Client, scope: &Scope, key: &str, (source, size, sha): (&mut S, u64, &str), headers: Headers, until: u64, mut held: impl AsyncFnMut(&mut Client) -> Result<Option<Reply>, Refusal>) -> Result<Reply, Refusal> {
     let checksum = Checksum { algorithm: Algorithm::Sha256, bytes: hex::decode(sha).map_err(unavailable)? };
     let op = Op::Put { bucket: scope.bucket.clone(), key: key.to_owned(), id: identity()?, length: size, headers, checksum: Some(checksum), md5: None, trailing: None };
@@ -494,6 +496,7 @@ async fn holds(client: &mut Client, scope: &Scope, key: &str, (size, sha): (u64,
 /// applied is answered from the version it made. Where the upload is gone (finished, its answer
 /// lost, or let go) the key's bytes say which: `sha`'s are done, else a new upload begins. One the
 /// node refused (its condition, say) is aborted: it leaves nothing behind.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn upload<S: Restart>(client: &mut Client, scope: &Scope, key: &str, (source, size, sha): (&mut S, u64, &str), headers: Headers, until: u64) -> Result<Reply, Refusal> {
     let (mut id, mut opened) = (identity()?, Opened::default());
     let mut pauses = Pauses::new();

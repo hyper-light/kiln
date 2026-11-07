@@ -680,13 +680,8 @@ impl LogMetrics {
                 }
                 None => None,
             };
-            let ends = async {
-                match next {
-                    // Past already: at once.
-                    Some(at) => crate::rt::sleep(Duration::from_millis(u64::try_from(at.saturating_sub(super::clock_ms())).unwrap_or(0))).await,
-                    None => std::future::pending().await,
-                }
-            };
+            // Past already: at once.
+            let ends = crate::rt::due(next.map(|at| std::time::Instant::now() + Duration::from_millis(u64::try_from(at.saturating_sub(super::clock_ms())).unwrap_or(0))));
             due = futures::select_biased! {
                 () = shutdown.cancelled().fuse() => return,
                 () = self.woken.notified().fuse() => false,

@@ -327,6 +327,7 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
 /// Signs the trail's checkpoints as they come due, and anchors each in the Rekor kiln is
 /// configured with, until the server stops (docs/ci.md W27-R09); what can't be done is said once,
 /// until it's done or why changes.
+#[allow(clippy::disallowed_methods)] // (e) checkpoints looked at every LOOK_EVERY; the trail's writes could tell
 pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut said = String::new();
     while hub.shutdown.sleep(LOOK_EVERY).await {

@@ -116,6 +116,7 @@ impl Conn {
     }
 
     /// Waits for the target's budget.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
     pub async fn budget(&self) {
         let wait = {
             let mut next = self.next.lock();
@@ -322,6 +323,7 @@ impl Cd {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) target connect retry, doubling
     async fn connect_target(self: Arc<Self>, name: String) {
         let mut wait = Duration::from_secs(5);
         loop {
@@ -426,6 +428,7 @@ impl Cd {
         crate::rt::spawn(async move { this.poll_kind(cluster, kind).await });
     }
 
+    #[allow(clippy::disallowed_methods)] // (c) a target kind with no watch polled every 2 s; Kubernetes and Argo CD watch APIs would tell
     async fn poll_kind(self: Arc<Self>, cluster: String, kind: GroupKind) {
         let name: obj::Str = cluster.as_str().into();
         let mut seen: Option<HashMap<ResKey, u64>> = None;
@@ -708,6 +711,7 @@ pub fn applied(desired: &Value, made: Value) -> Applied {
 }
 
 /// Polls `f` until it says done (`Some`), for at most `limit`.
+#[allow(clippy::disallowed_methods)] // (c) a target settles by its settle_every, user-set
 pub async fn until<T, F, Fut>(conn: &Conn, limit: Duration, what: &str, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,

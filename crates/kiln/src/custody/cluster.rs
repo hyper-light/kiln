@@ -140,6 +140,7 @@ pub async fn copy_hand_on(hub: &Hub, machine: &str, instance: Option<&str>, path
 /// Until the server stops: every [`CHECK_EVERY`], each checkpoint of the log due to a learner that
 /// checks them ([`crate::store::learner::Periods`]), signed and sent; one that closes a period kept.
 /// None with learners off (`[cluster] learners = false`: every runner lets its replica go).
+#[allow(clippy::disallowed_methods)] // (e) checkpoints looked at every CHECK_EVERY; the log's writes could tell
 pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     if !hub.cfg.cluster.learners {
         return Ok(());

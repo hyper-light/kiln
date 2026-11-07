@@ -450,6 +450,7 @@ fn shutdown_on_signals(token: Shutdown) {
 /// Run an agent until shutdown. Persistent agents supervise their own main loop. One that
 /// handed its terminals to its supervisor to take up a new binary exits with
 /// [`kiln::supervise::HANDOVER_EXIT`], so the supervisor starts that binary at once.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
 async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if opts.ephemeral {
         let r = kiln::agent::run(opts, shutdown).await;

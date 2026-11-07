@@ -255,6 +255,7 @@ async fn credential_for(host: &Host, peer: Option<u32>, forward: Option<&Forward
 /// alone, its group of processes or a harness among its ancestors, never by what it says (the
 /// mark any process can set): one outside every session gets nothing. The key stays here; the
 /// signature and its certificate (DER) go back, base64.
+#[allow(clippy::disallowed_methods)] // (e) waits a picked while for a signature
 async fn sign_for(host: &Host, peer: Option<u32>, message: &str) -> Value {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;

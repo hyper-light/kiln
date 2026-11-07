@@ -117,6 +117,7 @@ impl Client {
     /// [`Self::websocket`], with `headers` on the handshake. An opening a kiln server shed did nothing (goal 6, plan
     /// 01a1a59c2abe step 4): it is opened again after the server's `Retry-After`, while that leaves time before the
     /// deadline (a runner's tunnel then opens once the server takes it, not on a path of its own choosing).
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     pub async fn websocket_with(&self, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
         let deadline = Instant::now().checked_add(DEFAULT_TIMEOUT);
         loop {
@@ -217,6 +218,7 @@ impl RequestBuilder<'_> {
         self
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     pub async fn send(self) -> anyhow::Result<Response> {
         let timeout = self.timeout;
         let deadline = Instant::now().checked_add(timeout);

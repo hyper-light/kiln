@@ -1634,6 +1634,7 @@ impl Hub {
     /// What the runner process holding what `msg` is about (`crate::instances`' routing) says it
     /// can do: 0 for nothing, or no such process. One that has just connected says it a moment
     /// after (its build, then its capabilities), so this waits up to three seconds for it.
+    #[allow(clippy::disallowed_methods)] // (e) waits a picked while for a runner's Caps
     pub async fn routed_caps(&self, machine: &str, msg: &ServerMsg) -> u32 {
         for _ in 0..30 {
             let to = self.route(machine, msg);
@@ -1874,6 +1875,7 @@ impl Hub {
 
     /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands"), once a
     /// second: answers overdue, parked commands whose runner never came back.
+    #[allow(clippy::disallowed_methods)] // left to its owner (the Kiln vs. T3Code agent): the wire's deadlines (RTOs, COMING_FOR, PARK_FOR, HAVE_AGAIN)
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(1));
         let mut said = Instant::now();
@@ -3396,6 +3398,7 @@ impl Hub {
     /// messages' larger handlers (a front door's status, its facts' fold, its power, an identity's ask, a
     /// leg's records and signature, what its inventory lets go of) are boxed where they're made (goal 9, plan
     /// 01a1a87b2cec step 5).
+    #[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
     async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
@@ -4801,14 +4804,20 @@ impl Hub {
             }
     }
 
-    /// Sample the server host itself for the UI ("server" series).
+    /// Sample the server host itself for the UI ("server" series), at the user-set `[telemetry] sample_seconds` (a): each
+    /// sample due that long after the last one's was, those missed while busy skipped (goal 9, plan 01a1a87b2cec step 5).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
-        let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
+        let every = Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1)));
+        let mut due = Instant::now();
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = tick.tick().fuse() => {}
+            if !self.shutdown.sleep_until(due).await {
+                return Ok(());
+            }
+            let now = Instant::now();
+            due = kiln_seams::clock::later(due, every);
+            if due <= now {
+                due = kiln_seams::clock::later(now, every);
             }
             // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
             // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
@@ -4833,6 +4842,7 @@ impl Hub {
 
     /// Daily retention: delete old runs and their logs.
     /// Close terminal sessions left idle with nobody attached; forget ended ones.
+    #[allow(clippy::disallowed_methods)] // (e) idle terminals swept every 30 s; each one's idle end is a deadline
     pub async fn terminal_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let idle = Duration::from_secs(self.cfg.terminal.idle_minutes.max(1).saturating_mul(60));
         loop {
@@ -4845,6 +4855,7 @@ impl Hub {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) retention pruned hourly; the oldest run's age at the user-set retention is the deadline
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(3600));
         loop {

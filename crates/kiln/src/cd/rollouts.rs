@@ -152,6 +152,7 @@ fn inbox_of(host: &Arc<dyn Host>, mut inbox: parking_lot::MutexGuard<'_, HashMap
 
 /// A rollout's driver, until nothing is left to do: it drives whichever rollout of the object is
 /// kept, so a newer one carries on with it.
+#[allow(clippy::disallowed_methods)] // (c) a rollout's targets polled; their own words could tell
 async fn driver(host: Arc<dyn Host>, target: String, key: String, tx: Sender<Msg>, rx: Receiver<Msg>) {
     let id = rollout_id(&target, &key);
     let (hot, rest) = host.every();
@@ -586,6 +587,7 @@ impl Cd {
     }
 
     /// After an abort: the app back to the deployment that ran before, once no sync runs.
+    #[allow(clippy::disallowed_methods)] // (c) waits 10 s on health before rolling back
     fn roll_back_after(self: &Arc<Self>, rec: &RolloutRecord, to: u64) {
         let (cd, app) = (self.clone(), rec.app.clone());
         tracing::info!(app = %app, to, "deployments: a rollout aborted; the app goes back to the deployment that ran before");

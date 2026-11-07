@@ -54,6 +54,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
     // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
