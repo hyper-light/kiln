@@ -430,7 +430,7 @@ pub struct Chunk {
     /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
     /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
-    /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
+    /// Whether a read of its copy's events took its texts ([`Events::page_parts`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
     /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
     page_read: AtomicBool,
@@ -626,7 +626,7 @@ impl Chunk {
     }
 
     /// The first of its events whose texts the reads of its copy's newest page took and keep, where a read took them
-    /// ([`Events::pieces_with`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
+    /// ([`Events::page_parts`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
     /// 11, plan 01a1a87b2e56 step 5).
     fn page_reach(&self) -> Option<usize> {
         if !self.page_read.load(Ordering::Relaxed) {
@@ -831,7 +831,7 @@ impl Chunk {
     }
 }
 
-/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::page_parts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unread {
     /// The range isn't all there, or a compact chunk's segment can't be read (a spill file that doesn't give it back):
@@ -1113,11 +1113,15 @@ impl Events {
         Some(())
     }
 
-    /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
-    /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
-    /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. [`Unread::Cannot`] where the range isn't all there, or a chunk's segment can't be
-    /// read.
+    /// The page of its events `range` as `GET /api/harness/sessions/{id}/events` answers it, `{"events":[…]}`, in the
+    /// pieces it's made of, in order, none copied twice: a compact chunk's part a slice of its texts as its newest page's
+    /// reads keep them ([`Chunk::page_texts`]), inflated once for all the reads of it rather than at each (goal 10, plan
+    /// 01a1a87b2dae step 5), the page's framing around it pieces of their own; another chunk's events' texts written out
+    /// once, into one buffer of their length that takes the framing around them too, so a page of the open chunk alone is
+    /// one piece. The list of pieces is made at its length, and each buffer at its own, so its share takes none more (goal
+    /// 9, plan 01a1a87b2cec step 3, sessions-read: the list grew as it filled, three blocks, and each buffer was a byte
+    /// longer than its texts, so their share took a block of its own). [`Unread::Cannot`] where the range isn't all there,
+    /// an event in it has no number or id, or a chunk's segment can't be read.
     ///
     /// A compact chunk's segment is inflated only where `inflate` says so (step 5), and a spilled one's read from its
     /// file first (goal 11 audit A3): a read on a shard takes the texts its copy's reads kept, and has the others made
@@ -1125,13 +1129,22 @@ impl Events {
     /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
     /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
     /// 3.6 ms on the CPU, past the shards' quantum.
-    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
-        let mut i = range.start;
+    pub fn page_parts(&self, range: std::ops::Range<usize>, inflate: bool) -> Result<Vec<Bytes>, Unread> {
+        const OPEN: &[u8] = br#"{"events":["#;
+        const CLOSE: &[u8] = b"]}";
+        if range.is_empty() {
+            return Ok(vec![Bytes::from_static(br#"{"events":[]}"#)]);
+        }
+        // Each chunk the range reaches into is a piece, and a compact one's the framing on either side of it: room for
+        // all of them, at the most.
+        let mut parts = Vec::with_capacity(self.reaches(range.clone())?.saturating_mul(2).saturating_add(1));
+        let (mut i, mut before) = (range.start, OPEN);
         while i < range.end {
             let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
             let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
             let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
-            if n == 0 {
+            let metas = chunk.meta.get(k..k + n).filter(|metas| !metas.is_empty()).ok_or(Unread::Cannot)?;
+            if metas.iter().any(|m| m.seq().is_none() || m.id().is_empty()) {
                 return Err(Unread::Cannot);
             }
             // A spilled chunk's texts are read from its spill file off the runtime's threads alone, which may wait on disk:
@@ -1140,9 +1153,7 @@ impl Events {
             if chunk.is_spilled() && !inflate {
                 return Err(Unread::Unkept);
             }
-            if i > range.start {
-                out.push(Bytes::from_static(b","));
-            }
+            let after: &'static [u8] = if i + n == range.end { CLOSE } else { b"" };
             if chunk.is_compact() {
                 let std::ops::Range { start: from, end: to } = chunk.span(k, n).ok_or(Unread::Cannot)?;
                 let (at, texts) = match chunk.page_texts_kept(from) {
@@ -1155,21 +1166,41 @@ impl Events {
                     return Err(Unread::Cannot);
                 }
                 chunk.page_read.store(true, Ordering::Relaxed);
-                out.push(texts.slice(from..to));
+                parts.push(Bytes::from_static(before));
+                parts.push(texts.slice(from..to));
+                if !after.is_empty() {
+                    parts.push(Bytes::from_static(after));
+                }
             } else {
                 let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
-                let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
+                let len = before.len() + evs.iter().map(|e| e.entry.text().len()).sum::<usize>() + (n - 1) + after.len();
+                let mut joined = Vec::with_capacity(len);
+                joined.extend_from_slice(before);
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
                         joined.push(b',');
                     }
                     joined.extend_from_slice(e.entry.text().as_bytes());
                 }
-                out.push(Bytes::from(joined));
+                joined.extend_from_slice(after);
+                parts.push(Bytes::from(joined));
             }
+            before = b",";
             i += n;
         }
-        Ok(())
+        Ok(parts)
+    }
+
+    /// How many of its chunks `range` reaches into. [`Unread::Cannot`] where the range isn't all there.
+    fn reaches(&self, range: std::ops::Range<usize>) -> Result<usize, Unread> {
+        let (mut i, mut chunks) = (range.start, 0usize);
+        while i < range.end {
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let n = self.chunk(c).ok_or(Unread::Cannot)?.len().checked_sub(k).filter(|n| *n > 0).ok_or(Unread::Cannot)?;
+            i += n.min(range.end - i);
+            chunks += 1;
+        }
+        Ok(chunks)
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -2181,16 +2212,7 @@ impl View {
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq() != Some(1)) {
             return Err(Unread::Cannot);
         }
-        for i in start..end {
-            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
-            if m.seq().is_none() || m.id().is_empty() {
-                return Err(Unread::Cannot);
-            }
-        }
-        let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_with(start..end, &mut parts, inflate)?;
-        parts.push(Bytes::from_static(b"]}"));
-        Ok(parts)
+        self.events.page_parts(start..end, inflate)
     }
 }
 
@@ -5675,6 +5697,42 @@ mod tests {
         m.upsert(Arc::new(Entry::new(json!({"id": "loose", "kind": "assistant", "text": "no number"}))));
         m.publish();
         anyhow::ensure!(m.view().events_page_kept(None, 50) == Err(Unread::Cannot), "the store's to answer");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): the realistic largest page read on a shard, as `GET
+    /// /api/harness/sessions/{id}/events?limit=50` asks kiln-lab's sessions for theirs, fifty events each as long as the lab's
+    /// stand-in writes its longest (a `Read` of 200 lines, about 15 KB of JSON), reaching from the open chunk into the
+    /// compact one before it, is made in two blocks: its list of pieces and the open chunk's one buffer, each at its length,
+    /// the page's framing in that buffer or pieces of their own. Its list grew as it filled and its buffer was a byte longer
+    /// than its texts, so their share took one more: five blocks. It says the page's bytes as before.
+    #[test]
+    fn g9_s3_the_largest_page_is_made_in_two_blocks() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let output = (0..200).map(|l| format!("    {l:04} the retry loop reads its deadline from the same clock as backoff")).collect::<Vec<_>>().join("\n");
+        // Two sealed chunks, compact, and the open one holding twenty: the newest fifty reach thirty into the compact one before.
+        let n = u64::try_from(CHUNK * 2 + 20)?;
+        for q in 1..=n {
+            m.rev = q;
+            let path = format!("/work/crates/kiln/src/part{}.rs", q % 97);
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "at": 1, "kind": "tool", "tool_id": format!("toolu_{q}"), "name": "Read", "tool": "read", "title": path, "input": {"file_path": path}, "status": "done", "output": output, "started": 1}))));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","));
+        anyhow::ensure!(page.len() > 50 * 14_000, "the largest page: {} bytes", page.len());
+        // Its compact chunk's texts made off the shard, and kept, by the read before.
+        anyhow::ensure!(view.events_page(None, 50).map(|p| p.concat()) == Some(page.clone().into_bytes()), "made off the shard");
+        let before = crate::os::counted::made().blocks;
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the page on the shard: {u:?}"))?;
+        let made = crate::os::counted::made().blocks.saturating_sub(before);
+        anyhow::ensure!(kept.concat() == page.into_bytes(), "the page's bytes");
+        anyhow::ensure!(made == 2, "the page made in {made} blocks");
         Ok(())
     }
 
