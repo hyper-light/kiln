@@ -20,9 +20,10 @@ const LOWEST: i32 = -16;
 /// runtime's precision (`hyper_rt::machine::wake::sample_window`, which sizes the shard's own quantum estimate). Its callers
 /// learn into it with loads and stores: a sample lost to another's at the same moment is one of many (goal 9, plan
 /// 01a1a87b2cec step 3).
+/// Laid out so a sample stores to two cache lines, its totals' and its bucket's.
 #[derive(Debug)]
+#[repr(C, align(64))]
 pub struct Costs {
-    buckets: [Bucket; BUCKETS],
     units: AtomicU64,
     ns: AtomicU64,
     /// Σ ns²/units over its samples, f64 bits: their spread, which sizes the window.
@@ -30,9 +31,11 @@ pub struct Costs {
     /// Samples since the buckets were last halved, and how many they're halved at.
     taken: AtomicU64,
     window: AtomicU64,
+    buckets: [Bucket; BUCKETS],
 }
 
 #[derive(Debug)]
+#[repr(C, align(32))]
 struct Bucket {
     units: AtomicU64,
     ns: AtomicU64,
@@ -45,12 +48,12 @@ impl Costs {
     /// (`hyper_rt::machine::bench::MIN_SAMPLES`).
     pub const fn nothing_yet() -> Self {
         Self {
-            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0) } }; BUCKETS],
             units: AtomicU64::new(0),
             ns: AtomicU64::new(0),
             squares: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             window: AtomicU64::new(hyper_rt::machine::bench::MIN_SAMPLES as u64),
+            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0) } }; BUCKETS],
         }
     }
 
@@ -120,7 +123,7 @@ impl Costs {
             return None;
         }
         let (free, budget) = (free as f64, defer as f64 * units as f64);
-        let mut points = self.buckets.iter().enumerate().rev().filter_map(|(i, b)| b.points(floor(i))).flatten().peekable();
+        let mut points = self.buckets.iter().enumerate().rev().filter_map(|(i, b)| b.points(i)).flatten().peekable();
         // The units of the dearest points so far, and their nanoseconds: at n units, those past `free` cost
         // n·past_ns − free·past past it, and the n that makes that the budget holds where the next point stays within.
         let (mut past, mut past_ns) = (0.0, 0.0);
@@ -143,14 +146,14 @@ impl Default for Costs {
 }
 
 impl Bucket {
-    /// Its units as two points, (cost, units), the dearest first: at its dearest and at its floor, in the shares that keep
-    /// its nanoseconds. None while it holds none.
-    fn points(&self, floor: f64) -> Option<[(f64, f64); 2]> {
+    /// Its units as two points, (cost, units), the dearest first: at its dearest and at its floor (the `i`th's), in the
+    /// shares that keep its nanoseconds. None while it holds none.
+    fn points(&self, i: usize) -> Option<[(f64, f64); 2]> {
         let units = self.units.load(Relaxed);
         if units == 0 {
             return None;
         }
-        let (units, ns, dearest) = (units as f64, self.ns.load(Relaxed) as f64, f64::from_bits(self.dearest.load(Relaxed)));
+        let (floor, units, ns, dearest) = (floor(i), units as f64, self.ns.load(Relaxed) as f64, f64::from_bits(self.dearest.load(Relaxed)));
         // Clamped: a sample lost to another's can leave its mean past its floor or its dearest.
         let share = if dearest > floor { ((ns / units - floor) / (dearest - floor)).clamp(0.0, 1.0) } else { 1.0 };
         Some([(dearest, units * share), (floor, units * (1.0 - share))])
@@ -164,9 +167,10 @@ fn bucket(cost: f64) -> usize {
     usize::try_from(power - LOWEST).map_or(0, |i| i.min(BUCKETS - 1))
 }
 
-/// The least cost bucket `i` holds: its power of two, but none for the bottom, which holds every cost under its next.
+/// The least cost bucket `i` holds: its power of two (an f64 of that exponent), but none for the bottom, which holds every
+/// cost under its next.
 fn floor(i: usize) -> f64 {
-    if i == 0 { 0.0 } else { 2f64.powi(LOWEST + i as i32) }
+    if i == 0 { 0.0 } else { f64::from_bits(u64::try_from(1023 + LOWEST + i as i32).unwrap_or(0) << 52) }
 }
 
 fn add(a: &AtomicU64, v: u64) {
@@ -291,6 +295,15 @@ mod tests {
         }
         assert_eq!(c.fit(10_000, 0), Some(10), "the dear ones forgotten after {cheap} cheap ones");
         assert!(cheap > hyper_rt::machine::bench::MIN_SAMPLES as u64, "not before a window of cheap ones: {cheap}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a cost falls in the bucket of its power of two, whose floor is that power.
+    #[test]
+    fn g9_s3_a_cost_falls_in_its_power_of_twos_bucket() {
+        for i in 1..BUCKETS {
+            assert_eq!((bucket(floor(i)), bucket(floor(i) * 1.999)), (i, i), "bucket {i}, floor {}", floor(i));
+        }
+        assert_eq!((bucket(0.0), bucket(f64::MIN_POSITIVE), bucket(1.0), bucket(1e300)), (0, 0, usize::try_from(-LOWEST).unwrap_or(0), BUCKETS - 1));
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: with nothing free (work that can go elsewhere), the rule is the expected cost
