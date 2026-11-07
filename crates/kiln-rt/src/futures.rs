@@ -53,6 +53,32 @@ pub fn thread_run_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)).flatten()
 }
 
+/// The poll this shard's thread is in, by the shard's clock ([`poll_clock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollClock {
+    /// When the poll began, as the loop published it as it began: the same for every reading within one poll, and another
+    /// for the next, so it tells one poll from the next.
+    pub began_ns: u64,
+    /// Now.
+    pub now_ns: u64,
+}
+
+impl PollClock {
+    /// How long the poll has held its shard so far, nanoseconds.
+    pub fn held_ns(&self) -> u64 {
+        self.now_ns.saturating_sub(self.began_ns)
+    }
+}
+
+/// The poll this shard's thread is in now: when it began and now, on the shard's clock (its cheap reading). What a task's
+/// code weighs its next piece against to end its poll within the step's quantum ([`step_budget_ns`]), however it came to
+/// that piece, rather than a turn it keeps itself (kiln's goal 9, plan 01a1a87b2cec step 3: a poll past the quantum holds
+/// every other task on its shard). None off a shard's thread, between polls, and in a simulation, whose clock doesn't move
+/// within a poll.
+pub fn poll_clock() -> Option<PollClock> {
+    registry::with_current(|ctx| (!ctx.is_sim && ctx.current.get() != crate::shard::NO_TASK).then(|| PollClock { began_ns: ctx.now_ns.get(), now_ns: ctx.now_ns() })).flatten()
+}
+
 /// What a piece of work spent on the thread that ran it ([`spent`]; kiln's goal 9, plan 01a1a87b2cec step 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spent {
