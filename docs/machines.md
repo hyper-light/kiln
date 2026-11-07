@@ -168,8 +168,10 @@ the grace is RFC 6298's bound over them, the smoothed time and four times its va
 back later than twice the grace counts as twice the grace (the RFC's backoff), so one gone for hours
 moves it once as far as the grace itself. What's learned is kept in kiln.db (`kv`,
 `runners/comeback`) as it changes, so a restart gives runners the grace learned before it. Until a
-first runner has come back holding work, the grace is 45 s, what kiln gave every runner before it
-learned.
+first runner has come back holding work, the grace is the longest a runner that's up takes to come
+back once the server answers, by its own redials (`crate::comeback::prior`): a dial given up
+unanswered (20 s, the runner's `DIAL_TIMEOUT`), then its longest wait before the next (30 s, its
+`REDIAL_MOST`, jittered up to a quarter more): 57.5 s. The server's code is its runners'.
 
 ### Finished job pods are forgotten
 

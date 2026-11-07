@@ -70,6 +70,12 @@ pub fn jitter(d: Duration) -> Duration {
     Duration::from_millis(ms.saturating_add(j))
 }
 
+/// The longest [`jitter`] makes of `d`: a quarter more.
+pub fn jitter_most(d: Duration) -> Duration {
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(ms.saturating_add(ms / 4))
+}
+
 /// Run `make()` forever (until `cancel`), restarting on `Err` or panic. Returning `Ok(())` means the
 /// child finished on purpose and is not restarted. Placed on the next shard round-robin
 /// ([`crate::rt::spawn_spread_joined`]). The caller's place is the task's spawn site, which the
