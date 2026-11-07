@@ -285,6 +285,12 @@ impl Lags {
     /// When a window is first counted after it ends: the 99th percentile of the last five minutes'
     /// lateness, and a quarter more, 2 to 30 s.
     fn settle_ms(&self, now_ms: i64) -> i64 {
+        self.settle_ms_with(None, now_ms)
+    }
+
+    /// [`Lags::settle_ms`] as it would be with `more` noted at `now_ms` too: what a mark at `now_ms` makes it, before
+    /// the mark (goal 9, plan 01a1a87b2cec step 5: [`State::next_due`]).
+    fn settle_ms_with(&self, more: Option<&[u32; LAG_BUCKETS]>, now_ms: i64) -> i64 {
         let minute = now_ms.div_euclid(60_000);
         let mut all = [0u64; LAG_BUCKETS];
         for (m, h) in &self.minutes {
@@ -292,6 +298,11 @@ impl Lags {
                 for (a, b) in all.iter_mut().zip(h.iter()) {
                     *a += u64::from(*b);
                 }
+            }
+        }
+        if let Some(more) = more {
+            for (a, b) in all.iter_mut().zip(more.iter()) {
+                *a += u64::from(*b);
             }
         }
         let total: u64 = all.iter().sum();
@@ -397,11 +408,16 @@ impl State {
     /// When window `w` is ready to count, as [`State::due`] has it: once it ended and settled and, counted before, once
     /// its wait since passed; none while nothing came for it since it was counted.
     fn ready_at(&self, w: i64, win: &Win) -> Option<i64> {
+        self.ready_at_in(w, win, self.counting.settle_ms)
+    }
+
+    /// [`State::ready_at`] with windows settling `settle_ms` after they end.
+    fn ready_at_in(&self, w: i64, win: &Win, settle_ms: i64) -> Option<i64> {
         if !win.dirty {
             return None;
         }
         let end = (w + WINDOW).div_euclid(1_000_000);
-        let settled = end + self.counting.settle_ms;
+        let settled = end + settle_ms;
         Some(match win.counted_ms {
             None => settled,
             Some(c) => settled.max(c + ((c - end) / 2).min((end + HORIZON_MS - c) / 2).max(AGAIN_MIN_MS)),
@@ -410,10 +426,13 @@ impl State {
 
     /// When the first count is due ([`State::ready_at`]), those of what `spans` noted since the last mark (left in
     /// place, between counts) taken as marked at `now_ms`, and not before the points refused are offered again: none
-    /// while nothing waits (goal 9, plan 01a1a87b2cec step 5).
+    /// while nothing waits (goal 9, plan 01a1a87b2cec step 5). Each window settles as a mark at `now_ms` would have them
+    /// settle, its lateness with what `spans` noted (`State::mark` makes the settle again): the moment `due` first says
+    /// it after that mark, not the last mark's settle.
     fn next_due(&self, spans: &Spans, now_ms: i64) -> Option<i64> {
-        let marked = self.windows.iter().filter_map(|(w, win)| self.ready_at(*w, win));
-        let noted = self.reach(spans, now_ms).into_iter().filter_map(|w| self.ready_at(w, &Win { dirty: true, counted_ms: self.windows.get(&w).and_then(|x| x.counted_ms) }));
+        let settle = self.lags.settle_ms_with((spans.batches > spans.backlogs).then_some(&spans.lags), now_ms);
+        let marked = self.windows.iter().filter_map(|(w, win)| self.ready_at_in(*w, win, settle));
+        let noted = self.reach(spans, now_ms).into_iter().filter_map(|w| self.ready_at_in(w, &Win { dirty: true, counted_ms: self.windows.get(&w).and_then(|x| x.counted_ms) }, settle));
         let first = marked.chain(noted).min()?;
         Some(self.behind.map_or(first, |(at, _)| first.max(at)))
     }
@@ -829,9 +848,11 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: the next count is due when its window is first ready, as `due` says, and never
-    /// while nothing waits. Do: a counter started, nothing marked; a window just ended noted (not taken); then marked; a
-    /// window counted and dirty again; points refused. Expect: none; the window's end and settle, the very moment `due`
-    /// first says it; its wait since its count; not before the refused points are offered again, and `due` holds too.
+    /// while nothing waits. Do: a counter started (its settle set to the least by hand, which no lateness seen gives),
+    /// nothing marked; a window just ended noted (not taken); then marked; a window counted and dirty again; points
+    /// refused. Expect: none; the window's end and the settle a mark makes of the lateness seen (none: SETTLE_MS), noted
+    /// and marked alike, the very moment `due` first says it; its wait since its count; not before the refused points
+    /// are offered again, and `due` holds too.
     #[test]
     fn g9_s5_the_next_count_is_due_when_its_window_is_ready_and_never_while_nothing_waits() {
         let mut st = State { started: true, counting: Counting { settle_ms: SETTLE_MIN_MS, ..Counting::default() }, ..State::default() };
@@ -840,11 +861,11 @@ mod tests {
         let w1 = window_of(now * 1_000_000) - WINDOW;
         let end1 = (w1 + WINDOW) / 1_000_000;
         let noted = Spans { windows: vec![(w1, w1)], ..Spans::default() };
-        assert_eq!(st.next_due(&noted, now), Some(end1 + SETTLE_MIN_MS), "noted, not taken: its end and settle");
+        assert_eq!(st.next_due(&noted, now), Some(end1 + SETTLE_MS), "noted, not taken: its end and the settle a mark makes");
         st.mark(&noted, now);
-        assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + SETTLE_MIN_MS), "marked: the same");
-        assert_eq!(st.due(end1 + SETTLE_MIN_MS - 1), None);
-        assert_eq!(st.due(end1 + SETTLE_MIN_MS), Some(w1), "the moment it's due");
+        assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + SETTLE_MS), "marked: the same");
+        assert_eq!(st.due(end1 + SETTLE_MS - 1), None);
+        assert_eq!(st.due(end1 + SETTLE_MS), Some(w1), "the moment it's due");
         // Counted 60 s after it ended, then dirty again: 30 s later.
         st.windows.insert(w1, Win { dirty: true, counted_ms: Some(end1 + 60_000) });
         assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + 90_000));
