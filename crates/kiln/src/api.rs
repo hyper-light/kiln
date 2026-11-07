@@ -7050,8 +7050,9 @@ struct Read {
     now_us: u64,
     at: Instant,
     woken: crate::route_latency::FrameLeg,
-    /// What its viewer's flushes are learned to cost a byte, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec step 3).
-    costs: &'static kiln_http::turn::Writes,
+    /// What its viewer's flushes are learned to cost a byte on its shard, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>,
 }
 
 impl Read {
@@ -7133,7 +7134,7 @@ where
             break;
         }
         // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
-        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.fitting(room)).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
+        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.try_with(|c| c.fitting(room)).ok().flatten()).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
             give_turn_up(costs).await;
             *turns = crate::rt::Turns::new();
@@ -7163,23 +7164,27 @@ where
     Ok(came_to)
 }
 
-/// What flushing a viewer's socket is learned to cost a byte (`kiln_http::turn::Writes`): every viewer's flushes teach it
-/// ([`flush_timed`]), and its turns given up what coming back costs ([`give_turn_up`]); each batch's are weighed by it
-/// ([`write_live_batch`]; goal 9, plan 01a1a87b2cec step 3).
-static FLUSHES: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+thread_local! {
+    /// What flushing a viewer's socket is learned to cost a byte on a shard (`kiln_http::turn::Writes`): each shard's own, a
+    /// shard being a thread, so a flush stores only to cache lines its own core holds, and a fresh shard learns from nothing
+    /// (goal 9, plan 01a1a87b2cec step 3). Its viewers' flushes teach it ([`flush_timed`]), and their turns given up what
+    /// coming back costs ([`give_turn_up`]); each of their batches is weighed by it ([`write_live_batch`]). Made in place
+    /// with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
+    static FLUSHES: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+}
 
 /// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
 /// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
-async fn give_turn_up(costs: &kiln_http::turn::Writes) {
+async fn give_turn_up(costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>) {
     hyper_rt::futures::yield_now().await;
     if let Some(poll) = hyper_rt::futures::poll_clock() {
-        costs.resumed(poll.held_ns());
+        costs.try_with(|c| c.resumed(poll.held_ns())).unwrap_or_default();
     }
 }
 
 /// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
 /// socket (a flush that waited took its peer's time, not its own).
-async fn flush_timed<S>(tx: &mut S, costs: &kiln_http::turn::Writes, bytes: usize) -> Result<(), S::Error>
+async fn flush_timed<S>(tx: &mut S, costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>, bytes: usize) -> Result<(), S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
@@ -7187,7 +7192,8 @@ where
     let began = Instant::now();
     let (flushed, waited) = waited(tx.flush()).await;
     if !waited && bytes > 0 {
-        costs.learn(u64::try_from(bytes).unwrap_or(u64::MAX), u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        costs.try_with(|c| c.learn(u64::try_from(bytes).unwrap_or(u64::MAX), took)).unwrap_or_default();
     }
     flushed
 }
@@ -9507,7 +9513,9 @@ mod tests {
     /// twice the quantum on the CPU (a flush of all of it, as before, is four).
     #[test]
     fn g9_s3_a_viewers_batch_is_flushed_within_its_polls_quantum() -> anyhow::Result<()> {
-        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
         /// Shape: each frame's padding, and the socket's flush, nanoseconds a byte.
         const FRAME: usize = 32 << 10;
         const NS_PER_BYTE: u64 = 2;
@@ -9553,18 +9561,23 @@ mod tests {
     /// nothing: the batch went a flush, and its shard given up, a frame.
     #[test]
     fn g9_s3_a_viewers_batch_whose_flushes_vary_goes_a_few_frames_a_flush() -> anyhow::Result<()> {
-        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
         /// Shape: the batch's frames.
         const FRAMES: u64 = 32;
-        for _ in 0..16 {
-            COSTS.learn(64 << 10, 32_768);
-            COSTS.learn(64 << 10, 327_680);
-        }
         let quantum = crate::rt::block_on(async { hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard")) })?;
         let frame = usize::try_from(quantum / 40)?;
         let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(frame))).collect();
         let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
         crate::rt::block_on(async move {
+            // Taught on the shard that writes the batch: each shard's costs are its own.
+            COSTS.try_with(|c| {
+                for _ in 0..16 {
+                    c.learn(64 << 10, 32_768);
+                    c.learn(64 << 10, 327_680);
+                }
+            })?;
             let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
             let (mut have, mut polls, mut turns) = (0, 0u64, crate::rt::Turns::new());
             let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };

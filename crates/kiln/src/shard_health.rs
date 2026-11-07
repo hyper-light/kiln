@@ -111,32 +111,33 @@ pub const fn lab_period_bound(window: Duration, shards: u64) -> Duration {
 pub struct Reads {
     /// The last read, nanoseconds since [`base`]: 0, none yet.
     last_ns: AtomicU64,
-    /// The time between reads, learned as RFC 6298 learns a round trip (`crate::rt::Smoothed`).
-    every: crate::rt::Smoothed,
+    /// The times between reads, a read a unit (`kiln_http::turn::Costs`, no gain picked): the shortest and the longest its
+    /// window holds are when the next read may come.
+    every: kiln_http::turn::Costs,
 }
 
 impl Reads {
     pub const fn new() -> Self {
-        Self { last_ns: AtomicU64::new(0), every: crate::rt::Smoothed::nothing_yet() }
+        Self { last_ns: AtomicU64::new(0), every: kiln_http::turn::Costs::nothing_yet() }
     }
 
     /// A read at `now_ns` (since [`base`]): the time since the last one learned.
     pub fn read(&self, now_ns: u64) {
         let last = self.last_ns.swap(now_ns.max(1), Ordering::Relaxed);
         if last != 0 && now_ns > last {
-            self.every.learn(now_ns - last);
+            self.every.learn(1, now_ns - last);
         }
     }
 
     /// Whether a run at `now_ns`, `period_ns` before the next, copies for the read that may come next: until two reads have
     /// taught their pace, every run; then each run from a period before the earliest the next read may come (the last, and
-    /// the time between reads less four deviations) through a period past the latest (plus four): every read finds a copy
-    /// a period old at the most. Past that the reader's gone: none until it reads again.
+    /// the shortest time between reads the window holds) through a period past the latest (the longest): every read as far
+    /// apart as one the window holds finds a copy a period old at the most. Past that the reader's gone: none until it reads
+    /// again. (It was RFC 6298's mean and four deviations, a gain and a K picked: goal 9, plan 01a1a87b2cec step 3.)
     pub fn due(&self, now_ns: u64, period_ns: u64) -> bool {
-        let (last, Some(mean)) = (self.last_ns.load(Ordering::Relaxed), self.every.mean()) else { return true };
-        let spread = self.every.dev().saturating_mul(4).saturating_add(period_ns);
-        let since = now_ns.saturating_sub(last);
-        since.saturating_add(spread) >= mean && since <= mean.saturating_add(spread)
+        let (last, Some((shortest, longest))) = (self.last_ns.load(Ordering::Relaxed), self.every.range()) else { return true };
+        let (since, period) = (now_ns.saturating_sub(last) as f64, period_ns as f64);
+        since + period >= shortest && since <= longest + period
     }
 }
 
@@ -1506,7 +1507,7 @@ mod tests {
             // Reads a second apart, the last of them now.
             let learned = Reads::new();
             for _ in 0..16 {
-                learned.every.learn(ms(1_000));
+                learned.every.learn(1, ms(1_000));
             }
             learned.last_ns.store(nanos(Instant::now().saturating_duration_since(base())).max(1), Ordering::Relaxed);
             let copied = (me.wakes(), me.calls(), me.parks());

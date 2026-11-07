@@ -247,8 +247,8 @@ pub struct Room {
     bound: AtomicUsize,
     /// Whether `bound` holds: an [`unbounded`] queue's room takes every send.
     limited: bool,
-    /// A [`pipe`]'s pace, which sets its bound as it's learned.
-    pace: Option<Pace>,
+    /// A [`pipe`]'s pace, which sets its bound as it's learned: apart, so no other queue's room carries its costs.
+    pace: Option<Box<Pace>>,
     held: AtomicUsize,
     /// No receiver any more: whoever waits for room stops waiting (what it sends is refused).
     closed: AtomicBool,
@@ -265,7 +265,7 @@ impl Room {
 
     /// A [`pipe`]'s room, counted as `owner`'s: one item until its first is sent, then as its pace sets it ([`Pace`]).
     fn paced(owner: &'static Owner) -> Self {
-        Self { owner, bound: AtomicUsize::new(0), limited: true, pace: Some(Pace::new()), held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
+        Self { owner, bound: AtomicUsize::new(0), limited: true, pace: Some(Box::new(Pace::new())), held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
     }
 
     /// A room with no bound, counted as `owner`'s: it takes whatever comes ([`unbounded`]), adding nothing to
@@ -430,22 +430,23 @@ impl Drop for Room {
 }
 
 /// A [`pipe`]'s pace (consts-audit B4): how long its producer takes to make an item (from its last send's end to its next
-/// send), and how long its consumer takes to take a KiB (over takes that found the next item waiting: the consumer taking,
-/// not waiting for the producer), each learned as RFC 6298 learns a round trip (`crate::rt::Smoothed`). Its room is what
-/// the consumer takes while the producer makes its next item, and an item past it: a consumer slower than its producer
-/// never waits for the next, and a producer runs no further ahead than that. Two items until both are learned. A queue of a
-/// fixed count of places held its producer's items as the channel it replaced did, whatever took them.
+/// send), an item a unit, and how long its consumer takes to take a byte (over takes that found the next item waiting: the
+/// consumer taking, not waiting for the producer), each its window's mean (`kiln_http::turn::Costs`, no gain picked: it was
+/// RFC 6298's, an eighth of the way to each sample; goal 9, plan 01a1a87b2cec step 3). Its room is what the consumer takes
+/// while the producer makes its next item, and an item past it: a consumer slower than its producer never waits for the
+/// next, and a producer runs no further ahead than that. Two items until both are learned. A queue of a fixed count of
+/// places held its producer's items as the channel it replaced did, whatever took them.
 struct Pace {
     born: Instant,
     /// The end of the producer's last send, nanoseconds since `born` (0: none yet), and whether it has made its next.
     sent_ns: AtomicU64,
     making: AtomicBool,
-    make_ns: crate::rt::Smoothed,
+    make: kiln_http::turn::Costs,
     /// The consumer's last take, nanoseconds since `born` (0: none yet), its bytes, and whether more waited behind it.
     took_ns: AtomicU64,
     took_bytes: AtomicUsize,
     backlogged: AtomicBool,
-    per_kib_ns: crate::rt::Smoothed,
+    take: kiln_http::turn::Costs,
 }
 
 impl Pace {
@@ -454,11 +455,11 @@ impl Pace {
             born: Instant::now(),
             sent_ns: AtomicU64::new(0),
             making: AtomicBool::new(false),
-            make_ns: crate::rt::Smoothed::nothing_yet(),
+            make: kiln_http::turn::Costs::nothing_yet(),
             took_ns: AtomicU64::new(0),
             took_bytes: AtomicUsize::new(0),
             backlogged: AtomicBool::new(false),
-            per_kib_ns: crate::rt::Smoothed::nothing_yet(),
+            take: kiln_http::turn::Costs::nothing_yet(),
         }
     }
 
@@ -483,7 +484,7 @@ impl Pace {
     fn made_at(&self, at: u64) {
         let last = self.sent_ns.load(Ordering::Relaxed);
         if last != 0 && !self.making.swap(true, Ordering::Relaxed) {
-            self.make_ns.learn(at.saturating_sub(last));
+            self.make.learn(1, at.saturating_sub(last));
         }
     }
 
@@ -494,13 +495,12 @@ impl Pace {
     }
 
     /// An item of `bytes` taken at `at`, `more` waiting behind it: where the one before it had more behind it, the
-    /// consumer took that one in the time since, which is learned per KiB.
+    /// consumer took that one in the time since, which is learned by its bytes.
     fn taken_at(&self, at: u64, bytes: usize, more: bool) {
         let at = at.max(1);
         let (last, last_bytes) = (self.took_ns.swap(at, Ordering::Relaxed), self.took_bytes.swap(bytes, Ordering::Relaxed));
-        if last != 0 && last_bytes > 0 && self.backlogged.load(Ordering::Relaxed) {
-            let per_kib = u128::from(at.saturating_sub(last)).saturating_mul(1024) / u128::try_from(last_bytes).unwrap_or(u128::MAX);
-            self.per_kib_ns.learn(u64::try_from(per_kib).unwrap_or(u64::MAX));
+        if last != 0 && self.backlogged.load(Ordering::Relaxed) {
+            self.take.learn(u64::try_from(last_bytes).unwrap_or(u64::MAX), at.saturating_sub(last));
         }
         self.backlogged.store(more, Ordering::Relaxed);
     }
@@ -508,11 +508,8 @@ impl Pace {
     /// The room that keeps the consumer fed while the producer makes its next item, items of `item` bytes: what the
     /// consumer takes in a make's time, and an item past it; two items until both are learned.
     fn room(&self, item: usize) -> usize {
-        match (self.make_ns.mean(), self.per_kib_ns.mean()) {
-            (Some(make), Some(per_kib)) if per_kib > 0 => {
-                let drained = u128::from(make).saturating_mul(1024) / u128::from(per_kib);
-                usize::try_from(drained).unwrap_or(usize::MAX).saturating_add(item)
-            }
+        match (self.make.mean(), self.take.mean()) {
+            (Some(make), Some(per_byte)) if per_byte > 0.0 => ((make / per_byte) as usize).saturating_add(item),
             _ => item.saturating_mul(2),
         }
     }
