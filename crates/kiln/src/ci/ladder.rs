@@ -839,7 +839,7 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         // Each bound here only ends a hang: a loaded machine takes what time it takes.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let hub = crate::hub::tests::scratch_hub().await?;
             let polls = Arc::new(AtomicU64::new(0));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), run_loop(Arc::clone(&hub)))));

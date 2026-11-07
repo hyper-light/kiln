@@ -1032,7 +1032,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Each bound here only ends a hang: a loaded machine takes what time it takes.
         let until = std::time::Instant::now() + Duration::from_secs(300);
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
             let ms = Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
             let (polls, shutdown) = (Arc::new(AtomicU64::new(0)), crate::rt::Shutdown::new());

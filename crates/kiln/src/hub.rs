@@ -5731,7 +5731,7 @@ pub(crate) mod tests {
     fn g9_s5_an_idle_servers_loops_arm_no_clock() -> anyhow::Result<()> {
         // Each bound here only ends a hang: a loaded machine takes what time it takes.
         let until = Instant::now() + Duration::from_secs(300);
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let hub = scratch_hub().await?;
             let dir = tempfile::tempdir()?;
             let monitors = crate::observe::monitors::Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");

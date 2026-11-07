@@ -2849,6 +2849,7 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
 /// with it and its inbox here is fenced first, as for a move (`ids`, `fence`; CP-T3.2): the newer
 /// process keeps an inbox of its own. With no word of how it went, it waits here and asks again
 /// until it's known, as a move does.
+#[allow(clippy::disallowed_methods)] // (e) its hand-over's settle sleeps, passed to hand_to_newer_by
 async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
     let id = s.id.clone();
     let send = |bytes: Vec<u8>| {

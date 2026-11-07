@@ -3699,6 +3699,7 @@ impl Leg {
     /// job container, or an Alpine machine), musl builds, kept as GitHub's runner keeps them
     /// (`node20_alpine`): see [`musl_node`]. Asked for up to [`DOWNLOAD_TRIES`] times, each ask
     /// again said in step `idx`'s log.
+    #[allow(clippy::disallowed_methods)] // (b) a retry backoff between Node's download tries
     async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });

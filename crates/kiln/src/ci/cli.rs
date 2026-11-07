@@ -1767,6 +1767,7 @@ async fn next_key(typed: &async_channel::Receiver<Vec<u8>>, typing: bool) -> Opt
 
 /// `kiln debug terminal <leg>` (W17-R01): a terminal in a running or kept leg, in this one, raw
 /// (on Unix) and following this window's size, until the shell there ends or Ctrl-] leaves it.
+#[allow(clippy::disallowed_methods)] // (e) looks at the local terminal's size each half second; SIGWINCH would tell
 async fn terminal(api: &Api, leg: &str) -> Result<()> {
     use crate::http::ws::Message;
     use futures::{FutureExt as _, StreamExt as _};
