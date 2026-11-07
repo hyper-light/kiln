@@ -1238,7 +1238,7 @@ fn ensure_launcher(unit: &str, bin: &Path) -> anyhow::Result<PathBuf> {
 /// On a Mac with kiln's signing identity (`kiln signing setup`), the copy about to become `dest`
 /// signed with it, so macOS knows it as the program it let onto the local network before.
 fn sign_placed(tmp: &Path, dest: &Path) {
-    if let Err(e) = crate::os::macsign::sign_as(tmp, dest, &crate::updates::own_build()) {
+    if let Err(e) = crate::os::macsign::sign_as(tmp, dest, &crate::updates::own_build_blocking()) {
         say(format!("couldn't sign {} as kiln ({e:#}): macOS may ask again before it reaches the server", dest.display()));
     }
 }

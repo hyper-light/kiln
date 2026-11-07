@@ -80,6 +80,7 @@ pub async fn report(hub: &Hub, run_id: &str) -> anyhow::Result<()> {
 
 /// Keeps GitLab's and Bitbucket's commit statuses with KilnCI's runs, for as long as the server
 /// runs: each run's change as it's broadcast, and every minute the ones a host didn't take.
+#[allow(clippy::disallowed_methods)] // (c) host statuses reconciled every RECONCILE_EVERY; their webhooks would tell
 pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.subscribe_events()?;

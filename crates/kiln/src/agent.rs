@@ -193,6 +193,7 @@ async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
 /// Shutdown, or (lingering, shutdown already said) the next 50 ms tick, to look again whether the
 /// loop may end.
+#[allow(clippy::disallowed_methods)] // (e) lingering after shutdown: looks again every 50 ms whether the loop may end; its tasks' ends would tell
 async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
     if lingering {
         crate::rt::sleep(Duration::from_millis(50)).await;
@@ -201,6 +202,7 @@ async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (b) enrollment retry, jittered doubling backoff
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
@@ -268,6 +270,7 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
 /// instance's own while it is valid, else the machine's. Its own goes once it is for another key
 /// (the machine enrolled again since, with a new one): with it, no TLS configuration is made and
 /// the runner never reaches the server, so an upgrade that starts it never completes.
+#[allow(clippy::disallowed_methods)] // (b) enrollment retry, jittered doubling backoff
 async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
@@ -666,6 +669,7 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
 /// while yet (an old build keeps them until its last job ends and it retires, minutes later). It
 /// stops once the server takes the replica away (`join` emptied by a Leave) or this runner is
 /// going (`going`). `wait`: how long before each try again ([`replica_wait`]).
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
 async fn start_replica<S, F, Fut>(join: &parking_lot::Mutex<Option<(u64, String)>>, going: impl Fn() -> bool, start: F, wait: fn(u32) -> Duration) -> anyhow::Result<(S, u64)>
 where
     F: Fn(u64, String) -> Fut,
@@ -781,6 +785,7 @@ impl ReplicaStart {
     /// the newest word to join. Nothing else would start it again, and its front door would leave
     /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
     /// the server restarted).
+    #[allow(clippy::disallowed_methods)] // (e) polls its replica's progress every REPLICA_CHECK; the replica's applied index could tell
     async fn watch(self) {
         let mut behind = 0u32;
         loop {
@@ -972,11 +977,11 @@ async fn roll_back(
 }
 
 /// (The runner being upgraded.) Its conversation stores, let go of for the new build
-/// (`Frame::Stores`): once its tee has kept what its sessions said last, it lets go of its own store
-/// itself, however long keeping that takes (`Held::take`); each store is closed, as long as its disk
-/// takes to sync it (the new build waits for this frame, and opens no store meanwhile), and its files
-/// moved as `moves` says (its own first, then its copy of the server's). What couldn't be is left
-/// out, and the new build opens a store of its own for it.
+/// (`Frame::Stores`): the tee lets go of its own, everything its sessions said in it already (each
+/// update is kept as it's handed on); each store is closed, as long as its disk takes to sync it (the
+/// new build waits for this frame, and opens no store meanwhile), and its files moved as `moves` says
+/// (its own first, then its copy of the server's). What couldn't be is left out, and the new build
+/// opens a store of its own for it.
 #[cfg(unix)]
 fn give_stores(held: &crate::convo::store::Held, own: Option<crate::convo::store::Store>, mirror: Option<crate::convo::store::Store>, moves: &[(PathBuf, PathBuf)]) -> crate::bluegreen::Frame {
     let _ = held.take();
@@ -1095,6 +1100,7 @@ async fn stop_new_build(sup: Option<crate::bluegreen::Supervisor>, green: crate:
 
 /// Whether process `pid` is gone within `patience` (looked at every 20 ms).
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // (e) polls a process's exit; its exit would tell
 async fn gone_within(pid: u32, patience: Duration) -> bool {
     let until = std::time::Instant::now() + patience;
     while crate::bluegreen::alive(pid) {
@@ -1380,9 +1386,12 @@ async fn sleep_until_opt(t: Option<Instant>) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (d) heartbeat and watchdog, QUIC's keepalive covers liveness; (a) samples at the server's sample_seconds; (e) facts every 10 min, picked graces
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
-    crate::updates::warm_own_binary().await;
+    // Its binary read beside its first connection, which says its build (`updates::runner_build`).
+    crate::updates::open_own();
+    crate::updates::read_own();
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -1741,6 +1750,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_signs = false;
     // The server takes custody records (docs/ci.md W27-R08).
     let mut server_custody = false;
+    // The server takes runners back as fast as it can, and so takes word that what this runner sends on its Welcome is
+    // out (`AgentMsg::Settled`; docs/resilience.md R5).
+    let mut server_admission = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, (Instant, Duration)> = HashMap::new();
     // The server takes word that a frame of its couldn't be read here (`AgentMsg::Unread`): of each
@@ -1825,7 +1837,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         }
         let sink = if convo.is_some() || waits {
-            let (sink, tee) = crate::convo::store::tee_held(harness_tx.clone(), convo.clone(), 8192);
+            let (sink, tee) = crate::convo::store::tee_held(harness_tx.clone(), convo.clone());
             convo_held = Some(tee);
             sink
         } else {
@@ -2200,7 +2212,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let empty = tracing::field::Empty;
                 match b {
                     Bg::Fetched { job, exe, build } => {
-                        let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %crate::updates::own_build(), to = %build, upgrade_id = %job, result = empty, error = empty);
+                        // Known since this runner said its build; this loop never waits for it either way.
+                        let from = crate::updates::own_binary_now().and_then(Result::ok).map_or_else(|| "unknown".to_owned(), |o| o.build);
+                        let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %from, to = %build, upgrade_id = %job, result = empty, error = empty);
                         let start = tracing::info_span!(target: "kiln::upgrade", parent: &root, "upgrade.start", result = empty, error = empty);
                         // The new build runs as another instance of this machine, newer than this one.
                         let gid = crate::util::new_id();
@@ -2852,6 +2866,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Err(e) = redials.connected(Instant::now()) {
                     tracing::warn!(error = %format!("{e:#}"), "what this runner learned of its dials isn't kept");
                 }
+                // Its admission, first (docs/resilience.md R5): a server over its limit tells it its turn, and lets go of
+                // what follows until it closes; one that admits it takes the rest. An older server skips it, as a test
+                // build's `old` runner never says it.
+                if !crate::runner::chaos::get().is_some_and(|c| c.old)
+                    && let Ok(b) = proto::encode(&AgentMsg::Admit)
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 // The machine it is (docs/machines.md, "One record a machine"), which process of it
                 // this is, then Hello (an older server skips the first two).
                 if !o.ephemeral
@@ -2877,10 +2899,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead. Its binary's hash was worked out as this runner
-                // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                // an outpost says it's one instead. Its binary is read from this runner's start, beside the
+                // connection (`updates::read_own`), its engine's probes off the event loop.
                 let building = Instant::now();
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
+                let mut build = if o.outpost { crate::updates::outpost_build().await } else { crate::updates::runner_build().await };
                 let build_took = building.elapsed();
                 if let AgentMsg::Build { caps, .. } = &mut build {
                     // It sends its conversations' store: the server keeps them from that (a new build
@@ -2916,14 +2938,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
                 let started = Instant::now();
-                let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
+                let facts = if !o.ephemeral && !o.outpost { Some(crate::updates::runner_facts().await) } else { None };
                 let facts_took = started.elapsed();
                 if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
@@ -3012,6 +3034,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_work = false;
                 work_said = None;
                 server_identity = false;
+                server_admission = false;
                 server_signs = false;
                 server_limit = false;
                 limit_said = None;
@@ -3591,6 +3614,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         // Custody records sent before go again: the server takes each once.
                         server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        server_admission = caps & proto::CAP_ADMISSION != 0;
                         shared.server_custody.store(server_custody, std::sync::atomic::Ordering::Release);
                         crate::runner::custody::server_checks(server_custody);
                         crate::runner::custody::server_relays(caps & proto::CAP_RELAYS != 0 && !o.ephemeral);
@@ -3781,6 +3805,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(true)).await;
                         }
+                        // What it sent on its Welcome is out, before this on its lane: its admission ends.
+                        if server_admission {
+                            own.0.send(Up::Term(AgentMsg::Settled)).await.ok();
+                        }
+                    }
+                    // Over its admission limit (docs/resilience.md R5): this runner's next dial at its turn, drawn within
+                    // it; it closes its link, whose frames the server lets go meanwhile.
+                    ServerMsg::Later { after_us, width_us } => {
+                        let (after, width) = (Duration::from_micros(after_us), Duration::from_micros(width_us));
+                        tracing::info!(after_ms = after.as_millis() as u64, width_ms = width.as_millis() as u64, "the server is taking runners back at the rate it can: dialing again at this runner's turn");
+                        redials.later(Instant::now(), after, width, rand::random());
+                        net.command(Out::Disconnect { peer: SERVER_PEER }).await;
+                    }
+                    // The server's drain (docs/resilience.md C3, step 5): it says when it expects to answer again, and
+                    // this runner's turn after that: the next dial then, not to a server that's down. It closes its link.
+                    ServerMsg::Back { after_us, width_us } => {
+                        let (after, width) = (Duration::from_micros(after_us), Duration::from_micros(width_us));
+                        tracing::info!(after_ms = after.as_millis() as u64, width_ms = width.as_millis() as u64, "the server is going down: dialing it again when it expects to answer");
+                        redials.back(Instant::now(), after, width, rand::random());
+                        net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                     }
                     ServerMsg::Refused { reason } => {
                         tracing::error!(%reason, "server refused this agent");
@@ -5548,7 +5592,7 @@ mod tests {
             };
             let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
             let (out, passed) = async_channel::unbounded();
-            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
             sink.send(("a1".to_owned(), said("m1", 1, "before the upgrade"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             let id = st.id().to_owned();
@@ -5597,7 +5641,7 @@ mod tests {
             st.send("a1", &said("m1", 1, "before the upgrade"));
             let id = st.id().to_owned();
             let (out, _passed) = async_channel::unbounded();
-            let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+            let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
             let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
             let began = Instant::now();
             let frame = crate::rt::blocking(move || give_stores(&held, Some(st), None, &moves)).await?;
@@ -5629,50 +5673,6 @@ mod tests {
         })
     }
 
-    /// The store goes to the new build once its tee has kept every update its sessions sent it, however
-    /// long that takes. Here what's after the tee takes nothing for half again the 10 s the handover once
-    /// waited for the tee at most (`TEE_DRAIN`), after which it took the store whatever the tee still
-    /// held, and that went nowhere: the handover waits, and the store it hands over holds every update.
-    #[cfg(unix)]
-    #[test]
-    fn a_store_goes_to_the_new_build_once_its_tee_has_kept_every_update_however_long_that_takes() -> anyhow::Result<()> {
-        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
-        crate::rt::block_on(async move {
-            let dir = tempfile::tempdir()?;
-            let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
-            std::fs::create_dir_all(&blue)?;
-            let upkeep = || crate::config::Conversations::default().upkeep();
-            let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
-            let id = st.id().to_owned();
-            // What's after the tee holds one update and takes none until it's read: the tee keeps the
-            // first and passes it on, keeps the second and waits to pass it on, and holds the third.
-            let (out, passed) = async_channel::bounded(1);
-            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
-            let sent: Vec<String> = (1..=3).map(|n| format!("update {n}")).collect();
-            for (n, text) in (1u64..).zip(&sent) {
-                sink.send(("a1".to_owned(), said(&format!("m{n}"), n, text))).await.map_err(|_| anyhow::anyhow!("closed"))?;
-            }
-            // Handed over on a thread of its own, as the runner hands it.
-            let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
-            let giver = std::thread::spawn(move || give_stores(&held, Some(st), None, &moves));
-            let once = Duration::from_secs(10);
-            crate::rt::sleep(once + once / 2).await;
-            anyhow::ensure!(!giver.is_finished(), "the store was handed over while its tee still held updates");
-            for _ in &sent {
-                passed.recv().await?;
-            }
-            let frame = crate::rt::blocking(move || giver.join()).await?.map_err(|_| anyhow::anyhow!("the handover panicked"))?;
-            let to = green.join(crate::convo::FILE).to_string_lossy().into_owned();
-            anyhow::ensure!(matches!(&frame, crate::bluegreen::Frame::Stores { own: Some(o), mirror: None } if *o == to), "the store wasn't handed over");
-            let there = crate::convo::open(&green, upkeep()).ok_or_else(|| anyhow::anyhow!("no store there"))?;
-            anyhow::ensure!(there.id() == id, "the new build went on in another store");
-            there.sync()?;
-            let kept = there.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>());
-            anyhow::ensure!(kept.as_ref() == Some(&sent), "not every update its sessions sent went with the store: {kept:?}");
-            Ok(())
-        })
-    }
-
     /// A store the new build couldn't open it sets aside there, kept whole, and goes on in a new
     /// one; rolled back, the runner being upgraded takes its own back as it was, from where the new
     /// build said it set it aside (or, its answer lost, under the first name), not the new build's.
@@ -5692,7 +5692,7 @@ mod tests {
                 st.send("a1", &said("m1", 1, "before the upgrade"));
                 let id = st.id().to_owned();
                 let (out, _passed) = async_channel::unbounded();
-                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
                 let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
                 let (h, m) = (held.clone(), moves.clone());
                 crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;

@@ -986,7 +986,7 @@ release pipeline runs there too (W28 step 3):
     source is the repository's mirror and `ci_workflows` (migration `20261017-1200_w02_workflows`);
     tests use a plain repository.
   - `ci/workflows.rs`: the routes of W02-R12.
-  - `kiln validate` in `main.rs`.
+  - `kiln validate` in `entry.rs`.
   - `pipeline::from_ir`.
 - *Tests.*
   - AC01, `crates/kiln-ci/tests/wf_corpus.rs`: 457 files (F-03: GitHub's starter workflows and 25

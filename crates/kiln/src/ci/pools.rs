@@ -96,6 +96,7 @@ const KEEP_SAMPLES: i64 = 7 * 24 * 3600;
 
 /// Each pool's size (starting, idle, busy) and the legs waiting for it, a minute apart from the
 /// server's start, for its scaling history (W21-R08), kept a week.
+#[allow(clippy::disallowed_methods)] // (c) pools' capacity sampled every minute; their own words could tell
 pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut first = true;
     loop {
@@ -353,6 +354,7 @@ async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> 
 /// Every 15 s, the executor pods (docs/ci.md W13-R07): one that ended goes; one that can't start
 /// (its image can't be pulled, its container made) for two minutes goes, its executor failed with
 /// why; one whose executor the scheduler hasn't got (stopped, or from before a restart) goes.
+#[allow(clippy::disallowed_methods)] // (c) Kubernetes: pool pods reaped every 15 s; its watch API would tell
 pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut stuck_since: HashMap<String, std::time::Instant> = HashMap::new();
     loop {

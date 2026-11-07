@@ -609,12 +609,20 @@ impl Info {
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it): a queue (`crate::memory::queue`)
-/// bounded in bytes (the server's own sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's,
-/// on their way to its loop, whose uplink bounds them in bytes; goal 5, plan 01a1a59c2aae), or a channel's
-/// sending end (tests'). Either way a sender waits for room: nothing is dropped.
+/// Where a session's updates go (the server's registry, or the uplink to it): straight to where they go ([`To`]), or,
+/// a runner's, kept in its conversation store on the way, in the session's own turn (`crate::convo::store::tee_held`).
+/// Either way a sender waits for room: nothing is dropped.
 #[derive(Clone, Debug)]
 pub enum Sink {
+    To(To),
+    Kept(Arc<crate::convo::store::Tee>),
+}
+
+/// Where a session's updates go past any store: a queue (`crate::memory::queue`) bounded in bytes (the server's own
+/// sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's, on their way to its loop, whose uplink bounds
+/// them in bytes; goal 5, plan 01a1a59c2aae), or a channel's sending end (tests').
+#[derive(Clone, Debug)]
+pub enum To {
     Bounded(crate::memory::queue::Sender<Local>),
     Channel(async_channel::Sender<(String, Update)>),
     /// A runner's: each update with when it was handed on ([`Taken`]; goal 10, plan 01a1a87b2dae step 5).
@@ -623,7 +631,7 @@ pub enum Sink {
 
 /// An update of session `session` on a runner's way to the server, with when its session handed it on: when
 /// the runner took it in, which its frame says how long before it was made (`crate::wire::stamp`; goal 10, plan
-/// 01a1a87b2dae step 5). What waits between (a tee's store, the runner's loop) is the runner's.
+/// 01a1a87b2dae step 5). What waits between (the store's room, the runner's loop) is the runner's.
 #[derive(Debug)]
 pub struct Taken {
     pub session: String,
@@ -631,7 +639,7 @@ pub struct Taken {
     pub at: std::time::Instant,
 }
 
-/// What a session of the server's own machine hands the server's registry ([`Sink::Bounded`]): its updates, then, the last
+/// What a session of the server's own machine hands the server's registry ([`To::Bounded`]): its updates, then, the last
 /// thing its task hands on, that the task is gone ([`Sink::gone`]).
 #[derive(Debug)]
 pub enum Local {
@@ -648,67 +656,90 @@ impl crate::memory::queue::Weigh for Local {
     }
 }
 
+/// Hands an update of a session of the server's own machine to its registry ([`Local::Said`]): what an error gives back is
+/// what went (a task's end is said by [`Sink::gone`] alone).
+async fn said(q: &crate::memory::queue::Sender<Local>, (session, update): (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
+    q.send(Local::Said(session, update)).await.map_err(|e| {
+        async_channel::SendError(match e.0 {
+            Local::Said(session, update) => (session, update),
+            Local::Gone(session) => (session, Update::Closed),
+        })
+    })
+}
+
 impl Sink {
     /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
-    /// updates any more. A runner's sink notes when ([`Sink::Stamped`]).
+    /// updates any more. A runner's sink notes when ([`To::Stamped`]), and keeps it in its store first ([`Sink::Kept`]).
     pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
-        match self {
-            Sink::Bounded(q) => {
-                let (session, update) = update;
-                // What an error gives back is what went: an update (a task's end is said by `gone` alone).
-                q.send(Local::Said(session, update)).await.map_err(|e| {
-                    async_channel::SendError(match e.0 {
-                        Local::Said(session, update) => (session, update),
-                        Local::Gone(session) => (session, Update::Closed),
-                    })
-                })
+        let (to, t) = match self {
+            Sink::To(To::Bounded(q)) => return said(q, update).await,
+            Sink::To(To::Channel(c)) => return c.send(update).await,
+            Sink::To(to) => (to, Taken { session: update.0, update: update.1, at: std::time::Instant::now() }),
+            Sink::Kept(tee) => {
+                let t = Taken { session: update.0, update: update.1, at: std::time::Instant::now() };
+                tee.keep(&t).await;
+                (tee.next(), t)
             }
-            Sink::Channel(c) => c.send(update).await,
-            Sink::Stamped(q) => {
-                let (session, update) = update;
-                q.send(Taken { session, update, at: std::time::Instant::now() }).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
-            }
-        }
-    }
-
-    /// Hands on an update taken in before (a tee passing a runner's updates on): when it was taken in goes with
-    /// it where this sink keeps that ([`Sink::Stamped`]), never noted again here.
-    /// Its error boxed: an update and its stamp are large, and its callers ask only whether it went.
-    pub async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
-        let Taken { session, update, at } = t;
-        let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
-        match self {
-            Sink::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
-            Sink::Bounded(_) => self.send((session, update)).await.map_err(|e| back(e.0)),
-            Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
-        }
+        };
+        to.send_taken(t).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
     }
 
     /// Session `session`'s task is gone, whatever ended it: the last thing it hands on, after all it said. The server's own
     /// registry lets go then of what it held for the session until nothing it said could still be on its way (a close's hold:
     /// `super::copies::Shard::close`, HARNESS-4); a runner's sink and a test's take nothing for it.
     pub async fn gone(&self, session: &str) {
-        if let Sink::Bounded(q) = self {
+        if let Sink::To(To::Bounded(q)) = self {
             let _ = q.send(Local::Gone(session.to_owned())).await;
         }
     }
 }
 
+impl To {
+    /// Hands on an update taken in before: when it was taken in goes with it where this keeps that ([`To::Stamped`]).
+    async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
+        let Taken { session, update, at } = t;
+        let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
+        match self {
+            To::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
+            To::Bounded(q) => said(q, (session, update)).await.map_err(|e| back(e.0)),
+            To::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
+        }
+    }
+}
+
+impl From<crate::memory::queue::Sender<Taken>> for To {
+    fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
+        To::Stamped(q)
+    }
+}
+
+impl From<crate::memory::queue::Sender<Local>> for To {
+    fn from(q: crate::memory::queue::Sender<Local>) -> Self {
+        To::Bounded(q)
+    }
+}
+
+impl From<async_channel::Sender<(String, Update)>> for To {
+    fn from(c: async_channel::Sender<(String, Update)>) -> Self {
+        To::Channel(c)
+    }
+}
+
 impl From<crate::memory::queue::Sender<Taken>> for Sink {
     fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
-        Sink::Stamped(q)
+        Sink::To(To::Stamped(q))
     }
 }
 
 impl From<crate::memory::queue::Sender<Local>> for Sink {
     fn from(q: crate::memory::queue::Sender<Local>) -> Self {
-        Sink::Bounded(q)
+        Sink::To(To::Bounded(q))
     }
 }
 
 impl From<async_channel::Sender<(String, Update)>> for Sink {
     fn from(c: async_channel::Sender<(String, Update)>) -> Self {
-        Sink::Channel(c)
+        Sink::To(To::Channel(c))
     }
 }
 
@@ -1696,6 +1727,7 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
 
 /// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
 /// still in it ended at once, then the group removed.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 fn end_group(g: crate::os::contain::Group, after: Duration) {
     crate::rt::spawn(async move {
         crate::rt::sleep(after).await;
@@ -1758,6 +1790,7 @@ fn kill_command(root: u32, command: &str) -> bool {
 }
 
 /// Wait (up to `wait`) for `pid` to be gone: whether it is.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 async fn gone(pid: u32, wait: Duration) -> bool {
     let end = Instant::now() + wait;
     while crate::os::pid_alive(pid) {
@@ -2535,6 +2568,7 @@ struct Synced {
 /// sent, their contents on the server, the log having brought them back), then where the copy
 /// stands, for the machine it goes to to take the log that far before it goes on there. None: its
 /// folder isn't a synced copy here. An error, and it doesn't leave: it would leave work behind.
+#[allow(clippy::disallowed_methods)] // (e) a session's files flushed every FILES_EVERY; their writes could tell
 async fn files_out(s: &Session, cwd: &str, to: &str) -> Result<Option<Synced>, String> {
     let Some(sync) = crate::sync::runner::global() else { return Ok(None) };
     let folder = std::path::Path::new(cwd);
@@ -2758,6 +2792,7 @@ enum Arrived {
 /// A session that moved here goes on once its folder has taken its repo's sync log as far as the
 /// machine it left had it: it never starts on files older than the ones it left. Messages sent
 /// meanwhile wait in `carry`; closing it ends the wait.
+#[allow(clippy::disallowed_methods)] // (e) a session's files looked at every second; their writes could tell
 async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ctl_rx: &crate::memory::queue::Receiver<Ctl>, carry: &mut Vec<Command>, files: &Files) -> Arrived {
     let note = |text: String, level: Level| s.core.lock().upsert("move-files", None, super::model::Body::Notice { level, text });
     let Some(sync) = crate::sync::runner::global() else {
@@ -2854,6 +2889,7 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
 /// with it and its inbox here is fenced first, as for a move (`ids`, `fence`; CP-T3.2): the newer
 /// process keeps an inbox of its own. With no word of how it went, it waits here and asks again
 /// until it's known, as a move does.
+#[allow(clippy::disallowed_methods)] // (e) its hand-over's settle sleeps, passed to hand_to_newer_by
 async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
     let id = s.id.clone();
     let send = |bytes: Vec<u8>| {
@@ -2979,6 +3015,7 @@ async fn unfenced(s: &Session, fence: &FenceFor, why: String) -> String {
 /// and queue, over reach. Ok once that runner has taken it over and runs it. One that may have taken
 /// it (all of it went, and no answer came) is asked again until it says: meanwhile the session
 /// takes nothing here.
+#[allow(clippy::disallowed_methods)] // (e) a hand-over's measured pause
 async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &CarriedIds, fence: &FenceFor, settle: &SettleFor) -> Result<(), String> {
     use super::moving::Carry;
     if mv.local {
@@ -3191,6 +3228,7 @@ fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static 
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // (e) a session's next due time; a picked 1.5 s look
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queue::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, carried: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) {
     // The harness it runs in (a switch changes it); what it says is marked as its.
     let mut kind = kind;

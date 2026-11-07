@@ -883,6 +883,7 @@ pub fn set_server_policies(layers: Vec<(reap::Scope, reap::Policy)>) {
 
 /// W24-R31: the reaper's clock on this runner. Every minute it checks whether free space, the
 /// ceiling or the schedule calls for a reap; it starts once per process.
+#[allow(clippy::disallowed_methods)] // (e) warm workspaces reaped every minute; their expiries are deadlines
 pub fn start_reaper(work: &Path) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let work = work.to_path_buf();

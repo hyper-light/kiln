@@ -9,6 +9,8 @@
 //!
 //! The events are the lab's mix (`crates/kiln-lab/src/standin.rs`, `benches/session_feed.rs`): a fifth tool
 //! calls with their output, the rest thoughts and replies of a few hundred words.
+// Tests drive real time: they wait on it as they must (kiln's `clippy.toml` timers are for what ships).
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 

@@ -207,6 +207,7 @@ fn adopt(l: std::net::TcpListener) -> io::Result<hyper_rt::tcp::TcpListener> {
 }
 
 /// Serve HTTPS on `port` with what `shared` holds.
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub fn listen_https(port: u16, shared: &Arc<Shared>) -> io::Result<Listening> {
     let (std_listener, bound) = bind(port)?;
     let stop = Shutdown::new();
@@ -255,6 +256,7 @@ pub fn listen_https(port: u16, shared: &Arc<Shared>) -> io::Result<Listening> {
 /// Keeps [`Shared::h2`] saying whether the upstream speaks HTTP/2: asked at once when the upstream
 /// changes (not offered until it answers), and every [`PROBE_EVERY`] (it may be upgraded, or
 /// rolled back), until `stop`.
+#[allow(clippy::disallowed_methods)] // (e) follows its h2 connection every second; its close would tell
 async fn follow_h2(shared: Arc<Shared>, stop: Shutdown) {
     let mut asked: Option<(String, Instant)> = None;
     loop {
@@ -620,6 +622,7 @@ fn html_escape(s: &str) -> String {
 
 /// Plain HTTP on `port`: kiln's CA and, at an address, how to trust it; everything else
 /// redirected to the HTTPS front door.
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub fn listen_redirect(port: u16, redirect: &Arc<Redirect>) -> io::Result<Listening> {
     let (std_listener, bound) = bind(port)?;
     let stop = Shutdown::new();

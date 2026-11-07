@@ -451,6 +451,7 @@ pub(crate) fn try_of(cfg: &crate::config::ci::Ci, branch: &str) -> super::dispat
 }
 
 /// The job run at `sha`, to its end: its conclusion, or given a test, the test's own result in it.
+#[allow(clippy::disallowed_methods)] // (e) polls a bisection's run; the run's end could tell
 async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: &str, trusted: bool) -> Tried {
     let mut vars = BTreeMap::new();
     if let (Some(test), Some(unit)) = (&b.test, &b.unit) {

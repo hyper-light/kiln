@@ -313,6 +313,7 @@ pub struct Refresh {
 
 impl Refresh {
     /// Keeps `files` fresh from now on, every four minutes, until the leg lets go of it.
+    #[allow(clippy::disallowed_methods)] // (e) credentials refreshed every 240 s; their expiries are the deadlines
     pub fn start(http: Arc<crate::http::client::Client>, url: String, request_token: String) -> Arc<Refresh> {
         let r = Arc::new(Refresh { files: Mutex::new(Vec::new()), fresh: Mutex::new(Vec::new()), url, request_token, http });
         let weak: Weak<Refresh> = Arc::downgrade(&r);

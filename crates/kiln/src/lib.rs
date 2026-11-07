@@ -1,5 +1,11 @@
 //! kiln: a self-hosted GitOps CI/CD job server for the hyper-light stack.
 
+// Tests drive real time: they wait on it as they must (`clippy.toml`'s timers are for what ships).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
+// The binary's commands (`entry`) name the library `kiln::`, as they did from the binary's own crate.
+extern crate self as kiln;
+
 pub mod access;
 pub mod accounts;
 pub mod audit;
@@ -28,6 +34,7 @@ pub mod dirs;
 pub mod doctor;
 pub mod discovery;
 pub mod dns;
+pub mod entry;
 pub mod exec;
 pub mod fleet;
 pub mod frontdoor;

@@ -688,6 +688,7 @@ impl Notifier {
 }
 
 /// An email's delivery: tried again on what the relay says is transient, not on what it refuses.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn deliver_email(job: &Job) -> (bool, String) {
     let Integration::Email { to, from, host, port, security, username, password, ca } = &job.integration else { return (false, "not an email integration".into()) };
     let relay = super::smtp::Relay { host: host.clone(), port: port.unwrap_or(security.port()), security: *security, username: username.clone(), password: password.clone(), ca: ca.clone() };
@@ -743,6 +744,7 @@ impl Answer {
 /// One call to a service, tried as a notification is: again after a network error, a 429 (after
 /// its `Retry-After`) or a 5xx, the wait doubling from a second, five tries; any other 4xx is the
 /// service refusing it (trying again changes nothing), said in its words.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn call(http: &Client, method: Method, url: &str, headers: &[(String, String)], body: Option<&[u8]>) -> Result<Answer, String> {
     let mut wait = BACKOFF;
     let mut outcome = String::new();

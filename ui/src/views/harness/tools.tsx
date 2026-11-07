@@ -14,7 +14,7 @@ import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
-import { Prose } from "./parts";
+import { Prose } from "./prose";
 
 const MCP_DOT: Record<string, string> = { connected: "succeeded", pending: "queued", failed: "failed", needs_auth: "timed_out", disabled: "cancelled" };
 const MCP_LABEL: Record<string, string> = { connected: "connected", pending: "connecting", failed: "failed", needs_auth: "needs sign-in", disabled: "off" };

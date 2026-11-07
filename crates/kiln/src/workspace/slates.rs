@@ -199,6 +199,7 @@ fn starting() -> &'static futures::lock::Mutex<()> {
 }
 
 /// The instance answers, its anchor started (and its one-node group made) when it wasn't running.
+#[allow(clippy::disallowed_methods)] // (c) polls slates' start; its own word would tell
 pub async fn ensure_up() -> anyhow::Result<()> {
     if up().await {
         return Ok(());

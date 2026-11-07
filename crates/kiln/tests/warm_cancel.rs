@@ -5,6 +5,8 @@
 //! target directory, at the same path. The warm build concludes as the cold one, with the same test
 //! outcomes and the same release binary, `a` fresh and `b`, cut off, rebuilt: what a cancelled
 //! leg's workspace going back to its lane relies on (W24-R11).
+// Tests drive real time: they wait on it as they must (kiln's `clippy.toml` timers are for what ships).
+#![allow(clippy::disallowed_methods)]
 
 #![cfg(unix)]
 

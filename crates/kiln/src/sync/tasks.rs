@@ -907,6 +907,7 @@ async fn wait_news(hub: &Arc<Hub>, id: &str, machine: &str, ids: &[String]) -> R
 
 /// Waits for a synced copy to be in step, having looked at its folder and taken the group's files
 /// if it was to; how it is doing shown on the tasks `ids`.
+#[allow(clippy::disallowed_methods)] // (e) polls a step's task; its news could tell
 async fn wait_in_step(hub: &Arc<Hub>, repo: &str, member: u64, ids: &[String], what: &str) -> Result<(), String> {
     let start = Instant::now();
     let mut bad: Option<Instant> = None;

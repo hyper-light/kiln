@@ -166,6 +166,7 @@ static KICK: LazyLock<crate::rt::Notify> = LazyLock::new(crate::rt::Notify::new)
 
 /// Keeps the pending legs for as long as the server runs, and with the engine on (`index`) indexes
 /// them as they finish. With it off nothing is indexed, and the pending are what the search counts.
+#[allow(clippy::disallowed_methods)] // (e) the index's upkeep every 30 s; legs finishing could tell
 pub fn spawn(hub: Arc<Hub>, index: bool) {
     crate::rt::spawn(async move {
         loop {

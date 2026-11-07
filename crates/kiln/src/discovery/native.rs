@@ -35,6 +35,7 @@ pub async fn run(_: &Arc<Discovery>, _: &Shutdown, _: &Arc<dyn Fn() + Send + Syn
 /// Register and browse through the system until `shutdown`. An error means it could not start
 /// (the caller falls back to kiln's own multicast DNS); later failures are retried.
 #[cfg(any(target_os = "macos", windows))]
+#[allow(clippy::disallowed_methods)] // (c) the OS's mDNS service browsed every 15 s
 pub async fn run(d: &Arc<Discovery>, shutdown: &Shutdown, on_change: &Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::net::IpAddr;

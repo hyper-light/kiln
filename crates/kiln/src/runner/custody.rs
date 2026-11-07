@@ -366,6 +366,7 @@ pub(crate) fn cluster_signer() -> Option<String> {
 /// [`cluster_signer`], waited for up to `within` while it may yet come: its server hasn't said yet
 /// whether it takes custody records, or it does and this process's identity isn't certified yet. A
 /// learner starting waits for it before it fetches a copy or says it checks the log.
+#[allow(clippy::disallowed_methods)] // (e) polls for the cluster's signer; its word could tell
 pub(crate) async fn cluster_signer_within(within: std::time::Duration) -> Option<String> {
     use std::sync::atomic::Ordering::Relaxed;
     let until = std::time::Instant::now() + within;

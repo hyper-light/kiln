@@ -126,6 +126,7 @@ pub fn start(ctx: Ctx, shutdown: &Shutdown) -> Handle {
 }
 
 /// After `wait`, or never.
+#[allow(clippy::disallowed_methods)] // (e) a front door's next look at its due time
 async fn soon(wait: Option<Duration>) {
     match wait {
         Some(d) => crate::rt::sleep(d).await,
@@ -133,6 +134,7 @@ async fn soon(wait: Option<Duration>) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (c) the front door's state looked at every TICK; its processes have no word
 async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
     let mut fd = FrontDoor::new(ctx);
     let mut tick = Interval::new(TICK);

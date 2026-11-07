@@ -184,6 +184,7 @@ struct Keeper {
 
 /// Keep the copies under `base` (`~/.kiln/reach`), as the node at `handle` notes their uses in
 /// `using`.
+#[allow(clippy::disallowed_methods)] // (e) the keeper's next turn after a picked TICK
 pub fn start(handle: Handle, using: Arc<Using>, base: PathBuf) {
     crate::rt::spawn(async move {
         let mut k = Keeper { base, using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };

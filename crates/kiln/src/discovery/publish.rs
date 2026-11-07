@@ -480,6 +480,7 @@ fn set_status(d: &Discovery, result: Result<(), String>) {
 }
 
 /// Keep this instance published until `shutdown`, then withdraw it.
+#[allow(clippy::disallowed_methods)] // (c) the published record checked every CHECK_EVERY
 pub async fn run(d: &Arc<Discovery>, shutdown: &Shutdown) {
     let Some(p) = d.settings.publish.clone() else { return };
     if !d.announcing() {

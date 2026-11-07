@@ -1,0 +1,13 @@
+# kiln's lint configuration. Clippy reads the clippy.toml nearest a crate's manifest, so this one is kiln's alone.
+
+# No clock without a due item (Ada, 2026-11-07; goal 9, plan 01a1a87b2cec step 5): a loop sleeps on events (a write
+# watched, a notifier its writer signals), and a timer exists only while a pending item has a due time, armed for the
+# earliest one (`rt::sleep_until`, `rt::due`, `Shutdown::sleep_until`); an operation's own deadline is `rt::timeout`.
+# Test code is exempt (the crate root says so). An allow at a site says which kind it is, in one line, so the next
+# round plans itself: (a) a user-set interval, (b) a retry backoff, (c) an external system with no notification,
+# (d) a heartbeat, (e) other, with why.
+disallowed-methods = [
+  { path = "kiln::rt::Interval::new", reason = "event-driven: watch the state or arm a deadline" },
+  { path = "kiln::rt::sleep", reason = "event-driven: watch the state or arm a deadline" },
+  { path = "kiln::rt::Shutdown::sleep", reason = "event-driven: watch the state or arm a deadline" },
+]

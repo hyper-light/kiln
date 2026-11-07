@@ -186,6 +186,7 @@ impl Watcher {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (c) tailscaled polled every LOOK_EVERY; its IPN bus would tell
 async fn watch(w: Arc<Watched>, stop: Shutdown) {
     loop {
         let probe = w.probe.lock().clone();
@@ -469,6 +470,7 @@ impl TailnetDns {
 }
 
 /// Keep the tailnet's split DNS on the front doors: now and then, and whenever woken.
+#[allow(clippy::disallowed_methods)] // (c) tailnet DNS synced every SYNC_EVERY; tailscaled's IPN bus would tell
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     // Runners report within moments of the server starting: give them that before the first look.
     if !hub.shutdown.sleep(Duration::from_secs(20)).await {

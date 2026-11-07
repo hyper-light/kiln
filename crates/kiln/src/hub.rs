@@ -27,6 +27,7 @@ use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
 
+pub mod admission;
 mod build;
 
 /// The server's secrets as `cfg` says them, a `file:` one read from its file (blocking: [`Hub::job_secrets`] reads them
@@ -50,6 +51,9 @@ const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 const HISTORY: usize = 720;
 /// How long an agent that declined a job is not offered that job again.
 const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
+/// How long a runner sent a job's Cancel for passing its limit has to say it ended, before the server settles the job
+/// itself.
+const CANCEL_WAIT: Duration = Duration::from_secs(60);
 /// How long a command whose caller doesn't wait for it is waited for, to log what came of it.
 pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
 /// How long a runner is given to say it froze a job, or let it go on (docs/ci.md W26-R22): its
@@ -80,6 +84,49 @@ pub enum Launch {
     /// No pod is on its way: launch again from `at`. `check_pods` when the failed attempt may
     /// have left a pod behind (an API timeout) or a dead one may hold the name.
     Retry { at: Instant, check_pods: bool },
+}
+
+/// The scheduler loop's state between its wakes ([`Hub::scheduler_loop`]; goal 9, plan 01a1a87b2cec step 5).
+struct Scheduler {
+    /// Whether jobs waited at its last look.
+    waiting: bool,
+    /// When its last look began: a placement's wait that ended before it is one that look saw.
+    looked: Instant,
+    /// When its last check began, and its unix second: what fell due before it, that check took.
+    checked: Option<(Instant, i64)>,
+    /// When the first job running with a limit passes it after the last check (unix seconds).
+    timeout_at: Option<i64>,
+    /// When the next secret falls unused (unix seconds).
+    secrets_at: Option<i64>,
+}
+
+/// What woke the scheduler loop.
+#[derive(Clone, Copy)]
+enum Woke {
+    Started,
+    /// [`Hub::wake`].
+    Told,
+    /// A write to the jobs.
+    Jobs,
+    /// A write to the runners' records ([`Hub::runners`]).
+    Runners,
+    /// A write to the secrets.
+    Secrets,
+    /// The first of its deadlines passed.
+    Due(Due),
+}
+
+/// The scheduler's first deadlines ([`Hub::scheduler_due`]): what to check, and while jobs wait, what to place.
+#[derive(Clone, Copy)]
+struct Due {
+    check: Option<Instant>,
+    place: Option<Instant>,
+}
+
+impl Due {
+    fn first(self) -> Option<Instant> {
+        [self.check, self.place].into_iter().flatten().min()
+    }
 }
 
 /// How long an outpost invite works ([`OutpostInvites`]).
@@ -529,8 +576,13 @@ pub struct Hub {
     pub net: NetHandle,
     pub pki: Arc<crate::pki::Pki>,
     /// Every runner's live record, by name: a copy read without a lock, each record changed by
-    /// swapping a new copy of it in with the rest ([`Hub::change_agent`]; goal 5, plan 01a1a59c2aae).
-    pub agents: crate::rcu::Rcu<HashMap<String, Arc<AgentLive>>>,
+    /// swapping a new copy of it in with the rest ([`Hub::change_agent`]; goal 5, plan 01a1a59c2aae). Each
+    /// write told to [`Hub::runners`].
+    pub agents: crate::rcu::Watched<HashMap<String, Arc<AgentLive>>>,
+    /// Told after every write to the runners' records, their processes and the processes lost
+    /// ([`crate::rcu::Watched`]): what the scheduler places jobs by and arms its deadlines by, so it looks
+    /// when they change, and never on a tick to find out (goal 9, plan 01a1a87b2cec step 5).
+    pub(crate) runners: Arc<crate::rt::Changed>,
     /// The labels of the runners kiln knows by their machine id, by name, as the store keeps them
     /// (docs/machines.md): what [`Hub::shown`] says of one that hasn't connected since this server
     /// started, and repo sync of the machines its activity names. Loaded as it starts
@@ -610,6 +662,9 @@ pub struct Hub {
     /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
     /// loop sends them now rather than on its next tick.
     commands_due: Notify,
+    /// Told when an integration is made, changed or removed (`crate::ci::integrations`): the replies' reader reads
+    /// their list again (`crate::ci::replies::run`).
+    pub integrations_changed: Notify,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: crate::rcu::Rcu<HashMap<String, Arc<Vec<crate::aisessions::AiSession>>>>,
     /// Questions asked of runners (transcripts, views, folders, a doctor's look) waiting for their
@@ -625,11 +680,17 @@ pub struct Hub {
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
+    /// When it started, in unix milliseconds: what the pages count its uptime from, so nothing of the server's is made
+    /// again as its uptime goes on (goal 9, plan 01a1a87b2cec step 5).
+    pub started_ms: i64,
     pub generation: u64,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
     /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
     pub comeback: crate::comeback::Comeback,
+    /// Runners reconnecting taken back only as fast as the server can, and its drain's notice to them
+    /// (docs/resilience.md R5; [`admission`]).
+    pub admission: admission::Admission,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -676,10 +737,10 @@ pub struct Hub {
     pub joins: crate::join::Requests,
     /// Each machine's runner processes and what each one holds (see `crate::instances`): a copy read
     /// without a lock, changed by swapping a new one in (goal 5, plan 01a1a59c2aae).
-    pub instances: crate::rcu::Rcu<crate::instances::Instances>,
+    pub instances: crate::rcu::Watched<crate::instances::Instances>,
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
-    lost_instances: crate::rcu::Rcu<HashMap<PeerId, (String, Instant, Vec<String>)>>,
+    lost_instances: crate::rcu::Watched<HashMap<PeerId, (String, Instant, Vec<String>)>>,
     /// Agent sessions on their way from a machine's older runner processes to its newest
     /// (`crate::handovers`).
     pub(crate) handovers: Mutex<crate::handovers::Handovers>,
@@ -784,6 +845,7 @@ impl Hub {
         let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         let live = crate::live::Live::new(&cfg.server);
+        let runners = Arc::new(crate::rt::Changed::new());
         let hub = Arc::new(Self {
             cfg,
             store,
@@ -791,7 +853,7 @@ impl Hub {
             logs,
             net,
             pki,
-            agents: crate::rcu::Rcu::default(),
+            agents: crate::rcu::Watched::new(HashMap::new(), &runners),
             labels,
             machine_names: Default::default(),
             said_machine: Default::default(),
@@ -816,6 +878,7 @@ impl Hub {
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
+            integrations_changed: Notify::new(),
             ai_sessions: Default::default(),
             ai_requests: Default::default(),
             ai_seq: AtomicU64::new(1),
@@ -824,9 +887,11 @@ impl Hub {
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
+            started_ms: crate::util::now_ms(),
             generation,
             runners_before: AtomicU64::new(0),
             comeback: crate::comeback::Comeback::default(),
+            admission: admission::Admission::new(clock.now()),
             admin_token,
             join_token,
             ephemeral_tokens: Default::default(),
@@ -848,8 +913,9 @@ impl Hub {
             declined: Default::default(),
             discovery,
             joins: crate::join::Requests::default(),
-            instances: crate::rcu::Rcu::default(),
-            lost_instances: Default::default(),
+            instances: crate::rcu::Watched::new(crate::instances::Instances::default(), &runners),
+            lost_instances: crate::rcu::Watched::new(HashMap::new(), &runners),
+            runners,
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
@@ -1064,6 +1130,7 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
+        self.terminals.told();
         self.emit(&ServerEvent::Terminals);
     }
 
@@ -1137,6 +1204,10 @@ impl Hub {
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
+            // Ended however it ended: a requeue of it waits for no step (`crate::comeback`).
+            if j.status.is_terminal() {
+                self.comeback.ended(job_id);
+            }
             j.spec = None;
             self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
@@ -1144,6 +1215,10 @@ impl Hub {
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
+            // Its queued jobs too, which a cancelled run doesn't tell one by one.
+            if r.status.is_terminal() {
+                self.comeback.run_ended(run_id);
+            }
             self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
@@ -1336,6 +1411,12 @@ impl Hub {
 
     /// The audit log's rows a minute for what the wires couldn't read, as they come due.
     pub(crate) async fn tick_unread(&self) {
+        // Its copy swapped only once a minute's over (goal 9, plan 01a1a87b2cec step 5): swapped at each of the commands
+        // loop's seconds, it was a new copy a second, and the runners' list kept ahead of what it's made of (this copy
+        // among it, `crate::reads::AgentsKey`) was made again for the read after, on the compute pool.
+        if !self.refusals.load().due() {
+            return;
+        }
         let rows = self.refusals.update(crate::wire::unread::Refusals::tick);
         self.audit_unread(rows).await;
     }
@@ -1570,6 +1651,7 @@ impl Hub {
     /// What the runner process holding what `msg` is about (`crate::instances`' routing) says it
     /// can do: 0 for nothing, or no such process. One that has just connected says it a moment
     /// after (its build, then its capabilities), so this waits up to three seconds for it.
+    #[allow(clippy::disallowed_methods)] // (e) waits a picked while for a runner's Caps
     pub async fn routed_caps(&self, machine: &str, msg: &ServerMsg) -> u32 {
         for _ in 0..30 {
             let to = self.route(machine, msg);
@@ -1810,6 +1892,7 @@ impl Hub {
 
     /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands"), once a
     /// second: answers overdue, parked commands whose runner never came back.
+    #[allow(clippy::disallowed_methods)] // left to its owner (the Kiln vs. T3Code agent): the wire's deadlines (RTOs, COMING_FOR, PARK_FOR, HAVE_AGAIN)
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(1));
         let mut said = Instant::now();
@@ -2244,20 +2327,115 @@ impl Hub {
         Ok(folded)
     }
 
-    /// What runners took to come back before this start, from kiln.db ([`crate::comeback`]): the grace their jobs and
-    /// attaches get from now on.
+    /// What runners took to come back and requeues cost before this start, from kiln.db ([`crate::comeback`]): the grace
+    /// their jobs and attaches get from now on.
     pub async fn take_comebacks(&self) {
-        if let Ok(Some(kept)) = self.store.kv_get(crate::comeback::KEY.to_owned()).await {
-            self.comeback.take_kept(&kept);
+        let kept = self.store.kv_get(crate::comeback::KEY.to_owned()).await;
+        if let Err(e) = kept.and_then(|kept| kept.map_or(Ok(()), |kept| self.comeback.take_kept(&kept))) {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost before this start wasn't taken: the grace starts from their redials");
         }
+    }
+
+    /// What admissions and this server's restarts taught the runs before this one, from kiln.db, and the restart
+    /// this start ends, learned as the server answers runners again; `started`, how long this start took
+    /// ([`admission`]; docs/resilience.md R5).
+    pub async fn take_admission(&self, started: Duration) {
+        let mut kept = [None, None, None];
+        for (k, key) in kept.iter_mut().zip([admission::KEY, admission::RESTARTS, admission::STOPPED]) {
+            match self.store.kv_get(key.to_owned()).await {
+                Ok(v) => *k = v,
+                Err(e) => tracing::warn!(key, error = %format!("{e:#}"), "what an earlier run learned of admissions wasn't read: learning it again"),
+            }
+        }
+        let [admissions, restarts, stopped] = kept;
+        self.admission.take_kept(admissions.as_deref(), restarts.as_deref());
+        // How long ago it began to stop, by the wall clock it kept that by: none if that clock went back since.
+        let ago = stopped.as_deref().and_then(|ms| ms.trim().parse::<i64>().ok()).and_then(|ms| u64::try_from(self.clock.unix_ms().saturating_sub(ms)).ok()).map(Duration::from_millis);
+        if let Some(text) = self.admission.answering(started, ago)
+            && let Err(e) = self.store.kv_set(admission::RESTARTS.to_owned(), text).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "how long this server took to restart wasn't kept");
+        }
+        // Taken once: a stop with no drain after it (a crash) teaches nothing from this one.
+        if stopped.is_some()
+            && let Err(e) = self.store.kv_delete(admission::STOPPED.to_owned()).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "when this server last began to stop wasn't let go");
+        }
+        tracing::info!(limit = self.admission.limit(), turn_us = self.admission.turn().map(|d| d.as_micros() as u64), restart_ms = self.admission.restart().map(|d| d.as_millis() as u64), "admission of runners reconnecting");
+    }
+
+    /// The server's drain, as it stops (docs/resilience.md C3, step 5): when it began to, and what admissions taught it,
+    /// kept for its next start; and, declared (`[server] admission`), each runner that takes it told when the server
+    /// expects to answer again and its turn after that ([`admission::Admission::back`]), then waited for as it closes
+    /// its link, for as long as the transport's idle timeout at most (a runner silent that long is gone already).
+    pub async fn drain_notice(&self) {
+        for (key, value) in [(admission::STOPPED, self.clock.unix_ms().to_string()), (admission::KEY, self.admission.kept())] {
+            if let Err(e) = self.store.kv_set(key.to_owned(), value).await {
+                tracing::warn!(key, error = %format!("{e:#}"), "what this server's next start learns from wasn't kept");
+            }
+        }
+        if !self.cfg.server.admission {
+            return;
+        }
+        let Some(restart) = self.admission.restart() else { return };
+        let mut told: Vec<PeerId> = {
+            let instances = self.instances.load();
+            self.peers.load().keys().copied().filter(|p| instances.get(*p).is_some_and(|i| i.wide & proto::CAP_ADMISSION != 0)).collect()
+        };
+        told.sort_unstable();
+        let left = self.admission.leaving(&told);
+        for (k, peer) in told.iter().enumerate() {
+            let (after_us, width_us) = self.admission.back(k, restart).micros();
+            self.send_peer(*peer, &ServerMsg::Back { after_us, width_us }).await;
+        }
+        tracing::info!(runners = told.len(), restart_ms = restart.as_millis() as u64, "told runners when this server expects to answer again");
+        if crate::rt::timeout(crate::net::limits(true).idle_timeout, left).await.is_err() {
+            tracing::info!("runners told of the drain still connected as the transport's idle timeout passed: their links close");
+        }
+    }
+
+    /// `turn` told to runner `peer`, over the admission limit: it closes its link and dials again then.
+    async fn tell_turn(&self, peer: PeerId, turn: admission::Turn) {
+        let (after_us, width_us) = turn.micros();
+        tracing::debug!(peer, after_us, width_us, in_progress = self.admission.in_progress(), limit = self.admission.limit(), "a runner over the admission limit is told its turn");
+        self.send_peer(peer, &ServerMsg::Later { after_us, width_us }).await;
+    }
+
+    /// What's learned of comebacks and requeues, kept for the next start ([`crate::comeback`]).
+    async fn keep_comebacks(&self, kept: String) {
+        if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost wasn't kept for the next start");
+        }
+    }
+
+    /// Puts job `job`, which ran on runner `on`, back in the queue, or fails it when it's out of retries; requeued, what
+    /// that costs is learned once it's under way elsewhere ([`crate::comeback`]).
+    async fn requeue(&self, job: &str, on: &str, reason: String) -> anyhow::Result<bool> {
+        let requeued = self.store.requeue_job(job.to_owned(), reason).await?;
+        match self.store.job(job.to_owned()).await? {
+            Some(j) if j.status == Status::Queued => self.comeback.requeued(job, &j.run_id, on, Instant::now()),
+            _ => self.comeback.ended(job),
+        }
+        Ok(requeued)
+    }
+
+    /// Requeues whose runs were deleted (with their repository) wait for no step ([`crate::comeback`]).
+    pub async fn runs_deleted(&self) -> anyhow::Result<()> {
+        for run in self.comeback.requeued_runs() {
+            if self.store.run(run.clone()).await?.is_none() {
+                self.comeback.run_ended(&run);
+            }
+        }
+        Ok(())
     }
 
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
     /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
-    /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
-    /// than the grace, as pods connected before it started may still come back.
+    /// forgotten. Its jobs and their history keep its name. Nothing until the server has heard its
+    /// runners for the grace, as pods connected before it started may still come back.
     pub async fn forget_finished_pods(&self) -> Vec<String> {
-        if self.started.elapsed() <= self.comeback.grace() {
+        if self.comeback.heard_for() <= self.comeback.grace() {
             return Vec::new();
         }
         self.forget_pods_but_waiting().await
@@ -2467,11 +2645,18 @@ impl Hub {
             // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
             let label = Self::net_label(&ev);
+            let peer = match &ev {
+                NetEvent::Connected { peer, .. } | NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } | NetEvent::Frame { peer, .. } => *peer,
+            };
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied. What its piece held the shard for is learned as
             // it's taken (goal 9, plan 01a1a87b2cec step 3).
             if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
+            }
+            // The control loop's time on it: what admissions in progress cost it (docs/resilience.md R5).
+            if me == crate::wire::fan::CONTROL {
+                self.admission.worked(peer, began.elapsed());
             }
             // Taken: what of its runner's waits for it goes.
             marks.took(me, n);
@@ -2556,6 +2741,9 @@ impl Hub {
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+                for (p, turn) in self.admission.closed(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
                 self.tunnels.closed(peer);
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.ask(move |c| c.down(peer)).await;
@@ -2605,20 +2793,28 @@ impl Hub {
             // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
             // goal 9, plan 01a1a87b2cec step 3). Whether its runner's Hello came is read off the links' map, its
             // name not copied out of it (step 5).
-            NetEvent::Frame { peer, lane, data, .. } => match crate::wire::payload::read_frame(data, self.said_hello(peer)).await {
-                // Anything on its control lane before its Hello is out of order: Hello comes first
-                // there. On its other lanes a frame may come before its Hello is read (it sends them
-                // once it's connected): it's let go, as it was.
-                crate::wire::payload::Frame::BeforeHello { what } => {
-                    if lane == proto::LANE_CONTROL {
-                        self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
-                    } else {
-                        tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
-                    }
+            NetEvent::Frame { peer, lane, data, .. } => {
+                let hello = self.said_hello(peer);
+                // A runner over the admission limit: what its connection sends is let go unread until it closes, but
+                // an Admit, how it comes back (docs/resilience.md R5).
+                if !hello && self.admission.letting_go(peer) && !crate::wire::fan::admits(&data) {
+                    return Ok(());
                 }
-                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
-                crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
-            },
+                match crate::wire::payload::read_frame(data, hello).await {
+                    // Anything on its control lane before its Hello is out of order: Hello comes first
+                    // there. On its other lanes a frame may come before its Hello is read (it sends them
+                    // once it's connected): it's let go, as it was.
+                    crate::wire::payload::Frame::BeforeHello { what } => {
+                        if lane == proto::LANE_CONTROL {
+                            self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
+                        } else {
+                            tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
+                        }
+                    }
+                    crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
+                    crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                }
+            }
         }
         Ok(())
     }
@@ -2815,7 +3011,7 @@ impl Hub {
             self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() }).await;
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
-            match self.store.requeue_job(j.clone(), format!("{reason} ({})", self.shown(name))).await {
+            match self.requeue(&j, name, format!("{reason} ({})", self.shown(name))).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
                 Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
@@ -2899,7 +3095,15 @@ impl Hub {
     /// pointer to each, not room for the largest (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
-            return crate::api::boxed(|| self.on_hello(peer, h)).await;
+            let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+            return crate::api::boxed(|| self.on_hello(peer, h, at)).await;
+        }
+        // Its admission (docs/resilience.md R5), the first thing it says on a connection.
+        if let Carried::Nothing(AgentMsg::Admit) = msg {
+            if let admission::Verdict::Later(turn) = self.admission.admit(peer, self.clock.now(), self.cfg.server.admission) {
+                self.tell_turn(peer, turn).await;
+            }
+            return Ok(());
         }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
@@ -2944,7 +3148,14 @@ impl Hub {
             Carried::Read(read) => return self.on_read(peer, &agent, read, arrived).await,
         };
         match msg {
-            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } => {}
+            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } | AgentMsg::Admit => {}
+            // What it sent on its Welcome is out: its admission ends, and the first to teach a turn gives every runner
+            // waiting for one its turn.
+            AgentMsg::Settled => {
+                for (p, turn) in self.admission.settled(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
+            }
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
             | AgentMsg::LegResults { .. }
@@ -2985,6 +3196,10 @@ impl Hub {
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
+                    let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+                    if let Some(kept) = self.comeback.step_started(&job, &agent, at) {
+                        self.keep_comebacks(kept).await;
+                    }
                     self.store.step_update(job.clone(), idx, Status::Running, None).await?;
                     self.logs.step(&job, idx, "running");
                     self.emit_job(&job).await;
@@ -3021,7 +3236,11 @@ impl Hub {
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
-                    self.declined.update(|d| d.insert((job.clone(), agent.clone()), Instant::now()));
+                    // Those whose wait is over go as one is added: no sweep for them (goal 9, plan 01a1a87b2cec step 5).
+                    self.declined.update(|d| {
+                        d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF);
+                        d.insert((job.clone(), agent.clone()), Instant::now())
+                    });
                     self.store.unclaim_job(job.clone(), format!("declined by {}: {reason}", self.shown(&agent))).await?;
                     self.emit_job(&job).await;
                     self.wake.notify();
@@ -3173,6 +3392,9 @@ impl Hub {
         if let Some(h) = handed {
             crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToOwner, began.saturating_duration_since(h));
         }
+        // The frames it makes carry where it came from, for the viewers who ask (goal 10, plan 01a1a87b2dae step 5).
+        let runner_us = taken.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX));
+        let _came = crate::harness::live::carrying(Some(crate::harness::live::Came { arrived_us: arrived.map(crate::harness::live::us_at), took_us: crate::harness::live::us_at(began), runner_us }));
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
@@ -3328,6 +3550,7 @@ impl Hub {
     /// messages' larger handlers (a front door's status, its facts' fold, its power, an identity's ask, a
     /// leg's records and signature, what its inventory lets go of) are boxed where they're made (goal 9, plan
     /// 01a1a87b2cec step 5).
+    #[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
     async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
@@ -3627,7 +3850,8 @@ impl Hub {
         Ok(())
     }
 
-    async fn on_hello(&self, peer: PeerId, h: Hello) -> anyhow::Result<()> {
+    /// `at`: when the hello came off the wire.
+    async fn on_hello(&self, peer: PeerId, h: Hello, at: Instant) -> anyhow::Result<()> {
         let cert_name = self.pending_peers.load().get(&peer).cloned();
         let refuse = |reason: String| async move {
             tracing::warn!(peer, %reason, "agent refused");
@@ -3687,9 +3911,7 @@ impl Hub {
             } else if held_by_other(id) {
                 // Another runner process of this machine runs it.
             } else {
-                self.store
-                    .requeue_job(id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
-                    .await?;
+                self.requeue(id, &name, format!("agent {} restarted without the job", self.shown(&name))).await?;
                 self.emit_job(id).await;
             }
         }
@@ -3763,19 +3985,16 @@ impl Hub {
             stale: false,
         };
         let prev = self.agents.load().get(&name).map(|a| AgentLive::clone(a));
-        // Back still running jobs: how long it took to come back (`crate::comeback`), since the server lost it, or,
-        // one this server hasn't seen since it started (it ran them through the restart), since the start.
-        let came_back = match &prev {
+        // Back still running jobs: how long until its hello came (`crate::comeback`), since the server lost it, or, one
+        // this server hasn't seen since it started (it ran them through the restart), since the start.
+        let since = match &prev {
             _ if h.running.is_empty() => None,
-            Some(p) if !p.connected => p.lost_at.map(|t| t.elapsed()),
+            Some(p) if !p.connected => p.lost_at,
             Some(_) => None,
-            None => Some(self.started.elapsed()),
+            None => Some(self.started),
         };
-        if let Some(after) = came_back {
-            let kept = self.comeback.came_back(after);
-            if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
-                tracing::warn!(error = %format!("{e:#}"), "how long runners take to come back wasn't kept for the next start");
-            }
+        if let Some(since) = since {
+            self.keep_comebacks(self.comeback.came_back(at.saturating_duration_since(since))).await;
         }
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
@@ -3832,7 +4051,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS | proto::CAP_ADMISSION }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte. Once each
         // copy's owner has applied what this loop handed it before (`crate::harness::copies`): a
@@ -4260,32 +4479,117 @@ impl Hub {
 
     // ------------------------------------------------------------ scheduler
 
-    /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
-    /// and once a second as a safety net.
+    /// Assigns queued jobs to agents (or launches pods) until nothing more fits, and acts on what falls due: no clock
+    /// without a due item (goal 9, plan 01a1a87b2cec step 5; it looked every second and swept every five, whatever was
+    /// due). It looks at the queue when told, when the jobs change (whatever queues one, `crate::store::Changes::watch`),
+    /// and while jobs wait, when the runners change ([`Hub::runners`]) or a placement's wait ends; it checks what's due
+    /// when the first deadline passes ([`Hub::scheduler_due`]). With nothing queued, running with a limit, away or due,
+    /// it arms no timer.
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(1));
-        let mut slow = Instant::now();
-        let mut pods = Instant::now();
+        let jobs = self.store.changes().watch(&["jobs"]);
+        let secrets = self.store.changes().watch(&["ci_secrets"]);
+        let mut s = Scheduler { waiting: false, looked: Instant::now(), checked: None, timeout_at: None, secrets_at: crate::ci::notify::secrets_unused_at(&self).await? };
+        let mut woke = Woke::Started;
         loop {
-            futures::select_biased! {
+            // Listened for before anything is looked at: a change to the runners after its look ends this wait.
+            let runners = self.runners.listen();
+            let now = Instant::now();
+            let (look, check) = match woke {
+                Woke::Started => (true, true),
+                Woke::Told | Woke::Jobs => (true, false),
+                Woke::Runners => (s.waiting, false),
+                Woke::Secrets => (false, false),
+                Woke::Due(due) => (s.waiting && due.place.is_some_and(|t| t <= now), due.check.is_some_and(|t| t <= now)),
+            };
+            if look {
+                s.looked = now;
+                s.waiting = self.schedule_once().await?;
+            }
+            if check {
+                s.checked = Some((now, crate::util::now_unix()));
+                s.secrets_at = self.check_due(s.secrets_at).await?;
+            }
+            // A running job's limit moves only with the jobs, and what's past it was taken by the last check.
+            if check || matches!(woke, Woke::Started | Woke::Jobs) {
+                s.timeout_at = self.store.next_timeout(s.checked.map_or(i64::MIN, |(_, unix)| unix)).await?;
+            }
+            // A secret made when none was: the first due; any other write only moves one later.
+            if matches!(woke, Woke::Secrets) && s.secrets_at.is_none() {
+                s.secrets_at = crate::ci::notify::secrets_unused_at(&self).await?;
+            }
+            crate::ci::notify::quarantined(&self);
+            let due = self.scheduler_due(&s);
+            woke = futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = self.wake.notified().fuse() => {}
-                () = tick.tick().fuse() => {}
-            }
-            self.schedule_once().await?;
-            if slow.elapsed() >= Duration::from_secs(5) {
-                slow = Instant::now();
-                self.check_timeouts().await?;
-                self.check_lost_agents().await;
-                crate::ci::notify::runners_gone(&self);
-                crate::ci::notify::secrets_unused(&self);
-                crate::ci::notify::quarantined(&self);
-            }
-            // Finished job pods' records (docs/machines.md), once a minute.
-            if pods.elapsed() >= Duration::from_secs(60) {
-                pods = Instant::now();
-                self.forget_finished_pods().await;
-            }
+                () = self.wake.notified().fuse() => Woke::Told,
+                () = jobs.notified().fuse() => Woke::Jobs,
+                () = runners.fuse() => Woke::Runners,
+                () = secrets.notified().fuse() => Woke::Secrets,
+                () = crate::rt::due(due.first()).fuse() => Woke::Due(due),
+            };
+        }
+    }
+
+    /// The scheduler's next deadlines by what's pending now (goal 9, plan 01a1a87b2cec step 5), each only once after
+    /// what last took it. To check, after the last check: a runner away past its grace holding jobs (requeued) or a
+    /// pod's (forgotten); a runner process lost past it; the server's own grace (what ran before it started is
+    /// orphaned, its finished pods forgotten); a runner's offline notice; a running job's limit; a cancel unanswered;
+    /// a retire to ask again; a secret falling unused. To place, while jobs wait, after the last look: a pairing
+    /// declined offered again, a pod's launch looked at again, a runner's sample gone stale (one without a fresh
+    /// sample is placed by its room).
+    fn scheduler_due(&self, s: &Scheduler) -> Due {
+        let (now, now_ms) = (Instant::now(), crate::util::now_ms());
+        // A wall-clock moment (unix milliseconds) on this clock, past ones in the past.
+        let at_ms = |ms: i64| {
+            let d = Duration::from_millis(ms.abs_diff(now_ms));
+            if ms >= now_ms { now.checked_add(d) } else { now.checked_sub(d) }
+        };
+        let grace = self.comeback.grace();
+        let (agents, lost, cancels) = (self.agents.load(), self.lost_instances.load(), self.cancel_sent.load());
+        let checks = agents
+            .values()
+            .filter(|a| !a.connected && (a.ephemeral || !a.running.is_empty()))
+            .filter_map(|a| a.lost_at?.checked_add(grace))
+            .chain(lost.values().filter_map(|(_, t, _)| t.checked_add(grace)))
+            .chain(self.comeback.heard_since().and_then(|at| at.checked_add(grace)))
+            .chain(crate::ci::notify::offline_at(self))
+            .chain(cancels.values().filter_map(|t| t.checked_add(CANCEL_WAIT)))
+            .chain(self.instances.load().retire_due(RETIRE_REPEAT))
+            .chain([s.timeout_at, s.secrets_at].into_iter().flatten().filter_map(|unix| at_ms(unix.saturating_mul(1000))));
+        let check = match s.checked {
+            Some((at, _)) => checks.filter(|t| *t > at).min(),
+            None => checks.min(),
+        };
+        let place = if s.waiting {
+            let start = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
+            self.declined
+                .load()
+                .values()
+                .filter_map(|t| t.checked_add(DECLINE_BACKOFF))
+                .chain(self.launching.load().values().filter_map(|l| match l {
+                    Launch::Pod(t) => t.checked_add(start),
+                    Launch::Retry { at, .. } => Some(*at),
+                }))
+                .chain(agents.values().filter(|a| a.connected).filter_map(|a| at_ms(a.sample.as_ref()?.ts_ms.saturating_add(kiln_ci::sched::state::SAMPLE_FRESH_MS + 1))))
+                .filter(|t| *t > s.looked)
+                .min()
+        } else {
+            None
+        };
+        Due { check, place }
+    }
+
+    /// What's due, acted on (goal 9, plan 01a1a87b2cec step 5): jobs past their limit, runners and processes away past
+    /// their grace, the restart's orphans and finished pods, the runners' offline notices; and, when the first secret
+    /// falls unused (`secrets_at`), the secrets looked at. When the next secret falls unused comes back.
+    async fn check_due(self: &Arc<Self>, secrets_at: Option<i64>) -> anyhow::Result<Option<i64>> {
+        self.check_timeouts().await?;
+        self.check_lost_agents().await;
+        self.forget_finished_pods().await;
+        crate::ci::notify::runners_gone(self);
+        match secrets_at {
+            Some(at) if at <= crate::util::now_unix() => crate::ci::notify::secrets_unused(self).await,
+            kept => Ok(kept),
         }
     }
 
@@ -4316,14 +4620,15 @@ impl Hub {
         secrets_of(&self.cfg)
     }
 
-    async fn schedule_once(&self) -> anyhow::Result<()> {
+    /// One look at the queue: each waiting job placed where it fits. Whether jobs were waiting as it looked.
+    async fn schedule_once(&self) -> anyhow::Result<bool> {
         // The waiting jobs, how many run, and the waiting jobs' runs, as one read saw them (the DB query
         // audit, 2026-11-06: where it read the first two apart and then each run on its own).
         let crate::store::Scheduling { queued, running, runs } = self.store.scheduling(2000).await?;
         metrics::global().jobs_queued.set(i64::try_from(queued.len()).unwrap_or(i64::MAX));
         metrics::global().jobs_running.set(running);
         if queued.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
@@ -4399,7 +4704,7 @@ impl Hub {
                         Some(a) if *a != crate::wire::commands::Answer::Sent => {
                             let why = format!("assignment could not be delivered: {}", a.words());
                             self.release_slot(&agent, &job.id);
-                            self.store.requeue_job(job.id.clone(), why).await?;
+                            self.requeue(&job.id, &agent, why).await?;
                         }
                         _ => pending.log_when_answered(LOG_WITHIN),
                     }
@@ -4486,7 +4791,7 @@ impl Hub {
             }
         }
         self.emit_queue();
-        Ok(())
+        Ok(true)
     }
 
     /// The HTTP base URL an agent should use: loopback for the in-process agent, the in-cluster
@@ -4561,7 +4866,7 @@ impl Hub {
                     }
                     self.cancel_sent.update(|c| c.insert(job.id.clone(), Instant::now()));
                 }
-                Some(t) if t.elapsed() > Duration::from_secs(60) => {
+                Some(t) if t.elapsed() > CANCEL_WAIT => {
                     // The agent did not report back: settle it ourselves.
                     if let Some(agent) = &job.agent {
                         self.release_slot(agent, &job.id);
@@ -4586,11 +4891,16 @@ impl Hub {
         // As long as runners took to come back (`crate::comeback`).
         let grace = self.comeback.grace();
         // Jobs of a runner process that went away while its machine stayed connected through
-        // another one, and did not come back in time.
-        let expired: Vec<(String, Vec<String>)> = self.lost_instances.update(|g| {
-            let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > grace).map(|(p, _)| *p).collect();
-            peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
-        });
+        // another one, and did not come back in time. Written only when one didn't: each write wakes the
+        // scheduler ([`Hub::runners`]).
+        let expired: Vec<(String, Vec<String>)> = if self.lost_instances.load().values().any(|(_, t, _)| t.elapsed() > grace) {
+            self.lost_instances.update(|g| {
+                let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > grace).map(|(p, _)| *p).collect();
+                peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
+            })
+        } else {
+            Vec::new()
+        };
         for (name, jobs) in expired {
             if jobs.iter().any(|j| self.ci.is_leg(j)) {
                 self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() }).await;
@@ -4601,7 +4911,7 @@ impl Hub {
                     continue;
                 }
                 self.release_slot(&name, &j);
-                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({})", self.shown(&name))).await {
+                match self.requeue(&j, &name, format!("runner process did not reconnect ({})", self.shown(&name))).await {
                     Ok(_) => self.emit_job(&j).await,
                     Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
                 }
@@ -4623,10 +4933,10 @@ impl Hub {
         if self.agents.load().values().any(|a| gone(a)) {
             self.agents.update(|m| m.retain(|_, a| !gone(a)));
         }
-        self.declined.update(|d| d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF));
-        // Running jobs assigned to agents we have no session for at all (after a server restart).
-        // By their ids and runners alone, the rest of their rows unread (the DB query audit, 2026-11-06).
-        if self.started.elapsed() > grace
+        // Running jobs assigned to agents we have no session for at all (after a server restart), once it has heard
+        // its runners for the grace. By their ids and runners alone, the rest of their rows unread (the DB query
+        // audit, 2026-11-06).
+        if self.comeback.heard_for() > grace
             && let Ok(running) = self.store.running_holders().await {
                 // Jobs held by a connected agent, or by one still inside its reconnect grace, are
                 // not orphans.
@@ -4639,24 +4949,27 @@ impl Hub {
                     .collect();
                 for (id, agent) in running {
                     if !known.contains(&id) && agent.as_deref() != Some("-")
-                        && let Ok(true) = self.store.requeue_job(id.clone(), "orphaned after restart".into()).await {
+                        && let Ok(true) = self.requeue(&id, agent.as_deref().unwrap_or_default(), "orphaned after restart".into()).await {
                             self.emit_job(&id).await;
                         }
                 }
             }
-        // Expire unused pod enrollment tokens.
-        self.ephemeral_tokens.update(|t| t.retain(|_, (_, exp)| *exp > Instant::now()));
-        self.executor_tokens.update(|t| t.retain(|_, (_, _, exp)| *exp > Instant::now()));
     }
 
-    /// Sample the server host itself for the UI ("server" series).
+    /// Sample the server host itself for the UI ("server" series), at the user-set `[telemetry] sample_seconds` (a): each
+    /// sample due that long after the last one's was, those missed while busy skipped (goal 9, plan 01a1a87b2cec step 5).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
-        let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
+        let every = Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1)));
+        let mut due = Instant::now();
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = tick.tick().fuse() => {}
+            if !self.shutdown.sleep_until(due).await {
+                return Ok(());
+            }
+            let now = Instant::now();
+            due = kiln_seams::clock::later(due, every);
+            if due <= now {
+                due = kiln_seams::clock::later(now, every);
             }
             // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
             // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
@@ -4681,6 +4994,7 @@ impl Hub {
 
     /// Daily retention: delete old runs and their logs.
     /// Close terminal sessions left idle with nobody attached; forget ended ones.
+    #[allow(clippy::disallowed_methods)] // (e) idle terminals swept every 30 s; each one's idle end is a deadline
     pub async fn terminal_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let idle = Duration::from_secs(self.cfg.terminal.idle_minutes.max(1).saturating_mul(60));
         loop {
@@ -4693,6 +5007,7 @@ impl Hub {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) retention pruned hourly; the oldest run's age at the user-set retention is the deadline
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(3600));
         loop {
@@ -5359,6 +5674,172 @@ pub(crate) mod tests {
     /// test turns terminals on.
     pub(crate) async fn scratch_hub() -> anyhow::Result<Arc<Hub>> {
         scratch_hub_with(|_| {}).await
+    }
+
+    /// A job of a run of its own queued in `hub`'s store, for no runner in particular.
+    async fn queue_one(hub: &Hub) -> anyhow::Result<()> {
+        use crate::store::{Repo, Run, Status};
+        let repo = hub
+            .store
+            .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  only: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+        let run = Run { id: "run1".into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
+        hub.store.create_run(run, planned).await?;
+        anyhow::ensure!(hub.store.scheduling(10).await?.queued.len() == 1, "one job queued");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item; train 34's census: hub.rs's scheduler, about one
+    /// timer wake a second): a job waiting with no runner to take it arms no clock, where the scheduler looked every
+    /// second (and, after the ticks branch, a second on while jobs waited, for room made without a word); room is a
+    /// write to the runners' records, and that wakes it. Do: a scratch hub, one job queued, its scheduler started and
+    /// settled; two and a half seconds of nothing; then a runner's record put in (one that can't take the job: not
+    /// built). Expect: no poll at all in the quiet; the runner's record wakes it at once.
+    #[test]
+    fn g9_s5_the_scheduler_arms_no_clock_while_a_job_waits_and_looks_when_the_runners_change() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            queue_one(&hub).await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).scheduler_loop())));
+            let deadline = Instant::now() + HANG;
+            let seen = crate::rt::settled(&polls, deadline).await?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            // Its one deadline, the server's own grace (what ran before it started), is the runners' redial bound away.
+            anyhow::ensure!(hub.started.checked_add(hub.comeback.grace()).is_none_or(|t| t > Instant::now()), "the server's grace fell in the quiet");
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with a job waiting and nothing due");
+            hub.put_agent(live_runner("box", "linux", "x86_64"));
+            while polls.load(Ordering::Relaxed) == seen {
+                anyhow::ensure!(Instant::now() < deadline, "a runner's record never woke the scheduler");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(hub.store.scheduling(10).await?.queued.len() == 1, "a runner that isn't built takes no job");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): an idle server's loops arm no timer beyond their
+    /// pending deadlines. Do: a scratch hub with nothing queued, running, away or due; its scheduler, plans' driver,
+    /// screens' watch and monitors started (each counted by its polls: a timer of another test in its file can't count
+    /// against it), and its land queue and conflict ladder (counted by their files' timer wakes: a kick from a test beside
+    /// them is a word, not a clock); five seconds. Expect: no poll and no timer wake, but the scheduler's one deadline,
+    /// the server's own grace, which is the runners' redial bound away. Each of these woke on its own clock before: every
+    /// second, two seconds, three.
+    #[test]
+    fn g9_s5_an_idle_servers_loops_arm_no_clock() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async move {
+            let hub = scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let monitors = crate::observe::monitors::Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+            let loops = [("scheduler", Arc::new(AtomicU64::new(0))), ("plans", Arc::new(AtomicU64::new(0))), ("screens", Arc::new(AtomicU64::new(0))), ("monitors", Arc::new(AtomicU64::new(0)))];
+            let [(_, sched), (_, plans), (_, screens), (_, mons)] = &loops;
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(sched), Arc::clone(&hub).scheduler_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(plans), crate::plans::agents::drive(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(screens), crate::harness::screen::watch(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(mons), Arc::clone(&monitors).run(hub.shutdown.clone()))));
+            drop(crate::rt::spawn(crate::ci::land::run_loop(Arc::clone(&hub))));
+            drop(crate::rt::spawn(crate::ci::ladder::run_loop(Arc::clone(&hub))));
+            for (_, polls) in &loops {
+                crate::rt::settled(polls, until).await?;
+            }
+            let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+            let files = ["ci/land.rs", "ci/ladder.rs"];
+            let before: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            let woke = crate::rt::timer_wakes_over("ci/land.rs", Duration::from_secs(5)).await;
+            anyhow::ensure!(hub.started.checked_add(hub.comeback.grace()).is_none_or(|t| t > Instant::now()), "the server's grace fell in the quiet");
+            let after: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            for ((name, polls), was) in loops.iter().zip(&seen) {
+                let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                anyhow::ensure!(polled == 0, "{name}: {polled} polls in 5 s, idle");
+            }
+            for ((file, b), a) in files.iter().zip(&before).zip(&after) {
+                anyhow::ensure!(a == b, "{file}: {} timer wakes in 5 s, idle", a.saturating_sub(*b));
+            }
+            anyhow::ensure!(woke == 0, "ci/land.rs: {woke} timer wakes in 5 s, idle");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the scheduler's deadlines are its pending items' due times, each only once
+    /// after what last took it, and nothing else (it swept every five seconds and looked every second). Do: a scratch
+    /// hub; its deadlines read fresh, then once it began hearing its runners, after a check, with a runner away holding a
+    /// job, back, with a pairing declined while a job waits, and after a look past it. Expect: none before it hears its
+    /// runners; then only the server's own grace from when it began hearing them (what ran before it started, orphaned:
+    /// train 52's comeback.hearing); then the runner's offline notice and its grace for its job, whichever comes first;
+    /// none of its once it's back; the pairing's wait, to place, only while jobs wait and only after the last look.
+    #[test]
+    fn g9_s5_the_schedulers_deadlines_are_its_pending_items_due_times() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let grace = hub.comeback.grace();
+            let now = Instant::now();
+            let mut s = Scheduler { waiting: false, looked: now, checked: Some((now, crate::util::now_unix())), timeout_at: None, secrets_at: None };
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing heard of its runners yet, nothing pending: nothing due");
+            let heard = Instant::now();
+            hub.comeback.hearing(heard);
+            let due = hub.scheduler_due(&s);
+            anyhow::ensure!(due.check == heard.checked_add(grace) && due.place.is_none(), "only the server's own grace, from when it began hearing its runners: {:?} {:?}", due.check, due.place);
+            // Past the server's grace: nothing pending, no deadline at all.
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing pending, nothing due");
+            let lost = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+            hub.put_agent(AgentLive { connected: false, lost_at: Some(lost), running: vec!["j1".into()], ..live_runner("box", "linux", "x86_64") });
+            let away = [lost.checked_add(grace), crate::ci::notify::offline_at(&hub)].into_iter().flatten().min();
+            s.checked = Some((now, crate::util::now_unix()));
+            anyhow::ensure!(away.is_some() && hub.scheduler_due(&s).check.is_some_and(|t| Some(t) <= away), "a runner away holding a job: its grace or its notice");
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            hub.change_agent("box", |a| {
+                a.connected = true;
+                a.lost_at = None;
+            });
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "back: none of its deadlines");
+            let declined = Instant::now();
+            hub.declined.update(|d| d.insert(("j1".into(), "box".into()), declined));
+            anyhow::ensure!(hub.scheduler_due(&s).place.is_none(), "no job waits: nothing to place");
+            s.waiting = true;
+            s.looked = declined.checked_sub(Duration::from_millis(1)).unwrap_or(declined);
+            anyhow::ensure!(hub.scheduler_due(&s).place == declined.checked_add(DECLINE_BACKOFF), "the pairing's wait, to place");
+            s.looked = declined.checked_add(DECLINE_BACKOFF).unwrap_or(declined);
+            anyhow::ensure!(hub.scheduler_due(&s).place.is_none(), "a look after the wait ended took it");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the unread wires' audit swaps the refusals' copy only once a minute's over:
+    /// swapped at each of the commands loop's seconds, it was a new copy a second, and the runners' list kept ahead of
+    /// what it's made of (that copy among it) was made again for the read after. Do: a scratch hub on a simulated clock;
+    /// a refusal noted (its row at once, its minute begun); ticks within the minute; the minute over; a tick after.
+    /// Expect: the same copy across the ticks within the minute; its end closes the window, a new copy; then the same.
+    #[test]
+    fn g9_s5_the_unread_audit_swaps_its_copy_only_once_a_minute_is_over() -> anyhow::Result<()> {
+        use crate::wire::unread::{Code, Sender, Unread, Wire};
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |_| {}).await?;
+            let u = Unread { wire: Wire::Runner, from: Sender::Runner { name: "box".into(), instance: "main".into() }, what: "variant 51".into(), code: Code::Unknown, why: "AgentMsg has 51 variants".into() };
+            let noted = hub.refusals.update(|r| r.note(u.clone(), None));
+            anyhow::ensure!(noted.rows.len() == 1, "the first refusal's row at once");
+            let before = hub.refusals.get();
+            hub.tick_unread().await;
+            clock.advance(Duration::from_secs(30));
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&before, &hub.refusals.get()), "a new copy within the minute, with nothing due");
+            clock.advance(Duration::from_secs(31));
+            hub.tick_unread().await;
+            let after = hub.refusals.get();
+            anyhow::ensure!(!Arc::ptr_eq(&before, &after), "the minute's over: its window closes");
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&after, &hub.refusals.get()), "a new copy after the minute, with nothing due");
+            Ok(())
+        })
     }
 
     pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
@@ -6163,33 +6644,126 @@ pub(crate) mod tests {
         })
     }
 
-    /// docs/machines.md, "The grace to come back" (Ada, 2026-11-06: no arbitrary constants): the grace a runner gets to come back
-    /// is learned from how long runners took to come back holding their work (`crate::comeback`), not 45 s whatever they
-    /// did. A runner back holding a job 3 s after the server lost it teaches the grace (RFC 6298's bound: 3 s and four
-    /// times 1.5 s); then one lost 30 s ago holding a job has it taken back, and one lost 1 s ago keeps its own. With the
-    /// 45 s grace the one lost 30 s ago kept its job. What's learned is kept for the next start, which takes it.
+    /// Run `id` with one job, running on runner `on`: the job's id.
+    async fn a_running_job(hub: &Hub, id: &str, on: &str) -> anyhow::Result<String> {
+        let repo = hub
+            .store
+            .upsert_repo(crate::store::Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+        let run = crate::store::Run {
+            id: id.into(),
+            repo_id: repo.id.clone(),
+            repo_name: repo.name.clone(),
+            number: 0,
+            pipeline: "ci".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "abc".into(),
+            message: String::new(),
+            author: String::new(),
+            status: Status::Queued,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        hub.store.create_run(run, planned).await?;
+        let job = hub.store.jobs(id.into(), false).await?.into_iter().next().map(|j| j.id).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        anyhow::ensure!(hub.store.claim_job(job.clone(), on.into(), "baremetal".into()).await?);
+        Ok(job)
+    }
+
+    /// docs/machines.md, "The grace to come back" (research 01a1b3bbac36): learned from what the hub sees. A runner lost
+    /// past the grace has its job requeued, and that job's first step on another runner, 10 s later, is what a requeue
+    /// costs. A runner lost 6 s ago whose hello came off the wire 2 s ago came back in 4 s: the server's 2 s aren't
+    /// charged to it. Waiting 4 s for it beats a 10 s requeue: one lost 30 s ago has its job taken back, one lost 1 s
+    /// ago keeps its own. What's learned is kept for the next start, which takes it.
     #[test]
-    fn comeback_the_grace_a_runner_gets_is_learned_from_how_long_runners_took_to_come_back() -> anyhow::Result<()> {
+    fn comeback_the_grace_is_learned_from_the_requeues_and_comebacks_the_hub_sees() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
             let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
-            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "nothing learned yet: the runners' longest redial");
-            hub.put_agent(lost("box", Duration::from_secs(3), "job-b"));
+            let job = a_running_job(&hub, "run1", "gone").await?;
+            hub.put_agent(lost("gone", crate::comeback::prior() * 2, &job));
+            hub.check_lost_agents().await;
+            let stepped = Instant::now() + Duration::from_secs(10);
+            join_runner(&hub, 2, "other", 0);
+            hub.change_agent("other", |a| a.running = vec![job.clone()]);
+            let step = NetEvent::Frame { peer: 2, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::StepStarted { job: job.clone(), idx: 0 })?, at: stepped };
+            hub.on_net_at(step, &mut Some(Arrived { at: stepped, taken: Instant::now() })).await?;
+            let kept = || async { hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db")) };
+            let cost = Duration::from_nanos(kept().await?.split('/').next().unwrap_or_default().parse()?);
+            anyhow::ensure!((Duration::from_secs(10)..Duration::from_secs(11)).contains(&cost), "{}", kept().await?);
+            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "no comeback yet");
+            let now = Instant::now();
+            hub.put_agent(AgentLive { lost_at: now.checked_sub(Duration::from_secs(6)), ..lost("box", Duration::ZERO, "job-b") });
             hub.pending_peers.update(|m| m.insert(1, "box".into()));
-            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") })).await?;
+            let hello = AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") });
+            let came = now.checked_sub(Duration::from_secs(2)).ok_or_else(|| anyhow::anyhow!("no instant 2 s ago"))?;
+            hub.on_net_at(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&hello)?, at: came }, &mut Some(Arrived { at: came, taken: now })).await?;
             let grace = hub.comeback.grace();
-            anyhow::ensure!((Duration::from_secs(9)..Duration::from_secs(20)).contains(&grace), "back in 3 s: {grace:?}");
-            hub.put_agent(lost("gone", Duration::from_secs(30), "job-g"));
+            anyhow::ensure!((Duration::from_secs(4)..Duration::from_secs(5)).contains(&grace), "back in 4 s, a requeue 10 s: {grace:?}");
+            hub.put_agent(lost("slow", Duration::from_secs(30), "job-s"));
             hub.put_agent(lost("blip", Duration::from_secs(1), "job-x"));
             hub.check_lost_agents().await;
             let running = |n: &str| hub.agents.load().get(n).map(|a| a.running.clone()).unwrap_or_default();
-            anyhow::ensure!(running("gone").is_empty(), "lost 30 s ago, past the learned grace: its job taken back");
+            anyhow::ensure!(running("slow").is_empty(), "lost 30 s ago, past the grace: its job taken back");
             anyhow::ensure!(running("blip") == ["job-x"], "lost 1 s ago, within it: its job waits for it");
-            // Kept: the next start takes it.
-            let kept = hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db"))?;
             let next = crate::comeback::Comeback::default();
-            next.take_kept(&kept);
-            anyhow::ensure!(next.grace() == hub.comeback.grace(), "{kept}");
+            next.take_kept(&kept().await?)?;
+            anyhow::ensure!(next.grace() == grace, "{}", kept().await?);
+            Ok(())
+        })
+    }
+
+    /// Lifeguard's local health (research 01a1b3bbac36 f5): after a restart, runners are charged from when the server
+    /// began hearing them, not from its start. With a 1 ns grace learned, a job held by a runner not back isn't taken
+    /// for orphaned before the server hears its runners, however long ago it started; once it has heard them for the
+    /// grace, it's requeued.
+    #[test]
+    fn comeback_after_a_restart_runners_are_charged_from_when_the_server_began_hearing_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.comeback.take_kept("10000000000/1 0:1")?;
+            anyhow::ensure!(hub.comeback.grace() == Duration::from_nanos(1));
+            let job = a_running_job(&hub, "run1", "away").await?;
+            crate::rt::sleep(Duration::from_millis(5)).await;
+            let status = || async { anyhow::Ok(hub.store.job(job.clone()).await?.map(|j| j.status)) };
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Running), "not hearing its runners yet: {:?}", status().await?);
+            hub.comeback.hearing(Instant::now().checked_sub(Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("no instant 1 s ago"))?);
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Queued), "{:?}", status().await?);
+            Ok(())
+        })
+    }
+
+    /// A requeue waits for its job's next step no longer than the job or its run lasts: a job requeued and then
+    /// cancelled leaves nothing waiting, nor one whose run is cancelled (its queued jobs aren't told one by one), nor
+    /// one whose repository is deleted with its runs.
+    #[test]
+    fn comeback_a_requeue_ends_with_its_job_or_its_run() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut jobs = Vec::new();
+            for run in ["by-job", "by-run", "deleted"] {
+                let job = a_running_job(&hub, run, run).await?;
+                hub.put_agent(AgentLive { connected: false, lost_at: Instant::now().checked_sub(crate::comeback::prior() * 2), running: vec![job.clone()], busy: 1, ..live_runner(run, "linux", "x86_64") });
+                hub.check_lost_agents().await;
+                anyhow::ensure!(hub.comeback.waits(&job), "{run}: requeued, waiting for a step");
+                jobs.push(job);
+            }
+            let [by_job, by_run, deleted] = jobs.as_slice() else { anyhow::bail!("three jobs") };
+            hub.cancel_jobs("by-job", vec![by_job.clone()], "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_job), "its job cancelled");
+            hub.cancel_run("by-run", "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_run), "its run cancelled");
+            anyhow::ensure!(hub.comeback.waits(deleted));
+            hub.store.delete_repo("r1".into()).await?;
+            hub.runs_deleted().await?;
+            anyhow::ensure!(!hub.comeback.waits(deleted), "its run deleted");
             Ok(())
         })
     }
@@ -6371,6 +6945,110 @@ pub(crate) mod tests {
             for id in ["paused", "within"] {
                 anyhow::ensure!(hub.store.job(id.into()).await?.is_some_and(|j| j.status == Status::Running), "{id} runs on");
             }
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md R5, through the hub: a herd of 50 runners reconnecting at once, the server having learned
+    /// that an admission alone takes 7 ms of which the control loop's work is 2 ms (four at once, a turn of 2 ms).
+    /// Four are admitted (their Hellos taken); each of the other 46 is told its own turn, after the four in progress and
+    /// those told before it, a turn apart, and what its connection sends (its Machine, its Hello) is let go unread. As
+    /// the four settle and the clock reaches each one's turn, it comes back and is admitted past the limit, never told
+    /// a second turn: every runner admitted, each refused at most once.
+    #[test]
+    fn r5_a_herd_through_the_hub_each_told_its_own_turn_once() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            let t0 = clock.now();
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            anyhow::ensure!((hub.admission.limit(), hub.admission.turn()) == (4, Some(Duration::from_millis(2))));
+            let name = |p: PeerId| format!("runner-{p}");
+            let told = |p: PeerId| -> Vec<ServerMsg> { hub.sent.lock().iter().filter(|(q, m)| *q == p && matches!(m, ServerMsg::Later { .. })).map(|(_, m)| m.clone()).collect() };
+            let connect = |p: PeerId| {
+                let hub = Arc::clone(&hub);
+                async move {
+                    hub.pending_peers.update(|m| m.insert(p, name(p)));
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Admit).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Machine { id: String::new() }).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of(&name(p)))).await
+                }
+            };
+            let herd: Vec<PeerId> = (1..=50).collect();
+            for &p in &herd {
+                connect(p).await?;
+            }
+            let admitted: Vec<PeerId> = herd.iter().copied().filter(|p| hub.agent_of(*p).is_some()).collect();
+            anyhow::ensure!(admitted == [1, 2, 3, 4], "the limit's four admitted: {admitted:?}");
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                let after_us = 2_000 * (4 + u64::try_from(k)?);
+                anyhow::ensure!(told(p) == [ServerMsg::Later { after_us, width_us: 2_000 }], "runner {p}: {:?}", told(p));
+            }
+            for p in 1..=4 {
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0);
+            for &p in herd.iter().skip(4) {
+                hub.on_net(NetEvent::Closed { peer: p, reason: "told its turn".into() }).await?;
+            }
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                // Its turn: a turn for each of the four in progress, then one for each told before it.
+                clock.advance_to(t0 + Duration::from_millis(2) * (4 + u32::try_from(k)?));
+                connect(p).await?;
+                anyhow::ensure!(hub.agent_of(p).is_some(), "runner {p} admitted at its turn");
+                anyhow::ensure!(told(p).len() == 1, "runner {p} told {} turns", told(p).len());
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0 && herd.iter().all(|p| hub.agent_of(*p).is_some()), "every runner admitted");
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md C3 step 5 and R5: the drain's notice. A stop kept 7 s before this start answers runners is
+    /// the restart learned (and let go of, so a crash after teaches nothing from it); as the server stops again it keeps
+    /// when, and tells each runner that takes the notice when it expects to answer again, its turn after that in the
+    /// order of their peers, waiting for them to close; a runner from before is told nothing. The notice moves that
+    /// runner's first dial to the restart.
+    #[test]
+    fn r5_the_drain_tells_runners_when_the_server_expects_to_answer_again() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            hub.store.kv_set(admission::STOPPED.to_owned(), (clock.unix_ms() - 7_000).to_string()).await?;
+            hub.take_admission(Duration::from_secs(2)).await;
+            anyhow::ensure!(hub.admission.restart() == Some(Duration::from_secs(7)), "{:?}", hub.admission.restart());
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_none(), "taken once");
+            anyhow::ensure!(hub.store.kv_get(admission::RESTARTS.to_owned()).await?.is_some(), "kept");
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            join_runner(&hub, 7, "beta", proto::CAP_ADMISSION);
+            join_runner(&hub, 3, "alpha", proto::CAP_ADMISSION);
+            join_runner(&hub, 5, "old", 0);
+            let backs = || -> Vec<(PeerId, ServerMsg)> { hub.sent.lock().iter().filter(|(_, m)| matches!(m, ServerMsg::Back { .. })).cloned().collect() };
+            let ((), closed) = futures::join!(hub.drain_notice(), async {
+                while backs().len() < 2 {
+                    crate::rt::sleep(Duration::from_millis(1)).await;
+                }
+                for p in [3, 7] {
+                    hub.on_net(NetEvent::Closed { peer: p, reason: "told".into() }).await?;
+                }
+                anyhow::Ok(())
+            });
+            closed?;
+            let said = backs();
+            anyhow::ensure!(said == [(3, ServerMsg::Back { after_us: 7_000_000, width_us: 2_000 }), (7, ServerMsg::Back { after_us: 7_002_000, width_us: 2_000 })], "{said:?}");
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_some_and(|ms| ms == clock.unix_ms().to_string()), "when it began to stop, kept");
+            anyhow::ensure!(hub.store.kv_get(admission::KEY.to_owned()).await?.as_deref() == Some(hub.admission.kept().as_str()));
+            // The runner's side: its first dial at the restart and its turn, not by its own redials.
+            let t0 = Instant::now();
+            let learned = crate::agent::redial::Learned::of(&[Duration::from_millis(3)], &[Duration::from_secs(30); 20]);
+            let mut r = crate::agent::redial::Redials::new(learned, None, t0);
+            r.dialing(t0);
+            anyhow::ensure!(r.connected(t0).is_ok());
+            r.back(t0, Duration::from_micros(7_002_000), Duration::from_micros(2_000), 0);
+            r.failed(t0, u64::MAX);
+            anyhow::ensure!(r.deadline() == Some(t0 + Duration::from_micros(7_002_000)), "{:?}", r.deadline().map(|d| d - t0));
             Ok(())
         })
     }

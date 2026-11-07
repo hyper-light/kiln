@@ -210,6 +210,71 @@ pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     file.read_at(buf, offset)
 }
 
+/// Opens `path` to be read through once, keeping as little of it in the page cache as the system lets: on macOS
+/// past the cache (`F_NOCACHE`: what's cached is read from it, nothing new is kept); on Linux each piece is let go
+/// as it's read ([`read_once_past`]).
+pub fn open_read_once(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    // Advice, as `read_once_past`'s: the reads read the same either way.
+    #[cfg(target_os = "macos")]
+    let _ = rustix::fs::fcntl_nocache(&file, true);
+    Ok(file)
+}
+
+/// The page cache's copy of `[offset, offset + len)` of a file read through once ([`open_read_once`]), let go now
+/// that it's read: Linux's `POSIX_FADV_DONTNEED`, which keeps every page a process maps (a binary's own code, when
+/// the file is that binary). macOS kept none ([`open_read_once`]).
+pub fn read_once_past(file: &File, offset: u64, len: u64) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(len) = std::num::NonZeroU64::new(len) {
+        // Advice: what was read is read either way, and a file system with no cache to drop refuses it.
+        let _ = rustix::fs::fadvise(file, offset, Some(len), rustix::fs::Advice::DontNeed);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (file, offset, len);
+}
+
+/// How many of `file`'s pages the page cache holds, of how many it has: `mincore(2)` over a read-only mapping of it,
+/// which reads none of it. Tests alone.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub fn cached_pages(file: &File) -> io::Result<(usize, usize)> {
+    let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+    let pages = len.div_ceil(rustix::param::page_size().max(1));
+    if pages == 0 {
+        return Ok((0, 0));
+    }
+    // SAFETY: a new read-only shared mapping of the file's `len` bytes where the kernel picks; nothing reads through
+    // it, and it's unmapped below, once, before this returns.
+    let at = unsafe { rustix::mm::mmap(std::ptr::null_mut(), len, rustix::mm::ProtFlags::READ, rustix::mm::MapFlags::SHARED, file, 0) }?;
+    let mut held = vec![0u8; pages];
+    // SAFETY: `at` is the mapping just made, `len` bytes, and `held` has the byte for each of its pages mincore(2)
+    // writes.
+    let asked = unsafe { nix::libc::mincore(at, len, held.as_mut_ptr().cast()) };
+    let refused = (asked != 0).then(io::Error::last_os_error);
+    // SAFETY: the mapping made above, unmapped once; nothing refers into it.
+    unsafe { rustix::mm::munmap(at, len) }?;
+    match refused {
+        Some(e) => Err(e),
+        None => Ok((held.iter().filter(|b| **b & 1 != 0).count(), pages)),
+    }
+}
+
+/// `bytes` written to a new file at `path`, synced, and out of the page cache: what reading it then takes is what a
+/// read brings in. Tests alone.
+#[cfg(test)]
+pub fn write_uncached(path: &Path, bytes: &[u8]) -> io::Result<File> {
+    use std::io::Write as _;
+    let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+    #[cfg(target_os = "macos")]
+    rustix::fs::fcntl_nocache(&file, true)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+    Ok(file)
+}
+
 /// Write all of `buf` at `offset` without moving a shared cursor.
 pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     file.write_all_at(buf, offset)
@@ -429,6 +494,7 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// waiting for them, so dead processes never pile up whatever left them: a wait that missed its
 /// wake-up, a handle dropped unwaited, a child an earlier image of this process started before an
 /// in-place upgrade. Started once per process.
+#[allow(clippy::disallowed_methods)] // (e) zombies reaped every 10 s; SIGCHLD would tell
 pub fn start_reaper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {

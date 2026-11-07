@@ -320,14 +320,64 @@ resources` would have been reverted by the next sync.
 
 **R5. Runners reconnect in a herd.**
 
-- **Design:**
-  - **Runners:** full-jitter `Backoff` on agent dial and session reconnect.
-  - **Server:** a token bucket for agent sessions. Over it, the QUIC handshake is refused with a
-    retry-after the agent honours.
-  - **Shutdown:** the server's drain (C3) tells connected agents "back in about N s, with jitter",
-    so they don't all dial on the first refusal.
-- **Done when:** 50 simulated agents reconnecting after a restart spread over at least 20 s, with
-  no refusal storm.
+- **Design** (as built, 2026-11-07; Ada: no picked figures, and the tightest p50 to p99.9). Each
+  value below is learned from what the server measures, or derived from those:
+  - **Runners** learn when to dial from their own dials (`crate::agent::redial`): full jitter up to
+    a due time drawn from the outages they saw. They're back within about 0.2 s of a restarted
+    server answering, so the server shapes the herd.
+  - **Admission** (`crate::hub::admission`). An admission runs from a runner's `Admit`, the first
+    thing it says on a connection, to its `Settled`, said once what it sends on its `Welcome` is out.
+    The hub's control loop takes every runner's Hello and control messages one at a time, so it
+    finishes at most one admission per `work`, its measured time on one: the time it held the
+    runner's own events, over the share of the loop the other runners' messages left it meanwhile.
+    How busy its shard and the store are is in that time. The limit is Little's law over the control
+    loop: admissions an uncontended `alone` long (Admit to Settled with none beside it), arriving one
+    per `work`, overlap `alone / work` at once, and one more so the control loop never waits for the
+    next (by the sketch's rule, below, which reckons the spread in). With nothing learned the limit
+    is one: the next when the last is done. This is BBR's bandwidth-delay
+    product (Cardwell et al., 2016) for admissions: a measured rate times an uncontended time. A
+    token bucket's rate and burst would be picked figures. Gradient2, TCP Vegas and Envoy's adaptive
+    concurrency compare a latency against its uncontended value, so they find the knee only by
+    probing past it. Measuring the serial stage's own work gives it from one admission.
+  - **Retry-after.** Over the limit, a runner is refused before its Hello and its catch-up (what its
+    connection sends is let go unread until it closes) and is told its turn (`ServerMsg::Later`).
+    Its turn comes after every admission ahead of it, those in progress and the turns already given,
+    a `work` each, and after what letting it go costs the loop (learned over the runners let go). So
+    each runner over the limit has a turn of its own, in order. The runner dials at a point it draws
+    within its turn: its jitter is one admission's time at most. Its turn is kept under its peer, and
+    back at its turn it's admitted past the limit, so one refusal is the most a runner gets. Drawn
+    within their turns, the jitters telescope to under one turn (Lindley's recursion), so each one's
+    wait for the control loop stays under a turn and the count passes the limit by two at most, plus
+    the cost of letting go of the runners refused meanwhile, in turns. With nothing learned of `work`,
+    runners over the limit wait (their frames let go) until the first admission settles, then each is
+    told its turn.
+  - **Shutdown** (C3, step 5). The server keeps when it began to stop (kiln.db's kv) and learns, as
+    it next answers runners, how long that took: its restarts. On its way down it tells each runner
+    that takes it (`ServerMsg::Back`) when it expects to answer again, and that runner's turn after
+    that, a `work` apart, then waits for them to close their links. The wait lasts the transport's
+    idle timeout at most. With no restart learned it expects as long as its own start took: a start
+    is most of a restart, and the stop and the supervisor's or Kubernetes' part aren't known until a
+    restart is seen. Runners dial then instead of dialing a server that's down.
+  - What things cost is learned on `kiln_http::turn::Costs`, the program's one sketch of it:
+    buckets by powers of two that forget by halving every window, the window what a mean of the
+    samples' own spread needs (`hyper_rt::machine::wake::sample_window`). The values above are its
+    means, and the limit is its rule (`Costs::fit`): the most admissions whose control-loop work,
+    reckoned at the dearest it holds, runs past an admission alone by no more than a turn.
+  - **Off until declared** (`[server] admission`, §0.3 opt-in automation). Admissions are measured,
+    and what they teach is kept, either way.
+- **Done when:** 50 and 500 simulated runners reconnecting after a restart, each redialing as its
+  own redials say, are all admitted and none is refused more than once. The herd completes within
+  what the measured admission rate allows: a turn an admission, or the arrivals' own spread if
+  longer, plus the first and last admissions' time, a turn each for the last one's jitter and wait,
+  and what letting the refused runners go costs the loop. There's no picked spread. Admissions in
+  progress pass the limit by two at most, plus that letting go in turns. The control loop's other
+  work waits for a limit's worth of admissions and that letting go, not the herd: with the limit
+  undeclared, the same herd makes it wait for much of the herd. A drained server's notice moves runners' first dial to its learned restart, and with nothing
+  learned the first admission teaches a turn. **Done** (branch r5-admission:
+  `hub::admission::tests::r5_*`, `agent::redial::tests::r5_*`, `hub::tests::r5_*`).
+  - This replaces "spread over at least 20 s". A picked spread delays every runner behind it,
+    however fast the server could take them, and sets the p99.9 at the spread whatever the p50.
+    Here the herd takes what the server's own rate allows, each runner placed once.
 
 ## 5. Recovery
 
@@ -365,7 +415,7 @@ resources` would have been reverted by the next sync.
   2. a `preStop` sleep covers endpoint removal;
   3. new requests are refused;
   4. requests in flight finish within 20 s;
-  5. agents are told when to return (R5);
+  5. agents are told when to return (R5): **done**, the drain's notice (`ServerMsg::Back`);
   6. streams are closed with a reconnect hint (WebSocket close 1012);
   7. the store is flushed.
 - **Done when:** a rolling restart under load loses no request that wasn't a stream.

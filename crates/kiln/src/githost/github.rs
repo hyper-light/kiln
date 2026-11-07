@@ -694,6 +694,7 @@ fn rfc3339(unix: i64) -> String {
 
 /// Keeps GitHub's check runs with KilnCI's runs, for as long as the server runs: each run's change
 /// as it's broadcast, and every minute the ones GitHub may have missed.
+#[allow(clippy::disallowed_methods)] // (c) GitHub checks reconciled every minute; its check_run webhooks would tell
 pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.subscribe_events()?;

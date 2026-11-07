@@ -907,30 +907,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     }
 }
 
-/// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
-/// same room (a full `sink` holds the sessions back, as it always did): `room` updates, whatever each
-/// carries, on a lock-free queue (goal 5, plan 01a1a59c2aae: an async-channel's wait took
-/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own). Each goes on
-/// with when it was sent in, its wait here the runner's (goal 10, plan 01a1a87b2dae step 5: `Taken`).
-pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
-    let sink: Sink = sink.into();
-    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
-    crate::rt::spawn(async move {
-        while let Ok(t) = rx.recv().await {
-            store.send(&t.session, &t.update);
-            // A store over its bound holds what passes back, rather than its rows piling up (goal 11), once they're as
-            // many as this runner's streams keep unanswered for the server (goal 10, plan 01a1a87b2dae step 5: the
-            // disk's stall held the updates, and the frames they make, before the server ever had them).
-            store.room_within(crate::wire::uplink::TOTAL_ROOM).await;
-            if sink.send_taken(t).await.is_err() {
-                break;
-            }
-        }
-    });
-    tx.into()
-}
-
-/// Where the store a [`tee_held`] keeps what passes in stands.
+/// Where the store a runner's sessions' updates are kept in stands ([`Tee`]).
 enum Keeping {
     /// Not given yet: the rows wait for it, in order.
     Waiting(Vec<Row>),
@@ -939,14 +916,54 @@ enum Keeping {
     Gone,
 }
 
+/// The way a runner's sessions hand their updates to its loop ([`tee_held`]): each kept in the conversation store (or held
+/// for it until it's given, or let go of once it's taken away), then passed on, in the session's own turn. A task of its
+/// own did it, the updates handed to it first: a hop of its own on every update's way to the server, its wake and its turn
+/// on a shard, behind whatever that shard ran (goal 10, plan 01a1a87b2dae step 5: 32 µs at the median, 192 to 384 at
+/// p99 and up to 16 ms in the Mac's lab, beside the 12 to 16 µs of the loop's own take after it).
+pub struct Tee {
+    keeping: Arc<Mutex<Keeping>>,
+    next: crate::harness::session::To,
+}
+
+impl std::fmt::Debug for Tee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tee").field("next", &self.next).finish_non_exhaustive()
+    }
+}
+
+impl Tee {
+    /// `t` kept, under the lock a taker waits on; then, the lock let go, a store over its bound holds it back once its
+    /// rows are as many as this runner's streams keep unanswered (goal 11, plan 01a1a87b2e56 step 3).
+    pub async fn keep(&self, t: &Taken) {
+        let kept_in = match &mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+            Keeping::Waiting(rows) => {
+                rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
+                None
+            }
+            Keeping::Store(st) => {
+                st.send(&t.session, &t.update);
+                Some(st.clone())
+            }
+            Keeping::Gone => None,
+        };
+        if let Some(st) = kept_in {
+            st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
+        }
+    }
+
+    /// Where what it keeps goes on.
+    pub fn next(&self) -> &crate::harness::session::To {
+        &self.next
+    }
+}
+
 /// The store a [`tee_held`] keeps what passes through it in, held so that it can be given later
 /// (a new build taking over waits for the store the runner it takes over from hands it,
 /// `crate::bluegreen`) or taken away (that runner, handing its store over).
 #[derive(Clone)]
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
-    /// Takes asked of the tee ([`Held::take`]), each answered with the store: one a handover.
-    takes: crate::memory::queue::Sender<mpsc::Sender<Option<Store>>>,
 }
 
 impl Held {
@@ -959,111 +976,22 @@ impl Held {
         *k = Keeping::Store(store);
     }
 
-    /// The store, taken away by the tee itself, between the updates it keeps: once nothing waits in
-    /// it (after the take was asked), every update it took in kept, however long keeping them takes;
-    /// never with one taken in and not yet kept. What passes after goes nowhere. None: it had none.
-    /// Blocking: for a thread of its own. A tee that has ended takes nothing more in, and gives its
-    /// store up at once. It was taken here, once the tee's queue looked empty or after 10 s whatever
-    /// it held (a handover's wait for it, `TEE_DRAIN`): an update the tee had taken off its queue and
-    /// not yet kept went nowhere, and so did every one still in it past the 10 s.
+    /// The store, taken away: everything sent through the tee before is in it (each update is kept as it's sent), and what
+    /// passes after goes nowhere. None: it had none.
     pub fn take(&self) -> Option<Store> {
-        let (reply, answer) = mpsc::channel();
-        if self.takes.send_blocking(reply).is_ok()
-            && let Ok(store) = answer.recv()
-        {
-            return store;
+        match std::mem::replace(&mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
+            Keeping::Store(st) => Some(st),
+            Keeping::Waiting(_) | Keeping::Gone => None,
         }
-        take_now(&self.keeping)
     }
 }
 
-/// The store, taken away now: what passes after goes nowhere.
-fn take_now(keeping: &Mutex<Keeping>) -> Option<Store> {
-    match std::mem::replace(&mut *keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
-        Keeping::Store(st) => Some(st),
-        Keeping::Waiting(_) | Keeping::Gone => None,
-    }
-}
-
-/// An update a tee took in: kept, under the lock a giver waits on; then, the lock let go, held back
-/// while the store holds more than this runner's streams keep unanswered (as [`tee`]'s; goal 11,
-/// plan 01a1a87b2e56 step 3); then passed on with when it was sent in, not now: its wait here was the
-/// runner's (goal 10, plan 01a1a87b2dae step 5). Whether its sink still takes updates.
-async fn pass(keeping: &Mutex<Keeping>, sink: &Sink, t: Taken) -> bool {
-    let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
-        Keeping::Waiting(rows) => {
-            rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
-            None
-        }
-        Keeping::Store(st) => {
-            st.send(&t.session, &t.update);
-            Some(st.clone())
-        }
-        Keeping::Gone => None,
-    };
-    if let Some(st) = kept_in {
-        st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
-    }
-    sink.send_taken(t).await.is_ok()
-}
-
-/// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
-/// the store wait for it in memory; never given, they go.
-pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
-    use async_channel::TryRecvError;
-    use futures::future::Either;
-    let sink: Sink = sink.into();
-    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s, each with when it was sent in.
-    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
-    // Takes are asked one a handover: nothing else bounds them, and none waits to be asked.
-    let (takes, asks) = crate::memory::queue::unbounded::<mpsc::Sender<Option<Store>>>(&crate::memory::owners::CHANNELS);
+/// A sink that keeps what passes through it in `store` on its way to `next` ([`Tee`]), with its store [`Held`]: given
+/// now, or later, or taken away. Rows that come before the store wait for it in memory; never given, they go.
+pub fn tee_held(next: impl Into<crate::harness::session::To>, store: Option<Store>) -> (Sink, Held) {
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
-    let held = Held { keeping: keeping.clone(), takes };
-    crate::rt::spawn(async move {
-        // Takes asked and not yet answered: answered once nothing waits in the tee, looked at after each
-        // was asked, so every update sent before a take is kept before it's answered.
-        let mut asked: Vec<mpsc::Sender<Option<Store>>> = Vec::new();
-        // Whether a take may still be asked (a `Held` lives).
-        let mut asking = true;
-        loop {
-            let t = match rx.try_recv() {
-                Ok(t) => t,
-                Err(TryRecvError::Closed) => break,
-                Err(TryRecvError::Empty) if !asked.is_empty() => {
-                    let mut store = take_now(&keeping);
-                    for reply in asked.drain(..) {
-                        let _ = reply.send(store.take());
-                    }
-                    continue;
-                }
-                Err(TryRecvError::Empty) if asking => match futures::future::select(std::pin::pin!(rx.recv()), std::pin::pin!(asks.recv())).await {
-                    Either::Left((Ok(t), _)) => t,
-                    Either::Left((Err(_), _)) => break,
-                    Either::Right((Ok(reply), _)) => {
-                        asked.push(reply);
-                        continue;
-                    }
-                    Either::Right((Err(_), _)) => {
-                        asking = false;
-                        continue;
-                    }
-                },
-                Err(TryRecvError::Empty) => match rx.recv().await {
-                    Ok(t) => t,
-                    Err(_) => break,
-                },
-            };
-            if !pass(&keeping, &sink, t).await {
-                break;
-            }
-        }
-        // Ended: nothing more comes in, and a take asked meanwhile is answered now.
-        let mut store = if asked.is_empty() { None } else { take_now(&keeping) };
-        for reply in asked.drain(..) {
-            let _ = reply.send(store.take());
-        }
-    });
-    (tx.into(), held)
+    let tee = Tee { keeping: Arc::clone(&keeping), next: next.into() };
+    (Sink::Kept(Arc::new(tee)), Held { keeping })
 }
 
 /// A store on a new database in a temporary folder, for tests.
@@ -1393,7 +1321,7 @@ mod tests {
     fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = async_channel::unbounded();
-            let (sink, held) = tee_held(out, None, 16);
+            let (sink, held) = tee_held(out, None);
             sink.send(("a1".to_owned(), said("m1", 1, "before the store"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             // It goes on at once, with no store yet.
             let (id, _) = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
@@ -1409,21 +1337,14 @@ mod tests {
         })
     }
 
-    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a tee's way in is a lock-free queue of
-    /// `room` updates. Sessions on every shard sending at once, past its room while what's after it takes
-    /// slowly, each have every update passed on once, in the order sent; its way in never holds more than its
-    /// room; and once its senders are gone and it's drained, what's after it sees the end.
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: sessions on every shard sending at once through the tee,
+    /// past the room of what's after it while that takes slowly, each have every update passed on once, in the order sent;
+    /// and once its senders are gone, what's after it sees the end.
     #[test]
-    fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
+    fn g5_a_tee_passes_every_shards_updates_on_once_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = crate::memory::queue::places::<crate::harness::session::Local>(&crate::memory::owners::CHANNELS, 4);
-            let room = 16;
-            let (sink, _held) = tee_held(out, None, room);
-            // Looked at weakly: a sender held here would keep the tee from ever ending.
-            let way_in = match &sink {
-                Sink::Stamped(q) => q.downgrade(),
-                Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
-            };
+            let (sink, _held) = tee_held(out, None);
             let (senders, per) = (8usize, 200u64);
             let mut sending = Vec::new();
             for t in 0..senders {
@@ -1438,10 +1359,9 @@ mod tests {
                 }));
             }
             drop(sink);
-            let (mut got, mut most) = (vec![Vec::<u64>::new(); senders], 0usize);
+            let mut got = vec![Vec::<u64>::new(); senders];
             loop {
-                most = most.max(way_in.upgrade().map_or(0, |q| q.len()));
-                let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the tee never ended"))?;
+                let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the senders never ended"))?;
                 let Ok(crate::harness::session::Local::Said(id, u)) = next else { break };
                 let t: usize = id.trim_start_matches('s').parse()?;
                 let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
@@ -1457,37 +1377,61 @@ mod tests {
             for (t, theirs) in got.iter().enumerate() {
                 anyhow::ensure!(theirs.iter().copied().eq(0..per), "session {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
             }
-            anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
-            anyhow::ensure!(way_in.upgrade().is_none_or(|q| q.is_empty()), "drained, its senders gone");
             Ok(())
         })
     }
 
-    /// Goal 10, plan 01a1a87b2dae step 5: a runner's tee passes each update on with when its session sent it in, not
-    /// when the tee got to pass it on: an update that waited in the tee, behind a sink with no room, still says when
-    /// it was taken in, so its frame counts that wait as the runner's. Into a sink that keeps no such time (the
-    /// server's), it passes on as it always did.
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's session hands its update to the runner's loop through the tee in its own
+    /// turn, with no task between them: once its send is done, the update is in the loop's queue and its rows are on their way
+    /// to the store, on a thread that's no shard and with nothing else run. The tee was a task of its own, the update handed to
+    /// it first: a wake and a turn on a shard, every update (192 to 384 µs at p99 in the Mac's lab).
+    #[test]
+    fn g10_s5_a_runners_update_reaches_its_loop_in_the_sessions_own_turn() -> anyhow::Result<()> {
+        let (_d, st) = scratch()?;
+        let (out, passed) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, 64);
+        let (sink, _held) = tee_held(out, Some(st.clone()));
+        futures::executor::block_on(async {
+            for n in 1..=32u64 {
+                let sent = Instant::now();
+                sink.send(("a1".to_owned(), said(&format!("m{n}"), n, "handed on"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+                let t = passed.try_recv().map_err(|_| anyhow::anyhow!("update {n} isn't in the loop's queue once its send is done"))?;
+                anyhow::ensure!(t.session == "a1" && matches!(&t.update, Update::Events { events } if events.first().is_some_and(|e| e.seq == n)), "update {n}, in order: {t:?}");
+                anyhow::ensure!(sent <= t.at, "taken in as it was sent");
+            }
+            anyhow::Ok(())
+        })?;
+        st.sync()?;
+        anyhow::ensure!(st.kept("a1", 100)?.map(|k| k.events.len()) == Some(32), "every update kept, as it went");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's tee passes each update on with when its session sent it in, not when it
+    /// went on: an update that waited, behind a loop with no room, still says when it was taken in, so its frame counts that
+    /// wait as the runner's. Into a sink that keeps no such time (the server's), it passes on as it always did.
     #[test]
     fn g10_s5_a_tee_passes_each_update_on_with_when_it_was_taken_in() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, 1);
-            let (sink, _held) = tee_held(out, None, 16);
-            anyhow::ensure!(matches!(sink, Sink::Stamped(_)), "its way in notes when");
+            let (sink, _held) = tee_held(out, None);
             sink.send(("a1".to_owned(), said("m1", 1, "fills what's after the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             let before = Instant::now();
-            sink.send(("a1".to_owned(), said("m2", 2, "waits in the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
-            let sent = Instant::now();
-            // The tee holds the second while what's after it has no room.
+            let waiting = {
+                let sink = sink.clone();
+                crate::rt::spawn_spread_joined(async move { sink.send(("a1".to_owned(), said("m2", 2, "waits for room"))).await.is_ok() })
+            };
+            // The second waits while what's after the tee has no room.
             let waited = Duration::from_millis(30);
             crate::rt::sleep(waited).await;
+            // Taking the first is what frees the room the second waits for.
+            let freed = Instant::now();
             let first = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             let second = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            anyhow::ensure!(waiting.await.unwrap_or(false), "the second went");
             anyhow::ensure!(first.session == "a1" && matches!(&second.update, Update::Events { events } if events.first().is_some_and(|e| e.id == "m2")), "in order: {first:?} {second:?}");
-            anyhow::ensure!(before <= second.at && second.at <= sent, "taken in as it was sent, not as the tee passed it on");
-            anyhow::ensure!(second.at.elapsed() >= waited, "its wait in the tee is counted from then");
+            anyhow::ensure!(before <= second.at && second.at <= freed, "taken in as it was sent, before what's after the tee had room for it");
             // Into a sink of plain updates, as before.
             let (plain, got) = async_channel::unbounded();
-            let (sink, _held) = tee_held(plain, None, 16);
+            let (sink, _held) = tee_held(plain, None);
             sink.send(("a2".to_owned(), said("m3", 3, "plain"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             let (id, u) = crate::rt::timeout(Duration::from_secs(5), got.recv()).await??;
             anyhow::ensure!(id == "a2" && u == said("m3", 3, "plain"), "passed on as it came");
@@ -1495,66 +1439,17 @@ mod tests {
         })
     }
 
-    /// A tee lets go of its store itself, between the updates it keeps ([`Held::take`]): a take asked
-    /// while the tee has taken an update off its queue and not yet kept it (held here at the lock it
-    /// keeps under) is answered only once that update is kept, and the store it gives up holds it. The
-    /// store was taken once the tee's queue looked empty, and such an update went nowhere when the take
-    /// came first to that lock.
-    #[test]
-    fn a_take_waits_for_an_update_the_tee_took_in_and_hasnt_kept() -> anyhow::Result<()> {
-        let (_d, st) = scratch()?;
-        let id = st.id().to_owned();
-        let (sink, held, passed) = crate::rt::block_on({
-            let st = st.clone();
-            async move {
-                let (out, passed) = async_channel::unbounded();
-                let (sink, held) = tee_held(out, Some(st), 16);
-                Ok((sink, held, passed))
-            }
-        })?;
-        let way_in = match &sink {
-            Sink::Stamped(q) => q.downgrade(),
-            Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
-        };
-        // The lock the tee keeps under, held here: it takes the update in, and waits there to keep it.
-        let lock = held.keeping.lock().unwrap_or_else(PoisonError::into_inner);
-        let s = sink.clone();
-        crate::rt::block_on(async move { s.send(("a1".to_owned(), said("m1", 1, "taken in"))).await.map_err(|_| anyhow::anyhow!("closed")) })?;
-        let until = Instant::now() + READ_WAIT;
-        while way_in.upgrade().is_some_and(|q| !q.is_empty()) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        anyhow::ensure!(way_in.upgrade().is_none_or(|q| q.is_empty()), "the tee never took the update in");
-        // The take asked meanwhile, on a thread of its own, as a handover asks it.
-        let h = held.clone();
-        let taker = std::thread::spawn(move || h.take());
-        while held.takes.is_empty() && !taker.is_finished() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        anyhow::ensure!(!held.takes.is_empty(), "the take wasn't asked of the tee, or was answered with the update not yet kept");
-        drop(lock);
-        let taken = taker.join().map_err(|_| anyhow::anyhow!("the taker panicked"))?.ok_or_else(|| anyhow::anyhow!("no store given up"))?;
-        anyhow::ensure!(taken.id() == id, "another store given up");
-        taken.sync()?;
-        let texts = taken.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>());
-        anyhow::ensure!(texts == Some(vec!["taken in".to_owned()]), "the update the tee took in before the take went nowhere: {texts:?}");
-        anyhow::ensure!(passed.try_recv().is_ok(), "the update wasn't passed on");
-        Ok(())
-    }
-
     #[test]
     fn a_tee_whose_store_is_taken_away_keeps_nothing_more_in_it() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = async_channel::unbounded();
             let (_d, st) = scratch()?;
-            let (sink, held) = tee_held(out, Some(st.clone()), 16);
+            let (sink, held) = tee_held(out, Some(st.clone()));
             sink.send(("a1".to_owned(), said("m1", 1, "kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
-            let h = held.clone();
-            let (taken, again) = crate::rt::blocking(move || (h.take(), h.take())).await?;
-            let taken = taken.ok_or_else(|| anyhow::anyhow!("no store"))?;
+            let taken = held.take().ok_or_else(|| anyhow::anyhow!("no store"))?;
             assert_eq!(taken.id(), st.id());
-            assert!(again.is_none(), "taken once");
+            assert!(held.take().is_none(), "taken once");
             // After: it still goes on, and isn't kept.
             sink.send(("a1".to_owned(), said("m2", 2, "not kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
@@ -1766,7 +1661,7 @@ mod tests {
         crate::rt::block_on(async move {
             let (_dir, store) = scratch()?;
             let (sink, out) = async_channel::bounded(4);
-            let tee = tee(sink, store.clone(), 4);
+            let (tee, _held) = tee_held(sink, Some(store.clone()));
             for i in 1..=3u64 {
                 tee.send(("a1".to_owned(), said(&format!("m{i}"), i, "x"))).await?;
             }

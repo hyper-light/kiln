@@ -78,6 +78,7 @@ fn collect(name: &str, pipe: Option<impl Read + Send + 'static>) -> io::Result<o
     Ok(rx)
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
@@ -87,6 +88,7 @@ async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_step(step: &Mutex<Step>) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = step.lock().child.try_wait()? {
@@ -96,6 +98,7 @@ async fn wait_step(step: &Mutex<Step>) -> io::Result<ExitStatus> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_held(held: &Mutex<Held>) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = held.lock().try_wait()? {
@@ -112,6 +115,7 @@ async fn kill_and_reap(child: &mut GroupChild) {
 }
 
 /// Wait for a pid to exit by polling `try_wait` (no pidfds on Windows).
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 pub async fn wait_pid_exit<S>(_pid: u32, mut try_wait: impl FnMut() -> io::Result<Option<S>>) -> io::Result<S> {
     loop {
         if let Some(status) = try_wait()? {
@@ -145,6 +149,7 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child's job is killed. The child is reaped either way.
+#[allow(clippy::disallowed_methods)] // (e) polls a pipe on Windows; overlapped I/O would tell
 pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = spawn_job(&mut cmd, false).with_context(|| format!("spawn {:?}", cmd.get_program()))?;

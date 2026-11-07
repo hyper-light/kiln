@@ -2790,6 +2790,7 @@ struct Login {
     token: String,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -2861,6 +2862,7 @@ struct PasswordLogin {
     name: Option<String>,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_password(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: PasswordLogin =
@@ -2907,6 +2909,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
 
 /// `POST /api/auth/passkey`: a passkey's answer to its challenge; the session of whoever it's
 /// theirs (docs/ci.md W10).
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_passkey(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3031,7 +3034,7 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
         let stats = hub.store.stats(Some(repos.clone())).await?;
         let queue = hub.store.queue_among(repos.clone()).await?;
-        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
+        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "started_ms": hub.started_ms, "hostname": null, "generation": hub.generation, "children": [], "sample": null });
         return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
     }
     // Kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), made of the last day's
@@ -3150,9 +3153,10 @@ fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<B
 /// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
 /// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
 /// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
-/// quantum), the overview here (its counts and a few kilobytes encoded). Says when the overview next changes
-/// by itself: at the next second of the server's uptime, which it says.
-pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
+/// quantum), the overview here (its counts and a few kilobytes encoded). Neither changes by itself: the overview
+/// says when the server started, and the pages count its uptime (goal 9, plan 01a1a87b2cec step 5: it was made
+/// again every second while it was read, for its uptime).
+pub(crate) async fn make_ahead(hub: &Arc<Hub>) {
     let v = &hub.harness.views;
     if v.agents.asked()
         && let Some(key) = agents_key(hub)
@@ -3161,10 +3165,8 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     {
         tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it");
     }
-    if !v.overview.asked() {
-        return None;
-    }
-    if let Some(key) = overview_key(hub)
+    if v.overview.asked()
+        && let Some(key) = overview_key(hub)
         && !v.overview.holds(&key)
     {
         let was = v.overview.now();
@@ -3173,7 +3175,6 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
         }
     }
-    Some(hub.started + Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1)))
 }
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
@@ -3236,7 +3237,7 @@ fn agents_made(hub: &Hub, key: &crate::reads::AgentsKey) -> Vec<crate::hub::Agen
 /// What the server says of itself now ([`crate::reads::SystemNow`]).
 fn system_now(hub: &Hub) -> crate::reads::SystemNow {
     crate::reads::SystemNow {
-        uptime_s: hub.started.elapsed().as_secs(),
+        started_ms: hub.started_ms,
         hostname: crate::config::Config::hostname(),
         children: crate::server::registry().snapshot(),
         sample: hub.history.load().get("server").and_then(|q| q.back().cloned()),
@@ -3248,7 +3249,7 @@ fn system_now(hub: &Hub) -> crate::reads::SystemNow {
 fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_s": s.uptime_s,
+        "started_ms": s.started_ms,
         "hostname": s.hostname,
         "generation": hub.generation,
         "children": s.children,
@@ -3260,8 +3261,13 @@ fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
     })
 }
 
+/// `GET /api/system`, made as it's asked: its uptime too, for the API's readers from before `started_ms`.
 fn system_json(hub: &Hub) -> serde_json::Value {
-    system_of(hub, &system_now(hub))
+    let mut v = system_of(hub, &system_now(hub));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("uptime_s".into(), json!(hub.started.elapsed().as_secs()));
+    }
+    v
 }
 
 async fn system(hub: &Hub) -> Response {
@@ -3394,6 +3400,7 @@ async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
 async fn delete_repo(hub: &Hub, id: &str) -> R {
     let repo = find_repo(hub, id).await?;
     hub.store.delete_repo(repo.id.clone()).await?;
+    hub.runs_deleted().await?;
     // Its runs go with it: the CI engine stops their legs where they run, as GitHub does.
     hub.ci.send(crate::ci::dispatch::Msg::RepoDeleted { repo: repo.id });
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;
@@ -3956,6 +3963,7 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
 /// `POST /api/agents/:name/probe` (docs/ci.md W13-R01, on request): the runner probes its facts
 /// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
 /// 202 without one.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
     let Some(before) = hub.agents.load().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
         return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
@@ -4033,13 +4041,15 @@ fn outpost_invite(hub: &Hub) -> Response {
     )
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
     let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some());
+    // A job pod's token, refused once its time is up (none is swept away for it: goal 9, plan 01a1a87b2cec step 5).
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -4119,6 +4129,7 @@ fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
 /// certificate and a CSR signed with that certificate's key ([`crate::pki::Pki::sign_instance`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll_instance(hub: &Hub, req: Request) -> R {
     let r: crate::agent::InstanceRequest =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -4166,6 +4177,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// machine says it is, and while a process of it is connected (what it holds would move from under
 /// it). An id known already, not connected, is the same machine's second record: the two merge,
 /// and every other record of the machine not connected folds in with them ([`Hub::fold_duplicates`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused rekey's picked delay (slows guessing)
 async fn rekey_agent(hub: &Hub, req: Request) -> R {
     let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
@@ -4517,6 +4529,7 @@ async fn create_join(hub: &Hub, req: Request) -> R {
 
 /// `GET /api/join-requests/:id`: the machine polls with its secret (`Authorization: Bearer`); an
 /// admin sees the request as listed.
+#[allow(clippy::disallowed_methods)] // (e) polls a join's answer; the join's decision could tell
 async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     let now = Instant::now();
     if authed(hub, headers) {
@@ -4717,6 +4730,11 @@ async fn download_for(hub: &Hub, target: &str) -> R {
 /// Build `build` for `target`: what an upgrade names, so a machine gets exactly the binary it
 /// was told the SHA-256 of (kiln may hand out more than one for a platform).
 async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
+    if target == TARGET {
+        // The server's own build is listed once its binary is read (`updates::binaries`): an upgrade naming it waits
+        // for that, and one that couldn't be read is said below as a build kiln doesn't have.
+        let _read = crate::updates::own_binary().await;
+    }
     let Some(b) = crate::updates::binaries(hub).into_iter().find(|b| b.target == target && b.build == build) else {
         return Err(err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")));
     };
@@ -4780,7 +4798,7 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
     srv::json(
         StatusCode::OK,
         &json!({
-            "server": crate::updates::server(hub, force),
+            "server": crate::updates::server(hub, force).await,
             "runners": runners,
             "jobs": jobs,
             "binaries": crate::updates::binaries(hub),
@@ -6680,6 +6698,9 @@ struct Takes {
     /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
     /// settled tool calls without their bodies (docs/wire.md, "Windows").
     view: crate::harness::registry::View,
+    /// `timing=1`: each live frame followed by the server's times with it ([`timing_frame`]), as an API read that asks
+    /// is told its own (`Kiln-Timing`): goal 10, plan 01a1a87b2dae step 5, the lab's frames split frame by frame.
+    timing: bool,
 }
 
 impl Takes {
@@ -6694,6 +6715,7 @@ impl Takes {
             patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
             after,
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+            timing: has("timing=1"),
         }
     }
 }
@@ -7006,10 +7028,9 @@ fn session_error(error: String) -> String {
 /// largest messages (1 MiB) held for it at a time.
 const FEED_READ: usize = 16;
 
-/// How long a viewer with nothing to read waits before it looks whether its feed broke (a full bus
-/// may refuse the resync marker as well as its frames), and how long a viewer of a session whose
-/// feed the bus can't hold waits between snapshots. Under 5 s, so a viewer whose feed broke starts
-/// over within 5 s of it, its wait having begun at most a frame's handling after.
+/// How long a viewer of a session whose feed the bus can't hold waits between snapshots. A viewer with a feed waits
+/// on the feed and its refusals ([`crate::harness::live::Viewer::refused`]: a full bus may refuse the resync marker
+/// as well as its frames), on no clock (goal 9, plan 01a1a87b2cec step 5).
 const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a viewer's wait on its session's feed came to.
@@ -7019,8 +7040,8 @@ enum Live {
     Refused(kiln_seams::bus::Refusal),
     /// The session has no feed on the bus: time for another snapshot.
     Feedless,
-    /// A while with nothing: time to see whether the feed broke since (a full bus may refuse its
-    /// resync marker as well as its frames).
+    /// The feed refused something: time to see whether it broke since the viewer last started over (a full bus may
+    /// refuse its resync marker as well as its frames).
     Quiet,
 }
 
@@ -7092,15 +7113,18 @@ enum Fed {
 /// and the turn ends with it (goal 9, plan 01a1a87b2cec step 3). Fed in a turn of cheap feeds, a batch was flushed whole as
 /// it ended, its write (a system call of all of it) past the quantum: a viewer's live polls held their shard 0.64 ms on the
 /// CPU calm at the longest in g9p35.
-async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, takes: Takes, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
     use futures::SinkExt as _;
+    let patches = takes.patches;
     let (mut fed, costs) = (0u64, read.costs);
     // What's fed since the last flush, in bytes.
     let mut unflushed = 0usize;
     let mut came_to = Fed::Written;
+    // Where the publish clock began on the clock of day, for a viewer that asked for the server's times (`timing=1`).
+    let epoch = takes.timing.then(|| epoch_us().saturating_sub(crate::harness::live::now_us()));
     // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
     // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
     // viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds).
@@ -7126,6 +7150,7 @@ where
         }
         let (rev, range) = (frame.rev, frame.range_for_viewer(patches));
         let published = crate::harness::live::published_us(&m.payload);
+        let times = epoch.zip(published).map(|(epoch, published)| timing_frame(epoch, published, crate::harness::live::came_of(&m.payload), read.now_us));
         let said = crate::harness::live::into_text(m.payload, range);
         // A state or changeset that went as its patch alone, to a viewer that takes it whole (none did as it
         // went: `live::Feed::wants_whole`): it starts over rather than take nothing.
@@ -7148,6 +7173,10 @@ where
         *have = (*have).max(rev);
         unflushed = unflushed.saturating_add(said.len());
         tx.feed(ws::text(said)).await?;
+        if let Some(times) = times {
+            unflushed = unflushed.saturating_add(times.len());
+            tx.feed(ws::text(times)).await?;
+        }
         fed = fed.saturating_add(1);
         if turns.over() {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
@@ -7162,6 +7191,33 @@ where
     crate::route_latency::observe_took(crate::route_latency::Class::Websocket, wrote, fed);
     crate::route_latency::observe_frames(crate::route_latency::FrameLeg::Write, wrote, fed);
     Ok(came_to)
+}
+
+/// Microseconds since the epoch, now: the clock of day a lab on the same machine stamps by.
+fn epoch_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// The server's times with a live frame, for a viewer that asked (`timing=1`), sent right after the frame (goal 10, plan
+/// 01a1a87b2dae step 5): `{"t":"timing","published":…,"read":…,"arrived":…,"took":…,"runner":…}`, each a time of day in
+/// microseconds since the epoch (the publish clock's `epoch` added): its publish, its viewer's read of it off the bus, and,
+/// where its frame was made of a runner's update (`crate::harness::live::Came`), that update's frame's arrival off the wire
+/// and its owner's take of it, and its runner's hold of it (a duration, microseconds). A lab on the server's machine sets
+/// them against its own stamps, as it does an API read's `Server-Timing`, and splits each slow frame where its time went.
+fn timing_frame(epoch: u64, published: u64, came: Option<crate::harness::live::Came>, read: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(r#"{{"t":"timing","published":{},"read":{}"#, epoch.saturating_add(published), epoch.saturating_add(read));
+    if let Some(c) = came {
+        if let Some(at) = c.arrived_us {
+            let _ = write!(out, r#","arrived":{}"#, epoch.saturating_add(at));
+        }
+        let _ = write!(out, r#","took":{}"#, epoch.saturating_add(c.took_us));
+        if let Some(r) = c.runner_us {
+            let _ = write!(out, r#","runner":{r}"#);
+        }
+    }
+    out.push('}');
+    out
 }
 
 thread_local! {
@@ -7222,6 +7278,7 @@ static VIEWER_COMMAND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "vi
 /// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
 /// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
 /// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
+#[allow(clippy::disallowed_methods)] // (e) a viewer with no feed snapshots every FEEDLESS; its session's changes could tell. A catch-up's pacing is measured
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, who: String) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
@@ -7292,12 +7349,14 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     }
     loop {
         let live = {
-            let (bus, topic, from) = (&hub.bus, &topic, at);
+            // Its refusals listened for before they're read: one after the read ends the wait; one before it, the read finds.
+            let (bus, topic, from, refused, broke) = (&hub.bus, &topic, at, viewer.refused(), viewer.refusals() != refusals);
             waited(async move {
                 match from {
+                    Some(_) if broke => Live::Quiet,
                     Some(from) => {
                         let wait = bus.wait(topic, from).fuse();
-                        let quiet = crate::rt::sleep(FEEDLESS).fuse();
+                        let quiet = refused.fuse();
                         futures::pin_mut!(wait, quiet);
                         futures::select_biased! {
                             w = wait => match w {
@@ -7333,7 +7392,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let (read, next) = (Read::now(woke, own), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, read, &mut turns)).await? {
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes, &topic, read, &mut turns)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
@@ -8663,15 +8722,8 @@ mod tests {
             assert_eq!(seqs, (11..=60).collect::<Vec<u64>>(), "its newest fifty, oldest first");
             assert_eq!(got("/api/agents"), serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?);
             assert_eq!(got("/api/me"), serde_json::to_vec(&me_json(&hub, Some(&owner), Vec::new()))?);
-            // The uptime may have gone on a second between the two: compared without it.
-            let without_uptime = |mut v: serde_json::Value| {
-                if let Some(system) = v.get_mut("system").and_then(serde_json::Value::as_object_mut) {
-                    system.remove("uptime_s");
-                }
-                v
-            };
             let stored = overview_json(&hub, &hub.store.stats(None).await?, &hub.agent_list().await, &system_now(&hub), queue_now());
-            assert_eq!(without_uptime(serde_json::from_slice(&got("/api/overview"))?), without_uptime(stored));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&got("/api/overview"))?, stored);
             assert_eq!(got("/api/runs"), serde_json::to_vec(&crate::reads::runs(&hub.store, &HashMap::new(), None).await?)?);
             let plans = crate::plans::list(&hub, crate::plans::Asked { session: Some("a".into()), proposed: true, ..crate::plans::Asked::default() }).await?;
             assert_eq!(got("/api/plans?session=a&proposed=1"), serde_json::to_vec(&plans)?);
@@ -8958,6 +9010,36 @@ mod tests {
         assert_eq!(made.as_ref(), was.as_slice());
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&made)?.get("events").and_then(serde_json::Value::as_array).map(Vec::len), Some(2), "the row that isn't JSON left out");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): the overview says when the server started, and
+    /// what it's made of doesn't change as the server's uptime goes on, so nothing makes it again for that (it was made
+    /// again every second while it was read; the pages count the uptime now). Do: a scratch hub's overview read; what
+    /// it's made of taken twice, a second and a half apart. Expect: it says `started_ms` and no `uptime_s`; the two
+    /// equal, but for the supervisor's children (another test's may change them meanwhile).
+    #[test]
+    fn g9_s5_the_overview_says_when_the_server_started_and_isnt_made_again_for_its_uptime() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let deadline = Instant::now() + HANG;
+            let made = loop {
+                if let Some(key) = overview_key(&hub) {
+                    break hub.harness.views.overview.answer(key, |k| overview_made(&hub, k))?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            let said: serde_json::Value = serde_json::from_slice(&made.json)?;
+            anyhow::ensure!(said.pointer("/system/started_ms").and_then(serde_json::Value::as_i64) == Some(hub.started_ms), "{said}");
+            anyhow::ensure!(said.pointer("/system/uptime_s").is_none(), "an uptime that's stale as soon as it's kept: {said}");
+            let before = system_now(&hub);
+            crate::rt::sleep(Duration::from_millis(1_500)).await;
+            let after = system_now(&hub);
+            anyhow::ensure!(before == after || before.children != after.children, "what the overview's made of changed with nothing changed");
+            Ok(())
+        })
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: the overview counts its runners from their rows and live records as they're
@@ -9418,6 +9500,51 @@ mod tests {
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
             anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a viewer that asked for the server's times (`timing=1`) has each live frame followed
+    /// by them: its publish and its read, and where its frame was made of a runner's update, that update's arrival, its
+    /// owner's take and its runner's hold, as times of day a lab on the machine sets against its own stamps; a frame made
+    /// of none says only its publish and read. A viewer that didn't ask is sent its frames alone.
+    #[test]
+    fn g10_s5_a_viewer_that_asks_has_each_frame_followed_by_its_times() -> anyhow::Result<()> {
+        futures::executor::block_on(async {
+            let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
+            let (mut tx, _rx) = socket.split();
+            // The publish clock starts at its first reading: a stamp 900 µs before now needs it that old.
+            const BEFORE: u64 = 900;
+            while crate::harness::live::now_us() <= BEFORE {
+                std::thread::sleep(Duration::from_micros(BEFORE));
+            }
+            let now = crate::harness::live::now_us();
+            let came = crate::harness::live::Came { arrived_us: Some(now - BEFORE), took_us: now - 300, runner_us: Some(70) };
+            let made = {
+                let _came = crate::harness::live::carrying(Some(came));
+                fed_frame(1, r#"{"t":"events","rev":1}"#, 1)
+            };
+            let batch = vec![made, fed_frame(2, r#"{"t":"events","rev":2}"#, 2)];
+            let (mut have, before) = (0, epoch_us());
+            let read = Read::now(crate::harness::live::now_us(), true);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Takes { timing: true, ..Takes::default() }, "sessions/s/0.0", read, &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
+            let texts = texts_read(writes.try_iter().collect::<Vec<_>>().concat())?;
+            anyhow::ensure!(texts.len() == 4, "each frame, then its times: {texts:?}");
+            let times = |i: usize| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(texts.get(i).map_or("", String::as_str))?) };
+            let (first, second) = (times(1)?, times(3)?);
+            let at = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+            anyhow::ensure!(first.get("t").and_then(serde_json::Value::as_str) == Some("timing"), "{first}");
+            let (published, arrived, took) = (at(&first, "published").unwrap_or(0), at(&first, "arrived").unwrap_or(0), at(&first, "took").unwrap_or(0));
+            anyhow::ensure!(published >= before.saturating_sub(5_000_000) && published <= epoch_us(), "a time of day: {first}");
+            anyhow::ensure!(published.saturating_sub(arrived) >= 900 && published.saturating_sub(took) >= 300 && took.saturating_sub(arrived) == 600, "the update's arrival and take, on the publish's clock: {first}");
+            anyhow::ensure!(at(&first, "runner") == Some(70) && at(&first, "read").is_some_and(|r| r >= published.saturating_sub(1)), "its runner's hold and its read: {first}");
+            anyhow::ensure!(at(&second, "arrived").is_none() && at(&second, "took").is_none() && at(&second, "runner").is_none() && at(&second, "published").is_some(), "a frame made of no update: {second}");
+            // Not asked: the frames alone.
+            let batch = vec![fed_frame(3, r#"{"t":"events","rev":3}"#, 3)];
+            write_live_batch(&mut tx, batch, &mut have, Takes::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(texts_read(writes.try_iter().collect::<Vec<_>>().concat())? == [r#"{"t":"events","rev":3}"#.to_owned()], "the frame alone");
             anyhow::Ok(())
         })
     }
