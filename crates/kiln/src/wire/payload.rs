@@ -849,6 +849,14 @@ impl Piece {
         Self { read, costs, rest }
     }
 
+    /// Frame `data`'s piece, its message read on the shard whatever its kind has learned (a test's).
+    #[cfg(test)]
+    pub(crate) fn on_shard(data: &[u8]) -> Self {
+        let message = crate::proto::item_at(data).map_or(data, |item| item.body);
+        let (costs, rest) = kind_costs(message);
+        Self { read: Read::Shard(0), costs, rest }
+    }
+
     /// A runner's frame of job output (a log chunk): read whole and written where the hub's loop takes it, all of it the
     /// piece's own.
     pub fn job_log() -> Self {

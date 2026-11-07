@@ -2676,10 +2676,11 @@ impl Registry {
     /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
     /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
-        let id = r.session.clone();
+        let owner = self.sessions.owner_of(&r.session);
         self.room_for_rows(r.shipped).await;
-        if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
-            tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        // Its owner found before it's handed over, so its id isn't copied for that (goal 9, plan 01a1a87b2cec step 3).
+        if !self.sessions.send_to(owner, Msg::Runner(Box::new(r))).await {
+            tracing::debug!(owner, "an agent session's update came as the server's copies went");
         }
     }
 

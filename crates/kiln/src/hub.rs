@@ -5979,6 +5979,55 @@ pub(crate) mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: what the hub's loop makes taking a runner's session update on the channel, read on its
+    /// shard, past what reading the update itself makes (its box, its events and their texts): its stream's name and its
+    /// session's id, read out of its frame where they lie; its runner's name, and the runner's name again for its owner; its box
+    /// to its owner; its answer, and what its receivers publish of the stream; the answer encoded. Nine blocks, and the test
+    /// hub's copy of what it sends. At 98bb86697e4 it made eight more (the lab's mix, 33 blocks a frame with its read's 15, the
+    /// diag of 11-07): the item read whole as a message of its own and its handling boxed, the runner's and the stream's names
+    /// copied for each item and each answer, what its receivers have published again for each item though nothing it said had
+    /// changed, the session's id copied to find its owner. Its item's body and its update's JSON were each moved down its
+    /// frame, and read through for UTF-8, besides.
+    #[test]
+    fn g9_s3_a_session_update_on_the_channel_makes_the_loop_nine_blocks() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let frame = |seq: u64, u: &Update| -> anyhow::Result<Vec<u8>> {
+                let body = proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? })?;
+                proto::encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq, low: seq.saturating_sub(1), body }))
+            };
+            let event = |data: Vec<u8>| NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data, at: Instant::now() };
+            let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hub.on_net(event(frame(1, &open)?)).await?;
+            hub.sent.lock().reserve(64);
+            for n in 1..=8u64 {
+                let said = Update::Events { events: vec![Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } }] };
+                let json = serde_json::to_vec(&said)?;
+                let before = crate::os::counted::made();
+                let read: Box<Update> = serde_json::from_slice(&json)?;
+                let own = crate::os::counted::made().blocks - before.blocks;
+                drop(read);
+                let data = frame(n + 1, &said)?;
+                let piece = crate::wire::payload::Piece::on_shard(&data);
+                let ev = event(data);
+                // Heard this second already, its runner's record isn't copied: what's counted is the item's.
+                hub.heard("fedora");
+                let (taken, made) = crate::os::counted::counted(hub.on_net_at(ev, Some(piece), &mut None)).await;
+                taken?;
+                anyhow::ensure!(made.blocks.saturating_sub(own) == 9 + 1, "update {n}: {} blocks past its read's {own}", made.blocks.saturating_sub(own));
+            }
+            hub.harness.applied("s1").await;
+            let events = hub.harness.events_json("s1", None, 20).ok_or_else(|| anyhow::anyhow!("no copy of s1"))?;
+            let seen: serde_json::Value = serde_json::from_slice(&events)?;
+            let ids: Vec<&str> = seen.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str)).collect();
+            assert_eq!(ids, (1..=8).map(|n| format!("e{n}")).collect::<Vec<_>>(), "every update taken, in order");
+            Ok(())
+        })
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 3: the hub's loops take each runner frame as a piece of their turns on their shards,
     /// each given up for where it won't fit what's left of the turn's quantum, and lose none of them nor their order: a
     /// session's Open and its events, one a frame, end in its copy as sent (on its owner's session loop); a custody record
