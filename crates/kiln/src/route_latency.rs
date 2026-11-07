@@ -434,9 +434,172 @@ fn runners(segs: &[&str]) -> bool {
     )
 }
 
-/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`], [`FRAME_LEGS`]).
+/// The legs of the server's frames on their way into a runner process, on the runner (runner-fan; goal 10, plan
+/// 01a1a87b2dae step 4): how long each kind of frame waits, and what holds the runner's loops. Set beside the runner's
+/// own hold of its sessions' updates (`RunnerLeg::Runner`, the other way), they say where a command, a message to an
+/// agent or the server's answer waits on the runner. On the runner's registry as `kiln_runner_in_leg_seconds{leg,kind}`,
+/// which reaches the server's observe store with the rest of its registry (`crate::observe::kiln::start_registry`, its
+/// host's tag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InLeg {
+    /// From the net thread taking a frame off its link to handing it to its loop's queue: the net thread's own hold.
+    Net,
+    /// From the frame's arrival off its link to its loop taking it, but for its wait for the server's earlier frames on the
+    /// runner's other loops (`order`): the net thread's hold, its queue's wait, its loop's wake and the events before it.
+    Wait,
+    /// From its loop taking it to the server's earlier frames on the runner's other loops having been taken, which it may
+    /// not overtake (`crate::wire::fan`): observed only for a frame that had any to wait for.
+    Order,
+    /// Not a frame's wait but what makes the next one's: a loop's time with each event it takes, from taking it to being done
+    /// with it, whatever it waited on meanwhile, by what it was ([`InKind`]).
+    Held,
+    /// From a loop handing a command or a message to its session (`crate::harness::host::Host::command_at`) to the
+    /// session's lane taking it up.
+    ToSession,
+    /// From a command applied to its answer handed to the net thread.
+    Answer,
+}
+
+impl InLeg {
+    pub const ALL: [InLeg; 6] = [InLeg::Net, InLeg::Wait, InLeg::Order, InLeg::Held, InLeg::ToSession, InLeg::Answer];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            InLeg::Net => "net",
+            InLeg::Wait => "wait",
+            InLeg::Order => "order",
+            InLeg::Held => "held",
+            InLeg::ToSession => "to_session",
+            InLeg::Answer => "answer",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            InLeg::Net => 0,
+            InLeg::Wait => 1,
+            InLeg::Order => 2,
+            InLeg::Held => 3,
+            InLeg::ToSession => 4,
+            InLeg::Answer => 5,
+        }
+    }
+}
+
+/// What a runner's loop took, for its legs ([`InLeg`]): one of the server's frames, by what it is, or another of the
+/// loop's events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InKind {
+    /// A command or a message for one agent session, or its question about one.
+    Session,
+    /// Another of the server's commands on the channel.
+    Command,
+    /// The server's answers about the runner's own streams: what it took (`Ack`), wants again (`Want`) and has (`Have`).
+    Answers,
+    /// A frame of a protocol of its own the link carries: repo sync's, observe's and the cluster group's Raft, the
+    /// conversation store's feed, reach, ports.
+    Carried,
+    /// The rest of the server's frames: its handshake, its states, its questions and answers.
+    Other,
+    /// The link coming up or going.
+    Link,
+    /// Not the server's: an agent session's update on its way up.
+    Update,
+    /// Not the server's: what the runner says of its own (its jobs', its answers, its telemetry).
+    Own,
+    /// Not the server's: the rest (its clocks, its jobs' ends, its terminals, its upgrades).
+    Rest,
+}
+
+impl InKind {
+    pub const ALL: [InKind; 9] = [InKind::Session, InKind::Command, InKind::Answers, InKind::Carried, InKind::Other, InKind::Link, InKind::Update, InKind::Own, InKind::Rest];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            InKind::Session => "session",
+            InKind::Command => "command",
+            InKind::Answers => "answers",
+            InKind::Carried => "carried",
+            InKind::Other => "other",
+            InKind::Link => "link",
+            InKind::Update => "update",
+            InKind::Own => "own",
+            InKind::Rest => "rest",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            InKind::Session => 0,
+            InKind::Command => 1,
+            InKind::Answers => 2,
+            InKind::Carried => 3,
+            InKind::Other => 4,
+            InKind::Link => 5,
+            InKind::Update => 6,
+            InKind::Own => 7,
+            InKind::Rest => 8,
+        }
+    }
+}
+
+/// A runner's in-legs, each (leg, kind) made by its first observation, so only those the runner's traffic has are rendered
+/// (goal 11, plan 01a1a87b2e56 step 5: zeros a runner's registry carried into observe), each to the microsecond below a few
+/// milliseconds, as the server's runner legs are ([`Legs`]).
+pub struct InLegs([[OnceLock<PerShard>; InKind::ALL.len()]; InLeg::ALL.len()]);
+
+impl InLegs {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())))
+    }
+
+    /// A frame or an event of `kind` spent `took` on `leg`.
+    pub fn observe(&self, leg: InLeg, kind: InKind, took: Duration) {
+        if let Some(cell) = self.0.get(leg.index()).and_then(|l| l.get(kind.index())) {
+            cell.get_or_init(|| PerShard::new(crate::shard_health::DELAY_BUCKETS)).observe(took.as_secs_f64());
+        }
+    }
+
+    /// `leg`'s histogram for `kind`, where one was observed.
+    pub fn of(&self, leg: InLeg, kind: InKind) -> Option<&PerShard> {
+        self.0.get(leg.index())?.get(kind.index())?.get()
+    }
+}
+
+/// The runner's in-legs, made by the first one its loops time: none in a process without a runner's loop.
+static IN_LEGS: OnceLock<InLegs> = OnceLock::new();
+
+/// The runner's.
+pub fn in_legs() -> &'static InLegs {
+    IN_LEGS.get_or_init(InLegs::new)
+}
+
+/// A server's frame, or another event of a runner's loop, of `kind`, spent `took` on `leg`.
+pub fn observe_in(leg: InLeg, kind: InKind, took: Duration) {
+    in_legs().observe(leg, kind, took);
+}
+
+/// The `kiln_route_*` families, in the exposition: those the process made ([`ROUTES`], [`LEGS`], [`FRAME_LEGS`]); and a
+/// runner's in-legs where it made them ([`IN_LEGS`]).
 pub fn render(o: &mut String) {
     render_of(o, ROUTES.get(), LEGS.get(), FRAME_LEGS.get());
+    render_in(o, IN_LEGS.get());
+}
+
+/// The runner's in-legs' family, its series where they're made.
+fn render_in(o: &mut String, legs: Option<&InLegs>) {
+    let Some(legs) = legs else { return };
+    let _ = writeln!(
+        o,
+        "# HELP kiln_runner_in_leg_seconds The server's frames on their way into a runner, on the runner, by leg and kind: net (the net thread's hold of a frame), wait (its arrival to its loop taking it), order (its wait for the server's earlier frames on the runner's other loops), held (a loop's time with each event it takes, its waits included), to_session (a command or message handed to its session to the session's lane taking it), answer (a command applied to its answer handed to the net thread).\n# TYPE kiln_runner_in_leg_seconds histogram"
+    );
+    for leg in InLeg::ALL {
+        for kind in InKind::ALL {
+            if let Some(h) = legs.of(leg, kind) {
+                h.render(o, "kiln_runner_in_leg_seconds", &format!("leg=\"{}\",kind=\"{}\"", leg.name(), kind.name()));
+            }
+        }
+    }
 }
 
 /// The families of `routes`, `legs` and `frames`: each said, with its TYPE, whether or not it's made (as every family
@@ -712,5 +875,30 @@ mod tests {
         }
         assert!(o.contains("kiln_frame_leg_seconds_bucket{leg=\"woken\",le=\"0.00001\"}"), "the shards' delay buckets");
         assert!(o.find("# TYPE kiln_runner_wait_leg_seconds").is_some_and(|runner| o.find("# TYPE kiln_frame_leg_seconds").is_some_and(|frame| runner < frame)), "after the runner's legs");
+    }
+
+    /// runner-fan: a runner's in-legs are each leg's by what took it, made by their first observation: only those its
+    /// traffic had are rendered, each with its leg and its kind, to the microsecond as the server's runner legs are; a
+    /// process whose loops timed none renders none of the family.
+    #[test]
+    fn runner_fan_a_runners_in_legs_are_by_leg_and_kind_and_rendered_where_made() {
+        assert_eq!(InLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["net", "wait", "order", "held", "to_session", "answer"]);
+        assert_eq!(InLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), (0..InLeg::ALL.len()).collect::<Vec<_>>());
+        assert_eq!(InKind::ALL.iter().map(|k| k.index()).collect::<Vec<_>>(), (0..InKind::ALL.len()).collect::<Vec<_>>());
+        let mut none = String::new();
+        render_in(&mut none, None);
+        assert!(none.is_empty(), "no loop timed any: no family");
+        let legs = InLegs::new();
+        legs.observe(InLeg::Wait, InKind::Session, Duration::from_micros(12));
+        legs.observe(InLeg::Wait, InKind::Session, Duration::from_micros(1_300));
+        legs.observe(InLeg::Held, InKind::Carried, Duration::from_micros(40));
+        assert_eq!(legs.of(InLeg::Wait, InKind::Session).map(PerShard::count), Some(2));
+        assert!(legs.of(InLeg::Wait, InKind::Command).is_none(), "made by its first observation only");
+        let mut o = String::new();
+        render_in(&mut o, Some(&legs));
+        assert!(o.contains("kiln_runner_in_leg_seconds_count{leg=\"wait\",kind=\"session\"} 2"), "{o}");
+        assert!(o.contains("kiln_runner_in_leg_seconds_count{leg=\"held\",kind=\"carried\"} 1"), "{o}");
+        assert!(!o.contains("kind=\"command\""), "none for what nothing took");
+        assert!(o.contains("kiln_runner_in_leg_seconds_bucket{leg=\"wait\",kind=\"session\",le=\"0.000025\"}"), "the shards' delay buckets: {o}");
     }
 }

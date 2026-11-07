@@ -102,6 +102,17 @@ The server's commands to a runner process ride that process's command streams on
   runners need for the legs assigned to them at once. A link that drops before it's answered ends
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
+An agent session's commands go on streams of the session's own, to a runner process that says it
+takes them (`CAP_SESSION_STREAMS`, bit 54): `p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>`,
+each waiting as the process's own of its kind does. What's for one session there (a command for it,
+its close, a file its message carries, its release, a page streamed for whoever views it) goes in the
+session's order on the runner's loop on the shard that owns the session, and waits for no other
+session's (runner-fan: the process's two streams took every session's commands one at a time, each
+behind the last). A session's opening, and a package it goes on from, stay on the process's own: they
+make the session, and what's for it comes once they're answered. Once a session's close is answered,
+both ends let go of its streams; an item of one that comes again is taken from its `low`, as a
+receiver that lost a stream takes it. A runner process without the bit gets every command on its two.
+
 A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
 after its hello and its `Build`, before anything else on its control lane. Until then its commands
 wait for that, a live one too, rather than being refused as if it were away or going the old way.

@@ -310,11 +310,29 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
     }
 }
 
-/// Queues command `body` (a `what`, riding `stream`) to runner processes `peers` of machine `agent`
-/// (shown as `shown`), run by the commands' owner on its commands: on its command stream for one that
-/// keeps the channel, else handed to `legacy` (which says whether it went).
+/// The agent session a command is one of a session's for, on a runner that takes those on the session's own command streams
+/// (`CAP_SESSION_STREAMS`; runner-fan): what it tells a session there, in the session's order, on the loop of the shard that
+/// owns it, waiting for no other session's. A session's opening and a package to go on from are the process's: they make
+/// the session there, and what's for it comes once they're answered.
+fn session_lane(msg: &ServerMsg) -> Option<&str> {
+    match msg {
+        ServerMsg::HarnessCmd { session, .. }
+        | ServerMsg::HarnessClose { session }
+        | ServerMsg::HarnessFile { session, .. }
+        | ServerMsg::HarnessRelease { session }
+        | ServerMsg::StreamOpen { session, .. }
+        | ServerMsg::StreamControl { session, .. }
+        | ServerMsg::StreamInput { session, .. }
+        | ServerMsg::StreamClose { session, .. } => Some(session),
+        _ => None,
+    }
+}
+
+/// Queues command `body` (a `what`, riding `stream`; for agent session `session` where it's one of a session's:
+/// [`session_lane`]) to runner processes `peers` of machine `agent` (shown as `shown`), run by the commands' owner on its
+/// commands: on its command stream for one that keeps the channel, else handed to `legacy` (which says whether it went).
 #[allow(clippy::too_many_arguments)]
-fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, what: &'static str, peers: Vec<PeerId>, stream: Option<crate::wire::commands::Kind>, body: &[u8], mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
+fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, what: &'static str, peers: Vec<PeerId>, stream: Option<crate::wire::commands::Kind>, session: Option<&str>, body: &[u8], mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
     use crate::wire::commands::{Answer, Kind as Stream};
     if peers.is_empty() {
         return Pending { agent: agent.to_owned(), shown: shown.to_owned(), what, waits: Vec::new(), at_once: Answer::Unreachable { why: format!("{shown} is not connected") }, away: false };
@@ -330,7 +348,7 @@ fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, w
         match stream.filter(|_| c.keeps(p)) {
             Some(kind) => {
                 away &= c.is_away(p);
-                let mut rx = c.push(p, kind, body.to_vec(), Instant::now());
+                let mut rx = c.push(p, kind, session, body.to_vec(), Instant::now());
                 match rx.try_recv() {
                     Ok(Some(a)) => given.push(a),
                     _ => waits.push(rx),
@@ -1658,11 +1676,11 @@ impl Hub {
             Err(e) => return Pending { agent: agent.to_owned(), shown, what, waits: Vec::new(), at_once: Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }, away: false },
         };
         let (tx, rx) = futures::channel::oneshot::channel();
-        let (stream, net, a, s) = (stream_of(msg), self.net.clone(), agent.to_owned(), shown.clone());
+        let (stream, net, a, s, lane) = (stream_of(msg), self.net.clone(), agent.to_owned(), shown.clone(), session_lane(msg).map(str::to_owned));
         self.cmds.tell(move |c| {
             let mut peers = peers;
             peers.extend(last.filter(|p| c.keeps(*p)));
-            let pending = queue_on(c, &a, &s, what, peers, stream, &body, |p, body| net.try_send(p, LANE_CONTROL, Kind::Control, body));
+            let pending = queue_on(c, &a, &s, what, peers, stream, lane.as_deref(), &body, |p, body| net.try_send(p, LANE_CONTROL, Kind::Control, body));
             // What it comes to, for whoever waits on it here.
             drop(crate::rt::spawn(async move {
                 let _ = tx.send(pending.answer(LOG_WITHIN).await);
@@ -1693,12 +1711,12 @@ impl Hub {
         };
         // Queued by the commands' owner, in its turn. A runner from before the channel gets it as it
         // always did, sent after the rest.
-        let (stream, a, s) = (stream_of(msg), agent.to_owned(), shown.clone());
+        let (stream, a, s, lane) = (stream_of(msg), agent.to_owned(), shown.clone(), session_lane(msg).map(str::to_owned));
         let queued = self
             .cmds
             .ask(move |c| {
                 let mut legacy: Vec<(PeerId, Vec<u8>)> = Vec::new();
-                let pending = queue_on(c, &a, &s, what, peers, stream, &body, |p, body| {
+                let pending = queue_on(c, &a, &s, what, peers, stream, lane.as_deref(), &body, |p, body| {
                     legacy.push((p, body));
                     true
                 });
@@ -1749,7 +1767,7 @@ impl Hub {
             };
             return Ok(serde_json::json!({ "sent": self.net.send(peer, lane, kind, bytes).await }));
         }
-        let Some(rx) = self.cmds.ask(move |c| c.push(peer, Stream::Live, bytes, Instant::now())).await else { return Err("the server's commands have stopped".into()) };
+        let Some(rx) = self.cmds.ask(move |c| c.push(peer, Stream::Live, None, bytes, Instant::now())).await else { return Err("the server's commands have stopped".into()) };
         self.flush_commands().await;
         let answer = match crate::rt::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(a)) => a,
@@ -3029,7 +3047,13 @@ impl Hub {
                 }
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
-                    self.cmds.ask(move |c| c.connected(peer)).await;
+                    // One that takes an agent session's commands on the session's own streams gets them there (runner-fan).
+                    let lanes = caps & proto::CAP_SESSION_STREAMS != 0;
+                    self.cmds.ask(move |c| {
+                        c.lanes(peer, lanes);
+                        c.connected(peer);
+                    })
+                    .await;
                     self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&agent))).await;
                 } else {
                     let waited = self.cmds.ask(move |c| c.not_wire(peer)).await.unwrap_or_default();
@@ -5305,7 +5329,9 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+        // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+        let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+        let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
@@ -5416,6 +5442,40 @@ pub(crate) mod tests {
 
     /// A test hub's loops, one a shard and its control loop, as the server starts them (`Hub::net_loops`): the net
     /// thread's end that hands them what a runner sends, and how far each has taken (goal 10, plan 01a1a87b2dae step 4).
+    /// runner-fan (P): what's for one agent session rides the session's own command streams (a command for it, its close, a
+    /// file its message carries, its release, a page streamed for whoever views it); its opening and a package it goes on
+    /// from stay on the process's, as does all that isn't a session's. And an item the server's commands put on a session's
+    /// own stream is one the runner's fan hands that session's loop.
+    #[test]
+    fn runner_fan_a_sessions_commands_ride_its_own_streams_to_its_loop() -> anyhow::Result<()> {
+        let s = || "s1".to_owned();
+        let lanes = [
+            ServerMsg::HarnessCmd { session: s(), json: "{}".into() },
+            ServerMsg::HarnessClose { session: s() },
+            ServerMsg::HarnessFile { session: s(), file: "f".into(), offset: 0, data: Vec::new(), done: true },
+            ServerMsg::HarnessRelease { session: s() },
+            ServerMsg::StreamOpen { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamControl { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamInput { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamClose { stream: "st".into(), session: s() },
+        ];
+        for m in &lanes {
+            anyhow::ensure!(session_lane(m) == Some("s1"), "{} rides its session's own streams", crate::wire::server_name(m));
+        }
+        for m in [ServerMsg::HarnessOpen { session: s(), json: "{}".into() }, ServerMsg::HarnessPackage { session: s(), offset: 0, data: Vec::new(), done: true }, ServerMsg::Cancel { job: "j".into(), reason: "r".into() }] {
+            anyhow::ensure!(session_lane(&m).is_none(), "{} rides the process's", crate::wire::server_name(&m));
+        }
+        let mut c = crate::wire::commands::Commands::new(7);
+        c.on_frame(1, crate::wire::channel::Receiver::new().have());
+        c.lanes(1, true);
+        let body = proto::encode(lanes.first().ok_or_else(|| anyhow::anyhow!("none"))?)?;
+        let _answer = c.push(1, crate::wire::commands::Kind::Live, Some("s1"), body, Instant::now());
+        let (_, frame) = c.poll(Instant::now()).into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing sent"))?;
+        let data = proto::encode(&ServerMsg::Wire(frame))?;
+        anyhow::ensure!(crate::wire::fan::peek_server(Kind::Control, proto::LANE_CONTROL, &data).0 == crate::wire::fan::Head::Session("s1"), "the runner's fan hands it session s1's loop");
+        Ok(())
+    }
+
     fn hub_loops(hub: &Arc<Hub>) -> (crate::wire::fan::Fan, Arc<crate::wire::fan::Marks>) {
         let (fan, loops) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
         let marks = Arc::clone(&loops.marks);
@@ -5797,8 +5857,8 @@ pub(crate) mod tests {
             for peer in [1, 2] {
                 hub.cmds.ask(move |c| c.coming(peer, now)).await;
             }
-            let mut old = hub.cmds.ask(move |c| c.push(1, Kind::Parked, b"close s1".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
-            let mut new = hub.cmds.ask(move |c| c.push(2, Kind::Parked, b"close s2".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
+            let mut old = hub.cmds.ask(move |c| c.push(1, Kind::Parked, None, b"close s1".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
+            let mut new = hub.cmds.ask(move |c| c.push(2, Kind::Parked, None, b"close s2".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
             // Heard long after its hello, a runner that keeps the channel still has time to say so.
             anyhow::ensure!(hub.cmds.ask(move |c| c.overdue(now + Duration::from_secs(10))).await.unwrap_or_default().is_empty(), "taken for old on the clock");
             // box-a says its upgrade preference before any Caps: from before the channel.

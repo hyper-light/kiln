@@ -635,6 +635,43 @@ pub fn sends() -> &'static SendsMetrics {
     })
 }
 
+/// A host's records store's durable writes (`crate::records::turso`): for each transaction committed, the sync of the write
+/// that held it (its COMMIT, which makes it durable: Turso's WAL with `SyncMode::Full`, F_FULLFSYNC on Apple's systems),
+/// and how many transactions that write held. On a runner its transactions are its sessions' inboxes' takes, one a message
+/// (`crate::harness::inbox`): beside `kiln_sends_take_seconds`, a message's whole take, they say how much of it was its
+/// sync, and how often messages shared one (runner-fan: the share of a message's answer its runner's sync is).
+pub struct RecordsMetrics {
+    /// Each committed transaction's wait for its write's sync.
+    pub sync_seconds: Histogram,
+    /// Each committed transaction's group: the transactions its write held.
+    pub group_size: Histogram,
+}
+
+impl RecordsMetrics {
+    /// A durable write of `n` transactions, whose sync took `synced`: each of them waited for it.
+    pub fn committed(&self, synced: std::time::Duration, n: u64) {
+        self.sync_seconds.observe_n(synced.as_secs_f64(), n);
+        self.group_size.observe_n(f64::from(u32::try_from(n).unwrap_or(u32::MAX)), n);
+    }
+}
+
+/// The records store's families, made by its first durable write: a process that writes no records renders none (goal 11,
+/// plan 01a1a87b2e56 step 5's rule for a runner's registry, `crate::route_latency::ROUTES`).
+static RECORDS: OnceLock<RecordsMetrics> = OnceLock::new();
+
+pub fn records() -> &'static RecordsMetrics {
+    RECORDS.get_or_init(|| RecordsMetrics { sync_seconds: Histogram::new(SEND_BUCKETS), group_size: Histogram::new(crate::records::turso::GROUP_BUCKETS) })
+}
+
+/// The records store's families, in the exposition, where they're made ([`RECORDS`]).
+fn render_records(o: &mut String) {
+    let Some(m) = RECORDS.get() else { return };
+    let _ = writeln!(o, "# HELP kiln_records_sync_seconds How long each transaction a host's records store committed waited for its write's sync (on a runner: each message its sessions' inboxes took).\n# TYPE kiln_records_sync_seconds histogram");
+    m.sync_seconds.render(o, "kiln_records_sync_seconds", "");
+    let _ = writeln!(o, "# HELP kiln_records_group_size How many transactions the durable write that held each committed transaction held.\n# TYPE kiln_records_group_size histogram");
+    m.group_size.render(o, "kiln_records_group_size", "");
+}
+
 /// Sends' families, in the exposition.
 fn render_sends(o: &mut String) {
     let m = sends();
@@ -1489,6 +1526,7 @@ pub fn render() -> String {
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
     render_sync(&mut o);
     render_sends(&mut o);
+    render_records(&mut o);
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);
