@@ -53,6 +53,32 @@ pub fn thread_run_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)).flatten()
 }
 
+/// The poll this shard's thread is in, by the shard's clock ([`poll_clock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollClock {
+    /// When the poll began, as the loop published it as it began: the same for every reading within one poll, and another
+    /// for the next, so it tells one poll from the next.
+    pub began_ns: u64,
+    /// Now.
+    pub now_ns: u64,
+}
+
+impl PollClock {
+    /// How long the poll has held its shard so far, nanoseconds.
+    pub fn held_ns(&self) -> u64 {
+        self.now_ns.saturating_sub(self.began_ns)
+    }
+}
+
+/// The poll this shard's thread is in now: when it began and now, on the shard's clock (its cheap reading). What a task's
+/// code weighs its next piece against to end its poll within the step's quantum ([`step_budget_ns`]), however it came to
+/// that piece, rather than a turn it keeps itself (kiln's goal 9, plan 01a1a87b2cec step 3: a poll past the quantum holds
+/// every other task on its shard). None off a shard's thread, between polls, and in a simulation, whose clock doesn't move
+/// within a poll.
+pub fn poll_clock() -> Option<PollClock> {
+    registry::with_current(|ctx| (!ctx.is_sim && ctx.current.get() != crate::shard::NO_TASK).then(|| PollClock { began_ns: ctx.now_ns.get(), now_ns: ctx.now_ns() })).flatten()
+}
+
 /// What a piece of work spent on the thread that ran it ([`spent`]; kiln's goal 9, plan 01a1a87b2cec step 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spent {
@@ -91,16 +117,17 @@ impl Spent {
 /// Runs `work` on the calling thread and says what it spent ([`Spent`]): kiln's estimates of where work runs (a shard or
 /// the compute pool) learn its cost from it, so a loaded host's preemptions don't send short work off its shard (kiln's
 /// goal 9, plan 01a1a87b2cec step 5: on a host at load 75, 37-55 µs reads of runners' frames went to the pool, where their
-/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the clock, the thread's
-/// CPU clock (its shard's task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its
-/// voluntary switches (`getrusage`), each before and after.
+/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the shard's clock
+/// (`machine::clock::shard_clock_ns`, as the compute pool times its jobs, on any thread), the thread's CPU clock (its shard's
+/// task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its voluntary switches (`getrusage`),
+/// each before and after.
 pub fn spent<R>(work: impl FnOnce() -> R) -> (R, Spent) {
     let task = thread_run_ns();
     let os = if task.is_none() { crate::attribution::thread_cpu_now() } else { None };
     let switches = crate::attribution::voluntary_switches_now();
-    let began = std::time::Instant::now();
+    let began = crate::machine::clock::shard_clock_ns();
     let out = work();
-    let wall_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let wall_ns = crate::machine::clock::shard_clock_ns().saturating_sub(began);
     let cpu_ns = match (task, os) {
         (Some(from), _) => thread_run_ns().map(|to| to.saturating_sub(from)),
         (None, Some(from)) => crate::attribution::thread_cpu_now().map(|to| to.saturating_sub(from)),

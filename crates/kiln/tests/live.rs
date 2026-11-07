@@ -260,3 +260,41 @@ fn bp_g3_s2_fuzzed_upgrades_and_first_frames_never_panic() -> anyhow::Result<()>
     assert!(!log.contains("panicked"), "the server panicked:\n{log}");
     Ok(())
 }
+
+/// bp-g3 step 2: a person's session cookie, as a browser sends it, opens the protocol from the server's
+/// own page and not from another site's.
+#[test]
+fn bp_g3_s2_a_session_cookie_opens_it_from_the_servers_own_origin() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let server = common::start_env(dir.path(), &Options::default(), false, &[("KILN_LIVE", "1")])?;
+    let (port, admin) = (server.port, server.admin.clone());
+    let cookie = common::custody::person(port, &admin, "dev")?;
+    let v1 = format!("Sec-WebSocket-Protocol: kiln-bp.{}\r\n", kiln_bp::VERSION);
+    let (head, _) = upgrade(port, &format!("Cookie: kiln_session={cookie}\r\nOrigin: http://127.0.0.1:{port}\r\n{v1}Sec-WebSocket-Extensions: permessage-deflate\r\n"))?;
+    assert_eq!(status(&head), 101, "the right cookie, Origin and version: {head}");
+    assert_eq!(header(&head, "sec-websocket-protocol"), Some(format!("kiln-bp.{}", kiln_bp::VERSION).as_str()), "{head}");
+    assert!(header(&head, "sec-websocket-extensions").is_none(), "deflate never echoed: {head}");
+    let (head, _) = upgrade(port, &format!("Cookie: kiln_session={cookie}\r\nOrigin: https://evil.example\r\n{v1}"))?;
+    assert_eq!(status(&head), 403, "the same cookie from another site's page: {head}");
+    let (head, _) = upgrade(port, &format!("Cookie: kiln_session=not-a-session\r\nOrigin: http://127.0.0.1:{port}\r\n{v1}"))?;
+    assert_eq!(status(&head), 401, "a cookie that isn't a session: {head}");
+    Ok(())
+}
+
+/// bp-g3 step 2: a server without `[server] live` has no endpoint, and says so in the field an older
+/// page ignores (optional and additive: `"live": null`).
+#[test]
+fn bp_g3_s2_a_server_without_it_says_so_and_has_no_endpoint() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let server = common::start(dir.path(), &Options::default())?;
+    let (port, admin) = (server.port, server.admin.clone());
+    for path in ["/api/me", "/api/system"] {
+        let (code, body) = http(port, "GET", path, &admin, None)?;
+        assert_eq!(code, 200, "{path}: {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        assert!(v.get("live").is_some_and(Value::is_null), "{path} says it has no endpoint: {body}");
+    }
+    let (head, _) = upgrade(port, &format!("Authorization: Bearer {admin}\r\nSec-WebSocket-Protocol: kiln-bp.{}\r\n", kiln_bp::VERSION))?;
+    assert_eq!(status(&head), 404, "no endpoint: {head}");
+    Ok(())
+}

@@ -125,18 +125,11 @@ fn cache_bytes(server: bool, learned: u64) -> u64 {
 }
 /// Bytes the log's file may take (it grows as it's used).
 const DISK: u64 = 4 << 30;
-/// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
-const KEEP: u64 = if cfg!(test) { 8 } else { 256 };
+/// The log's checkpoint cadence, entries and bytes, as its layout states it ([`log_facts`]): the log retains two, the
+/// one a compaction checkpoints and the one after it, and what's uncommitted past them (hyper-log's `Config::derive`).
+const CADENCE: (u64, u64) = (4096, 256 << 20);
 /// Changes waiting for the log, at most: past them a write waits its turn.
 pub(super) const QUEUED: usize = 1024;
-/// Entries, and log bytes, between compactions.
-const COMPACT_ENTRIES: u64 = if cfg!(test) { 64 } else { 8192 };
-const COMPACT_BYTES: u64 = 128 << 20;
-/// With learners, a compaction keeps up to this much of the log behind what's applied, at the
-/// entries' mean size, for a learner a little behind (a runner reconnecting); one further behind
-/// takes a copy of the database.
-const KEEP_LEARNERS_BYTES: u64 = 64 << 20;
-const KEEP_LEARNERS: u64 = if cfg!(test) { 16 } else { 65_536 };
 /// How often the server's member beats while it has learners: a learner hears what's committed
 /// when no write moves.
 const BEAT: Duration = Duration::from_secs(1);
@@ -354,13 +347,24 @@ fn log_facts(align: Alignment, cache: u64) -> Facts {
         largest_entry: LARGEST + (64 << 10),
         disk_bytes: DISK,
         max_groups: GROUPS,
-        cadence_entries: 4096,
-        cadence_bytes: 256 << 20,
+        cadence_entries: CADENCE.0,
+        cadence_bytes: CADENCE.1,
         uncommitted_entries: 2048,
         uncommitted_bytes: 64 << 20,
         // What replays at a start reads the file; the cache serves learners out of step (`cache_bytes`).
         cache_bytes: cache,
     }
+}
+
+/// The applied entries a compaction keeps behind what's applied, of a log that holds `held` of them in `held_bytes`: the
+/// newest that a learner lacking them catches up from sooner than from a copy of kiln.db, `image` bytes, which a learner
+/// behind the log's start fetches in their place over the same link (`Store::copy_for_learner`). That's CockroachDB's
+/// rule (`raft_log_queue.go`: a raft log past the size of the data it replicates is recovered faster by a snapshot), the
+/// entries at the log's mean size, within the [`CADENCE`] a compaction checkpoints. A compaction is due once more than
+/// this has applied since the last, so each frees what came since.
+fn keep(held: u64, held_bytes: u64, image: u64) -> u64 {
+    let mean = (held_bytes / held.max(1)).max(1);
+    (image.min(CADENCE.1) / mean).min(CADENCE.0)
 }
 
 /// An entry: one write's change, or a part of it (a large one).
@@ -591,6 +595,7 @@ impl Group {
                     next: 1,
                     start: Instant::now(),
                     since: 0,
+                    image: 0,
                     broken: None,
                     applied: applied2,
                     point: point2,
@@ -863,8 +868,10 @@ struct Driver {
     pending: std::collections::HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
     next: u64,
     start: Instant,
-    /// What was applied at the last compaction.
+    /// What was applied at the last compaction, or where the log started as it opened.
     since: u64,
+    /// kiln.db's bytes as last read ([`Driver::retain`]).
+    image: u64,
     /// Why the group can't take writes, once it can't.
     broken: Option<String>,
     /// The last entry applied, for the store to say.
@@ -920,7 +927,8 @@ impl Driver {
             ready.send(Err(Opening::Failed(e))).ok();
             return;
         }
-        self.since = self.replica.applied().index;
+        // What the log holds as it opens counts as come since its last compaction.
+        self.since = self.replica.log_mut().bounds().map_or(0, |(start, _)| start.index);
         ready.send(Ok(())).ok();
         let mut stopping: Option<Instant> = None;
         loop {
@@ -991,21 +999,13 @@ impl Driver {
                 self.learn_spans();
             }
             self.log_reads.store(self.replica.log().handle().asked(), Ordering::Relaxed);
-            // Compacting makes kiln.db durable (a commit that waits for the disk, holding its write
-            // lock), so it's every so many writes, not by the image's size (on one node a marker).
-            let applied = self.replica.applied().index;
-            if self.replica.is_stalled() || applied.saturating_sub(self.since) >= COMPACT_ENTRIES || self.replica.compactable_bytes() >= COMPACT_BYTES {
-                let now = self.now();
-                if self.replica.compact(self.keep().min(applied), now, &self.waker).unwrap_or(false) {
-                    self.since = applied;
-                }
-            }
             if let Ok((start, _)) = self.replica.log_mut().bounds() {
                 self.log_start.store(start.index, Ordering::SeqCst);
                 if let Some(sizes) = &mut self.replica.machine_mut().sizes {
                     sizes.let_go_through(start.index);
                 }
             }
+            self.retain();
             // What waited for room goes in now there's some, in order.
             self.propose_held();
             if let Some(since) = stopping {
@@ -1047,15 +1047,30 @@ impl Driver {
         Ok(())
     }
 
-    /// Entries a compaction keeps behind what's applied: with learners, as many as fit
-    /// [`KEEP_LEARNERS_BYTES`] at the entries' mean size, for one a little behind.
-    fn keep(&self) -> u64 {
-        if self.replica.is_stalled() || self.replica.configuration().learners.is_empty() {
-            return KEEP;
+    /// Compacts the log once more entries have applied since its last compaction than it keeps ([`keep`]), or once it's
+    /// stalled for room. A compaction makes kiln.db durable, a commit that waits for the disk holding its write lock.
+    /// kiln.db never shrinks, so what's kept by its size as last read is never more than by its size now: it's read again
+    /// only for a compaction that looks due.
+    fn retain(&mut self) {
+        let (applied, stalled) = (self.replica.applied().index, self.replica.is_stalled());
+        let (since, held, held_bytes) = (applied.saturating_sub(self.since), applied.saturating_sub(self.log_start.load(Ordering::SeqCst)), self.replica.compactable_bytes());
+        let due = |image| stalled || since > keep(held, held_bytes, image);
+        if !due(self.image) {
+            return;
         }
-        let entries = self.replica.applied().index.saturating_sub(self.since).max(1);
-        let mean = (self.replica.compactable_bytes() / entries).max(1);
-        (KEEP_LEARNERS_BYTES / mean).clamp(KEEP, KEEP_LEARNERS)
+        self.image = database_bytes(&self.replica.machine().conn).unwrap_or_else(|e| {
+            tracing::warn!("kiln.db's size didn't read, so the cluster log keeps all its cadence holds: {e}");
+            u64::MAX
+        });
+        if !due(self.image) {
+            return;
+        }
+        let now = self.now();
+        match self.replica.compact(keep(held, held_bytes, self.image), now, &self.waker) {
+            Ok(true) => self.since = applied,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("the cluster log didn't compact: {e:?}"),
+        }
     }
 
     /// Brings the group's learners to those wanted, one change at a time.
@@ -1270,6 +1285,12 @@ pub(super) fn stand(conn: &Connection, at: Point, conf: &ConfState) -> anyhow::R
     })();
     conn.execute_batch("PRAGMA synchronous = NORMAL").ok();
     done
+}
+
+/// The bytes of the database `conn` has open, as SQLite counts its pages, the WAL's newest among them.
+fn database_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    let bytes: i64 = conn.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| r.get(0))?;
+    Ok(u64::try_from(bytes).unwrap_or(0))
 }
 
 /// Whether `e` is SQLite's busy or locked: another connection held kiln.db past this one's wait.
@@ -2132,24 +2153,117 @@ mod tests {
         set(&server, "after", "2")?;
         until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
         assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
-        // Away while the server writes past what the log keeps for it: back, it takes a new copy.
-        // Back only once the log starts past it: compactions go out when the log has room for
-        // them, so the writes alone don't say one has.
+        // Away while the server writes three times what kiln.db holds, over one row (the log grows, kiln.db doesn't):
+        // back, it takes a new copy. Back only once the log starts past it: compactions go out when the log has room
+        // for them, so the writes alone don't say one has.
         let away_at = learner.standing().1;
         up.store(false, Ordering::SeqCst);
-        for i in 0..200 {
-            set(&server, &format!("away{i}"), "x")?;
+        let value = "v".repeat(64 << 10);
+        let writes = 3 * kiln_db_bytes(&dir.path().join("kiln.db"))? / (64 << 10);
+        for i in 0..writes {
+            set(&server, "away", &format!("{i}{value}"))?;
         }
         server.flush_group()?;
         until("the server's log starting past the learner", || Ok(g.log_start() > away_at))?;
         up.store(true, Ordering::SeqCst);
-        until("the writes made while it was away", || Ok(read("away199")?.as_deref() == Some("x")))?;
+        let last = format!("{}{value}", writes.saturating_sub(1));
+        until("the writes made while it was away", || Ok(read("away")?.as_deref() == Some(last.as_str())))?;
         assert_eq!(copies.load(Ordering::SeqCst), 2, "left behind by the log, it took a new copy");
         set(&server, "later", "3")?;
         until("a write after the new copy", || Ok(read("later")?.as_deref() == Some("3")))?;
         done.store(true, Ordering::SeqCst);
         links.join().ok();
         Ok(())
+    }
+
+    /// kiln.db's bytes, as the group weighs them.
+    fn kiln_db_bytes(db: &Path) -> anyhow::Result<u64> {
+        Ok(database_bytes(&Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?)?)
+    }
+
+    /// Research 01a1b3bbac36 (f9, f11's pick 4): a compaction keeps the newest entries a learner lacking them catches up
+    /// from sooner than from a copy of kiln.db, fewer bytes than it holds, within the cadence a compaction checkpoints.
+    /// What's kept follows kiln.db's size and the entries' sizes, and no size of its own.
+    #[test]
+    fn retention_keeps_fewer_bytes_than_kiln_db_within_a_cadence() {
+        let (kib, mib) = (1u64 << 10, 1u64 << 20);
+        assert_eq!(keep(100, 100 * kib, 2 * mib), 2048, "entries of a KiB: a 2 MiB kiln.db's worth");
+        assert_eq!(keep(100, 100 * kib, 3 * mib), 3072, "a larger kiln.db, more of them");
+        assert_eq!(keep(100, 100 * 64 * kib, 2 * mib), 32, "entries of 64 KiB, fewer");
+        assert_eq!(keep(100, 100 * kib, 1 << 30), CADENCE.0, "within the cadence's entries");
+        assert_eq!(keep(10, 10 * 8 * mib, 1 << 40), CADENCE.1 / (8 * mib), "and its bytes");
+        assert_eq!(keep(1, mib, 4 * kib), 0, "a kiln.db smaller than an entry: its copy beats replaying any");
+    }
+
+    /// Research 01a1b3bbac36 (f9, f11's pick 4): no runner back from away is sent a copy of kiln.db that the log would
+    /// have caught it up from sooner. Away while the server writes two thirds of what kiln.db holds over one row (the log
+    /// grows, kiln.db doesn't), a learner catches up from the log; away for three times what kiln.db holds, it fetches a
+    /// copy. kiln.db first grows by rows of its own, so the shorter absence is many times what the sizes this replaced
+    /// kept in tests (16 entries, compacting every 64): they sent the learner a copy after it too.
+    #[test]
+    fn retention_follows_kiln_dbs_size_and_how_long_a_runner_was_away() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let server = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let value = "v".repeat(64 << 10);
+        // Away while the server overwrites one row `writes` times, back once the log kept what it lacks (or, `left`
+        // behind, once the log starts past it): the copies it took to catch up.
+        let away = |writes: u64, left: bool| -> anyhow::Result<u64> {
+            let (before, away_at) = (copies.load(Ordering::SeqCst), learner.standing().1);
+            up.store(false, Ordering::SeqCst);
+            g.unreachable(member);
+            for i in 0..writes {
+                set(&server, "away", &format!("{i}{value}"))?;
+            }
+            server.flush_group()?;
+            if left {
+                until("the server's log starting past the learner", || Ok(g.log_start() > away_at))?;
+            }
+            anyhow::ensure!(left || g.log_start() <= away_at, "the log keeps the {writes} writes the learner lacks: it starts at {}, past {away_at}", g.log_start());
+            up.store(true, Ordering::SeqCst);
+            let last = format!("{}{value}", writes.saturating_sub(1));
+            until("the writes made while it was away", || Ok(read("away")?.as_deref() == Some(last.as_str())))?;
+            Ok(copies.load(Ordering::SeqCst).saturating_sub(before))
+        };
+        let checked = (|| -> anyhow::Result<()> {
+            for i in 0..160 {
+                set(&server, &format!("grow{i}"), &value)?;
+            }
+            until("kiln.db's growth on the learner", || Ok(read("grow159")?.is_some()))?;
+            let fits = kiln_db_bytes(&db)? / (64 << 10);
+            let caught_up = away(2 * fits / 3, false)?;
+            anyhow::ensure!(caught_up == 0, "lacking less than kiln.db holds, it caught up from the log, not {caught_up} copies");
+            let left = away(3 * fits, true)?;
+            anyhow::ensure!(left == 1, "lacking more than kiln.db holds, it fetched a copy, not {left}");
+            Ok(())
+        })();
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        checked
     }
 
     /// A write kiln.db holds and the log never got (the server stopped before it reached the log,
