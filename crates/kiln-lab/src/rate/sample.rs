@@ -267,6 +267,14 @@ impl Tree {
         }
     }
 
+    /// Each of the tree's processes' page faults now, minor and major (Linux; none elsewhere).
+    fn faults(&self) -> BTreeMap<u32, (u64, u64)> {
+        if !cfg!(target_os = "linux") {
+            return BTreeMap::new();
+        }
+        processes(Some(&self.pids)).into_iter().map(|(pid, p)| (pid, (p.minflt, p.majflt))).collect()
+    }
+
     /// The tree's usage now; none where the OS won't say, or the server is gone.
     pub fn now(&self) -> Option<Usage> {
         let u = if cfg!(target_os = "linux") {
@@ -340,6 +348,9 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
     let unix = || SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs_f64());
     let (mut first_wall, mut last_wall) = (None, None);
     let mut next = Instant::now();
+    // Each process's faults at the window's start and as last seen: one that ends mid-window keeps what it made until then,
+    // where a sum over those still there would drop it (and read less than nothing, so none).
+    let (mut faults_from, mut faults_seen) = (None::<BTreeMap<u32, (u64, u64)>>, BTreeMap::new());
     loop {
         let now = Instant::now();
         if let Some(u) = tree.now() {
@@ -347,6 +358,9 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
             last_wall = unix();
             first_wall = first_wall.or(last_wall);
         }
+        let faults = tree.faults();
+        faults_from.get_or_insert_with(|| faults.clone());
+        faults_seen.extend(faults);
         if now >= to {
             break;
         }
@@ -355,6 +369,10 @@ pub fn window(tree: &mut Tree, from: Instant, to: Instant) -> Window {
     }
     let mut w = summarize(&points);
     (w.from_unix_s, w.to_unix_s) = (first_wall, last_wall);
+    if let Some(from) = faults_from.filter(|_| cfg!(target_os = "linux")) {
+        let made = |pick: fn(&(u64, u64)) -> u64| from.iter().map(|(pid, f)| faults_seen.get(pid).map_or(0, |s| pick(s).saturating_sub(pick(f)))).sum::<u64>();
+        (w.minor_faults, w.major_faults) = (Some(made(|f| f.0)), Some(made(|f| f.1)));
+    }
     held(&first, &threads(&tree.pids), looked.elapsed().as_secs_f64(), &mut w);
     w
 }
