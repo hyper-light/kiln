@@ -197,10 +197,16 @@ pub fn doc_differs(doc: &str, run: &BrowserRun) -> Vec<(String, String)> {
     let a: Vec<&str> = inside.trim().lines().collect();
     let b: Vec<&str> = want.trim().lines().collect();
     let mut out = Vec::new();
+    // Each line under its table's heading (`#### case in browser`): with the row's condition and
+    // measure, that names the cell.
+    let mut table = "";
     for i in 0..a.len().max(b.len()) {
         let (x, y) = (a.get(i).copied().unwrap_or(""), b.get(i).copied().unwrap_or(""));
+        if let Some(h) = y.strip_prefix("#### ").or_else(|| x.strip_prefix("#### ")) {
+            table = h;
+        }
         if x != y {
-            out.push((x.to_owned(), y.to_owned()));
+            out.push((format!("{table}: {x}"), format!("{table}: {y}")));
         }
     }
     out
@@ -376,6 +382,31 @@ mod tests {
         assert!(p50.ends_with("kiln-today 1200 (mean) |"), "{p50}");
         let p99 = t.lines().find(|l| l.contains("cpu p99 ")).unwrap_or_default();
         assert!(p99.contains("50000 (50000–50000) n=500.0 |"), "{p99}");
+    }
+
+    /// plan 01a1a832e9cc step 10's test: a number of the run changed by hand is a line that
+    /// differs, named by its table (case and browser), its condition and measure, with the doc's
+    /// value and the run's; the run as it was, none.
+    #[test]
+    fn g1_s10_a_changed_number_names_its_cell_and_both_values() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let doc = std::fs::read_to_string(root.join("docs/browser-lab.md")).unwrap_or_default();
+        let Some(path) = doc.lines().find_map(|l| l.trim().strip_prefix("<!-- browser-lab run: ")?.strip_suffix(" -->")) else { return };
+        let run: Result<BrowserRun, _> = serde_json::from_slice(&std::fs::read(root.join(path)).unwrap_or_default());
+        let Ok(mut run) = run else { return assert!(run.is_ok(), "{path}: not a run file") };
+        assert!(doc_differs(&doc, &run).is_empty(), "the doc isn't {path}'s as it is");
+        let cell = |j: &JobRecord| j.case == "burst" && j.browser == "chromium" && j.condition == "50k/1" && j.target == "h2o-h2";
+        assert!(run.jobs.iter().any(cell), "{path} has no h2o-h2 burst at 50k/1 in Chromium");
+        for j in run.jobs.iter_mut().filter(|j| cell(j)) {
+            if let Some(v) = j.numbers.get_mut("time.p50_ms") {
+                *v *= 2.0;
+            }
+        }
+        let d = doc_differs(&doc, &run);
+        assert_eq!(d.len(), 1, "{d:?}");
+        let (was, now) = d.first().map(|(a, b)| (a.as_str(), b.as_str())).unwrap_or_default();
+        assert!(was.starts_with("burst in chromium: | 50k/1 | time p50 (ms) |") && now.starts_with("burst in chromium: | 50k/1 | time p50 (ms) |"), "{was}\n{now}");
+        assert_ne!(was, now);
     }
 
     /// plan 01a1a832e9cc step 10: docs/browser-lab.md's tables are the run files' it names
