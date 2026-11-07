@@ -237,7 +237,7 @@ fn config(server: &str) -> String {
 
 /// The tag of an image built from this binary: `kiln:` and its build id.
 fn own_tag() -> Option<String> {
-    let id = crate::updates::own_build();
+    let id = crate::updates::own_build_blocking();
     (id != "unknown").then(|| format!("{APP}:{id}"))
 }
 

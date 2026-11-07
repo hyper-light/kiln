@@ -3394,6 +3394,7 @@ async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
 async fn delete_repo(hub: &Hub, id: &str) -> R {
     let repo = find_repo(hub, id).await?;
     hub.store.delete_repo(repo.id.clone()).await?;
+    hub.runs_deleted().await?;
     // Its runs go with it: the CI engine stops their legs where they run, as GitHub does.
     hub.ci.send(crate::ci::dispatch::Msg::RepoDeleted { repo: repo.id });
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;
@@ -4717,6 +4718,11 @@ async fn download_for(hub: &Hub, target: &str) -> R {
 /// Build `build` for `target`: what an upgrade names, so a machine gets exactly the binary it
 /// was told the SHA-256 of (kiln may hand out more than one for a platform).
 async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
+    if target == TARGET {
+        // The server's own build is listed once its binary is read (`updates::binaries`): an upgrade naming it waits
+        // for that, and one that couldn't be read is said below as a build kiln doesn't have.
+        let _read = crate::updates::own_binary().await;
+    }
     let Some(b) = crate::updates::binaries(hub).into_iter().find(|b| b.target == target && b.build == build) else {
         return Err(err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")));
     };
@@ -4780,7 +4786,7 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
     srv::json(
         StatusCode::OK,
         &json!({
-            "server": crate::updates::server(hub, force),
+            "server": crate::updates::server(hub, force).await,
             "runners": runners,
             "jobs": jobs,
             "binaries": crate::updates::binaries(hub),
