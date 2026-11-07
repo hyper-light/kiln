@@ -66,13 +66,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
-    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
-    {
-        let dir = cfg.server.data_dir.clone();
-        crate::rt::spawn_spread(async move {
-            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-        });
-    }
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); this build's are kept beside them once it
+    // serves its UI.
+    crate::ui::keep_in(&cfg.server.data_dir);
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");

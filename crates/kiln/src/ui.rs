@@ -30,6 +30,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -69,30 +70,76 @@ const PLACEHOLDER: &str = r#"<!doctype html><html><head><meta charset="utf-8"><t
 code{color:#cdc4e0}</style></head><body><div><h1>kiln</h1><p>The UI was not built into this binary.
 Run <code>npm --prefix ui ci &amp;&amp; npm --prefix ui run build</code> and rebuild.</p></div></body></html>"#;
 
-/// Where earlier builds' assets are kept.
-static KEPT: OnceLock<PathBuf> = OnceLock::new();
+/// Where earlier builds' assets are kept, and whether this build's were sent to be kept there ([`Keeping`]).
+static KEPT: Keeping = Keeping::new();
 /// How long an asset is kept after the last build that had it.
 const KEEP_FOR: Duration = Duration::from_secs(14 * 24 * 3600);
 
-/// Keeps this build's hashed assets in `<data>/ui-assets`, beside earlier builds' (each kept for
-/// two weeks after the last build that had it), for `serve`.
-pub fn keep_assets(data_dir: &Path) {
-    let dir = data_dir.join("ui-assets");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+/// The kept assets' folder, once the server names it ([`keep_in`]), and whether this build's assets were sent to be
+/// kept there ([`serving`]), once a process.
+struct Keeping {
+    dir: OnceLock<PathBuf>,
+    begun: AtomicBool,
+}
+
+impl Keeping {
+    const fn new() -> Self {
+        Self { dir: OnceLock::new(), begun: AtomicBool::new(false) }
+    }
+
+    fn get(&self) -> Option<&PathBuf> {
+        self.dir.get()
+    }
+
+    /// The folder this build's assets are to be kept in, the first time it's asked once the folder is named; none after.
+    fn first(&self) -> Option<PathBuf> {
+        let dir = self.dir.get()?;
+        (!self.begun.load(Ordering::Relaxed) && !self.begun.swap(true, Ordering::Relaxed)).then(|| dir.clone())
+    }
+}
+
+/// Earlier builds' assets served from `<data>/ui-assets` from now on (a page loaded before a deploy), as the server
+/// starts: no file read or written. This build's are written there only once it serves its UI ([`serving`]).
+pub fn keep_in(data_dir: &Path) {
+    let _ = KEPT.dir.set(data_dir.join("ui-assets"));
+}
+
+/// The UI is being served (a page, its shell, an asset): this build's assets are kept beside earlier builds'
+/// ([`keep_assets`]), once a process, on the blocking pool, so the pages it serves load what they haven't yet after a later
+/// build replaces it. Before its first page no browser has this build's scripts to ask for them, so a server no one loads
+/// the UI from writes none of them: they were written at every start (join-burst: 17 MB, each asset and its brotli and gzip
+/// copies, into a fresh instance's page cache as runners joined).
+pub fn serving() {
+    if let Some(dir) = KEPT.first() {
+        drop(crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || keep_assets(&dir, own_files())).await;
+        }));
+    }
+}
+
+/// This build's files as [`keep_assets`] keeps them: each one's name, bytes and SHA-256.
+fn own_files() -> impl Iterator<Item = (Cow<'static, str>, Cow<'static, [u8]>, [u8; 32])> {
+    Assets::iter().filter_map(|name| {
+        let f = Assets::get(&name)?;
+        let sha = f.metadata.sha256_hash();
+        Some((name, f.data, sha))
+    })
+}
+
+/// Keeps `files`' hashed assets (this build's: [`own_files`]) in `dir`, beside earlier builds' (each kept for two weeks
+/// after the last build that had it), for `serve`.
+fn keep_assets(dir: &Path, files: impl Iterator<Item = (Cow<'static, str>, Cow<'static, [u8]>, [u8; 32])>) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "can't keep the UI's earlier assets");
         return;
     }
-    // Earlier builds' assets are servable from here on, while this build's are kept beside them and the
-    // dictionaries are found: a page loaded before the deploy needn't wait for all of it (goal 8, plan
-    // 01a1a832ebfd step 5: reading every kept script for its SHA-256 takes a while).
-    let _ = KEPT.set(dir.clone());
+    let dir = dir.to_path_buf();
     let now = SystemTime::now();
-    for name in Assets::iter() {
+    for (name, data, sha) in files {
         let Some(file) = name.strip_prefix("assets/") else { continue };
         let path = dir.join(file);
-        let Some(f) = Assets::get(&name) else { continue };
         if !path.exists()
-            && let Err(e) = std::fs::write(&path, &f.data)
+            && let Err(e) = std::fs::write(&path, &data)
         {
             tracing::warn!(error = %e, file, "can't keep a UI asset");
             continue;
@@ -100,7 +147,6 @@ pub fn keep_assets(data_dir: &Path) {
         // With the brotli and gzip copies this build packed of it, so an earlier build's goes packed too, to a
         // client that takes gzip alone as to a browser (goal 8, plan 01a1a832ebfd step 3; goal 11's audit, row
         // B15): on disk, nothing on the heap.
-        let sha = f.metadata.sha256_hash();
         let copies = [(dir.join(format!("{file}.br")), BUILT.0), (dir.join(format!("{file}.gz")), BUILT.1)];
         for (copy, table) in &copies {
             if !copy.exists()
@@ -143,7 +189,7 @@ pub fn keep_assets(data_dir: &Path) {
 const DELTAS: &str = ".deltas";
 
 /// The kept scripts and stylesheets by their SHA-256: made whole as the builds are kept
-/// (`keep_assets`) and swapped in, read on a request without a lock (`crate::rcu`; the API runtime's
+/// ([`keep_assets`]) and swapped in, read on a request without a lock (`crate::rcu`; the API runtime's
 /// lockless hot path, scripts/locks/hot.toml).
 fn kept_dictionaries() -> &'static Rcu<HashMap<[u8; 32], String>> {
     static D: OnceLock<Rcu<HashMap<[u8; 32], String>>> = OnceLock::new();
@@ -457,6 +503,7 @@ pub fn font(name: &str) -> Option<Bytes> {
 /// The app's shell (any page, rendered in the browser): for pages that render only in the browser,
 /// and for when the UI server isn't there.
 pub fn shell(req: &Request) -> Response {
+    serving();
     match Assets::get("_shell.html") {
         Some(f) => {
             let sha = f.metadata.sha256_hash();
@@ -810,6 +857,36 @@ mod tests {
             assert_eq!(coding.as_deref(), Some("gzip"), "{name}");
             assert_eq!(gunzip(&body).as_deref(), Some(f.data.as_ref()), "{name}");
         }
+        Ok(())
+    }
+
+    /// join-burst, item 4: a server's start writes none of the UI's files. It names `<data>/ui-assets` and nothing more
+    /// (a path made, no file touched), where it spawned `keep_assets` onto the blocking pool, which made the folder and
+    /// wrote every hashed asset and its brotli and gzip copies (17 MB into a fresh instance's page cache, as runners
+    /// joined). This build's files are kept once it serves its UI: its folder is handed out the first time asked, never
+    /// again, and only once it's named; what's kept then is each asset (nothing else of the build) and the deltas' folder.
+    #[test]
+    fn join_burst_a_start_writes_no_ui_file_until_the_ui_is_served() -> anyhow::Result<()> {
+        let data = tempfile::tempdir()?;
+        let before = crate::os::counted::made();
+        keep_in(data.path());
+        let made = crate::os::counted::made();
+        anyhow::ensure!(made.blocks.saturating_sub(before.blocks) <= 2, "the start's naming of the folder allocated {} blocks", made.blocks.saturating_sub(before.blocks));
+        anyhow::ensure!(std::fs::read_dir(data.path())?.next().is_none(), "the start wrote into the data folder");
+        let keeping = Keeping::new();
+        assert_eq!(keeping.first(), None, "no folder named yet: nothing to keep in, and the once not spent");
+        let dir = data.path().join("ui-assets");
+        let _ = keeping.dir.set(dir.clone());
+        assert_eq!(keeping.first(), Some(dir.clone()), "the first UI served keeps the build's files");
+        assert_eq!(keeping.first(), None, "once a process");
+        let script = b"export const kiln = 1;".repeat(64);
+        let files = vec![
+            (Cow::Borrowed("assets/app-AbCdEfGh.js"), Cow::Owned(script.clone()), crate::ui_pack::sha256(&script)),
+            (Cow::Borrowed("_shell.html"), Cow::Borrowed(&b"<html></html>"[..]), crate::ui_pack::sha256(b"<html></html>")),
+        ];
+        keep_assets(&dir, files.into_iter());
+        assert_eq!(std::fs::read(dir.join("app-AbCdEfGh.js"))?, script, "an asset is kept as it is");
+        anyhow::ensure!(!dir.join("_shell.html").exists() && dir.join(DELTAS).is_dir(), "only assets are kept, beside the deltas' folder");
         Ok(())
     }
 }
