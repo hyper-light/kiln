@@ -25,7 +25,7 @@ import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Tries } from "@/lib/tries";
-import { Prose } from "@/views/harness/parts";
+import { Prose } from "@/views/harness/prose";
 import { Shimmer } from "@/views/harness/signals";
 import { ResearchPanel } from "@/views/research/research";
 import { ApproveInstead, useWaitsOn, type Approved } from "./approve";

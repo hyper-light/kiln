@@ -9,7 +9,7 @@ import * as React from "react";
 import { planHref, plansApi, type Plan } from "@/api/plans";
 import { Link } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
-import { Prose } from "@/views/harness/parts";
+import { Prose } from "@/views/harness/prose";
 import { effectiveNeeds, PlanGraph, StepBar } from "./graph";
 import type { GraphStep } from "./graph-layout";
 import { SavePlan } from "./save";

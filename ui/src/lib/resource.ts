@@ -372,6 +372,15 @@ function changed(e: Entry, fn: (prev: unknown) => unknown) {
 }
 
 /**
+ * `key`'s data, when it was loaded less than `ms` ago and nothing since says it's out of date: a
+ * key that reads what another already holds takes it instead of asking the server again.
+ */
+export function recent<T>(key: string, ms: number): T | undefined {
+  const e = entries.get(key);
+  return e && e.snap.has && !e.stale && !e.promise && Date.now() - e.settled < ms ? (e.snap.data as T) : undefined;
+}
+
+/**
  * Starts loading `key` now, without suspending. A section that reads several keys calls this for
  * each of them first, so their fetches run at once rather than one after another (each read
  * suspends before the next one starts).
