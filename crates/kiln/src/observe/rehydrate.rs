@@ -133,6 +133,8 @@ pub struct Rehydrations {
     /// Rehydrations removed while they are read: their reading stops.
     removed: Mutex<BTreeSet<String>>,
     archives: Arc<Archives>,
+    /// Told when one is queued or removed: its reader looks again ([`Rehydrations::run`]).
+    changed: crate::rt::Notify,
 }
 
 impl Rehydrations {
@@ -168,7 +170,7 @@ impl Rehydrations {
                 }
             }
         }
-        let me = Arc::new(Self { path, dir, all: Mutex::new(all), views: Mutex::new(views), removed: Mutex::new(BTreeSet::new()), archives });
+        let me = Arc::new(Self { path, dir, all: Mutex::new(all), views: Mutex::new(views), removed: Mutex::new(BTreeSet::new()), archives, changed: crate::rt::Notify::new() });
         me.saved();
         me
     }
@@ -258,6 +260,7 @@ impl Rehydrations {
         };
         all.push(made.clone());
         self.save(&all).map_err(|e| (500, e))?;
+        self.changed.notify();
         Ok(made)
     }
 
@@ -268,6 +271,7 @@ impl Rehydrations {
         let r = all.remove(at);
         self.save(&all).map_err(|e| (500, e))?;
         drop(all);
+        self.changed.notify();
         lock(&self.views).remove(id);
         if r.state == "reading" {
             // Its reading stops at its next object, and its view goes then.
@@ -314,14 +318,36 @@ impl Rehydrations {
         }
     }
 
-    /// Reads each rehydration queued, in the order asked, and lets views go as they expire, until
-    /// the server stops.
+    /// When the first view kept goes (ms since the epoch): the soonest end of those read or failed.
+    fn first_end(&self) -> Option<i64> {
+        lock(&self.all).iter().filter(|r| matches!(r.state.as_str(), "done" | "failed")).map(|r| r.expires).min()
+    }
+
+    /// Reads each rehydration queued, in the order asked, and lets views go as they expire, until the server stops:
+    /// woken by one queued or removed and at the first view's end, by nothing else (goal 9, plan 01a1a87b2cec step 5:
+    /// it looked every second, about one timer wake a second in the lab, train 34's census).
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
-        while shutdown.sleep(Duration::from_secs(1)).await {
-            self.expire(crate::util::now_ms());
+        use futures::FutureExt as _;
+        while !shutdown.is_cancelled() {
+            let now = crate::util::now_ms();
+            self.expire(now);
             let next = lock(&self.all).iter().find(|r| r.state == "queued").map(|r| r.id.clone());
             if let Some(id) = next {
                 self.rehydrate(&id).await;
+                continue;
+            }
+            // Past already, by the clock on the wall: at once.
+            let end = self.first_end().map(|end| Duration::from_millis(u64::try_from(end.saturating_sub(now)).unwrap_or(0)));
+            let ends = async {
+                match end {
+                    Some(d) => crate::rt::sleep(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            futures::select_biased! {
+                () = shutdown.cancelled().fuse() => return,
+                () = self.changed.notified().fuse() => {}
+                () = ends.fuse() => {}
             }
         }
     }
@@ -674,6 +700,44 @@ mod tests {
     }
 
     /// A range's folders: a day whole where it holds the day, its hours where it holds part.
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: observe/rehydrate.rs, about one timer wake a second in the
+    /// lab): the reader of rehydrations is woken by one queued or removed and at the first view's end, by nothing else.
+    /// Do: an archive with no cloud to read it from; the reader started with nothing kept; then two and a half seconds of
+    /// nothing. Expect: the reader not polled once (it looked every second); then a rehydration asked of the archive is
+    /// read as it's queued, on its own word (it fails: no cloud).
+    #[test]
+    fn g9_s5_the_reader_wakes_for_a_rehydration_queued_and_nothing_else() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            std::fs::write(dir.path().join("archives.json"), r#"{"archives":[{"id":"a1","name":"far","destination":{"type":"s3","bucket":"nowhere"}}]}"#)?;
+            let http = Arc::new(crate::http::client::Client::public()?);
+            let stop = crate::rt::Shutdown::new();
+            let clouds = crate::observe::cloud::Clouds::open(dir.path(), &dir.path().join("master.key"), Arc::clone(&http), stop.clone());
+            let r = Rehydrations::open(dir.path(), Archives::open(dir.path(), clouds, http));
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&r).run(stop.clone()))));
+            let deadline = Instant::now() + HANG;
+            while polls.load(Ordering::Relaxed) == 0 {
+                anyhow::ensure!(Instant::now() < deadline, "the reader never started");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let before = polls.load(Ordering::Relaxed);
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(before);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with nothing queued");
+            let asked = r.create(RehydrationIn { name: "back".into(), archive_id: "a1".into(), query: None, from: 0, to: 3_600_000, retention_days: None, max_scan_size_in_gb: None }).map_err(|(code, why)| anyhow::anyhow!("{code}: {why}"))?;
+            while r.get(&asked.id).is_some_and(|x| x.state == "queued") {
+                anyhow::ensure!(Instant::now() < deadline, "a rehydration queued was never read");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            stop.cancel();
+            Ok(())
+        })
+    }
+
     #[test]
     fn a_range_is_listed_by_its_days_and_hours() {
         let day = 17_666i64;

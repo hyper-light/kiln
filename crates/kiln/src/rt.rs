@@ -1127,6 +1127,18 @@ pub(crate) fn timer_wakes_in(file: &str) -> u64 {
     shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
 }
 
+/// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
+/// 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
