@@ -941,17 +941,18 @@ mod tests {
         }
         assert!(Place::of(None, "shared")?.with_server_properties(&["MemoryMax=128M".to_owned()]).is_err(), "only a scope of its own takes them");
         assert_eq!(shown(&Place::of(None, "shared")?.with_server_properties(&[])?.server(kiln, "u")), "/bin/kiln");
-        // A window over this process while, mid-window, it writes 32 MB it never touched: minor faults, and the
-        // window's moments on the wall clock.
+        // A window over this process while, mid-window, it writes 64 MB it never touched: minor faults, and the
+        // window's moments on the wall clock. 64 MB is past glibc's largest mmap threshold (32 MB), so the pages are
+        // fresh whatever the tests beside it freed; the window outlasts a loaded machine's late wake by seconds.
         let mut tree = sample::Tree::of(std::process::id());
         let from = Instant::now() + Duration::from_millis(50);
         let toucher = std::thread::spawn(move || {
             std::thread::sleep(from.saturating_duration_since(Instant::now()) + Duration::from_millis(250));
-            let pages = vec![1u8; 32 << 20];
+            let pages = vec![1u8; 64 << 20];
             pages.iter().step_by(4096).map(|b| u64::from(*b)).sum::<u64>()
         });
-        let w = sample::window(&mut tree, from, from + Duration::from_millis(600));
-        assert_eq!(toucher.join().ok(), Some(8192));
+        let w = sample::window(&mut tree, from, from + Duration::from_millis(2500));
+        assert_eq!(toucher.join().ok(), Some(16_384));
         if cfg!(target_os = "linux") {
             assert!(w.minor_faults.is_some_and(|f| f > 0) && w.major_faults.is_some(), "{w:?}");
         }
