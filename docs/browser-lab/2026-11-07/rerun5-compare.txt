@@ -1,0 +1,11 @@
+$ kiln-lab browser compare matrix.json h2o-h2 h2o-h2 --b-run rerun5/stream-100k-5-webkit-h2o-h2.json
+h2o-h2 against h2o-h2: 1 of 9 numbers differ beyond noise (11.1%), each held so all 9 hold together at 95% (Bonferroni).
+- stream webkit 100k/5 cpu_us.p50: -2.36 against -0.37
+$ kiln-lab browser compare matrix.json kiln-today kiln-today --b-run rerun5/burst-100k-1-chromium-kiln-today.json
+kiln-today against kiln-today: 0 of 9 numbers differ beyond noise (0.0%), each held so all 9 hold together at 95% (Bonferroni).
+$ kiln-lab browser compare matrix.json h2o-h2 h2o-h2 --b-run rerun5/burst-100k-5-webkit-h2o-h2.json
+h2o-h2 against h2o-h2: 0 of 9 numbers differ beyond noise (0.0%), each held so all 9 hold together at 95% (Bonferroni).
+$ kiln-lab browser compare matrix.json h2o-h2 h2o-h2 --b-run rerun5/burst-50k-1-chromium-h2o-h2.json
+h2o-h2 against h2o-h2: 0 of 9 numbers differ beyond noise (0.0%), each held so all 9 hold together at 95% (Bonferroni).
+$ kiln-lab browser compare matrix.json kiln-today kiln-today --b-run rerun5/burst-good-1-chromium-kiln-today.json
+kiln-today against kiln-today: 0 of 9 numbers differ beyond noise (0.0%), each held so all 9 hold together at 95% (Bonferroni).
