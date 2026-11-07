@@ -277,6 +277,9 @@ pub fn machine() -> Machine {
 pub struct Place {
     pub cpus: Option<String>,
     pub layout: String,
+    /// systemd resource-control properties the server's scope takes besides its weight (`KEY=VALUE`;
+    /// [`Place::with_server_properties`]).
+    pub server_properties: Vec<String>,
 }
 
 /// The weights production's layout gives the server and the hogs (`systemd.resource-control`'s
@@ -292,7 +295,20 @@ impl Place {
             anyhow::ensure!(cfg!(target_os = "linux"), "--server-cpus needs Linux (taskset)");
             anyhow::ensure!(!cpus_in(c).is_empty(), "--server-cpus takes a CPU list (16-31, or 0-3,8), not {c:?}");
         }
-        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned() })
+        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned(), server_properties: Vec::new() })
+    }
+
+    /// The server's scope held to `props` as well, systemd's resource-control properties (`KEY=VALUE`;
+    /// production's layout, where the server has a scope of its own): a constrained instance, as a small
+    /// cloud instance's or a container's limits hold it (Ada, 2026-11-07: one or two vCPUs, 128 to 256 MB,
+    /// under high load: `AllowedCPUs=0`, `CPUQuota=100%`, `MemoryMax=128M`, `MemorySwapMax=0`).
+    pub fn with_server_properties(mut self, props: &[String]) -> anyhow::Result<Self> {
+        anyhow::ensure!(props.is_empty() || self.production(), "--server-property needs --layout production, where the server has a scope of its own");
+        for p in props {
+            anyhow::ensure!(p.split_once('=').is_some_and(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty()), "--server-property takes KEY=VALUE (MemoryMax=128M), not {p:?}");
+        }
+        self.server_properties = props.to_vec();
+        Ok(self)
     }
 
     fn production(&self) -> bool {
@@ -303,11 +319,17 @@ impl Place {
     /// execs it in place, so its pid and process group stay the lab's to stop), on the server's CPUs
     /// when it has its own.
     pub fn command(&self, program: &Path, weight: u32, unit: &str) -> Command {
+        self.placed(program, weight, unit, &[])
+    }
+
+    /// [`Place::command`], its scope also given `properties`.
+    fn placed(&self, program: &Path, weight: u32, unit: &str, properties: &[String]) -> Command {
         let mut wrap: Vec<OsString> = Vec::new();
         if self.production() {
             wrap.extend(["systemd-run", "--user", "--scope", "--quiet", "--collect"].map(OsString::from));
             wrap.push(format!("--unit={unit}").into());
             wrap.push(format!("--property=CPUWeight={weight}").into());
+            wrap.extend(properties.iter().map(|p| OsString::from(format!("--property={p}"))));
             wrap.push("--".into());
         }
         if let Some(c) = &self.cpus {
@@ -324,9 +346,9 @@ impl Place {
         }
     }
 
-    /// The server's command (`program`), placed.
+    /// The server's command (`program`), placed, its scope held to the server's properties.
     pub fn server(&self, program: &Path, unit: &str) -> Command {
-        self.command(program, SERVER_WEIGHT, unit)
+        self.placed(program, SERVER_WEIGHT, unit, &self.server_properties)
     }
 }
 
