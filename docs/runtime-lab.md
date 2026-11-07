@@ -1363,7 +1363,8 @@ CPUs):
 - `cores-calm`, `cores`: the server on cores of its own (`[server] cores`, and its scope's
   `AllowedCPUs=`), calm and with the hogs on the CPUs past the server's;
 - `q<µs>-<configuration>`: a configuration with the shards' step quantum at `<µs>`
-  (`KILN_RT_QUANTUM_US`).
+  (`KILN_RT_QUANTUM_US`, fractions too: `q266.7-calm`). A value the server can't read stops it,
+  said, never dropped.
 
 With `PROF=1` each configuration gets one round more with perf recording the server over its window
 (`hook.sh`), kept apart from the measured rounds; every round's hook writes which CPUs each of the
@@ -1478,7 +1479,9 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   quantum also sets a cooperative task's share of its shard and its loops' turns (`rt::Turns`), how often
   a busy shard reads its inputs, the slow polls' threshold (twice it: 533 µs), the watchdog's stall (64
   quanta: 17.1 ms), the compute pool's pieces, the slice each shard asks for, and placement's margin.
-  `KILN_RT_QUANTUM_US` still sets another for the lab's A/B of quanta. The derivation is
+  `KILN_RT_QUANTUM_US` still sets another for the lab's A/B of quanta, in microseconds, fractions
+  too; a value the server can't read stops it, said (it was dropped with nothing said, and B2's lab ran
+  its pinned arm, 266.7, unpinned). The derivation is
   `rt::tests::g9_s3_the_step_quantum_is_derived_from_the_lab`.
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
