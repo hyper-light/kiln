@@ -2230,20 +2230,38 @@ impl Hub {
         Ok(folded)
     }
 
-    /// What runners took to come back before this start, from kiln.db ([`crate::comeback`]): the grace their jobs and
-    /// attaches get from now on.
+    /// What runners took to come back and requeues cost before this start, from kiln.db ([`crate::comeback`]): the grace
+    /// their jobs and attaches get from now on.
     pub async fn take_comebacks(&self) {
-        if let Ok(Some(kept)) = self.store.kv_get(crate::comeback::KEY.to_owned()).await {
-            self.comeback.take_kept(&kept);
+        let kept = self.store.kv_get(crate::comeback::KEY.to_owned()).await;
+        if let Err(e) = kept.and_then(|kept| kept.map_or(Ok(()), |kept| self.comeback.take_kept(&kept))) {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost before this start wasn't taken: the grace starts from their redials");
         }
+    }
+
+    /// What's learned of comebacks and requeues, kept for the next start ([`crate::comeback`]).
+    async fn keep_comebacks(&self, kept: String) {
+        if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost wasn't kept for the next start");
+        }
+    }
+
+    /// Puts job `job`, which ran on runner `on`, back in the queue, or fails it when it's out of retries; requeued, what
+    /// that costs is learned once it's under way elsewhere ([`crate::comeback`]).
+    async fn requeue(&self, job: &str, on: &str, reason: String) -> anyhow::Result<bool> {
+        let requeued = self.store.requeue_job(job.to_owned(), reason).await?;
+        if requeued {
+            self.comeback.requeued(job, on, Instant::now());
+        }
+        Ok(requeued)
     }
 
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
     /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
-    /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
-    /// than the grace, as pods connected before it started may still come back.
+    /// forgotten. Its jobs and their history keep its name. Nothing until the server has heard its
+    /// runners for the grace, as pods connected before it started may still come back.
     pub async fn forget_finished_pods(&self) -> Vec<String> {
-        if self.started.elapsed() <= self.comeback.grace() {
+        if self.comeback.heard_for() <= self.comeback.grace() {
             return Vec::new();
         }
         self.forget_pods_but_waiting().await
@@ -2801,7 +2819,7 @@ impl Hub {
             self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() }).await;
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
-            match self.store.requeue_job(j.clone(), format!("{reason} ({})", self.shown(name))).await {
+            match self.requeue(&j, name, format!("{reason} ({})", self.shown(name))).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
                 Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
@@ -2885,7 +2903,8 @@ impl Hub {
     /// pointer to each, not room for the largest (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
-            return crate::api::boxed(|| self.on_hello(peer, h)).await;
+            let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+            return crate::api::boxed(|| self.on_hello(peer, h, at)).await;
         }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
@@ -2971,6 +2990,10 @@ impl Hub {
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
+                    let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+                    if let Some(kept) = self.comeback.step_started(&job, &agent, at) {
+                        self.keep_comebacks(kept).await;
+                    }
                     self.store.step_update(job.clone(), idx, Status::Running, None).await?;
                     self.logs.step(&job, idx, "running");
                     self.emit_job(&job).await;
@@ -2988,6 +3011,7 @@ impl Hub {
             AgentMsg::JobFinished(r) => {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
+                    self.comeback.ended(&job);
                     if self.ci_leg(&r.job).await {
                         self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
                     } else {
@@ -3613,7 +3637,8 @@ impl Hub {
         Ok(())
     }
 
-    async fn on_hello(&self, peer: PeerId, h: Hello) -> anyhow::Result<()> {
+    /// `at`: when the hello came off the wire.
+    async fn on_hello(&self, peer: PeerId, h: Hello, at: Instant) -> anyhow::Result<()> {
         let cert_name = self.pending_peers.load().get(&peer).cloned();
         let refuse = |reason: String| async move {
             tracing::warn!(peer, %reason, "agent refused");
@@ -3673,9 +3698,7 @@ impl Hub {
             } else if held_by_other(id) {
                 // Another runner process of this machine runs it.
             } else {
-                self.store
-                    .requeue_job(id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
-                    .await?;
+                self.requeue(id, &name, format!("agent {} restarted without the job", self.shown(&name))).await?;
                 self.emit_job(id).await;
             }
         }
@@ -3749,19 +3772,16 @@ impl Hub {
             stale: false,
         };
         let prev = self.agents.load().get(&name).map(|a| AgentLive::clone(a));
-        // Back still running jobs: how long it took to come back (`crate::comeback`), since the server lost it, or,
-        // one this server hasn't seen since it started (it ran them through the restart), since the start.
-        let came_back = match &prev {
+        // Back still running jobs: how long until its hello came (`crate::comeback`), since the server lost it, or, one
+        // this server hasn't seen since it started (it ran them through the restart), since the start.
+        let since = match &prev {
             _ if h.running.is_empty() => None,
-            Some(p) if !p.connected => p.lost_at.map(|t| t.elapsed()),
+            Some(p) if !p.connected => p.lost_at,
             Some(_) => None,
-            None => Some(self.started.elapsed()),
+            None => Some(self.started),
         };
-        if let Some(after) = came_back {
-            let kept = self.comeback.came_back(after);
-            if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
-                tracing::warn!(error = %format!("{e:#}"), "how long runners take to come back wasn't kept for the next start");
-            }
+        if let Some(since) = since {
+            self.keep_comebacks(self.comeback.came_back(at.saturating_duration_since(since))).await;
         }
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
@@ -4385,7 +4405,7 @@ impl Hub {
                         Some(a) if *a != crate::wire::commands::Answer::Sent => {
                             let why = format!("assignment could not be delivered: {}", a.words());
                             self.release_slot(&agent, &job.id);
-                            self.store.requeue_job(job.id.clone(), why).await?;
+                            self.requeue(&job.id, &agent, why).await?;
                         }
                         _ => pending.log_when_answered(LOG_WITHIN),
                     }
@@ -4584,7 +4604,7 @@ impl Hub {
                     continue;
                 }
                 self.release_slot(&name, &j);
-                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({})", self.shown(&name))).await {
+                match self.requeue(&j, &name, format!("runner process did not reconnect ({})", self.shown(&name))).await {
                     Ok(_) => self.emit_job(&j).await,
                     Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
                 }
@@ -4607,9 +4627,10 @@ impl Hub {
             self.agents.update(|m| m.retain(|_, a| !gone(a)));
         }
         self.declined.update(|d| d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF));
-        // Running jobs assigned to agents we have no session for at all (after a server restart).
-        // By their ids and runners alone, the rest of their rows unread (the DB query audit, 2026-11-06).
-        if self.started.elapsed() > grace
+        // Running jobs assigned to agents we have no session for at all (after a server restart), once it has heard
+        // its runners for the grace. By their ids and runners alone, the rest of their rows unread (the DB query
+        // audit, 2026-11-06).
+        if self.comeback.heard_for() > grace
             && let Ok(running) = self.store.running_holders().await {
                 // Jobs held by a connected agent, or by one still inside its reconnect grace, are
                 // not orphans.
@@ -4622,7 +4643,7 @@ impl Hub {
                     .collect();
                 for (id, agent) in running {
                     if !known.contains(&id) && agent.as_deref() != Some("-")
-                        && let Ok(true) = self.store.requeue_job(id.clone(), "orphaned after restart".into()).await {
+                        && let Ok(true) = self.requeue(&id, agent.as_deref().unwrap_or_default(), "orphaned after restart".into()).await {
                             self.emit_job(&id).await;
                         }
                 }
@@ -6118,33 +6139,98 @@ pub(crate) mod tests {
         })
     }
 
-    /// docs/machines.md, "The grace to come back" (Ada, 2026-11-06: no arbitrary constants): the grace a runner gets to come back
-    /// is learned from how long runners took to come back holding their work (`crate::comeback`), not 45 s whatever they
-    /// did. A runner back holding a job 3 s after the server lost it teaches the grace (RFC 6298's bound: 3 s and four
-    /// times 1.5 s); then one lost 30 s ago holding a job has it taken back, and one lost 1 s ago keeps its own. With the
-    /// 45 s grace the one lost 30 s ago kept its job. What's learned is kept for the next start, which takes it.
+    /// A run with one job, running on runner `on`: its id.
+    async fn a_running_job(hub: &Hub, on: &str) -> anyhow::Result<String> {
+        let repo = hub
+            .store
+            .upsert_repo(crate::store::Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+        let run = crate::store::Run {
+            id: "run1".into(),
+            repo_id: repo.id.clone(),
+            repo_name: repo.name.clone(),
+            number: 0,
+            pipeline: "ci".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "abc".into(),
+            message: String::new(),
+            author: String::new(),
+            status: Status::Queued,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        hub.store.create_run(run, planned).await?;
+        let job = hub.store.jobs("run1".into(), false).await?.into_iter().next().map(|j| j.id).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        anyhow::ensure!(hub.store.claim_job(job.clone(), on.into(), "baremetal".into()).await?);
+        Ok(job)
+    }
+
+    /// docs/machines.md, "The grace to come back" (research 01a1b3bbac36): learned from what the hub sees. A runner lost
+    /// past the grace has its job requeued, and that job's first step on another runner, 10 s later, is what a requeue
+    /// costs. A runner lost 6 s ago whose hello came off the wire 2 s ago came back in 4 s: the server's 2 s aren't
+    /// charged to it. Waiting 4 s for it beats a 10 s requeue: one lost 30 s ago has its job taken back, one lost 1 s
+    /// ago keeps its own. What's learned is kept for the next start, which takes it.
     #[test]
-    fn comeback_the_grace_a_runner_gets_is_learned_from_how_long_runners_took_to_come_back() -> anyhow::Result<()> {
+    fn comeback_the_grace_is_learned_from_the_requeues_and_comebacks_the_hub_sees() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
             let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
-            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "nothing learned yet: the runners' longest redial");
-            hub.put_agent(lost("box", Duration::from_secs(3), "job-b"));
+            let job = a_running_job(&hub, "gone").await?;
+            hub.put_agent(lost("gone", crate::comeback::prior() * 2, &job));
+            hub.check_lost_agents().await;
+            let stepped = Instant::now() + Duration::from_secs(10);
+            join_runner(&hub, 2, "other", 0);
+            hub.change_agent("other", |a| a.running = vec![job.clone()]);
+            let step = NetEvent::Frame { peer: 2, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::StepStarted { job: job.clone(), idx: 0 })?, at: stepped };
+            hub.on_net_at(step, &mut Some(Arrived { at: stepped, taken: Instant::now() })).await?;
+            let kept = || async { hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db")) };
+            let cost = Duration::from_nanos(kept().await?.split('/').next().unwrap_or_default().parse()?);
+            anyhow::ensure!((Duration::from_secs(10)..Duration::from_secs(11)).contains(&cost), "{}", kept().await?);
+            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "no comeback yet");
+            let now = Instant::now();
+            hub.put_agent(AgentLive { lost_at: now.checked_sub(Duration::from_secs(6)), ..lost("box", Duration::ZERO, "job-b") });
             hub.pending_peers.update(|m| m.insert(1, "box".into()));
-            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") })).await?;
+            let hello = AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") });
+            let came = now.checked_sub(Duration::from_secs(2)).ok_or_else(|| anyhow::anyhow!("no instant 2 s ago"))?;
+            hub.on_net_at(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&hello)?, at: came }, &mut Some(Arrived { at: came, taken: now })).await?;
             let grace = hub.comeback.grace();
-            anyhow::ensure!((Duration::from_secs(9)..Duration::from_secs(20)).contains(&grace), "back in 3 s: {grace:?}");
-            hub.put_agent(lost("gone", Duration::from_secs(30), "job-g"));
+            anyhow::ensure!((Duration::from_secs(4)..Duration::from_secs(5)).contains(&grace), "back in 4 s, a requeue 10 s: {grace:?}");
+            hub.put_agent(lost("slow", Duration::from_secs(30), "job-s"));
             hub.put_agent(lost("blip", Duration::from_secs(1), "job-x"));
             hub.check_lost_agents().await;
             let running = |n: &str| hub.agents.load().get(n).map(|a| a.running.clone()).unwrap_or_default();
-            anyhow::ensure!(running("gone").is_empty(), "lost 30 s ago, past the learned grace: its job taken back");
+            anyhow::ensure!(running("slow").is_empty(), "lost 30 s ago, past the grace: its job taken back");
             anyhow::ensure!(running("blip") == ["job-x"], "lost 1 s ago, within it: its job waits for it");
-            // Kept: the next start takes it.
-            let kept = hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db"))?;
             let next = crate::comeback::Comeback::default();
-            next.take_kept(&kept);
-            anyhow::ensure!(next.grace() == hub.comeback.grace(), "{kept}");
+            next.take_kept(&kept().await?)?;
+            anyhow::ensure!(next.grace() == grace, "{}", kept().await?);
+            Ok(())
+        })
+    }
+
+    /// Lifeguard's local health (research 01a1b3bbac36 f5): after a restart, runners are charged from when the server
+    /// began hearing them, not from its start. With a 1 ns grace learned, a job held by a runner not back isn't taken
+    /// for orphaned before the server hears its runners, however long ago it started; once it has heard them for the
+    /// grace, it's requeued.
+    #[test]
+    fn comeback_after_a_restart_runners_are_charged_from_when_the_server_began_hearing_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.comeback.take_kept("10000000000/1 0:1")?;
+            anyhow::ensure!(hub.comeback.grace() == Duration::from_nanos(1));
+            let job = a_running_job(&hub, "away").await?;
+            crate::rt::sleep(Duration::from_millis(5)).await;
+            let status = || async { anyhow::Ok(hub.store.job(job.clone()).await?.map(|j| j.status)) };
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Running), "not hearing its runners yet: {:?}", status().await?);
+            hub.comeback.hearing(Instant::now().checked_sub(Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("no instant 1 s ago"))?);
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Queued), "{:?}", status().await?);
             Ok(())
         })
     }

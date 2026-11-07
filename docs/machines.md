@@ -161,15 +161,19 @@ record: "fedora.attlocal.net was machine <id>: folded into kiln-a094a12d.attloca
 A runner the server has lost (its link dropped), or that was connected just before the server
 started again, is given a grace to come back: its jobs wait that long for it before they're
 requeued, an attach to a session it holds waits that long as the server starts (docs/wire.md,
-"Restarts"), and a job pod's record is kept that long. The grace is learned from how long runners
-take to come back (`crate::comeback`): each runner that comes back still running jobs is a sample
-(the time since the server lost it, or since the server started for one it hasn't seen since), and
-the grace is RFC 6298's bound over them, the smoothed time and four times its variation. A runner
-back later than twice the grace counts as twice the grace (the RFC's backoff), so one gone for hours
-moves it once as far as the grace itself. What's learned is kept in kiln.db (`kv`,
-`runners/comeback`) as it changes, so a restart gives runners the grace learned before it. Until a
-first runner has come back holding work, the grace is the longest a runner that has learned nothing
-of its dials takes to dial again once it has lost the server, by its own redials
+"Restarts"), and a job pod's record is kept that long. The grace is the wait that costs least
+(`crate::comeback`): waiting `t` for a lost runner costs the time until it's back if it's back by
+`t`, else `t` and a requeue, and the least expected cost is where the comebacks' hazard falls to one
+over a requeue's cost. Both are measured. Each runner that comes back still running jobs says how
+long it took, until its hello came off the wire, since the server lost it (or since the server
+started, for one it hasn't seen since): counted by bit length, so a runner gone for hours is one
+count in its own bucket and moves the grace only if waiting for such runners costs less than
+requeueing them. Each requeued job says what a requeue costs: the time until a step of it starts on
+another runner. The grace is a bucket's top. What's learned is kept in kiln.db (`kv`,
+`runners/comeback`) as it changes, so a restart gives runners the grace learned before it; after a
+restart they're charged from when the server began hearing them, not from its start. Until a
+comeback and a requeue's cost have both been seen, the grace is the longest a runner that has
+learned nothing of its dials takes to dial again once it has lost the server, by its own redials
 (`crate::comeback::prior`): a dial left to the transport (its idle timeout), then the wait before the
 next, as long as such a dial costs: 20 s. The server's code is its runners'.
 
