@@ -1,0 +1,7 @@
+$ bash -c cd /home/adalundhe/.cache/kiln-bp/g1/lab-snap3/web && node check-origin.mjs /home/adalundhe/.cache/kiln-bp/g1/catalogue2/payloads /home/adalundhe/.cache/kiln-bp/g1/catalogue2/catalogue.json
+{"kind":"events","frames":75583,"recording":"the catalogue's digest","sse":"75583 of 75583 equal","fetch-stream":"75583 of 75583 equal"}
+{"kind":"session","frames":23019,"recording":"the catalogue's digest","sse":"23019 of 23019 equal","fetch-stream":"23019 of 23019 equal"}
+{"kind":"log","frames":11981,"recording":"the catalogue's digest","sse":"11981 of 11981 equal","fetch-stream":"11981 of 11981 equal"}
+{"kind":"terminal","frames":6001,"recording":"the catalogue's digest","sse":"6001 of 6001 equal","fetch-stream":"6001 of 6001 equal"}
+every replayed frame holds
+exit 0
