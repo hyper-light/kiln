@@ -117,16 +117,17 @@ impl Spent {
 /// Runs `work` on the calling thread and says what it spent ([`Spent`]): kiln's estimates of where work runs (a shard or
 /// the compute pool) learn its cost from it, so a loaded host's preemptions don't send short work off its shard (kiln's
 /// goal 9, plan 01a1a87b2cec step 5: on a host at load 75, 37-55 µs reads of runners' frames went to the pool, where their
-/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the clock, the thread's
-/// CPU clock (its shard's task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its
-/// voluntary switches (`getrusage`), each before and after.
+/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the shard's clock
+/// (`machine::clock::shard_clock_ns`, as the compute pool times its jobs, on any thread), the thread's CPU clock (its shard's
+/// task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its voluntary switches (`getrusage`),
+/// each before and after.
 pub fn spent<R>(work: impl FnOnce() -> R) -> (R, Spent) {
     let task = thread_run_ns();
     let os = if task.is_none() { crate::attribution::thread_cpu_now() } else { None };
     let switches = crate::attribution::voluntary_switches_now();
-    let began = std::time::Instant::now();
+    let began = crate::machine::clock::shard_clock_ns();
     let out = work();
-    let wall_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let wall_ns = crate::machine::clock::shard_clock_ns().saturating_sub(began);
     let cpu_ns = match (task, os) {
         (Some(from), _) => thread_run_ns().map(|to| to.saturating_sub(from)),
         (None, Some(from)) => crate::attribution::thread_cpu_now().map(|to| to.saturating_sub(from)),

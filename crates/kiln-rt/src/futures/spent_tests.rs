@@ -33,8 +33,8 @@ fn g9_s5_spent_tells_a_spin_from_a_wait() {
     /// Shape: long against the clocks' reads (a microsecond or less) and a scheduler's tick, short for a test.
     const SPAN_NS: u64 = 5_000_000;
     let (_, spun) = spent(|| {
-        let began = std::time::Instant::now();
-        while began.elapsed().as_nanos() < u128::from(SPAN_NS) {
+        let began = crate::machine::clock::shard_clock_ns();
+        while crate::machine::clock::shard_clock_ns().saturating_sub(began) < SPAN_NS {
             std::hint::spin_loop();
         }
     });
