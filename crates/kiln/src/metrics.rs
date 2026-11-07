@@ -1376,6 +1376,7 @@ pub struct HostSample {
     pub ts_ms: i64,
     pub cpu_pct: f32,
     pub cpus: u32,
+    // The machine's 1-minute load on the `cpus` this process may use (`HostSample::load_on`).
     pub load1: f32,
     pub mem_total: u64,
     pub mem_used: u64,
@@ -1384,6 +1385,22 @@ pub struct HostSample {
     pub net_rx: u64,
     pub net_tx: u64,
     pub procs: u32,
+}
+
+impl HostSample {
+    /// The machine's 1-minute load as the `cpus` a process may use carry it (W05-R03): `load1`, the machine's (each of its
+    /// tasks running or waiting), spread over all `host` of its CPUs, the share on those `cpus`. A sample's load is this, so
+    /// judged against its `cpus` it's the machine's against its cores, wherever it's judged (a runner's room and being
+    /// overloaded, the engine's headroom, the UI). The machine's whole load against a confined runner's few CPUs (an
+    /// affinity, a cgroup's quota) read it overloaded, with no room, on a machine with both.
+    pub fn load_on(load1: f32, cpus: u32, host: u32) -> f32 {
+        if cpus == 0 || host <= cpus {
+            return load1;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let share = cpus as f32 / host as f32;
+        load1 * share
+    }
 }
 
 pub static AGENT_SAMPLES: OnceLock<Rcu<BTreeMap<String, HostSample>>> = OnceLock::new();
@@ -1558,7 +1575,7 @@ pub fn render() -> String {
     if !samples.is_empty() {
         for (name, kind, h) in [
             ("kiln_agent_cpu_percent", "gauge", "Agent host CPU utilisation."),
-            ("kiln_agent_load1", "gauge", "Agent host 1m load."),
+            ("kiln_agent_load1", "gauge", "Agent host 1m load, on the CPUs the agent may use."),
             ("kiln_agent_memory_used_bytes", "gauge", "Agent host memory in use."),
             ("kiln_agent_memory_total_bytes", "gauge", "Agent host memory."),
             ("kiln_agent_disk_used_bytes", "gauge", "Agent work volume used."),

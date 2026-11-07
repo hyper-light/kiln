@@ -1705,7 +1705,7 @@ pub struct Registry {
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
     /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
     pub views: crate::reads::Views,
-    local_rx: crate::memory::queue::Receiver<(String, Update)>,
+    local_rx: crate::memory::queue::Receiver<super::session::Local>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Rcu<Option<String>>,
     /// The shell pid of each of the server's own terminals (their directory and environment are
@@ -1868,7 +1868,7 @@ impl Registry {
         // (`run_local`): as many bytes as an owner's inbox holds (`crate::net::EVENTS_BYTES`), where they go
         // next; past it a session waits to send (goal 11, plan 01a1a87b2e56 step 3). Its 8,192 places, made
         // up front, took 1.05 MB of an idle server's heap (research 01a1a87b2e57, f10).
-        let (tx, rx) = crate::memory::queue::bounded::<(String, Update)>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
+        let (tx, rx) = crate::memory::queue::bounded::<super::session::Local>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
@@ -2413,9 +2413,24 @@ impl Registry {
         // only while its inbox is full): in bounded turns of the shard.
         let mut turns = crate::rt::Turns::new();
         loop {
-            let Ok((id, u)) = rx.recv().await else { return Ok(()) };
-            hub.harness.ingest_from(&Location::Local, &id, u, false).await;
+            let Ok(said) = rx.recv().await else { return Ok(()) };
+            hub.harness.take_local(said).await;
             turns.end().await;
+        }
+    }
+
+    /// What one of the server's own sessions handed on ([`Registry::run_local`]): an update, to its copy's owner, or that its
+    /// task is gone, after which its owner holds nothing for it (HARNESS-4). Each goes to that owner after what was handed on
+    /// before it, so the owner takes a task's end after all it said.
+    pub(crate) async fn take_local(&self, said: super::session::Local) {
+        match said {
+            super::session::Local::Said(id, u) => self.ingest_from(&Location::Local, &id, u, false).await,
+            super::session::Local::Gone(id) => {
+                let of = id.clone();
+                if !self.sessions.send(&id, Msg::Run(Box::new(move |s: &mut Shard| s.task_gone(&of)))).await {
+                    tracing::debug!(session = %id, "an agent session's end came as the server's copies went");
+                }
+            }
         }
     }
 
@@ -2845,7 +2860,12 @@ impl Registry {
         let mut stored_changes: Option<Files> = None;
         // An Open taken: its copy, published once it's taken, is what an attach may wait for as the server starts.
         let opened = matches!(u, Update::Open { .. });
-        if let Update::Open { info, since } = &u {
+        // A session held closed (its close came before its announcement) gets no copy again (HARNESS-4); what the store keeps
+        // of it is kept as before.
+        let held = s.closed_open(id, &from, &u);
+        if let Update::Open { info, since } = &u
+            && !held
+        {
             let old = s.get(id);
             // A runner that started again goes on from what this copy has of the same epoch:
             // its events through `since` stay; what's after them comes again.
@@ -4529,11 +4549,17 @@ impl Registry {
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
-            // Its viewers are told, and its feed's topic goes with the last of them.
-            let sid = id.to_owned();
+            // Its viewers are told, and its feed's topic goes with the last of them. One of the server's own machine,
+            // closed here, still says its last as its task ends: until then it's held closed, so what it said before and
+            // is still on its way makes no copy of it again (HARNESS-4).
+            let (sid, held) = (id.to_owned(), ok && matches!(loc, Some(Location::Local)));
             self.sessions
                 .on(id, move |s| {
-                    s.remove(&sid);
+                    if held {
+                        s.close(&sid);
+                    } else {
+                        s.remove(&sid);
+                    }
                 })
                 .await;
             self.keeper.forget(id);
@@ -4729,6 +4755,84 @@ mod tests {
             let one = hub.harness.open_as(&hub, "local", spec, 1, std::slice::from_ref(&c)).await?;
             assert_eq!(one.first().map(|i| i.id.as_str()), Some(c.as_str()));
             assert!(crate::util::is_id(&crate::util::new_id()) && !crate::util::is_id("../../etc") && !crate::util::is_id(&a.to_uppercase()));
+            Ok(())
+        })
+    }
+
+    /// HARNESS-4 (CP-M2's AC-M2.2): a session of the server's own machine, closed, is no longer known, and stays so until
+    /// its task's last word. Its announcement, said before its close but taken after it (under load the loop that takes
+    /// what the server's own sessions say handed it on late, while the close went to its copy's owner directly), makes no
+    /// copy of it again; its end lets go of what held it closed. No loop takes what its task says here: each of its words
+    /// is handed over by the test, in the order load made.
+    #[test]
+    fn harness_4_a_closed_agents_announcement_after_its_close_makes_no_copy_of_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
+            let info = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            let id = info.id.clone();
+            let known = |hub: &Hub| hub.harness.info(&id).is_some() || hub.harness.list().iter().any(|i| i.id == id);
+            let held = |hub: &Arc<Hub>| {
+                let (hub, key, of) = (Arc::clone(hub), id.clone(), id.clone());
+                async move { hub.harness.sessions.on(&key, move |s| s.held_closed(&of)).await }
+            };
+            anyhow::ensure!(known(&hub), "open, it's known");
+            anyhow::ensure!(hub.harness.close(&hub, &id).await, "closed");
+            anyhow::ensure!(!known(&hub), "closed, it's still known");
+            hub.harness.ingest(&Location::Local, &id, Update::Open { info: Box::new(info.clone()), since: None }).await;
+            anyhow::ensure!(!known(&hub), "a closed agent is still known: its announcement after its close made it again");
+            hub.harness.ingest(&Location::Local, &id, Update::Closed).await;
+            anyhow::ensure!(!known(&hub) && held(&hub).await == Some(false), "its end lets go of what held it closed");
+            Ok(())
+        })
+    }
+
+    /// HARNESS-4: what holds a closed session of the server's own machine closed goes with its task, however that ends.
+    /// Here it ends without saying `Closed`: let go of (it went on elsewhere) before its close came, it ends on that. Its task
+    /// is held as it starts, waiting for a process it takes over to end, so both reach it before it reads either; then it
+    /// goes on. What it hands on is taken as the server's own loop takes it, through its last word, that it's gone: its
+    /// announcement makes no copy of it, and nothing of it is held after.
+    #[test]
+    fn harness_4_a_closes_hold_goes_with_the_sessions_task_however_it_ends() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let mut taken_over = std::process::Command::new("sleep").arg("600").spawn()?;
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), takeover_pid: Some(taken_over.id()), ..Spec::default() };
+            let info = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            let id = info.id.clone();
+            let known = |hub: &Hub| hub.harness.info(&id).is_some() || hub.harness.list().iter().any(|i| i.id == id);
+            let held = |hub: &Arc<Hub>| {
+                let (hub, key, of) = (Arc::clone(hub), id.clone(), id.clone());
+                async move { hub.harness.sessions.on(&key, move |s| s.held_closed(&of)).await }
+            };
+            anyhow::ensure!(hub.harness.local.let_go(&id), "let go of");
+            anyhow::ensure!(hub.harness.close(&hub, &id).await, "closed");
+            anyhow::ensure!(!known(&hub) && held(&hub).await == Some(true), "closed, not known, held closed");
+            taken_over.kill()?;
+            taken_over.wait()?;
+            let mut said = Vec::new();
+            loop {
+                let next = hub.harness.local_rx.recv().await.map_err(|_| anyhow::anyhow!("the server's own sessions' updates ended"))?;
+                let last = matches!(&next, super::super::session::Local::Gone(g) if *g == id);
+                said.push(match &next {
+                    super::super::session::Local::Said(_, Update::Open { .. }) => "open",
+                    super::super::session::Local::Said(_, Update::Closed) => "closed",
+                    super::super::session::Local::Said(..) => "said",
+                    super::super::session::Local::Gone(_) => "gone",
+                });
+                hub.harness.take_local(next).await;
+                if last {
+                    break;
+                }
+            }
+            hub.harness.sessions.applied(&id).await;
+            anyhow::ensure!(said.contains(&"open") && !said.contains(&"closed"), "its task announced it, and ended without saying Closed: {said:?}");
+            anyhow::ensure!(!known(&hub), "a closed agent is still known: {said:?}");
+            anyhow::ensure!(held(&hub).await == Some(false), "still held closed after its task is gone: {said:?}");
             Ok(())
         })
     }

@@ -11,8 +11,9 @@ use std::sync::mpsc::{Sender, channel};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use super::{By, Came, Quiet, Wake, came, deadline, sleep_quiet, to_poll};
+use super::{By, Came, Quiet, Wake, came, deadline, kick_wait, sleep_quiet, to_poll};
 use crate::RtError;
+use crate::parking::Woken;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::shard::ShardId;
 use crate::shard_loop::Counters;
@@ -70,12 +71,12 @@ fn pause(span: Duration) {
     }
 }
 
-/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came and how long it took on `tx`.
-fn sleeper(rt: &Runtime, shard: ShardId, tx: Sender<(Result<Came, RtError>, Duration)>) {
+/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came, when it began and how long it took on `tx`.
+fn sleeper(rt: &Runtime, shard: ShardId, tx: Sender<(Result<Came, RtError>, Instant, Duration)>) {
     rt.spawn_on(shard, async move {
         let started = Instant::now();
         let came = sleep_quiet(ns(SPAN), ns(SPAN)).await;
-        let _ = tx.send((came, started.elapsed()));
+        let _ = tx.send((came, started, started.elapsed()));
     })
     .unwrap();
 }
@@ -151,6 +152,30 @@ fn g9_s5_a_quiet_sleep_says_how_its_turn_came() {
     assert_eq!(to_poll(Came::Running(5), 200, 100), Came::Running(5), "a poll that reads an earlier clock adds nothing");
 }
 
+/// Do: a sleep falling due at 1_000 on the clock of a driver whose epoch is 5_000 on the shard's; the park it fell due
+/// in announced at 5_700 and waiting from 5_800 on the shard's clock, kicked by a sender that stamped 5_900 (900 on the
+/// driver's); the loop reading the wait's return at 1_200 (6_200), the park itself later, at 6_500 or at 9_000; the turn
+/// taken by a poll at 1_700. Expect: `Came::Woken`, the kick's wait to the loop's reading (300) and the rest from it to
+/// the poll (500) summing to the whole, from the kick's stamp to the poll (800), each stretch once, however late the
+/// park's own reading; and no wait for a kick stamped as the park was set up, which it didn't measure.
+#[test]
+fn g9_s5_a_woken_sleeps_parts_sum_to_its_whole() {
+    let (epoch, stamped) = (5_000, 5_900);
+    let quiet = Quiet { due_ns: 1_000, quiet_ns: 500, word: 0, came: None, site: None };
+    let woken = Woken { announced_ns: 5_700, waiting_ns: 5_800, returned_ns: 6_500, kicked_ns: Some(stamped) };
+    let (woke, poll) = (1_200, 1_700);
+    let whole = poll + epoch - stamped;
+    for returned_ns in [6_500, 9_000] {
+        let waited = kick_wait(&Woken { returned_ns, ..woken }, woke, epoch);
+        assert_eq!(waited, Some(300), "the kick's wait, to the loop's reading of the wait's return");
+        let (turn, from) = came(&quiet, Some(Wake { at_ns: woke, by: By::Kick, waited_ns: waited }));
+        assert_eq!((turn, from), (Came::Woken(Some(300)), woke), "woken, the rest counted from the loop's reading");
+        assert_eq!(to_poll(turn, from, poll), Came::Woken(Some(whole)), "its parts sum to its whole");
+    }
+    let early = Woken { kicked_ns: Some(5_750), ..woken };
+    assert_eq!(kick_wait(&early, woke, epoch), None, "a kick stamped as the park was set up");
+}
+
 /// Kiln's goal 9, plan 01a1a87b2cec step 5: an idle shard is woken for a quiet sleep once its quiet is out, by a timer,
 /// and says so. Do: on a running runtime's idle shard, a quiet sleep of [`SPAN`], nothing else on the shard. Expect: it
 /// comes after its span, `Came::Quiet`, and the shard took a timer's wake for it.
@@ -161,7 +186,7 @@ fn g9_s5_an_idle_shard_is_woken_for_a_quiet_sleep_after_its_quiet() {
     let before = counters_on(&rt, shard);
     let (tx, rx) = channel();
     sleeper(&rt, shard, tx);
-    let (came, took) = rx.recv_timeout(ANSWER).unwrap();
+    let (came, _, took) = rx.recv_timeout(ANSWER).unwrap();
     let after = counters_on(&rt, shard);
     assert!(matches!(came, Ok(Came::Quiet(_))), "{came:?}");
     assert!(took >= SPAN, "it came after {took:?}, its span {SPAN:?}");
@@ -170,10 +195,13 @@ fn g9_s5_an_idle_shard_is_woken_for_a_quiet_sleep_after_its_quiet() {
 }
 
 /// Kiln's goal 9, plan 01a1a87b2cec step 5: a shard that work wakes within a quiet sleep's quiet is never woken for it.
-/// Do: on a running runtime's shard, a quiet sleep of [`SPAN`], and a task the test's thread wakes from off the shard
-/// every [`GAP`] until the sleep has come. Count the shard's wakes by timers from the sleep's start to its end. Expect:
-/// none; the sleep's turn came with the shard's work (`Came::Woken`, its wake's time where the shard knows it, or
-/// `Came::Running` where the shard was running as it fell due), never by its own deadline.
+/// Its deadline ends a park only after its quiet with no wake at all, so it does once a host holds the thread waking the
+/// shard that long, and the sleep then comes by it, as it should. Do: on a running runtime's shard, a quiet sleep of
+/// [`SPAN`], and a task the test's thread wakes from off the shard every [`GAP`] until the sleep has come, noting when
+/// each wake began and ended. Count the shard's wakes by timers from the sleep's start to its end. Expect: one exactly
+/// when the sleep came by its own deadline (`Came::Quiet`), and that only if the test's thread went the quiet without a
+/// wake while it waited; so while the thread kept up, none, and the sleep's turn came with the shard's work
+/// (`Came::Woken`, by a kick, or `Came::Running` where the shard was running as it fell due); either way after its span.
 #[test]
 fn g9_s5_a_shard_work_wakes_within_its_quiet_takes_no_timer_wake() {
     let rt = Runtime::start(&config()).unwrap();
@@ -195,10 +223,14 @@ fn g9_s5_a_shard_work_wakes_within_its_quiet_takes_no_timer_wake() {
     let (tx, rx) = channel();
     sleeper(&rt, shard, tx);
     let started = Instant::now();
-    let (came, took) = loop {
+    // Each wake of the task, from just before it to just after: it reached the shard between the two.
+    let mut woke = Vec::new();
+    let (came, began, took) = loop {
         pause(GAP);
+        let from = Instant::now();
         open.store(true, Ordering::SeqCst);
         waker.wake();
+        woke.push((from, Instant::now()));
         waker = wakers.recv_timeout(ANSWER).unwrap();
         if let Ok(answer) = rx.try_recv() {
             break answer;
@@ -209,38 +241,82 @@ fn g9_s5_a_shard_work_wakes_within_its_quiet_takes_no_timer_wake() {
     stop.store(true, Ordering::SeqCst);
     open.store(true, Ordering::SeqCst);
     waker.wake();
-    assert!(matches!(came, Ok(Came::Woken(_) | Came::Running(_))), "{came:?}");
-    if let Ok(Came::Woken(Some(waited))) = came {
-        assert!(waited < ns(SPAN), "its wake took {waited} ns");
-    }
+    let came = match came {
+        Ok(came) => came,
+        Err(refused) => panic!("the sleep was refused: {refused:?}"),
+    };
+    // The longest the test's thread went without a wake while the sleep waited: from just before one of its wakes (or the
+    // sleep's start) to just after the next (or its end), the furthest apart the two can have reached the shard.
+    let ended = began + took;
+    let froms = std::iter::once(began).chain(woke.iter().map(|(from, _)| *from));
+    let tos = woke.iter().map(|(_, to)| *to).chain(std::iter::once(ended));
+    let held = froms.zip(tos).map(|(from, to)| to.min(ended).saturating_duration_since(from.max(began))).max();
+    let held = held.unwrap_or_default();
+    let (timer, kicks) = (after.woken_by_timer - before.woken_by_timer, after.woken_by_kick - before.woken_by_kick);
+    eprintln!("came {came:?} after {took:?}; {held:?} at the most without a wake; {timer} timer wakes, {kicks} kicks");
     assert!(took >= SPAN, "it came after {took:?}, its span {SPAN:?}");
-    assert_eq!(after.woken_by_timer, before.woken_by_timer, "a timer woke the shard: {before:?} to {after:?}");
-    assert!(after.woken_by_kick > before.woken_by_kick, "{before:?} to {after:?}");
+    // The shard's only timer is the sleep's own deadline, which ends it: a timer wake exactly when it came by that.
+    let quiet = matches!(came, Came::Quiet(_));
+    assert_eq!(timer, u64::from(quiet), "it came {came:?}: {before:?} to {after:?}");
+    // And that only after its quiet with no wake at all: while the test's thread kept up, the turn came with work.
+    assert!(!quiet || held >= SPAN, "it came {came:?}, the test's thread {held:?} at the most without a wake");
+    if let Came::Woken(_) = came {
+        assert!(kicks > 0, "woken with no kick: {before:?} to {after:?}");
+    }
     rt.shutdown().unwrap();
 }
 
 /// Kiln's goal 9, plan 01a1a87b2cec step 5: a quiet sleep falling due while its shard runs ends at the shard's next step,
-/// as a timer would, saying how late. Do: on a running runtime's shard, a quiet sleep of [`SPAN`], then a task that holds
-/// the shard twice that in one poll. Expect: `Came::Running`, as late as the hold ran past its due time, give or take.
+/// as a timer would, saying how late: from its due time to that step's poll of it. Do: on a running runtime's shard, a
+/// quiet sleep of [`SPAN`], then a task that holds the shard twice that in one poll; each notes the shard's clock and
+/// counts as it begins and ends. Expect, where the hold began after the sleep and before it could fall due:
+/// `Came::Running`, in the step after the hold's with no park between, as late as that step came, after the hold's end
+/// and by the sleep's own, less its due time (its span after it began, by the hold's start); in every run, no earlier
+/// than its span.
 #[test]
 fn g9_s5_a_quiet_sleep_due_on_a_running_shard_ends_at_its_next_step() {
     let rt = Runtime::start(&config()).unwrap();
     let shard = rt.shard_ids()[0];
+    let counts = || crate::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
     let (tx, rx) = channel();
-    sleeper(&rt, shard, tx);
-    let (held_tx, held) = channel();
     rt.spawn_on(shard, async move {
-        hold(SPAN * 2);
-        let _ = held_tx.send(());
+        let armed = crate::futures::now_ns();
+        let came = sleep_quiet(ns(SPAN), ns(SPAN)).await;
+        let _ = tx.send((came, armed, crate::futures::now_ns(), counts()));
     })
     .unwrap();
-    held.recv_timeout(ANSWER).unwrap();
-    let (came, took) = rx.recv_timeout(ANSWER).unwrap();
-    let Ok(Came::Running(late)) = came else {
-        panic!("{came:?}");
+    let (held_tx, held) = channel();
+    rt.spawn_on(shard, async move {
+        let from = crate::futures::now_ns();
+        hold(SPAN * 2);
+        let _ = held_tx.send((from, crate::futures::now_ns(), counts()));
+    })
+    .unwrap();
+    let (from, to, at_end) = held.recv_timeout(ANSWER).unwrap();
+    let (came, armed, taken, at_turn) = rx.recv_timeout(ANSWER).unwrap();
+    let came = match came {
+        Ok(came) => came,
+        Err(refused) => panic!("the sleep was refused: {refused:?}"),
     };
-    assert!(late > 0 && late < ns(SPAN * 2), "{late} ns late");
-    assert!(took >= SPAN * 2 - GAP, "it came after {took:?}, before the hold ended");
+    let (span, since) = (ns(SPAN), |at: u64| i128::from(at) - i128::from(armed));
+    let (steps, waits) = ((at_end.steps, at_turn.steps), (at_end.waits, at_turn.waits));
+    let (came_at, held_over) = (since(taken), (since(from), since(to)));
+    eprintln!("came {came:?} at {came_at}, the hold {held_over:?} (ns after it began); steps {steps:?}, waits {waits:?}");
+    // Its due time is its span after the shard's clock as it was first polled, at or after `armed`.
+    assert!(taken - armed >= span, "it came {} ns after it began, within its span", taken - armed);
+    if (armed..armed + span).contains(&from) {
+        // It fell due while the shard ran: its turn came at the next step, the one after the hold's.
+        let Came::Running(late) = came else {
+            panic!("it fell due while the shard ran, and came {came:?}");
+        };
+        let next = steps.1 == steps.0 + 1 && waits.1 == waits.0;
+        assert!(next, "its turn not the step after the hold's: steps {steps:?}, waits {waits:?}");
+        // Its due time is no earlier than its span after `armed` and no later than its span after `from` (it was polled
+        // first); the step's poll of it came after the hold's end, `to`, and by its own, `taken`.
+        let (least, most) = (to.saturating_sub(from).saturating_sub(span), (taken - armed).saturating_sub(span));
+        let after_due = least..=most;
+        assert!(after_due.contains(&late), "{late} ns late, the step after the hold's {after_due:?} ns after it fell due");
+    }
     rt.shutdown().unwrap();
 }
 

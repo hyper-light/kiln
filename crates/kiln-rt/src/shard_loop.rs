@@ -1735,7 +1735,15 @@ impl Shard {
             }
             return (false, None);
         };
-        self.note_last_wake(woke, woken.and_then(|woken| woken.latency_ns()), deadline_ns, by_quiet);
+        // A kick's wait counted to the reading the wait returned with, which the rest of a quiet sleep's turn is counted
+        // from: each stretch once ([`crate::quiet::kick_wait`]).
+        let kick_ns = match (woken, woke, self.core.driver.clock()) {
+            (Some(woken), Some(woke), crate::driver::Clock::Since(epoch)) => {
+                crate::quiet::kick_wait(&woken, woke.ns, epoch)
+            }
+            _ => None,
+        };
+        self.note_last_wake(woke, kick_ns, deadline_ns, by_quiet);
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
         }

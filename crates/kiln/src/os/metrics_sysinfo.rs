@@ -35,8 +35,10 @@ impl Sampler {
         self.sys.refresh_memory();
         let mem_total = self.sys.total_memory();
         let mem_used = mem_total.saturating_sub(self.sys.available_memory());
+        // The machine's load on this process's CPUs of all the machine's (`HostSample::load_on`, W05-R03).
+        let cpus = u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1);
         #[allow(clippy::cast_possible_truncation)]
-        let load1 = System::load_average().one as f32;
+        let load1 = HostSample::load_on(System::load_average().one as f32, cpus, u32::try_from(self.sys.cpus().len()).unwrap_or(u32::MAX));
 
         self.nets.refresh(true);
         let (mut net_rx, mut net_tx) = (0u64, 0u64);
@@ -54,7 +56,7 @@ impl Sampler {
         HostSample {
             ts_ms: crate::util::now_ms(),
             cpu_pct: self.sys.global_cpu_usage(),
-            cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
+            cpus,
             load1,
             mem_total,
             mem_used,

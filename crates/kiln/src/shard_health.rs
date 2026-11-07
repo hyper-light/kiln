@@ -1342,14 +1342,26 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5 (Ada's word of 2026-11-06): a shard that work wakes within each period takes no
-    /// timer wake for its probe, whose samples are that work's wakes (`by="work"`). Do: on a shard of its own, a task
-    /// another thread wakes every 2 ms (a hundredth of a period's quiet, so a host would have to hold that thread a whole
-    /// period to let the shard's park run out), and the probe for six runs. Expect: the shard's timer wakes don't move
-    /// over them; the probe's samples are work's, none its own timer's.
+    /// timer wake for its probe, whose samples are that work's wakes (`by="work"`). A park runs out for the probe's quiet
+    /// sleep only after its quiet, the period, with no wake at all: a host that holds the thread waking the shard that long
+    /// lets it, and the probe's own timer then wakes the shard, as it should. Do: on a shard of its own, a task another
+    /// thread wakes every 2 ms, noting when each wake began and ended, and the probe's six runs, one at a time. Expect, run
+    /// by run: a timer wake only in a run in which the waking thread went the quiet without a wake, the run's sample then
+    /// the probe's own timer's; every other run's sample work's, or none (a kick whose start the shard didn't know); so no
+    /// timer wake at all while the waking thread keeps up, and samples by work from the runs it kept up with.
     #[test]
     fn g9_s5_a_shard_woken_by_work_takes_no_timer_wake_for_its_probe() -> anyhow::Result<()> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
+        /// One of the probe's runs: when it began and ended, the shard's counts at each, and its samples of each kind.
+        struct Run {
+            began: Instant,
+            ended: Instant,
+            before: hyper_rt::shard_loop::Counters,
+            after: hyper_rt::shard_loop::Counters,
+            work: u64,
+            probe: u64,
+        }
         let _ = base();
         let gap = Duration::from_millis(2);
         let runs = 6_u64;
@@ -1360,21 +1372,28 @@ mod tests {
             move || {
                 // A channel nobody sends on: each wait on it is the gap.
                 let (_hold, idle) = std::sync::mpsc::channel::<()>();
-                let mut waker = None;
+                let mut waker: Option<std::task::Waker> = None;
+                // Each wake of the gate, from just before it to just after: it reached the shard between the two.
+                let mut woke = Vec::new();
+                let mut wake = |w: &std::task::Waker| {
+                    let before = Instant::now();
+                    open.store(true, Ordering::SeqCst);
+                    w.wake_by_ref();
+                    woke.push((before, Instant::now()));
+                };
                 while !stop.load(Ordering::SeqCst) {
                     let _ = idle.recv_timeout(gap);
                     while let Ok(w) = wakers.try_recv() {
                         waker = Some(w);
                     }
                     if let Some(w) = &waker {
-                        open.store(true, Ordering::SeqCst);
-                        w.wake_by_ref();
+                        wake(w);
                     }
                 }
-                if let Some(w) = waker {
-                    open.store(true, Ordering::SeqCst);
-                    w.wake();
+                if let Some(w) = &waker {
+                    wake(w);
                 }
+                woke
             }
         });
         let shard_stop = Arc::clone(&stop);
@@ -1386,25 +1405,49 @@ mod tests {
                 }
             })
             .map_err(|e| anyhow::anyhow!("the gate's task: {e}"))?;
+            let counters = || hyper_rt::futures::shard_counters().unwrap_or_default();
             // The waking thread under way first: a gate woken once.
-            let me = Shard::new();
-            let mut first = hyper_rt::futures::shard_counters().unwrap_or_default();
-            while first.woken_by_kick == 0 {
+            while counters().woken_by_kick == 0 {
                 let _ = hyper_rt::futures::sleep(1_000_000).await;
-                first = hyper_rt::futures::shard_counters().unwrap_or_default();
             }
-            wake_every(&me, usize::MAX, PERIOD, runs, &Reads::new()).await;
-            let after = hyper_rt::futures::shard_counters().unwrap_or_default();
+            let (me, reads) = (Shard::new(), Reads::new());
+            let mut each = Vec::new();
+            for _ in 0..runs {
+                let (began, before) = (Instant::now(), counters());
+                let (work, probe) = (me.delay_by(By::Work).count(), me.delay_by(By::Probe).count());
+                wake_every(&me, usize::MAX, PERIOD, 1, &reads).await;
+                let (ended, after) = (Instant::now(), counters());
+                let (work, probe) = (me.delay_by(By::Work).count().saturating_sub(work), me.delay_by(By::Probe).count().saturating_sub(probe));
+                each.push(Run { began, ended, before, after, work, probe });
+            }
             shard_stop.store(true, Ordering::SeqCst);
-            Ok((me.runs(), me.delay_by(By::Work).count(), me.delay_by(By::Probe).count(), first, after))
+            Ok((me.runs(), each))
         });
         stop.store(true, Ordering::SeqCst);
-        let _ = waking.join();
-        let (ran, work, probe, first, after) = result?;
-        anyhow::ensure!(ran == runs, "{ran} of {runs} runs");
-        anyhow::ensure!(probe == 0 && work >= 1 && work <= runs, "{work} samples by work, {probe} by the probe's timer");
-        anyhow::ensure!(after.woken_by_timer == first.woken_by_timer, "the shard took {} timer wakes: {first:?} to {after:?}", after.woken_by_timer - first.woken_by_timer);
-        anyhow::ensure!(after.woken_by_kick > first.woken_by_kick, "{first:?} to {after:?}");
+        let woke = waking.join().map_err(|_| anyhow::anyhow!("the waking thread panicked"))?;
+        let (ran, each) = result?;
+        anyhow::ensure!(ran == runs && each.len() == usize::try_from(runs)?, "{ran} of {runs} runs");
+        // The longest the waking thread went without a wake within a run: from just before one of its wakes (or the run's
+        // start) to just after the next (or the run's end), the furthest apart the two can have reached the shard.
+        let held_in = |run: &Run| {
+            let from = std::iter::once(run.began).chain(woke.iter().map(|(before, _)| *before));
+            let to = woke.iter().map(|(_, after)| *after).chain(std::iter::once(run.ended));
+            from.zip(to).map(|(from, to)| to.min(run.ended).saturating_duration_since(from.max(run.began))).max().unwrap_or_default()
+        };
+        // Each run's: that longest hold, the shard's timer wakes and kicks over it, and its samples by work and by the probe's
+        // timer.
+        let rows: Vec<_> = each.iter().map(|run| (held_in(run), run.after.woken_by_timer.saturating_sub(run.before.woken_by_timer), run.after.woken_by_kick.saturating_sub(run.before.woken_by_kick), run.work, run.probe)).collect();
+        println!("g9_s5: each run's longest hold of the waking thread, timer wakes, kicks, samples by work and by the probe's timer: {rows:?}");
+        for (n, &(held, timer, kicks, work, probe)) in rows.iter().enumerate() {
+            // The run's sample is of what woke the shard: the probe's own timer's exactly when the shard took a timer wake
+            // (its quiet sleep's deadline, which ends the run), else work's, or none for a kick whose start it didn't know.
+            anyhow::ensure!(timer == probe && probe + work <= 1 && (probe + work == 1 || kicks > 0), "run {n}: {timer} timer wakes and {kicks} kicks, {work} samples by work and {probe} by the probe's timer");
+            // A timer wake only where a park could last its quiet: the waking thread held that long without a wake.
+            anyhow::ensure!(timer == 0 || held >= PERIOD, "run {n}: a timer wake, the waking thread {held:?} at the most without a wake, under the quiet's {PERIOD:?}");
+        }
+        // The runs the waking thread kept up with, which work alone woke: their samples work's.
+        let (kept_up, work) = rows.iter().filter(|(held, ..)| *held < PERIOD).fold((0_usize, 0_u64), |(n, samples), &(_, _, _, work, _)| (n + 1, samples + work));
+        anyhow::ensure!(kept_up == 0 || work >= 1, "the waking thread kept up through {kept_up} runs, none of them sampled by work");
         Ok(())
     }
 

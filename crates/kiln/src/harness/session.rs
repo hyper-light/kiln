@@ -614,7 +614,7 @@ impl Info {
 /// sending end (tests'). Either way a sender waits for room: nothing is dropped.
 #[derive(Clone, Debug)]
 pub enum Sink {
-    Bounded(crate::memory::queue::Sender<(String, Update)>),
+    Bounded(crate::memory::queue::Sender<Local>),
     Channel(async_channel::Sender<(String, Update)>),
     /// A runner's: each update with when it was handed on ([`Taken`]; goal 10, plan 01a1a87b2dae step 5).
     Stamped(crate::memory::queue::Sender<Taken>),
@@ -630,12 +630,38 @@ pub struct Taken {
     pub at: std::time::Instant,
 }
 
+/// What a session of the server's own machine hands the server's registry ([`Sink::Bounded`]): its updates, then, the last
+/// thing its task hands on, that the task is gone ([`Sink::gone`]).
+#[derive(Debug)]
+pub enum Local {
+    Said(String, Update),
+    Gone(String),
+}
+
+impl crate::memory::queue::Weigh for Local {
+    fn weight(&self) -> usize {
+        match self {
+            Local::Said(session, update) => crate::memory::queue::Weigh::weight(session).saturating_add(crate::memory::queue::Weigh::weight(update)),
+            Local::Gone(session) => crate::memory::queue::Weigh::weight(session),
+        }
+    }
+}
+
 impl Sink {
     /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
     /// updates any more. A runner's sink notes when ([`Sink::Stamped`]).
     pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
         match self {
-            Sink::Bounded(q) => q.send(update).await,
+            Sink::Bounded(q) => {
+                let (session, update) = update;
+                // What an error gives back is what went: an update (a task's end is said by `gone` alone).
+                q.send(Local::Said(session, update)).await.map_err(|e| {
+                    async_channel::SendError(match e.0 {
+                        Local::Said(session, update) => (session, update),
+                        Local::Gone(session) => (session, Update::Closed),
+                    })
+                })
+            }
             Sink::Channel(c) => c.send(update).await,
             Sink::Stamped(q) => {
                 let (session, update) = update;
@@ -652,8 +678,17 @@ impl Sink {
         let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
         match self {
             Sink::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
-            Sink::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
+            Sink::Bounded(_) => self.send((session, update)).await.map_err(|e| back(e.0)),
             Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
+        }
+    }
+
+    /// Session `session`'s task is gone, whatever ended it: the last thing it hands on, after all it said. The server's own
+    /// registry lets go then of what it held for the session until nothing it said could still be on its way (a close's hold:
+    /// `super::copies::Shard::close`, HARNESS-4); a runner's sink and a test's take nothing for it.
+    pub async fn gone(&self, session: &str) {
+        if let Sink::Bounded(q) = self {
+            let _ = q.send(Local::Gone(session.to_owned())).await;
         }
     }
 }
@@ -664,8 +699,8 @@ impl From<crate::memory::queue::Sender<Taken>> for Sink {
     }
 }
 
-impl From<crate::memory::queue::Sender<(String, Update)>> for Sink {
-    fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
+impl From<crate::memory::queue::Sender<Local>> for Sink {
+    fn from(q: crate::memory::queue::Sender<Local>) -> Self {
         Sink::Bounded(q)
     }
 }
@@ -1344,6 +1379,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items, adopt)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
         }
+        // Gone, however it ended (it said `Closed`, went on elsewhere or panicked): the last it hands on.
+        sink.gone(&id).await;
     });
     Ok(s)
 }

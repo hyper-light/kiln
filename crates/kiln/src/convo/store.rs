@@ -1275,7 +1275,7 @@ mod tests {
     #[test]
     fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            let (out, passed) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, 4);
+            let (out, passed) = crate::memory::queue::places::<crate::harness::session::Local>(&crate::memory::owners::CHANNELS, 4);
             let room = 16;
             let (sink, held) = tee_held(out, None, room);
             // Looked at weakly: a sender held here would keep the tee from ever ending.
@@ -1301,7 +1301,7 @@ mod tests {
             loop {
                 most = most.max(way_in.upgrade().map_or(0, |q| q.len()));
                 let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the tee never ended"))?;
-                let Ok((id, u)) = next else { break };
+                let Ok(crate::harness::session::Local::Said(id, u)) = next else { break };
                 let t: usize = id.trim_start_matches('s').parse()?;
                 let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
                 got.get_mut(t).ok_or_else(|| anyhow::anyhow!("no session {t}"))?.extend(events.iter().map(|e| e.seq));
