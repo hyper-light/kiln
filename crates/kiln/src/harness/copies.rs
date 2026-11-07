@@ -3888,9 +3888,10 @@ pub struct Ingest {
 /// Every runner's updates were judged on the hub's one loop, on the HTTP listener's shard, behind every
 /// runner's other messages (the lab's runner wait at p99, 155 to 195 ms).
 pub struct RunnerUpdate {
-    /// The runner process it came from, and its machine.
+    /// The runner process it came from, and its machine (its name shared with the hub's map of runners' links: goal 9, plan
+    /// 01a1a87b2cec step 3).
     pub peer: hyper_transport::PeerId,
-    pub agent: String,
+    pub agent: Arc<str>,
     pub session: String,
     pub update: Update,
     /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`), as its
@@ -4355,7 +4356,13 @@ impl Copies {
     /// Hands `msg` to session `id`'s owner, waiting while its inbox is full: false when there's no
     /// owner any more (the registry is going).
     pub async fn send(&self, id: &str, msg: Msg) -> bool {
-        match self.inboxes.get(self.owner_of(id)) {
+        self.send_to(self.owner_of(id), msg).await
+    }
+
+    /// Hands `msg` to shard `shard`'s owner ([`Copies::owner_of`]), waiting while its inbox is full: false when there's no
+    /// owner any more.
+    pub async fn send_to(&self, shard: usize, msg: Msg) -> bool {
+        match self.inboxes.get(shard) {
             Some(inbox) => inbox.send(msg).await.is_ok(),
             None => false,
         }

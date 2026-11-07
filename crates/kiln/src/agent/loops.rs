@@ -318,8 +318,8 @@ impl Loop {
         if let Some(has) = shared.adopt.load().get(&stream).filter(|h| h.upto > self.receiver.state(&stream).upto) {
             self.receiver.restore(has.clone());
         }
-        let answer = match self.receiver.on_item(&stream, seq, low, body, Instant::now()) {
-            Arrival::Take(body) => {
+        let answer = match self.receiver.on_item(&stream, seq, low, Instant::now()) {
+            Arrival::Take(_) => {
                 let (refused, closed) = match proto::read_server(&body) {
                     Ok(ServerMsg::Wire(_)) => (Some((Refusal::Malformed, "a channel frame inside a command".to_owned())), None),
                     Ok(inner) => self.apply(shared, inner).await,
@@ -490,8 +490,8 @@ pub(super) fn stream_open(shared: &Shared, stream: String, session: String, spec
 /// either knows: it never goes back, which its server would take for a runner that lost what it answered.
 pub(super) fn have_of(own: crate::wire::channel::Frame, shared: &Shared) -> crate::wire::channel::Frame {
     use std::collections::BTreeMap;
-    let mut all: BTreeMap<String, crate::wire::channel::Has> = BTreeMap::new();
-    let mut add = |h: crate::wire::channel::Has| match all.get_mut(&h.stream) {
+    let mut all: BTreeMap<Arc<str>, crate::wire::channel::Has> = BTreeMap::new();
+    let mut add = |h: crate::wire::channel::Has| match all.get_mut(&*h.stream) {
         Some(had) => {
             had.upto = had.upto.max(h.upto);
             for n in h.nacks {
@@ -502,7 +502,7 @@ pub(super) fn have_of(own: crate::wire::channel::Frame, shared: &Shared) -> crat
             had.nacks.sort_by_key(|n| n.seq);
         }
         None => {
-            all.insert(h.stream.clone(), h);
+            all.insert(Arc::clone(&h.stream), h);
         }
     };
     if let crate::wire::channel::Frame::Have(has) = own {
@@ -731,12 +731,12 @@ mod tests {
             drop(tx);
             session_loop(Arc::clone(&s), 1, rx, Arc::clone(&marks)).await;
             let answers = said(&sent);
-            let refused = |f: &Frame| matches!(f, Frame::Ack(h) if h.stream == "l:7.1/gone-3" && h.upto == 1 && h.nacks.iter().any(|n| n.seq == 1 && n.code == Refusal::Unknown));
+            let refused = |f: &Frame| matches!(f, Frame::Ack(h) if &*h.stream == "l:7.1/gone-3" && h.upto == 1 && h.nacks.iter().any(|n| n.seq == 1 && n.code == Refusal::Unknown));
             anyhow::ensure!(answers.len() == 2 && answers.iter().all(refused), "its NACK, then again for the copy: {answers:?}");
             let closed = std::iter::from_fn(|| own_rx.try_recv().ok()).filter(|u| matches!(u, Up::Term(AgentMsg::Harness { session, .. }) if session == "gone-3")).count();
             anyhow::ensure!(closed == 1, "applied once: the session said gone once, not for its copy ({closed})");
             let have = s.have.first().map(|h| h.get()).unwrap_or_default();
-            anyhow::ensure!(have.iter().any(|h| h.stream == "l:7.1/gone-3" && h.upto == 1), "published for the runner's Have: {have:?}");
+            anyhow::ensure!(have.iter().any(|h| &*h.stream == "l:7.1/gone-3" && h.upto == 1), "published for the runner's Have: {have:?}");
             // Its close, answered: the stream's state goes.
             let close = ServerMsg::HarnessClose { session: "gone-3".into() };
             let (tx, rx) = crate::memory::queue::unbounded::<Routed>(&crate::memory::owners::CHANNELS);

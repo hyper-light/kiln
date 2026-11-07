@@ -50,10 +50,19 @@ pub fn put(json: &mut String, taken: Duration) {
 /// `None`, and `json` as it was, when it doesn't end so. Nothing is copied or moved: the field is cut off the
 /// end and the object's brace put back.
 pub fn take(json: &mut String) -> Option<Duration> {
-    let (at, us) = field(json)?;
+    let (at, us) = field(json.as_bytes())?;
     json.truncate(at);
     json.push('}');
     Some(Duration::from_micros(us))
+}
+
+/// [`take`] of an update's JSON where its frame holds it (goal 9, plan 01a1a87b2cec step 3): the field cut off by the
+/// object's brace written where the field begins. The JSON's length without it, and how long the runner held the update;
+/// nothing moved.
+pub fn cut(json: &mut [u8]) -> Option<(usize, Duration)> {
+    let (at, us) = field(json)?;
+    *json.get_mut(at)? = b'}';
+    Some((at.saturating_add(1), Duration::from_micros(us)))
 }
 
 /// Where in `json` the field [`put`] appends starts (its comma, or its name in an object that had nothing
@@ -61,19 +70,19 @@ pub fn take(json: &mut String) -> Option<Duration> {
 /// field: `"taken_us":` after a comma or the object's opening brace, then a whole number that fits a `u64`,
 /// then the brace that ends the object, nothing after it. A member of a nested object, or a string that
 /// says the same words, ends otherwise (`}}`, `"}`), so it's never taken for the field.
-fn field(json: &str) -> Option<(usize, u64)> {
-    let inner = json.strip_suffix('}')?;
-    let digits = inner.bytes().rev().take_while(u8::is_ascii_digit).count();
+fn field(json: &[u8]) -> Option<(usize, u64)> {
+    let inner = json.strip_suffix(b"}")?;
+    let digits = inner.iter().rev().take_while(|b| b.is_ascii_digit()).count();
     if digits == 0 {
         return None;
     }
     let (head, number) = inner.split_at_checked(inner.len().saturating_sub(digits))?;
-    let us = number.bytes().try_fold(0u64, |n, d| n.checked_mul(10)?.checked_add(u64::from(d.checked_sub(b'0')?)))?;
-    let before = head.strip_suffix(NAME)?;
-    if let Some(rest) = before.strip_suffix(',') {
+    let us = number.iter().try_fold(0u64, |n, d| n.checked_mul(10)?.checked_add(u64::from(d.checked_sub(b'0')?)))?;
+    let before = head.strip_suffix(NAME.as_bytes())?;
+    if let Some(rest) = before.strip_suffix(b",") {
         return Some((rest.len(), us));
     }
-    (before == "{").then_some((before.len(), us))
+    (before == b"{").then_some((before.len(), us))
 }
 
 #[cfg(test)]
