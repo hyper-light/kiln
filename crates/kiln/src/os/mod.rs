@@ -117,6 +117,15 @@ pub const RUN_GROUP: &str = "run-";
 /// a runner moves them where systemd has none.
 pub const UNIT_LEAF: &str = "kiln";
 
+/// The page faults the process has taken since it started, by kind ([`page_faults`]; allocs-metric).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Faults {
+    /// Pages given without reading them: a fresh one zeroed, or one still in memory mapped in.
+    pub minor: u64,
+    /// Pages read in from disk.
+    pub major: u64,
+}
+
 /// A CPU list as Linux writes one (`0-3,8,10-11`: cpuset(7)'s list format, systemd's
 /// `AllowedCPUs=`): the CPUs it names, in order, each once; why not, for one that isn't.
 pub fn cpu_list(text: &str) -> Result<Vec<u32>, String> {
