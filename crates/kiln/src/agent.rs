@@ -1751,6 +1751,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_signs = false;
     // The server takes custody records (docs/ci.md W27-R08).
     let mut server_custody = false;
+    // The server takes runners back as fast as it can, and so takes word that what this runner sends on its Welcome is
+    // out (`AgentMsg::Settled`; docs/resilience.md R5).
+    let mut server_admission = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, (Instant, Duration)> = HashMap::new();
     // The server takes word that a frame of its couldn't be read here (`AgentMsg::Unread`): of each
@@ -2862,6 +2865,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Err(e) = redials.connected(Instant::now()) {
                     tracing::warn!(error = %format!("{e:#}"), "what this runner learned of its dials isn't kept");
                 }
+                // Its admission, first (docs/resilience.md R5): a server over its limit tells it its turn, and lets go of
+                // what follows until it closes; one that admits it takes the rest. An older server skips it, as a test
+                // build's `old` runner never says it.
+                if !crate::runner::chaos::get().is_some_and(|c| c.old)
+                    && let Ok(b) = proto::encode(&AgentMsg::Admit)
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 // The machine it is (docs/machines.md, "One record a machine"), which process of it
                 // this is, then Hello (an older server skips the first two).
                 if !o.ephemeral
@@ -2926,7 +2937,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -3022,6 +3033,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_work = false;
                 work_said = None;
                 server_identity = false;
+                server_admission = false;
                 server_signs = false;
                 server_limit = false;
                 limit_said = None;
@@ -3601,6 +3613,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         // Custody records sent before go again: the server takes each once.
                         server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        server_admission = caps & proto::CAP_ADMISSION != 0;
                         shared.server_custody.store(server_custody, std::sync::atomic::Ordering::Release);
                         crate::runner::custody::server_checks(server_custody);
                         crate::runner::custody::server_relays(caps & proto::CAP_RELAYS != 0 && !o.ephemeral);
@@ -3791,6 +3804,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(true)).await;
                         }
+                        // What it sent on its Welcome is out, before this on its lane: its admission ends.
+                        if server_admission {
+                            own.0.send(Up::Term(AgentMsg::Settled)).await.ok();
+                        }
+                    }
+                    // Over its admission limit (docs/resilience.md R5): this runner's next dial at its turn, drawn within
+                    // it; it closes its link, whose frames the server lets go meanwhile.
+                    ServerMsg::Later { after_us, width_us } => {
+                        let (after, width) = (Duration::from_micros(after_us), Duration::from_micros(width_us));
+                        tracing::info!(after_ms = after.as_millis() as u64, width_ms = width.as_millis() as u64, "the server is taking runners back at the rate it can: dialing again at this runner's turn");
+                        redials.later(Instant::now(), after, width, rand::random());
+                        net.command(Out::Disconnect { peer: SERVER_PEER }).await;
+                    }
+                    // The server's drain (docs/resilience.md C3, step 5): it says when it expects to answer again, and
+                    // this runner's turn after that: the next dial then, not to a server that's down. It closes its link.
+                    ServerMsg::Back { after_us, width_us } => {
+                        let (after, width) = (Duration::from_micros(after_us), Duration::from_micros(width_us));
+                        tracing::info!(after_ms = after.as_millis() as u64, width_ms = width.as_millis() as u64, "the server is going down: dialing it again when it expects to answer");
+                        redials.back(Instant::now(), after, width, rand::random());
+                        net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                     }
                     ServerMsg::Refused { reason } => {
                         tracing::error!(%reason, "server refused this agent");

@@ -183,7 +183,10 @@ answered had answered; once the server has been unreachable longer than it ever 
 up gives the next one twice as long. After the server is lost, the next dial is due once the time it
 has likely been back unnoticed (from the outages seen, and scale-free past the longest) adds up to
 what a dial costs, its patience, and is drawn uniformly up to then (AWS's full jitter). Before any
-dial has answered, a dial is the transport's to end.
+dial has answered, a dial is the transport's to end. What the server says while the link is up comes
+first (docs/resilience.md R5): over its admission limit it gives the runner its turn, and going down
+it says when it expects to answer again and the runner's turn after that; the next dial is at a
+point drawn within the turn it gives.
 
 ### Finished job pods are forgotten
 

@@ -27,6 +27,7 @@ use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
 
+pub mod admission;
 mod build;
 
 /// The server's secrets as `cfg` says them, a `file:` one read from its file (blocking: [`Hub::job_secrets`] reads them
@@ -630,6 +631,9 @@ pub struct Hub {
     pub runners_before: AtomicU64,
     /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
     pub comeback: crate::comeback::Comeback,
+    /// Runners reconnecting taken back only as fast as the server can, and its drain's notice to them
+    /// (docs/resilience.md R5; [`admission`]).
+    pub admission: admission::Admission,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -827,6 +831,7 @@ impl Hub {
             generation,
             runners_before: AtomicU64::new(0),
             comeback: crate::comeback::Comeback::default(),
+            admission: admission::Admission::new(clock.now()),
             admin_token,
             join_token,
             ephemeral_tokens: Default::default(),
@@ -2252,6 +2257,72 @@ impl Hub {
         }
     }
 
+    /// What admissions and this server's restarts taught the runs before this one, from kiln.db, and the restart
+    /// this start ends, learned as the server answers runners again; `started`, how long this start took
+    /// ([`admission`]; docs/resilience.md R5).
+    pub async fn take_admission(&self, started: Duration) {
+        let mut kept = [None, None, None];
+        for (k, key) in kept.iter_mut().zip([admission::KEY, admission::RESTARTS, admission::STOPPED]) {
+            match self.store.kv_get(key.to_owned()).await {
+                Ok(v) => *k = v,
+                Err(e) => tracing::warn!(key, error = %format!("{e:#}"), "what an earlier run learned of admissions wasn't read: learning it again"),
+            }
+        }
+        let [admissions, restarts, stopped] = kept;
+        self.admission.take_kept(admissions.as_deref(), restarts.as_deref());
+        // How long ago it began to stop, by the wall clock it kept that by: none if that clock went back since.
+        let ago = stopped.as_deref().and_then(|ms| ms.trim().parse::<i64>().ok()).and_then(|ms| u64::try_from(self.clock.unix_ms().saturating_sub(ms)).ok()).map(Duration::from_millis);
+        if let Some(text) = self.admission.answering(started, ago)
+            && let Err(e) = self.store.kv_set(admission::RESTARTS.to_owned(), text).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "how long this server took to restart wasn't kept");
+        }
+        // Taken once: a stop with no drain after it (a crash) teaches nothing from this one.
+        if stopped.is_some()
+            && let Err(e) = self.store.kv_delete(admission::STOPPED.to_owned()).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "when this server last began to stop wasn't let go");
+        }
+        tracing::info!(limit = self.admission.limit(), turn_us = self.admission.turn().map(|d| d.as_micros() as u64), restart_ms = self.admission.restart().map(|d| d.as_millis() as u64), "admission of runners reconnecting");
+    }
+
+    /// The server's drain, as it stops (docs/resilience.md C3, step 5): when it began to, and what admissions taught it,
+    /// kept for its next start; and, declared (`[server] admission`), each runner that takes it told when the server
+    /// expects to answer again and its turn after that ([`admission::Admission::back`]), then waited for as it closes
+    /// its link, for as long as the transport's idle timeout at most (a runner silent that long is gone already).
+    pub async fn drain_notice(&self) {
+        for (key, value) in [(admission::STOPPED, self.clock.unix_ms().to_string()), (admission::KEY, self.admission.kept())] {
+            if let Err(e) = self.store.kv_set(key.to_owned(), value).await {
+                tracing::warn!(key, error = %format!("{e:#}"), "what this server's next start learns from wasn't kept");
+            }
+        }
+        if !self.cfg.server.admission {
+            return;
+        }
+        let Some(restart) = self.admission.restart() else { return };
+        let mut told: Vec<PeerId> = {
+            let instances = self.instances.load();
+            self.peers.load().keys().copied().filter(|p| instances.get(*p).is_some_and(|i| i.wide & proto::CAP_ADMISSION != 0)).collect()
+        };
+        told.sort_unstable();
+        let left = self.admission.leaving(&told);
+        for (k, peer) in told.iter().enumerate() {
+            let (after_us, width_us) = self.admission.back(k, restart).micros();
+            self.send_peer(*peer, &ServerMsg::Back { after_us, width_us }).await;
+        }
+        tracing::info!(runners = told.len(), restart_ms = restart.as_millis() as u64, "told runners when this server expects to answer again");
+        if crate::rt::timeout(crate::net::limits(true).idle_timeout, left).await.is_err() {
+            tracing::info!("runners told of the drain still connected as the transport's idle timeout passed: their links close");
+        }
+    }
+
+    /// `turn` told to runner `peer`, over the admission limit: it closes its link and dials again then.
+    async fn tell_turn(&self, peer: PeerId, turn: admission::Turn) {
+        let (after_us, width_us) = turn.micros();
+        tracing::debug!(peer, after_us, width_us, in_progress = self.admission.in_progress(), limit = self.admission.limit(), "a runner over the admission limit is told its turn");
+        self.send_peer(peer, &ServerMsg::Later { after_us, width_us }).await;
+    }
+
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
     /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
     /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
@@ -2467,11 +2538,18 @@ impl Hub {
             // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
             let label = Self::net_label(&ev);
+            let peer = match &ev {
+                NetEvent::Connected { peer, .. } | NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } | NetEvent::Frame { peer, .. } => *peer,
+            };
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied. What its piece held the shard for is learned as
             // it's taken (goal 9, plan 01a1a87b2cec step 3).
             if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
+            }
+            // The control loop's time on it: what admissions in progress cost it (docs/resilience.md R5).
+            if me == crate::wire::fan::CONTROL {
+                self.admission.worked(peer, began.elapsed());
             }
             // Taken: what of its runner's waits for it goes.
             marks.took(me, n);
@@ -2556,6 +2634,9 @@ impl Hub {
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+                for (p, turn) in self.admission.closed(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
                 self.tunnels.closed(peer);
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.ask(move |c| c.down(peer)).await;
@@ -2605,20 +2686,28 @@ impl Hub {
             // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
             // goal 9, plan 01a1a87b2cec step 3). Whether its runner's Hello came is read off the links' map, its
             // name not copied out of it (step 5).
-            NetEvent::Frame { peer, lane, data, .. } => match crate::wire::payload::read_frame(data, self.said_hello(peer)).await {
-                // Anything on its control lane before its Hello is out of order: Hello comes first
-                // there. On its other lanes a frame may come before its Hello is read (it sends them
-                // once it's connected): it's let go, as it was.
-                crate::wire::payload::Frame::BeforeHello { what } => {
-                    if lane == proto::LANE_CONTROL {
-                        self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
-                    } else {
-                        tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
-                    }
+            NetEvent::Frame { peer, lane, data, .. } => {
+                let hello = self.said_hello(peer);
+                // A runner over the admission limit: what its connection sends is let go unread until it closes, but
+                // an Admit, how it comes back (docs/resilience.md R5).
+                if !hello && self.admission.letting_go(peer) && !crate::wire::fan::admits(&data) {
+                    return Ok(());
                 }
-                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
-                crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
-            },
+                match crate::wire::payload::read_frame(data, hello).await {
+                    // Anything on its control lane before its Hello is out of order: Hello comes first
+                    // there. On its other lanes a frame may come before its Hello is read (it sends them
+                    // once it's connected): it's let go, as it was.
+                    crate::wire::payload::Frame::BeforeHello { what } => {
+                        if lane == proto::LANE_CONTROL {
+                            self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
+                        } else {
+                            tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
+                        }
+                    }
+                    crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
+                    crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                }
+            }
         }
         Ok(())
     }
@@ -2901,6 +2990,13 @@ impl Hub {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
             return crate::api::boxed(|| self.on_hello(peer, h)).await;
         }
+        // Its admission (docs/resilience.md R5), the first thing it says on a connection.
+        if let Carried::Nothing(AgentMsg::Admit) = msg {
+            if let admission::Verdict::Later(turn) = self.admission.admit(peer, self.clock.now(), self.cfg.server.admission) {
+                self.tell_turn(peer, turn).await;
+            }
+            return Ok(());
+        }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
         // The machine it is, said before its Hello (docs/machines.md, "One record a machine"): what
@@ -2944,7 +3040,14 @@ impl Hub {
             Carried::Read(read) => return self.on_read(peer, &agent, read, arrived).await,
         };
         match msg {
-            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } => {}
+            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } | AgentMsg::Admit => {}
+            // What it sent on its Welcome is out: its admission ends, and the first to teach a turn gives every runner
+            // waiting for one its turn.
+            AgentMsg::Settled => {
+                for (p, turn) in self.admission.settled(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
+            }
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
             | AgentMsg::LegResults { .. }
@@ -3832,7 +3935,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS | proto::CAP_ADMISSION }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte. Once each
         // copy's owner has applied what this loop handed it before (`crate::harness::copies`): a
@@ -6329,6 +6432,110 @@ pub(crate) mod tests {
             for id in ["paused", "within"] {
                 anyhow::ensure!(hub.store.job(id.into()).await?.is_some_and(|j| j.status == Status::Running), "{id} runs on");
             }
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md R5, through the hub: a herd of 50 runners reconnecting at once, the server having learned
+    /// that an admission alone takes 7 ms of which the control loop's work is 2 ms (four at once, a turn of 2 ms).
+    /// Four are admitted (their Hellos taken); each of the other 46 is told its own turn, after the four in progress and
+    /// those told before it, a turn apart, and what its connection sends (its Machine, its Hello) is let go unread. As
+    /// the four settle and the clock reaches each one's turn, it comes back and is admitted past the limit, never told
+    /// a second turn: every runner admitted, each refused at most once.
+    #[test]
+    fn r5_a_herd_through_the_hub_each_told_its_own_turn_once() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            let t0 = clock.now();
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            anyhow::ensure!((hub.admission.limit(), hub.admission.turn()) == (4, Some(Duration::from_millis(2))));
+            let name = |p: PeerId| format!("runner-{p}");
+            let told = |p: PeerId| -> Vec<ServerMsg> { hub.sent.lock().iter().filter(|(q, m)| *q == p && matches!(m, ServerMsg::Later { .. })).map(|(_, m)| m.clone()).collect() };
+            let connect = |p: PeerId| {
+                let hub = Arc::clone(&hub);
+                async move {
+                    hub.pending_peers.update(|m| m.insert(p, name(p)));
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Admit).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Machine { id: String::new() }).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of(&name(p)))).await
+                }
+            };
+            let herd: Vec<PeerId> = (1..=50).collect();
+            for &p in &herd {
+                connect(p).await?;
+            }
+            let admitted: Vec<PeerId> = herd.iter().copied().filter(|p| hub.agent_of(*p).is_some()).collect();
+            anyhow::ensure!(admitted == [1, 2, 3, 4], "the limit's four admitted: {admitted:?}");
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                let after_us = 2_000 * (4 + u64::try_from(k)?);
+                anyhow::ensure!(told(p) == [ServerMsg::Later { after_us, width_us: 2_000 }], "runner {p}: {:?}", told(p));
+            }
+            for p in 1..=4 {
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0);
+            for &p in herd.iter().skip(4) {
+                hub.on_net(NetEvent::Closed { peer: p, reason: "told its turn".into() }).await?;
+            }
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                // Its turn: a turn for each of the four in progress, then one for each told before it.
+                clock.advance_to(t0 + Duration::from_millis(2) * (4 + u32::try_from(k)?));
+                connect(p).await?;
+                anyhow::ensure!(hub.agent_of(p).is_some(), "runner {p} admitted at its turn");
+                anyhow::ensure!(told(p).len() == 1, "runner {p} told {} turns", told(p).len());
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0 && herd.iter().all(|p| hub.agent_of(*p).is_some()), "every runner admitted");
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md C3 step 5 and R5: the drain's notice. A stop kept 7 s before this start answers runners is
+    /// the restart learned (and let go of, so a crash after teaches nothing from it); as the server stops again it keeps
+    /// when, and tells each runner that takes the notice when it expects to answer again, its turn after that in the
+    /// order of their peers, waiting for them to close; a runner from before is told nothing. The notice moves that
+    /// runner's first dial to the restart.
+    #[test]
+    fn r5_the_drain_tells_runners_when_the_server_expects_to_answer_again() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            hub.store.kv_set(admission::STOPPED.to_owned(), (clock.unix_ms() - 7_000).to_string()).await?;
+            hub.take_admission(Duration::from_secs(2)).await;
+            anyhow::ensure!(hub.admission.restart() == Some(Duration::from_secs(7)), "{:?}", hub.admission.restart());
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_none(), "taken once");
+            anyhow::ensure!(hub.store.kv_get(admission::RESTARTS.to_owned()).await?.is_some(), "kept");
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            join_runner(&hub, 7, "beta", proto::CAP_ADMISSION);
+            join_runner(&hub, 3, "alpha", proto::CAP_ADMISSION);
+            join_runner(&hub, 5, "old", 0);
+            let backs = || -> Vec<(PeerId, ServerMsg)> { hub.sent.lock().iter().filter(|(_, m)| matches!(m, ServerMsg::Back { .. })).cloned().collect() };
+            let ((), closed) = futures::join!(hub.drain_notice(), async {
+                while backs().len() < 2 {
+                    crate::rt::sleep(Duration::from_millis(1)).await;
+                }
+                for p in [3, 7] {
+                    hub.on_net(NetEvent::Closed { peer: p, reason: "told".into() }).await?;
+                }
+                anyhow::Ok(())
+            });
+            closed?;
+            let said = backs();
+            anyhow::ensure!(said == [(3, ServerMsg::Back { after_us: 7_000_000, width_us: 2_000 }), (7, ServerMsg::Back { after_us: 7_002_000, width_us: 2_000 })], "{said:?}");
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_some_and(|ms| ms == clock.unix_ms().to_string()), "when it began to stop, kept");
+            anyhow::ensure!(hub.store.kv_get(admission::KEY.to_owned()).await?.as_deref() == Some(hub.admission.kept().as_str()));
+            // The runner's side: its first dial at the restart and its turn, not by its own redials.
+            let t0 = Instant::now();
+            let learned = crate::agent::redial::Learned::of(&[Duration::from_millis(3)], &[Duration::from_secs(30); 20]);
+            let mut r = crate::agent::redial::Redials::new(learned, None, t0);
+            r.dialing(t0);
+            anyhow::ensure!(r.connected(t0).is_ok());
+            r.back(t0, Duration::from_micros(7_002_000), Duration::from_micros(2_000), 0);
+            r.failed(t0, u64::MAX);
+            anyhow::ensure!(r.deadline() == Some(t0 + Duration::from_micros(7_002_000)), "{:?}", r.deadline().map(|d| d - t0));
             Ok(())
         })
     }

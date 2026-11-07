@@ -127,6 +127,13 @@ pub struct Server {
     /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
     /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
     pub shed: bool,
+    /// Runners reconnecting are taken back only as fast as the server can (docs/resilience.md R5,
+    /// `crate::hub::admission`): admissions in progress are held to what the control loop takes at
+    /// once by Little's law, a runner past that is told its turn and dials again then, and on its way
+    /// down the server tells its runners when it expects to answer again. Off until declared, as what
+    /// kiln decides on its own is (docs/ci.md §0.3, "Opt-in automation"): admissions are measured and
+    /// what they teach is kept either way, and off, every runner is taken as it comes.
+    pub admission: bool,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
     /// these alone (`AllowedCPUs=`, where the service manager has the cpuset controller) and,
@@ -483,6 +490,7 @@ impl Default for Server {
             h3_cert: None,
             h3_key: None,
             shed: false,
+            admission: false,
             cores: None,
             realtime: false,
             nudge: crate::nudge::Mode::Off,
