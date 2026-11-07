@@ -1,0 +1,6 @@
+# step 8's test: five cells of /home/adalundhe/.cache/kiln-bp/g1/lab/step8/matrix.json drawn with random.Random(20261106).sample over its 216 cells
+r5-stream-100k-5-webkit-h2o-h2 --targets h2o-h2 --profiles 100k --losses 5 --cases stream --first-round 0 --rounds 5 --browsers webkit --k 8
+r5-burst-100k-1-chromium-kiln-today --targets kiln-today --profiles 100k --losses 1 --cases burst --first-round 0 --rounds 5 --browsers chromium --k 8
+r5-burst-100k-5-webkit-h2o-h2 --targets h2o-h2 --profiles 100k --losses 5 --cases burst --first-round 0 --rounds 5 --browsers webkit --k 8
+r5-burst-50k-1-chromium-h2o-h2 --targets h2o-h2 --profiles 50k --losses 1 --cases burst --first-round 0 --rounds 5 --browsers chromium --k 8
+r5-burst-good-1-chromium-kiln-today --targets kiln-today --profiles good --losses 1 --cases burst --first-round 0 --rounds 5 --browsers chromium --k 8

@@ -234,6 +234,8 @@ for its answer, as it does for any that doesn't come (`kiln_sends_unanswered_tot
 | `kiln_sends_unanswered_total` | messages the server stopped waiting for an answer to |
 | `kiln_sends_unchecked_total` | messages a host without inboxes handed on (`KILN_INBOX` off, or its records couldn't be opened): not checked for repeats |
 | `kiln_sends_take_seconds` | how long an inbox took to take a message, on the host that took it (its buckets close near the drive's sync floor: 2, 3, 4, 5, 7.5 ms) |
+| `kiln_records_sync_seconds` | for each transaction the host's records store committed (on a runner, each message its inboxes took), how long it waited for its write's sync: the part of a take that's on disk, in the take's buckets |
+| `kiln_records_group_size` | for each of those transactions, how many its write held: how often messages share one sync |
 
 The "Sends" row of the Kiln overview dashboard (deploy/grafana/dashboards/kiln-overview.json) shows
 messages taken, repeated, unanswered and handed on unchecked, refusals by reason, and the inbox's

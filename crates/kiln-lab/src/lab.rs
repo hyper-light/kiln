@@ -340,6 +340,8 @@ pub struct Round {
     /// Seconds the fill took (every session's conversation in), not measured beyond that.
     pub fill_s: f64,
     pub shards: usize,
+    /// Each number the round reports, every one finite: one that isn't is absent ([`finite_numbers`]).
+    #[serde(deserialize_with = "finite_numbers")]
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
     /// What held the shards past 100 µs in the window, and over the fill (`kiln_shard_held_*`, goal 9, plan
@@ -559,6 +561,16 @@ fn brings_events(text: &[u8]) -> bool {
     text.starts_with(br#"{"t":"events""#) || text.starts_with(br#"{"t":"stream""#)
 }
 
+/// The stamps a live frame brings that are its own news, as `websocket` times them: each seen on this socket for the
+/// first time, and written once the viewer had asked for the session (`from_us`). One written before is of an event the
+/// viewer's snapshot already held, re-sent whole with an update to it, such as a Task's call in its result's frame
+/// (g9p35-sub, 2026-11-06: every subagent frame read past 2.5 s was a call re-carried so, a whole subagent turn after it
+/// was written, counted as `websocket.own_attach`): it says nothing of how long that frame took. Every stamp is marked
+/// seen either way.
+fn frames_news(text: &[u8], seen: &mut HashSet<u64>, from_us: u64) -> Vec<u64> {
+    stamps(text).filter(|&stamp| seen.insert(stamp) && stamp >= from_us).collect()
+}
+
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
@@ -609,11 +621,9 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                 Ok(Frame::Text(text)) if brings_events(&text) => {
                     // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
                     let (now, arrived_us) = (now_us(), sock.arrived());
-                    for stamp in stamps(&text) {
-                        if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
-                            watch.frames.push((stamp, now.saturating_sub(stamp)));
-                        }
+                    for stamp in frames_news(&text, &mut seen, watch.from_us) {
+                        out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
+                        watch.frames.push((stamp, now.saturating_sub(stamp)));
                     }
                 }
                 // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
@@ -1136,6 +1146,9 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     arrivals(&mut numbers, &in_window);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    // No number that isn't finite is written: JSON can't say one (serde_json writes a NaN or an infinity as null), and a
+    // run that held one couldn't be read back (g9p35's round 5, `bus.delivery_top_ms` past its histogram's last bound).
+    numbers.retain(|_, v| v.is_finite());
     let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
     let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
@@ -1148,6 +1161,27 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     }
     let quantum_us = measure::quantum_us(&after);
     Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
+}
+
+/// What of a window's histogram `buckets` went past its last finite bound, as `<family>_past_last_bound`, their count (0
+/// where none did), and `<family>_top_at_least_ms`, that bound, the least the top reached, where some did: a top past the
+/// last bound is no number (`+Inf`, kept out of the round), and the tail it hides is said instead (main's ask, 2026-11-06:
+/// g9p35's round 5 had 10 bus deliveries past 5 s calm and 35 with hogs). Nothing for a build without the histogram.
+fn put_past(put: &mut impl FnMut(String, Option<f64>), family: &str, buckets: &[(f64, f64)]) {
+    if buckets.is_empty() {
+        return;
+    }
+    let past = measure::past_last_bound(buckets);
+    put(format!("{family}_past_last_bound"), Some(past.map_or(0.0, |(n, _)| n)));
+    put(format!("{family}_top_at_least_ms"), past.map(|(_, bound)| bound * 1000.0));
+}
+
+/// A round's numbers as a run.json holds them, those that aren't finite numbers dropped: a run written before the lab kept
+/// them out holds a NaN or an infinity as null (serde_json's way; g9p35's round 5, `bus.delivery_top_ms`), which reads
+/// back as no number at all, as the lab now writes it.
+fn finite_numbers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f64>, D::Error> {
+    let all: BTreeMap<String, Option<f64>> = BTreeMap::deserialize(d)?;
+    Ok(all.into_iter().filter_map(|(k, v)| Some((k, v.filter(|v| v.is_finite())?))).collect())
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
@@ -1375,8 +1409,11 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     let diff = |name: &str, want: &[(&str, &str)]| Some(after.get(name, want)? - before.get(name, want)?);
     let per_s = |v: f64| v / secs.max(1e-9);
     let histogram = |name: &str, want: &[(&str, &str)]| measure::delta(&before.buckets(name, want), &after.buckets(name, want));
+    // A number that isn't finite is none: a histogram's top past its last bound is `+Inf` (`measure::histogram_top`), which
+    // JSON can't say (g9p35's round 5: a bus delivery past `kiln_bus_delivery_seconds`'s last bound, its
+    // `bus.delivery_top_ms` written as null, and the run then unreadable).
     let mut put = |name: String, v: Option<f64>| {
-        if let Some(v) = v {
+        if let Some(v) = v.filter(|v| v.is_finite()) {
             n.insert(format!("{prefix}{name}"), v);
         }
     };
@@ -1488,6 +1525,7 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     put("bus.delivery_p99_ms".into(), measure::histogram_quantile(0.99, &delivery).map(|v| v * 1000.0));
     put("bus.delivery_p999_ms".into(), measure::histogram_quantile(0.999, &delivery).map(|v| v * 1000.0));
     put("bus.delivery_top_ms".into(), measure::histogram_top(&delivery).map(|v| v * 1000.0));
+    put_past(&mut put, "bus.delivery", &delivery);
     put("bus.topics".into(), after.get("kiln_bus_topics", &[]));
     // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
     // pool thread.
@@ -1498,6 +1536,7 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         put("compute.wait_p99_ms".into(), measure::histogram_quantile(0.99, &wait).map(|v| v * 1000.0));
         put("compute.piece_p99_ms".into(), measure::histogram_quantile(0.99, &piece).map(|v| v * 1000.0));
         put("compute.piece_top_ms".into(), measure::histogram_top(&piece).map(|v| v * 1000.0));
+        put_past(&mut put, "compute.piece", &piece);
         put("compute.busy".into(), diff("kiln_compute_piece_seconds_sum", &[]).map(per_s));
     }
     // The blocking pool's shares (goal 3, step 4: what their sizes are derived from).
@@ -1832,6 +1871,77 @@ mod tests {
         assert!(flood.readers >= 16 * overload.readers && flood.mcp > overload.mcp, "{flood:?}");
         assert_eq!((flood.read_think_ms, flood.mcp_think_ms, flood.dwell_s), (0, 0, 0));
         assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
+    }
+
+    /// The lab writes no number that isn't finite (main's ask, 2026-11-06). In g9p35's round 5 a bus delivery took longer
+    /// than `kiln_bus_delivery_seconds`'s last bound, so `bus.delivery_top_ms`, the histogram's top, was `+Inf`, which
+    /// serde_json writes as null, and kiln-lab's report and table then refused the run (`invalid type: null, expected
+    /// f64`). Now such a number is absent (the quantiles, finite, stay), and a run.json written before, its null in it,
+    /// reads back without it.
+    #[test]
+    fn a_number_past_a_histograms_last_bound_is_absent_and_an_old_null_reads_back() {
+        let scrape = |a: u32, b: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_bus_delivery_seconds_bucket{{le=\"0.001\"}} {a}\nkiln_bus_delivery_seconds_bucket{{le=\"1\"}} {b}\nkiln_bus_delivery_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(5, 9, 10), 60.0);
+        assert!(n.values().all(|v| v.is_finite()), "{n:?}");
+        assert_eq!(n.get("bus.delivery_top_ms"), None, "past the last bound: {n:?}");
+        assert_eq!(n.get("bus.delivery_p99_ms"), Some(&1000.0), "{n:?}");
+        let round = Round {
+            build: "b".to_owned(),
+            index: 5,
+            hogs: 0,
+            machine: Machine::default(),
+            fill_s: 1.0,
+            shards: 4,
+            numbers: BTreeMap::from([("server.rss_mb".to_owned(), 296.0)]),
+            seen: BTreeMap::new(),
+            held: Vec::new(),
+            fill_held: Vec::new(),
+            quantum_us: None,
+            locks: BTreeMap::new(),
+        };
+        let mut written = serde_json::to_value(&round).unwrap_or_default();
+        if let Some(numbers) = written.get_mut("numbers").and_then(Value::as_object_mut) {
+            numbers.insert("bus.delivery_top_ms".to_owned(), Value::Null);
+        }
+        let back = serde_json::from_value::<Round>(written).map_err(|e| e.to_string());
+        assert_eq!(back.as_ref().map(|r| r.numbers.clone()), Ok(BTreeMap::from([("server.rss_mb".to_owned(), 296.0)])), "an old null reads back as no number");
+    }
+
+    /// main's ask (2026-11-06): a bus delivery past the histogram's last bound is said by how many went past it and the
+    /// bound, the least the top reached, where the top itself is no number; with none past, the count is 0 and the top
+    /// stands.
+    #[test]
+    fn a_bus_deliverys_top_past_the_last_bound_is_said_by_how_many_and_the_bound() {
+        let scrape = |a: u32, b: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_bus_delivery_seconds_bucket{{le=\"0.001\"}} {a}\nkiln_bus_delivery_seconds_bucket{{le=\"5\"}} {b}\nkiln_bus_delivery_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(4_000, 4_524, 4_534), 60.0);
+        assert_eq!((n.get("bus.delivery_past_last_bound"), n.get("bus.delivery_top_at_least_ms"), n.get("bus.delivery_top_ms")), (Some(&10.0), Some(&5000.0), None), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "fill.", &scrape(0, 0, 0), &scrape(10, 12, 12), 60.0);
+        assert_eq!((none.get("fill.bus.delivery_past_last_bound"), none.get("fill.bus.delivery_top_at_least_ms"), none.get("fill.bus.delivery_top_ms")), (Some(&0.0), None, Some(&5000.0)), "{none:?}");
+    }
+
+    /// main's ask (2026-11-06): the compute pool's piece past its histogram's last bound is said as the bus's delivery is.
+    #[test]
+    fn a_compute_pieces_top_past_the_last_bound_is_said_too() {
+        let scrape = |jobs: u32, a: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_compute_jobs_total {jobs}\nkiln_compute_piece_seconds_bucket{{le=\"0.01\"}} {a}\nkiln_compute_piece_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(7, 5, 7), 60.0);
+        assert_eq!((n.get("compute.piece_past_last_bound"), n.get("compute.piece_top_at_least_ms"), n.get("compute.piece_top_ms")), (Some(&2.0), Some(&10.0), None), "{n:?}");
+        assert!(n.values().all(|v| v.is_finite()), "{n:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
@@ -2181,6 +2291,21 @@ mod tests {
         assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
         assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
         assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
+    /// main's ask (2026-11-06): a stamp written before the viewer asked for the session, first seen in a later frame, is of
+    /// an event its snapshot held, re-sent with an update: the Task's call in its result's frame is no frame's latency; the
+    /// result's own stamp is, once; a stamp written once the attach began counts in its first frame.
+    #[test]
+    fn a_task_call_re_sent_in_its_results_frame_is_no_frames_latency() {
+        let mut seen = HashSet::new();
+        // The viewer asked for the session at 2,000 µs: the Task's call, written at 1,000, was in its snapshot; a subagent's
+        // event came at 2,500, the Task's result at 5,000.
+        assert_eq!(frames_news(br#"{"t":"events","events":[{"id":"e7","text":"@lab:2500 reading"}]}"#, &mut seen, 2_000), vec![2_500]);
+        let result = br#"{"t":"events","events":[{"id":"toolu_task","body":{"input":{"description":"@lab:1000 audit"},"output":"@lab:5000 done"}}]}"#;
+        assert_eq!(frames_news(result, &mut seen, 2_000), vec![5_000], "the call's stamp, re-carried, isn't the frame's");
+        assert_eq!(frames_news(result, &mut seen, 2_000), Vec::<u64>::new(), "nothing counts twice");
+        assert!(seen.contains(&1_000), "the re-carried stamp is marked seen: {seen:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 3: a frame is told apart by whether it waited for its own

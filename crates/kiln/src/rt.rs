@@ -868,7 +868,8 @@ const fn polls_ahead_at_p999(busy_ppm: u64) -> u64 {
 /// shard was held so 0.3% of the time or more, past the 0.1% its p99.9 can spare, so its p99.9 was 1295 µs. Under
 /// lazy preemption (fedora's) the host's wait is the CPU's next tick instead, up to 1 ms (docs/priority.md,
 /// wake-2): step 4's to keep off (cores of their own), not the quantum's. `KILN_RT_QUANTUM_US` sets another,
-/// for the lab's A/B of quanta.
+/// for the lab's A/B of quanta, in microseconds, a fraction too ([`quantum_us_ns`]): a value it can't read stops the
+/// runtime, said.
 pub const STEP_BUDGET_NS: u64 = DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(LAB_BUSY_PPM).saturating_add(1);
 
 /// The most tasks a shard's step polls (hyper-rt's `RuntimeConfig::batch`), as kiln's shards have run since hyper-rt
@@ -896,6 +897,21 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
         wake_tracking: None,
         latency_objective_ns: None,
     }
+}
+
+/// The step quantum `KILN_RT_QUANTUM_US` sets, nanoseconds: `v` microseconds above 0, a fraction too (`266.7`, to the
+/// nanosecond); an error naming the variable for anything else (empty, not a number, 0 or less, not finite).
+fn quantum_us_ns(v: &str) -> Result<u64, String> {
+    let refused = || format!("KILN_RT_QUANTUM_US={v:?}: not a number of microseconds above 0 (the shards' step quantum, as 266.7)");
+    let us = v.trim().parse::<f64>().map_err(|_| refused())?;
+    if !us.is_finite() || us <= 0.0 {
+        return Err(refused());
+    }
+    let ns = (us * 1000.0).round();
+    if ns < 1.0 || ns > u64::MAX as f64 {
+        return Err(refused());
+    }
+    Ok(ns as u64)
 }
 
 /// The blocking pool's shares.
@@ -931,9 +947,10 @@ fn start() -> Result<Rt, String> {
     }
     let mut config = runtime_config(p.shards, p.tasks_per_shard);
     // The step quantum from `KILN_RT_QUANTUM_US`: the lab's A/B of quanta on one build (goal 9, plan
-    // 01a1a87b2cec step 3).
-    if let Some(us) = std::env::var("KILN_RT_QUANTUM_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
-        config.step_budget_ns = us.saturating_mul(1000);
+    // 01a1a87b2cec step 3; scripts/shard_lab's q<µs> arms). A value it can't read stops the runtime, said: it was
+    // dropped with nothing said, and a lab's pinned arm (266.7) ran unpinned (consts-audit).
+    if let Ok(v) = std::env::var("KILN_RT_QUANTUM_US") {
+        config.step_budget_ns = quantum_us_ns(&v)?;
     }
     if let Some(cores) = CORES.get() {
         config.cores = shard_cores(cores, p.shards);
@@ -3947,6 +3964,27 @@ mod tests {
             timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
             Ok(())
         })
+    }
+
+    /// Consts-audit: `KILN_RT_QUANTUM_US` reads fractional microseconds, to the nanosecond, where it read whole ones and
+    /// dropped the rest with nothing said (a lab's arm pinned at 266.7 ran unpinned). Do: 266.7, 250, 0.5, with spaces.
+    /// Expect: 266,700 ns, 250,000 ns, 500 ns.
+    #[test]
+    fn a_pinned_quantum_reads_fractional_microseconds() {
+        assert_eq!(quantum_us_ns("266.7"), Ok(266_700));
+        assert_eq!(quantum_us_ns("250"), Ok(250_000));
+        assert_eq!(quantum_us_ns(" 0.5 "), Ok(500));
+    }
+
+    /// Consts-audit: a value of `KILN_RT_QUANTUM_US` it can't read is refused with an error naming it, the runtime not
+    /// started, never dropped with nothing said. Do: nothing, words, 0, a negative, not-a-number, infinity, less than a
+    /// nanosecond. Expect: each an error that names `KILN_RT_QUANTUM_US` and the value.
+    #[test]
+    fn an_unreadable_pinned_quantum_is_refused_by_name() {
+        for v in ["", "abc", "0", "-5", "NaN", "inf", "0.0001", "266,7"] {
+            let said = quantum_us_ns(v).err().unwrap_or_default();
+            assert!(said.starts_with("KILN_RT_QUANTUM_US=") && said.contains(&format!("{v:?}")), "{v:?}: {said:?}");
+        }
     }
 
     /// Consts-audit B1 (goal 9, plan 01a1a87b2cec step 3): work stays on its shard only where it fits a turn (the quantum) and

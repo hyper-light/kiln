@@ -44,7 +44,8 @@ SELinux (the driver's folder mounted read-only, the job's folder read-write, bot
 with no cgroup of its own (`--cgroups=disabled`: systemd, outside the lab's PID namespace, can't
 place it, and a browser's CPU isn't a measure). No sudo, no `--privileged`, nothing loaded outside
 the image. On 2026-11-05 on kiln-a094a12d the probe passed with Chromium 156.0.8078.4 on the
-machine and WebKit 27.2 in the image, started as uid 1000.
+machine and WebKit 27.2 in the image, started as uid 1000, and again on 2026-11-07
+(`docs/browser-lab/2026-11-07/probe.txt`).
 
 `kiln-lab browser probe` checks each capability in turn and stops at the first one missing, naming
 it: Linux, an unprivileged start, `unshare`, `nsenter`, `ip`, `tc`, user namespaces; then, inside,
@@ -158,19 +159,21 @@ What the UI does, from the catalogue (sizes in bytes above the transport, rates 
 | request | `GET /api/harness/sessions` | 2,911 / 3,014 | |
 | request | `GET /api/me` | 1,254 / 1,254 | |
 | request | `GET /api/metrics/history` | 114,104 / 171,477 | |
-| request | a session's snapshot (the session socket's first, packed frame) | 715 KB unpacked for a session of 200 events | |
+| request | a session's snapshot (the session socket's first, packed frame) | 715 KB unpacked for a session of 200 events (715,426 B: `2026-11-07/snapshot.txt`) | |
 | request | `POST /api/harness/sessions/:id/command` (a message to an agent) | 156 / 156 answered, 57 sent | |
 
 Every request rode HTTP/2; every socket was an HTTP/1.1 connection of its own. Left out, with why:
-pages, the UI server's server functions and static files (`GET /`, `/agents/:id`, `/runs/...`, 121
+pages, the UI server's server functions and static files (`GET /`, `/agents/:id`, `/runs/...`, 120
 files under `/assets`): page loads are goal 8's.
 
 Two recordings on one stand-in seed (`KILN_LAB_SEED=7`) send the same event bodies once their
 stamps and ids are taken out (`node catalogue.mjs compare`): of the 2,773 events both 150-second
-recordings sent (keyed by their turn and place in it), 2,773 hashed equal. A run uses the same seed,
+recordings sent (keyed by their turn and place in it), 2,773 hashed equal (`docs/browser-lab/2026-11-07/recordings.txt`,
+the two recordings compared again). A run uses the same seed,
 so the baselines replay exactly what kiln sends.
 
-At the recording's pace, `/api/events` alone carries about 250 kbit/s: five times a 50 kbit/s link
+At the recording's pace, `/api/events` alone carries about 162 kbit/s (31.1 frames a second of
+652 bytes on average, the catalogue's): three times a 50 kbit/s link
 before any page, session or request. The matrix's paces are a link's half at most (below).
 
 ## The probe and the three measures
@@ -233,10 +236,11 @@ request job). On 2026-11-04 (`docs/browser-lab/2026-11-04/check4.json`, the good
 HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
 
 - calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs); in the
-  pilot's first jobs at K = 8, on the lab machine at a load of about 67 with no core idle, the worst
-  job's was 232 µs and the median job's 75 µs: on a busy machine eight browsers' echoes wait for a
+  pilot's first jobs at K = 8 (pass 0's good-link pilot, its round 0: `2026-11-05/pass0-pilot-good.json`),
+  on the lab machine at a load of 22 to 43 (median 34), the worst job's was 232 µs and the median
+  job's 75.5 µs: on a busy machine eight browsers' echoes wait for a
   core, so the matrix's good-link times carry up to a quarter of a millisecond of clock error. With
-  groups of 40 echoes taken back to back (2026-11-05, K = 8, `check4b`) Chromium's worst job was
+  groups of 40 echoes taken back to back (2026-11-05, K = 8, `docs/browser-lab/2026-11-05/check4b.json`) Chromium's worst job was
   26 µs and 226 µs in two jobs, WebKit's (in the image) 606 µs and 662 µs. Both have a cause, read
   from the jobs' echoes:
   - WebKit's page timer steps by 1 ms (`timer_grain_us` 1000, cross-origin isolated; Chromium's
@@ -253,10 +257,11 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
   terminal's frames 0.1% apart; the message to an agent's answer was 3.7% apart with one id for
   every message, and 8.3% apart (169 bytes against 156) with a new id each time as the UI sends
-  them. Then (2026-11-05, K = 8, ids unique to each link, `check4b`) 162.5 against 156 (4.2%), read
+  them. Then (2026-11-05, K = 8, ids unique to each link, `check4b.json`) 162.5 against 156 (4.2%), read
   apart by browser from the jobs' samples: Chromium's answers were 154, 155 and 156 bytes (the
   digits of `seq`, the session's event count, growing from one digit to three over a job, as the
-  recording's 154 to 156), WebKit's 168 to 170, each 14 bytes longer, in every link; the 162.5 was
+  recording's 154 to 156), WebKit's 168 to 170, each 14 bytes longer, in every link (the run file's
+  means for kiln today: 155.5 and 169.5 bytes, 34,842 and 37,978 over 224 answers each); the 162.5 was
   the two browsers' mean. The answers, kept with their samples since, name the 14 bytes:
   `,"repeat":true`. WebKit's jobs ran after Chromium's against the same kiln with the same ids
   (unique to each link, not to each job), so kiln answered each as a repeat of Chromium's. A write's
@@ -292,16 +297,19 @@ can't hold (it ends at any CR or LF), and 10 of a log's frames hold several line
 streaming fetch's one frame a line splits; the origin now sends a terminal's and a log's text as
 a JSON string (the escapes are the carrier's cost, in its bytes). Then every frame held: 75,583
 `/api/events` frames, 23,019 of a session's, 11,981 of a log's and 6,001 of a terminal's, each on
-both carriers, the replay's digests the catalogue's (`node check-origin.mjs`, exit 0). `kiln-lab
+both carriers, the replay's digests the catalogue's (`node check-origin.mjs`, exit 0; again on
+2026-11-07, `docs/browser-lab/2026-11-07/check-origin.txt`). `kiln-lab
 browser start-stop` runs the same check through each reference server, the first of its 20 starts
 (`check-origin.mjs served`: the server's HTTP/2, gzip asked for, in a client's namespace).
-On 2026-11-05 (`kiln-lab browser start-stop --times 20`, which prints what it found and keeps no run file; the final configs, h2o's binary
+On 2026-11-05, and again for the record on 2026-11-07 (`kiln-lab browser start-stop --times 20`,
+which prints what it found: `docs/browser-lab/2026-11-07/start-stop.txt`, the numbers below its;
+the final configs, h2o's binary
 `8b2d8a23…`, Caddy's `4ef1f68c…`): h2o and Caddy over HTTP/2 and HTTP/3 each came up 20 of 20 and
 stopped clean 20 of 20, served 14 of 14 static bodies byte for byte, and sent on every stream frame
 whole on both carriers, gzipped (75,583 + 23,019 + 11,981 + 6,001 frames each), each frame from its
-stamp to the reader p50 0.1 to 0.3 ms; the p99 was 95 to 141 ms for the events' and a session's
+stamp to the reader p50 0.1 to 0.2 ms; the p99 was 102 to 145 ms for the events' and a session's
 replay (every frame of the recording sent 1 ms apart; alike in all four servers and on both
-carriers, so no one server holding frames back) and 0.3 to 1.3 ms for a log's and a terminal's.
+carriers, so no one server holding frames back) and 0.2 to 1.2 ms for a log's and a terminal's.
 
 A target is a record (`crates/kiln-lab/src/browser/targets.rs`): its server, its port, whether it
 is HTTP/3, its carrier for streams, the protocol the page must have got, and the browsers it runs
@@ -350,8 +358,10 @@ The tuning, and why:
 - JSON compressed as each server does best, since the bar is against each protocol's best
   practice; kiln today sends JSON uncompressed (f8), as it does in production. Static bodies: h2o
   brotli, then gzip (`compress: [ br, gzip ]`), Caddy zstd, then gzip (`encode zstd gzip`).
-  Streams, as measured on the lab machine (2026-11-05, a probe of each server on localhost: 51
-  `/api/events` frames 10 ms apart, 3,968 bytes uncompressed): neither server compresses an event
+  Streams, as measured on the lab machine (2026-11-05, and again for the record on 2026-11-07:
+  `pass1/compress-probe.sh`, `docs/browser-lab/2026-11-07/compress-probe.txt`; a probe of each
+  server on localhost: 51 `/api/events`-like frames 10 ms apart, 3,968 bytes uncompressed, the
+  script's own stream): neither server compresses an event
   stream by default (h2o's compressible types leave out `text/event-stream` and
   `application/x-ndjson`; Caddy's encoder waits for 512 bytes, which a stream's frames don't
   reach, and leaves NDJSON out). So h2o marks both types compressible and gzips its streams: its
@@ -474,7 +484,7 @@ the CPU's mean and says so.
 
 The whole run at K = 8: the pilot (good/0 and 50k/1, 5 rounds, kiln today twice, h2o over HTTP/2
 and HTTP/3 with Cubic and Reno, both browsers where each runs: about 12 h, scaled from pass 0's
-Chromium-only pilot, 1.7 h and about 5.3 h, by 8 rows to 5) and the matrix's 109.5 h above: about
+Chromium-only pilot, 1.7 h and about 5.3 h, by 8 rows to 5) and the matrix's 109.6 h above: about
 122 h, a little over five days.
 <!-- run plan: end -->
 
@@ -488,7 +498,8 @@ kiln-lab browser check-profiles --out ~/.cache/kiln-bp/g1/checks
 kiln-lab browser record --kiln path/to/kiln --out ~/.cache/kiln-bp/g1/record
 kiln-lab browser plan --k 8
 kiln-lab browser run --kiln path/to/kiln --h2o path/to/h2o --caddy path/to/caddy \
-  --payloads ~/.cache/kiln-bp/g1/catalogue/payloads --k 8 --rounds 5 --out DIR
+  --payloads ~/.cache/kiln-bp/g1/catalogue2/payloads --seed 7 --k 8 --rounds 5 --out DIR
+  # one cell of it: --targets T --profiles P --losses L --cases C --browsers B
 kiln-lab browser report DIR/run.json
 kiln-lab browser compare DIR/run.json kiln-today kiln-today-b
 kiln-lab browser compare A/run.json kiln-today kiln-today --b-run B/run.json   # two runs' cells
@@ -507,7 +518,21 @@ pilot's checks. Step 8's: `pass1/frozen.py` lists the jobs a freeze overlapped a
 round to run again; `pass1/step8.sh KILN_LAB` merges the matrix (what it leaves out, and why, at its
 head), writes `coverage.py`'s shortfalls and `report`'s tables; `pass1/fill.py` lists the rounds the
 merged matrix still lacks as parts; `pass1/rerun5.py` draws step 8's five cells and compares their
-rerun with the matrix.
+rerun with the matrix; `pass1/records.sh` runs the checks that print and keep no run file again for
+the record (`docs/browser-lab/2026-11-07/`).
+
+**A cell again, as written.** The command above with one cell's flags gives that cell again within
+noise on a machine as quiet as the matrix's: step 8's five cells, run so on 2026-11-06, were 44 of 45
+numbers within noise of the matrix ("Step 8: the matrix"). Run so again on 2026-11-07
+(`docs/browser-lab/2026-11-07/fresh-good-1-request.json`: requests on the good link at 1% loss in
+Chromium, kiln today and h2o over HTTP/2, `kiln-lab browser compare` against the matrix) while the lab
+machine was busy with other work (its one-minute load 12 to 105 at the jobs' starts, against 11 to 32
+for the matrix's jobs of the cell), 2 of each target's 9 numbers were not: kiln today's time p99
+(442.7 ms against 3,564) and bytes p99 (139,470 against 143,751 B), h2o's time p50 and p99.9 (21.6
+against 37.7 ms, 510 against 1,350). Its round on a quiet machine (load 12 to 19) was the matrix's
+for h2o (p50 22.0 ms, p99 376) and nearer it for kiln today (p99 889 ms against 404 to 586). The good
+link's times move with the machine's load; each job records it (`machine`), so a rerun's load can be
+read against the matrix's before its numbers are.
 
 Adding a target (goals 3, 5, 6): a record in `targets()`, its server's start in `servers.rs`, and,
 if its carrier is new, the probe page's reading of it in `probe.js`.
@@ -1081,7 +1106,8 @@ the same cell, its median over the cell's losses and browsers, with the least an
 
 **Pass 0, superseded.** The first pilot ran from 2026-11-05 03:37Z to 08:31Z (pilot-good done,
 pilot-50k three rounds in), from a snapshot of the lab as it stood on 2026-11-04 (`lab-snap`), and
-was stopped by its unit's name; its files are kept in `~/.cache/kiln-bp/g1/lab-pass0`. None of its
+was stopped by its unit's name; its two parts are `docs/browser-lab/2026-11-05/pass0-pilot-good.json` and `pass0-pilot-50k.json`
+(slim). None of its
 numbers are used, for five reasons found since: it ran Chromium only; a write's id was the same in
 every job, so kiln answered later jobs' writes as repeats (14 bytes longer); its baselines' terminal
 frames crossed SSE and the streaming fetch without their line ends (1 to 3 bytes a frame short); its
@@ -1176,12 +1202,13 @@ kiln-lab browser compare $D/k1-50k-stream.json kiln-today kiln-today --b-run $D/
   only: `<part>.take` and `<part>.skip` beside them are the parts' claim markers, which an earlier
   glob took for parts).
 - **h2o's QUIC controller**: at 50k/1, the median p99 of every h2o-h3 job is 3,841 ms with Cubic
-  (15 jobs) against 5,040 ms with Reno (15 jobs), so h2o's HTTP/3 rows run with **Cubic**
+  (15 jobs) against 5,041 ms with Reno (15 jobs), so h2o's HTTP/3 rows run with **Cubic**
   (`h2o-h3`).
-- **CPU under the background's noise.** kiln today's server at rest is noisy: two background
-  windows before a job differ by 5,000 to 250,000 µs of CPU a second (h2o's by 20 to 8,000), so
-  over a reading (25 ms on the good link; 75 to 330 ms at 50 kbit/s, where a reading with no
-  operation carries on to the next) its floor is 180 to 10,600 µs. kiln today's per-operation CPU
+- **CPU under the background's noise.** kiln today's server at rest is noisy (both copies, `kiln-today` and `kiln-today-b`, cell by
+  cell, from `pilot.json`): two background
+  windows before a job differ by 5,318 to 246,124 µs of CPU a second (h2o's by 19 to 7,827; each
+  cell's median), so over a reading (25 ms on the good link; 75 to 327 ms at 50 kbit/s, where a
+  reading with no operation carries on to the next) its floor is 180 to 10,648 µs. kiln today's per-operation CPU
   p50 is at or under it in most pilot cells: at 50k/1 it even comes out negative (requests in
   Chromium -1,852 µs, bursts -136 µs; the background's rate taken from readings that held little
   else), and on the good link its streams' and requests' p50 in Chromium (1,213 and 2,343 µs under
@@ -1219,7 +1246,8 @@ The rest of pass 1 ran on fedora alone behind its memory gate (`run-pass-mem.sh`
 its own, `guard-mem.sh` beside them), and what went wrong on the way is part of the record:
 
 - **Memory freezes.** Between 02:06Z and 04:46Z on 2026-11-06 the guard froze parts' units 31 times
-  (fedora is shared), 13 parts for 49 to 83 minutes each in all. A job a freeze overlapped is left out (`merge --drop-jobs`,
+  (fedora is shared), 13 parts for 49 to 83 minutes each in all (the guard's log:
+  `docs/browser-lab/2026-11-06/freeze.log`). A job a freeze overlapped is left out (`merge --drop-jobs`,
   `pass1/frozen.py`'s list: 30 jobs) and its round runs again on its own seeds under its own number
   (`--first-round`, the `fa-` parts).
 - **A full disk.** At 06:29Z fedora's `/home` filled (and the kernel killed a part for memory): 14
@@ -1229,7 +1257,7 @@ its own, `guard-mem.sh` beside them), and what went wrong on the way is part of 
   from 09:48Z (`<part>.failed-node` kept). Nothing was measured in those 30 minutes.
 - **The baselines' events.** The merge of what had run by 09:55Z showed the baselines' bursts with
   about 0.6 of kiln's operations (at 50k/1 in Chromium, 786 a job against kiln today's 1,280, none
-  missed). The origin replayed `events` recorded *frames*, and 35% of a session's recorded frames
+  missed: the baselines' jobs of that cell from before, `docs/browser-lab/2026-11-06/before-s2-50k-1-burst.json`). The origin replayed `events` recorded *frames*, and 35% of a session's recorded frames
   (39% of `/api/events`') are state and patches with no stamp, so each baseline burst carried 26
   events to kiln's 40, and its streams' sessions and entities 0.61 to 0.65 of kiln's rate: a lighter load,
   which flattered the baselines' times under bursts. The origin now replays events (each with the
@@ -1237,9 +1265,9 @@ its own, `guard-mem.sh` beside them), and what went wrong on the way is part of 
   (`pass1/s2.parts`, the `s2-` parts, from a snapshot that differs from pass 1's by the origin and the
   burst's replay cursor alone, `lab-snap2`); the merge leaves out the baselines' streams and bursts
   from before (requests and kiln today's rows were never affected). Measured again, a baseline burst
-  job at 50k/1 has 1,170 to 1,270 operations (the last burst can be cut by the job's end), and h2o
-  over HTTP/2's in Chromium went from a p50 of 2.0 s and a p99 of 3.9 s to 2.8 s and 6.1 s in its
-  first round. The origin's check (`check-origin.mjs`) still finds every frame equal on both carriers
+  job at 50k/1 has 1,169 to 1,268 operations (the last burst can be cut by the job's end), and h2o
+  over HTTP/2's in Chromium, its first round against its first round before, went from a p50
+  of 2.0 s and a p99 of 3.95 s to 2.83 s and 6.12 s. The origin's check (`check-origin.mjs`) still finds every frame equal on both carriers
   and the replay the catalogue's.
 - **Named failures.** Some jobs failed by name (the lab kiln not up within 120 s, an origin not up
   within 20 s, drivers that left no result, a turn refused while the lab session's machine
@@ -1350,7 +1378,8 @@ limits (200 µs in Chromium, WebKit's 1 ms grain).
 
 **Step 8's test: five cells measured again.** After the matrix ended, five of its 216 cells were
 drawn (`pass1/rerun5.py parts`, `random.Random(20261106)`) and measured again in a session of their
-own (the unit `kiln-bp-g1-lab-r5`, 22:56Z to 23:38Z, each cell's rounds on its own seeds and K), then
+own (the unit `kiln-bp-g1-lab-r5`, 22:56Z to 23:38Z, each cell's rounds on its own seeds and K;
+its run files `docs/browser-lab/2026-11-06/rerun5/`, slim, and the draw `rerun5/parts`), then
 each against the matrix's (`kiln-lab browser compare MATRIX T T --b-run RERUN`, Bonferroni over the
 cell's nine numbers):
 
