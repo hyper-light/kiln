@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::thread::LocalKey;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
@@ -92,8 +93,8 @@ pub(crate) struct WriteBuf {
     tail: Vec<u8>,
     /// What of the first piece (the first segment, or the tail when there are none) went out already.
     sent: usize,
-    /// What its writes are learned to cost ([`crate::turn::Writes`]): every connection's, but a test's own.
-    costs: &'static crate::turn::Writes,
+    /// What its writes are learned to cost on the shard it writes on ([`crate::turn::WRITES`], each shard's own), or a test's.
+    costs: &'static LocalKey<crate::turn::Writes>,
     /// It gave its poll's shard up and hasn't come back to write since ([`WriteBuf::cap`]): its next write goes, and
     /// teaches what coming back costs.
     gave_up: bool,
@@ -108,7 +109,7 @@ impl Default for WriteBuf {
 impl WriteBuf {
     /// One whose writes teach, and are held to, `costs` alone (a test's).
     #[cfg(test)]
-    pub(crate) fn with_costs(costs: &'static crate::turn::Writes) -> Self {
+    pub(crate) fn with_costs(costs: &'static LocalKey<crate::turn::Writes>) -> Self {
         let mut buf = Self::default();
         buf.costs = costs;
         buf
@@ -183,10 +184,12 @@ impl WriteBuf {
     /// Writes until everything went out (`Ready(Ok)`), the transport is full (`Pending`) or fails. On a shard, a poll writes
     /// what fits what's left of its quantum, at what writes are learned to cost a byte ([`WriteBuf::cap`]), and gives its
     /// shard up (`Pending`, its task woken at once) where nothing more fits, to write on at its next poll: the shard's other
-    /// tasks go between (goal 9, plan 01a1a87b2cec step 3). Each write teaches what writes cost.
+    /// tasks go between (goal 9, plan 01a1a87b2cec step 3). Each write on a shard teaches that shard what writes cost; off
+    /// one, where nothing is held back, none is timed.
     pub(crate) fn poll_flush<T: AsyncWrite + Unpin>(&mut self, io: &mut T, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.is_empty() {
-            let cap = match self.cap() {
+            let room = crate::turn::room();
+            let cap = match room.and_then(|room| self.cap(room)) {
                 Some(0) => {
                     self.gave_up = true;
                     cx.waker().wake_by_ref();
@@ -198,9 +201,9 @@ impl WriteBuf {
             if std::mem::take(&mut self.gave_up)
                 && let Some(poll) = hyper_rt::futures::poll_clock()
             {
-                self.costs.resumed(poll.held_ns());
+                self.teach(|costs| costs.resumed(poll.held_ns()));
             }
-            let began = Instant::now();
+            let began = room.map(|_| Instant::now());
             let n = if self.segs.is_empty() {
                 let rest = self.tail.get(self.sent..).unwrap_or_default();
                 let rest = rest.get(..cap.min(rest.len())).unwrap_or(rest);
@@ -226,7 +229,10 @@ impl WriteBuf {
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
-            self.costs.learn(u64::try_from(n).unwrap_or(u64::MAX), u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            if let Some(began) = began {
+                let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.teach(|costs| costs.learn(u64::try_from(n).unwrap_or(u64::MAX), took));
+            }
             self.advance(n);
         }
         std::task::ready!(Pin::new(&mut *io).poll_flush(cx))?;
@@ -235,16 +241,23 @@ impl WriteBuf {
 }
 
 impl WriteBuf {
-    /// The most this poll's next write may carry: what fits what's left of the poll's quantum ([`crate::turn::room`]) at
-    /// what writes are learned to cost ([`crate::turn::Writes::fitting`]), `Some(0)` where nothing more does; after giving its
-    /// shard up with nothing written since, what fits a whole quantum, so each poll it gave the shard up for writes at its
-    /// next. None, as much as there is: off a shard, before any write was timed, and where even a whole quantum fits none
-    /// (each write past it teaches it).
-    fn cap(&self) -> Option<usize> {
-        match self.costs.fitting(crate::turn::room()?)? {
-            0 if self.gave_up => crate::turn::quantum().and_then(|q| self.costs.fitting(crate::turn::signed(q))).filter(|n| *n > 0),
+    /// The most this poll's next write may carry: what fits `room`, what's left of the poll's quantum ([`crate::turn::room`]),
+    /// at what writes are learned to cost on this shard ([`crate::turn::Writes::fitting`]), `Some(0)` where nothing more does;
+    /// after giving its shard up with nothing written since, what fits a whole quantum, so each poll it gave the shard up for
+    /// writes at its next. None, as much as there is: before any write was timed here, and where even a whole quantum fits
+    /// none (each write past it teaches it).
+    fn cap(&self, room: i64) -> Option<usize> {
+        let fitting = |costs: &crate::turn::Writes| match costs.fitting(room)? {
+            0 if self.gave_up => crate::turn::quantum().and_then(|q| costs.fitting(crate::turn::signed(q))).filter(|n| *n > 0),
             fit => Some(fit),
-        }
+        };
+        // A shard's own costs are made with its thread and have nothing to drop: they're there for its whole life.
+        self.costs.try_with(fitting).ok().flatten()
+    }
+
+    /// `learn` taught to what its writes cost on this shard.
+    fn teach(&self, learn: impl FnOnce(&crate::turn::Writes)) {
+        self.costs.try_with(learn).unwrap_or_default();
     }
 }
 
@@ -321,9 +334,10 @@ mod tests {
     }
 
     /// A transport each write to which takes its time on the thread, `ns_per_byte` a byte: what a flush on a shard is held to
-    /// (goal 9, plan 01a1a87b2cec step 3).
+    /// (goal 9, plan 01a1a87b2cec step 3). Each write's length kept in `sizes`, where it has room for it (none is made).
     struct Slow {
         ns_per_byte: u64,
+        sizes: Vec<usize>,
     }
 
     impl AsyncWrite for Slow {
@@ -331,6 +345,10 @@ mod tests {
             let until = Instant::now() + std::time::Duration::from_nanos(self.ns_per_byte.saturating_mul(u64::try_from(buf.len()).unwrap_or(u64::MAX)));
             while Instant::now() < until {
                 std::hint::spin_loop();
+            }
+            let this = self.get_mut();
+            if this.sizes.len() < this.sizes.capacity() {
+                this.sizes.push(buf.len());
             }
             Poll::Ready(Ok(buf.len()))
         }
@@ -370,9 +388,11 @@ mod tests {
     /// one poll, and none of them is 1 ms on the CPU. The flush before wrote it all in that one poll (2.2 ms).
     #[test]
     fn g9_s3_a_flush_writes_within_its_polls_quantum() -> Result<(), String> {
-        static COSTS: crate::turn::Writes = crate::turn::Writes::nothing_yet();
+        thread_local! {
+            static COSTS: crate::turn::Writes = const { crate::turn::Writes::nothing_yet() };
+        }
         let (polls, longest_cpu_ns) = crate::testing::block_on(async {
-            let mut io = Slow { ns_per_byte: 2 };
+            let mut io = Slow { ns_per_byte: 2, sizes: Vec::new() };
             let mut buf = WriteBuf::with_costs(&COSTS);
             for _ in 0..8 {
                 buf.push(Bytes::from(vec![1u8; 32 << 10]));
@@ -398,6 +418,56 @@ mod tests {
         })??;
         assert!(polls > 1, "the flush wrote 1 MiB in the poll that had held its shard 200 µs already");
         assert!(longest_cpu_ns < 1_000_000, "a poll of the flush held its shard {longest_cpu_ns} ns on the CPU");
+        Ok(())
+    }
+
+    /// The sizes of the writes a flush of 1 MiB made from the start of a poll, its buffer the shard's own
+    /// (`crate::turn::WRITES`), each write 2 ns a byte.
+    async fn flush_a_mib() -> Result<Vec<usize>, String> {
+        let mut io = Slow { ns_per_byte: 2, sizes: Vec::with_capacity(1 << 10) };
+        let mut buf = WriteBuf::default();
+        buf.push(Bytes::from(vec![2u8; 1 << 20]));
+        hyper_rt::futures::yield_now().await;
+        std::future::poll_fn(|cx| buf.poll_flush(&mut io, cx)).await.map_err(|e| e.to_string())?;
+        Ok(io.sizes)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: each shard learns what its own writes cost, and a write learning and fitted there
+    /// allocates nothing. Do: on a fresh runtime's first shard, two windows of 32 KiB flushes at 2 ns a byte, a poll each,
+    /// what they allocate counted; then 1 MiB flushed from the start of a poll there, and on its second shard. Expect: the
+    /// flushes allocated nothing (each write timed, learned and fitted, the costs halved between them, the shard's own
+    /// costs first touched among them); the first shard wrote its MiB in pieces that fit its quantum, the second in one
+    /// write, as a fresh process writes its first: it knows nothing of the first's writes. With every shard's writes
+    /// learned together (one static), the second wrote in the first's pieces.
+    #[test]
+    fn g9_s3_a_shards_writes_teach_its_own_costs_alone() -> Result<(), String> {
+        let runtime = hyper_rt::Runtime::start(&crate::testing::config(2, 16)).map_err(|e| e.to_string())?;
+        let shards: Vec<hyper_rt::SlotHolder> = runtime.shard_ids().iter().filter_map(|id| runtime.holder_of(*id)).collect();
+        let (first, second) = (shards.first().copied().ok_or("no first shard")?, shards.get(1).copied().ok_or("no second shard")?);
+        let counted = crate::testing::block_on_at(first, async {
+            let mut io = Slow { ns_per_byte: 2, sizes: Vec::with_capacity(1 << 10) };
+            let mut buf = WriteBuf::default();
+            hyper_measure::alloc::begin();
+            hyper_measure::alloc::pause();
+            for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+                buf.push(Bytes::from(vec![1u8; 32 << 10]));
+                std::future::poll_fn(|cx| {
+                    hyper_measure::alloc::resume();
+                    let flushed = buf.poll_flush(&mut io, cx);
+                    hyper_measure::alloc::pause();
+                    flushed
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                hyper_rt::futures::yield_now().await;
+            }
+            Ok::<_, String>(hyper_measure::alloc::end())
+        })??;
+        let (taught, fresh) = (crate::testing::block_on_at(first, flush_a_mib())??, crate::testing::block_on_at(second, flush_a_mib())??);
+        drop(runtime);
+        assert_eq!((counted.allocations, counted.reallocations), (0, 0), "the flushes' writes, learned and fitted, allocated: {counted:?}");
+        assert!(taught.first().is_some_and(|n| *n < 1 << 20), "the shard that learned its writes wrote its MiB whole: {taught:?}");
+        assert_eq!(fresh, [1 << 20], "a shard that wrote nothing yet holds its first write to what another shard learned");
         Ok(())
     }
 
