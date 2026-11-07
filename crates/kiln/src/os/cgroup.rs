@@ -32,7 +32,7 @@ impl Memory {
 }
 
 /// A limit as a cgroup writes it: `max` (v2), or v1's page-rounded `i64::MAX`, is none.
-fn limit(text: &str) -> Option<u64> {
+pub(crate) fn limit(text: &str) -> Option<u64> {
     let t = text.trim();
     if t == "max" {
         return None;

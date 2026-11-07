@@ -331,20 +331,31 @@ fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) 
 }
 
 /// The session's environment over the machine's: what its shell had (minus the shell's own
-/// terminal plumbing), without what a Claude Code session sets for its children.
+/// terminal plumbing), with no `KILN_*` variable of either but those kiln gives it, and without what
+/// a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    // kiln's own variables are the server's or the runner's that starts it (its data folder, its
+    // config, its supervisor's socket, its admin token), or those of the shell `kiln spawn` took the
+    // environment of, which a kiln terminal has from the server: none goes on to the agent, which
+    // gets its own from kiln (its sockets here, its mark and its tools' as it starts). A test server
+    // an agent started opened production's database through its KILN_DATA_DIR (2026-11-06).
+    for (k, _) in std::env::vars_os() {
+        if kilns(&k) {
+            p.env_remove(k);
+        }
+    }
     // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
     if let Some(path) = search_path() {
         p.env("PATH", path);
     }
+    for (k, v) in &spec.env {
+        if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
+            p.env(k, v);
+        }
+    }
     // `kiln run` in the agent's shell reaches other runners through this machine's runner.
     if let Some(sock) = crate::reach::local::socket() {
         p.env("KILN_REACH_SOCK", sock);
-    }
-    for (k, v) in &spec.env {
-        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_RUNNER_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
-            p.env(k, v);
-        }
     }
     // `kiln spawn` and `kiln agents` in its commands: what it starts are its children (the socket
     // knows the agent by its process).
@@ -353,13 +364,17 @@ fn set_env(p: &mut Process, spec: &Spec) {
     }
     // What it asks goes to this process, which runs it and holds its key (W27-R03), whichever
     // process of the machine serves the machine's socket.
-    match super::socket::own_served() {
-        Some(sock) => p.env("KILN_RUNNER_SOCK", sock),
-        None => p.env_remove("KILN_RUNNER_SOCK"),
-    };
+    if let Some(sock) = super::socket::own_served() {
+        p.env("KILN_RUNNER_SOCK", sock);
+    }
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);
     }
+}
+
+/// Whether `name` is one of kiln's own variables (`KILN_*`).
+fn kilns(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"KILN_")
 }
 
 /// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
@@ -1097,6 +1112,61 @@ mod tests {
         let (modes, default) = kind.modes();
         assert_eq!(default, "accept-edits");
         assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
+        Ok(())
+    }
+
+    /// None of kiln's own variables in the environment of the server that starts an agent (its data
+    /// folder, config, supervisor's socket and admin token: a test server an agent started opened
+    /// production's database through its KILN_DATA_DIR, 2026-11-06), nor in the shell `kiln spawn`
+    /// took the environment of (a kiln terminal's has the server's), reaches the agent's harness: it
+    /// has the rest of what it was started with, what it was given, and its own mark. Runs again in a
+    /// process of its own whose environment has a server's.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_inherits_none_of_the_servers_own_kiln_variables() -> anyhow::Result<()> {
+        const SERVERS: [(&str, &str); 7] = [
+            ("KILN_DATA_DIR", "/srv/kiln/data"),
+            ("KILN_CONFIG", "/srv/kiln/server.toml"),
+            ("KILN_SUPERVISOR", "/run/user/1000/kiln/supervise-0.sock"),
+            ("KILN_SUPERVISED", "1"),
+            ("KILN_GENERATION", "3"),
+            ("KILN_ADMIN_TOKEN", "not-a-token"),
+            ("MACHINE_SAYS", "kept"),
+        ];
+        const AS_SERVER: &str = "KILN_TEST_AS_SERVER";
+        if std::env::var_os(AS_SERVER).is_none() {
+            let me = format!("{}::an_agent_inherits_none_of_the_servers_own_kiln_variables", module_path!().split_once("::").map_or("", |(_, path)| path));
+            let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"]).env(AS_SERVER, "1").envs(SERVERS).output()?;
+            let said = String::from_utf8_lossy(&out.stdout);
+            anyhow::ensure!(out.status.success(), "as a server ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+            anyhow::ensure!(said.contains("1 passed"), "{me} didn't run as a server: {said}");
+            return Ok(());
+        }
+        // A stand-in harness that writes down the environment it starts with.
+        let dir = tempfile::tempdir()?;
+        let seen = dir.path().join("env");
+        let harness = dir.path().join("devin");
+        std::fs::write(&harness, "#!/bin/sh\nenv > \"$SEEN\"\n")?;
+        crate::os::make_executable(&harness)?;
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        // Started from a kiln terminal on the server, whose shell has the server's variables too.
+        let spec = Spec {
+            kind: "devin".into(),
+            program: Some(harness.to_string_lossy().into_owned()),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            env: vec![("SEEN".into(), seen.to_string_lossy().into_owned()), ("KILN_DATA_DIR".into(), "/srv/kiln/data".into()), ("KILN_TERM_SESSION".into(), "t1".into())],
+            ..Spec::default()
+        };
+        let mut p = kind.launch(&spec, "s1")?;
+        // Marked as the agent's, as a session starts it (`session.rs`).
+        p.env(super::super::survivors::MARK, "s1");
+        let status = p.stdin(std::process::Stdio::null()).status()?;
+        anyhow::ensure!(status.success(), "the stand-in harness: {status}");
+        let env = std::fs::read_to_string(&seen)?;
+        let vars: Vec<(&str, &str)> = env.lines().filter_map(|l| l.split_once('=')).collect();
+        let kilns: Vec<&str> = vars.iter().map(|(k, _)| *k).filter(|k| k.starts_with("KILN_")).collect();
+        anyhow::ensure!(kilns == ["KILN_AGENT"], "the harness has kiln variables that aren't its own: {kilns:?}");
+        anyhow::ensure!(vars.contains(&("KILN_AGENT", "s1")) && vars.contains(&("MACHINE_SAYS", "kept")) && vars.iter().any(|(k, _)| *k == "SEEN"), "{vars:?}");
         Ok(())
     }
 

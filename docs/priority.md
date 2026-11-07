@@ -62,6 +62,23 @@ itself, and systemd owns a unit's cgroups unless it delegates them. So:
   facts (`executors.host.priority`) and its log at start. Reinstalling or upgrading the runner
   (`kiln install --agent --upgrade`) writes the delegated unit.
 
+**Memory.** A delegated unit that declares a floor for kiln's own processes (`MemoryMin=`,
+`MemoryLow=`: production's server's unit) has it kept for them alone. As it arranges its unit, the
+server (or runner) enables `+memory` for the unit's children, writes the unit's `memory.min` and
+`memory.low` on its leaf, and gives `kiln-agents` a share of its own: what the unit may have (the
+least of its `MemoryMax=`, a slice's above it and the machine's memory) less that floor as its
+`memory.max`, and, where the unit or a slice above it is slowed (`MemoryHigh=`), as far short of
+that as its `memory.high`. Every number is the unit's, a slice's or the machine's. What agents run
+(builds of 8-10 GB each) is then slowed, reclaimed and killed inside their folder: it never takes
+kiln's floor, slows the unit (its server's threads with it) or fills it, where an OOM kill could take
+the server. The agents' sessions are counted together, in their folder. A unit that declares no
+floor has nothing to keep and is left as it was; one that leaves the agents nothing past the floor
+keeps the floor and says why the agents have no share. Both are said in the log at start (`kiln's own
+processes keep their unit's memory floor`, `agents share their unit's memory`) and in how agents'
+processes are held together. It's worked out as kiln starts: a unit's memory changed while it runs
+(`systemctl set-property`) is taken up at its next start. Before this, production's agents ran in
+the server's own cgroup, which hit its `memory.high` 15.9 million times.
+
 **Docker legs.** A leg's job container, its services, its Docker actions, its egress relay and the
 containers its steps make through its Docker socket get the least weight Docker gives a container,
 `--cpu-shares 2` (`cpu.weight` 1), as a host leg's group has. A leg's own `options:` win.
@@ -805,6 +822,9 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
 - Production (a hand-written system unit with `User=`): `LimitRTPRIO=1` in its unit and `[server] realtime
   = true` in its config, a deploy of a binary that places the shards ("The bare-metal default", above; the exact
   drop-in, what shows it took and how to take it back: docs/runtime-lab.md, "Ada's call").
+- Production's agents in cgroups of their own, apart from its server's memory ("Memory", above): its unit
+  needs `Delegate=yes` and `DelegateSubgroup=kiln`, and a restart, which ends every agent session the
+  server hosts. Its `MemoryHigh=` and `MemoryMax=` then hold the server and its agents together.
 - The lab: its machine's kernel is lazy and it has no root there, so its A/Bs of the partition and of the
   real-time class wait on the owner (research `01a1a87b2cee` f17, f18: rtkit refuses this user a
   real-time class there). The real-time A/B needs one root command there (docs/runtime-lab.md, "Goal 8
@@ -817,6 +837,13 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   `+cpu` for its children), and reads `cpu.weight` 1 on an agent's group with what it starts inside
   it, never `cpu.idle`, and the default on a person's run's.
   `g8_s2_the_unit_whose_leaf_kiln_runs_in_is_its_home` reads the home.
+- `os::contain::tests::agents_memory_is_held_in_their_folder_and_never_takes_kilns_floor` (Linux): a
+  delegated scope of the user's own with a floor, a point it's slowed at and a most (`MemoryMin=`,
+  `MemoryLow=`, `MemoryHigh=`, `MemoryMax=`, no swap), arranged as the server does: the floor on its
+  leaf alone, the agents' share on their folder, and an agent's work twice that share killed in the
+  folder while the unit itself is never slowed, filled or made to kill and its own process runs on.
+  `agents_share_what_their_unit_may_have_less_kilns_own_floor`: the share of production's unit as it
+  was written, without its limits, under a slice's, and none where the floor leaves nothing.
 - `install::tests::g8_units_are_delegated_and_the_server_comes_first` and
   `g8_systemd_reads_the_units_kiln_writes`: the runner's and the server's units, `kiln.slice` with
   its weights and cores, `ProcessType` `Interactive` for the server's launchd job, and

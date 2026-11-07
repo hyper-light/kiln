@@ -138,7 +138,17 @@ harness started before the runner had groups, that mark is how their processes a
 takes looking at every process on the machine. The runner logs how it holds them as it starts
 (`agents' processes are held together by`). Only the runner and the server, which start agents,
 hold them together: a test or a tool that links kiln and starts a harness leaves its processes
-where they are, so a test run in a kiln terminal makes no groups in the runner's cgroup.
+where they are, so a test run in a kiln terminal makes no groups in the runner's cgroup. Where the
+unit kiln runs in declares a floor for kiln's own processes (production's server's), the agents'
+groups share what the unit has past it, so what they run never presses on the server's memory
+([priority.md](priority.md), "Memory").
+
+A harness has none of kiln's own variables (`KILN_*`) from the environment of the server or runner
+that starts it (its data folder, config, supervisor's socket, admin token), nor from the shell
+`kiln spawn` took the environment of (a kiln terminal's has the server's): only those kiln gives it,
+`KILN_AGENT`, its sockets (`KILN_HARNESS_SOCK`, `KILN_RUNNER_SOCK`, `KILN_REACH_SOCK`) and, for
+Antigravity, its kiln MCP server's (`KILN_REACH_ON`, `KILN_SESSION`). A test server an agent started
+opened production's database through its inherited `KILN_DATA_DIR` (2026-11-06).
 
 Every ten seconds the runner notes what runs under each harness and what else is the agent's (in
 its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's

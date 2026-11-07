@@ -41,7 +41,8 @@ pub struct Spec {
     /// The terminal session (shell) this agent belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
-    /// Environment captured from that shell (`kiln spawn`), applied over the machine's own.
+    /// Environment captured from that shell (`kiln spawn`), applied over the machine's own, kiln's
+    /// own variables (`KILN_*`) left out of both (`super::kinds`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
     /// Offer the harness's skip-all-permissions mode (it is never the default, only a choice).
