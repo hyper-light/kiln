@@ -647,7 +647,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         match r.noted {
             Noted::As(_, code) => {
                 let nack = if code == Code::Unknown { Refusal::Unsupported } else { Refusal::Malformed };
-                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
+                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
             }
             Noted::Below => {
                 p.refused_below(s, proto::LANE_TERM, below)?;
@@ -660,7 +660,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         seq += 1;
         let percent = 20 + u8::try_from(n)?;
         p.msg(proto::LANE_TERM, &AgentMsg::Wire(Frame::Item { stream: stream.to_owned(), seq, low: seq - 1, body: proto::encode(&power(percent))? }))?;
-        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
+        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
         until(&format!("{name}'s next item was never applied"), || record(s.port, &s.admin, name).pointer("/battery/percent").and_then(Value::as_u64) == Some(u64::from(percent)))?;
         ran.passed(Wire::RunnerItem, r, &format!("runner:{name}"), "counted, audited, on its page", "the next item taken and applied");
     }

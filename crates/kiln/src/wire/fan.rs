@@ -1390,7 +1390,7 @@ mod tests {
                 for i in 0..9 {
                     for key_steps in &all {
                         let Some((stream, seq, refusal)) = key_steps.get(i).cloned() else { continue };
-                        if matches!(own.on_item("a", &stream, seq, seq.saturating_sub(1), vec![1], now), Arrival::Take(_)) {
+                        if matches!(own.on_item("a", &stream, seq, seq.saturating_sub(1), now), Arrival::Take(_)) {
                             let _ = own.answer("a", &stream, seq, refusal);
                         }
                     }
@@ -1410,7 +1410,7 @@ mod tests {
                     let prefix = format!("{k}#");
                     one.forget_where(|s| s != stream && s.starts_with(&prefix));
                 }
-                if matches!(one.on_item(&stream, seq, seq.saturating_sub(1), vec![1], now), Arrival::Take(_)) {
+                if matches!(one.on_item(&stream, seq, seq.saturating_sub(1), now), Arrival::Take(_)) {
                     let _ = match refusal {
                         None => one.took(&stream, seq),
                         Some((code, why)) => one.refused(&stream, seq, code, why),
@@ -1527,7 +1527,7 @@ mod tests {
                     let (Some(own), Some(queue)) = (links.get(k), queues.get_mut(k)) else { continue };
                     for _ in 0..take {
                         let Some((stream, seq, low, body)) = queue.pop_front() else { break };
-                        let answer = match own.on_item("r", &stream, seq, low, body.clone(), now) {
+                        let answer = match own.on_item("r", &stream, seq, low, now) {
                             Arrival::Take(_) => {
                                 applied.entry(stream.clone()).or_default().push(seq);
                                 let refusal = refuses(&body).then(|| (Refusal::Refused, "seven".to_owned()));
