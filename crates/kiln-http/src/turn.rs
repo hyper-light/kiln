@@ -110,11 +110,11 @@ impl Costs {
         (units > 0).then(|| self.ns.load(Relaxed) as f64 / units as f64)
     }
 
-    /// The rule work is weighed by: the most units whose cost past `free` nanoseconds is expected to be no more than
-    /// `defer`, what putting the rest off costs; none until a cost was learned. Each bucket's units are reckoned at its
-    /// dearest and at its floor, in the shares that keep their nanoseconds: the widest spread they could have, so what's
-    /// past `free` is never reckoned short.
-    pub fn fit(&self, free: u64, defer: u64) -> Option<u64> {
+    /// The rule work is weighed by: the most units whose cost past `free` nanoseconds (negative: already past by that) is
+    /// expected to be no more than `defer`, what putting the rest off costs; none until a cost was learned. Each bucket's
+    /// units are reckoned at its dearest and at its floor, in the shares that keep their nanoseconds: the widest spread they
+    /// could have, so what's past `free` is never reckoned short.
+    pub fn fit(&self, free: i64, defer: u64) -> Option<u64> {
         let units = self.units.load(Relaxed);
         if units == 0 {
             return None;
@@ -128,11 +128,11 @@ impl Costs {
             past += u;
             past_ns += u * cost;
             let n = (budget + free * past) / past_ns;
-            if n * points.peek().map_or(0.0, |p| p.0) <= free {
+            if points.peek().is_none_or(|p| n * p.0 <= free) {
                 return Some(n as u64);
             }
         }
-        Some(u64::MAX)
+        None
     }
 }
 
@@ -197,10 +197,11 @@ impl Writes {
         self.resumes.learn(1, held);
     }
 
-    /// The most bytes a write may carry in `room` nanoseconds: those whose cost past it is expected to be no more than a
-    /// poll's coming back to write the rest ([`Costs::fit`]). None until a write was timed: the first goes whole, and
-    /// teaches. Until a poll came back, putting the rest off is taken to cost nothing: what fits at the dearest.
-    pub fn fitting(&self, room: u64) -> Option<usize> {
+    /// The most bytes a write may carry in `room` nanoseconds (negative: its poll is past its quantum by that): those whose
+    /// cost past it is expected to be no more than a poll's coming back to write the rest ([`Costs::fit`]), so what a poll
+    /// writes past its quantum in all is. None until a write was timed: the first goes whole, and teaches. Until a poll came
+    /// back, putting the rest off is taken to cost nothing: what fits at the dearest.
+    pub fn fitting(&self, room: i64) -> Option<usize> {
         let defer = self.resumes.mean().map_or(0, |ns| ns as u64);
         self.bytes.fit(room, defer).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
     }
@@ -209,11 +210,17 @@ impl Writes {
 /// What every connection's writes are learned to cost ([`Writes`]).
 pub(crate) static WRITES: Writes = Writes::nothing_yet();
 
-/// What's left of the shard's step quantum after what the poll a write is in has held its shard for, nanoseconds
-/// (`hyper_rt::futures::poll_clock`). None off a shard (a thread of its own, a test's), where a write is never held back.
-pub fn room() -> Option<u64> {
+/// What's left of the shard's step quantum after what the poll a write is in has held its shard for, nanoseconds, negative
+/// once the poll is past it (`hyper_rt::futures::poll_clock`). None off a shard (a thread of its own, a test's), where a
+/// write is never held back.
+pub fn room() -> Option<i64> {
     let poll = hyper_rt::futures::poll_clock()?;
-    Some(quantum()?.saturating_sub(poll.held_ns()))
+    Some(signed(quantum()?).saturating_sub(signed(poll.held_ns())))
+}
+
+/// `ns` as a signed count of nanoseconds.
+pub fn signed(ns: u64) -> i64 {
+    i64::try_from(ns).unwrap_or(i64::MAX)
 }
 
 /// The quantum a whole poll has: the shard's step quantum (`hyper_rt::futures::step_budget_ns`).
@@ -252,6 +259,17 @@ mod tests {
         w.resumed(2_000);
         let fit = w.fitting(250_000);
         assert!(fit.is_some_and(|n| n > 25_000 && n < 250_000), "{fit:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a poll writes past its quantum in all is what coming back costs, not that
+    /// again with each write: the room is negative once the poll is past it, and what's past counts. Do: writes at 2 ns a
+    /// byte, coming back 3 µs. Expect: 1,500 bytes fit no room left, 500 fit 2 µs past it, none 3 µs past it.
+    #[test]
+    fn g9_s3_a_poll_past_its_quantum_writes_no_more_than_coming_back_costs() {
+        let w = Writes::nothing_yet();
+        w.learn(64 << 10, 131_072);
+        w.resumed(3_000);
+        assert_eq!((w.fitting(0), w.fitting(-2_000), w.fitting(-3_000), w.fitting(-9_000)), (Some(1_500), Some(500), Some(0), Some(0)));
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: no gain is picked; the sketch forgets by halving each window. Do: a window of jobs

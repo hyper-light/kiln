@@ -242,7 +242,7 @@ impl WriteBuf {
     /// (each write past it teaches it).
     fn cap(&self) -> Option<usize> {
         match self.costs.fitting(crate::turn::room()?)? {
-            0 if self.gave_up => crate::turn::quantum().and_then(|q| self.costs.fitting(q)).filter(|n| *n > 0),
+            0 if self.gave_up => crate::turn::quantum().and_then(|q| self.costs.fitting(crate::turn::signed(q))).filter(|n| *n > 0),
             fit => Some(fit),
         }
     }
