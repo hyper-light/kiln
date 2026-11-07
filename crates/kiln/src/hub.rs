@@ -3318,6 +3318,9 @@ impl Hub {
         if let Some(h) = handed {
             crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToOwner, began.saturating_duration_since(h));
         }
+        // The frames it makes carry where it came from, for the viewers who ask (goal 10, plan 01a1a87b2dae step 5).
+        let runner_us = taken.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX));
+        let _came = crate::harness::live::carrying(Some(crate::harness::live::Came { arrived_us: arrived.map(crate::harness::live::us_at), took_us: crate::harness::live::us_at(began), runner_us }));
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));

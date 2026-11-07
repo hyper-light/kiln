@@ -13,7 +13,6 @@
   --sg-ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-
 /* ------------------------------------------------------------ optic */
 
 .sg-optic {
@@ -550,6 +549,10 @@
 :root[data-motion="paused"] .sg-trace-glow > span,
 :root[data-motion="paused"] .sg-load path,
 :root[data-motion="paused"] .sg-caret {
+  animation-play-state: paused;
+}
+/* A shimmer off screen waits where it is (signals.tsx, watchSeen): unseen, it would still be painted every frame. */
+.sg-shimmer[data-unseen] {
   animation-play-state: paused;
 }
 

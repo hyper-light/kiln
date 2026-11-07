@@ -80,7 +80,7 @@ type BarProps = {
  */
 function ToChips({ picked, onPick }: { picked: AgentInfo[]; onPick?: (ids: string[], on: boolean) => void }) {
   const [fold, setFold] = React.useState<Fold>(UNFOLDED);
-  // A new ref when those picked change: it measures once they're on the page, then whenever the line
+  // A new ref when those picked change: it measures once they're laid out, then whenever the line
   // or a chip changes size (the window, a font arriving).
   const key = picked.map((a) => `${a.id}:${agentLabel(a)}`).join("\n");
   const fit = React.useCallback(
@@ -95,7 +95,8 @@ function ToChips({ picked, onPick }: { picked: AgentInfo[]; onPick?: (ids: strin
         const next = foldChips({ line: line.clientWidth, chips: widths, more, count: all, typed: 0, gap });
         setFold((was) => (sameFold(was, next) ? was : next));
       };
-      update();
+      // First as its observer hears, once they're laid out (before they're painted): measured as
+      // they're put in, the whole page would be laid out there and then.
       const watch = new ResizeObserver(update);
       watch.observe(line);
       for (const el of copy.children) watch.observe(el);

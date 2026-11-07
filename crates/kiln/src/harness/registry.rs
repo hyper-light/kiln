@@ -2744,7 +2744,7 @@ impl Registry {
             }
             self.raise_epoch(id, info.epoch);
         }
-        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported })
+        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported, came: super::live::came() })
     }
 
     /// An update of a session from the machine it runs on, as the shard that owns the session's copy
@@ -2759,8 +2759,10 @@ impl Registry {
     /// history in one update held its owner's shard up to 83 ms). One long to write out (a large tool output)
     /// is written by its owner off the shard first (`super::copies::Shard::want_write`).
     pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
-        let Ingest { from, id, mut u, shipped, reported } = i;
+        let Ingest { from, id, mut u, shipped, reported, came } = i;
         let id = id.as_str();
+        // The frames it makes carry where it came from, at whichever turn it's taken (goal 10, plan 01a1a87b2dae step 5).
+        let _came = super::live::carrying(came);
         // Only the machine a session runs on speaks for it: a copy left behind where it went on
         // from says nothing more of it.
         if !matches!(u, Update::Open { .. }) && s.get(id).is_some_and(|m| *m.location != from) {
@@ -2787,7 +2789,7 @@ impl Registry {
         let tried = s.take_off_written(id);
         if tried.is_none() && !same && shared.is_none() && s.get(id).is_some_and(|m| super::copies::long_off(m, &u, &said)) {
             s.want_off(id, store.is_some());
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported, came });
         }
         // An Open going on from an event inside a compact chunk of its copy (a runner's reconnect after it lost events the copy
         // has): that chunk is read back off the shard first, as one an update changes is, nothing of the Open taken yet (goal 9,
@@ -2796,7 +2798,7 @@ impl Registry {
             && let Some(c) = s.get(id).filter(|m| m.info.epoch == info.epoch).and_then(|m| m.thaw_for_open(*n)).filter(|c| !std::ptr::eq(s.thawed().as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported, came });
         }
         let (mut written_off, took_off) = match tried {
             Some(w) => {
@@ -2933,7 +2935,7 @@ impl Registry {
             && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // A stream into an event of an older compact chunk (a long tool's output, a subagent's text): the same, once that
         // chunk is read back off the shard, before the stream is taken (goal 9, plan 01a1a87b2cec step 3).
@@ -2941,7 +2943,7 @@ impl Registry {
             && let Some(c) = m.thaw_for_stream(event).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
         {
             s.want_thaw(id, c);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // Its first event goes in under an older number than the copy's newest: the same, once the copy's events are made
         // again with it in off the shard (goal 9, plan 01a1a87b2cec step 3).
@@ -2950,7 +2952,7 @@ impl Registry {
         {
             let rev = m.rev;
             s.want_insert(id, at, e, rev);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         // Its first event is long to write out (a large tool output) and wasn't written yet: the same, once its owner wrote it
         // out off the shard (goal 9, plan 01a1a87b2cec step 3: `super::copies::Shard::want_write`).
@@ -2959,7 +2961,7 @@ impl Registry {
         {
             let (cwd, location) = (m.info.cwd.clone(), Location::clone(&m.location));
             s.want_write(id, store.is_some(), cwd, location);
-            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came });
         }
         m.rev = m.rev.saturating_add(1);
         // The meta its machine said (goal 9, plan 01a1a87b2cec step 3; goal 11): its copy's catalog already (the same again), else
@@ -3316,7 +3318,7 @@ impl Registry {
             s.publish_board();
             self.returning.came();
         }
-        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
+        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new(), came })
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
@@ -6592,7 +6594,7 @@ mod tests {
             for id in ["s", "fill"] {
                 hub.harness.ingest(&there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
             }
-            let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() });
+            let mut next = Some(Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new(), came: None });
             let (mut took, mut fills) = (Vec::new(), 0);
             // Only bounds a hang: past it the test fails rather than waits forever.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
