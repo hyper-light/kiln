@@ -34,7 +34,7 @@
 //! owner mostly waiting) took it on the hub's shard, and the owner took it again on its own as it waited.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -244,9 +244,11 @@ fn park(until: Option<Instant>) -> bool {
 /// figures as it changes; its bound joins the owner's as it's made and leaves it as it goes.
 pub struct Room {
     owner: &'static Owner,
-    bound: usize,
+    bound: AtomicUsize,
     /// Whether `bound` holds: an [`unbounded`] queue's room takes every send.
     limited: bool,
+    /// A [`pipe`]'s pace, which sets its bound as it's learned.
+    pace: Option<Pace>,
     held: AtomicUsize,
     /// No receiver any more: whoever waits for room stops waiting (what it sends is refused).
     closed: AtomicBool,
@@ -258,18 +260,62 @@ impl Room {
     /// A room of `bound` bytes, counted as `owner`'s.
     pub fn new(owner: &'static Owner, bound: usize) -> Self {
         owner.bound_add(bound);
-        Self { owner, bound, limited: true, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
+        Self { owner, bound: AtomicUsize::new(bound), limited: true, pace: None, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
+    }
+
+    /// A [`pipe`]'s room, counted as `owner`'s: one item until its first is sent, then as its pace sets it ([`Pace`]).
+    fn paced(owner: &'static Owner) -> Self {
+        Self { owner, bound: AtomicUsize::new(0), limited: true, pace: Some(Pace::new()), held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
     }
 
     /// A room with no bound, counted as `owner`'s: it takes whatever comes ([`unbounded`]), adding nothing to
     /// the owner's bound.
     fn unbounded(owner: &'static Owner) -> Self {
-        Self { owner, bound: 0, limited: false, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
+        Self { owner, bound: AtomicUsize::new(0), limited: false, pace: None, held: AtomicUsize::new(0), closed: AtomicBool::new(false), freed: Waiters::new() }
     }
 
     /// The most it may hold, in bytes.
     pub fn bound(&self) -> usize {
-        self.bound
+        self.bound.load(Ordering::Acquire)
+    }
+
+    /// The most it may hold from now on, `n` bytes: its owner's bound with it, and whoever waits for room looks again
+    /// where it grew ([`pipe`]).
+    fn set_bound(&self, n: usize) {
+        // Most sends and takes find it as it was: no store, and the owner's figures as they were.
+        if self.bound.load(Ordering::Relaxed) == n {
+            return;
+        }
+        let was = self.bound.swap(n, Ordering::AcqRel);
+        if n > was {
+            self.owner.bound_add(n - was);
+            self.freed.wake();
+        } else {
+            self.owner.bound_sub(was - n);
+        }
+    }
+
+    /// A producer made the item it's about to send ([`Pace::made`]).
+    fn made(&self) {
+        if let Some(pace) = &self.pace {
+            pace.made();
+        }
+    }
+
+    /// An item of `n` bytes sent: a pipe's room as its pace now sets it.
+    fn sent(&self, n: usize) {
+        if let Some(pace) = &self.pace {
+            pace.sent();
+            self.set_bound(pace.room(n));
+        }
+    }
+
+    /// An item of `n` bytes taken, `more` waiting behind it: a pipe's room as its pace now sets it.
+    fn taken(&self, n: usize, more: bool) {
+        if let Some(pace) = &self.pace {
+            pace.taken(n, more);
+            self.set_bound(pace.room(n));
+        }
     }
 
     /// What it holds now, in bytes.
@@ -283,7 +329,7 @@ impl Room {
         let mut now = self.held.load(Ordering::Acquire);
         loop {
             let after = now.saturating_add(n);
-            if self.limited && now > 0 && after > self.bound {
+            if self.limited && now > 0 && after > self.bound.load(Ordering::Acquire) {
                 return false;
             }
             match self.held.compare_exchange_weak(now, after, Ordering::AcqRel, Ordering::Acquire) {
@@ -379,7 +425,96 @@ impl Drop for Room {
     fn drop(&mut self) {
         // What it still held goes with it (its items are dropped with their queue), and so does its bound.
         self.owner.sub(*self.held.get_mut());
-        self.owner.bound_sub(self.bound);
+        self.owner.bound_sub(*self.bound.get_mut());
+    }
+}
+
+/// A [`pipe`]'s pace (consts-audit B4): how long its producer takes to make an item (from its last send's end to its next
+/// send), and how long its consumer takes to take a KiB (over takes that found the next item waiting: the consumer taking,
+/// not waiting for the producer), each learned as RFC 6298 learns a round trip (`crate::rt::Smoothed`). Its room is what
+/// the consumer takes while the producer makes its next item, and an item past it: a consumer slower than its producer
+/// never waits for the next, and a producer runs no further ahead than that. Two items until both are learned. A queue of a
+/// fixed count of places held its producer's items as the channel it replaced did, whatever took them.
+struct Pace {
+    born: Instant,
+    /// The end of the producer's last send, nanoseconds since `born` (0: none yet), and whether it has made its next.
+    sent_ns: AtomicU64,
+    making: AtomicBool,
+    make_ns: crate::rt::Smoothed,
+    /// The consumer's last take, nanoseconds since `born` (0: none yet), its bytes, and whether more waited behind it.
+    took_ns: AtomicU64,
+    took_bytes: AtomicUsize,
+    backlogged: AtomicBool,
+    per_kib_ns: crate::rt::Smoothed,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            born: Instant::now(),
+            sent_ns: AtomicU64::new(0),
+            making: AtomicBool::new(false),
+            make_ns: crate::rt::Smoothed::nothing_yet(),
+            took_ns: AtomicU64::new(0),
+            took_bytes: AtomicUsize::new(0),
+            backlogged: AtomicBool::new(false),
+            per_kib_ns: crate::rt::Smoothed::nothing_yet(),
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1)
+    }
+
+    fn made(&self) {
+        self.made_at(self.now_ns());
+    }
+
+    fn sent(&self) {
+        self.sent_at(self.now_ns());
+    }
+
+    fn taken(&self, bytes: usize, more: bool) {
+        self.taken_at(self.now_ns(), bytes, more);
+    }
+
+    /// The producer made its next item at `at` (nanoseconds since `born`): the time since its last send ended learned,
+    /// once an item.
+    fn made_at(&self, at: u64) {
+        let last = self.sent_ns.load(Ordering::Relaxed);
+        if last != 0 && !self.making.swap(true, Ordering::Relaxed) {
+            self.make_ns.learn(at.saturating_sub(last));
+        }
+    }
+
+    /// A send ended at `at`.
+    fn sent_at(&self, at: u64) {
+        self.sent_ns.store(at.max(1), Ordering::Relaxed);
+        self.making.store(false, Ordering::Relaxed);
+    }
+
+    /// An item of `bytes` taken at `at`, `more` waiting behind it: where the one before it had more behind it, the
+    /// consumer took that one in the time since, which is learned per KiB.
+    fn taken_at(&self, at: u64, bytes: usize, more: bool) {
+        let at = at.max(1);
+        let (last, last_bytes) = (self.took_ns.swap(at, Ordering::Relaxed), self.took_bytes.swap(bytes, Ordering::Relaxed));
+        if last != 0 && last_bytes > 0 && self.backlogged.load(Ordering::Relaxed) {
+            let per_kib = u128::from(at.saturating_sub(last)).saturating_mul(1024) / u128::try_from(last_bytes).unwrap_or(u128::MAX);
+            self.per_kib_ns.learn(u64::try_from(per_kib).unwrap_or(u64::MAX));
+        }
+        self.backlogged.store(more, Ordering::Relaxed);
+    }
+
+    /// The room that keeps the consumer fed while the producer makes its next item, items of `item` bytes: what the
+    /// consumer takes in a make's time, and an item past it; two items until both are learned.
+    fn room(&self, item: usize) -> usize {
+        match (self.make_ns.mean(), self.per_kib_ns.mean()) {
+            (Some(make), Some(per_kib)) if per_kib > 0 => {
+                let drained = u128::from(make).saturating_mul(1024) / u128::from(per_kib);
+                usize::try_from(drained).unwrap_or(usize::MAX).saturating_add(item)
+            }
+            _ => item.saturating_mul(2),
+        }
     }
 }
 
@@ -443,6 +578,18 @@ pub fn places<T>(owner: &'static Owner, places: usize) -> (Sender<T>, Receiver<T
     made(Room::new(owner, places.saturating_mul(place_of::<T>())), at_place::<T>)
 }
 
+/// A queue whose room its pace sets (consts-audit B4: [`Pace`]), counted as `owner`'s by its items' weights: what its
+/// consumer takes while its producer makes the next item, an item past it. For a producer handing a consumer a stream
+/// (a body's chunks, a file's, a terminal's output), where a count of places was the channel's it replaced.
+pub fn pipe<T: Weigh>(owner: &'static Owner) -> (Sender<T>, Receiver<T>) {
+    made(Room::paced(owner), counted::<T>)
+}
+
+/// [`pipe`] for items counted at their places alone ([`place_of`]), whatever each carries.
+pub fn pipe_places<T>(owner: &'static Owner) -> (Sender<T>, Receiver<T>) {
+    made(Room::paced(owner), at_place::<T>)
+}
+
 /// A queue with no bound, counted as `owner`'s at its items' places ([`place_of`]): every send goes at once,
 /// none waits or is told it's full, as into an unbounded channel (goal 4, plan 01a1a59c2a9c step 5). For
 /// senders that must never wait, whose items something else bounds (each use says what).
@@ -503,7 +650,7 @@ impl<T> Drop for Sender<T> {
 
 impl<T> std::fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sender").field("held", &self.room.held()).field("bound", &self.room.bound).finish()
+        f.debug_struct("Sender").field("held", &self.room.held()).field("bound", &self.room.bound()).finish()
     }
 }
 
@@ -520,6 +667,7 @@ impl<T> Sender<T> {
     /// Queues `item`, waiting first while the queue has no room for it: an error, with the item, once no
     /// one takes from the queue any more.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
+        self.room.made();
         let bytes = (self.chan.weigh)(&item);
         if self.is_closed() || !self.room.take(bytes).await {
             return Err(SendError(item));
@@ -530,6 +678,7 @@ impl<T> Sender<T> {
     /// Queues `item` if it has room now: `Full` (with the item) when it hasn't, `Closed` when no one takes
     /// from it any more.
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        self.room.made();
         let bytes = (self.chan.weigh)(&item);
         if self.is_closed() {
             return Err(TrySendError::Closed(item));
@@ -542,6 +691,7 @@ impl<T> Sender<T> {
 
     /// [`Sender::send`], blocking its thread: for a thread of its own, never the runtime's.
     pub fn send_blocking(&self, item: T) -> Result<(), SendError<T>> {
+        self.room.made();
         let bytes = (self.chan.weigh)(&item);
         if self.is_closed() || !self.room.take_blocking(bytes, None) {
             return Err(SendError(item));
@@ -552,6 +702,7 @@ impl<T> Sender<T> {
     /// Queues `item` whatever the queue holds: for a sender that must never wait, its item counted all the
     /// same (each use says why it can't wait).
     pub fn force_send(&self, item: T) -> Result<(), SendError<T>> {
+        self.room.made();
         let bytes = (self.chan.weigh)(&item);
         if self.is_closed() {
             return Err(SendError(item));
@@ -566,6 +717,7 @@ impl<T> Sender<T> {
         match self.chan.items.push(Weighed { bytes, item }) {
             Ok(()) => {
                 self.chan.takers.wake();
+                self.room.sent(bytes);
                 Ok(())
             }
             Err(refused) => {
@@ -606,7 +758,7 @@ impl<T> Sender<T> {
 
     /// The most the queue holds, in bytes.
     pub fn bound(&self) -> usize {
-        self.room.bound
+        self.room.bound()
     }
 
     /// Whether `other` sends into the same queue.
@@ -721,6 +873,9 @@ impl<T> Taking<T> {
 
     /// An item taken: its bytes let go, which wakes whoever waits for room.
     fn taken(&self, w: Weighed<T>) -> T {
+        if self.room.pace.is_some() {
+            self.room.taken(w.bytes, !self.chan.items.is_empty());
+        }
         self.room.give(w.bytes);
         w.item
     }
@@ -765,7 +920,7 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> std::fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Receiver").field("held", &self.inner.room.held()).field("bound", &self.inner.room.bound).finish()
+        f.debug_struct("Receiver").field("held", &self.inner.room.held()).field("bound", &self.inner.room.bound()).finish()
     }
 }
 
@@ -841,7 +996,7 @@ impl<T> Receiver<T> {
 
     /// The most the queue holds, in bytes.
     pub fn bound(&self) -> usize {
-        self.inner.room.bound
+        self.inner.room.bound()
     }
 
     /// Whether the queue is closed (no sender, or [`Receiver::close`]).
@@ -860,6 +1015,66 @@ impl<T> Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Consts-audit B4: a pipe's room is what its consumer takes while its producer makes its next item, an item past it,
+    /// each learned, where a queue held a fixed count of places (4, 16, 256: the channels' they replaced) whatever took
+    /// them. Do: KiB items; nothing learned yet; a producer making one every 10 ms and a consumer taking one a millisecond
+    /// with more waiting; then a consumer taking one each 20 ms; then a producer making one every 100 ms; and a pipe's
+    /// ends, an item through it. Expect: two items until both are learned; then 11 KiB (ten items' draining during a make,
+    /// an item past it); with the slow consumer 1.5 KiB (the producer an item and a half ahead at the most); with the slow
+    /// producer 6 KiB (more ahead, to keep the consumer fed while it makes the next); a pipe's room one item until its
+    /// first send, then two.
+    #[test]
+    fn b4_a_pipes_room_is_what_its_consumer_takes_while_its_producer_makes_the_next() -> anyhow::Result<()> {
+        const KIB: usize = 1024;
+        let ms = |n: u64| n * 1_000_000;
+        let pace = Pace::new();
+        anyhow::ensure!(pace.room(KIB) == 2 * KIB, "nothing learned: two items");
+        // A producer making an item every 10 ms (its sends' ends 10 ms apart, each made just before it's sent).
+        let mut t = ms(1);
+        for _ in 0..32 {
+            pace.made_at(t);
+            pace.sent_at(t);
+            t += ms(10);
+        }
+        anyhow::ensure!(pace.room(KIB) == 2 * KIB, "the producer's pace alone: two items");
+        // A consumer taking an item a millisecond, more waiting behind each.
+        let mut c = ms(1);
+        for _ in 0..32 {
+            pace.taken_at(c, KIB, true);
+            c += ms(1);
+        }
+        anyhow::ensure!(pace.room(KIB) == 11 * KIB, "a fast consumer: {} bytes", pace.room(KIB));
+        let slow = Pace::new();
+        for k in 0..32 {
+            slow.made_at(ms(10 * k));
+            slow.sent_at(ms(10 * k));
+            slow.taken_at(ms(20 * k), KIB, true);
+        }
+        anyhow::ensure!(slow.room(KIB) == KIB + KIB / 2, "a slow consumer: {} bytes", slow.room(KIB));
+        let ahead = Pace::new();
+        for k in 0..32 {
+            ahead.made_at(ms(100 * k));
+            ahead.sent_at(ms(100 * k));
+            ahead.taken_at(ms(20 * k), KIB, true);
+        }
+        anyhow::ensure!(ahead.room(KIB) == 6 * KIB, "a slow producer: {} bytes", ahead.room(KIB));
+        // A consumer that waited for each item teaches nothing of its own pace.
+        let waiting = Pace::new();
+        for k in 0..32 {
+            waiting.made_at(ms(10 * k));
+            waiting.sent_at(ms(10 * k));
+            waiting.taken_at(ms(10 * k), KIB, false);
+        }
+        anyhow::ensure!(waiting.room(KIB) == 2 * KIB, "a consumer waiting on its producer: two items");
+        static OWNER: Owner = Owner::new("test_queue_pipe");
+        let (tx, rx) = pipe::<Vec<u8>>(&OWNER);
+        anyhow::ensure!(tx.bound() == 0, "a pipe's room before its first send: an item alone");
+        tx.try_send(vec![0; KIB]).map_err(|_| anyhow::anyhow!("the first item"))?;
+        anyhow::ensure!(tx.bound() == 2 * counted(&vec![0u8; KIB]), "after its first send: two items, {}", tx.bound());
+        anyhow::ensure!(rx.try_recv().map(|v| v.len()) == Ok(KIB), "the item through it");
+        Ok(())
+    }
 
     /// A test's item, counted (its place with it) at `0` bytes: at least [`PLACE`].
     struct Item(usize);

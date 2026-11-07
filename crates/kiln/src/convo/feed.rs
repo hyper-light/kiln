@@ -1523,8 +1523,8 @@ mod tests {
     /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R4: a feed with a batch on its way is woken by none of its store's
     /// commits meanwhile ([`Store::watch`]: a task of its own took each commit's word and passed it on, both woken for every
     /// commit), and ships them all once the batch is taken. Do: at its store's tip, one update (sent at once, not taken); up to
-    /// ten commits a writer's commit apart (`COMMIT_MS`), each waited for, for four seconds at the most (a loaded disk holds a
-    /// commit for hundreds of ms); count its wakes over them. Expect: one a second at the most, its wait's own bound, not
+    /// ten commits, each waited for, for four seconds at the most (a loaded disk holds a commit for hundreds of ms); count its
+    /// wakes over them. Expect: one a second at the most, its wait's own bound, not
     /// one a commit (more commits than that, so a wake a commit would show); every event at the server once it's taken.
     #[test]
     fn g9_s5_r4_a_feed_with_a_batch_on_its_way_is_woken_by_no_commit_meanwhile() -> anyhow::Result<()> {
@@ -1543,7 +1543,6 @@ mod tests {
                 runner.send("a1", &said(&format!("m{}", commits + 2), commits + 2, "meanwhile"));
                 runner.sync()?;
                 (took_for, wakes) = (began.elapsed(), ship.stats.wakes().saturating_sub(before));
-                crate::rt::sleep(Duration::from_millis(super::super::store::COMMIT_MS)).await;
             }
             let most = took_for.as_secs() + 1;
             anyhow::ensure!(commits > most, "{commits} commits against at most {most} wakes: too few to tell a wake a commit from none");

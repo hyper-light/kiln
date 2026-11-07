@@ -229,7 +229,7 @@ and fetch for kiln today; Server-Sent Events, streaming fetch and fetch for the 
 capture on each client link, `crates/kiln-lab/web/capture.py`: a raw packet socket in the client's
 own namespace, every frame's length and time, written as pcap with the browser's TLS keys beside it
 for goal 7) and `--stall 10` (the server stopped, every process of it, for 2 s, 10 s into each
-request job). On 2026-11-04 (`~/.cache/kiln-bp/g1/check4`, the good link, kiln today, h2o over
+request job). On 2026-11-04 (`docs/browser-lab/2026-11-04/check4.json`, the good link, kiln today, h2o over
 HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
 
 - calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs); in the
@@ -240,7 +240,7 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   26 µs and 226 µs in two jobs, WebKit's (in the image) 606 µs and 662 µs. Both have a cause, read
   from the jobs' echoes:
   - WebKit's page timer steps by 1 ms (`timer_grain_us` 1000, cross-origin isolated; Chromium's
-    5 µs; a 5 s job on one link, `~/.cache/kiln-bp/g1/grain`): its round trips read 0 or 1,000 µs,
+    5 µs; a 5 s job on one link, `docs/browser-lab/2026-11-05/grain.json`): its round trips read 0 or 1,000 µs,
     so an offset from them is off by up to a millisecond whatever the link does. WebKit's residuals
     (20 to 662 µs, within its grain) are its timer's, and its limit is its grain (plan v5);
   - Chromium's 226 µs was one group of ten, in one job: every one of its 40 echoes took 745 µs or
@@ -262,7 +262,7 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   (unique to each link, not to each job), so kiln answered each as a repeat of Chromium's. A write's
   id now carries the job's number in the run too (`l` + link + job in three base-36 digits + the
   request's in five: still ten characters, as the UI's `lab-rec-12`). Then (2026-11-05, K = 8,
-  `~/.cache/kiln-bp/g1/check4c`, kiln today and h2o over HTTP/2, both browsers) every answer was
+  `docs/browser-lab/2026-11-05/check4c.json`, kiln today and h2o over HTTP/2, both browsers) every answer was
   154 to 156 bytes, as the recording's, the `seq` digits apart: 155.8 against 156 (0.1%), within 2%;
   in the same run `GET /api/agents` 1.3%, `GET /api/me` 0.0%, `GET /api/overview` 0.3%. The
   calibration there, each browser held to its own limit: Chromium's worst job 67.2 µs and median
@@ -295,7 +295,7 @@ a JSON string (the escapes are the carrier's cost, in its bytes). Then every fra
 both carriers, the replay's digests the catalogue's (`node check-origin.mjs`, exit 0). `kiln-lab
 browser start-stop` runs the same check through each reference server, the first of its 20 starts
 (`check-origin.mjs served`: the server's HTTP/2, gzip asked for, in a client's namespace).
-On 2026-11-05 (`~/.cache/kiln-bp/g1/check5c-ss`, the final configs, h2o's binary
+On 2026-11-05 (`kiln-lab browser start-stop --times 20`, which prints what it found and keeps no run file; the final configs, h2o's binary
 `8b2d8a23…`, Caddy's `4ef1f68c…`): h2o and Caddy over HTTP/2 and HTTP/3 each came up 20 of 20 and
 stopped clean 20 of 20, served 14 of 14 static bodies byte for byte, and sent on every stream frame
 whole on both carriers, gzipped (75,583 + 23,019 + 11,981 + 6,001 frames each), each frame from its
@@ -309,7 +309,7 @@ in. Each job's record says which protocol each path came over (`nextHopProtocol`
 reference server, which its access log says (`server_protocols`: WebKit gives a stream the page
 holds open no timing entry, so a WebKit stream's protocol is the server's word); `check-probe`
 holds every path of every reference server's job to its target's protocol. On 2026-11-05
-(`~/.cache/kiln-bp/g1/check5c`, K = 1, streams and requests): h2o and Caddy over HTTP/2 11 of 11
+(`docs/browser-lab/2026-11-05/check5c.json`, K = 1, streams and requests): h2o and Caddy over HTTP/2 11 of 11
 paths over h2 in Chromium and in WebKit (WebKit 27.2 in Playwright's image under podman; 3 of its
 11, the streams, by the servers' logs), h2o and Caddy over HTTP/3 11 of 11 over h3 in Chromium;
 `check-probe` exit 0.
@@ -1043,6 +1043,40 @@ than step 6 planned, and by how much, is in "Step 8: the matrix".
 | good/5 | cpu p99.9 (µs) | 14998 (10985–35561) n=11363 | 2378 (1728–2939) n=9016 | - | 1243 (1097–2793) n=8961 | - | h2o-h2 1243 |
 <!-- browser-lab tables: end -->
 
+### What the numbers say
+
+Every number here is `pass1/say.py`'s, over the tables above (`kiln-lab browser report
+docs/browser-lab/2026-11-06/matrix.json`): a ratio is kiln today's median over the best baseline's in
+the same cell, its median over the cell's losses and browsers, with the least and the most.
+
+- **Kiln today is the best target in 38 of the 486 numbers**: 32 of a request (most of them its
+  bytes at p99 or p99.9, the largest answers) and a stream's
+  p50 time on the good link in all 6 of its cells. h2o over HTTP/2 is the best in 177, Caddy over
+  HTTP/2 in 133, Caddy over HTTP/3 in 79 and h2o over HTTP/3 in 59.
+- **Bytes.** Kiln today sends JSON uncompressed (f8) and each baseline compresses it; a stream's
+  event costs kiln today 2.6 times the best baseline's bytes at p50 on the good link, 6.8 at
+  100 kbit/s and 12.9 at 50 kbit/s (12.3 to 14.4); a burst's message 11.2, 5.7 and 7.8; a request,
+  2.6, 13.1 and 6.8 at p50, while at p99 and p99.9 a request's bytes are about the same (0.9 to 1.6).
+- **Time.** On the good link kiln today's p50 is the best baseline's (stream 0.99, burst 1.04,
+  request 1.07) and its tail is not: p99 1.75, 2.99 and 2.10. On the slow links the bytes become
+  time: a burst's message reaches the page 10.5 (100 kbit/s) and 10.9 times (50 kbit/s) later at
+  p50 and 8.1 and 9.6 times at p99; a stream's event 6.8 and 13.4 times later at p99, though its p50
+  is near (1.13, 1.46). Requests stay within about 2 (p50 2.08 at 50 kbit/s, p99 1.08 to 1.20). At
+  50 and 100 kbit/s kiln today's stream times are lower bounds and its WebKit requests at 50 kbit/s
+  are of the ones that completed ("Step 8: the matrix").
+- **Server CPU.** Where the lab resolves it, kiln today spends 5 to 53 times the best baseline's
+  CPU per operation at p99: a burst's message 5.1, 6.2 and 22.3 times (100 kbit/s, 50 kbit/s, the
+  good link), a stream's event 15.9, 53.4 and 23.1, a request 16.3, 26.7 and 14.6. Many of its p50s,
+  and some of the baselines', are under the background's noise and give the mean (step 4's rule).
+- **HTTP/3 against HTTP/2** (the better of h2o and Caddy on each, Chromium): the same on a clean
+  link (time p99 0.99 at 0% loss) and better as loss grows: time p99 0.91 at 1% and 0.75 at 5%
+  (0.21 to 1.89 over the cells), p99.9 0.74 at 5%. Bytes are about the same (p50 0.90 to 0.91 at
+  each loss).
+- **For goal 10's bar** (a cell meets 1/10 when the whole interval of kiln's value over the best
+  baseline's is at or under 0.1): the best baseline in nearly every cell is an HTTP/2 or HTTP/3
+  server that compresses, and kiln today is near it or several times it, so the new protocol has
+  to be ten times better than that server, not than kiln today.
+
 ### Where the run stands
 
 **Pass 0, superseded.** The first pilot ran from 2026-11-05 03:37Z to 08:31Z (pilot-good done,
@@ -1113,12 +1147,28 @@ median 33, at most 114, CPU pressure (some, avg10) median 9%; every job records 
 
 ### Step 7: the pilot's checks
 
-`pass1/step7.sh` (on the lab machine, after the pilot's parts and `pass1/fedora-kcheck.parts`):
+`pass1/step7.sh` (on the lab machine, after the pilot's parts and `pass1/fedora-kcheck.parts`). Its
+run files are in the repository (each `kiln-lab browser merge --slim` of the part's own): the
+pilot, `docs/browser-lab/2026-11-05/pilot.json` (240 jobs, the six pilot parts), and the K check's
+cells, `docs/browser-lab/2026-11-05/{k1,k1b,k2,k4,xm}-50k-stream.json` and `k1-good-request.json`;
+each number below comes again from them as written:
+
+```sh
+D=docs/browser-lab/2026-11-05
+kiln-lab browser compare $D/pilot.json kiln-today kiln-today-b                          # the A/A: 0 of 108
+kiln-lab browser compare $D/pilot.json kiln-today kiln-today --b-run $D/k1-good-request.json   # K = 8 against 1: 0 of 18
+kiln-lab browser compare $D/pilot.json kiln-today kiln-today --b-run $D/k1-50k-stream.json     # 0 of 18
+kiln-lab browser compare $D/xm-50k-stream.json kiln-today kiln-today --b-run $D/k1-50k-stream.json   # 2 of 18
+kiln-lab browser compare $D/k4-50k-stream.json kiln-today kiln-today --b-run $D/k1-50k-stream.json   # 3 of 18
+kiln-lab browser compare $D/k2-50k-stream.json kiln-today kiln-today --b-run $D/k1-50k-stream.json   # 0 of 18
+kiln-lab browser compare $D/k2-50k-stream.json kiln-today kiln-today --b-run $D/k1b-50k-stream.json  # 0 of 18
+kiln-lab browser compare $D/k1-50k-stream.json kiln-today kiln-today --b-run $D/k1b-50k-stream.json  # 0 of 18
+```
 
 - **The A/A**: kiln today against itself (`kiln-today-b`), interleaved on the same seeds, in both
   browsers, good/0 and 50k/1, each case: **0 of 108** numbers differ beyond noise (each held so all
   108 hold together at 95%, Bonferroni). The bar is 5%.
-- **Every number has its interval and sample count**: the pilot's tables (120 rows,
+- **Every number has its interval and sample count**: the pilot's tables (108 rows,
   `kiln-lab browser report` of the merged pilot) give each target's median of its rounds, its 95%
   interval and n, and each time p99.9 its within-round band.
 - **Report and compare read the run files back**: for each pilot part, the tables `report` prints

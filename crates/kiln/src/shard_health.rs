@@ -55,7 +55,8 @@
 //!   those withdrawn, the wakes it took in and those its thread made (`kiln_shard_wakes_sent_total{to}`), the kicks
 //!   it sent and was saved, the threads it unparked; its readiness registrations, and its tasks' TCP accepts,
 //!   reads and writes, with those that moved nothing (`kiln_shard_socket_calls_idle_total{call}`). Copied at the
-//!   probe's first wake and every [`COUNTS_EVERY`]th after: these families move every 100 ms, the rest every wake.
+//!   probe's first wake and then for each read of `/metrics`, a period before it at the most ([`Reads`]): the rest
+//!   every wake.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -100,19 +101,59 @@ pub const fn lab_period_bound(window: Duration, shards: u64) -> Duration {
     Duration::from_nanos((window_ns.saturating_mul(shards as u128) / TAIL_PROBES as u128) as u64)
 }
 
-/// The oldest the copies of a shard's parks, wakes and calls may be ([`COUNTS_EVERY`]): kiln-lab reads them as
-/// differences across its window (`window_s`: 60 s, 10 s at the shortest), so a copy this old moves a window's count by
-/// 2 × 0.1 s / 10 s = 2% at the most, 0.3% over the default (goal 9, plan 01a1a87b2cec step 5).
-pub const COUNTS_AGE: Duration = Duration::from_millis(100);
+/// When `/metrics` is read, learned (consts-audit B3; goal 9, plan 01a1a87b2cec step 5): the probes copy what moves too
+/// often to copy at every wake (what a shard's parks, wakes and calls cost it: [`Wakes`], [`Calls`], [`ParkTimes`],
+/// [`Spins`]) and read their thread's wait where nothing judges it (`crate::nudge`) only for the read that may come next,
+/// a period before it at the most. They copied at every 5th wake (`COUNTS_EVERY`), whatever read them, from an age of
+/// 100 ms that kiln-lab's 10 s window could spare (`COUNTS_AGE`). Every read finds them a period old at the most; between
+/// reads, and with no reader, they copy nothing. The delay, how late, the most late, the last wake, the CPU time and the
+/// tasks stay each wake's own: goal 9's step 1 reads those at every wake.
+pub struct Reads {
+    /// The last read, nanoseconds since [`base`]: 0, none yet.
+    last_ns: AtomicU64,
+    /// The time between reads, learned as RFC 6298 learns a round trip (`crate::rt::Smoothed`).
+    every: crate::rt::Smoothed,
+}
 
-/// Every how many of its wakes a probe copies what its shard's parks, wakes and calls cost it ([`Wakes`], [`Calls`],
-/// [`ParkTimes`]: 34 counts) to `/metrics`, its first wake among them (goal 9, plan 01a1a87b2cec step 5): as many whole
-/// periods as [`COUNTS_AGE`] holds (5 of 17.07 ms, every 85 ms). The delay, how late, the most late, the last wake, the
-/// CPU time and the tasks stay each wake's own: goal 9's step 1 reads those at every wake.
-pub const COUNTS_EVERY: u64 = {
-    let every = COUNTS_AGE.as_nanos() / PERIOD.as_nanos();
-    if every == 0 { 1 } else { every as u64 }
-};
+impl Reads {
+    pub const fn new() -> Self {
+        Self { last_ns: AtomicU64::new(0), every: crate::rt::Smoothed::nothing_yet() }
+    }
+
+    /// A read at `now_ns` (since [`base`]): the time since the last one learned.
+    pub fn read(&self, now_ns: u64) {
+        let last = self.last_ns.swap(now_ns.max(1), Ordering::Relaxed);
+        if last != 0 && now_ns > last {
+            self.every.learn(now_ns - last);
+        }
+    }
+
+    /// Whether a run at `now_ns`, `period_ns` before the next, copies for the read that may come next: until two reads have
+    /// taught their pace, every run; then each run from a period before the earliest the next read may come (the last, and
+    /// the time between reads less four deviations) through a period past the latest (plus four): every read finds a copy
+    /// a period old at the most. Past that the reader's gone: none until it reads again.
+    pub fn due(&self, now_ns: u64, period_ns: u64) -> bool {
+        let (last, Some(mean)) = (self.last_ns.load(Ordering::Relaxed), self.every.mean()) else { return true };
+        let spread = self.every.dev().saturating_mul(4).saturating_add(period_ns);
+        let since = now_ns.saturating_sub(last);
+        since.saturating_add(spread) >= mean && since <= mean.saturating_add(spread)
+    }
+}
+
+impl Default for Reads {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process's reads of `/metrics` ([`Reads`]), which every probe copies for.
+static READS: Reads = Reads::new();
+
+/// Whether what's copied for `/metrics` is due at `now` ([`Reads::due`], the probes' period apart): the nudge's reading of
+/// its thread's wait, where nothing judges it, too (`crate::nudge`).
+pub(crate) fn copies_due(now: Instant) -> bool {
+    READS.due(nanos(now.saturating_duration_since(base())), nanos(PERIOD))
+}
 
 /// How late a probe ran, in seconds (goal 9, plan 01a1a87b2cec step 1): a shard's ready work is to run within
 /// a millisecond at p99.9 (Ada, 2026-11-05), so the buckets resolve that millisecond: 25 µs apart to 250 µs,
@@ -397,7 +438,7 @@ impl Shard {
     /// start isn't known: its latest lateness is then none, the shard having been parked as the probe fell due), the
     /// shard's counts as the run read them (`counters`) and its thread's CPU time (`cpu`, [`CpuClock`]); on the shard,
     /// so what it reads of the shard is the shard's own.
-    fn note(&self, sample: Option<(Duration, By)>, now: Instant, counters: Option<&hyper_rt::shard_loop::Counters>, cpu: Option<u64>) {
+    fn note(&self, sample: Option<(Duration, By)>, now: Instant, counters: Option<&hyper_rt::shard_loop::Counters>, cpu: Option<u64>, copy: bool) {
         let late = sample.map_or(Duration::ZERO, |(late, _)| late);
         let late_ns = nanos(late);
         if let Some((_, by)) = sample {
@@ -424,8 +465,8 @@ impl Shard {
             let tasks = held_tasks(c);
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
-            // At its first run and every [`COUNTS_EVERY`]th after.
-            if run.is_multiple_of(COUNTS_EVERY) {
+            // At its first run, and for the next read of `/metrics` ([`Reads`]).
+            if copy || run == 0 {
                 self.wakes.store(&Wakes::of(c));
                 self.calls.store(&Calls::of(c));
                 self.parks.store(&ParkTimes::of(c));
@@ -647,7 +688,7 @@ pub fn start(period: Duration) -> usize {
 /// Shard `i`'s probe: runs every `period` on its shard and notes how late ready work ran there.
 async fn probe(i: usize, period: Duration) {
     let Some(me) = shards().get(i) else { return };
-    wake_every(me, i, period, u64::MAX).await;
+    wake_every(me, i, period, u64::MAX, &READS).await;
 }
 
 /// `me`'s probe on shard `i`, for `runs` runs, each a `period` after the last one ran, in a quiet sleep (goal 9, plan
@@ -657,8 +698,9 @@ async fn probe(i: usize, period: Duration) {
 /// (a kick from its sender's stamp; another timer from its deadline), to the probe's run; parked a whole period, the
 /// probe's own timer, from its deadline. A wake whose start the shard doesn't know (a socket's readiness, a completion)
 /// gives no sample: goal 9 step 1's samples are the rest, none skipped. Off a shard, or beside another quiet sleep on
-/// it, a sleep on the shard's timers as before, a probe's sample.
-async fn wake_every(me: &Shard, i: usize, period: Duration, runs: u64) {
+/// it, a sleep on the shard's timers as before, a probe's sample. What moves too often to copy at every run is copied for
+/// `reads` ([`Reads`]).
+async fn wake_every(me: &Shard, i: usize, period: Duration, runs: u64, reads: &Reads) {
     let span_ns = nanos(period);
     let mut clock = CpuClock::Unchosen;
     for _ in 0..runs {
@@ -675,7 +717,7 @@ async fn wake_every(me: &Shard, i: usize, period: Duration, runs: u64) {
         // of its own (goal 9, plan 01a1a87b2cec step 5).
         let counters = hyper_rt::futures::shard_counters();
         let cpu = clock.read();
-        me.note(sample, now, counters.as_ref(), cpu);
+        me.note(sample, now, counters.as_ref(), cpu, reads.due(nanos(now.saturating_duration_since(base())), span_ns));
         // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4): a
         // run with no sample, none late (the shard was parked as the probe fell due: no queue).
         crate::overload::tick(i, sample.map_or(Duration::ZERO, |(late, _)| late), cpu, counters.as_ref());
@@ -750,6 +792,8 @@ fn secs(d: Duration) -> f64 {
 
 /// The `kiln_shard_*` families, in the exposition.
 pub fn render(o: &mut String) {
+    // A read, which the probes learn the pace of and copy for (consts-audit B3).
+    READS.read(nanos(Instant::now().saturating_duration_since(base())));
     let all = shards();
     let help = |o: &mut String, name: &str, kind: &str, h: &str| {
         let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
@@ -1215,8 +1259,7 @@ mod tests {
     /// Goal 9, plan 01a1a87b2cec step 5: the probes' period is the longest that sees what they must: hyper-rt's
     /// watchdog's limit as the shards' runtime is configured with it (a probe is due inside every hold it reports), and
     /// within the lab's tail of the shards' delay (kiln-lab's realistic profile, a 60 s window across the lab's four
-    /// shards, `crate::os::alloc::SHARDS`: ten probes past its p99.9 or more); the copies of a shard's counts as many
-    /// whole periods apart as their age allows; overload's tolerance many periods long.
+    /// shards, `crate::os::alloc::SHARDS`: ten probes past its p99.9 or more); overload's tolerance many periods long.
     #[test]
     fn g9_s5_the_probes_period_sees_every_hold_the_watchdog_reports_and_the_labs_tail() -> anyhow::Result<()> {
         let c = crate::rt::runtime_config(4, 64);
@@ -1226,8 +1269,6 @@ mod tests {
         anyhow::ensure!(PERIOD <= lab && lab == Duration::from_millis(24), "within the lab's tail: {PERIOD:?}, its bound {lab:?}");
         let probes = Duration::from_secs(60).as_nanos() * u128::from(crate::os::alloc::SHARDS) / PERIOD.as_nanos();
         anyhow::ensure!(probes >= u128::from(TAIL_PROBES), "{probes} probes a round");
-        let every = u32::try_from(COUNTS_EVERY)?;
-        anyhow::ensure!(PERIOD * every <= COUNTS_AGE && PERIOD * (every + 1) > COUNTS_AGE, "copies {every} periods apart");
         let tolerance = Duration::from_millis(u64::from(crate::headroom::settings::PLATFORM_TOLERANCE_MS));
         anyhow::ensure!(tolerance.as_nanos() / PERIOD.as_nanos() == 58, "overload's tolerance: {} periods", tolerance.as_nanos() / PERIOD.as_nanos());
         Ok(())
@@ -1268,7 +1309,7 @@ mod tests {
             let start = Instant::now();
             let before = hyper_rt::futures::shard_counters().unwrap_or_default();
             // No overload watch for this shard (its index is none): the shard's samples alone.
-            wake_every(&me, usize::MAX, PERIOD, runs).await;
+            wake_every(&me, usize::MAX, PERIOD, runs, &Reads::new()).await;
             let took = start.elapsed();
             let after = hyper_rt::futures::shard_counters().unwrap_or_default();
             let s = me.snapshot();
@@ -1352,7 +1393,7 @@ mod tests {
                 let _ = hyper_rt::futures::sleep(1_000_000).await;
                 first = hyper_rt::futures::shard_counters().unwrap_or_default();
             }
-            wake_every(&me, usize::MAX, PERIOD, runs).await;
+            wake_every(&me, usize::MAX, PERIOD, runs, &Reads::new()).await;
             let after = hyper_rt::futures::shard_counters().unwrap_or_default();
             shard_stop.store(true, Ordering::SeqCst);
             Ok((me.runs(), me.delay_by(By::Work).count(), me.delay_by(By::Probe).count(), first, after))
@@ -1388,10 +1429,10 @@ mod tests {
         let _ = base();
         let me = Shard::new();
         let now = Instant::now();
-        me.note(Some((Duration::from_micros(40), By::Work)), now, None, None);
-        me.note(Some((Duration::from_micros(150), By::Probe)), now, None, None);
-        me.note(Some((Duration::from_micros(60), By::Work)), now, None, None);
-        me.note(None, now, None, None);
+        me.note(Some((Duration::from_micros(40), By::Work)), now, None, None, false);
+        me.note(Some((Duration::from_micros(150), By::Probe)), now, None, None, false);
+        me.note(Some((Duration::from_micros(60), By::Work)), now, None, None, false);
+        me.note(None, now, None, None, false);
         let s = me.snapshot();
         assert_eq!((me.runs(), s.probes, s.late, s.most_late), (4, 3, Duration::ZERO, Duration::from_micros(150)));
         assert_eq!((me.delay_by(By::Work).count(), me.delay_by(By::Probe).count()), (2, 1));
@@ -1409,24 +1450,70 @@ mod tests {
         }
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a probe copies what its shard's parks, wakes and calls cost it at its first
-    /// run and every [`COUNTS_EVERY`]th after (those families move every 100 ms), while each run's own samples (its
-    /// delay, the shard's polls) are noted at every run as before.
+    /// Consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): a probe copies what its shard's parks, wakes and calls cost it at
+    /// its first run and then for `/metrics`' next read, as learned, where it copied at every 5th run whatever read them
+    /// (`COUNTS_EVERY`, from a 100 ms age kiln-lab's window could spare). Do: runs a period (17 ms) apart; no reads yet,
+    /// then one, then reads every second, then every 100 ms, then none for a long while; and a real probe's runs on a shard
+    /// for reads unlearned, then for reads learned a second apart. Expect: every run copies until two reads have taught
+    /// their pace; reads a second apart, only the runs within a period of the next read as the reads' spread allows, so
+    /// each read finds a copy a period old at the most (a few runs in 58); reads 100 ms apart, more of the runs; a reader
+    /// gone, none; the probe copies at every run for unlearned reads, and at its first run alone between learned ones,
+    /// each run's own samples noted at every run all the same.
     #[test]
-    fn g9_s5_a_probe_copies_parks_wakes_and_calls_every_tenth_wake() -> anyhow::Result<()> {
+    fn b3_a_probe_copies_its_shards_counts_for_the_next_read_of_metrics() -> anyhow::Result<()> {
+        let period = nanos(PERIOD);
+        let ms = |n: u64| n * 1_000_000;
+        let step = usize::try_from(period)?;
+        let reads = Reads::new();
+        anyhow::ensure!((0..ms(1_000)).step_by(step).all(|t| reads.due(t, period)), "no reads: every run copies");
+        reads.read(ms(1_000));
+        anyhow::ensure!((ms(1_000)..ms(2_000)).step_by(step).all(|t| reads.due(t, period)), "one read: every run still");
+        // The runs in a second that copy for a reader reading every `every` ms, after twenty reads taught its pace: the
+        // second starts at a read, and the reads go on through it.
+        let copies_a_second = |every: u64| {
+            let reads = Reads::new();
+            let mut next = 0;
+            while next <= ms(20 * every) {
+                reads.read(next);
+                next += ms(every);
+            }
+            let from = next - ms(every);
+            let mut copies = 0;
+            for t in (from..from + ms(1_000)).step_by(step) {
+                while next <= t {
+                    reads.read(next);
+                    next += ms(every);
+                }
+                copies += usize::from(reads.due(t, period));
+            }
+            (copies, reads)
+        };
+        let (near, second) = copies_a_second(1_000);
+        anyhow::ensure!((1..=4).contains(&near), "reads a second apart: {near} of 59 runs copy for the next");
+        let last = ms(20_000);
+        anyhow::ensure!(second.due(last + ms(1_000) - period / 2, period) && !second.due(last + ms(500), period), "a copy just before the next read, none halfway");
+        let (often, _) = copies_a_second(100);
+        anyhow::ensure!((8..=12).contains(&often) && often > near, "reads 100 ms apart: {often} runs a second copy, against {near} for reads a second apart");
+        anyhow::ensure!(!second.due(last + ms(30_000), period), "a reader gone: no copies");
         let _ = base();
-        on_a_shard(async {
+        on_a_shard(async move {
             let me = Shard::new();
-            wake_every(&me, usize::MAX, PERIOD, 1).await;
+            wake_every(&me, usize::MAX, PERIOD, 1, &Reads::new()).await;
             let first = (me.wakes(), me.calls(), me.parks());
-            anyhow::ensure!(first.0.steps > 0, "copied at the first wake: {first:?}");
-            wake_every(&me, usize::MAX, PERIOD, COUNTS_EVERY - 1).await;
+            anyhow::ensure!(first.0.steps > 0, "copied at the first run: {first:?}");
+            wake_every(&me, usize::MAX, PERIOD, 1, &Reads::new()).await;
+            anyhow::ensure!(me.wakes().steps > first.0.steps, "reads unlearned: copied again");
+            // Reads a second apart, the last of them now.
+            let learned = Reads::new();
+            for _ in 0..16 {
+                learned.every.learn(ms(1_000));
+            }
+            learned.last_ns.store(nanos(Instant::now().saturating_duration_since(base())).max(1), Ordering::Relaxed);
+            let copied = (me.wakes(), me.calls(), me.parks());
             let polls = me.snapshot().polls;
-            anyhow::ensure!((me.wakes(), me.calls(), me.parks()) == first, "copied again before its {COUNTS_EVERY}th wake after");
-            wake_every(&me, usize::MAX, PERIOD, 1).await;
-            anyhow::ensure!(me.wakes().steps > first.0.steps, "not copied again at its {COUNTS_EVERY}th wake after");
-            let s = me.snapshot();
-            anyhow::ensure!(me.runs() == COUNTS_EVERY + 1 && s.polls > polls, "each run noted all the same: {s:?}");
+            wake_every(&me, usize::MAX, PERIOD, 3, &learned).await;
+            anyhow::ensure!((me.wakes(), me.calls(), me.parks()) == copied, "between learned reads: no copies");
+            anyhow::ensure!(me.runs() == 5 && me.snapshot().polls > polls, "each run noted all the same");
             Ok(())
         })
     }
@@ -1456,7 +1543,7 @@ mod tests {
             }
             anyhow::ensure!(clock.read() >= first, "the chosen clock only moves on");
             let me = Shard::new();
-            wake_every(&me, usize::MAX, PERIOD, 3).await;
+            wake_every(&me, usize::MAX, PERIOD, 3, &Reads::new()).await;
             let s = me.snapshot();
             anyhow::ensure!(me.runs() == 3 && (s.busy.is_some() || first.is_none()), "three runs noted, with the thread's CPU time: {s:?}");
             Ok(())
