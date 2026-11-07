@@ -98,6 +98,10 @@ pub struct Service {
     keys: Mutex<Option<Result<Arc<vapid::Keys>, String>>>,
     pub watch: Mutex<watch::Watch>,
     reached: Mutex<Reached>,
+    /// Tests: the events its listener took, and the turns it ended by itself, its next event to wait for its next poll
+    /// ([`listen`]): its own, where a thread's counted every listener that thread ran, another test's among them.
+    #[cfg(test)]
+    took: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
 }
 
 /// The process's client for push services (public roots), built once.
@@ -292,12 +296,6 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// Tests: the events the listener polled on this thread took, and the turns it ended by itself, its next event to wait
-    /// for its next poll ([`listen`]).
-    static TOOK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
 /// The next event waiting already for the listener on `battery` or `sessions`, a battery's first; none where neither has one.
 fn waiting(battery: &mut crate::memory::lanes::Reader<Arc<str>>, sessions: &mut crate::memory::lanes::Reader<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
     for lane in [battery, sessions] {
@@ -378,10 +376,10 @@ async fn listen(hub: &Arc<Hub>, mut rx: crate::memory::lanes::Reader<Arc<str>>, 
             heed(hub, what);
         }
         #[cfg(test)]
-        TOOK.with(|t| {
-            let (took, ended) = t.get();
-            t.set((took + 1, ended + u64::from(turns.over())));
-        });
+        {
+            hub.push.took.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            hub.push.took.1.fetch_add(u64::from(turns.over()), std::sync::atomic::Ordering::Relaxed);
+        }
         turns.end().await;
     }
 }
@@ -591,13 +589,14 @@ mod tests {
                 let low = crate::os::battery::Battery { percent: 9, ac: false, charging: false, minutes: None };
                 hub.emit(&crate::wire::events::ServerEvent::MachineBatteryLow { machine: format!("m{i}"), battery: low, text: "low".into() });
             }
-            let (took, ended) = TOOK.with(std::cell::Cell::get);
+            let took_now = |p: &Service| (p.took.0.load(std::sync::atomic::Ordering::Relaxed), p.took.1.load(std::sync::atomic::Ordering::Relaxed));
+            let (took, ended) = took_now(&hub.push);
             let (mut now, mut polls, began) = ((took, ended), 0u64, std::time::Instant::now());
             let mut listening = std::pin::pin!(listen(&hub, rx, sessions));
             std::future::poll_fn(|cx| {
                 polls += 1;
                 let _ = listening.as_mut().poll(cx);
-                now = TOOK.with(std::cell::Cell::get);
+                now = took_now(&hub.push);
                 if now.0 - took >= n || began.elapsed() > std::time::Duration::from_secs(60) { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
             })
             .await;
@@ -721,12 +720,11 @@ mod tests {
                 anyhow::ensure!(Instant::now() < deadline, "the listener never listened");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
-            let before = crate::rt::timer_wakes_in("push/mod.rs");
             hub.emit(&info(Status::Running, None));
             hub.emit(&info(Status::Waiting, Some("q1")));
             hub.emit(&info(Status::Running, None));
-            crate::rt::sleep(watch::Kind::NeedsYou.settle() * 2).await;
-            let woke = crate::rt::timer_wakes_in("push/mod.rs").saturating_sub(before);
+            // Slept in rt.rs: a sleep here would be a timer of this file's, and counted against it.
+            let woke = crate::rt::timer_wakes_over("push/mod.rs", watch::Kind::NeedsYou.settle() * 2).await;
             let went = said(&hub, "q1").await?;
             anyhow::ensure!(woke <= u64::try_from(went)?, "{woke} timer wakes for a note called off before it settled ({went} said)");
             hub.emit(&info(Status::Waiting, Some("q2")));
