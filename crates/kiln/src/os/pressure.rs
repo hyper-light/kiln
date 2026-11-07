@@ -367,13 +367,13 @@ mod tests {
         let freed = crate::os::alloc::stats().unwrap_or_default();
         let block_bytes = u64::try_from(BLOCK).unwrap_or(u64::MAX);
         assert!(freed.dirty >= block_bytes / 2, "the freed block's pages are dirty until its decay: {freed:?}");
-        let faults = crate::os::page_faults().unwrap_or_default();
+        let majors = || crate::os::page_faults().map(|f| f.major);
+        let before = majors();
         relieve(Source::Events);
         let purged = crate::os::alloc::stats().unwrap_or_default();
         assert!(purged.dirty < block_bytes / 2, "purged at once: {freed:?} then {purged:?}");
         assert!(heard().iter().any(|(s, n)| *s == Source::Events && *n >= 1));
         // A purge faults nothing in: it gives pages back.
-        let after = crate::os::page_faults().unwrap_or_default();
-        assert!(after.major == faults.major, "{faults:?} then {after:?}");
+        assert_eq!(majors(), before, "no page read in");
     }
 }

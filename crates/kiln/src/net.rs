@@ -530,12 +530,12 @@ pub const WINDOW: u64 = 64 << 20;
 /// runners' bytes wait in), and never under QUIC's first window (RFC 9002 §7.2), which the transport takes no ceiling
 /// below; a runner's, [`WINDOW`]. The endpoint keeps it while it lives: what's past it of a peer's waits with the peer.
 pub fn window(server: bool) -> u64 {
-    if server {
-        let share = u64::try_from(crate::memory::room::share()).unwrap_or(u64::MAX);
-        share.max(hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM))
-    } else {
-        WINDOW
-    }
+    if server { window_of(crate::memory::room::share()) } else { WINDOW }
+}
+
+/// The server's receive window for a share of `share` bytes ([`window`]): the share, never under QUIC's first window.
+pub fn window_of(share: usize) -> u64 {
+    u64::try_from(share).unwrap_or(u64::MAX).max(hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM))
 }
 
 pub fn limits(server: bool) -> Limits {

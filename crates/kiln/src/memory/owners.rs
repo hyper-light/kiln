@@ -250,9 +250,12 @@ mod tests {
         assert_eq!(out(4096).weight() - out(0).weight(), 4096);
         assert_eq!(crate::net::EVENTS_BYTES, usize::try_from(crate::net::limits(false).window_ceiling).unwrap_or(0), "a runner's events' bound is the window its net thread holds its lane at");
         assert_eq!(crate::net::OUT_BYTES, usize::try_from(crate::net::WINDOW).unwrap_or(0));
-        // The server's window is a share of what it may hold (join-burst, item 1), never under QUIC's first window.
-        let share = u64::try_from(crate::memory::room::share()).unwrap_or(0);
-        assert_eq!(crate::net::limits(true).window_ceiling, share.max(hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM)));
+        // The server's window is a share of what it may hold (join-burst, item 1), never under QUIC's first window. (Its
+        // share now is the process's, which other tests' runners measure again as they come and go.)
+        let first = hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM);
+        assert_eq!(crate::net::window_of(0), first, "no room: QUIC's first window");
+        assert_eq!(crate::net::window_of(20 << 20), 20 << 20, "a share of 20 MiB: a 20 MiB window");
+        assert!(crate::net::limits(true).window_ceiling >= first);
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a message to a session's owner weighs the texts its update
@@ -291,8 +294,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let _registry = crate::harness::registry::Registry::new(dir.path().to_path_buf());
         anyhow::ensure!(LOCAL_UPDATES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "local updates' bound: {:?}", LOCAL_UPDATES.bound());
-        let inboxes = crate::memory::room::share().saturating_mul(crate::rt::shard_count().max(1));
-        anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= inboxes), "inboxes' bound: {:?}, a share each {inboxes}", SESSION_INBOXES.bound());
+        // Each a share of what the server may hold, as it's measured (`harness::copies`'
+        // join_burst_the_servers_inboxes_hold_a_share_and_follow_it holds them to it).
+        anyhow::ensure!(SESSION_INBOXES.bound().is_some(), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
         for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite", "ui_events", "log_feeds", "terminal_feeds"] {
