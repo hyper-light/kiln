@@ -1,0 +1,12 @@
+$ bash /home/adalundhe/.cache/kiln-bp/g1/pass1/compress-probe.sh
+h2o ctype /s: content-type: text/event-stream content-encoding: br  bytes 4122
+h2o ctype /fetch: content-type: application/x-ndjson content-encoding: br  bytes 4122
+h2o ctypegz /s: content-type: text/event-stream content-encoding: gzip  bytes 668
+h2o ctypegz /fetch: content-type: application/x-ndjson content-encoding: gzip  bytes 668
+caddy probe 200
+caddy min0 /s: content-encoding: zstd content-type: text/event-stream  bytes 848
+caddy min0 /fetch: content-encoding: zstd content-type: application/x-ndjson  bytes 848
+[OCSP Stapling] failed to execute share/h2o/fetch-ocsp-response:No such file or directory
+[OCSP Stapling] disabled for certificate file:/home/adalundhe/.cache/kiln-bp/g1/compress-probe/c.pem
+received SIGTERM, gracefully shutting down
+exit 0
