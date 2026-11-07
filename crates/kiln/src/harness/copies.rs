@@ -3127,36 +3127,16 @@ fn made_of(session: &str, e: &super::model::Event, keep: bool, cwd: &str, locati
     Made { entry: Arc::new(entry), row, mentions: super::registry::mentions(session, cwd, location, e) }
 }
 
-/// What writing an event out takes by its bytes (`super::weigh::event`), as the owners write them on their shards and off
-/// (goal 9, plan 01a1a87b2cec step 3): moving averages of each one's bytes and of how long it took, nanoseconds, a new
-/// sample's weight 1/8 as RFC 6298 smooths a round trip, as `crate::wire::payload` learns what reading a runner's frame
-/// takes. Every owner learns into it, a load and a store each: a sample lost to another owner's at the same moment is one
-/// of many.
-static WRITES: Rate = Rate::new();
+/// What writing an event out takes a byte (`super::weigh::event`), as the owners write them on their shards and off (goal 9,
+/// plan 01a1a87b2cec step 3): its window's mean (`kiln_http::turn::Costs`, the bytes its units; no gain picked, where it
+/// was moving averages of bytes and times with RFC 6298's eighth, which one slow write moved an eighth of the way). Every
+/// owner learns into it, a load and a store each: a sample lost to another owner's at the same moment is one of many.
+static WRITES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
-/// A rate learned by moving averages of samples' sizes and times ([`WRITES`]).
-struct Rate {
-    bytes: AtomicU64,
-    ns: AtomicU64,
-}
-
-impl Rate {
-    const fn new() -> Self {
-        Self { bytes: AtomicU64::new(0), ns: AtomicU64::new(0) }
-    }
-
-    /// Nanoseconds a sample of `bytes` is expected to take, at the rate learned: none until one was taken.
-    fn expected(&self, bytes: u64) -> u64 {
-        bytes.saturating_mul(self.ns.load(Ordering::Relaxed)).checked_div(self.bytes.load(Ordering::Relaxed)).unwrap_or(0)
-    }
-
-    /// A sample of `bytes` took `ns`.
-    fn learn(&self, bytes: u64, ns: u64) {
-        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
-        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
-        self.bytes.store(smooth(self.bytes.load(Ordering::Relaxed), bytes), Ordering::Relaxed);
-        self.ns.store(smooth(self.ns.load(Ordering::Relaxed), ns), Ordering::Relaxed);
-    }
+/// Nanoseconds `bytes` are expected to take at `costs`' rate, its window's mean a byte ([`WRITES`]): none until one was
+/// learned.
+fn expected_ns(costs: &kiln_http::turn::Costs, bytes: u64) -> u64 {
+    costs.mean().map_or(0, |per_byte| (bytes as f64 * per_byte) as u64)
 }
 
 /// What writing out a session's state that changed costs, and a meta that changed, every session's learned together by
@@ -3260,7 +3240,7 @@ fn nanos(d: Duration) -> u64 {
 
 /// Nanoseconds writing event `e` out is expected to take ([`WRITES`]).
 pub(super) fn write_ns(e: &super::model::Event) -> u64 {
-    WRITES.expected(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
+    expected_ns(&WRITES, u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
 }
 
 /// Whether writing event `e` out is expected to take past a turn on its owner's shard (the quantum), or to cost it more than
@@ -3277,10 +3257,10 @@ pub(super) fn wrote(e: &super::model::Event, took: Duration) {
     WRITES.learn(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX), nanos(took));
 }
 
-/// What writing a changeset update out takes by its bytes (`super::weigh`'s: its files' hunks), as the owners write them on
-/// their shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
+/// What writing a changeset update out takes a byte (`super::weigh`'s: its files' hunks), as the owners write them on their
+/// shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
 /// written out as its entry ([`Mirror::take_changes`]). A runner sends one of up to its harness frame's 512 KiB.
-static CHANGES: Rate = Rate::new();
+static CHANGES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// `u`'s bytes, as [`CHANGES`] counts them.
 fn changes_bytes(u: &Update) -> u64 {
@@ -3292,7 +3272,7 @@ fn changes_bytes(u: &Update) -> u64 {
 /// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
 /// it is, and learned.
 pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
-    let ns = CHANGES.expected(changes_bytes(u));
+    let ns = expected_ns(&CHANGES, changes_bytes(u));
     matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
 }
 
@@ -3321,15 +3301,15 @@ pub(super) fn said_off(costs: &kiln_http::turn::Costs, sides: crate::rt::Sides) 
     sides.quantum_ns.is_some_and(|q| costs.fit(0, sides.trip_ns.map_or(0, |t| t.min(q))).is_none_or(|n| n == 0))
 }
 
-/// What reading a reply's JSON into its tree takes by its bytes ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
-static REPLIES: Rate = Rate::new();
+/// What reading a reply's JSON into its tree takes a byte ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
+static REPLIES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// Reply `e`'s JSON as its tree, as `agents.result` and an experiment read it (goal 11 audit A2(c)): read where it's asked
 /// where that's expected to fit a turn and cost no more than the compute pool's round trip (`crate::rt::here`, by what
 /// replies' bytes took to read: [`REPLIES`]), else on the pool. Nothing learned yet, it's read where it's asked, and learned.
 pub(super) async fn reply_value(e: Arc<Entry>) -> Value {
     let bytes = u64::try_from(e.text().len()).unwrap_or(u64::MAX);
-    let ns = REPLIES.expected(bytes);
+    let ns = expected_ns(&REPLIES, bytes);
     if crate::rt::here(ns, ns) {
         let began = Timer::start();
         let value = e.value();
@@ -5876,6 +5856,23 @@ mod tests {
         assert!(!said_off(&took(20_000), shard), "learned short: on the shard");
         assert!(said_off(&took(2_000_000), shard), "learned long: off the shard");
         assert!(!said_off(&kiln_http::turn::Costs::nothing_yet(), none), "off any shard: where it's asked");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: one slow write sends no events off their owners' shards. Do: on a shard whose
+    /// pool's round trip is 60 µs, two windows of 4 KiB events written at 1 ns a byte, then one that took 2 ms (its owner's
+    /// thread held by the host), then a 4 KiB event weighed as `long_to_write` weighs it. Expect: written on the shard, as
+    /// before the slow one (expected under 50 µs wherever the window stood). RFC 6298's eighth put it at 254 µs: the next
+    /// dozen went to the pool, each a round trip for 4 µs of work.
+    #[test]
+    fn g9_s3_one_slow_write_sends_no_events_off_the_shard() {
+        let shard = crate::rt::Sides { quantum_ns: Some(266_667), trip_ns: Some(60_000) };
+        let writes = kiln_http::turn::Costs::nothing_yet();
+        for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+            writes.learn(4 << 10, 4_096);
+        }
+        writes.learn(4 << 10, 2_000_000);
+        let ns = expected_ns(&writes, 4 << 10);
+        assert!(shard.take_here(ns, ns), "after one slow write, a 4 KiB event is expected to take {ns} ns: off its owner's shard");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a session's states are judged by what they cost on average, not by their last few.
