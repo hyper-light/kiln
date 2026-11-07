@@ -29,6 +29,7 @@ use crate::terminal::{self, PtyOut, PtySession};
 
 /// The runner's loops for its agent sessions' frames (runner-fan).
 mod loops;
+pub(crate) mod redial;
 
 /// Bytes of output/results held while disconnected before the oldest log chunks are shed.
 const UPLINK_BUFFER: usize = 128 << 20;
@@ -315,20 +316,6 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
         }
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
-}
-
-/// A dial that produced no transport event in this long is treated as lost (see `run`).
-pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
-/// A runner's redials (see `run`): the first after this, each after a dial that failed twice the wait before it up to
-/// [`REDIAL_MOST`], each jittered up to a quarter more (`crate::sup::jitter`); from the first again once it connects.
-/// The server gives a runner as long as the longest of them to come back before it has learned how long runners take
-/// (`crate::comeback::prior`).
-pub(crate) const REDIAL_FIRST: Duration = Duration::from_millis(500);
-pub(crate) const REDIAL_MOST: Duration = Duration::from_secs(30);
-
-/// The wait before the redial after one that failed, `last` having been the wait before it.
-pub(crate) fn redial_after(last: Duration) -> Duration {
-    last.saturating_mul(2).min(REDIAL_MOST)
 }
 
 struct Running {
@@ -1674,9 +1661,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
     // with them, to come after what was held.
     let mut welcomed = false;
-    let mut dial_backoff = REDIAL_FIRST;
-    let mut redial: Option<Instant> = Some(Instant::now());
-    let mut dialing_since: Option<Instant> = None;
+    // When to dial the server and how long to give a dial, learned from this machine's dials, kept across restarts.
+    let kept = (!o.ephemeral).then(|| o.state_dir.join("redials"));
+    let learned = kept.as_deref().map(redial::Learned::kept).transpose().unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "what this runner learned of its dials doesn't read: learning it again");
+        None
+    });
+    let mut redials = redial::Redials::new(learned.unwrap_or_default(), kept, Instant::now());
     // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
     // server late.
     let chaos = crate::runner::chaos::get();
@@ -2085,7 +2076,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
-            () = sleep_until_opt(redial).fuse() => Ev::Redial,
+            () = sleep_until_opt(redials.deadline()).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
             () = sleep_until_opt(wire_in.want_due().filter(|_| connected && server_wire)).fuse() => Ev::Wants,
             () = sleep_until_opt(have_soon.map(|(at, _)| at)).fuse() => Ev::HaveSoon,
@@ -2711,20 +2702,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Bg::Forwarded(_) | Bg::Again(..) => {}
                 }
             }
-            Ev::Redial => {
-                redial = None;
-                match paths.target(&http, Instant::now()).await {
+            Ev::Redial => match redials.on_deadline(Instant::now()) {
+                redial::Step::Dial => match paths.target(&http, Instant::now()).await {
                     Ok(addr) => {
-                        dialing_since = Some(Instant::now());
+                        redials.dialing(Instant::now());
                         net.command(Out::Connect { addr }).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "cannot resolve server");
-                        redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
-                        dial_backoff = redial_after(dial_backoff);
+                        redials.dialing(Instant::now());
+                        redials.failed(Instant::now(), rand::random());
                     }
+                },
+                // Its end comes back from the transport as the dial's failure.
+                redial::Step::GiveUp => {
+                    net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                 }
-            }
+                redial::Step::Wait => {}
+            },
             Ev::Watchdog => {
                 if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() > Duration::from_secs(5) {
                     let now = exe.as_deref().and_then(binary_mtime);
@@ -2838,17 +2833,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     terms.remove(&session);
                     own.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg ended".into()) })).await.ok();
                 }
-                // A dial that never resolves (no Connected / Closed / Unreachable) would leave the
-                // agent waiting forever, e.g. after dialing before the network existed at boot.
-                // Treat it as failed: rebuild the endpoint on a fresh socket and dial again.
-                if !connected && dialing_since.is_some_and(|t| t.elapsed() > DIAL_TIMEOUT) {
-                    tracing::warn!(server = %quic_addr, after = ?DIAL_TIMEOUT, "no answer from server; rebuilding transport and redialing");
-                    dialing_since = None;
-                    net.command(Out::Rebuild).await;
-                    let now = Instant::now();
-                    redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
-                    dial_backoff = redial_after(dial_backoff);
-                }
                 // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
                 // answers again: drop this connection (what is sent meanwhile waits in the buffer)
                 // and dial directly; the tunnel stays open until that connection is up.
@@ -2864,8 +2848,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
                     }
-                    dialing_since = None;
-                    redial = Some(Instant::now());
+                    redials.switch(Instant::now());
                 }
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
@@ -2876,8 +2859,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // server's frames wait meanwhile.
                 let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
-                dialing_since = None;
-                dial_backoff = REDIAL_FIRST;
+                if let Err(e) = redials.connected(Instant::now()) {
+                    tracing::warn!(error = %format!("{e:#}"), "what this runner learned of its dials isn't kept");
+                }
                 // The machine it is (docs/machines.md, "One record a machine"), which process of it
                 // this is, then Hello (an older server skips the first two).
                 if !o.ephemeral
@@ -3008,16 +2992,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
                 let now = Instant::now();
-                let mut at_once = false;
+                redials.failed(now, rand::random());
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
                     // No word comes for agent sessions on their way to a newer process: they go on here.
                     crate::harness::handing::runner_link_lost();
                 } else {
-                    tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
+                    tracing::debug!(%reason, via = %paths.via(), next = ?redials.deadline().map(|at| at.saturating_duration_since(now)), "dial failed");
                     // The path changed (to the tunnel, or back): dial that way now.
-                    at_once = paths.dial_failed(now);
+                    if paths.dial_failed(now) {
+                        redials.switch(now);
+                    }
                 }
                 connected = false;
                 welcomed = false;
@@ -3053,12 +3039,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
                 }
-                dialing_since = None;
-                redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 if let Some(until) = chaos_down.take() {
-                    redial = redial.map(|r| r.max(until));
+                    redials.hold(until);
                 }
-                dial_backoff = redial_after(dial_backoff);
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
                 let msg: ServerMsg = match proto::read_server(&data) {
@@ -3825,8 +3808,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
                         }
+                        // Its Closed has the runner dial again when its redials say.
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
-                        redial = Some(Instant::now() + Duration::from_secs(60));
                     }
                     ServerMsg::Assign(mut a) => {
                         // The URL this agent reached the server through is the one that works
