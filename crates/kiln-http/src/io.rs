@@ -58,6 +58,9 @@ fn poll_io<T>(wait: &mut Option<Wait>, stream: &TcpStream, writable: bool, cx: &
             Ok(Some(value)) => return Poll::Ready(Ok(value)),
             Err(error) => return Poll::Ready(Err(to_io(error))),
             Ok(None) => {
+                // The try would have blocked: its charge took nothing, and the wait armed next is the one charged
+                // (`hyper_rt::coop::refund`).
+                hyper_rt::coop::refund();
                 let ready = if writable { stream.writable() } else { stream.readable() };
                 if native {
                     *wait = Some(Wait::Native(ready));
@@ -118,24 +121,27 @@ impl TcpIo {
     }
 }
 
+/// Whether a read's or write's next step is a native wait polled under its task's own waker, which charges the
+/// task's turn itself (hyper-rt's readiness wait, `hyper_rt::coop`): the read or write then charges nothing more.
+/// One charge an operation: charged here as well, a read spent its poll's first charge, which always goes on, on
+/// no operation, and its wait's charge was refused at every poll once the poll's own work before it outlasted the
+/// share (futures' `read_to_end` zeroing its buffer's spare room again: kiln's proxy test spun a shard so,
+/// 2026-11-07).
+fn charged_at_wait(wait: &Option<Wait>, native: bool) -> bool {
+    native && matches!(wait, Some(Wait::Native(_)))
+}
+
 impl AsyncRead for TcpIo {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let native = is_native(cx);
+        if std::mem::take(&mut this.drained) && this.read_wait.is_none() && native {
+            this.read_wait = Some(Wait::Native(this.stream.readable()));
+        }
         // A read is a charge of the connection task's turn on its shard (hyper_rt::coop, kiln's goal 6): a
         // socket that always has bytes yields past the task's share, as one that waits does at its wait.
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+        if !charged_at_wait(&this.read_wait, native) && hyper_rt::coop::poll_proceed(cx).is_pending() {
             return Poll::Pending;
-        }
-        let this = self.get_mut();
-        if std::mem::take(&mut this.drained) && this.read_wait.is_none() && is_native(cx) {
-            let mut ready = this.stream.readable();
-            match Pin::new(&mut ready).poll(cx) {
-                Poll::Pending => {
-                    this.read_wait = Some(Wait::Native(ready));
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(to_io(e))),
-                Poll::Ready(Ok(())) => {}
-            }
         }
         let want = buf.len();
         let read = poll_io(&mut this.read_wait, &this.stream, false, cx, |s| s.try_read(buf));
@@ -148,20 +154,20 @@ impl AsyncRead for TcpIo {
 
 impl AsyncWrite for TcpIo {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
         // A write is a charge of the connection task's turn (hyper_rt::coop): a socket that always has room
         // yields past the task's share.
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+        if !charged_at_wait(&this.write_wait, is_native(cx)) && hyper_rt::coop::poll_proceed(cx).is_pending() {
             return Poll::Pending;
         }
-        let this = self.get_mut();
         poll_io(&mut this.write_wait, &this.stream, true, cx, |s| s.try_write(buf))
     }
 
     fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+        let this = self.get_mut();
+        if !charged_at_wait(&this.write_wait, is_native(cx)) && hyper_rt::coop::poll_proceed(cx).is_pending() {
             return Poll::Pending;
         }
-        let this = self.get_mut();
         match bufs {
             [] => Poll::Ready(Ok(0)),
             [one] => poll_io(&mut this.write_wait, &this.stream, true, cx, |s| s.try_write(one)),
@@ -176,5 +182,69 @@ impl AsyncWrite for TcpIo {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(self.get_mut().stream.shutdown(Shutdown::Write).map_err(to_io))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    use futures_io::AsyncRead;
+    use hyper_rt::tcp::{TcpListener, TcpStream};
+
+    use super::TcpIo;
+
+    /// Goal 6 (`hyper_rt::coop`): a read whose poll's own work before it outlasts the task's share, its readiness wait
+    /// armed, takes what came at its next poll, beside a task that wants the shard. Do: arm a reader's wait with nothing
+    /// to read, send it 4 KiB, then poll it until it reads, each poll spinning twice the shard's share before the read
+    /// (as futures' `read_to_end` zeroes its buffer's spare room again first), beside a task whose timer falls due every
+    /// quarter share. Expect: it reads at the first poll after its wait fired, a poll or two. A read that charged the
+    /// task's turn itself, ahead of its wait's charge, spent its poll's first charge, which always goes on, on no
+    /// operation, and its wait's was refused at every poll: it never read, its shard spinning (kiln's proxy test,
+    /// 2026-11-07).
+    #[test]
+    fn g6_s1_a_read_after_its_polls_own_work_takes_what_came() -> Result<(), String> {
+        let (polls, read) = crate::testing::block_on(async {
+            let share = hyper_rt::futures::step_budget_ns().ok_or("off a shard")?;
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 8).map_err(|e| e.to_string())?;
+            let client = TcpStream::connect(listener.local_addr().map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
+            let server = listener.accept().await.map_err(|e| e.to_string())?;
+            let done = Arc::new(AtomicBool::new(false));
+            let competing = Arc::clone(&done);
+            crate::testing::spawn(async move {
+                while !competing.load(Ordering::Acquire) {
+                    let _ = hyper_rt::futures::sleep(share / 4).await;
+                }
+            });
+            let mut reader = TcpIo::new(client);
+            let mut buf = [0u8; 8192];
+            let armed = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut reader).poll_read(cx, &mut buf).is_pending())).await;
+            if !armed {
+                return Err("read before anything was sent".to_owned());
+            }
+            server.try_write(&[7u8; 4096]).map_err(|e| e.to_string())?.ok_or("no room for 4 KiB")?;
+            let mut polls = 0u32;
+            let read = std::future::poll_fn(|cx| {
+                polls = polls.saturating_add(1);
+                if polls > 64 {
+                    return Poll::Ready(Err("no read in 64 polls".to_owned()));
+                }
+                while hyper_rt::futures::poll_clock().is_some_and(|p| p.held_ns() < share.saturating_mul(2)) {
+                    std::hint::spin_loop();
+                }
+                Pin::new(&mut reader).poll_read(cx, &mut buf).map_err(|e| e.to_string())
+            })
+            .await;
+            done.store(true, Ordering::Release);
+            Ok::<_, String>((polls, read?))
+        })??;
+        assert!(read > 0, "read nothing");
+        // Shape: the poll the wait fired for, one before it, and a wake of the task's own.
+        assert!(polls <= 3, "{polls} polls to read what came");
+        Ok(())
     }
 }

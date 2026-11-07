@@ -296,7 +296,12 @@ impl Future for Join {
             if crate::coop::proceed_in(ctx, cx).is_pending() {
                 return Poll::Pending;
             }
-            ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
+            let joined = ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()));
+            if joined.is_pending() {
+                // Not ended yet: the join waits, having taken nothing (`crate::coop::refund`).
+                crate::coop::refund_in(ctx);
+            }
+            joined
         })
         .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
     }
@@ -454,7 +459,9 @@ impl Future for Sleep {
             }
             return Poll::Ready(Ok(()));
         }
+        // Not due: the sleep waits, having taken nothing (`crate::coop::refund`).
         if armed {
+            crate::coop::refund();
             return Poll::Pending;
         }
         let site = self.site;
@@ -465,6 +472,7 @@ impl Future for Sleep {
         match taken {
             Some(Ok(id)) => {
                 self.timer = id;
+                crate::coop::refund();
                 Poll::Pending
             }
             Some(Err(refusal)) => Poll::Ready(Err(refusal)),

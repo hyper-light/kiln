@@ -36,6 +36,13 @@
 //!   share (futures' `read_to_end` zeroes its buffer's spare room again at every poll) would otherwise be
 //!   refused there at every poll, redoing that work and getting no further: a livelock that spun a shard of
 //!   kiln's tests.
+//! - **A leaf that waits gives that charge back** ([`refund`]): one that finds nothing to take (a wait not
+//!   fired, a channel empty, a timer not due) answers `Pending` having made no operation, so the charge its
+//!   poll's first goes on by goes to the next leaf, as Tokio's leaves give their unit back when they make no
+//!   progress (`RestoreOnPending`). Kept, a leaf that waits spent it: a read polled after a wait in the same
+//!   poll (`join!` of a write that waits for room and a `read_to_end`), or after a charge of the reader's own
+//!   ahead of its readiness wait, was refused at every poll, past its share by the zeroing redone before it,
+//!   and the shard spun (kiln's proxy test again, 2026-11-07: 109 minutes on one shard's thread).
 //!
 //! Tokio's budget counts operations, 128 a poll, and reads no clock; Seastar's task quota is a time (0.5 ms
 //! by default) that a timer ends, checked between tasks with two loads (`need_preempt`). Here the count is
@@ -76,6 +83,19 @@ pub(crate) fn proceed_in(here: &ShardContext, cx: &mut Context<'_>) -> Poll<()> 
 fn proceeds(here: &ShardContext, cx: &Context<'_>) -> bool {
     let own = crate::waker::polling_task_in(here, cx.waker()).is_some();
     here.charge(own)
+}
+
+/// Says the leaf that was just let go on ([`poll_proceed`]) made no operation: it found nothing to take and
+/// answers `Pending`, its task registered to be woken. Where that charge was the one its poll's first goes on
+/// by, the poll's next charge goes on by it instead, so a leaf that waits doesn't spend it (the module's notes).
+/// A leaf calls it on each path that waits, after its charge; nothing off a shard's thread.
+pub fn refund() {
+    let _ = registry::with_current(ShardContext::refund);
+}
+
+/// [`refund`] on the shard `here` a leaf has looked up already.
+pub(crate) fn refund_in(here: &ShardContext) {
+    here.refund();
 }
 
 /// The yield point of a long computation: one charge with no other operation (Tokio's `consume_budget`).

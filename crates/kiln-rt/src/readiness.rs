@@ -85,8 +85,11 @@ impl Future for Ready {
             if armed_for == word {
                 let outcome = registry::with_current(|ctx| ctx.interest_outcome(ticket)).flatten();
                 return match outcome {
-                    // Not fired: whatever woke the task, this wait goes on.
-                    None => Poll::Pending,
+                    // Not fired: whatever woke the task, this wait goes on, having taken nothing.
+                    None => {
+                        crate::coop::refund();
+                        Poll::Pending
+                    }
                     Some(outcome) => {
                         self.armed = None;
                         Poll::Ready(outcome)
@@ -110,6 +113,7 @@ impl Future for Ready {
         match registered {
             Some(Ok(ticket)) => {
                 self.armed = Some((ticket, word));
+                crate::coop::refund();
                 Poll::Pending
             }
             Some(Err(e)) => Poll::Ready(Err(e)),

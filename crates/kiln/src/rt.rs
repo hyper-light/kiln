@@ -2500,7 +2500,12 @@ impl Future for Listen<'_> {
         }
         let place = this.place();
         this.changed.waits.list.wait(&place, cx.waker());
-        if this.over() { Poll::Ready(()) } else { Poll::Pending }
+        if this.over() {
+            return Poll::Ready(());
+        }
+        // Nothing changed yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
+        hyper_rt::coop::refund();
+        Poll::Pending
     }
 }
 
@@ -2574,7 +2579,11 @@ impl<T: Clone> futures::Stream for Subscription<T> {
                 Poll::Ready(Ok(p)) => return Poll::Ready(Some(p.0)),
                 Poll::Ready(Err(async_broadcast::RecvError::Overflowed(_))) => {}
                 Poll::Ready(Err(async_broadcast::RecvError::Closed)) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Nothing sent yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
+                    hyper_rt::coop::refund();
+                    return Poll::Pending;
+                }
             }
         }
     }

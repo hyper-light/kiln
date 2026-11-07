@@ -301,6 +301,8 @@ impl Future for Recv<'_> {
         if arrived != 0 {
             return Poll::Ready(Ok(Signals(arrived)));
         }
+        // Nothing delivered: the wait goes on, having taken nothing (`crate::coop::refund`).
+        crate::coop::refund();
         Poll::Pending
     }
 }

@@ -342,6 +342,45 @@ fn g6_s1_each_poll_makes_at_least_one_operation() {
     assert!(polls <= 2 * STEPS, "{polls} polls for {STEPS} steps");
 }
 
+/// A leaf that waits gives its charge back (`hyper_rt::coop::refund`). Each step's poll first polls a wait that
+/// isn't due (a sleep an hour out, as a `join!` polls a write that waits for room before a read), then does twice
+/// its share of its own work, then charges (`consume_budget`, the read), beside a competitor whose timer is due by
+/// then: the wait gives back the charge its poll's first goes on by, so the step's charge goes on by it, and each
+/// step takes a poll. Kept, the wait spent it, the step's charge was refused at every poll, and the step was redone
+/// poll after poll (kiln's proxy test spun a shard so for 109 minutes, 2026-11-07).
+#[test]
+fn g6_s1_a_leaf_that_waits_leaves_its_polls_first_operation_to_the_next() {
+    const STEPS: u32 = 8;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let seen = Arc::new(Seen::default());
+    let seen_in = Arc::clone(&seen);
+    let polls = rt
+        .block_on(async move {
+            let done = Arc::new(AtomicBool::new(false));
+            spawn(compete(Arc::clone(&seen_in), Arc::clone(&done))).unwrap();
+            hyper_rt::futures::yield_now().await;
+            // Shape: an hour, so it never falls due while the test runs.
+            let mut waiting = std::pin::pin!(sleep(3_600_000_000_000));
+            let mut polls = 0u32;
+            for _ in 0..STEPS {
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    assert!(polls <= 4 * STEPS, "a step's work redone poll after poll: {polls} polls");
+                    assert!(waiting.as_mut().poll(cx).is_pending(), "an hour's sleep fell due");
+                    work(2 * QUANTUM_NS);
+                    let mut leaf = consume_budget();
+                    Pin::new(&mut leaf).poll(cx)
+                })
+                .await;
+            }
+            done.store(true, Ordering::Release);
+            polls
+        })
+        .unwrap();
+    // As `g6_s1_each_poll_makes_at_least_one_operation`'s: at most two polls a step.
+    assert!(polls <= 2 * STEPS, "{polls} polls for {STEPS} steps");
+}
+
 /// A simulated shard keeps a step a yield (docs/runtime.md §11): its clock does not move within a poll, so a
 /// charge never ends one, and a loop of due timers is one poll.
 #[test]

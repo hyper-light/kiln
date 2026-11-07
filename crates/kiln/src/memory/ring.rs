@@ -107,7 +107,11 @@ impl<T: Clone> futures::Stream for Subscription<T> {
                 Poll::Ready(Ok(item)) => return Poll::Ready(Some(item)),
                 Poll::Ready(Err(RecvError::Overflowed(_))) => {}
                 Poll::Ready(Err(RecvError::Closed)) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Nothing sent yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
+                    hyper_rt::coop::refund();
+                    return Poll::Pending;
+                }
             }
         }
     }

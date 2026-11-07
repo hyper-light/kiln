@@ -137,6 +137,8 @@ impl Future for Notified<'_> {
         if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
             return Poll::Ready(Ok(()));
         }
+        // Not notified: the wait goes on, having taken nothing (`crate::coop::refund`).
+        crate::coop::refund();
         Poll::Pending
     }
 }
@@ -286,7 +288,11 @@ impl<T> Future for OneshotReceiver<T> {
         self.shared.cell().register(word);
         match poll_value(&mut self.as_mut().try_recv()) {
             Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+            None => {
+                // Nothing sent yet: the wait goes on, having taken nothing (`crate::coop::refund`).
+                crate::coop::refund();
+                Poll::Pending
+            }
         }
     }
 }
@@ -583,6 +589,8 @@ impl<T> Send<'_, T> {
                     // A grant landed before this task's word did, so its wake went nowhere: be polled again.
                     cx.waker().wake_by_ref();
                 }
+                // No room: the send waits, having sent nothing (`crate::coop::refund`).
+                crate::coop::refund_in(here);
                 Poll::Pending
             }
             sent => {
@@ -669,7 +677,11 @@ impl<T> Future for Recv<'_, T> {
         }
         match poll_value(&mut self.receiver.try_recv()) {
             Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+            None => {
+                // Empty: the wait goes on, having taken nothing (`crate::coop::refund`).
+                crate::coop::refund();
+                Poll::Pending
+            }
         }
     }
 }
@@ -982,7 +994,11 @@ impl Future for Changed<'_> {
         self.receiver.own.register(word);
         match self.receiver.check() {
             Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+            None => {
+                // Unchanged: the wait goes on, having taken nothing (`crate::coop::refund`).
+                crate::coop::refund();
+                Poll::Pending
+            }
         }
     }
 }
@@ -1136,6 +1152,8 @@ impl<'a> Future for Acquire<'a> {
                 return Poll::Ready(Ok(Permit { semaphore }));
             }
             own.register(word);
+            // Not granted yet: the wait goes on, having taken nothing (`crate::coop::refund`).
+            crate::coop::refund();
             return Poll::Pending;
         }
         if let Some(permit) = semaphore.try_acquire() {
@@ -1179,6 +1197,8 @@ impl<'a> Future for Acquire<'a> {
             return Poll::Ready(Ok(Permit { semaphore }));
         }
         self.waiting = Some(own);
+        // Queued: the wait goes on, having taken nothing (`crate::coop::refund`).
+        crate::coop::refund();
         Poll::Pending
     }
 }

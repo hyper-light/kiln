@@ -382,6 +382,10 @@ pub struct ShardContext {
     /// goes on whatever its time, so each poll makes at least one operation. The loop clears it as each poll
     /// begins.
     pub(crate) coop_charged: Cell<bool>,
+    /// Whether the latest charge was the one the poll's first goes on by ([`Self::coop_charged`]), which a leaf
+    /// that then finds nothing to take gives back ([`crate::coop::refund`]). The loop clears it as each poll
+    /// begins.
+    pub(crate) coop_given: Cell<bool>,
     /// What the task being polled says it is doing ([`crate::futures::label`]), for the shard's table of slow
     /// polls (`crate::slow`, kiln's goal 9). The loop clears it as each poll begins.
     pub(crate) label: Cell<Option<&'static crate::slow::Label>>,
@@ -498,6 +502,7 @@ impl ShardContext {
             accepting: Cell::new(true),
             coop_spent: Cell::new(false),
             coop_charged: Cell::new(false),
+            coop_given: Cell::new(false),
             label: Cell::new(None),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
@@ -660,10 +665,13 @@ impl ShardContext {
         crate::shard_loop::count(&self.live.coop_charges, 1);
         // A poll's first operation goes on whatever the time: a poll whose own work before it outlasted the share
         // would otherwise redo that work at every poll and get no further (as futures' `read_to_end`, which zeroes
-        // its buffer's spare room again each poll, did in kiln's proxy test, spinning its shard).
+        // its buffer's spare room again each poll, did in kiln's proxy test, spinning its shard). Given back by a
+        // leaf that then waits ([`Self::refund`]), so it goes to a leaf with something to take.
         if own && !self.coop_charged.replace(true) {
+            self.coop_given.set(true);
             return true;
         }
+        self.coop_given.set(false);
         if self.coop_spent.get() {
             return !own;
         }
@@ -686,6 +694,14 @@ impl ShardContext {
         }
         self.checked_ns.set(now);
         true
+    }
+
+    /// The latest charge bought no operation (its leaf found nothing to take, and waits): where it was the one the
+    /// poll's first goes on by, the next charge goes on by it instead ([`crate::coop::refund`]).
+    pub(crate) fn refund(&self) {
+        if self.coop_given.replace(false) {
+            self.coop_charged.set(false);
+        }
     }
 
     /// The online wake estimate, nanoseconds (the quantum).
