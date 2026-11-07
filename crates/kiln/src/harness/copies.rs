@@ -1959,6 +1959,11 @@ pub struct View {
     /// (goal 10, plan 01a1a87b2dae step 2); the events socket's frame of the change is made of it too
     /// (`crate::wire::events::harness_frame`, step 5).
     pub info_json: Bytes,
+    /// Which of its owner's encodings of its info `info_json` is ([`Encodings::info`] as its owner published it): two of
+    /// its views that say the same number say the same info, so the sessions' list tells a session's info said anew by
+    /// it, holding none of them ([`Listed`]; goal 9, plan 01a1a87b2cec step 3). [`UNSAID`] for one encoded for its view
+    /// alone.
+    pub info_said: u64,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
     pub state: Arc<StateDoc>,
@@ -1972,6 +1977,10 @@ pub struct View {
     /// The copy is gone (its session ended or went away): its last view.
     pub closed: bool,
 }
+
+/// [`View::info_said`] of an info encoded for its view alone (its info changed since its owner last published it), never
+/// one its owner published: no list takes it for one it said.
+pub const UNSAID: u64 = u64::MAX;
 
 impl View {
     /// What a snapshot is made of: all of it, by reference (its info aside, a few hundred bytes).
@@ -2416,6 +2425,7 @@ impl Mirror {
         let view = View {
             info: Arc::clone(&info),
             info_json: encoded.clone(),
+            info_said: 0,
             location: Arc::clone(&location),
             meta: null(),
             state: super::state_doc::none(),
@@ -2561,11 +2571,13 @@ impl Mirror {
     /// The copy as it is now, for its readers.
     pub fn view(&self) -> View {
         let (of, encoded) = &self.info_json;
+        let published = Arc::ptr_eq(of, &self.info);
         View {
             info: Arc::clone(&self.info),
             // Encoded as it was published ([`Mirror::publish`]), or now, should the info have changed
             // since without a publish.
-            info_json: if Arc::ptr_eq(of, &self.info) { encoded.clone() } else { info_json(&self.info) },
+            info_json: if published { encoded.clone() } else { info_json(&self.info) },
+            info_said: if published { self.encodings.info } else { UNSAID },
             location: Arc::clone(&self.location),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
@@ -3950,57 +3962,183 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
     usize::try_from(hash % u64::try_from(shards.max(1)).unwrap_or(1)).unwrap_or(0)
 }
 
+/// One open session in the sessions' list ([`Listed`]), in the list's order: its slot (by address alone, compared and never
+/// followed: the board the list was joined of holds it), the encoding of its info the list says ([`View::info_said`]),
+/// when it was made (the list's order is by that, then its id), where its info lies in the list's JSON, and what the
+/// list's weak ETag names of it (`crate::http::compress::digest`).
+#[derive(Clone, Copy)]
+struct Placed {
+    slot: usize,
+    info: u64,
+    made: i64,
+    at: usize,
+    len: usize,
+    digest: [u8; crate::http::compress::ETAG_DIGEST],
+}
+
+/// A slot's address, telling it from the others in the very board that holds them all: compared, never followed.
+fn address(slot: &Arc<Slot>) -> usize {
+    Arc::as_ptr(slot).addr()
+}
+
 /// The sessions' list as `GET /api/harness/sessions` answers it, joined once for every read that finds the
 /// sessions as they were ([`Copies::list_json`]; goal 10, plan 01a1a87b2dae step 5), with what it was joined
-/// of, held by identity: each shard's board, weakly (a session gone from one is let go of, and no other board
-/// takes its place unseen), and each session's info as its view said it, in the boards' order (no other
-/// encoding takes its place unseen).
+/// of: each shard's board, weakly (held by identity: no other board takes its place unseen), and each open session in
+/// them as the list says it ([`Placed`]), in the list's order, with each one's place in that order in the boards' order.
+/// Its JSON holds every info as the list says it: a join that finds the very sessions, some of their infos said anew,
+/// copies the others from it and digests only those, holding no view or info and sorting nothing (goal 9, plan
+/// 01a1a87b2cec step 3: each join took every session's view and its info twice, sorted them again and copied every info
+/// from its view; a list read held its shard to 272 µs on the CPU in the Mac lab's realistic profile, 119 µs of it in its
+/// route).
 struct Listed {
-    boards: Vec<Weak<Board>>,
-    infos: Vec<Bytes>,
+    boards: Arc<[Weak<Board>]>,
+    said: Vec<Placed>,
+    /// For each open session in the boards' order, its place in `said`.
+    boarded: Arc<[u32]>,
     json: Bytes,
-    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
-    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
-    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
     /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
     /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
     etag: Option<http::HeaderValue>,
 }
 
-/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
-/// could be there), else its digest now.
-fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
-    match prior.and_then(|p| p.digested.get(i)) {
-        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
-        _ => crate::http::compress::digest(info),
-    }
+/// What the boards hold of a list joined before ([`Listed::found`]).
+enum Found {
+    /// Its very sessions, each as it says it.
+    Same,
+    /// Its very sessions, these said anew: each one's place in the list, its info as its view says it, and which encoding
+    /// of it that is.
+    Anew(Vec<(usize, Bytes, u64)>),
+    /// Sessions came or went, or one said anew was made at another time than the list says: the list is joined whole.
+    Other,
+}
+
+/// The list's weak ETag, of its sessions' digests in its order.
+fn etag_of(said: &[Placed]) -> Option<http::HeaderValue> {
+    crate::http::compress::weak_etag(&crate::http::compress::digest_parts(said.iter().map(|s| &s.digest[..])))
 }
 
 impl Listed {
-    /// Whether `boards` hold the sessions it was joined of, each as its view said it then: the same board on
-    /// every shard, and in each, the same sessions open with the same info's encoding.
-    fn holds(&self, boards: &[ArcSwap<Board>]) -> bool {
+    /// What `boards` hold of the sessions it was joined of ([`Found`]): the very same board on every shard, and in each
+    /// the same sessions open, each with the encoding of its info the list says, else which were said anew.
+    fn found(&self, boards: &[ArcSwap<Board>]) -> Found {
         if self.boards.len() != boards.len() {
-            return false;
+            return Found::Other;
         }
-        let mut infos = self.infos.iter();
+        let (mut places, mut anew) = (self.boarded.iter(), Vec::new());
         for (was, board) in self.boards.iter().zip(boards.iter()) {
             let board = board.load();
             if !std::ptr::eq(was.as_ptr(), Arc::as_ptr(&board)) {
-                return false;
+                return Found::Other;
             }
             for slot in board.values() {
                 let view = slot.view.load();
                 if view.closed {
                     continue;
                 }
-                match infos.next() {
-                    Some(info) if info.as_ptr() == view.info_json.as_ptr() && info.len() == view.info_json.len() => {}
-                    _ => return false,
+                let Some(place) = places.next().and_then(|&p| usize::try_from(p).ok()) else { return Found::Other };
+                let Some(said) = self.said.get(place).filter(|s| s.slot == address(slot)) else { return Found::Other };
+                if said.info == view.info_said && said.info != UNSAID {
+                    continue;
                 }
+                if said.made != view.info.created_at {
+                    return Found::Other;
+                }
+                // Room for all the rest at the first said anew: one allocation, none where none is.
+                if anew.is_empty() {
+                    anew.reserve_exact(self.said.len());
+                }
+                anew.push((place, view.info_json.clone(), view.info_said));
             }
         }
-        infos.next().is_none()
+        match (places.next(), anew.is_empty()) {
+            (Some(_), _) => Found::Other,
+            (None, true) => Found::Same,
+            (None, false) => Found::Anew(anew),
+        }
+    }
+
+    /// The list again, the sessions `anew` says (its places in the list) said as their views say them now: the others'
+    /// infos copied from its JSON as they lie there, only the new ones digested. None where its own record of its JSON
+    /// doesn't hold (the list is then joined whole).
+    fn with_anew(&self, mut anew: Vec<(usize, Bytes, u64)>) -> Option<Listed> {
+        anew.sort_unstable_by_key(|(place, _, _)| *place);
+        let was_len: usize = anew.iter().filter_map(|(place, _, _)| self.said.get(*place)).map(|s| s.len).sum();
+        let now_len: usize = anew.iter().map(|(_, info, _)| info.len()).sum();
+        let mut json = Vec::with_capacity(self.json.len().checked_sub(was_len)?.checked_add(now_len)?);
+        let mut said = Vec::with_capacity(self.said.len());
+        let mut news = anew.iter().peekable();
+        json.push(b'[');
+        for (place, was) in self.said.iter().enumerate() {
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            said.push(match news.next_if(|(p, _, _)| *p == place) {
+                Some((_, info, n)) => {
+                    json.extend_from_slice(info);
+                    Placed { info: *n, at, len: info.len(), digest: crate::http::compress::digest(info), ..*was }
+                }
+                None => {
+                    json.extend_from_slice(self.json.get(was.at..was.at.checked_add(was.len)?)?);
+                    Placed { at, ..*was }
+                }
+            });
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Some(Listed { boards: Arc::clone(&self.boards), said, boarded: Arc::clone(&self.boarded), json: Bytes::from(json), etag })
+    }
+
+    /// The list joined whole from `boards`: each open session's view taken, sorted by when it was made, then its id, its
+    /// info copied in, and digested unless `prior` said the very same bytes for its slot.
+    fn joined(boards: &[ArcSwap<Board>], prior: Option<&Listed>) -> Listed {
+        let mut held = Vec::with_capacity(boards.len());
+        let mut open: Vec<(usize, Arc<View>)> = Vec::new();
+        for board in boards {
+            let board = board.load_full();
+            for slot in board.values() {
+                let view = slot.view.load_full();
+                if !view.closed {
+                    open.push((address(slot), view));
+                }
+            }
+            held.push(Arc::downgrade(&board));
+        }
+        let mut order: Vec<usize> = (0..open.len()).collect();
+        order.sort_by(|&a, &b| match (open.get(a), open.get(b)) {
+            (Some((_, a)), Some((_, b))) => a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)),
+            _ => std::cmp::Ordering::Equal,
+        });
+        // What `prior` said for each slot, by its address: an info that's the very bytes it said there is digested no more.
+        // The bytes are compared, not their encoding's number: a slot it knew may have gone since, and another have its
+        // address, with an encoding numbered the same.
+        let mut slots: Vec<(usize, &Placed)> = prior.map(|l| l.said.iter().map(|s| (s.slot, s)).collect()).unwrap_or_default();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        let digest_of = |slot: usize, info: &[u8]| {
+            let (_, said) = slots.get(slots.binary_search_by_key(&slot, |(s, _)| *s).ok()?)?;
+            let was = prior?.json.get(said.at..said.at.checked_add(said.len)?)?;
+            (was == info).then_some(said.digest)
+        };
+        let mut boarded = vec![0u32; open.len()];
+        let mut said = Vec::with_capacity(open.len());
+        let mut json = Vec::with_capacity(open.iter().map(|(_, v)| v.info_json.len()).sum::<usize>() + open.len().saturating_sub(1) + 2);
+        json.push(b'[');
+        for (place, &b) in order.iter().enumerate() {
+            let Some((slot, view)) = open.get(b) else { continue };
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            json.extend_from_slice(&view.info_json);
+            let digest = digest_of(*slot, &view.info_json).unwrap_or_else(|| crate::http::compress::digest(&view.info_json));
+            said.push(Placed { slot: *slot, info: view.info_said, made: view.info.created_at, at, len: view.info_json.len(), digest });
+            if let Some(p) = boarded.get_mut(b) {
+                *p = u32::try_from(place).unwrap_or(u32::MAX);
+            }
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Listed { boards: held.into(), said, boarded: boarded.into(), json: Bytes::from(json), etag }
     }
 }
 
@@ -4126,30 +4264,19 @@ impl Copies {
     /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
     /// session, while each state its agents send changes one session's info).
     pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
-        let prior = self.listed.load_full();
-        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
-            return (listed.json.clone(), listed.etag.clone());
-        }
+        let prior = self.listed.load();
+        let listed = match prior.as_deref() {
+            Some(was) => match was.found(&self.boards) {
+                Found::Same => return (was.json.clone(), was.etag.clone()),
+                Found::Anew(anew) => was.with_anew(anew).unwrap_or_else(|| Listed::joined(&self.boards, Some(was))),
+                Found::Other => Listed::joined(&self.boards, Some(was)),
+            },
+            None => Listed::joined(&self.boards, None),
+        };
         self.joins.fetch_add(1, Ordering::Relaxed);
-        let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
-        for board in self.boards.iter() {
-            let board = board.load_full();
-            for slot in board.values() {
-                let view = slot.view.load_full();
-                if !view.closed {
-                    infos.push(view.info_json.clone());
-                    views.push(view);
-                }
-            }
-            boards.push(Arc::downgrade(&board));
-        }
-        views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
-        let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
-        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
-        (json, etag)
+        let answer = (listed.json.clone(), listed.etag.clone());
+        self.listed.store(Some(Arc::new(listed)));
+        answer
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
