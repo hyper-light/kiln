@@ -6789,7 +6789,7 @@ pub(crate) mod tests {
             join_runner(&hub, 2, "other", 0);
             hub.change_agent("other", |a| a.running = vec![job.clone()]);
             let step = NetEvent::Frame { peer: 2, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::StepStarted { job: job.clone(), idx: 0 })?, at: stepped };
-            hub.on_net_at(step, &mut Some(Arrived { at: stepped, taken: Instant::now() })).await?;
+            hub.on_net_at(step, None, &mut Some(Arrived { at: stepped, taken: Instant::now() })).await?;
             let kept = || async { hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db")) };
             let cost = Duration::from_nanos(kept().await?.split('/').next().unwrap_or_default().parse()?);
             anyhow::ensure!((Duration::from_secs(10)..Duration::from_secs(11)).contains(&cost), "{}", kept().await?);
@@ -6799,7 +6799,7 @@ pub(crate) mod tests {
             hub.pending_peers.update(|m| m.insert(1, "box".into()));
             let hello = AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") });
             let came = now.checked_sub(Duration::from_secs(2)).ok_or_else(|| anyhow::anyhow!("no instant 2 s ago"))?;
-            hub.on_net_at(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&hello)?, at: came }, &mut Some(Arrived { at: came, taken: now })).await?;
+            hub.on_net_at(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&hello)?, at: came }, None, &mut Some(Arrived { at: came, taken: now })).await?;
             let grace = hub.comeback.grace();
             anyhow::ensure!((Duration::from_secs(4)..Duration::from_secs(5)).contains(&grace), "back in 4 s, a requeue 10 s: {grace:?}");
             hub.put_agent(lost("slow", Duration::from_secs(30), "job-s"));
