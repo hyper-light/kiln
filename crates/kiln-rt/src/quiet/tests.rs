@@ -70,12 +70,13 @@ fn pause(span: Duration) {
     }
 }
 
-/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came and how long it took on `tx`.
+/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came and how long it took on `tx`, on the shard's
+/// clock, the one its account is on.
 fn sleeper(rt: &Runtime, shard: ShardId, tx: Sender<(Result<Came, RtError>, Duration)>) {
     rt.spawn_on(shard, async move {
-        let started = Instant::now();
+        let started = crate::futures::now_ns();
         let came = sleep_quiet(ns(SPAN), ns(SPAN)).await;
-        let _ = tx.send((came, started.elapsed()));
+        let _ = tx.send((came, Duration::from_nanos(crate::futures::now_ns().saturating_sub(started))));
     })
     .unwrap();
 }
@@ -252,7 +253,8 @@ fn g9_s5_a_shard_work_wakes_within_its_quiet_takes_no_timer_wake() {
 
 /// Kiln's goal 9, plan 01a1a87b2cec step 5: a quiet sleep falling due while its shard runs ends at the shard's next step,
 /// as a timer would, saying how late. Do: on a running runtime's shard, a quiet sleep of [`SPAN`], then a task that holds
-/// the shard twice that in one poll. Expect: `Came::Running`, as late as the hold ran past its due time, give or take.
+/// the shard twice that in one poll. Expect: `Came::Running`, late from its due time: no later than the sleep took past
+/// its span, however long the host kept the shard from its next step.
 #[test]
 fn g9_s5_a_quiet_sleep_due_on_a_running_shard_ends_at_its_next_step() {
     let rt = Runtime::start(&config()).unwrap();
@@ -270,8 +272,8 @@ fn g9_s5_a_quiet_sleep_due_on_a_running_shard_ends_at_its_next_step() {
     let Ok(Came::Running(late)) = came else {
         panic!("{came:?}");
     };
-    assert!(late > 0 && late < ns(SPAN * 2), "{late} ns late");
     assert!(took >= SPAN * 2 - GAP, "it came after {took:?}, before the hold ended");
+    assert!(late > 0 && late <= ns(took - SPAN), "{late} ns late, its sleep {took:?}");
     rt.shutdown().unwrap();
 }
 

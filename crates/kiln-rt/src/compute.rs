@@ -1295,9 +1295,13 @@ mod tests {
     }
 
     static WENT_COLD: AtomicUsize = AtomicUsize::new(0);
+    static ASKING: OnceLock<Thread> = OnceLock::new();
 
     fn went_cold() {
         WENT_COLD.fetch_add(1, Ordering::SeqCst);
+        if let Some(asking) = ASKING.get() {
+            asking.unpark();
+        }
     }
 
     /// Kiln's goal 11, plan 01a1a87b2e56 step 5: a worker claimed within its wait runs on as before; one idle
@@ -1305,25 +1309,32 @@ mod tests {
     #[test]
     fn g11_s5_an_idle_worker_goes_cold_once_past_its_wait() {
         use std::sync::Arc;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         let cold = Cold {
             after: Duration::from_millis(20),
             then: went_cold,
         };
-        let idle_for = |held: Duration| {
+        let idle_until = |claim: &dyn Fn()| {
             let state = Arc::new(AtomicU8::new(IDLE));
             let waiting = Arc::clone(&state);
             let worker = std::thread::spawn(move || wait_while_idle(&waiting, Some(cold)));
-            std::thread::sleep(held);
+            claim();
             state.store(RUNNING, Ordering::Release);
             worker.thread().unpark();
             worker.join().unwrap();
         };
-        idle_for(Duration::ZERO);
+        idle_until(&|| ());
         // A claim within the wait can still come after it on a loaded machine: then the worker went cold, once.
         assert!(WENT_COLD.load(Ordering::SeqCst) <= 1);
         let before = WENT_COLD.load(Ordering::SeqCst);
-        idle_for(Duration::from_millis(300));
+        ASKING.set(std::thread::current()).unwrap();
+        // Claimed once it went cold, at the machine's pace; the bound only ends a hang.
+        idle_until(&|| {
+            let hang = Instant::now() + Duration::from_secs(300);
+            while WENT_COLD.load(Ordering::SeqCst) == before && Instant::now() < hang {
+                std::thread::park_timeout(hang.saturating_duration_since(Instant::now()));
+            }
+        });
         assert_eq!(WENT_COLD.load(Ordering::SeqCst) - before, 1, "cold once in an idle past 20 ms");
     }
 }

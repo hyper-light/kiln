@@ -105,7 +105,42 @@ impl Drop for File {
     fn drop(&mut self) {
         less(&FILE_BYTES, usize::try_from(self.end.load(Ordering::Relaxed)).unwrap_or(usize::MAX));
         let _ = std::fs::remove_file(&self.path);
+        #[cfg(test)]
+        if let Ok(mut gone) = GONE.lock() {
+            gone.push((self.path.clone(), crate::rt::on_shard()));
+        }
     }
+}
+
+/// Tests: each spill file let go of, and whether that was on a shard ([`give_way`]).
+#[cfg(test)]
+pub(crate) static GONE: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl Dir {
+    /// A new file for session `id`'s spilled segments, as a spill makes one.
+    pub(crate) fn new_file(&self, id: &str) -> io::Result<Arc<File>> {
+        self.create(id)
+    }
+}
+
+#[cfg(test)]
+impl File {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// `old`, the file a copy spilled to before its spill went to `new`, let go of: where it's the file's last reference, on the
+/// blocking pool (`crate::rt::SHARE_FS`), which its going removes and closes (`File`'s drop), so never on its owner's shard,
+/// where they held the shard 130 to 250 µs, past its quantum, as "a copy's spill taken in" in a Mac's lab (goal 9, plan
+/// 01a1a87b2cec step 3). One its chunks still refer to, or `new` itself, only counts one fewer, here; so does any off a
+/// shard, and any the pool won't take (none running, a test's).
+pub fn give_way(old: Arc<File>, new: &Arc<File>) {
+    if Arc::ptr_eq(&old, new) || Arc::strong_count(&old) > 1 || !crate::rt::on_shard() {
+        return;
+    }
+    let _ = hyper_rt::blocking::run(crate::rt::SHARE_FS, move || drop(old));
 }
 
 /// `n` off `count`, never below none.
